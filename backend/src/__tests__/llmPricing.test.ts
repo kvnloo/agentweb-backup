@@ -158,6 +158,19 @@ describe('llmPricing', () => {
       expect(MODEL_PRICING['gpt-5.5'].cacheReadPerM ?? MODEL_PRICING['gpt-5.5'].inPerM * 0.1).toBeCloseTo(0.5, 6);
     });
 
+    it('prices GPT-6 Astra at the Azure GlobalStandard $10/$50 BYOK rate, not a marketplace promo (ENG-1769)', () => {
+      // BYOK traffic bills at Azure's list rate; the backend only takes
+      // OpenRouter's usage.cost override when is_byok !== true, so this row
+      // is what customers are actually charged. Live-confirmed 2026-09-05:
+      // 13 prompt + 5 completion tokens -> $0.00013 + $0.00025 upstream.
+      const price = getModelPrice('openrouter/openai/gpt-6-astra');
+      expect(price).not.toBeNull();
+      expect(price!.inPerM).toBe(10);
+      expect(price!.outPerM).toBe(50);
+      expect(price!.cacheReadPerM).toBeCloseTo(1.0, 10);
+      expect(price!.cacheWritePerM).toBeCloseTo(12.5, 10);
+    });
+
     it('prices gemini-3.1-flash-live-preview at the confirmed $0.75/$4.50 text rate', () => {
       expectRate('gemini-3.1-flash-live-preview', 0.75, 4.5);
     });

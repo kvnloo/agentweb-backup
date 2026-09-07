@@ -225,6 +225,40 @@ case "$operation" in
     exit 0
     ;;
 
+  describe-target-group-attributes)
+    # Fixture `tg_attrs`: current deregistration_delay value, or "ERROR|<msg>".
+    if [ -f "${MOCK_DIR}/tg_attrs_exit" ]; then
+      code=$(cat "${MOCK_DIR}/tg_attrs_exit")
+      printf 'mock aws: simulated describe-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    val='20'
+    [ -f "${MOCK_DIR}/tg_attrs" ] && val=$(cat "${MOCK_DIR}/tg_attrs")
+    printf '%s\n' "$val"
+    exit 0
+    ;;
+
+  modify-target-group-attributes)
+    printf '%s\n' "$all_args" >>"${MOCK_DIR}/modify_tg_calls"
+    if [ -f "${MOCK_DIR}/modify_tg_exit" ]; then
+      code=$(cat "${MOCK_DIR}/modify_tg_exit")
+      printf 'mock aws: simulated modify-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    # Applying the mutation updates what the next describe call reports,
+    # unless the fixture wants to prove a silent-drop scenario (tg_attrs_stuck).
+    if [ ! -f "${MOCK_DIR}/tg_attrs_stuck" ]; then
+      for pair in $all_args; do
+        case "$pair" in
+          Key=deregistration_delay.timeout_seconds,Value=*)
+            printf '%s\n' "${pair#*Value=}" >"${MOCK_DIR}/tg_attrs"
+            ;;
+        esac
+      done
+    fi
+    exit 0
+    ;;
+
   describe-target-health)
     # Fixture `target_health`: "<target-id><TAB><State>" lines, NONE, or ERROR|.
     if [ -f "${MOCK_DIR}/target_health" ]; then
@@ -770,6 +804,77 @@ M=$(new_mock_dir)
 set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878: a Green deploy never invokes the probe' 0 'SUCCESS: environment'
+
+# ---------------------------------------------------------------------------
+# ENG-823 — ensure_deregistration_delay sets DeregistrationDelay directly
+# against the live target group after a verified deploy, since two straight
+# `.ebextensions` fixes both silently failed to apply it.
+# ---------------------------------------------------------------------------
+
+# Not opted in (EB_DEREGISTRATION_DELAY_SECONDS unset): zero extra AWS calls.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-823: opted-out deploy still succeeds' 0 'SUCCESS: environment'
+if grep -qF 'DeregistrationDelay' "${WORKDIR}/out.txt"; then
+  printf '  FAIL ENG-823: opted-out deploy made a DeregistrationDelay call anyway\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: opted-out deploy makes no DeregistrationDelay call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# Opted in, target group currently at the AWS default: applies and verifies.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: opted-in deploy still succeeds' 0 'SUCCESS: environment'
+check 'ENG-823: sets DeregistrationDelay on the live target group' 0 \
+  'Setting DeregistrationDelay on target group def: 20s -> 600s.'
+check 'ENG-823: confirms the value by re-reading it, not by trusting the call' 0 \
+  'Confirmed DeregistrationDelay=600s on target group def.'
+
+# Already at the desired value: no-op, no mutation call.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '600\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: already-correct value is a no-op' 0 \
+  'already 600s on target group def; no change needed.'
+if [ -f "$M/modify_tg_calls" ]; then
+  printf '  FAIL ENG-823: no-op case still called modify-target-group-attributes\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: already-correct value makes no modify call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# The regression this exists to catch: modify-target-group-attributes reports
+# success but the value is silently dropped, exactly like .ebextensions did
+# twice. Must fail the job rather than report a false green.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+: >"$M/tg_attrs_stuck"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a silently-dropped value fails the job, not a false green' 1 \
+  'still reads 20s, not the desired 600s'
+
+# A denied elbv2 call fails loudly rather than reporting the deploy as fully
+# applied when it was not.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+printf '1\n' >"$M/modify_tg_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a denied modify-target-group-attributes call fails the job' 1 \
+  'modify-target-group-attributes failed for'
 
 # ---------------------------------------------------------------------------
 # ENG-878 follow-up — EB_HEALTH_PROBE_DRYRUN exercises the probe on a healthy

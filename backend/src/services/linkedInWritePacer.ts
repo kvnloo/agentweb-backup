@@ -315,6 +315,39 @@ export async function reserveWriteSlot(
 }
 
 /**
+ * Read-only peek at whether an account is currently inside the hourly/burst pacer's
+ * cooldown (`reserveWriteSlot`'s minGap/hourly-ceiling state), and when it clears.
+ *
+ * Deliberately non-mutating: unlike `reserveWriteSlot`/`pruneWindow`, this never
+ * writes back to `recentWritesByAccount` or reserves a slot. It exists so a status
+ * endpoint (e.g. daily-quota) can answer "cooling down until 14:32" without the
+ * side effects of an actual reservation attempt.
+ */
+export function peekWriteCooldown(
+  accountId: string,
+  now: number = Date.now(),
+): { active: boolean; expiresAt: string | null } {
+  const gap = minGapMs();
+  const hourlyCap = maxWritesPerHour();
+  if (gap === 0 && hourlyCap === 0) return { active: false, expiresAt: null };
+
+  const recent = (recentWritesByAccount.get(accountId) || []).filter((ts) => now - ts < HOUR_MS);
+  if (hourlyCap > 0 && recent.length >= hourlyCap) {
+    const expiresAt = (recent[0] ?? now) + HOUR_MS;
+    return { active: true, expiresAt: new Date(expiresAt).toISOString() };
+  }
+
+  const lastWrite = recent.length > 0 ? recent[recent.length - 1] : 0;
+  if (recent.length > 0) {
+    const nextAvailable = lastWrite + gap;
+    if (nextAvailable > now) {
+      return { active: true, expiresAt: new Date(nextAvailable).toISOString() };
+    }
+  }
+  return { active: false, expiresAt: null };
+}
+
+/**
  * DAILY send-volume ceiling (distinct from the hourly/burst pacer above).
  *
  * Before this, "5 invites / 10 messages per run" existed only as prose in the

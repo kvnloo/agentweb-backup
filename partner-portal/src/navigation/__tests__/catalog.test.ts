@@ -1,5 +1,6 @@
 import {
   getHeaderNavigation,
+  getGroupedHeaderNavigation,
   portalRouteCatalog,
 } from '../catalog';
 
@@ -81,6 +82,31 @@ describe('Partner Portal route catalog', () => {
       ['Config', '/config'],
       ['Admin', '/admin'],
     ]);
+  });
+
+  it('groups the approved admin header without hiding Admin', () => {
+    const grouped = getGroupedHeaderNavigation({ authenticated: true, isAdmin: true, isContractor: true });
+    expect(grouped.direct.map(({ label }) => label)).toEqual(['Home', 'Tasks', 'Workflows', 'Admin', 'Release']);
+    expect(grouped.build.map(({ label }) => label)).toEqual([
+      'Templates', 'HTML Templates', 'Prompt Templates', 'Skills', 'Work Plans', 'Schedule Templates',
+    ]);
+    expect(grouped.operate.map(({ label }) => label)).toEqual([
+      'GTM Tracker', 'Client Health', 'Agent Runs', 'Contractor Accesses', 'Config',
+    ]);
+  });
+
+  it('does not expose admin groups to a regular authenticated partner', () => {
+    const grouped = getGroupedHeaderNavigation({ authenticated: true, isAdmin: false, isContractor: false });
+    expect(grouped.direct.map(({ label }) => label)).toEqual(['Home', 'Tasks', 'Workflows', 'Release']);
+    expect(grouped.build).toEqual([]);
+    expect(grouped.operate.map(({ label }) => label)).toEqual(['Config']);
+  });
+
+  it('keeps contractor access in Operate only when the viewer has that role', () => {
+    const withoutContractor = getGroupedHeaderNavigation({ authenticated: true, isAdmin: true, isContractor: false });
+    const withContractor = getGroupedHeaderNavigation({ authenticated: true, isAdmin: true, isContractor: true });
+    expect(withoutContractor.operate.map(({ label }) => label)).not.toContain('Contractor Accesses');
+    expect(withContractor.operate.map(({ label }) => label)).toContain('Contractor Accesses');
   });
 
   it('flags every known placeholder and reachable dead-end explicitly', () => {

@@ -252,6 +252,7 @@ export interface ChatSession {
   // list) — see agentMode/core/workflow.ts file header.
   workflowRun?: WorkflowRunState;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
+  calledFunctionsVersion?: number; // Optimistic-lock counter guarding calledFunctions read-modify-write races
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
@@ -602,6 +603,14 @@ function keywordBasedChunkRetrieval(
 export interface MetaMeasurementCheckRecord {
   accountId: string;
   campaignId?: string;
+  /**
+   * Kept in step with `metaLaunchGate.ts`'s declaration of the same name — structural typing
+   * means a field added there and not here still persists (DynamoDB is schemaless), so the
+   * compiler will NOT catch the drift. It went missing once already, when the gate started
+   * recording which ad a block was about.
+   */
+  adId?: string;
+  creativeId?: string;
   action: string;
   outcome: 'passed' | 'blocked' | 'overridden';
   /** Per-destination check results (url + status + detected pixels). */
@@ -1753,12 +1762,13 @@ export class ChatbotDB {
    * absent for non-legacy sessions). Callers that need the real conversation
    * must use `getChatSession`.
    */
-  async getChatSessionRecord(sessionId: string): Promise<ChatSession | null> {
+  async getChatSessionRecord(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1771,7 +1781,7 @@ export class ChatbotDB {
   }
 
   async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
-    const session = await this.getChatSessionRecord(sessionId);
+    const session = await this.getChatSessionRecord(sessionId, consistentRead);
 
     if (!session) {
       return null;
@@ -3652,44 +3662,80 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1698 hardening: calledFunctions previously had multiple independent
+   * read-modify-write writers (increment per tool-dispatch batch, reset on new
+   * plan, decrement on step completion/skip) with no concurrency guard, so a
+   * writer computing its new value from a stale read could silently undo a
+   * concurrent writer's change (e.g. a reset landing between another request's
+   * read and write resurrects the exact stale credit the reset just cleared).
+   * This helper closes that gap with optimistic locking on `calledFunctionsVersion`:
+   * every writer re-reads fresh state and recomputes its mutation on conflict
+   * instead of blindly overwriting.
+   */
+  async mutateCalledFunctions(
+    sessionId: string,
+    mutate: (current: Record<string, number>) => Record<string, number>,
+    maxAttempts = 5
+  ): Promise<ChatSession> {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Record-only read: this loop only needs calledFunctions/calledFunctionsVersion,
+      // so avoid getChatSession's AW-ChatMessages query (and possible one-time
+      // migration write) on every retry attempt.
+      const session = await this.getChatSessionRecord(sessionId);
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
+      const currentVersion = session.calledFunctionsVersion || 0;
+      const nextCounts = mutate(session.calledFunctions || {});
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          sessionId,
+        },
+        UpdateExpression:
+          "SET calledFunctions = :calledFunctions, calledFunctionsVersion = :nextVersion, adminListPartition = :adminListPartition",
+        ConditionExpression:
+          "attribute_not_exists(calledFunctionsVersion) OR calledFunctionsVersion = :currentVersion",
+        ExpressionAttributeValues: {
+          ":calledFunctions": nextCounts,
+          ":nextVersion": currentVersion + 1,
+          ":currentVersion": currentVersion,
+          ":adminListPartition": "all",
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      try {
+        const result = await dynamodb.update(params).promise();
+        return result.Attributes as ChatSession;
+      } catch (error: any) {
+        if (error?.code === "ConditionalCheckFailedException" && attempt < maxAttempts - 1) {
+          // Jittered backoff so multiple writers that just conflicted don't
+          // immediately retry in lockstep and re-collide.
+          const backoffMs = 20 * Math.pow(2, attempt) + Math.random() * 20;
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+        console.error("Error mutating called functions:", error);
+        throw error;
+      }
+    }
+    throw new Error(`mutateCalledFunctions: exhausted retries for session ${sessionId}`);
+  }
+
   async incrementCalledFunctions(
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    // Get current session to retrieve existing calledFunctions
-    const session = await this.getChatSession(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
-
-    // Merge the new counts with existing counts
-    const currentCounts = session.calledFunctions || {};
-    const updatedCounts = { ...currentCounts };
-    
-    for (const [functionName, count] of Object.entries(functionCounts)) {
-      updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
-    }
-
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": updatedCounts,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error incrementing called functions:", error);
-      throw error;
-    }
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
+      }
+      return updatedCounts;
+    });
   }
 
   async incrementFailedFunctions(
@@ -3736,66 +3782,40 @@ export class ChatbotDB {
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    // Get current session to retrieve existing calledFunctions
-    const session = await this.getChatSession(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        updatedCounts[functionName] = (updatedCounts[functionName] || 0) - count;
+      }
+      return updatedCounts;
+    });
+  }
 
-    // Decrement the counts
-    const currentCounts = session.calledFunctions || {};
-    const updatedCounts = { ...currentCounts };
-    
-    for (const [functionName, count] of Object.entries(functionCounts)) {
-      updatedCounts[functionName] = (updatedCounts[functionName] || 0) - count;
-    }
-
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": updatedCounts,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error decrementing called functions:", error);
-      throw error;
-    }
+  /**
+   * ENG-1698: clamped decrement used when a step's required-call credit is
+   * consumed (completed) or released (skipped without over-penalizing a later
+   * step). Applies against a fresh read via mutateCalledFunctions rather than
+   * a value the caller precomputed from a possibly-stale baseline.
+   */
+  async decrementCalledFunctionsClamped(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        const currentCount = updatedCounts[functionName] || 0;
+        updatedCounts[functionName] = Math.max(0, currentCount - count);
+      }
+      return updatedCounts;
+    });
   }
 
   async updateCalledFunctions(
     sessionId: string,
     calledFunctions: Record<string, number>
   ): Promise<ChatSession> {
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": calledFunctions,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error updating called functions:", error);
-      throw error;
-    }
+    return this.mutateCalledFunctions(sessionId, () => calledFunctions);
   }
 
   // Common function to create or reuse interactive share for a session

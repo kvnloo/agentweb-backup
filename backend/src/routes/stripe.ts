@@ -3,9 +3,8 @@ import Stripe from "stripe";
 import crypto from "crypto";
 import { createStripeClient } from "../services/stripeClientFactory";
 import dotenv from "dotenv";
-import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from "../middleware/auth";
-import { userDb, User } from "../services/db"; // Added userDb and User
+import { userDb } from "../services/db";
 import * as stripeController from "../controllers/stripeController";
 import { resolveBillingUserId } from '../services/tokenUsageService';
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
@@ -37,8 +36,18 @@ function getStripe(): Stripe | null {
 
 /**
  * @route GET /api/stripe/session/:sessionId
- * @desc Get customer email from Stripe Checkout session
- * @access Public (consider adding authentication if needed)
+ * @desc Read-only lookup: resolve a Stripe Checkout session id to the
+ *       customer email and whether that email already has an AgentWeb
+ *       account. Used by the post-checkout/registration frontend flows
+ *       before the user has a JWT, so this route stays unauthenticated —
+ *       but it must never write. All profile-field writes (companyName,
+ *       useCaseCategories, stripe_customer_id, waitlist upsert) moved to
+ *       the signature-verified `checkout.session.completed` webhook
+ *       handler (`syncCheckoutProfileFields` in stripeService.ts).
+ *       (ENG-1756: this route used to run those writes for anyone who
+ *       could guess/obtain a session id, and logged the full session
+ *       object including PII.)
+ * @access Public (read-only)
  */
 router.get("/session/:sessionId", async (req: Request, res: Response) => {
   const stripe = getStripe();
@@ -62,61 +71,13 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       expand: ["customer", "payment_intent.customer", "setup_intent.customer"],
     });
 
-    // Log the entire session object to inspect its structure, including custom fields/metadata
+    // Log only ids/status — never the full session object (it carries the
+    // customer's email, name, phone, and any custom-field PII).
     console.log(
-      "Full Stripe Session Object for ID",
-      sessionId,
-      ":",
-      JSON.stringify(session, null, 2)
+      `Stripe session ${sessionId}: status=${session.status} payment_status=${session.payment_status}`
     );
 
     let email: string | null = null;
-    let fullName: string | undefined = undefined;
-    let phoneNumber: string | undefined = undefined;
-    let stripeCustomerIdFromSession: string | undefined = undefined;
-    let companyNameFromCustomFields: string | undefined = undefined;
-    let productUsageValueFromStripe: string | undefined = undefined;
-    let productUsageLabelFromStripe: string | undefined = undefined;
-
-    // Extract custom fields
-    if (session.custom_fields && Array.isArray(session.custom_fields)) {
-      for (const field of session.custom_fields) {
-        if (
-          field.key === "companyname" &&
-          field.text &&
-          typeof field.text.value === "string"
-        ) {
-          companyNameFromCustomFields = field.text.value;
-        }
-        if (
-          field.key === "howdoyouplantousethisproduct" &&
-          field.dropdown &&
-          typeof field.dropdown.value === "string"
-        ) {
-          const selectedValue = field.dropdown.value;
-          productUsageValueFromStripe = selectedValue;
-          const selectedOption = field.dropdown.options?.find(
-            (opt) => opt.value === selectedValue
-          );
-          if (selectedOption && typeof selectedOption.label === "string") {
-            productUsageLabelFromStripe = selectedOption.label;
-          } else {
-            productUsageLabelFromStripe = selectedValue;
-            console.warn(
-              `Stripe session ${sessionId}: Label not found for product usage value '${selectedValue}'. Using value instead.`
-            );
-          }
-        }
-      }
-    }
-
-    if (session.customer) {
-      if (typeof session.customer === "string") {
-        stripeCustomerIdFromSession = session.customer;
-      } else if (session.customer.id && !session.customer.deleted) {
-        stripeCustomerIdFromSession = session.customer.id;
-      }
-    }
 
     // Extract email from various possible locations in the session object
     if (
@@ -126,12 +87,8 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.customer.email
     ) {
       email = session.customer.email;
-      fullName = session.customer.name || undefined;
-      phoneNumber = session.customer.phone || undefined;
     } else if (session.customer_details && session.customer_details.email) {
       email = session.customer_details.email;
-      fullName = session.customer_details.name || undefined;
-      phoneNumber = session.customer_details.phone || undefined;
     } else if (
       session.payment_intent &&
       typeof session.payment_intent === "object" &&
@@ -141,8 +98,6 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.payment_intent.customer.email
     ) {
       email = session.payment_intent.customer.email;
-      fullName = session.payment_intent.customer.name || undefined;
-      phoneNumber = session.payment_intent.customer.phone || undefined;
     } else if (
       session.setup_intent &&
       typeof session.setup_intent === "object" &&
@@ -152,190 +107,24 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
       session.setup_intent.customer.email
     ) {
       email = session.setup_intent.customer.email;
-      fullName = session.setup_intent.customer.name || undefined;
-      phoneNumber = session.setup_intent.customer.phone || undefined;
     }
 
-    if (email) {
-      email = email.toLowerCase(); // Normalize email
-      const existingUser = await userDb.getUserByEmail(email);
-
-      if (existingUser && existingUser.userId) {
-        console.log(
-          `Stripe session email ${email} matches existing user ${existingUser.userId}.`
-        );
-
-        const userUpdates: Partial<User> = {}; // CORRECTED TYPE USAGE
-        let needsUserUpdate = false;
-
-        if (
-          stripeCustomerIdFromSession &&
-          existingUser.stripe_customer_id !== stripeCustomerIdFromSession
-        ) {
-          userUpdates.stripe_customer_id = stripeCustomerIdFromSession;
-          needsUserUpdate = true;
-        }
-        if (
-          companyNameFromCustomFields &&
-          existingUser.companyName !== companyNameFromCustomFields
-        ) {
-          userUpdates.companyName = companyNameFromCustomFields;
-          needsUserUpdate = true;
-        }
-        if (
-          productUsageLabelFromStripe &&
-          (!existingUser.useCaseCategories ||
-            existingUser.useCaseCategories.length !== 1 ||
-            existingUser.useCaseCategories[0] !== productUsageLabelFromStripe)
-        ) {
-          userUpdates.useCaseCategories = [productUsageLabelFromStripe];
-          needsUserUpdate = true;
-        }
-
-        if (needsUserUpdate) {
-          try {
-            await userDb.updateUser(existingUser.userId, userUpdates);
-            console.log(
-              `Updated existing user ${existingUser.userId} with new details:`,
-              userUpdates
-            );
-          } catch (userUpdateError) {
-            console.error(
-              `Failed to update details for existing user ${existingUser.userId}:`,
-              userUpdateError
-            );
-          }
-        }
-
-        // Also update waitlist entry for consistency if user exists
-        const waitlistUpdatesForUser: Partial<WaitlistEntry> = {}; // CORRECTED TYPE USAGE
-        let needsWaitlistUpdateForUser = false;
-
-        if (stripeCustomerIdFromSession) {
-          waitlistUpdatesForUser.stripe_customer_id =
-            stripeCustomerIdFromSession;
-          needsWaitlistUpdateForUser = true; // Assume update if ID is present, updateDetails will check if different
-        }
-        if (companyNameFromCustomFields) {
-          waitlistUpdatesForUser.companyName = companyNameFromCustomFields;
-          needsWaitlistUpdateForUser = true;
-        }
-        if (productUsageLabelFromStripe) {
-          waitlistUpdatesForUser.useCaseCategories = [
-            productUsageLabelFromStripe,
-          ];
-          needsWaitlistUpdateForUser = true;
-        }
-
-        if (needsWaitlistUpdateForUser) {
-          try {
-            const waitlistEntryForUser = await waitlistDb.getByEmail(email);
-            if (waitlistEntryForUser) {
-              // Check if actual changes are needed before calling update
-              const currentWaitlist = waitlistEntryForUser;
-              const changesExist = Object.keys(waitlistUpdatesForUser).some(
-                (key) =>
-                  waitlistUpdatesForUser[
-                    key as keyof typeof waitlistUpdatesForUser
-                  ] !== currentWaitlist[key as keyof typeof currentWaitlist]
-              );
-              if (changesExist) {
-                await waitlistDb.updateDetails(email, waitlistUpdatesForUser);
-                console.log(
-                  `Updated waitlist entry for user ${email} with new details:`,
-                  waitlistUpdatesForUser
-                );
-              }
-            } else {
-              console.log(
-                `User ${email} exists but no corresponding waitlist entry found to update details.`
-              );
-            }
-          } catch (waitlistUpdateError) {
-            console.error(
-              `Failed to update details for waitlist entry of user ${email}:`,
-              waitlistUpdateError
-            );
-          }
-        }
-
-        return res.json({
-          email,
-          existingUser: true,
-          stripe_customer_id:
-            stripeCustomerIdFromSession || existingUser.stripe_customer_id,
-          companyName: companyNameFromCustomFields || existingUser.companyName,
-          useCaseCategories: productUsageLabelFromStripe
-            ? [productUsageLabelFromStripe]
-            : existingUser.useCaseCategories,
-        });
-      } else {
-        // No existing user, proceed with waitlist logic
-        console.log(
-          `Stripe session email ${email} does not match an existing user. Proceeding with waitlist logic.`
-        );
-        const existingWaitlistEntry = await waitlistDb.getByEmail(email);
-        const waitlistDataForUpsert: any = {
-          email: email,
-          fullName: fullName,
-          phoneNumber: phoneNumber,
-          companyName:
-            companyNameFromCustomFields || existingWaitlistEntry?.companyName, // Prioritize new, then existing, then default
-          supportNote:
-            existingWaitlistEntry?.supportNote || "Joined/Updated from Stripe",
-          joinedAt: existingWaitlistEntry?.joinedAt || new Date().toISOString(),
-          status: "invited", // Always ensure status is invited
-          invitedAt: new Date().toISOString(),
-          stripe_customer_id: stripeCustomerIdFromSession, // Add stripe_customer_id
-          useCaseCategories: productUsageLabelFromStripe
-            ? [productUsageLabelFromStripe]
-            : existingWaitlistEntry?.useCaseCategories || [], // Map to array
-        };
-        // Default companyName if still undefined
-        if (waitlistDataForUpsert.companyName === undefined) {
-          waitlistDataForUpsert.companyName = "Freelancer"; // Default if nothing else provided
-        }
-
-        if (existingWaitlistEntry) {
-          console.log(`Updating existing waitlist entry for ${email}.`);
-          await waitlistDb.updateDetails(email, waitlistDataForUpsert);
-        } else {
-          console.log(`Creating new waitlist entry for ${email}.`);
-          await waitlistDb.add(waitlistDataForUpsert); // add handles the toLowerCase for email internally
-        }
-        return res.json({
-          email,
-          existingUser: false,
-          stripe_customer_id: stripeCustomerIdFromSession,
-          companyName: companyNameFromCustomFields,
-          useCaseCategories: productUsageLabelFromStripe
-            ? [productUsageLabelFromStripe]
-            : [],
-        });
-      }
-    } else {
-      console.warn(
-        `Email not found for session ID: ${sessionId}. Relevant session fields:`,
-        {
-          customer_id: stripeCustomerIdFromSession, // Log the extracted ID
-          customer_details_email: session.customer_details?.email,
-          payment_intent_id: session.payment_intent
-            ? typeof session.payment_intent === "string"
-              ? session.payment_intent
-              : session.payment_intent.id
-            : null,
-          setup_intent_id: session.setup_intent
-            ? typeof session.setup_intent === "string"
-              ? session.setup_intent
-              : session.setup_intent.id
-            : null,
-        }
-      );
+    if (!email) {
+      console.warn(`Email not found for session ID: ${sessionId}.`);
       return res.status(404).json({
         error:
           "Email not found for this session. The session may not have an associated email or customer.",
       });
     }
+
+    email = email.toLowerCase(); // Normalize email
+    const existingUser = await userDb.getUserByEmail(email);
+
+    return res.json({
+      email,
+      existingUser: !!(existingUser && existingUser.userId),
+      payment_status: session.payment_status,
+    });
   } catch (error: any) {
     console.error("Stripe API error while retrieving session:", error.message);
     if (

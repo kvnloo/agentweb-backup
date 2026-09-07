@@ -125,8 +125,44 @@ const PYTHON_IMPORT_AST_SCRIPT = [
   'print(json.dumps(modules))',
 ].join('\n');
 
+// The repo's production f-strings (e.g. agent-engine/app/services/mcp_client.py)
+// use syntax Python 3.10 cannot parse (ENG-1433: a backslash inside an f-string
+// expression, valid since 3.12). CI runs a modern interpreter, but a headless
+// post-merge-verifier host's `python3` can resolve to whatever the OS shipped
+// (3.10.12 on Ubuntu 22.04) regardless of what's actually installed alongside it.
+// Probe for a compatible interpreter instead of trusting bare `python3` on PATH.
+let cachedPython3: string | null = null;
+function resolvePython3(): string {
+  if (cachedPython3) return cachedPython3;
+  const candidates = [
+    'python3.13',
+    'python3.12',
+    'python3.11',
+    // uv-managed installs (common on dev/agent boxes) aren't always on PATH.
+    `${process.env.HOME || ''}/.local/bin/python3.12`,
+    `${process.env.HOME || ''}/.local/bin/python3.11`,
+    '/usr/bin/python3.12',
+    '/usr/bin/python3.11',
+    'python3',
+  ];
+  for (const candidate of candidates) {
+    const probe = spawnSync(candidate, ['-c', 'import sys; assert sys.version_info >= (3, 11)'], {
+      encoding: 'utf8',
+    });
+    if (probe.status === 0) {
+      cachedPython3 = candidate;
+      return candidate;
+    }
+  }
+  // Nothing satisfies >=3.11 — fall back to plain python3 so the original
+  // error (a real parse failure, now correctly attributable to the source
+  // file rather than the host) still surfaces instead of silently no-op'ing.
+  cachedPython3 = 'python3';
+  return 'python3';
+}
+
 function findDirectPythonProviderImports(content: string): string[] {
-  const parsed = spawnSync('python3', ['-c', PYTHON_IMPORT_AST_SCRIPT], {
+  const parsed = spawnSync(resolvePython3(), ['-c', PYTHON_IMPORT_AST_SCRIPT], {
     input: content,
     encoding: 'utf8',
   });

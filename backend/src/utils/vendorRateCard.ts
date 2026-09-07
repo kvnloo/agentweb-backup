@@ -45,6 +45,18 @@ interface VendorRateEntry {
   usdPerUnit: number;
 }
 
+/**
+ * Version stamp for the rates below (ENG-1250 §5: "A price change creates a new
+ * version; historical events retain the rate version used").
+ *
+ * Dated to the last change to the rates in this file — currently the ENG-696
+ * Apollo `org_enrichment` / enrich.so `reverse_lookup` confirmations of
+ * 2026-09-02. **Bump this in the same commit as any rate edit**, otherwise two
+ * different prices share one version and a historical event can no longer be
+ * re-derived from the card that produced it.
+ */
+export const VENDOR_RATE_CARD_VERSION = "2026-09-02";
+
 const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   v0: {
     landing_page_generation: { recordingUnit: "generation", usdPerUnit: 2.0 },
@@ -123,6 +135,21 @@ export function getAllocatedRate(
     return null;
   }
   return providerCard[rateKey].usdPerUnit;
+}
+
+/**
+ * The card's own unit label for a vendor/rate-key pair, or null when unpriced.
+ * Lets a caller record `unit` from the card rather than restating it at the call
+ * site, where it can drift from the rate it is supposed to describe.
+ */
+export function getRecordingUnit(
+  provider: VendorRateProvider,
+  rateKey: string
+): string | null {
+  if (!rateKey || !Object.prototype.hasOwnProperty.call(RATE_CARD, provider)) return null;
+  const providerCard = RATE_CARD[provider];
+  if (!Object.prototype.hasOwnProperty.call(providerCard, rateKey)) return null;
+  return providerCard[rateKey].recordingUnit;
 }
 
 /**

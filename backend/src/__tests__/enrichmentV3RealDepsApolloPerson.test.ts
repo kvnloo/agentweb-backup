@@ -117,8 +117,12 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }));
+    // Two expected args: production calls matchPerson(input, { userId }), and
+    // toHaveBeenCalledWith compares the WHOLE argument list — a one-arg expectation can
+    // never match a two-arg call, so this negative passed no matter what was sent.
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }), expect.anything());
   });
 
   it('calls matchPerson with emailDomain when website absent but emailDomain present', async () => {
@@ -145,6 +149,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -211,7 +216,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
   });
 
   it('prefers email over name+domain when both present', async () => {
@@ -238,8 +243,8 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 
   it('passes the lead name alongside the email so matchPerson can run its identity gate', async () => {
@@ -267,9 +272,10 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' }),
+      { userId: 'user-1' },
     );
     // Still must NOT send domain on the email path (preserves cache-key behavior).
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 });
 
@@ -328,7 +334,7 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com', { userId: 'user-1' });
   });
 
   it('calls reverseLookup for business email', async () => {
@@ -346,7 +352,7 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 
@@ -367,6 +373,7 @@ describe('enrichSoFindEmail adapter', () => {
 
     expect(findEmail).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -389,7 +396,7 @@ describe('enrichSoFindEmail adapter', () => {
     if (!result.ok) return;
     expect(result.resolved.email).toBe('jane@acme.com');
     // reverse-lookup should be chained automatically after email found
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 

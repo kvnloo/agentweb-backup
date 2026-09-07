@@ -1,5 +1,5 @@
 /**
- * ENG-347 — unit tests for the shared-secret middleware guarding
+ * ENG-347/ENG-1754 — unit tests for the shared-secret middleware guarding
  * POST /api/agent-mode/run-scheduled-chats.
  *
  * Behavioral contract (from the Linear issue, human-reviewed):
@@ -7,16 +7,15 @@
  *      nothing downstream executes (next() is never called).
  *   2. With the shared secret header the request passes through unchanged.
  *
- * Rollout behavior (fail-open by design, see middleware doc comment):
- *   When SCHEDULED_CHATS_SERVICE_SECRET is unset, requests pass through
- *   (pre-ENG-347 behavior) so the backend's daily auto-deploy cannot break
- *   the manually-deployed agent-engine. Enforcement starts when the env var
- *   is set.
+ * Fail-closed behavior (ENG-1754, replaces the earlier fail-open rollout):
+ *   When neither SCHEDULED_CHATS_SERVICE_SECRET nor the Secrets Manager
+ *   secret resolves, the endpoint returns 503 and logs a loud error — it no
+ *   longer passes requests through unauthenticated.
  *
  * ENG-359: when the env var is unset the middleware now consults AWS Secrets
  * Manager before deciding. The SM helper is mocked here to return a payload
- * with no matching key, so the "env unset" path deterministically fails open
- * (no real AWS call, no dependence on whether the prod secret exists).
+ * with no matching key, so the "env unset" path deterministically fails
+ * closed (no real AWS call, no dependence on whether the prod secret exists).
  */
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('{}'),
@@ -116,38 +115,41 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
     });
   });
 
-  describe('when neither the env secret nor Secrets Manager resolves a secret (pre-rollout, fail-open by design)', () => {
+  describe('when neither the env secret nor Secrets Manager resolves a secret (fail-closed, ENG-1754)', () => {
     beforeEach(() => {
       delete process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV];
     });
 
-    it('passes the request through and warns exactly once per process', async () => {
+    it('returns 503 and logs an error exactly once per process; never calls next()', async () => {
       // Re-import a fresh module copy so the once-per-process warn flag AND the
       // in-process SM cache start clean here, independent of test ordering (a
       // prior test hitting the unset path would otherwise have consumed the
       // warn / primed the cache). The top-level getSecret mock resolves to
-      // '{}' — no matching key — so the SM path fails open.
+      // '{}' — no matching key — so the SM path fails closed.
       jest.resetModules();
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const fresh = require('../middleware/serviceAuth') as typeof import('../middleware/serviceAuth');
       const freshMiddleware = fresh.requireScheduledChatsServiceSecret;
 
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       const next1 = jest.fn();
       const res1 = mockRes();
       await freshMiddleware(mockReqWithHeader(undefined), res1, next1);
-      expect(next1).toHaveBeenCalledTimes(1);
-      expect(res1.status).not.toHaveBeenCalled();
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(warnSpy.mock.calls[0][0]).toContain(SCHEDULED_CHATS_SERVICE_SECRET_ENV);
+      expect(next1).not.toHaveBeenCalled();
+      expect(res1.status).toHaveBeenCalledWith(503);
+      expect(res1.json).toHaveBeenCalledWith({ error: 'Service temporarily unavailable' });
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toContain(SCHEDULED_CHATS_SERVICE_SECRET_ENV);
 
-      // Second unauthenticated request: still passes, but no repeat warning
+      // Second unauthenticated request: still 503s, but no repeat error log
       // (agent-engine polls this endpoint continuously — no log flooding).
       const next2 = jest.fn();
-      await freshMiddleware(mockReqWithHeader(undefined), mockRes(), next2);
-      expect(next2).toHaveBeenCalledTimes(1);
-      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const res2 = mockRes();
+      await freshMiddleware(mockReqWithHeader(undefined), res2, next2);
+      expect(next2).not.toHaveBeenCalled();
+      expect(res2.status).toHaveBeenCalledWith(503);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
     });
   });
 });
