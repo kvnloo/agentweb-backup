@@ -3130,6 +3130,70 @@ describe('AgentModeService - Work Plan', () => {
         expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
       });
 
+      it('ENG-1811: deleting the last pending step(s) WITHOUT re-adding them (never calling set_work_plan_status again) must not report the plan as done while debt is outstanding', async () => {
+        // Round-3 fresh-eyes review of PR #2808 found: the ledger's ONLY
+        // enforcement point is setWorkPlanStatusAttempt, which nothing calls
+        // once no steps remain 'pending'. Every OTHER place that infers "plan
+        // done" from workPlan.steps.every(completed|skipped) alone -- the
+        // buildWorkPlanContextMessages context banner, and the two
+        // workPlanCompleted checks in agentModeController's scheduled/verified
+        // chat retry loop -- was fooled by simply deleting the last pending
+        // step(s) via modify_work_plan and never re-adding them: no step is
+        // left 'pending', so the naive .every() check says "done" even though
+        // a removed step's required call never actually succeeded. Reviewer
+        // proved this with an executed repro against buildWorkPlanContextMessages
+        // directly; this test reproduces the same scenario plus the new
+        // isWorkPlanFullyResolved helper that both call sites now share.
+        const workPlan = {
+          title: 'Meta_Ads_Perf_Report',
+          steps: [
+            { stepCount: 1, title: 'Load Campaign Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+          pendingRequiredFunctionCalls: ['list_html_templates'],
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          // list_html_templates never succeeded -- steps 2 & 3 were removed
+          // (in an earlier, separate call) and never re-added.
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        // Every step is terminal (only step 1 remains, and it's completed) --
+        // the naive .every(completed|skipped) check alone would say "done".
+        expect(AgentModeService.isWorkPlanFullyResolved(mockSession.workPlan, mockSession.calledFunctions)).toBe(false);
+
+        // The context-message banner shown to the model must NOT claim the
+        // plan is finished -- it must surface the outstanding debt instead.
+        const contextMessages = AgentModeService.buildWorkPlanContextMessages(
+          mockSession.workPlan,
+          undefined,
+          true,
+          mockSession.calledFunctions
+        );
+        expect(contextMessages).toHaveLength(1);
+        expect(contextMessages[0].content).not.toContain('ALL 1 STEPS ARE DONE');
+        expect(contextMessages[0].content).toContain('NOT actually finished');
+        expect(contextMessages[0].content).toContain('list_html_templates');
+
+        // Once the debt function genuinely succeeds, the plan resolves correctly.
+        mockSession.calledFunctions.list_html_templates = 1;
+        expect(AgentModeService.isWorkPlanFullyResolved(mockSession.workPlan, mockSession.calledFunctions)).toBe(true);
+        const resolvedMessages = AgentModeService.buildWorkPlanContextMessages(
+          mockSession.workPlan,
+          undefined,
+          true,
+          mockSession.calledFunctions
+        );
+        expect(resolvedMessages[0].content).toContain('ALL 1 STEPS ARE DONE');
+      });
+
       it('does not silently drop expectedAssetCount/expectedAssetCountTools when a reused step OMITS those fields entirely', async () => {
         // Second-round fresh-eyes review of PR #2794 found: the reused-stepCount
         // fix above unconditionally protects requiredFunctionCalls (the merge

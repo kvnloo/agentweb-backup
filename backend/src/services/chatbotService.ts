@@ -5093,7 +5093,7 @@ export async function generateChatResponse(
       // none of the agent-mode image-resume hardening (progression / multi-intent /
       // completion guard / asset-awareness / hands-off autocomplete wording) is emitted.
       // The reported bug was agent-mode-only, so Emma needs no change here.
-      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, undefined, false);
+      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, undefined, false, session.calledFunctions);
       if (workPlanMessages.length > 0) {
         const lastUserMsgIndex = messages.map((m) => m.role).lastIndexOf("user");
         const insertAt = lastUserMsgIndex >= 0 ? lastUserMsgIndex : messages.length;

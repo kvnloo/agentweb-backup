@@ -3474,7 +3474,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -5523,6 +5523,29 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1811: is this work plan ACTUALLY finished — every step terminal AND no
+   * outstanding debt from a removed step's required function call that never
+   * genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against real
+   * session.calledFunctions, not just "does anything remain marked pending").
+   *
+   * The debt ledger's only *enforcement* point is setWorkPlanStatusAttempt, which
+   * nothing calls once no steps remain pending — so every OTHER place in the codebase
+   * that infers "plan done" from `steps.every(completed|skipped)` alone can be fooled
+   * by deleting the last pending step(s) via modify_work_plan and never re-adding them.
+   * Use this helper (not a bare `.every(...)`) anywhere that inference feeds a
+   * user-facing "done" claim or gates a retry loop.
+   */
+  public static isWorkPlanFullyResolved(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+    if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    if (!allStepsTerminal) return false;
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    return unresolvedPendingDebt.length === 0;
+  }
+
+  /**
    * Render a session work plan into LLM context message(s).
    *
    * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
@@ -5547,8 +5570,17 @@ export class AgentModeService {
    * stay byte-for-byte identical to current production behavior (header + step list +
    * the ORIGINAL autocomplete wording, nothing else). This keeps Emma's surface
    * unchanged while still fixing the agent-mode loop.
+   *
+   * `calledFunctions` (optional, session.calledFunctions) resolves ENG-1811 debt
+   * (`workPlan.pendingRequiredFunctionCalls`) against real call history. Without it, a
+   * caller that deletes the last pending step(s) via modify_work_plan (never re-adding
+   * them, never calling set_work_plan_status again) makes every step terminal while
+   * debt from the removed step was never satisfied — the ONLY enforcement point for
+   * that ledger is setWorkPlanStatusAttempt, which nothing here ever invokes again, so
+   * the "ALL STEPS ARE DONE" branch below would tell the model to stop and declare
+   * victory despite the outstanding requirement (found live via subagent review, PR #2808).
    */
-  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true, calledFunctions?: Record<string, number>): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -5560,10 +5592,22 @@ export class AgentModeService {
     };
 
     // Check if all steps are terminal (completed or skipped) — no pending work remains
-    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt: string[] = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    const allStepsDone = allStepsTerminal && unresolvedPendingDebt.length === 0;
 
     let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
     workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsTerminal && unresolvedPendingDebt.length > 0) {
+      // Every step looks terminal, but a step that got removed via modify_work_plan
+      // required a function call that never actually succeeded (ENG-1811 debt ledger).
+      // Do NOT tell the model the plan is done — that would silently launder the debt.
+      workPlanContent += `❌ This plan is NOT actually finished: ${unresolvedPendingDebt.join(', ')} ${unresolvedPendingDebt.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded. Call it for real, or use modify_work_plan to add back a step that genuinely does this work, before treating this plan as complete or reporting it to the user as done.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
 
     if (allStepsDone) {
       // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
@@ -5771,7 +5815,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5929,7 +5973,7 @@ export class AgentModeService {
     // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames, true, calledFunctions));
     } else {
       // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
       // scenario), a run that timed out mid-batch leaves already-generated images in
