@@ -63,14 +63,14 @@ describe('diagnoseLeadsAtZero — the real regression case', () => {
 });
 
 describe('diagnoseLeadsAtZero — demand drop vs normal variance mapping', () => {
-  it('supports genuine_demand_drop and rules out normal_variance when a campaign is in drought', async () => {
+  it('leaves genuine_demand_drop unchecked (never supported — no CTV access) and rules out normal_variance when a campaign is in drought', async () => {
     mockMonitorLeadVolume.mockResolvedValue({
       success: true,
-      reports: [{ accountId: ACCOUNT_ID, campaigns: [{ status: 'drought', reason: 'below p5 floor' }] }],
+      reports: [{ accountId: ACCOUNT_ID, campaigns: [{ status: 'drought', reason: 'below p5 floor', requiresTrackingValidation: true }] }],
     });
     const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
     const causes = result.diagnoses?.[0].causes ?? [];
-    expect(causes.find(c => c.cause === 'genuine_demand_drop')?.verdict).toBe('supported');
+    expect(causes.find(c => c.cause === 'genuine_demand_drop')?.verdict).toBe('unchecked');
     expect(causes.find(c => c.cause === 'normal_variance')?.verdict).toBe('ruled_out');
   });
 
@@ -105,14 +105,32 @@ describe('diagnoseLeadsAtZero — pixel/CAPI and destination evidence mapping', 
     expect(causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('ruled_out');
   });
 
-  it('supports landing_page_unreachable on a real destination alert for this account', async () => {
+  // Regression: an earlier draft matched capturedAlerts against a hand-typed 'meta-blackout'
+  // string. The real alert class is 'meta-attribution-blackout' (BLACKOUT_ALERT_CLASS in
+  // metaTrackingMonitor.ts) — the typo silently ruled out a genuine full attribution blackout
+  // instead of supporting pixel_capi_broken on it.
+  it('supports pixel_capi_broken on a real attribution-blackout alert, not just an optimisation-event alert', async () => {
     mockRunMetaTrackingMonitor.mockResolvedValue({
-      healthy: 1, blackouts: 0, destinationAlerts: 1, destinationOk: 0,
-      capturedAlerts: [{ subject: 'dest', message: 'destination unreachable', context: { 'Alert Class': 'meta-destination-coverage', 'Ad Account': ACCOUNT_ID } }],
+      healthy: 0, blackouts: 1, capturedAlerts: [{
+        subject: 'blackout', message: 'full attribution blackout',
+        context: { 'Alert Class': 'meta-attribution-blackout', 'Ad Account': ACCOUNT_ID },
+      }],
     });
     const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
     const causes = result.diagnoses?.[0].causes ?? [];
-    expect(causes.find(c => c.cause === 'landing_page_unreachable')?.verdict).toBe('supported');
+    expect(causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('supported');
+  });
+
+  it('supports landing_page_unreachable on a real destination alert for this account', async () => {
+    mockRunMetaTrackingMonitor.mockResolvedValue({
+      healthy: 1, blackouts: 0, destinationAlerts: 1, destinationOk: 0,
+      capturedAlerts: [{ subject: 'dest', message: 'destination unreachable', context: { 'Alert Class': 'meta-destination-unmeasured', 'Ad Account': ACCOUNT_ID } }],
+    });
+    const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
+    const causes = result.diagnoses?.[0].causes ?? [];
+    const landingPage = causes.find(c => c.cause === 'landing_page_unreachable');
+    expect(landingPage?.verdict).toBe('supported');
+    expect(landingPage?.evidence).toBe('destination unreachable');
   });
 
   it('rules out landing_page_unreachable when destinations are confirmed ok', async () => {
@@ -120,6 +138,16 @@ describe('diagnoseLeadsAtZero — pixel/CAPI and destination evidence mapping', 
     const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
     const causes = result.diagnoses?.[0].causes ?? [];
     expect(causes.find(c => c.cause === 'landing_page_unreachable')?.verdict).toBe('ruled_out');
+  });
+
+  it('sweeps each connected ad account separately, passing its own adAccountId', async () => {
+    mockGetAccounts.mockResolvedValue([
+      { platform: 'meta', account_id: 'act-A', config: { account_type: 'ad_account' } },
+      { platform: 'meta', account_id: 'act-B', config: { account_type: 'ad_account' } },
+    ]);
+    await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
+    const calledAccountIds = mockRunMetaTrackingMonitor.mock.calls.map((c: any[]) => c[0]?.adAccountId).sort();
+    expect(calledAccountIds).toEqual(['act-A', 'act-B']);
   });
 });
 
@@ -161,5 +189,31 @@ describe('diagnoseLeadsAtZero — client/account resolution', () => {
     const diagB = result.diagnoses?.find(d => d.accountId === 'act-B');
     expect(diagA?.causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).toBe('supported');
     expect(diagB?.causes.find(c => c.cause === 'pixel_capi_broken')?.verdict).not.toBe('supported');
+  });
+
+  // Regression: `evaluateLandingPageUnreachable` used to read `destinationAlerts`/`destinationOk`
+  // off a summary that (before the per-account sweep fix) aggregated across every account the
+  // sweep call covered — so account A's destination alert made account B's diagnosis falsely
+  // 'supported' too. Each account is now swept separately (`adAccountId` scoped), simulated here
+  // by returning a genuinely different summary per call.
+  it('never leaks one account\'s destination alert into another account\'s landing_page_unreachable verdict', async () => {
+    mockGetAccounts.mockResolvedValue([
+      { platform: 'meta', account_id: 'act-A', config: { account_type: 'ad_account' } },
+      { platform: 'meta', account_id: 'act-B', config: { account_type: 'ad_account' } },
+    ]);
+    mockRunMetaTrackingMonitor.mockImplementation(async (opts: any) => {
+      if (opts?.adAccountId === 'act-A') {
+        return {
+          healthy: 0, blackouts: 0, destinationAlerts: 1, destinationOk: 0, destinationUnverifiable: 0,
+          capturedAlerts: [{ subject: 'dest', message: 'A only', context: { 'Alert Class': 'meta-destination-unmeasured', 'Ad Account': 'act-A' } }],
+        };
+      }
+      return { healthy: 1, blackouts: 0, destinationAlerts: 0, destinationOk: 4, destinationUnverifiable: 0, capturedAlerts: [] };
+    });
+    const result = await diagnoseLeadsAtZero('caller-1', 'haven@example.com', true);
+    const diagA = result.diagnoses?.find(d => d.accountId === 'act-A');
+    const diagB = result.diagnoses?.find(d => d.accountId === 'act-B');
+    expect(diagA?.causes.find(c => c.cause === 'landing_page_unreachable')?.verdict).toBe('supported');
+    expect(diagB?.causes.find(c => c.cause === 'landing_page_unreachable')?.verdict).toBe('ruled_out');
   });
 });
