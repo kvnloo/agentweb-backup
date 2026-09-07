@@ -282,6 +282,16 @@ describe('spendChargingService', () => {
       await expect(chargeForCall(aRequest(), async () => 'paid-for-result')).resolves.toBe('paid-for-result');
     });
 
+    it('returns the vendor result even when the settleWith mapper itself throws', async () => {
+      // settleWith is caller code reading a vendor response shape; it can throw
+      // as easily as the ledger can, and the outcome must be the same.
+      await expect(
+        chargeForCall(aRequest(), async () => 'paid-for-result', () => {
+          throw new Error('unexpected vendor response shape');
+        }),
+      ).resolves.toBe('paid-for-result');
+    });
+
     it('runs the vendor call and charges nothing for customer-paid work', async () => {
       const call = jest.fn().mockResolvedValue('done');
 

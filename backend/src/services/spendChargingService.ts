@@ -345,8 +345,12 @@ export async function chargeForCall<T>(
     throw error;
   }
 
-  const actualCostUsd = settleWith ? settleWith(result) : undefined;
   try {
+    // settleWith is CALLER code reading a vendor response shape, so it can
+    // throw as easily as the ledger can (CodeRabbit, PR #2788). Evaluating it
+    // outside this block reintroduced the exact failure the catch exists to
+    // prevent: vendor paid, result discarded, caller retries and pays again.
+    const actualCostUsd = settleWith ? settleWith(result) : undefined;
     if (actualCostUsd === undefined) {
       // Settle at the reserved amount using the figure already in hand, rather
       // than settleSpend's read-back path: a fixed-price call would otherwise
