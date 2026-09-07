@@ -27,6 +27,7 @@ export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
+  'check_account_tracking_health',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
