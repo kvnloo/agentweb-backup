@@ -5,6 +5,8 @@
  * from or written to the backend. ENG-1124 fixed the display-name slice.
  * ENG-1316 closes the remaining gap: emailNotificationsEnabled is now a
  * real persisted field on PATCH /api/users/me/profile.
+ * ENG-188 adds emmaTipsEnabled to the same endpoint — the opt-out backing
+ * both the Settings toggle and the tip card's "don't show again" control.
  */
 import request from 'supertest';
 import express from 'express';
@@ -69,6 +71,46 @@ describe('PATCH /api/users/me/profile', () => {
     const res = await request(app)
       .patch('/api/users/me/profile')
       .send({ emailNotificationsEnabled: 'yes' });
+    expect(res.status).toBe(400);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('persists emmaTipsEnabled alone — the tip card\'s "don\'t show again" sends only this field', async () => {
+    userDb.updateUser.mockResolvedValue({});
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ emmaTipsEnabled: false });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(userDb.updateUser).toHaveBeenCalledWith('user-1', { emmaTipsEnabled: false });
+  });
+
+  it('persists emmaTipsEnabled alongside the other preference fields', async () => {
+    userDb.updateUser.mockResolvedValue({});
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ displayName: 'Ada Lovelace', emailNotificationsEnabled: true, emmaTipsEnabled: false });
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith('user-1', {
+      displayName: 'Ada Lovelace',
+      emailNotificationsEnabled: true,
+      emmaTipsEnabled: false,
+    });
+  });
+
+  it('re-enabling tips writes true, not a delete — absent must stay the enabled default', async () => {
+    userDb.updateUser.mockResolvedValue({});
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ emmaTipsEnabled: true });
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith('user-1', { emmaTipsEnabled: true });
+  });
+
+  it('rejects a non-boolean emmaTipsEnabled without writing', async () => {
+    const res = await request(app)
+      .patch('/api/users/me/profile')
+      .send({ emmaTipsEnabled: 'off' });
     expect(res.status).toBe(400);
     expect(userDb.updateUser).not.toHaveBeenCalled();
   });
