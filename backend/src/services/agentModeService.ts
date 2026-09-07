@@ -32956,11 +32956,17 @@ ${strippedHtml}`;
       // until the very next reset-to-pending, at which point a
       // never-actually-called requirement cleared while 'completed' stays
       // silently cleared through the reset and the step re-completes with no
-      // gate at all. For a step that resolved normally (every required call
-      // genuinely succeeded before it could complete), this protection is a
-      // no-op regardless of status -- `succeeded` is already >0 for
-      // everything that mattered -- so leaving it active while resolved costs
-      // nothing in the normal case and closes the reset-abuse path.
+      // gate at all. Note this protection is NOT a pure no-op for every
+      // resolved step: `session.calledFunctions[fn]` decrements back toward 0
+      // once the step consuming its credit completes (ENG-1698's
+      // decrementCalledFunctionsClamped), so a function called exactly once
+      // for its own step looks like `succeeded === 0` again immediately after
+      // that step's own legitimate completion -- indistinguishable from
+      // "never called." That's intentional, not a bug: it forces a genuine
+      // scope-reduction edit on an already-resolved step to re-prove the
+      // requirement rather than trust stale state, matching the
+      // "fail closed" posture the rest of this fix takes, and is itself
+      // covered by a dedicated test below rather than assumed harmless.
       const succeededFunctionCounts = session.calledFunctions || {};
       const mergeRequiredFunctionCalls = (
         existingRequired: string[] | undefined,
@@ -33105,6 +33111,17 @@ ${strippedHtml}`;
           const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
             ? originalStepsBeforeRemoval.get(newStep.stepCount)
             : undefined;
+          // When removedOriginal exists, the merge functions must run
+          // UNCONDITIONALLY, not only when the caller explicitly supplied the
+          // corresponding field. mergeExpectedAssetCount/Tools already handle
+          // requested === undefined correctly (return the existing value) --
+          // exactly like the existingIndex>=0 branch above, which calls them
+          // unconditionally for the same reason. Gating the call itself on
+          // `newStep.expectedAssetCount !== undefined` (the old pattern, still
+          // correct for a genuinely new step with no removedOriginal) would
+          // let a reused stepCount that simply OMITS the field skip protection
+          // entirely -- the asset-count gate would never even activate on the
+          // re-added step, a strictly worse bypass than an explicit lowering.
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -33117,16 +33134,12 @@ ${strippedHtml}`;
               ? mergeRequiredFunctionCalls(removedOriginal.requiredFunctionCalls, newStep.requiredFunctionCalls)
               : newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && {
-              expectedAssetCount: removedOriginal
-                ? mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount)
-                : newStep.expectedAssetCount,
-            }),
-            ...(newStep.expectedAssetCountTools !== undefined && {
-              expectedAssetCountTools: removedOriginal
-                ? mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools)
-                : newStep.expectedAssetCountTools,
-            })
+            ...(removedOriginal
+              ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
+              : (newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })),
+            ...(removedOriginal
+              ? { expectedAssetCountTools: mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools) }
+              : (newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools }))
           });
         }
       }
