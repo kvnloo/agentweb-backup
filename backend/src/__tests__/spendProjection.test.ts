@@ -138,13 +138,40 @@ describe('projectMonth', () => {
       expect(p.policyMode).toBe('paused');
     });
 
-    it('counts reservations toward the boundary, not just settled spend', () => {
+    // CodeRabbit, PR #2791: this module declares exactly ONE intended
+    // divergence from the live gate (all-vendor spend, not LLM-only). Counting
+    // reservations too would add a second, undocumented one, and §8 could no
+    // longer attribute a difference to either.
+    it('measures settled spend only, so the one intended divergence stays the only one', () => {
       const p = projectMonth('owner-1', '2026-09', [
         anEvent({ eventId: 'a', costMicroUsd: 4_000_000 }),
         anEvent({ eventId: 'b', costMicroUsd: 1_000_000, lifecycle: 'reserved' }),
       ], allowance, enforcingPolicy);
 
-      expect(p.policyMode).toBe('paused');
+      // 4m settled is below the 5m hard cap; the reservation must not push it over.
+      expect(p.policyMode).toBe('full_choice');
+      // §4's admission basis is settled + reserved — exposed as separate fields
+      // for whoever builds it, not folded into this measurement.
+      expect(p.settledMicroUsd + p.reservedMicroUsd).toBe(5_000_000);
+    });
+
+    it('a malformed policy cannot take the whole projection down with it', () => {
+      // optimizedDefaultModel absent from optimizedModelIds fails validation,
+      // and evaluateLlmUsageMode throws on it for an enforcing policy.
+      const broken = { ...enforcingPolicy, optimizedModelIds: ['a'], optimizedDefaultModel: 'b' };
+
+      const p = projectMonth('owner-1', '2026-09', [anEvent({ costMicroUsd: 123 })], allowance, broken);
+
+      // The figures that matter survive.
+      expect(p.settledMicroUsd).toBe(123);
+      // And the failure is reported, not swallowed.
+      expect(p.policyMode).toBe('full_choice');
+      expect(p.policyModeError).toMatch(/optimizedDefaultModel/);
+    });
+
+    it('reports no policy error on the normal path', () => {
+      expect(projectMonth('owner-1', '2026-09', [anEvent()], allowance, enforcingPolicy).policyModeError)
+        .toBeUndefined();
     });
 
     it('is full_choice with no policy — an unconfigured tier is not a paused one', () => {

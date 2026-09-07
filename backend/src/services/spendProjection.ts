@@ -71,8 +71,19 @@ export interface MonthlyProjection {
   /** How far past the allowance the subject already is, 0 when within it. */
   overspentMicroUsd: number;
 
-  /** SHADOW ONLY — see the module header. Nothing consumes this. */
+  /**
+   * SHADOW ONLY — see the module header. Nothing consumes this.
+   *
+   * Basis is settled spend, matching the live gate's, so the one intended
+   * divergence (all-vendor vs LLM-only) stays the only one §8 has to measure.
+   */
   policyMode: LlmUsageMode;
+  /**
+   * Why `policyMode` fell back to `full_choice`, when a malformed stored policy
+   * made it uncomputable. Absent on the normal path. Present means the mode is
+   * a default, not a measurement — a §8 comparison must not treat it as one.
+   */
+  policyModeError?: string;
 
   settledEventCount: number;
   reservedEventCount: number;
@@ -82,6 +93,39 @@ export interface MonthlyProjection {
 }
 
 const sum = (events: readonly SpendEvent[]) => events.reduce((t, e) => t + e.costMicroUsd, 0);
+
+/**
+ * The shadow mode, computed so it can never take the projection down with it.
+ *
+ * `evaluateLlmUsageMode` throws `InvalidLlmUsagePolicyError` when an enforcing
+ * policy fails validation. Letting that escape would mean one malformed stored
+ * policy aborts `projectMonth` entirely and the caller loses `settledMicroUsd`,
+ * the reservations and the allowance figures too -- an outage path fed by
+ * config data, for the sake of a field nothing reads (CodeRabbit, PR #2791).
+ * The failure is reported rather than swallowed, so a bad policy is visible
+ * without being fatal.
+ *
+ * Basis is SETTLED spend only, deliberately. This module declares exactly one
+ * intended divergence from the live gate -- all-vendor spend instead of
+ * LLM-only -- and that is the number §8 has to measure. Including reservations
+ * here would add a second, undocumented divergence, and the reconciliation
+ * could no longer attribute a difference to either one. §4's admission basis
+ * IS settled + reserved, and both are exposed as separate fields for whoever
+ * builds it.
+ */
+function shadowPolicyMode(
+  settledMicroUsd: number,
+  policy: LlmUsagePolicy | null | undefined,
+): { policyMode: LlmUsageMode; policyModeError?: string } {
+  try {
+    return { policyMode: evaluateLlmUsageMode({ costUsedMicroUsd: settledMicroUsd, policy }).usageMode };
+  } catch (error) {
+    return {
+      policyMode: "full_choice",
+      policyModeError: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 /**
  * Build the projection for one billing subject and month.
@@ -137,7 +181,7 @@ export function projectMonth(
     usableAllowanceMicroUsd,
     remainingMicroUsd,
     overspentMicroUsd,
-    policyMode: evaluateLlmUsageMode({ costUsedMicroUsd: committed, policy }).usageMode,
+    ...shadowPolicyMode(settledMicroUsd, policy),
     settledEventCount: settled.length,
     reservedEventCount: reserved.length,
     voidedEventCount: voided.length,
