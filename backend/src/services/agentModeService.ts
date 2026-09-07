@@ -32910,28 +32910,41 @@ ${strippedHtml}`;
       // had nothing left to check for that step and let it complete despite the
       // failed required call never succeeding.
       //
+      // ENG-1799 (follow-up): the original fix here only protected a function
+      // that had already FAILED at least once (failed>0 && succeeded===0). A
+      // production predefined-plan session (3fce3c5a-...) showed the same class
+      // of gap for functions that were simply never called at all -- never
+      // attempted, so never in failedFunctions either, but still genuinely
+      // required and unsatisfied. That shape passed the old check trivially
+      // (failed===0 fails the `failed > 0` test), so modify_work_plan could
+      // silently drop a still-unmet requirement the model had not gotten
+      // around to calling yet, the same gate-bypass shape, just without a
+      // prior failed attempt on record.
+      //
       // Fix: requiredFunctionCalls can still be freely modified -- added to,
       // reordered, or have functions removed -- EXCEPT it may never silently
-      // drop a function that has already failed for this session and has not
-      // since succeeded. That specific removal is the exact gate-bypass this
-      // incident hit. A function that was never required to begin with, or
-      // that failed and later succeeded, or that never failed at all, is
-      // unaffected and can still be dropped normally (e.g. a genuine,
-      // deliberate scope reduction).
-      const failedFunctionCounts = session.failedFunctions || {};
+      // drop a function that has not yet SUCCEEDED for this session, whether
+      // it previously failed or was never attempted at all. A function that
+      // was never required to begin with, or that has already succeeded at
+      // least once, is unaffected and can still be dropped normally (e.g. a
+      // genuine, deliberate scope reduction). Once a step has already
+      // resolved (completed/skipped), the gate that mattered already ran its
+      // decision, so edits to its requiredFunctionCalls afterward are pure
+      // bookkeeping and are exempt from this protection.
       const succeededFunctionCounts = session.calledFunctions || {};
       const mergeRequiredFunctionCalls = (
         existingRequired: string[] | undefined,
         requested: string[] | undefined,
+        stepStatus: string | undefined,
       ): string[] | undefined => {
         if (requested === undefined) return existingRequired;
-        const unresolvedFailures = (existingRequired || []).filter((fn) => {
+        if (stepStatus === 'completed' || stepStatus === 'skipped') return requested;
+        const unresolvedRequirements = (existingRequired || []).filter((fn) => {
           if (requested.includes(fn)) return false;
-          const failed = failedFunctionCounts[fn] || 0;
           const succeeded = succeededFunctionCounts[fn] || 0;
-          return failed > 0 && succeeded === 0;
+          return succeeded === 0;
         });
-        return unresolvedFailures.length > 0 ? [...requested, ...unresolvedFailures] : requested;
+        return unresolvedRequirements.length > 0 ? [...requested, ...unresolvedRequirements] : requested;
       };
 
       // Update or add steps
@@ -32944,7 +32957,11 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: mergeRequiredFunctionCalls(workPlan.steps[existingIndex].requiredFunctionCalls, newStep.requiredFunctionCalls),
+            requiredFunctionCalls: mergeRequiredFunctionCalls(
+              workPlan.steps[existingIndex].requiredFunctionCalls,
+              newStep.requiredFunctionCalls,
+              workPlan.steps[existingIndex].status,
+            ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
             // Allow scope changes: an explicit expectedAssetCount overrides (including 0
             // to clear the asset gate when the user approves a smaller set); omitting it
