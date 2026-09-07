@@ -171,3 +171,29 @@ describe('monitorLeadVolume — default window', () => {
     );
   });
 });
+
+describe('monitorLeadVolume — truncation propagation', () => {
+  beforeEach(() => {
+    (mockUserDb.getUserByEmail as jest.Mock).mockResolvedValue(CLIENT);
+    mockGetAccounts.mockResolvedValue([
+      { platform: 'meta', account_id: 'act123', config: { account_type: 'ad_account' } },
+    ]);
+  });
+
+  it('sets truncated: true when the campaign-rows query was truncated', async () => {
+    mockAdsMetricsDb.getSnapshotsByUserDateRange.mockResolvedValue({ rows: [], truncated: true });
+    const result = await monitorLeadVolume('caller-1', 'haven@example.com', true);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('sets truncated: true when the account-day query was truncated, even if campaign rows were not', async () => {
+    mockAdsMetricsDb.getAccountDaySnapshots.mockResolvedValue({ rows: [], truncated: true });
+    const result = await monitorLeadVolume('caller-1', 'haven@example.com', true);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('sets truncated: false when neither query was truncated', async () => {
+    const result = await monitorLeadVolume('caller-1', 'haven@example.com', true);
+    expect(result.truncated).toBe(false);
+  });
+});
