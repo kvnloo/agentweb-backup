@@ -2337,7 +2337,11 @@ describe('AgentModeService - Work Plan', () => {
         expect(chatbotDb.getChatSession).toHaveBeenCalledWith(mockSessionId, true);
       });
 
-      it('still allows a genuine scope reduction: dropping a required function that never failed', async () => {
+      // ENG-1799 tightened this: it is no longer enough for the dropped function to
+      // have merely never failed -- it must have actually SUCCEEDED at least once
+      // (see the new 'ENG-1799' describe block below for the "never called at all"
+      // case this test used to leave unprotected).
+      it('still allows a genuine scope reduction: dropping a required function that already succeeded', async () => {
         const workPlan = {
           title: 'Project Plan',
           steps: [
@@ -2357,8 +2361,8 @@ describe('AgentModeService - Work Plan', () => {
           userId: mockUserId,
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
-          calledFunctions: {},
-          failedFunctions: {}, // neither function has ever failed
+          calledFunctions: { get_meta_ads_metrics: 1 }, // already succeeded once
+          failedFunctions: {},
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
@@ -2479,6 +2483,215 @@ describe('AgentModeService - Work Plan', () => {
         expect(statusResult.success).toBe(false);
         expect(statusResult.message).toContain('Required function calls have not been made');
         expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_from_template (need 1, have 0)');
+      });
+    });
+
+    // ENG-1799: production session 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+    // the "Founder_Linkedin_Sales_Readiness_Audit" predefined plan. Investigation
+    // showed the SAME class of gap ENG-1793 fixed above, but for a required
+    // function that was never called at all rather than one that was called and
+    // failed: the old mergeRequiredFunctionCalls only protected a function with
+    // failedFunctions[fn] > 0, so a never-attempted function (failed === 0,
+    // succeeded === 0) failed that `failed > 0` test and could be silently
+    // dropped by modify_work_plan just as easily as a genuinely-satisfied one.
+    describe('ENG-1799: modify_work_plan cannot silently drop a never-called required function call', () => {
+      it('re-adds a required function that was never called, even when the update omits it', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'read_market_strategy', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {}, // none of the three has ever been called
+          failedFunctions: {}, // and none has ever failed either -- just never attempted
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              requiredFunctionCalls: [], // silently drops all three unmet requirements
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                stepCount: 1,
+                requiredFunctionCalls: expect.arrayContaining([
+                  'read_knowledge_base_files',
+                  'read_market_strategy',
+                  'you_search_web',
+                ]),
+              }),
+            ]),
+          })
+        );
+      });
+
+      it('still allows dropping a required function that already succeeded', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { read_knowledge_base_files: 1, you_search_web: 1 }, // both already succeeded
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              requiredFunctionCalls: ['read_knowledge_base_files'], // user approved dropping the already-satisfied you_search_web
+            },
+          ],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 1, requiredFunctionCalls: ['read_knowledge_base_files'] }),
+            ]),
+          })
+        );
+      });
+
+      it('does not protect a never-called function once the step has already resolved (completed)', async () => {
+        // Bookkeeping edits to an already-completed/skipped step are harmless --
+        // the gate that mattered already ran its decision.
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'ICP Info Collection',
+              status: 'completed' as const,
+              requiredFunctionCalls: ['read_knowledge_base_files', 'you_search_web'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 1, title: 'ICP Info Collection', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+          mockSessionId,
+          expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepCount: 1, requiredFunctionCalls: [] }),
+            ]),
+          })
+        );
+      });
+
+      it('end-to-end: modify_work_plan cannot be used to bypass set_work_plan_status\'s completion gate for a never-called function', async () => {
+        const workPlan = {
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [
+            {
+              stepCount: 6,
+              title: 'Generate HTML Readiness Report',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['create_html_file'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession: any = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {},
+          failedFunctions: {},
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+          mockSession.workPlan = updatedPlan;
+          return Promise.resolve(mockSession);
+        });
+
+        // Step 1: the model tries to clear the never-called step's required calls.
+        const modifyResult = await (agentModeService as any).modifyWorkPlan(
+          [{ stepCount: 6, title: 'Generate HTML Readiness Report', requiredFunctionCalls: [] }],
+          [],
+          mockSessionId
+        );
+        expect(modifyResult.success).toBe(true);
+
+        // Step 2: the model then tries to mark the step completed anyway.
+        const statusResult = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 6, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(statusResult.success).toBe(false);
+        expect(statusResult.message).toContain('Required function calls have not been made');
+        expect(statusResult.missingFunctionCalls[0].missing).toContain('create_html_file (need 1, have 0)');
       });
     });
   });
