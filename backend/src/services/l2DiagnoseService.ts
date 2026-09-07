@@ -9,7 +9,11 @@
  *
  * Only `leads_at_zero` has real evidence composition today — `budget_exhausted` (one of its five
  * causes) has no evidence source anywhere in this codebase (confirmed directly, see
- * `l2Diagnose.ts`'s doc comment) and stays permanently `unchecked`; `ctr_falling`/`cpm_rising`
+ * `l2Diagnose.ts`'s doc comment) and stays permanently `unchecked`. `genuine_demand_drop` is in the
+ * same position for a different reason: a drought verdict requires a Conversion Tracking Validator
+ * pass before it can be trusted (see `evaluateDemandVsVariance`'s doc comment), and CTV is a skill
+ * this pure orchestrator cannot invoke — so it can be `ruled_out` here but never `supported`.
+ * `ctr_falling`/`cpm_rising`
  * have ZERO evidence source for every one of their listed causes, so `diagnoseCtrFalling`/
  * `diagnoseCpmRising` are not implemented yet — calling `diagnose()` directly with every cause
  * `unchecked` already produces the correct `could_not_determine` result for those symptoms via
@@ -21,7 +25,9 @@ import { userDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
 import { monitorLeadVolume } from './leadVolumeMonitorService';
 import { runMetaTrackingMonitor } from '../cron/metaTrackingMonitorCron';
+import { BLACKOUT_ALERT_CLASS, OPTIMISATION_ALERT_CLASS, DESTINATION_ALERT_CLASS } from './metaTrackingMonitor';
 import { diagnose, type CauseEvaluation, type Diagnosis } from './l2Diagnose';
+import type { CampaignVolumeReport } from './leadVolumeMonitor';
 
 export interface DiagnoseLeadsAtZeroResult {
   success: boolean;
@@ -84,14 +90,24 @@ export async function diagnoseLeadsAtZero(
     };
   }
 
-  const [leadVolumeResult, trackingSummary] = await Promise.all([
+  // One tracking sweep PER AD ACCOUNT, not one for the whole client — `runMetaTrackingMonitor`'s
+  // aggregate counters (destinationOk/destinationAlerts/blackouts/...) sum across every account
+  // the call covers, so a client-wide call would let one account's destination alert leak into
+  // every sibling account's diagnosis. Scoping via `adAccountId` (same as `check_account_tracking_
+  // health`'s already-reviewed pattern) makes every counter genuinely single-account.
+  const [leadVolumeResult, trackingSummaries] = await Promise.all([
     monitorLeadVolume(callerUserId, clientNameOrEmail, true),
-    runMetaTrackingMonitor({ dryRun: true, userId: client.userId }),
+    Promise.all(
+      metaAdAccounts.map(acc =>
+        runMetaTrackingMonitor({ dryRun: true, userId: client.userId, adAccountId: acc.account_id }),
+      ),
+    ),
   ]);
 
-  const diagnoses = metaAdAccounts.map(acc => {
+  const diagnoses = metaAdAccounts.map((acc, i) => {
     const accountId = acc.account_id;
     const report = leadVolumeResult.reports?.find(r => r.accountId === accountId);
+    const trackingSummary = trackingSummaries[i];
 
     const pixelCapiEvaluation = evaluatePixelCapiBroken(accountId, trackingSummary);
     const causes: CauseEvaluation[] = [
@@ -124,8 +140,11 @@ export async function diagnoseLeadsAtZero(
   };
 }
 
-/** capturedAlerts with this class name indicate a real pixel/CAPI event-tracking failure. */
-const PIXEL_CAPI_ALERT_CLASSES = new Set(['meta-optimisation-event-missing', 'meta-blackout']);
+/** capturedAlerts with either class indicate a real pixel/CAPI event-tracking failure. Sourced
+ * from metaTrackingMonitor.ts's own exported constants rather than hand-typed strings — an
+ * earlier draft hand-typed 'meta-blackout' (the real class is 'meta-attribution-blackout'),
+ * which silently ruled out a full attribution blackout as "no alert found". */
+const PIXEL_CAPI_ALERT_CLASSES = new Set([OPTIMISATION_ALERT_CLASS, BLACKOUT_ALERT_CLASS]);
 
 function evaluatePixelCapiBroken(accountId: string, trackingSummary: any): CauseEvaluation {
   const alerts: any[] = trackingSummary?.capturedAlerts ?? [];
@@ -150,7 +169,7 @@ function evaluateLandingPageUnreachable(accountId: string, trackingSummary: any)
   const destinationUnverifiable = trackingSummary?.destinationUnverifiable ?? 0;
   if (destinationAlerts > 0) {
     const alerts: any[] = trackingSummary?.capturedAlerts ?? [];
-    const destAlert = alerts.find(a => a?.context?.['Ad Account'] === accountId && String(a?.context?.['Alert Class'] ?? '').includes('destination'));
+    const destAlert = alerts.find(a => a?.context?.['Ad Account'] === accountId && a?.context?.['Alert Class'] === DESTINATION_ALERT_CLASS);
     return {
       cause: 'landing_page_unreachable',
       verdict: 'supported',
@@ -170,8 +189,18 @@ function evaluateLandingPageUnreachable(accountId: string, trackingSummary: any)
  * 'insufficient_history' means neither can be judged yet. Reused directly rather than
  * re-implemented, per the same "don't redefine an existing rule in prose" principle already
  * applied to the destination/objective exclusion check elsewhere in this codebase.
+ *
+ * A drought verdict is never treated as `supported` evidence for genuine_demand_drop, though —
+ * `leadVolumeMonitor.ts`'s own contract (`requiresTrackingValidation: true` on every drought) is
+ * that a caller MUST run a Conversion Tracking Validator pass before treating a drought as
+ * confirmed, because a broken pixel/CAPI can produce the exact same "leads collapsed" signal as a
+ * genuine demand drop. CTV is a skill (LLM + tools), not code this pure orchestrator can call —
+ * same structural gap as budget_exhausted having no reachable evidence source — so a drought here
+ * stays `unchecked` for genuine_demand_drop rather than a confident, unvalidated `supported`.
+ * Ruling out normal_variance does NOT need CTV: it only claims the OBSERVED count fell outside its
+ * own normal noise band, which is true regardless of what caused the collapse.
  */
-function evaluateDemandVsVariance(report: { campaigns: Array<{ status: string; reason: string }> } | undefined): CauseEvaluation[] {
+function evaluateDemandVsVariance(report: { campaigns: CampaignVolumeReport[] } | undefined): CauseEvaluation[] {
   if (!report || report.campaigns.length === 0) {
     return [
       { cause: 'genuine_demand_drop', verdict: 'unchecked', evidence: 'no lead-volume report available for this account' },
@@ -184,7 +213,11 @@ function evaluateDemandVsVariance(report: { campaigns: Array<{ status: string; r
   const droughtCampaign = report.campaigns.find(c => c.status === 'drought');
   if (droughtCampaign) {
     return [
-      { cause: 'genuine_demand_drop', verdict: 'supported', evidence: droughtCampaign.reason },
+      {
+        cause: 'genuine_demand_drop',
+        verdict: 'unchecked',
+        evidence: `at least one campaign is below its own historical floor (${droughtCampaign.reason}), but this requires a Conversion Tracking Validator pass before it can be treated as a confirmed demand drop rather than a tracking failure — this orchestrator has no CTV access`,
+      },
       { cause: 'normal_variance', verdict: 'ruled_out', evidence: `at least one campaign is below its own historical floor: ${droughtCampaign.reason}` },
     ];
   }
