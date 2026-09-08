@@ -22,6 +22,13 @@
  * send-message/send-inmail/cancel/accept), so it only gates routing for that
  * one action.
  *
+ * The daily-cap check itself must account for ENG-1721's warm-up ramp (a
+ * freshly-connected account's effective cap is lower than its configured one
+ * for its first ~7-14 days) via `connectedAt` — the same account that hit
+ * ENG-1132/ENG-1614 in production was itself under 24h old, so evaluating
+ * headroom against the unramped configured cap would silently mis-evaluate
+ * exactly the account this fix was written for.
+ *
  * This module adds selection ON TOP of the existing pacing — it never
  * changes what `reserveWriteSlot`/`reserveDailyVolumeSlot` enforce for
  * whichever account is ultimately used, and it never clears or shortens the
@@ -76,6 +83,7 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
     action,
     requestedAccount.configuredDailyInviteCap,
     requestedAccount.dailyVolumeState,
+    { connectedAt: requestedAccount.connectedAt },
   ).allowed;
   if (requestedHasHeadroom && !requestedUnderCooldown) return null;
 
@@ -89,8 +97,15 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
       ownerUserId: (candidate as any).userId,
       configuredDailyInviteCap: (candidate as any)?.config?.daily_invite_cap,
       dailyVolumeState: (candidate as any)?.config?.daily_volume,
+      // ENG-1721's warm-up ramp lowers the effective cap for a freshly-connected
+      // account below its configured one — omitting this would have a candidate
+      // (or the requested account) evaluated against a cap it doesn't actually
+      // get today, exactly the class of gap this fix exists to close.
+      connectedAt: (candidate as any)?.created_at,
     };
-    const slot = reserveDailyVolumeSlot(action, account.configuredDailyInviteCap, account.dailyVolumeState);
+    const slot = reserveDailyVolumeSlot(action, account.configuredDailyInviteCap, account.dailyVolumeState, {
+      connectedAt: account.connectedAt,
+    });
     if (!slot.allowed) continue;
 
     const requestedReason = requestedUnderCooldown
