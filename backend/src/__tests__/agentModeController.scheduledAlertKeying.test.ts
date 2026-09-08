@@ -336,7 +336,14 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success', passed: true }));
   }, 30000);
 
-  it('keeps a generic LinkedIn requirement satisfied by a successful non-invite action', async () => {
+  // ENG-1720 INVERTED. This test used to assert `passed: true` for exactly the
+  // shape ENG-1132 AC #2 exists to catch: every send refused, one successful read,
+  // and the run reported as a success to an owner whose outreach sent nothing. It
+  // was the defect written down as expected behaviour — counting `linkedin_outreach`
+  // by tool NAME rather than by action. All 8 production schedules declaring this
+  // requirement (6 with an empty functionCallMinCalls, 2 with `{linkedin_outreach: 1}`)
+  // were defeated this way.
+  it('does NOT let a successful read satisfy a send requirement when every send was blocked', async () => {
     mockWorker.runInWorker.mockResolvedValue({
       ...okResponse,
       toolCalls: [
@@ -357,11 +364,13 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
     );
 
     expect(result).toEqual(expect.objectContaining({
-      status: 'success',
-      passed: true,
-      functionCallMatches: ['linkedin_outreach'],
-      functionCallMisses: [],
-      functionCallDetails: { linkedin_outreach: { actual: 2, required: 1 } },
+      status: 'failure',
+      passed: false,
+      functionCallMatches: [],
+      functionCallMisses: ['linkedin_outreach'],
+      // 0, not 2: the read is excluded outright, so the record can no longer say
+      // `actual: 2` beside a functionCallMisses entry naming the same tool.
+      functionCallDetails: { linkedin_outreach: { actual: 0, required: 1 } },
     }));
   }, 30000);
 
@@ -393,7 +402,110 @@ describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
       status: 'failure',
       passed: false,
       functionCallMisses: ['linkedin_outreach'],
-      functionCallDetails: { linkedin_outreach: { actual: 1, required: 2 } },
+      // ENG-1720: 0, not 1 — the successful `search-people` no longer pads a send
+      // requirement's count. The run sent nothing, and the record now says so.
+      functionCallDetails: { linkedin_outreach: { actual: 0, required: 2 } },
+    }));
+  }, 30000);
+
+  // ENG-1720 AC #2/#3 — cases the name-keyed count could not express at all.
+
+  it('fails a run whose sends all failed for a reason the cap regex never matched', async () => {
+    // ENG-1640 (2026-08-31): 8 leads, every send failing with "cannot be reached"
+    // across 3+ runs. LINKEDIN_INVITE_CAP_BLOCK_RE does not match that phrasing, so
+    // the old path never even reached the requirement check and the run passed.
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: { action: 'search-people' }, result: { success: true } },
+        {
+          name: 'linkedin_outreach',
+          arguments: { action: 'send-invite' },
+          result: { success: false, error: 'This person cannot be reached.' },
+        },
+      ],
+    } as any);
+
+    const result = await runScheduledChat(linkedInInviteSchedule, mockUserId, true, 'run-linkedin-unclassified-failure');
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'failure',
+      passed: false,
+      functionCallMisses: ['linkedin_outreach'],
+      functionCallDetails: { linkedin_outreach: { actual: 0, required: 1 } },
+    }));
+    // Not a recognised cap block, so no cooldown sentence is invented for the owner.
+    expect(result.actualResponse).not.toContain('No further send-invite actions will succeed');
+  }, 30000);
+
+  it('AC #3: a read-only LinkedIn schedule is not newly broken — no send attempted, name count stands', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: { action: 'search-people' }, result: { success: true } },
+        { name: 'linkedin_outreach', arguments: { action: 'get-profile' }, result: { success: true } },
+      ],
+    } as any);
+
+    const result = await runScheduledChat(linkedInInviteSchedule, mockUserId, true, 'run-linkedin-reads-only');
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'success',
+      passed: true,
+      functionCallMisses: [],
+      functionCallDetails: { linkedin_outreach: { actual: 2, required: 1 } },
+    }));
+  }, 30000);
+
+  it('recognises the underscore action spelling the dispatcher also routes to send-invite', async () => {
+    // agentModeService.linkedinOutreach folds `_` to `-` before its switch, so
+    // `send_invite` really sends. The old verbatim comparison classified it as a
+    // non-send and let a blocked run pass.
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: { action: 'search-people' }, result: { success: true } },
+        {
+          name: 'linkedin_outreach',
+          arguments: { action: 'send_invite' },
+          result: { success: false, error: 'Cannot resend yet — account invitation limit reached.' },
+        },
+      ],
+    } as any);
+
+    const result = await runScheduledChat(linkedInInviteSchedule, mockUserId, true, 'run-linkedin-underscore-action');
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'failure',
+      passed: false,
+      functionCallDetails: { linkedin_outreach: { actual: 0, required: 1 } },
+      // The block detector shares the same normalizer, so the owner still gets the
+      // cooldown sentence rather than a bare failure.
+      actualResponse: expect.stringContaining('No further send-invite actions will succeed'),
+    }));
+  }, 30000);
+
+  it('still pages oncall for a send failure that fired no dedicated blocked-invite alert', async () => {
+    // The generic alert is suppressed only when the dedicated linkedin_invite_blocked
+    // page actually fired. Keying that suppression on the requirement verdict instead
+    // would silence the ONLY page an unclassified all-sends-failed run gets.
+    mockWorker.runInWorker.mockResolvedValue({
+      ...okResponse,
+      toolCalls: [{
+        name: 'linkedin_outreach',
+        arguments: { action: 'send-invite' },
+        result: { success: false, error: 'This person cannot be reached.' },
+      }],
+    } as any);
+
+    await runScheduledChat(linkedInInviteSchedule, mockUserId, false, 'run-linkedin-unclassified-alert');
+    await flushAsync();
+
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledWith(expect.objectContaining({
+      subject: expect.stringContaining('Scheduled Chat Failed'),
+    }));
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalledWith(expect.objectContaining({
+      subject: expect.stringContaining('LinkedIn outreach run fully blocked'),
     }));
   }, 30000);
 

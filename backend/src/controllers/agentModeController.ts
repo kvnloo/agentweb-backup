@@ -43,6 +43,7 @@ import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlocked
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
+import { evaluateLinkedInSendRequirement, linkedInOutreachArgs, normalizeLinkedInOutreachAction } from '../utils/linkedInSendRequirement';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -678,29 +679,17 @@ const LINKEDIN_INVITE_CAP_BLOCK_RE =
 
 type LinkedInInviteSendBlock = {
   notice: string;
-  successfulInviteSends: number;
   // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
   // the tool arguments carried one. Used only to key the internal oncall alert's
   // per-account/day dedupe — never surfaced to the customer.
   accountId?: string;
 };
 
-function linkedInOutreachArgs(call: any): Record<string, any> | null {
-  const args = call?.arguments;
-  if (args && typeof args === 'object') return args;
-  if (typeof args !== 'string') return null;
-  try {
-    const parsed = JSON.parse(args);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function linkedInOutreachAction(call: any): string {
-  const args = linkedInOutreachArgs(call);
-  return args ? String(args.action || '').toLowerCase() : '';
-}
+// ENG-1720: `linkedInOutreachArgs` / `normalizeLinkedInOutreachAction` now live in
+// utils/linkedInSendRequirement.ts, shared with the action-aware requirement check
+// below. The local copies folded case only, so a `send_invite` (underscore) argument
+// — which the dispatcher routes to the very same send handler, see its
+// `action.replace(/_/g, '-')` — was not recognised as an invite here at all.
 
 /**
  * Detect a schedule-wide LinkedIn invitation block from the executed tool ledger.
@@ -709,11 +698,17 @@ function linkedInOutreachAction(call: any): string {
  * sending account, not just the recipient. Treating an attempted send as a clean
  * required-function match therefore reports a run as underway while every later
  * invite is guaranteed to fail (ENG-1132).
+ *
+ * ENG-1720: this is now a LABELLING decision, not the pass/fail one. It chooses the
+ * plain-language sentence the owner reads and keys the dedicated oncall page; whether
+ * the run met its `linkedin_outreach` requirement is decided by
+ * `evaluateLinkedInSendRequirement` on the ACTION, so a send failing in a way this
+ * pattern does not recognise still fails the run.
  */
 function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
   if (!Array.isArray(toolCalls)) return null;
   const inviteCalls = toolCalls.filter(
-    (call: any) => call?.name === 'linkedin_outreach' && linkedInOutreachAction(call) === 'send-invite',
+    (call: any) => call?.name === 'linkedin_outreach' && normalizeLinkedInOutreachAction(call) === 'send-invite',
   );
   const blockedCall = inviteCalls.find((call: any) => {
     if (toolCallSucceeded(call)) return false;
@@ -736,7 +731,6 @@ function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): Lin
     notice:
       `LinkedIn send-invite was blocked by ${reason}. ` +
       'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
-    successfulInviteSends: inviteCalls.filter(toolCallSucceeded).length,
   };
 }
 
@@ -6459,7 +6453,10 @@ export async function runScheduledChat(
     // Convert result to scheduled chat format. This list is the AUDIT record of what
     // the model called, so it deliberately keeps failed attempts — "it tried and the
     // tool errored" is exactly what someone reading run history needs to see.
-    const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
+    // ENG-1807 follow-up: prepend resumePriorToolCalls, same as finalFunctionCallDetails
+    // below already does — otherwise a resumed run's stored raw call list under-reports
+    // what actually happened relative to the `passed` verdict computed from it.
+    const actualFunctionCalls = [...resumePriorToolCalls, ...result.toolCalls].map((call: any) => call.name).filter(Boolean);
 
     // Calculate final function call details. ENG-1045/ENG-947: counted through the
     // same outcome-aware helper the checker uses (countCallsSatisfyingRequirement),
@@ -6505,24 +6502,36 @@ export async function runScheduledChat(
       };
     });
 
-    // An account-wide cooldown/pacing refusal is not a successful send. The
-    // verifier historically counted every non-publish call by name, so correct
-    // Schedules contract by tool name rather than action, so successful
-    // non-invite LinkedIn calls count too. Count every successful call from
-    // the combined ledger, rather than treating one such call as enough for
-    // a schedule that requires multiple calls.
+    // ENG-1720: a `linkedin_outreach` requirement is satisfied by a SEND that
+    // happened, not by any call that shares the tool's name.
+    //
+    // This branch used to count successful calls by NAME and only engaged when
+    // `LINKEDIN_INVITE_CAP_BLOCK_RE` had recognised a cooldown/pacing phrasing.
+    // Both halves leaked: ONE successful `search-people` satisfied `min: 1` while
+    // every `send-invite` was refused (the shape all 8 production schedules that
+    // declare this requirement are defeated by), and a send failing any OTHER way
+    // — "recipient cannot be reached", provider errors, the class ENG-1640 saw
+    // live — never reached the check at all. `evaluateLinkedInSendRequirement`
+    // decides on the ACTION, so the block regex is now only choosing which
+    // sentence the owner reads, not whether the run passed. See that module's
+    // docblock for why a run that attempted NO send keeps the name-keyed count
+    // (AC #3: read-only LinkedIn schedules are not newly broken) and why the
+    // nudge loop is deliberately left alone (press amplification, ENG-1715).
     const requiredLinkedInCalls = functionCallMinCalls.linkedin_outreach || 1;
-    const successfulLinkedInCalls = linkedInOutcomeToolCalls.filter(
-      (call: any) => call?.name === 'linkedin_outreach' && toolCallSucceeded(call),
-    );
+    const linkedInRequirementHeld = heldToFunctionNames.includes('linkedin_outreach');
+    const linkedInSendVerdict = evaluateLinkedInSendRequirement(linkedInOutcomeToolCalls, requiredLinkedInCalls);
     const linkedInInviteSendRequirementMissed = Boolean(
-      linkedInInviteSendBlock
-      && heldToFunctionNames.includes('linkedin_outreach')
-      && successfulLinkedInCalls.length < requiredLinkedInCalls,
+      linkedInRequirementHeld && linkedInSendVerdict.requirementMissed,
     );
-    if (linkedInInviteSendRequirementMissed) {
+    // Report the action-aware count on EVERY send run, not only a failing one.
+    // Leaving the name-keyed count on a passing send run would persist
+    // `{ actual: 7, required: 1 }` for a run that sent once — and on a failing one
+    // it produced `{ actual: 2, required: 1 }` sitting beside a functionCallMisses
+    // entry naming the same tool, the self-contradicting record ENG-827/ENG-1045
+    // spent two issues removing.
+    if (linkedInRequirementHeld && linkedInSendVerdict.reportedActual !== null) {
       finalFunctionCallDetails.linkedin_outreach = {
-        actual: successfulLinkedInCalls.length,
+        actual: linkedInSendVerdict.reportedActual,
         required: requiredLinkedInCalls,
       };
     }
@@ -6716,7 +6725,12 @@ export async function runScheduledChat(
         // linkedin_invite_blocked alert — sending this generic alert too would
         // double-page a single blocked run (CodeRabbit). The issue is still
         // filed unconditionally above so tracking stays intact either way.
-        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
+        // ENG-1720: keyed to `linkedInInviteSendBlock` — the condition that actually
+        // fired the dedicated `linkedin_invite_blocked` page above — not to the
+        // requirement verdict. Those two used to be the same condition; now that a
+        // send failing for a NON-cooldown reason also misses the requirement,
+        // suppressing on the verdict would silence the only page such a run gets.
+        .then(() => linkedInInviteSendBlock ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
           message: scheduledChatFailureDescription,
           sessionId,
@@ -7128,19 +7142,93 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1807: an exception here does not mean the run did nothing.
+    // persistIncrementally already wrote every settled turn to the session before a
+    // LATER step (title generation, self-improvement reflection, etc.) hit the error —
+    // e.g. a worker-drain mid-deploy. Hardcoding an empty ledger below would discard
+    // that real, already-persisted work. Reconstruct what actually happened from the
+    // session's own messages, the same way a RESUMED run already credits its abandoned
+    // portion (`reconstructPriorToolCalls`, used above at the resume-claim path) —
+    // this makes a run that quietly finished everything required stop being recorded
+    // as a permanent, empty failure just because a trailing step errored afterward.
+    // Keywords are reconstructed the same way `runVerifiedChatInner` scores them on the
+    // success path (`allContent.toLowerCase().includes(keyword.toLowerCase())`, see
+    // ~line 4297) — otherwise a schedule using keyword criteria could recover
+    // `passed: true` sitting next to a `keywordMisses` list still hardcoded to "every
+    // keyword missed", the exact self-contradicting-record shape ENG-827 exists to
+    // prevent elsewhere in this file.
+    // Scoped to what this run was actually ADMITTED to publish (fresh, pure recompute —
+    // `resolveSchedulePublishAuthorization` takes only `schedule`, no try-block-local
+    // state needed), not the raw config — so a requirement the run was never authorized
+    // for in the first place is correctly excluded here exactly as it is on the success
+    // path (`heldToFunctionNames` above). This does NOT track a mid-run revocation the
+    // way `effectivePublishAuthorization`'s live narrowing does (that state is try-block
+    // local and genuinely unreachable from here) — a narrower, disclosed residual gap.
+    // Acceptable because `narrowPublishAuthorization` is strictly monotonic (only ever
+    // REMOVES tools, never adds — see its own doc comment), so the admission-time scope
+    // used here is always a superset of whatever the live value would have narrowed to.
+    // That can only push the recovered verdict toward MORE misses, never toward crediting
+    // a publish that didn't happen — a match still requires an actual persisted, succeeded
+    // tool-call entry regardless. This DOES reach the owner via
+    // `sendScheduledChatResultEmail` (not merely internal logging), so "safe direction of
+    // error" is the actual guarantee being relied on here, not "nobody sees it".
+    const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
+    const recoveredHeldToNames = filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization);
+
+    // The entire block below reads a real, external, potentially-malformed record (the
+    // session) inside an error handler — the one place a second, NEW failure would be
+    // worst. Everything in it is defensively guarded (Array.isArray checks, the
+    // `.catch(() => null)` on the DB read) AND the whole block is wrapped one more time:
+    // any unexpected shape this hasn't anticipated falls back to the pre-fix-era safe
+    // values (empty ledger, passed:false) rather than throwing a new, unhandled error
+    // out of the one place that must never itself crash.
+    let recoveredToolCalls: RequiredCallLedgerEntry[] = [];
+    let recoveredContent = '';
+    try {
+      if (sessionId) {
+        const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
+        const recoveredMessages = Array.isArray(recoverySession?.messages) ? recoverySession!.messages : [];
+        recoveredToolCalls = reconstructPriorToolCalls(recoveredMessages);
+        recoveredContent = recoveredMessages
+          .filter((m: any) => m?.role === 'assistant' && typeof m.content === 'string')
+          .map((m: any) => m.content)
+          .join('\n\n');
+      }
+    } catch (recoveryError) {
+      console.error(`ENG-1807: ledger recovery failed for session ${sessionId}; falling back to the pre-fix empty-ledger result:`, recoveryError);
+      recoveredToolCalls = [];
+      recoveredContent = '';
+    }
+    const recoveredRequiredNames = Array.isArray(recoveredHeldToNames) ? recoveredHeldToNames : [];
+    const recoveredMinCalls = schedule.functionCallMinCalls || {};
+    const recoveredFunctionMatches = recoveredRequiredNames.filter((name: string) =>
+      countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
+    );
+    const recoveredFunctionMisses = recoveredRequiredNames.filter((name: string) => !recoveredFunctionMatches.includes(name));
+    const recoveredKeywords: string[] = Array.isArray(schedule.keywords) ? schedule.keywords : [];
+    const recoveredKeywordMatches = recoveredKeywords.filter((keyword: string) =>
+      recoveredContent.toLowerCase().includes(keyword.toLowerCase())
+    );
+    const recoveredKeywordMisses = recoveredKeywords.filter((keyword: string) => !recoveredKeywordMatches.includes(keyword));
+    // Evidence of genuine recovered activity — either dimension counts, so a
+    // keyword-only or function-call-only schedule can each still recover a pass. A
+    // schedule with NEITHER configured must not flip to `passed: true` on an exception
+    // merely because empty requirement lists are vacuously satisfied.
+    const hasRecoveredEvidence = recoveredToolCalls.length > 0 || recoveredContent.trim().length > 0;
+
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
-      passed: false,
+      passed: hasRecoveredEvidence && recoveredFunctionMisses.length === 0 && recoveredKeywordMisses.length === 0,
       actualResponse: `Error during execution: ${errorMessage}`,
-      actualFunctionCalls: [],
-      keywordMatches: [],
-      keywordMisses: schedule.keywords || [],
-      functionCallMatches: [],
-      functionCallMisses: schedule.requiredFunctionCalls || [],
+      actualFunctionCalls: recoveredToolCalls.map((call) => call.name).filter((n): n is string => Boolean(n)),
+      keywordMatches: recoveredKeywordMatches,
+      keywordMisses: recoveredKeywordMisses,
+      functionCallMatches: recoveredFunctionMatches,
+      functionCallMisses: recoveredFunctionMisses,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
