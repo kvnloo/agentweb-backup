@@ -26,8 +26,49 @@ import {
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
+import { listSpendEvents } from "../services/spendEventDb";
+import { buildSpendBreakdown } from "../services/spendReadModel";
 
 const router = express.Router();
+
+/**
+ * ENG-1250 §7: the spend breakdown for one billing subject and month, built
+ * from the immutable ledger.
+ *
+ * Exists because §7's requirement is that "no admin should need direct
+ * DynamoDB inspection to explain a pause" — and until this, nothing outside
+ * the ledger modules could read AW-SpendEvents at all.
+ *
+ * READ-ONLY, and deliberately so: it reports what the ledger says and cannot
+ * pause, unpause, or alter a balance. ENG-1250 AC6 keeps enforcement with
+ * Harsha, and a read model must never become the thing that pauses an account.
+ */
+router.get(
+  "/users/:billingUserId/spend/breakdown",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { billingUserId } = req.params as { billingUserId: string };
+      const month = String(req.query.month || "");
+
+      if (!MONTH_RE.test(month)) {
+        return res.status(400).json({ error: "month must be YYYY-MM" });
+      }
+
+      // The GSI is keyed on occurredAt, so the range is the calendar month.
+      // `-31` is safe for every month: it is an upper bound on a string
+      // comparison, not a date that has to exist.
+      const events = await listSpendEvents(billingUserId, `${month}-01`, `${month}-31`);
+
+      return res.json(buildSpendBreakdown(billingUserId, month, events));
+    } catch (error: any) {
+      console.error("[adminUsage] spend breakdown failed:", error?.message || error);
+      return res.status(500).json({ error: "Failed to build spend breakdown" });
+    }
+  }
+);
+
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^\d{4}-\d{2}$/;
