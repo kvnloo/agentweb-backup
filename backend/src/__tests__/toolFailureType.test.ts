@@ -180,6 +180,30 @@ describe('402 alternation is HTTP-status-anchored, not a bare number (ENG-664)',
   });
 });
 
+describe('publisher_refused → by_design, not config or bug (ENG-1162)', () => {
+  it('treats a publisher bot-block/WAF refusal as by_design — the tool worked, a third party declined it', () => {
+    expect(classifyToolFailureType('publisher_refused')).toBe('by_design');
+  });
+
+  it('does not route it to config — there is no credential/account fix on our side', () => {
+    expect(
+      classifyToolFailureType(
+        'publisher_refused',
+        'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+      ),
+    ).not.toBe('config');
+  });
+
+  it('classifies the real net::ERR_EMPTY_RESPONSE browser-navigation shape as by_design, not bug', () => {
+    expect(
+      classifyToolFailureType(
+        'publisher_refused',
+        'Error: browserBackend.callTool: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/example',
+      ),
+    ).toBe('by_design');
+  });
+});
+
 describe('quota_exceeded → config, not bug (ENG-1220)', () => {
   it('treats hard quota exhaustion as a config/billing gap, not a tool bug', () => {
     expect(classifyToolFailureType('quota_exceeded')).toBe('config');
