@@ -349,6 +349,49 @@ describe('Schedule Templates', () => {
       );
     });
 
+    // Production verification of ENG-1716 surfaced this: `authenticateToken`
+    // rebuilds `req.user` for a delegate session from the TARGET user's DB row
+    // (`isAdmin: targetUser.isAdmin || false`), so a session delegated into an
+    // account that happens to be an admin carries `isAdmin: true`. Reading that
+    // flag raw would let anyone able to mint a delegate token for an admin —
+    // including a contractor with that admin in their assigned list — publish a
+    // template to every customer's picker. `isRealAdmin` is the codebase's
+    // existing answer and withholds the bit from any delegated session.
+    it('refuses a DELEGATED session into an admin account (no borrowed admin bit)', async () => {
+      for (const visibility of ['system', 'public', 'platform']) {
+        (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+        const req = mockReq({
+          params: { templateId: 't1' },
+          body: { visibility },
+          user: { userId: 'user-1', email: 'admin-target@example.com', isAdmin: true },
+          delegateInfo: { adminUserId: 'sup-1', adminEmail: 'support@example.com', isDelegated: true },
+        });
+        const res = mockRes();
+        await agentModeController.updateScheduleTemplate(req as any, res);
+
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+      }
+    });
+
+    // The same delegated session keeps every non-privileged power it had, so the
+    // fix withholds admin reach without breaking support workflows.
+    it('a delegated session may still edit and submit the template for review', async () => {
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { name: 'Renamed by support', visibility: 'pending_review' },
+        user: { userId: 'user-1', email: 'admin-target@example.com', isAdmin: true },
+        delegateInfo: { adminUserId: 'sup-1', adminEmail: 'support@example.com', isDelegated: true },
+      });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1',
+        expect.objectContaining({ name: 'Renamed by support', visibility: 'pending_review' }),
+        { expectedVisibility: 'private' },
+      );
+    });
+
     it('AC #3: an admin may still publish through this route', async () => {
       const req = mockReq({
         params: { templateId: 't1' },
