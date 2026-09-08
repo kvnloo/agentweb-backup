@@ -268,9 +268,96 @@ describe('ENG-1807 — scheduled-chat run interrupted mid-flight reconstructs th
 
     const result = await runScheduledChat(baseSchedule as any, mockUserId, true);
 
+    expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
     expect(result.passed).toBe(false);
     expect(result.actualFunctionCalls).toEqual([]);
     expect(result.functionCallMisses).toEqual(['get_marketing_tips']);
+  });
+
+  it('recovers passed:true on a schedule with ZERO required function calls, guarded on genuine recovered activity (not vacuously true)', async () => {
+    const noRequirementsSchedule = { ...baseSchedule, requiredFunctionCalls: [], keywords: [] };
+    mockScheduleDb.getScheduleById.mockResolvedValue(noRequirementsSchedule);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        { role: 'user', content: 'Please run the report.' },
+        {
+          role: 'assistant',
+          content: 'Fetching marketing tips.',
+          metadata: { toolCalls: [{ id: 'c1', name: 'get_marketing_tips', arguments: {} }] },
+        },
+      ],
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(noRequirementsSchedule as any, mockUserId, true);
+
+    // Nothing was REQUIRED, but real activity WAS recovered — the guard's intended pass.
+    expect(result.passed).toBe(true);
+    expect(result.actualFunctionCalls).toEqual(['get_marketing_tips']);
+  });
+
+  it('does not flip passed:true on a bare schedule (nothing required, nothing recovered) — the vacuous case the guard exists to reject', async () => {
+    const noRequirementsSchedule = { ...baseSchedule, requiredFunctionCalls: [], keywords: [] };
+    mockScheduleDb.getScheduleById.mockResolvedValue(noRequirementsSchedule);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: [{ role: 'user', content: 'Please run the report.' }],
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('LLM provider error'));
+
+    const result = await runScheduledChat(noRequirementsSchedule as any, mockUserId, true);
+
+    expect(result.passed).toBe(false);
+  });
+
+  it('recovers keywordMatches/keywordMisses from the real recovered content instead of leaving keywordMisses hardcoded to every configured keyword', async () => {
+    const keywordSchedule = { ...baseSchedule, keywords: ['tips', 'strategy'] };
+    mockScheduleDb.getScheduleById.mockResolvedValue(keywordSchedule);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        { role: 'user', content: 'Please run the report.' },
+        {
+          role: 'assistant',
+          content: 'Here are some great marketing tips for your business.',
+          metadata: { toolCalls: [{ id: 'c1', name: 'get_marketing_tips', arguments: {} }] },
+        },
+      ],
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(keywordSchedule as any, mockUserId, true);
+
+    // "tips" appears in the recovered content, "strategy" does not — must NOT be
+    // reported as a self-contradicting passed:true next to keywordMisses:[all].
+    expect(result.keywordMatches).toEqual(['tips']);
+    expect(result.keywordMisses).toEqual(['strategy']);
+    expect(result.passed).toBe(false);
+  });
+
+  it('recovers passed:true only once BOTH the function-call and keyword requirements are satisfied by recovered evidence', async () => {
+    const keywordSchedule = { ...baseSchedule, keywords: ['tips'] };
+    mockScheduleDb.getScheduleById.mockResolvedValue(keywordSchedule);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        { role: 'user', content: 'Please run the report.' },
+        {
+          role: 'assistant',
+          content: 'Here are some great marketing tips for your business.',
+          metadata: { toolCalls: [{ id: 'c1', name: 'get_marketing_tips', arguments: {} }] },
+        },
+      ],
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(keywordSchedule as any, mockUserId, true);
+
+    expect(result.keywordMatches).toEqual(['tips']);
+    expect(result.keywordMisses).toEqual([]);
+    expect(result.functionCallMisses).toEqual([]);
+    expect(result.passed).toBe(true);
   });
 });
 
