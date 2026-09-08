@@ -204,8 +204,16 @@ export interface StaleInvitationDrainDeps {
   cancel: (invitationId: string, accountId: string) => Promise<void>;
   /** Drop the ledger row so the CRM stops showing "invitation pending". */
   forget: (accountId: string, invitationId: string) => Promise<unknown>;
-  /** Best-effort CRM provenance. Never allowed to fail a completed withdrawal. */
-  recordWithdrawal?: (candidate: StaleInvitationCandidate) => Promise<unknown>;
+  /**
+   * Best-effort CRM provenance. Never allowed to fail a completed withdrawal.
+   *
+   * A resolved `{ engagementLogged: false }` means the call SUCCEEDED but appended
+   * nothing (the lead vanished, or contention outlived the retries). That must be
+   * classified as not-recorded: treating a non-throw as success let a missing
+   * history entry be reported as written, which is the exact silence
+   * `crmRecordFailed` exists to break (CodeRabbit on PR #2797's stale diff).
+   */
+  recordWithdrawal?: (candidate: StaleInvitationCandidate) => Promise<{ engagementLogged?: boolean } | null | unknown>;
   now?: () => number;
   /** Injected for tests; real runs back off between CRM retries. */
   sleep?: (ms: number) => Promise<void>;
@@ -332,9 +340,16 @@ export async function withdrawStaleInvitations(params: {
       let lastErr: unknown;
       for (let attempt = 0; attempt < CRM_RECORD_ATTEMPTS; attempt++) {
         try {
-          await deps.recordWithdrawal(candidate);
-          recorded = true;
-          break;
+          const outcome: any = await deps.recordWithdrawal(candidate);
+          // An explicit `engagementLogged: false` is a completed call that wrote
+          // nothing — not a success. `null` (no lead to attach to) is not a
+          // failure: there is no history to miss.
+          if (outcome && typeof outcome === 'object' && outcome.engagementLogged === false) {
+            lastErr = new Error('CRM engagement was not appended');
+          } else {
+            recorded = true;
+            break;
+          }
         } catch (err) {
           lastErr = err;
           if (attempt < CRM_RECORD_ATTEMPTS - 1) await wait(CRM_RETRY_BACKOFF_MS * (attempt + 1));
