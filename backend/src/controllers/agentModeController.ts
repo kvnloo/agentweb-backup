@@ -5041,7 +5041,16 @@ async function evaluateLinkedInCapacityGate(
           account_name: acc.account_name,
           config: acc.config,
           // Pure arithmetic over already-loaded config — no I/O per account.
-          headroom: remainingDailyInvites(acc?.config?.daily_invite_cap, acc?.config?.daily_volume),
+          // ENG-1721: `created_at` is threaded through so the gate measures
+          // headroom against the SAME warm-up-ramped cap the pacer enforces.
+          // Without it a 1-day-old connection would look like it had its full
+          // configured headroom, the gate would let the run proceed, and the
+          // pacer would refuse its very first send.
+          headroom: remainingDailyInvites(
+            acc?.config?.daily_invite_cap,
+            acc?.config?.daily_volume,
+            { connectedAt: acc?.created_at },
+          ),
         }));
     },
   });
