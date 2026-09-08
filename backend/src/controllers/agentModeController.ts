@@ -3538,6 +3538,25 @@ type RunVerifiedChatResult = {
   sendPressExhausted?: boolean;
 };
 
+// ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
+// outstanding debt from a removed step's required function call that never
+// genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
+// real calledFunctions, not just "does anything remain marked pending").
+// Inlined here (rather than calling AgentModeService.isWorkPlanFullyResolved)
+// because ~150 test files in this suite mock '../services/agentModeService' as
+// a bare { agentModeService: {...} } object with no AgentModeService class
+// export -- depending on that class from this heavily-mocked controller file
+// breaks any of them that happen to exercise this retry loop.
+function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+  if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  if (!allStepsTerminal) return false;
+  const called = calledFunctions || {};
+  const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+    .filter((fn: string) => (called[fn] || 0) === 0);
+  return unresolvedPendingDebt.length === 0;
+}
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 async function runVerifiedChatInner(
@@ -4184,7 +4203,7 @@ async function runVerifiedChatInner(
         // Check work plan status
         const session = await chatbotDb.getChatSession(sessionId);
         const workPlan = session?.workPlan;
-        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+        const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, session?.calledFunctions);
 
         if (workPlan && !workPlanCompleted) {
           // Remind to complete pending steps
@@ -4264,7 +4283,7 @@ async function runVerifiedChatInner(
 
       // Check work plan status
       const workPlan = response.workPlan;
-      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+      const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];
@@ -7664,6 +7683,10 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  // ENG-1811: raw session.calledFunctions snapshot alongside workPlan, so a caller
+  // checking "is the plan done" can resolve pendingRequiredFunctionCalls debt against
+  // real call history instead of inferring completion from step status alone.
+  calledFunctions?: Record<string, number>;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
@@ -8028,6 +8051,7 @@ export async function generateSessionResponse(
   return {
     ...response,
     workPlan: finalSession?.workPlan,
+    calledFunctions: finalSession?.calledFunctions,
     skills
   };
 }

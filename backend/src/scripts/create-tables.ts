@@ -2617,6 +2617,7 @@ const main = async () => {
     await createAgentRunsTable();
     await createMetaCapiKeyCoverageTable();
     await createAdsThresholdsTable();
+    await createAdsOutcomeLedgerTable();
     await createContactEventsTable();
     await createCustomDomainsTable();
     await createLeadMagnetConfigsTable();
@@ -3318,6 +3319,48 @@ const createAdsThresholdsTable = async () => {
     KeySchema: [
       { AttributeName: 'entityKey', KeyType: 'HASH' },
       { AttributeName: 'paramKey', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1550 — outcome ledger: what the agent predicted a recommendation would do, and later
+// whether it was right. Keyed on the AD ACCOUNT (`<platform>#<accountId>`), same reasoning as
+// AW-AdsThresholds. GSI on status+evaluationDate lets a future scoring cron find "pending, past
+// due" rows without a table scan; no cron reads it yet, but it costs nothing to add up front.
+const createAdsOutcomeLedgerTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsOutcomeLedger`,
+    AttributeDefinitions: [
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      { AttributeName: 'recommendationId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'evaluationDate', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'recommendationId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StatusEvaluationDateIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'evaluationDate', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };

@@ -332,6 +332,95 @@ describe('AgentModeController - Scheduled Chat with Work Plan', () => {
       );
     });
 
+    it('ENG-1811: does not falsely report a work plan completed when every step is terminal but debt from a removed step is unresolved', async () => {
+      // Round-4 fresh-eyes review of PR #2808 found: workPlanCompletedWithoutDebt
+      // (the local, controller-side twin of AgentModeService.isWorkPlanFullyResolved,
+      // used by this exact scheduled-chat retry loop) was only tested indirectly
+      // via the service-level function -- never through this loop itself. This
+      // exercises the real regression scenario end-to-end: a plan whose steps all
+      // look terminal (the bare .every(...) check the pre-fix code used would say
+      // "done"), but pendingRequiredFunctionCalls still lists a function that
+      // genuinely never succeeded.
+      const debtedWorkPlan = {
+        title: 'Onboarding Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        pendingRequiredFunctionCalls: ['list_html_templates'],
+      };
+
+      const sessionWithDebt = {
+        ...mockSession,
+        workPlan: debtedWorkPlan,
+        calledFunctions: {}, // list_html_templates never actually succeeded
+      };
+
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDebt);
+
+      const responseWithDebt = {
+        ...mockResponse,
+        workPlan: debtedWorkPlan,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(responseWithDebt);
+
+      // No keyword / function requirements so success hinges only on the debt ledger,
+      // not on the base schedule's unrelated keyword/function gate.
+      const sched = { ...baseSchedule, keywords: [], requiredFunctionCalls: [] };
+      mockScheduleDb.getScheduleById.mockResolvedValue(sched);
+
+      const result = await runScheduledChat(sched, mockUserId, true);
+
+      // Must NOT converge early like the fully-completed-plan test above --
+      // the outstanding debt keeps workPlanCompleted false for the whole run.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(20);
+      expect(result).toEqual(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          status: 'failure',
+          passed: false,
+        })
+      );
+    });
+
+    it('ENG-1811: converges once the previously-unresolved debt function genuinely succeeds', async () => {
+      const debtedWorkPlan = {
+        title: 'Onboarding Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' as const },
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        pendingRequiredFunctionCalls: ['list_html_templates'],
+      };
+      // No keyword / function requirements so success hinges only on the debt ledger.
+      const sched = { ...baseSchedule, keywords: [], requiredFunctionCalls: [] };
+      mockScheduleDb.getScheduleById.mockResolvedValue(sched);
+
+      // The plan's own steps never change -- only calledFunctions does, mirroring
+      // a later, separate turn where the model genuinely calls the debt function.
+      let call = 0;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
+        call++;
+        return Promise.resolve({ ...mockResponse, toolCalls: [], workPlan: debtedWorkPlan });
+      });
+      mockChatbotDb.getChatSession.mockImplementation(() =>
+        Promise.resolve({
+          ...mockSession,
+          workPlan: debtedWorkPlan,
+          calledFunctions: (call >= 3 ? { list_html_templates: 1 } : {}) as Record<string, number>,
+        })
+      );
+
+      const result = await runScheduledChat(sched, mockUserId, true);
+
+      expect(call).toBe(3);
+      expect(result).toEqual(
+        expect.objectContaining({ scheduleId: mockScheduleId, status: 'success', passed: true })
+      );
+    });
+
     it('should progress through work plan steps sequentially', async () => {
       const workPlanStep1 = {
         title: 'Onboarding Plan',
