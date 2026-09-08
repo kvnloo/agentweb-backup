@@ -240,6 +240,32 @@ describe('withdrawStaleInvitations', () => {
     expect(result.withdrawn).toHaveLength(1);
   });
 
+  it('backs off between attempts however the attempt failed', async () => {
+    // Waiting only on a thrown error retried a CAS-contention engagementLogged:false
+    // immediately, so all three attempts could burn before the competing write
+    // settled (CodeRabbit on PR #2818).
+    const waits: number[] = [];
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => ({ engagementLogged: false })),
+      sleep: async (ms: number) => { waits.push(ms); },
+    });
+
+    await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(waits).toHaveLength(CRM_RECORD_ATTEMPTS - 1);
+    expect(waits[1]).toBeGreaterThan(waits[0]);
+  });
+
+  it('does not sleep after the FINAL attempt', async () => {
+    const waits: number[] = [];
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => { throw new Error('down'); }),
+      sleep: async (ms: number) => { waits.push(ms); },
+    });
+    await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+    expect(waits).toHaveLength(CRM_RECORD_ATTEMPTS - 1);
+  });
+
   it('treats a completed-but-unwritten CRM call as NOT recorded', async () => {
     // recordInviteWithdrawnInCrm resolves with engagementLogged:false when the lead
     // vanished or contention outlived its retries. Counting a non-throw as success

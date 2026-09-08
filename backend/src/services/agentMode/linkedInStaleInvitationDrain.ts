@@ -352,8 +352,14 @@ export async function withdrawStaleInvitations(params: {
           }
         } catch (err) {
           lastErr = err;
-          if (attempt < CRM_RECORD_ATTEMPTS - 1) await wait(CRM_RETRY_BACKOFF_MS * (attempt + 1));
         }
+        // Back off between attempts whichever way this one failed (CodeRabbit on
+        // PR #2818). Waiting only in the catch branch retried a CAS-contention
+        // `engagementLogged: false` IMMEDIATELY, so all three attempts could burn
+        // before the competing write settled — turning a recoverable race into a
+        // permanently missing history entry, which is the outcome this retry loop
+        // exists to avoid.
+        if (attempt < CRM_RECORD_ATTEMPTS - 1) await wait(CRM_RETRY_BACKOFF_MS * (attempt + 1));
       }
       if (!recorded) {
         console.error(
