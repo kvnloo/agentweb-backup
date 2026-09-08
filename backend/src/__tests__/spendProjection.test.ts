@@ -181,6 +181,31 @@ describe('projectMonth', () => {
   });
 });
 
+  describe('unlimited tiers', () => {
+    it('never reports overspend for an account with no cap', () => {
+      // Without this an uncapped account arrives with a 0 allowance -- "no
+      // policy" is not "zero dollars" -- and every micro-dollar it spends
+      // reads as overspend, so the response would call the account unlimited
+      // AND say it blew through a zero cap (CodeRabbit, PR #2811).
+      const p = projectMonth('owner-1', '2026-09', [anEvent({ costMicroUsd: 9_000_000 })], {
+        includedAllowanceMicroUsd: 0,
+        unlimited: true,
+      });
+
+      expect(p.unlimited).toBe(true);
+      expect(p.overspentMicroUsd).toBe(0);
+      expect(p.remainingMicroUsd).toBe(0);
+      expect(p.settledMicroUsd).toBe(9_000_000);
+    });
+
+    it('still reports overspend for a capped account', () => {
+      const p = projectMonth('owner-1', '2026-09', [anEvent({ costMicroUsd: 9_000_000 })], allowance);
+
+      expect(p.unlimited).toBe(false);
+      expect(p.overspentMicroUsd).toBe(6_000_000);
+    });
+  });
+
 describe('reconcileProjection — §3 invariant', () => {
   it('agrees with a projection built from the same events', () => {
     const events = [
