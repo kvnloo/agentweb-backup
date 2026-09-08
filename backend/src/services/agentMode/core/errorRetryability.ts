@@ -69,6 +69,12 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
   // "an identical retry is known-pointless".
   'read_bounded',
+  // publisher_refused is deliberately excluded (ENG-1162): read_file_content's publisher-refusal
+  // message doesn't embed the URL, so two different blocked sources (e.g. two different hosts)
+  // collide on the same breaker key — fast-tripping would trip the breaker across legitimately
+  // different resources, the same same-error-text-different-args hazard empty_result/not_found
+  // are excluded for above. It stays out of RETRYABLE_ERROR_CLASSES too, so it still falls to the
+  // conservative default (NOT retryable) via the normal 3-strike threshold.
 ]);
 
 export function isRetryableErrorClass(errorClass: string): boolean {
