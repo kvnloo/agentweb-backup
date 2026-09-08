@@ -11161,15 +11161,36 @@ export const scheduleTemplateDb = {
     reviewFeedback?: string;
     createdAt: string;
     updatedAt: string;
-  }) {
+  }, opts: {
+    /**
+     * ENG-1722: refuse to overwrite an existing row with this `templateId`.
+     *
+     * The seed script used to check-then-create with a freshly generated id on
+     * every run, so two concurrent runs could both observe "absent" and create
+     * DUPLICATE system templates — each visible to every customer — which is
+     * exactly the idempotence contract the seed is supposed to hold (CodeRabbit).
+     * A stable id plus this condition makes the create itself the uniqueness
+     * check, so there is no window between the two.
+     *
+     * On a collision the thrown error carries `alreadyExists`, which a seeder can
+     * treat as success rather than as a fault.
+     */
+    onlyIfAbsent?: boolean;
+  } = {}) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
         Item: template,
+        ...(opts.onlyIfAbsent ? { ConditionExpression: 'attribute_not_exists(templateId)' } : {}),
       };
       await dynamodb.put(params).promise();
       return template;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const exists: any = new Error(`Schedule template ${template.templateId} already exists`);
+        exists.alreadyExists = true;
+        throw exists;
+      }
       handleDynamoDbError(error, "createTemplate");
     }
   },

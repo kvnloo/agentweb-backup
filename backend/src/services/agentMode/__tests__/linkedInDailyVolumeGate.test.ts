@@ -84,7 +84,7 @@ describe('resolveLinkedInAccountForWrite — ownership resolution', () => {
 
 describe('paceLinkedInWrite — check ordering and persistence', () => {
   it('is a no-op for actions outside PACED_WRITE_ACTIONS — no pacer or persistence call at all', async () => {
-    const result = await paceLinkedInWrite('search-people', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined }, ACCOUNT_ID);
+    const result = await paceLinkedInWrite('search-people', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID);
 
     expect(result.refusal).toBeNull();
     expect(mockReserveWriteSlot).not.toHaveBeenCalled();
@@ -94,7 +94,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
   it('refuses on the daily cap WITHOUT ever calling the hourly/burst pacer', async () => {
     const exhausted = { invite: { count: 10, windowStartedAt: Date.now() } };
 
-    const result = await paceLinkedInWrite('send-invite', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: exhausted }, ACCOUNT_ID);
+    const result = await paceLinkedInWrite('send-invite', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: exhausted, connectedAt: undefined }, ACCOUNT_ID);
 
     expect(result.refusal).not.toBeNull();
     expect(result.refusal!.message).toBe('LinkedIn daily volume limit reached');
@@ -105,7 +105,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
   it('does NOT persist the daily reservation when the hourly/burst pacer refuses — the exact bug this fixes', async () => {
     mockReserveWriteSlot.mockResolvedValue({ allowed: false, reason: 'hourly ceiling reached', retryAfterMs: 60_000 });
 
-    const result = await paceLinkedInWrite('send-invite', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined }, ACCOUNT_ID);
+    const result = await paceLinkedInWrite('send-invite', { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID);
 
     expect(result.refusal).not.toBeNull();
     expect(result.refusal!.message).toBe('LinkedIn write actions are being paced');
@@ -121,7 +121,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
 
     const result = await paceLinkedInWrite(
       'send-invite',
-      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: 10, dailyVolumeState: undefined },
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
     );
 
@@ -146,7 +146,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
 
     const result = await paceLinkedInWrite(
       'send-invite',
-      { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined },
+      { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
     );
 
@@ -158,7 +158,7 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
 
     const result = await paceLinkedInWrite(
       'send-invite',
-      { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined },
+      { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
     );
 
@@ -168,20 +168,20 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
 
 describe('setDailyInviteCap', () => {
   it('writes the cap through the account OWNER record, not the caller', async () => {
-    await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined }, ACCOUNT_ID, 30);
+    await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID, 30);
 
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith('owner-user-id', 'unipile', ACCOUNT_ID, { daily_invite_cap: 30 });
   });
 
   it('validates and clamps the cap inside the focused gate helper', async () => {
     await expect(setDailyInviteCap(
-      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       -1,
     )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
 
     await expect(setDailyInviteCap(
-      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       100,
     )).resolves.toBe(30);
@@ -192,9 +192,113 @@ describe('setDailyInviteCap', () => {
   // an 11th invite — exceeding the configured daily cap.
   it('rejects a fractional cap', async () => {
     await expect(setDailyInviteCap(
-      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined },
+      { ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined },
       ACCOUNT_ID,
       10.5,
     )).rejects.toThrow('daily_invite_cap must be a non-negative integer');
+  });
+});
+
+// ENG-1721 / ENG-1609 AC #6 — the warm-up ramp has to reach the send path from
+// the ACCOUNT RECORD, not just be correct in isolation. The arithmetic is pinned
+// in linkedInWarmupRamp.test.ts; this pins the wiring.
+describe('warm-up ramp wiring (ENG-1721)', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const accountRow = (createdAt: string | undefined, config: any = {}) => ([{
+    platform: 'unipile',
+    account_id: ACCOUNT_ID,
+    userId: 'user-1',
+    created_at: createdAt,
+    config,
+  }]);
+
+  it('reads created_at off the account record', async () => {
+    const createdAt = new Date(Date.now() - DAY).toISOString();
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(
+      accountRow(createdAt, { daily_invite_cap: 30 }),
+    );
+
+    const resolved = await resolveLinkedInAccountForWrite('user-1', ACCOUNT_ID);
+
+    expect(resolved).toMatchObject({ connectedAt: createdAt, configuredDailyInviteCap: 30 });
+  });
+
+  it('AC #6: a connection made yesterday is refused at the warm-up rate, not its configured 30', async () => {
+    const account = {
+      ownerUserId: 'user-1',
+      configuredDailyInviteCap: 30,
+      // Five already sent today: under the configured 30, at the warm-up 5.
+      dailyVolumeState: { invite: { count: 5, windowStartedAt: Date.now() } },
+      connectedAt: new Date(Date.now() - DAY).toISOString(),
+    };
+
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+
+    expect(result.refusal).not.toBeNull();
+    expect(result.refusal!.message).toBe('LinkedIn daily volume limit reached');
+    expect(result.refusal!.error).toContain('safety ceiling of 5');
+    // Refused before the hourly pacer and before any write, exactly like the
+    // configured-cap path.
+    expect(mockReserveWriteSlot).not.toHaveBeenCalled();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
+  it('the same state on an ESTABLISHED connection is allowed through', async () => {
+    mockUpdateAccountConfig.mockImplementation(async (_u: string, _p: string, _a: string, fn: any) => {
+      fn({ daily_invite_cap: 30, daily_volume: { invite: { count: 5, windowStartedAt: Date.now() } } });
+    });
+    const account = {
+      ownerUserId: 'user-1',
+      configuredDailyInviteCap: 30,
+      dailyVolumeState: { invite: { count: 5, windowStartedAt: Date.now() } },
+      connectedAt: new Date(Date.now() - 200 * DAY).toISOString(),
+    };
+
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+
+    expect(result.refusal).toBeNull();
+  });
+
+  it('applies the ramp on the DURABLE re-check too, not just the cheap first check', async () => {
+    // The CAS callback re-derives the slot from freshly-read config. Reading the
+    // unramped cap there would commit a reservation the first check had refused —
+    // and created_at lives on the account row, not in config, so it has to come
+    // from the resolved account.
+    let capturedRefusal: string | undefined;
+    mockUpdateAccountConfig.mockImplementation(async (_u: string, _p: string, _a: string, fn: any) => {
+      // Fresh config shows 5 sent — fine for a configured 30, over the warm-up 5.
+      const out = fn({ daily_invite_cap: 30, daily_volume: { invite: { count: 5, windowStartedAt: Date.now() } } });
+      capturedRefusal = out?.skip ? 'skipped' : undefined;
+    });
+    const account = {
+      ownerUserId: 'user-1',
+      configuredDailyInviteCap: 30,
+      // Cheap check passes (nothing sent yet in the in-memory view)...
+      dailyVolumeState: { invite: { count: 0, windowStartedAt: Date.now() } },
+      connectedAt: new Date(Date.now() - DAY).toISOString(),
+    };
+
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+
+    // ...and the durable re-check catches it against the RAMPED cap.
+    expect(capturedRefusal).toBe('skipped');
+    expect(result.refusal).not.toBeNull();
+    expect(result.refusal!.error).toContain('safety ceiling of 5');
+  });
+
+  it('an account with no created_at keeps its configured cap rather than being throttled', async () => {
+    mockUpdateAccountConfig.mockImplementation(async (_u: string, _p: string, _a: string, fn: any) => {
+      fn({ daily_invite_cap: 30, daily_volume: { invite: { count: 5, windowStartedAt: Date.now() } } });
+    });
+    const account = {
+      ownerUserId: 'user-1',
+      configuredDailyInviteCap: 30,
+      dailyVolumeState: { invite: { count: 5, windowStartedAt: Date.now() } },
+      connectedAt: undefined,
+    };
+
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+
+    expect(result.refusal).toBeNull();
   });
 });

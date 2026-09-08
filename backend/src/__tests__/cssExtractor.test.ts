@@ -381,6 +381,52 @@ describe('cssExtractor', () => {
         })
       );
     });
+
+    it('surfaces a 403 from the JSDOM fallback fetch as a publisher refusal, not a bare status-code message (ENG-1162)', async () => {
+      // Puppeteer already failed (that's why we're here) and this fallback's own
+      // anonymous fetch is ALSO blocked — the same real-world case as ENG-1162's
+      // read_file_content bug, just via a different tool (read_page_source with
+      // extractDesignTokens:true). Without the fix, this throws a bare
+      // "Failed to fetch URL: Request failed with status code 403" that
+      // classifyToolErrorClass's embedded-status regex sweeps into 'auth'.
+      const origImpl = (findChromeExecutable as jest.Mock).getMockImplementation();
+      (findChromeExecutable as jest.Mock).mockReturnValue(undefined);
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 403');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 403, statusText: 'Forbidden' };
+      (axios.get as jest.Mock).mockRejectedValueOnce(axiosError);
+
+      await expect(extractCSSFromURL('https://blocked-fixture.example.com')).rejects.toThrow(
+        /The publisher refused this fetch \(HTTP 403: Forbidden\) — this is a site-side access block/
+      );
+
+      if (origImpl) {
+        (findChromeExecutable as jest.Mock).mockImplementation(origImpl);
+      } else {
+        (findChromeExecutable as jest.Mock).mockReturnValue('/usr/bin/google-chrome');
+      }
+    });
+
+    it('leaves a non-401/403 fetch failure on the original bare message (no over-broad rewrite)', async () => {
+      const origImpl = (findChromeExecutable as jest.Mock).getMockImplementation();
+      (findChromeExecutable as jest.Mock).mockReturnValue(undefined);
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 500');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 500, statusText: 'Internal Server Error' };
+      (axios.get as jest.Mock).mockRejectedValueOnce(axiosError);
+
+      await expect(extractCSSFromURL('https://flaky-fixture.example.com')).rejects.toThrow(
+        'Failed to fetch URL: Request failed with status code 500'
+      );
+
+      if (origImpl) {
+        (findChromeExecutable as jest.Mock).mockImplementation(origImpl);
+      } else {
+        (findChromeExecutable as jest.Mock).mockReturnValue('/usr/bin/google-chrome');
+      }
+    });
   });
 
   // =========== SUCCESS TESTS ===========
