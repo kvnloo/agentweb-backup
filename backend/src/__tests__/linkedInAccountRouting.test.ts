@@ -28,10 +28,16 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
     delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
   });
 
+  // Well past the ENG-1721 warm-up ramp (max 14 days) — these fixtures model
+  // an established account so existing assertions are about the configured
+  // cap, not the ramp. Cooldown/ramp-specific behavior gets its own fixtures.
+  const ESTABLISHED_CONNECTED_AT = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString();
+
   const cappedAccount: ResolvedLinkedInAccount = {
     ownerUserId: CALLER,
     configuredDailyInviteCap: 10,
     dailyVolumeState: { invite: { count: 10, windowStartedAt: Date.now() } },
+    connectedAt: ESTABLISHED_CONNECTED_AT,
   };
 
   it('returns null (no routing) when the requested account already has headroom — AC5, single/unconstrained account unchanged', async () => {
@@ -39,6 +45,7 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
       ownerUserId: CALLER,
       configuredDailyInviteCap: 10,
       dailyVolumeState: { invite: { count: 3, windowStartedAt: Date.now() } },
+      connectedAt: ESTABLISHED_CONNECTED_AT,
     };
 
     const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', headroomAccount);
@@ -69,6 +76,72 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
     expect(result!.reason).toContain('acct-B');
   });
 
+  describe('ENG-1721 warm-up ramp interaction', () => {
+    // The account behind the actual ENG-1132/ENG-1614 production incident was
+    // itself under 24h old — a freshly-connected account's EFFECTIVE cap is
+    // lower than its configured one (see ENG-1721's warm-up ramp), so headroom
+    // must be evaluated against the ramp, not just the configured cap, on
+    // BOTH the requested account and every candidate.
+    const justConnected = new Date().toISOString();
+    const wellEstablished = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString();
+
+    it('routes away from a freshly-connected requested account that has hit its ramp limit, even though its configured cap is much higher', async () => {
+      const rampedAccount: ResolvedLinkedInAccount = {
+        ownerUserId: CALLER,
+        configuredDailyInviteCap: 30,
+        // Day-1 ramp limit is 5 (LINKEDIN_WARMUP_RAMP) — already at 5, so this
+        // account has ZERO real headroom today despite its cap reading "30".
+        dailyVolumeState: { invite: { count: 5, windowStartedAt: Date.now() } },
+        connectedAt: justConnected,
+      };
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 30 } },
+        {
+          platform: 'unipile',
+          account_id: 'acct-B',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          created_at: wellEstablished,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+      ]);
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', rampedAccount);
+
+      expect(result).not.toBeNull();
+      expect(result!.accountId).toBe('acct-B');
+    });
+
+    it('does not pick a freshly-connected candidate that has already hit its own ramp limit', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 10 } },
+        {
+          // Configured cap reads generous (30), but this account is brand new —
+          // ramped down to 5/day — and has already used all 5 today.
+          platform: 'unipile',
+          account_id: 'acct-B',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          created_at: justConnected,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 5, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'acct-C',
+          userId: 'teammate-3',
+          sharedWithOrg: true,
+          created_at: wellEstablished,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 0, windowStartedAt: Date.now() } } },
+        },
+      ]);
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', cappedAccount);
+
+      expect(result).not.toBeNull();
+      expect(result!.accountId).toBe('acct-C');
+    });
+  });
+
   describe('LinkedIn account-level invitation cooldown ("Cannot resend yet")', () => {
     // ENG-1132/ENG-1614 root-cause check: the real production incidents behind this
     // ticket (iTrials/Sweta, Hannah K) were all this in-process breaker, not the
@@ -82,6 +155,7 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
       ownerUserId: CALLER,
       configuredDailyInviteCap: 10,
       dailyVolumeState: { invite: { count: 1, windowStartedAt: Date.now() } },
+      connectedAt: ESTABLISHED_CONNECTED_AT,
     };
 
     it('routes send-invite to another account when the requested one is under cooldown despite having daily headroom', async () => {
