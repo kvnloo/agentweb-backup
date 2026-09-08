@@ -198,34 +198,68 @@ describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
       jest.spyOn(Date, 'now').mockRestore();
     });
 
-    it('counts a loss on the tokenless path too, but never retries it', async () => {
-      // That path's aggregate write is an unconditional ADD: a retry after a
-      // lost response double-counts, which is the failure AC1 exists to
-      // prevent. Under-counting is recoverable through reconciliation;
-      // over-charging a customer is not.
-      mockPlain.mockRejectedValue(Object.assign(new Error('throttled'), { code: 'ThrottlingException' }));
+    it('retries a tokenless call too, now that every call carries a minted id', async () => {
+      // Before ENG-1250 §6 the tokenless path could not be retried safely: its
+      // unconditional ADD would double-count after a lost response. With a
+      // minted id the replay dedupes, so AC3's retry is now universally safe.
+      mockTxn.mockRejectedValue(Object.assign(new Error('throttled'), { code: 'ThrottlingException' }));
 
       await recordVendorUsage(ctx());
 
-      expect(mockPlain).toHaveBeenCalledTimes(1);
+      expect(mockTxn).toHaveBeenCalledTimes(3);
       expect(getDroppedWriteTotals()).toEqual({ count: 1, lostMicroUsd: 12500 });
     });
   });
 
-  describe('without a token — the legacy path is unchanged', () => {
-    it('writes the aggregate, then mirrors fail-open', async () => {
+  describe('without a token — every vendor call still takes the atomic path', () => {
+    it('uses the transaction even when the call site supplies no token', async () => {
+      // ENG-1250 §6: threading a minted nonce through eleven call sites would
+      // buy nothing the central mint does not, so the floor is raised here.
       await recordVendorUsage(ctx());
+
+      expect(mockTxn).toHaveBeenCalledTimes(1);
+      expect(mockPlain).not.toHaveBeenCalled();
+    });
+
+    it('mints a marked event id so a retry cannot double-count', async () => {
+      await recordVendorUsage(ctx());
+
+      expect(mockTxn.mock.calls[0][1].eventId).toMatch(/^gen:/);
+    });
+
+    it('gives distinct ids to two separate calls', async () => {
+      await recordVendorUsage(ctx());
+      await recordVendorUsage(ctx());
+
+      expect(mockTxn.mock.calls[0][1].eventId).not.toBe(mockTxn.mock.calls[1][1].eventId);
+    });
+  });
+
+  describe('fallback when the ledger transaction fails', () => {
+    beforeEach(() => {
+      mockTxn.mockRejectedValue(Object.assign(new Error('down'), { code: 'ValidationException' }));
+    });
+
+    it('still lands the LIVE row, so one table\'s outage does not stop both rails', async () => {
+      await recordVendorUsage(ctx({ idempotencyKey: 'k' }));
 
       expect(mockPlain).toHaveBeenCalledTimes(1);
       expect(mockMirror).toHaveBeenCalledTimes(1);
-      expect(mockTxn).not.toHaveBeenCalled();
     });
 
-    it('still does not mirror when the live write fails', async () => {
-      mockPlain.mockRejectedValue(new Error('usage table down'));
+    it('still counts the lost ledger write', async () => {
+      await recordVendorUsage(ctx({ idempotencyKey: 'k' }));
 
-      await expect(recordVendorUsage(ctx())).resolves.toBeUndefined();
-      expect(mockMirror).not.toHaveBeenCalled();
+      expect(getDroppedWriteTotals()).toEqual({ count: 1, lostMicroUsd: 12500 });
+    });
+
+    it('never throws even when the fallback fails too, and counts the loss ONCE', async () => {
+      // Both catches would otherwise fire for one lost write, inflating the
+      // lost-dollars figure AC3 exists to make trustworthy.
+      mockPlain.mockRejectedValue(new Error('usage table down as well'));
+
+      await expect(recordVendorUsage(ctx({ idempotencyKey: 'k' }))).resolves.toBeUndefined();
+      expect(getDroppedWriteTotals()).toEqual({ count: 1, lostMicroUsd: 12500 });
     });
   });
 });
