@@ -25,10 +25,13 @@ _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 # openai==1.109.1, httpx==0.28.1): the constructed client's underlying httpx
 # timeout was literally `None` with no `timeout` kwarg passed here, i.e. this
 # gateway has never had ANY effective request timeout, bounded only by
-# task_monitor.py's 900s/1800s process-level kill switch. Live-verified in
-# production (execution 1788877994807): a single browser-use per-step
-# get_next_action() call took ~7m45s before returning a malformed response
-# after ENG-1820 removed require_parameters. browser-use's per-step call is
+# task_monitor.py's process-level kill switch (TASK_EXECUTION_TIMEOUT_SECONDS,
+# default 900s for regular tasks; COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS,
+# 5400s in production via the systemd unit's real Environment= override, not
+# the code's own 1800s fallback default). Live-verified in production
+# (execution 1788877994807): a single browser-use per-step get_next_action()
+# call took ~7m45s before returning a malformed response after ENG-1820
+# removed require_parameters. browser-use's per-step call is
 # `with_structured_output(..., method="function_calling")`, a single
 # tool_choice-forced call with a small bounded JSON output (not a long
 # streaming generation), so a short bound is correct for it; the other two
@@ -38,6 +41,19 @@ _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 # in broad try/except that degrades gracefully on failure -- so one shared,
 # generous-but-bounded timeout is safe for all current callers without
 # needing per-call-site plumbing.
+#
+# Real worst-case latency before a step's failure surfaces is higher than
+# this constant alone suggests: openai's own SDK retries once on a timeout
+# (max_retries=1 below), so one stalled provider costs up to ~2x this value
+# before browser-use even sees the failure, and browser-use's own
+# max_failures=5 breaker (agent_kwargs in web_agent.py) means a
+# persistently-bad provider could still burn up to ~5x that (~1200s at the
+# current 120s) before browser-use gives up on the step -- which can exceed
+# the 900s regular-task kill switch above for a persistently-hanging
+# provider, in which case that outer timeout fires first rather than a
+# cleaner browser-use-level failure. Still strictly bounded either way,
+# unlike the pre-fix indefinite hang, but worth knowing the effective ceiling
+# is a multiple of REQUEST_TIMEOUT_SECONDS, not the value itself.
 REQUEST_TIMEOUT_SECONDS = 120
 
 # Only aliases whose old upstream ID no longer exists on OpenRouter belong here.
