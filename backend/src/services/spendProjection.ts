@@ -49,6 +49,15 @@ export interface AllowanceInputs {
   /** Admin grants (positive) and reversals (negative). */
   adminAdjustmentMicroUsd?: number;
   migrationAdjustmentMicroUsd?: number;
+  /**
+   * The tier has no configured cap, so there is nothing to exceed.
+   *
+   * Without this an uncapped account arrives with an included allowance of 0
+   * — because "no policy" is not "zero dollars" — and every micro-dollar it
+   * spends is reported as overspend (CodeRabbit, PR #2811). The response then
+   * says the account is unlimited AND that it blew through a zero cap.
+   */
+  unlimited?: boolean;
 }
 
 export interface MonthlyProjection {
@@ -70,6 +79,8 @@ export interface MonthlyProjection {
   remainingMicroUsd: number;
   /** How far past the allowance the subject already is, 0 when within it. */
   overspentMicroUsd: number;
+  /** True when the tier has no cap — remaining and overspent are then not meaningful. */
+  unlimited: boolean;
 
   /**
    * SHADOW ONLY — see the module header. Nothing consumes this.
@@ -166,8 +177,11 @@ export function projectMonth(
   );
 
   const committed = settledMicroUsd + reservedMicroUsd;
-  const remainingMicroUsd = Math.max(0, usableAllowanceMicroUsd - committed);
-  const overspentMicroUsd = Math.max(0, committed - usableAllowanceMicroUsd);
+  // An uncapped account cannot overspend or run down a balance; both figures
+  // are meaningless rather than zero-and-exceeded.
+  const unlimited = allowance.unlimited === true;
+  const remainingMicroUsd = unlimited ? 0 : Math.max(0, usableAllowanceMicroUsd - committed);
+  const overspentMicroUsd = unlimited ? 0 : Math.max(0, committed - usableAllowanceMicroUsd);
 
   return {
     billingUserId,
@@ -181,6 +195,7 @@ export function projectMonth(
     usableAllowanceMicroUsd,
     remainingMicroUsd,
     overspentMicroUsd,
+    unlimited,
     ...shadowPolicyMode(settledMicroUsd, policy),
     settledEventCount: settled.length,
     reservedEventCount: reserved.length,

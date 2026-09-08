@@ -47,6 +47,7 @@ const aProjection = (over: Partial<MonthlyProjection> = {}): MonthlyProjection =
   reservedEventCount: 0,
   voidedEventCount: 0,
   excludedEventCount: 0,
+  unlimited: false,
   ...over,
 });
 
@@ -258,6 +259,7 @@ describe('resolveAllowanceInputs', () => {
       adminAdjustmentMicroUsd: 500_000,
       migrationAdjustmentMicroUsd: 300_000,
       unlimited: false,
+      policy: { hardCostThresholdMicroUsd: 200_000_000 },
     });
   });
 

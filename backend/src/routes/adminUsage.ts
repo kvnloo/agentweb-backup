@@ -77,7 +77,10 @@ router.get(
 
       // Computed from the SAME events the breakdown reports, so the
       // explanation and the numbers behind it can never disagree.
-      const projection = projectMonth(billingUserId, month, events, allowance);
+      // The policy MUST be threaded: without it projectMonth evaluates with no
+      // policy, returns full_choice unconditionally, and no pause is ever
+      // explained — the opposite of what this endpoint exists for.
+      const projection = projectMonth(billingUserId, month, events, allowance, allowance.policy as any);
 
       return res.json({
         ...breakdown,

@@ -267,6 +267,12 @@ export async function resolveAllowanceInputs(
   migrationAdjustmentMicroUsd: number;
   /** True when the tier has no configured cap — an unlimited account cannot be paused by spend. */
   unlimited: boolean;
+  /**
+   * The tier's policy, returned so the caller can hand it to `projectMonth`.
+   * Without it the projection evaluates with no policy, reports `full_choice`
+   * unconditionally, and no pause can ever be explained (CodeRabbit, PR #2811).
+   */
+  policy: { hardCostThresholdMicroUsd: number } | null;
 }> {
   const user = await deps.getUser(billingUserId);
   const config = user?.subscriptionType ? await deps.getTierConfig(user.subscriptionType) : null;
@@ -282,5 +288,6 @@ export async function resolveAllowanceInputs(
     adminAdjustmentMicroUsd: adjustment.adminGrantedMicroUsd,
     migrationAdjustmentMicroUsd: adjustment.migrationOffsetMicroUsd,
     unlimited: policy == null,
+    policy,
   };
 }
