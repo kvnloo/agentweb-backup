@@ -47,17 +47,21 @@ _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 # needing per-call-site plumbing.
 #
 # Real worst-case latency before a step's failure surfaces is higher than
-# this constant alone suggests: openai's own SDK retries once on a timeout
-# (max_retries=1 below), so one stalled provider costs up to ~2x this value
-# before browser-use even sees the failure, and browser-use's own
-# max_failures=5 breaker (agent_kwargs in web_agent.py) means a
-# persistently-bad provider could still burn up to ~5x that (~1200s at the
-# current 120s) before browser-use gives up on the step -- which can exceed
-# the 900s regular-task kill switch above for a persistently-hanging
-# provider, in which case that outer timeout fires first rather than a
-# cleaner browser-use-level failure. Still strictly bounded either way,
-# unlike the pre-fix indefinite hang, but worth knowing the effective ceiling
-# is a multiple of REQUEST_TIMEOUT_SECONDS, not the value itself.
+# this constant alone suggests -- and, per the ENG-1822 FOLLOW-UP comment
+# below, this constant alone does not actually bound it at all against a
+# trickling provider. The real enforced per-call ceiling is
+# HARD_DEADLINE_SECONDS (defined below, currently 255s), which already wraps
+# openai's own SDK retry-on-timeout (max_retries=1 below) inside the same
+# wait_for -- so one stalled provider costs at most HARD_DEADLINE_SECONDS,
+# not an unbounded multiple of it. browser-use's own max_failures=5 breaker
+# (agent_kwargs in web_agent.py) means a persistently-bad provider can still
+# burn up to ~5x that (~1275s at the current 255s) before browser-use gives
+# up on the step -- which can exceed the 900s regular-task kill switch above
+# for a persistently-hanging provider, in which case that outer timeout
+# fires first rather than a cleaner browser-use-level failure. Still
+# strictly bounded either way, unlike the pre-fix indefinite hang, but worth
+# knowing the effective ceiling is a multiple of HARD_DEADLINE_SECONDS, not
+# the value itself.
 #
 # ENG-1822 FOLLOW-UP -- this constant alone does NOT bound real wall-clock
 # call duration, despite everything above and despite being verified live on
@@ -151,6 +155,18 @@ def _enforce_hard_deadline(base_cls):
     since the zero-argument `super()` shorthand only works for methods
     defined lexically inside a `class` statement, not ones assigned into a
     dynamically-built class's namespace via `type(...)`.
+
+    The returned class's __name__/__qualname__/__module__ are copied from
+    base_cls rather than left as a distinct "HardDeadline..." name:
+    browser-use's Agent._verify_llm_connection() looks up required env vars
+    via REQUIRED_LLM_API_ENV_VARS.get(self.llm.__class__.__name__, []),
+    keyed on the literal string "ChatOpenAI" -- confirmed directly against
+    the installed browser_use source. A distinctly-named subclass would
+    silently miss that lookup on every task (this deployment doesn't set
+    SKIP_LLM_API_KEY_VERIFICATION, so that check runs every time) and quietly
+    drop its own connection-failure error log, without changing behavior
+    anywhere that actually branches on the return value -- still worth
+    keeping identical rather than depending on that.
     """
 
     async def _hard_deadline_ainvoke(self, *args, **kwargs):
@@ -171,10 +187,25 @@ def _enforce_hard_deadline(base_cls):
         # thread (still stuck in the real call after we've already given up
         # on it) can't block the interpreter's normal shutdown sequence the
         # way a plain concurrent.futures.ThreadPoolExecutor worker would
-        # (those are non-daemon by default and get joined at exit). The
-        # thread itself is still bounded by the client's own `timeout`, so
-        # it can't leak forever -- this is the standard pattern for
-        # imposing a hard deadline on non-cooperative sync code.
+        # (those are non-daemon by default and get joined at exit).
+        #
+        # NOTE: unlike the async path, this does NOT actually bound how long
+        # the abandoned background thread itself keeps running -- the whole
+        # point of this module's ENG-1822 FOLLOW-UP investigation is that the
+        # client's own `timeout` does *not* reliably bound a trickling call,
+        # so a sync .invoke() hitting that same condition can leave its
+        # daemon thread (and its socket) blocked indefinitely after we've
+        # already raised TimeoutError to the caller. This is still a real
+        # improvement over the pre-fix behavior (the caller was blocked
+        # forever too, with no escape at all) and Python gives no safe way to
+        # forcibly cancel a blocked synchronous call from another thread, so
+        # a bounded-wait daemon thread is the accepted pattern here -- but do
+        # not read "daemon" as "can't leak a thread/socket," only as "can't
+        # block interpreter shutdown." browser-use calls the sync .invoke()
+        # path on every task via Agent._verify_llm_connection() (not gated by
+        # any env flag in this deployment), so this is a live, not
+        # theoretical, exposure worth knowing about if VM memory/FD usage
+        # ever needs explaining.
         result: queue.Queue = queue.Queue(maxsize=1)
 
         def _run():
@@ -194,11 +225,17 @@ def _enforce_hard_deadline(base_cls):
             raise payload
         return payload
 
-    return type(
-        f"HardDeadline{base_cls.__name__}",
+    # Named identically to base_cls (not e.g. "HardDeadlineChatOpenAI"): see
+    # the docstring above -- browser-use's string-keyed __class__.__name__
+    # lookups need to see "ChatOpenAI", not a distinctly-named subclass.
+    wrapped_cls = type(
+        base_cls.__name__,
         (base_cls,),
         {"ainvoke": _hard_deadline_ainvoke, "invoke": _hard_deadline_invoke},
     )
+    wrapped_cls.__qualname__ = base_cls.__qualname__
+    wrapped_cls.__module__ = base_cls.__module__
+    return wrapped_cls
 
 
 # Only aliases whose old upstream ID no longer exists on OpenRouter belong here.
