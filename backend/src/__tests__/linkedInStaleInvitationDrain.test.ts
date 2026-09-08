@@ -240,6 +240,57 @@ describe('withdrawStaleInvitations', () => {
     expect(result.withdrawn).toHaveLength(1);
   });
 
+  it('backs off between attempts however the attempt failed', async () => {
+    // Waiting only on a thrown error retried a CAS-contention engagementLogged:false
+    // immediately, so all three attempts could burn before the competing write
+    // settled (CodeRabbit on PR #2818).
+    const waits: number[] = [];
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => ({ engagementLogged: false })),
+      sleep: async (ms: number) => { waits.push(ms); },
+    });
+
+    await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(waits).toHaveLength(CRM_RECORD_ATTEMPTS - 1);
+    expect(waits[1]).toBeGreaterThan(waits[0]);
+  });
+
+  it('does not sleep after the FINAL attempt', async () => {
+    const waits: number[] = [];
+    const deps = makeDeps([row('a', 40)], {
+      recordWithdrawal: jest.fn(async () => { throw new Error('down'); }),
+      sleep: async (ms: number) => { waits.push(ms); },
+    });
+    await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+    expect(waits).toHaveLength(CRM_RECORD_ATTEMPTS - 1);
+  });
+
+  it('treats a completed-but-unwritten CRM call as NOT recorded', async () => {
+    // recordInviteWithdrawnInCrm resolves with engagementLogged:false when the lead
+    // vanished or contention outlived its retries. Counting a non-throw as success
+    // let a missing history entry be reported as written — the exact silence
+    // crmRecordFailed exists to break.
+    const recordWithdrawal = jest.fn(async () => ({ leadId: 'l1', listId: 'list1', engagementLogged: false }));
+    const deps = makeDeps([row('a', 40)], { recordWithdrawal, sleep: async () => {} });
+
+    const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+
+    expect(recordWithdrawal).toHaveBeenCalledTimes(CRM_RECORD_ATTEMPTS);
+    expect(result.crmRecordFailed).toHaveLength(1);
+    expect(result.withdrawn).toHaveLength(1);
+  });
+
+  it('counts engagementLogged:true, and a null (no lead to attach to), as recorded', async () => {
+    for (const outcome of [{ leadId: 'l1', listId: 'list1', engagementLogged: true }, null]) {
+      const deps = makeDeps([row('a', 40)], {
+        recordWithdrawal: jest.fn(async () => outcome as any), sleep: async () => {},
+      });
+      const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
+      expect(result.crmRecordFailed).toEqual([]);
+    }
+  });
+
   it('gives up after the bounded attempts and reports it', async () => {
     const recordWithdrawal = jest.fn(async () => { throw new Error('crm down'); });
     const deps = makeDeps([row('a', 40)], { recordWithdrawal, sleep: async () => {} });

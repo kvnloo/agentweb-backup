@@ -605,7 +605,7 @@ export async function recordInviteWithdrawnInCrm(params: {
   invitationId: string;
   sentAt?: string;
   listId?: string;
-}): Promise<{ leadId: string; listId: string } | null> {
+}): Promise<{ leadId: string; listId: string; engagementLogged: boolean } | null> {
   const normalized = normalizeLinkedInUrl(params.linkedinUrl);
   if (!normalized) return null;
 
@@ -648,7 +648,9 @@ export async function recordInviteWithdrawnInCrm(params: {
       invitationId: params.invitationId,
       eventType: INVITE_WITHDRAWN_EVENT,
     })) {
-      return { leadId, listId };
+      // Already recorded by an earlier run or a concurrent winner — the history
+      // entry exists, so this IS recorded from the caller's point of view.
+      return { leadId, listId, engagementLogged: true };
     }
     const expectedUpdatedAt = snapshot?.updatedAt ? String(snapshot.updatedAt) : undefined;
     try {
@@ -656,13 +658,15 @@ export async function recordInviteWithdrawnInCrm(params: {
         listId, leadId, engagement,
         expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt },
       );
-      return { leadId, listId };
+      return { leadId, listId, engagementLogged: true };
     } catch (err: any) {
       if (!err?.preconditionFailed) throw err;
       // Someone wrote to the lead in between — possibly this same withdrawal.
       // Re-read and let the loop re-decide.
       snapshot = await crmDb.getLeadById(listId, leadId);
-      if (!snapshot) return { leadId, listId };
+      // The lead vanished mid-retry — nothing was appended, and saying otherwise
+      // would let the drain report a missing history entry as written (CodeRabbit).
+      if (!snapshot) return { leadId, listId, engagementLogged: false };
     }
   }
 
@@ -671,5 +675,9 @@ export async function recordInviteWithdrawnInCrm(params: {
   console.warn(
     `[recordInviteWithdrawn] gave up appending the withdrawal engagement for lead ${listId}/${leadId} after ${MAX_ATTEMPTS} contended attempts`,
   );
-  return { leadId, listId };
+  // Contention outlived the retries: nothing was appended. The caller must be able
+  // to tell this apart from a successful write, or the drain's own
+  // `crmRecordFailed` report — the whole point of which is that nothing re-runs
+  // this — silently under-reports.
+  return { leadId, listId, engagementLogged: false };
 }
