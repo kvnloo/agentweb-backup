@@ -2205,10 +2205,17 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+        plan_id: { type: 'string', description: 'Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog.' },
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
+  execute: async (args: any, context: any) => {
     // Role-aware: admins (or admin-delegated sessions) get the full management
     // list via the admin route; everyone else gets the published/launchable set
     // via the public agent-mode route. Both go through authenticateToken.
@@ -2223,7 +2230,60 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    return jsonResult(data);
+    // ENG-1814: the raw HTTP response carries every step's full body (description,
+    // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
+    // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
+    // non-trivial catalog, forcing the model into a fragile multi-step
+    // search_tool_response/read_tool_response detour just to find a specific title (the
+    // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
+    // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
+    // this tool's output -- it re-fetches its own candidates independently -- so nothing
+    // needs the full shape here by default. Real external MCP clients (confirmed via
+    // mcp_tool_used telemetry -- claude_ai OAuth callers) DO call this tool though, and
+    // unlike launch_predefined_work_plan, an external end user reading the response
+    // (via their own client's LLM) could legitimately want a template's full step
+    // detail -- so the full legacy shape stays reachable behind an explicit opt-in
+    // rather than being silently removed.
+    if (args?.verbose === true) {
+      // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+      // catalog, reopening the same oversized-response/S3-offload mechanism this PR
+      // fixes -- for a caller who usually only wants one template's detail. plan_id
+      // scopes the response to just the matching template(s) so the common case
+      // (verbose + plan_id together) never re-triggers that risk; verbose alone with
+      // no plan_id is still allowed (there's a real, if rarer, use case for "diff
+      // every template's full detail at once") but isn't the guided default.
+      const scoped = args?.plan_id && Array.isArray(data)
+        ? data.filter((p: any) => p.id === args.plan_id || p.planId === args.plan_id || p.title === args.plan_id)
+        : data;
+      return jsonResult(scoped);
+    }
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
+    // Return only what a listing/matching consumer needs by default: the
+    // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
+    // top-level fields launch/recommend calls actually reference.
+    const compact = Array.isArray(data)
+      ? data.map((p: any) => ({
+          // Non-admin (getAllPredefinedWorkPlans) already remaps to `id`. Admin
+          // (getAllWorkPlans -> raw WorkPlan records) never has `id` at all -- only
+          // `planId`, the interface's actual primary key (workPlanService.ts) -- so
+          // `p.id` alone silently dropped the identifier entirely for every
+          // admin/delegated listing (JSON.stringify drops an undefined key), worse
+          // than the pre-fix raw passthrough. Fall back to `planId` so both shapes
+          // keep a real identifier under the `id` key recommend/launch expect.
+          id: p.id ?? p.planId,
+          title: p.title,
+          category: p.category,
+          autocomplete: p.autocomplete,
+          visibility: p.visibility,
+          // Non-admin already carries the computed ENG-1469 projection under
+          // `display`. Admin (raw WorkPlan records) only ever has the raw,
+          // often-undefined WorkPlanDisplayMetadataV1 shape (`stepLabels`, not
+          // `steps`) -- compute the same projection here so admin/delegated
+          // listings get equally useful disambiguating context.
+          display: p.display?.steps ? p.display : (projectWorkPlanForCustomer(p) ?? p.display),
+        }))
+      : data;
+    return jsonResult(compact);
   }
 });
 

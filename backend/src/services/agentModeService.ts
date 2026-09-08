@@ -1450,6 +1450,27 @@ export function normalizeWorkPlanTitleForMatch(value: unknown): string {
     .trim();
 }
 
+/**
+ * ENG-1814: does `a` look like a near-duplicate sibling of `b` -- same word count, differing
+ * in exactly one token -- the shape of the two real, distinct, live-confirmed incidents this
+ * ticket covers (`Founder_Linkedin_Sales_Readiness_Eval` vs `..._Audit`). Deliberately narrow
+ * (exact word-count match, exactly one differing token) so it flags true near-duplicates
+ * without over-triggering on templates that merely share some words -- a genuinely different
+ * template (different word count, or differing in more than one token) never collides. Titles
+ * are compared via normalizeWorkPlanTitleForMatch, so separator/case variance doesn't matter,
+ * only the actual words.
+ */
+export function areNearDuplicateWorkPlanTitles(a: unknown, b: unknown): boolean {
+  const wordsA = normalizeWorkPlanTitleForMatch(a).split(' ').filter(Boolean);
+  const wordsB = normalizeWorkPlanTitleForMatch(b).split(' ').filter(Boolean);
+  if (wordsA.length === 0 || wordsA.length !== wordsB.length) return false;
+  let diffCount = 0;
+  for (let i = 0; i < wordsA.length; i++) {
+    if (wordsA[i] !== wordsB[i]) diffCount++;
+  }
+  return diffCount === 1;
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -32616,6 +32637,7 @@ ${strippedHtml}`;
       // ENG-1794: case/whitespace/underscore-insensitive title match (see
       // normalizeWorkPlanTitleForMatch above) — planId still wins on an exact
       // match first, since a title collision must never shadow a stable id.
+      const matchedByPlanId = candidates.some((p) => p.planId === planTitleOrId);
       const needle = normalizeWorkPlanTitleForMatch(planTitleOrId);
       const predefinedPlan = candidates.find((p) => p.planId === planTitleOrId)
         ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
@@ -32625,6 +32647,42 @@ ${strippedHtml}`;
       }
       if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
         return { success: false, message: 'Not authorized to use this private work plan' };
+      }
+
+      // ENG-1814: a title-based match (not a stable planId) that has a near-duplicate
+      // sibling in the accessible set is exactly the shape of two real, live-confirmed
+      // incidents (Founder_Linkedin_Sales_Readiness_Eval/_Audit) where the model picked
+      // the wrong one of two similarly-named templates while sifting a large
+      // list_predefined_work_plans result, then launched it without ever re-confirming
+      // with the user. A planId-based match is exempt — an id is unambiguous by
+      // construction, and this is exactly the retry path this response's own message
+      // points the model at once the user disambiguates.
+      //
+      // Round-2 review: also catches an EXACT-duplicate title (a different planId whose
+      // normalized title is identical, not just one-word-different) -- arguably more
+      // dangerous than a near-duplicate, since normalizeWorkPlanTitleForMatch resolves
+      // both candidates equally and `.find()` above silently picked whichever happened
+      // to come first in the candidates array, with zero signal distinguishing intent.
+      // Nothing in workPlanService.ts enforces title uniqueness across visibility scopes,
+      // so this is a real (if narrow) possibility, not just theoretical.
+      if (!matchedByPlanId) {
+        const normalizedTargetTitle = normalizeWorkPlanTitleForMatch(predefinedPlan.title);
+        const ambiguousSibling = candidates.find((p) =>
+          p.planId !== predefinedPlan.planId && p.title
+            // Exact-duplicate check needs the same empty-guard the near-duplicate
+            // check already has -- otherwise two degenerately-titled (blank/
+            // separator-only) but genuinely unrelated templates normalize to the
+            // same '' and falsely pair up as ambiguous siblings.
+            && ((normalizedTargetTitle !== '' && normalizeWorkPlanTitleForMatch(p.title) === normalizedTargetTitle)
+              || areNearDuplicateWorkPlanTitles(p.title, predefinedPlan.title))
+        );
+        if (ambiguousSibling) {
+          return {
+            success: false,
+            message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
       }
 
       // Convert template steps -> session work plan (all steps start pending).
