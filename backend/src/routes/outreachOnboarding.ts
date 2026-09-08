@@ -33,6 +33,13 @@ import {
   DEFAULT_INVITE_CHAR_LIMIT,
 } from "../services/outreachInviteDraftService";
 
+/**
+ * ENG-1723: how long the onboarding save will wait on the optional schedule
+ * auto-create before returning without it. The prospects are already persisted
+ * by then, so the customer must never wait on this.
+ */
+const AUTO_CREATE_TIMEOUT_MS = 5000;
+
 const router = express.Router();
 
 /**

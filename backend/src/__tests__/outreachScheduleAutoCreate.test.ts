@@ -7,6 +7,7 @@
 
 import {
   OUTREACH_AUTO_CREATE_FLAG,
+  SUPPORTED_FREQUENCIES,
   DEFAULT_DAILY_CONNECTION_TARGET,
   isOutreachAutoCreateEnabled,
   evaluateAutoCreateTrigger,
@@ -260,6 +261,60 @@ describe('autoCreateOutreachSchedule', () => {
 
     const created = (deps.createSchedule as jest.Mock).mock.calls[0][0];
     expect(created.variableValues.icp_description).toBe('the audience captured during onboarding');
+  });
+
+  // CodeRabbit on PR #2802: calculateNextRunTime silently falls back to DAILY for
+  // an unknown cadence, and to a ONE-day interval for every_n_days with no
+  // interval — so the account would send more often than the template asked for,
+  // unattended, and the persisted row would claim a cadence nobody honours.
+  it('carries every_n_days through to the schedule AND to the next-run calculation', async () => {
+    process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
+    const deps = makeDeps({
+      findTemplate: jest.fn(async () => ({ ...TEMPLATE, suggestedFrequency: 'every_n_days', frequencyIntervalDays: 3 })),
+    });
+
+    const result = await autoCreateOutreachSchedule({ userId: 'user-1', leadListId: 'list-1', deps });
+
+    expect(result.outcome).toBe('created');
+    expect(result.plan).toMatchObject({ frequency: 'every_n_days', frequencyIntervalDays: 3 });
+    const created = (deps.createSchedule as jest.Mock).mock.calls[0][0];
+    expect(created.frequency).toBe('every_n_days');
+    expect(created.frequencyIntervalDays).toBe(3);
+  });
+
+  it('refuses every_n_days with no usable interval rather than running daily', async () => {
+    process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
+    for (const bad of [undefined, 0, -2, 1.5, 'three']) {
+      const deps = makeDeps({
+        findTemplate: jest.fn(async () => ({ ...TEMPLATE, suggestedFrequency: 'every_n_days', frequencyIntervalDays: bad as any })),
+      });
+      const result = await autoCreateOutreachSchedule({ userId: 'user-1', leadListId: 'list-1', deps });
+      expect(result).toMatchObject({ outcome: 'skipped', reason: 'template_cadence_invalid' });
+      expect(deps.createSchedule).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses a cadence the scheduler does not understand', async () => {
+    process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
+    const deps = makeDeps({
+      findTemplate: jest.fn(async () => ({ ...TEMPLATE, suggestedFrequency: 'fortnightly' })),
+    });
+    const result = await autoCreateOutreachSchedule({ userId: 'user-1', leadListId: 'list-1', deps });
+    expect(result).toMatchObject({ outcome: 'skipped', reason: 'template_cadence_invalid' });
+    expect(deps.createSchedule).not.toHaveBeenCalled();
+  });
+
+  it('accepts every supported cadence, and omits the interval for the others', async () => {
+    process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
+    for (const f of SUPPORTED_FREQUENCIES) {
+      const deps = makeDeps({
+        findTemplate: jest.fn(async () => ({ ...TEMPLATE, suggestedFrequency: f, frequencyIntervalDays: 2 })),
+      });
+      const result = await autoCreateOutreachSchedule({ userId: 'user-1', leadListId: 'list-1', deps });
+      expect(result.outcome).toBe('created');
+      const created = (deps.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.frequencyIntervalDays).toBe(f === 'every_n_days' ? 2 : undefined);
+    }
   });
 
   it('AC #4: never creates a second schedule for the same customer', async () => {

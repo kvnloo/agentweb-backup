@@ -52,6 +52,16 @@ export const isOutreachAutoCreateEnabled = (): boolean =>
  */
 export const DEFAULT_DAILY_CONNECTION_TARGET = '10';
 
+/**
+ * Cadences `calculateNextRunTime` actually understands. An unrecognised value does
+ * NOT throw there — it silently falls back to daily at 09:00 UTC while the
+ * schedule keeps the unknown string, so the row would claim a cadence the
+ * scheduler is not honouring (CodeRabbit on PR #2802). Auto-create refuses
+ * instead: this creates unattended outreach, and quietly sending more often than
+ * the template asked for is the one error that cannot be taken back.
+ */
+export const SUPPORTED_FREQUENCIES = ['hourly', 'daily', 'weekly', 'monthly', 'every_n_days'] as const;
+
 export type AutoCreateOutcome =
   | 'created'
   | 'dry_run'
@@ -71,6 +81,8 @@ export type AutoCreateReason =
   | 'tier_unresolved'
   /** No system template to create from — C6/ENG-1722 has not been seeded here. */
   | 'template_missing'
+  /** The template's cadence is unsupported, or `every_n_days` without a usable interval. */
+  | 'template_cadence_invalid'
   /** This customer already has one. Re-running onboarding must not make a second. */
   | 'already_exists';
 
@@ -172,6 +184,8 @@ export interface AutoCreatePlan {
   icpDescription: string;
   dailyConnectionTarget: string;
   frequency: string;
+  /** Present only for `every_n_days`; carried through so the cadence is honoured. */
+  frequencyIntervalDays?: number;
 }
 
 export interface AutoCreateResult {
@@ -193,7 +207,7 @@ export interface AutoCreateDeps {
   /** `getAllowedConnectedAccounts(userId)`. */
   allowedConnectedAccounts: (userId: string) => Promise<string[]>;
   /** The seeded system template, or null. */
-  findTemplate: () => Promise<{ templateId: string; name: string; startingMessage: string; variables: any[]; requiredFunctionCalls?: string[]; functionCallMinCalls?: Record<string, number>; suggestedFrequency?: string; description?: string } | null>;
+  findTemplate: () => Promise<{ templateId: string; name: string; startingMessage: string; variables: any[]; requiredFunctionCalls?: string[]; functionCallMinCalls?: Record<string, number>; suggestedFrequency?: string; frequencyIntervalDays?: number; description?: string } | null>;
   /** An existing auto-created schedule for this customer, or null. */
   findExistingSchedule: (userId: string, templateId: string) => Promise<string | null>;
   /** Persist. Only ever called on a real, flag-enabled create. */
@@ -258,6 +272,26 @@ export async function autoCreateOutreachSchedule(params: {
 
   // Non-null by construction: evaluateAutoCreateTrigger returns create:false for
   // a missing template or lead list before reaching here.
+  const frequency = template!.suggestedFrequency || 'daily';
+  const intervalDays = template!.frequencyIntervalDays;
+  // Validated rather than trusted: an unknown cadence silently becomes daily
+  // downstream, and `every_n_days` without an interval becomes every ONE day —
+  // either way the account sends more often than the template asked for.
+  if (!(SUPPORTED_FREQUENCIES as readonly string[]).includes(frequency)) {
+    return {
+      outcome: 'skipped',
+      reason: 'template_cadence_invalid',
+      detail: `Template cadence "${frequency}" is not one the scheduler understands, so it would silently run daily.`,
+    };
+  }
+  if (frequency === 'every_n_days' && !(Number.isInteger(intervalDays) && (intervalDays as number) >= 1)) {
+    return {
+      outcome: 'skipped',
+      reason: 'template_cadence_invalid',
+      detail: 'Template cadence is "every_n_days" but carries no usable interval, so it would run every day.',
+    };
+  }
+
   const plan: AutoCreatePlan = {
     userId,
     templateId: template!.templateId,
@@ -265,7 +299,8 @@ export async function autoCreateOutreachSchedule(params: {
     leadListId: String(params.leadListId),
     icpDescription: (params.icpDescription || '').trim() || 'the audience captured during onboarding',
     dailyConnectionTarget: DEFAULT_DAILY_CONNECTION_TARGET,
-    frequency: template!.suggestedFrequency || 'daily',
+    frequency,
+    ...(frequency === 'every_n_days' ? { frequencyIntervalDays: intervalDays as number } : {}),
   };
 
   if (dryRun) {
@@ -299,6 +334,9 @@ export async function autoCreateOutreachSchedule(params: {
     taskId: 'global',
     userId,
     frequency: plan.frequency,
+    // Persisted alongside the frequency, or the scheduler re-derives every later
+    // run at a one-day interval regardless of what the template asked for.
+    ...(plan.frequencyIntervalDays !== undefined ? { frequencyIntervalDays: plan.frequencyIntervalDays } : {}),
     scheduleName: template!.name,
     description: template!.description || '',
     startingMessage: template!.startingMessage,
@@ -310,7 +348,7 @@ export async function autoCreateOutreachSchedule(params: {
     // AC #6: an ordinary active schedule. No hidden flag, no undeletable marker —
     // the customer can see, edit and pause it like any other.
     status: 'active',
-    nextRunTime: calculateNextRunTime(plan.frequency, now, undefined, scheduleId).toISOString(),
+    nextRunTime: calculateNextRunTime(plan.frequency, now, plan.frequencyIntervalDays, scheduleId).toISOString(),
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     sessionId: null,
