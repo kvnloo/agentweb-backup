@@ -238,6 +238,44 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(text).not.toContain('welcomeMessage');
       expect(text).not.toContain('thumbnail_url');
     });
+
+    // Real external MCP clients (claude_ai via OAuth, confirmed via mcp_tool_used
+    // telemetry) call this tool too, and unlike launch_predefined_work_plan (which
+    // never consumes this tool's output), an external end user reading the response
+    // through their own client's LLM could legitimately want a template's full
+    // per-step detail. verbose=true keeps that capability reachable instead of
+    // silently removing it -- confirms it bypasses the compact map entirely and
+    // returns the raw fetch result untouched.
+    it('verbose=true returns the full untrimmed legacy shape instead of the compact listing', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      const raw = [{
+        id: 'wp-1',
+        title: 'Onboarding',
+        category: 'Client Success',
+        autocomplete: true,
+        visibility: 'system',
+        description: 'A'.repeat(500),
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            description: 'B'.repeat(500),
+            userInstructions: 'C'.repeat(500),
+            skillIds: ['skill-a', 'skill-b'],
+            requiredFunctionCalls: ['read_brand_guidelines'],
+          },
+        ],
+      }];
+      mockMcpFetch.mockResolvedValue(raw);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true }, context);
+      const text = result.content[0].text as string;
+
+      expect(JSON.parse(text)).toEqual(raw);
+      expect(text).toContain('A'.repeat(500));
+      expect(text).toContain('skill-a');
+      expect(text).toContain('requiredFunctionCalls');
+    });
   });
 
   describe('manage_predefined_work_plan - create', () => {

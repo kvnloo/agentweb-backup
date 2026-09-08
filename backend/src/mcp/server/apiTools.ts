@@ -2205,10 +2205,16 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a specific template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls); prefer the default shape for browsing/matching, since a large catalog in verbose mode may exceed the response-size threshold and get offloaded to search_tool_response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
+  execute: async (args: any, context: any) => {
     // Role-aware: admins (or admin-delegated sessions) get the full management
     // list via the admin route; everyone else gets the published/launchable set
     // via the public agent-mode route. Both go through authenticateToken.
@@ -2223,7 +2229,6 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
     // ENG-1814: the raw HTTP response carries every step's full body (description,
     // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
     // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
@@ -2232,7 +2237,17 @@ mcpToolRegistry.register({
     // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
     // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
     // this tool's output -- it re-fetches its own candidates independently -- so nothing
-    // needs the full shape here. Return only what a listing/matching consumer needs: the
+    // needs the full shape here by default. Real external MCP clients (confirmed via
+    // mcp_tool_used telemetry -- claude_ai OAuth callers) DO call this tool though, and
+    // unlike launch_predefined_work_plan, an external end user reading the response
+    // (via their own client's LLM) could legitimately want a template's full step
+    // detail -- so the full legacy shape stays reachable behind an explicit opt-in
+    // rather than being silently removed.
+    if (args?.verbose === true) {
+      return jsonResult(data);
+    }
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
+    // Return only what a listing/matching consumer needs by default: the
     // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
     // top-level fields launch/recommend calls actually reference.
     const compact = Array.isArray(data)
