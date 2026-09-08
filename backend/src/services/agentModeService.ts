@@ -28302,10 +28302,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = 'Request timeout while fetching file';
       }
 
+      // ENG-1162: a 401/403 from this plain external-URL fetch (not S3, not an
+      // AgentWeb-connected account) means the PUBLISHER refused the request —
+      // bot-blocking, a WAF, or a paywall — not an AgentWeb auth/permission
+      // problem. Left as a bare "HTTP 403: Forbidden", classifyToolErrorClass's
+      // embedded-status regex sweeps this into the generic 'auth' class, whose
+      // model-visible guidance says to have the user "reconnect the account" —
+      // nonsensical for an anonymous read, and it gave no signal that a failed
+      // read is NOT evidence the content doesn't exist (the run silently
+      // degraded to search instead of reporting the source as unverified).
+      // Named here so classifyToolErrorClass can match the marker and route to
+      // 'publisher_refused' instead.
+      const isPublisherRefusal = error.isAxiosError && (statusCode === 401 || statusCode === 403);
+      if (isPublisherRefusal) {
+        errorMessage = `The publisher refused this fetch (${errorMessage}) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.`;
+      }
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message,
+        error: isPublisherRefusal ? errorMessage : error.message,
         file_url: typeof fileUrl === 'string' ? fileUrl : undefined
       };
     }

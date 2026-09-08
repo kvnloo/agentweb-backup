@@ -103,6 +103,12 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',
   empty_result: 'the call succeeded but returned nothing. Do NOT repeat the identical call — broaden the query or try a different source.',
+  // ENG-1162: a publisher-side refusal (bot-block/WAF/paywall 401/403, or a
+  // browser navigation net::ERR_* failure) is not an AgentWeb account problem
+  // and, critically, is NOT proof the content is missing — the failure mode
+  // this ticket exists to fix was a run silently treating a blocked fetch as
+  // if the source didn't exist and quietly falling back to search.
+  publisher_refused: 'the publisher refused or failed to serve this content (bot-block, WAF, paywall, or a dropped/empty response) — this is NOT an AgentWeb account or permissions problem, and NOT evidence the content does not exist. If a different fetch path exists (another tool, a cached/alternate URL, or a search result covering the same content) try that once; otherwise report this source as UNVERIFIED rather than silently dropping the candidate or treating a search summary as equivalent verification.',
   truncated_response: 'your previous response for this call was cut off mid-generation — there is nothing wrong with the arguments themselves. Retry the SAME tool call and emit the complete arguments in one go, including every required field.',
 };
 
