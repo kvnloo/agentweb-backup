@@ -7146,24 +7146,48 @@ export async function runScheduledChat(
     // `passed: true` sitting next to a `keywordMisses` list still hardcoded to "every
     // keyword missed", the exact self-contradicting-record shape ENG-827 exists to
     // prevent elsewhere in this file.
+    // Scoped to what this run was actually ADMITTED to publish (fresh, pure recompute —
+    // `resolveSchedulePublishAuthorization` takes only `schedule`, no try-block-local
+    // state needed), not the raw config — so a requirement the run was never authorized
+    // for in the first place is correctly excluded here exactly as it is on the success
+    // path (`heldToFunctionNames` above). This does NOT track a mid-run revocation the
+    // way `effectivePublishAuthorization`'s live narrowing does (that state is try-block
+    // local and genuinely unreachable from here) — a narrower, disclosed residual gap,
+    // acceptable because this only feeds a diagnostic record, never a real publish.
+    const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
+    const recoveredHeldToNames = filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization);
+
+    // The entire block below reads a real, external, potentially-malformed record (the
+    // session) inside an error handler — the one place a second, NEW failure would be
+    // worst. Everything in it is defensively guarded (Array.isArray checks, the
+    // `.catch(() => null)` on the DB read) AND the whole block is wrapped one more time:
+    // any unexpected shape this hasn't anticipated falls back to the pre-fix-era safe
+    // values (empty ledger, passed:false) rather than throwing a new, unhandled error
+    // out of the one place that must never itself crash.
     let recoveredToolCalls: RequiredCallLedgerEntry[] = [];
     let recoveredContent = '';
-    if (sessionId) {
-      const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
-      const recoveredMessages = recoverySession?.messages || [];
-      recoveredToolCalls = reconstructPriorToolCalls(recoveredMessages);
-      recoveredContent = recoveredMessages
-        .filter((m: any) => m?.role === 'assistant' && typeof m.content === 'string')
-        .map((m: any) => m.content)
-        .join('\n\n');
+    try {
+      if (sessionId) {
+        const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
+        const recoveredMessages = Array.isArray(recoverySession?.messages) ? recoverySession!.messages : [];
+        recoveredToolCalls = reconstructPriorToolCalls(recoveredMessages);
+        recoveredContent = recoveredMessages
+          .filter((m: any) => m?.role === 'assistant' && typeof m.content === 'string')
+          .map((m: any) => m.content)
+          .join('\n\n');
+      }
+    } catch (recoveryError) {
+      console.error(`ENG-1807: ledger recovery failed for session ${sessionId}; falling back to the pre-fix empty-ledger result:`, recoveryError);
+      recoveredToolCalls = [];
+      recoveredContent = '';
     }
-    const recoveredRequiredNames = schedule.requiredFunctionCalls || [];
+    const recoveredRequiredNames = Array.isArray(recoveredHeldToNames) ? recoveredHeldToNames : [];
     const recoveredMinCalls = schedule.functionCallMinCalls || {};
     const recoveredFunctionMatches = recoveredRequiredNames.filter((name: string) =>
       countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
     );
     const recoveredFunctionMisses = recoveredRequiredNames.filter((name: string) => !recoveredFunctionMatches.includes(name));
-    const recoveredKeywords: string[] = schedule.keywords || [];
+    const recoveredKeywords: string[] = Array.isArray(schedule.keywords) ? schedule.keywords : [];
     const recoveredKeywordMatches = recoveredKeywords.filter((keyword: string) =>
       recoveredContent.toLowerCase().includes(keyword.toLowerCase())
     );
