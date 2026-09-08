@@ -6453,7 +6453,10 @@ export async function runScheduledChat(
     // Convert result to scheduled chat format. This list is the AUDIT record of what
     // the model called, so it deliberately keeps failed attempts — "it tried and the
     // tool errored" is exactly what someone reading run history needs to see.
-    const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
+    // ENG-1807 follow-up: prepend resumePriorToolCalls, same as finalFunctionCallDetails
+    // below already does — otherwise a resumed run's stored raw call list under-reports
+    // what actually happened relative to the `passed` verdict computed from it.
+    const actualFunctionCalls = [...resumePriorToolCalls, ...result.toolCalls].map((call: any) => call.name).filter(Boolean);
 
     // Calculate final function call details. ENG-1045/ENG-947: counted through the
     // same outcome-aware helper the checker uses (countCallsSatisfyingRequirement),
@@ -7139,19 +7142,93 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1807: an exception here does not mean the run did nothing.
+    // persistIncrementally already wrote every settled turn to the session before a
+    // LATER step (title generation, self-improvement reflection, etc.) hit the error —
+    // e.g. a worker-drain mid-deploy. Hardcoding an empty ledger below would discard
+    // that real, already-persisted work. Reconstruct what actually happened from the
+    // session's own messages, the same way a RESUMED run already credits its abandoned
+    // portion (`reconstructPriorToolCalls`, used above at the resume-claim path) —
+    // this makes a run that quietly finished everything required stop being recorded
+    // as a permanent, empty failure just because a trailing step errored afterward.
+    // Keywords are reconstructed the same way `runVerifiedChatInner` scores them on the
+    // success path (`allContent.toLowerCase().includes(keyword.toLowerCase())`, see
+    // ~line 4297) — otherwise a schedule using keyword criteria could recover
+    // `passed: true` sitting next to a `keywordMisses` list still hardcoded to "every
+    // keyword missed", the exact self-contradicting-record shape ENG-827 exists to
+    // prevent elsewhere in this file.
+    // Scoped to what this run was actually ADMITTED to publish (fresh, pure recompute —
+    // `resolveSchedulePublishAuthorization` takes only `schedule`, no try-block-local
+    // state needed), not the raw config — so a requirement the run was never authorized
+    // for in the first place is correctly excluded here exactly as it is on the success
+    // path (`heldToFunctionNames` above). This does NOT track a mid-run revocation the
+    // way `effectivePublishAuthorization`'s live narrowing does (that state is try-block
+    // local and genuinely unreachable from here) — a narrower, disclosed residual gap.
+    // Acceptable because `narrowPublishAuthorization` is strictly monotonic (only ever
+    // REMOVES tools, never adds — see its own doc comment), so the admission-time scope
+    // used here is always a superset of whatever the live value would have narrowed to.
+    // That can only push the recovered verdict toward MORE misses, never toward crediting
+    // a publish that didn't happen — a match still requires an actual persisted, succeeded
+    // tool-call entry regardless. This DOES reach the owner via
+    // `sendScheduledChatResultEmail` (not merely internal logging), so "safe direction of
+    // error" is the actual guarantee being relied on here, not "nobody sees it".
+    const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
+    const recoveredHeldToNames = filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization);
+
+    // The entire block below reads a real, external, potentially-malformed record (the
+    // session) inside an error handler — the one place a second, NEW failure would be
+    // worst. Everything in it is defensively guarded (Array.isArray checks, the
+    // `.catch(() => null)` on the DB read) AND the whole block is wrapped one more time:
+    // any unexpected shape this hasn't anticipated falls back to the pre-fix-era safe
+    // values (empty ledger, passed:false) rather than throwing a new, unhandled error
+    // out of the one place that must never itself crash.
+    let recoveredToolCalls: RequiredCallLedgerEntry[] = [];
+    let recoveredContent = '';
+    try {
+      if (sessionId) {
+        const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
+        const recoveredMessages = Array.isArray(recoverySession?.messages) ? recoverySession!.messages : [];
+        recoveredToolCalls = reconstructPriorToolCalls(recoveredMessages);
+        recoveredContent = recoveredMessages
+          .filter((m: any) => m?.role === 'assistant' && typeof m.content === 'string')
+          .map((m: any) => m.content)
+          .join('\n\n');
+      }
+    } catch (recoveryError) {
+      console.error(`ENG-1807: ledger recovery failed for session ${sessionId}; falling back to the pre-fix empty-ledger result:`, recoveryError);
+      recoveredToolCalls = [];
+      recoveredContent = '';
+    }
+    const recoveredRequiredNames = Array.isArray(recoveredHeldToNames) ? recoveredHeldToNames : [];
+    const recoveredMinCalls = schedule.functionCallMinCalls || {};
+    const recoveredFunctionMatches = recoveredRequiredNames.filter((name: string) =>
+      countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
+    );
+    const recoveredFunctionMisses = recoveredRequiredNames.filter((name: string) => !recoveredFunctionMatches.includes(name));
+    const recoveredKeywords: string[] = Array.isArray(schedule.keywords) ? schedule.keywords : [];
+    const recoveredKeywordMatches = recoveredKeywords.filter((keyword: string) =>
+      recoveredContent.toLowerCase().includes(keyword.toLowerCase())
+    );
+    const recoveredKeywordMisses = recoveredKeywords.filter((keyword: string) => !recoveredKeywordMatches.includes(keyword));
+    // Evidence of genuine recovered activity — either dimension counts, so a
+    // keyword-only or function-call-only schedule can each still recover a pass. A
+    // schedule with NEITHER configured must not flip to `passed: true` on an exception
+    // merely because empty requirement lists are vacuously satisfied.
+    const hasRecoveredEvidence = recoveredToolCalls.length > 0 || recoveredContent.trim().length > 0;
+
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
-      passed: false,
+      passed: hasRecoveredEvidence && recoveredFunctionMisses.length === 0 && recoveredKeywordMisses.length === 0,
       actualResponse: `Error during execution: ${errorMessage}`,
-      actualFunctionCalls: [],
-      keywordMatches: [],
-      keywordMisses: schedule.keywords || [],
-      functionCallMatches: [],
-      functionCallMisses: schedule.requiredFunctionCalls || [],
+      actualFunctionCalls: recoveredToolCalls.map((call) => call.name).filter((n): n is string => Boolean(n)),
+      keywordMatches: recoveredKeywordMatches,
+      keywordMisses: recoveredKeywordMisses,
+      functionCallMatches: recoveredFunctionMatches,
+      functionCallMisses: recoveredFunctionMisses,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
