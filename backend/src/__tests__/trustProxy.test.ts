@@ -75,4 +75,39 @@ describe('ENG-493: trust proxy is configured for the real ALB -> nginx -> Node t
       .send({});
     expect(otherCaller.status).toBe(400);
   });
+
+  it('keys off the real client, not an attacker-prepended leftmost XFF entry', async () => {
+    // AWS ALB appends to (rather than overwrites) a client-supplied X-Forwarded-For, so an
+    // attacker can prepend an arbitrary leftmost entry: "<spoofed>, <real client>, <ALB ip>".
+    // With the correct hop count (2), Express must skip the 2 rightmost trusted hops (the ALB
+    // and nginx) and resolve req.ip to the real client — NOT the attacker-controlled leftmost
+    // entry. A hop count of 3+ would incorrectly trust the spoofed entry, letting an attacker
+    // bypass IP-keyed rate limiting by rotating the spoofed value per request.
+    // Uses a client IP not already exhausted by an earlier test in this suite (the rate
+    // limiter's store persists across tests within the same process/window).
+    const realClient = '45.253.245.23';
+    const spoofedXff = `1.1.1.1, ${realClient}, 172.31.0.31`;
+
+    // Exhaust the real client's budget using the spoofed header shape.
+    for (let i = 0; i < 10; i++) {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .set('X-Forwarded-For', spoofedXff)
+        .send({});
+      expect(res.status).toBe(400);
+    }
+    const exhausted = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', spoofedXff)
+      .send({});
+    expect(exhausted.status).toBe(429);
+
+    // A different spoofed leftmost value with the SAME real client must still hit the same
+    // exhausted bucket — proving the key is the real client, not the spoofed IP.
+    const sameClientDifferentSpoof = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', `9.9.9.9, ${realClient}, 172.31.0.31`)
+      .send({});
+    expect(sameClientDifferentSpoof.status).toBe(429);
+  });
 });
