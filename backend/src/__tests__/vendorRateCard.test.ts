@@ -9,6 +9,8 @@ import {
   getAllocatedRate,
   computeAllocatedCost,
   VendorRateProvider,
+  VENDOR_RATE_CARD_VERSION,
+  getRecordingUnit,
 } from "../utils/vendorRateCard";
 
 describe("getAllocatedRate", () => {
@@ -111,5 +113,36 @@ describe("computeAllocatedCost", () => {
 
   it("treats a non-finite quantity as 0", () => {
     expect(computeAllocatedCost("v0", "landing_page_generation", Number.NaN)).toBe(0);
+  });
+
+  describe("rate-card version (ENG-1250 §5)", () => {
+    it("is a dated version string", () => {
+      expect(VENDOR_RATE_CARD_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    });
+
+    it("matches the last commit that changed a rate in this file", () => {
+      // Pinned deliberately. A rate edit that does not bump this leaves two
+      // different prices sharing one version, and a historical spend event can
+      // no longer be re-derived from the card that produced it.
+      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-09-02");
+    });
+  });
+
+  describe("getRecordingUnit", () => {
+    it("returns the card's own unit label for a priced entry", () => {
+      expect(getRecordingUnit("elevenlabs", "characters_flash_turbo")).toBe("1k_characters");
+      expect(getRecordingUnit("you.com", "query")).toBe("query");
+    });
+
+    it("returns null for an unknown provider or rate key, never a default", () => {
+      expect(getRecordingUnit("v0", "no_such_key")).toBeNull();
+      expect(getRecordingUnit("not_a_vendor" as never, "query")).toBeNull();
+      expect(getRecordingUnit("v0", "")).toBeNull();
+    });
+
+    it("does not resolve inherited Object properties as rate keys", () => {
+      expect(getRecordingUnit("v0", "constructor")).toBeNull();
+      expect(getRecordingUnit("v0", "toString")).toBeNull();
+    });
   });
 });

@@ -18,17 +18,29 @@ import { userDb } from './db';
  * list, unchanged behavior.
  */
 
-// Admin-only tools that READ other users' cross-account data. Curated subset of
-// ADMIN_SKILL_TOOL_NAMES (agentModeService) — only the tools whose output can
-// place another account's data into a report. Keep this list complete: a
-// missing entry is a false-negative that lets cross-account data through.
+// Tools whose output can place another account's data into a report. Mostly a
+// curated subset of ADMIN_SKILL_TOOL_NAMES (agentModeService) — those are
+// admin-only end to end. The 3 ENG-1801 entries below are an exception: they
+// are ordinary customer-facing tools that only read cross-account data when
+// the caller is an admin AND passes client_id (see getMetaCredentials);
+// listed here unconditionally since this guard has no way to see whether a
+// given historical run's calledFunctions entry was client_id-scoped, and
+// treating every call as potentially cross-account is the safe direction of
+// error. Keep this list complete: a missing entry is a false-negative that
+// lets cross-account data through.
 export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
+  'check_account_tracking_health',
+  'diagnose_leads_at_zero',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'list_meta_ads_campaigns',
+  'call_meta_ads_insights_api',
+  'get_meta_ads_metrics',
 ];
 
 /**

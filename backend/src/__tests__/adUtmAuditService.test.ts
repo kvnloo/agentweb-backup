@@ -68,6 +68,76 @@ const byId = (reports: CampaignAuditReport[]) =>
   Object.fromEntries(reports.map((r) => [r.campaignId, r]));
 
 describe("adUtmAuditService.auditCampaigns", () => {
+  /*
+   * ENG-1476 follow-up. A port read may stop at a page or wall-clock bound. The audit used to
+   * take whatever it received as the whole truth, so a bounded read produced a report that
+   * looked exactly like a complete one — and "all clean" from a partial read is the ENG-1584
+   * claim in a different place.
+   */
+  describe("a bounded port read is not a complete one", () => {
+    it("flags the campaign whose ad list stopped at a bound", async () => {
+      const port = {
+        listCampaigns: async () => [{ id: "c1", name: "Partial" }],
+        listAdDestinations: async () => ({
+          items: [{ adId: "a1", destinationUrls: ["https://x.example/?utm_source=fb&utm_medium=paid&utm_campaign=c"] }],
+          truncated: true,
+        }),
+      } as unknown as AdReadPort;
+      const completeness: { incomplete?: boolean } = {};
+
+      const reports = await auditCampaigns("meta", "u1", "acct1", port, completeness);
+
+      expect(reports[0].adReadIncomplete).toBe(true);
+      expect(completeness.incomplete).toBe(true);
+    });
+
+    it("reports the campaign list itself as incomplete when it stopped at a bound", async () => {
+      const port = {
+        listCampaigns: async () => ({ items: [{ id: "c1", name: "Seen" }], truncated: true }),
+        listAdDestinations: async () => [],
+      } as unknown as AdReadPort;
+      const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
+
+      await auditCampaigns("meta", "u1", "acct1", port, completeness);
+
+      // Campaigns beyond the bound were never audited, so no account-level conclusion holds.
+      expect(completeness.campaignListIncomplete).toBe(true);
+      expect(completeness.incomplete).toBe(true);
+    });
+
+    it("leaves completeness untouched for a plain-array port (LinkedIn shape)", async () => {
+      /*
+       * A port that reports no completeness signal must not have one invented for it — but the
+       * title used to say "Google/LinkedIn", and that pinned the wrong thing: Google's read IS
+       * bounded (a 50-page cap in googleAdsService.search), so its silence was a missing signal,
+       * not an absent one, and this test read as blessing it. The Google port now reports
+       * `truncated` (see adUtmAuditAdapters.test.ts). LinkedIn's fetchAllPages has no cap and
+       * errors rather than returning a partial page, so it is complete by construction and the
+       * bare-array shape stays correct for it.
+       */
+      const { port } = makePort({ c1: { name: "Ordinary", ads: [] } });
+      const completeness: { incomplete?: boolean } = {};
+
+      const reports = await auditCampaigns("google", "u1", "acct1", port, completeness);
+
+      expect(completeness.incomplete).toBeUndefined();
+      expect(reports[0].adReadIncomplete).toBeUndefined();
+    });
+
+    it("still works when no completeness object is passed at all", async () => {
+      // The out-param is optional; every existing caller omits it.
+      const port = {
+        listCampaigns: async () => ({ items: [{ id: "c1", name: "X" }], truncated: true }),
+        listAdDestinations: async () => ({ items: [], truncated: true }),
+      } as unknown as AdReadPort;
+
+      const reports = await auditCampaigns("meta", "u1", "acct1", port);
+
+      expect(reports).toHaveLength(1);
+      expect(reports[0].adReadIncomplete).toBe(true);
+    });
+  });
+
   it("treats a campaign with zero ads as tagged (vacuous — nothing to opt in)", async () => {
     const { port } = makePort({ c_empty: { name: "Empty Campaign", ads: [] } });
 

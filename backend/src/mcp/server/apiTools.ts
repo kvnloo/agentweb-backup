@@ -17,16 +17,10 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
-import { ctx, jsonResult } from './toolHelpers';
+import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-
-const CLIENT_ID_SCHEMA_PROPERTY = {
-  type: 'string' as const,
-  description:
-    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
-};
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -777,7 +771,11 @@ mcpToolRegistry.register({
         name: { type: 'string', description: 'Template name (create/update)' },
         description: { type: 'string', description: 'Template description (create/update)' },
         category: { type: 'string', description: 'Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)' },
-        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Visibility: system (admin-created, always visible), private (only visible to creator), public (approved, visible to all), pending_review (submitted for admin review). Default: private. (create/update)' },
+        visibility: { type: 'string', enum: ['private', 'pending_review'], description: "Visibility, on 'update' only. 'create' ALWAYS produces a private template and ignores this field. "
+          + "Only these two are settable here: 'private' (visible to you alone) and 'pending_review' "
+          + "(submitted for an administrator to approve). 'system' and 'public' are platform-wide and "
+          + "admin-only — asking for them is refused, not silently downgraded. To share a template with "
+          + "everyone, set 'pending_review' and an administrator approves or rejects it (ENG-1716)." },
         starting_message: { type: 'string', description: 'The prompt/message template. Use {{variable_name}} for variables. (create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, type: { type: 'string', enum: ['text', 'long_text', 'file'] } }, required: ['name'] }, description: 'Variable definitions (auto-extracted from message if not provided)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to verify in scheduled chat output (create/update)' },
@@ -2201,10 +2199,17 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+        plan_id: { type: 'string', description: 'Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog.' },
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
+  execute: async (args: any, context: any) => {
     // Role-aware: admins (or admin-delegated sessions) get the full management
     // list via the admin route; everyone else gets the published/launchable set
     // via the public agent-mode route. Both go through authenticateToken.
@@ -2219,7 +2224,60 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    return jsonResult(data);
+    // ENG-1814: the raw HTTP response carries every step's full body (description,
+    // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
+    // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
+    // non-trivial catalog, forcing the model into a fragile multi-step
+    // search_tool_response/read_tool_response detour just to find a specific title (the
+    // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
+    // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
+    // this tool's output -- it re-fetches its own candidates independently -- so nothing
+    // needs the full shape here by default. Real external MCP clients (confirmed via
+    // mcp_tool_used telemetry -- claude_ai OAuth callers) DO call this tool though, and
+    // unlike launch_predefined_work_plan, an external end user reading the response
+    // (via their own client's LLM) could legitimately want a template's full step
+    // detail -- so the full legacy shape stays reachable behind an explicit opt-in
+    // rather than being silently removed.
+    if (args?.verbose === true) {
+      // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+      // catalog, reopening the same oversized-response/S3-offload mechanism this PR
+      // fixes -- for a caller who usually only wants one template's detail. plan_id
+      // scopes the response to just the matching template(s) so the common case
+      // (verbose + plan_id together) never re-triggers that risk; verbose alone with
+      // no plan_id is still allowed (there's a real, if rarer, use case for "diff
+      // every template's full detail at once") but isn't the guided default.
+      const scoped = args?.plan_id && Array.isArray(data)
+        ? data.filter((p: any) => p.id === args.plan_id || p.planId === args.plan_id || p.title === args.plan_id)
+        : data;
+      return jsonResult(scoped);
+    }
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
+    // Return only what a listing/matching consumer needs by default: the
+    // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
+    // top-level fields launch/recommend calls actually reference.
+    const compact = Array.isArray(data)
+      ? data.map((p: any) => ({
+          // Non-admin (getAllPredefinedWorkPlans) already remaps to `id`. Admin
+          // (getAllWorkPlans -> raw WorkPlan records) never has `id` at all -- only
+          // `planId`, the interface's actual primary key (workPlanService.ts) -- so
+          // `p.id` alone silently dropped the identifier entirely for every
+          // admin/delegated listing (JSON.stringify drops an undefined key), worse
+          // than the pre-fix raw passthrough. Fall back to `planId` so both shapes
+          // keep a real identifier under the `id` key recommend/launch expect.
+          id: p.id ?? p.planId,
+          title: p.title,
+          category: p.category,
+          autocomplete: p.autocomplete,
+          visibility: p.visibility,
+          // Non-admin already carries the computed ENG-1469 projection under
+          // `display`. Admin (raw WorkPlan records) only ever has the raw,
+          // often-undefined WorkPlanDisplayMetadataV1 shape (`stepLabels`, not
+          // `steps`) -- compute the same projection here so admin/delegated
+          // listings get equally useful disambiguating context.
+          display: p.display?.steps ? p.display : (projectWorkPlanForCustomer(p) ?? p.display),
+        }))
+      : data;
+    return jsonResult(compact);
   }
 });
 
@@ -2942,6 +3000,136 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
     const data = await mcpFetch({
       method: 'GET',
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'check_account_tracking_health',
+  definition: {
+    name: 'check_account_tracking_health',
+    description: `Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.
+
+Resolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.
+
+Returns:
+- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.
+- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.
+
+Use this to check "is the pixel broken" / "is CAPI deployed" / "does this ad's destination actually carry a pixel this account owns" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.
+
+If the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const healthData: any = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    if (!healthData?.success || !healthData?.health?.client?.userId) {
+      return jsonResult({ success: false, error: healthData?.message || `Could not resolve client "${args.client_name_or_email}"` });
+    }
+    const userId = healthData.health.client.userId;
+    const adAccountId = healthData.health.ads_layer?.ad_account_id;
+    if (!adAccountId) {
+      return jsonResult({ success: false, error: `Client "${args.client_name_or_email}" has no connected Meta ad account — nothing to check.` });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/admin/tracking-monitor/run',
+      context: ctx(context),
+      body: { dryRun: true, userId, adAccountId },
+    });
+    return jsonResult({ success: true, client: healthData.health.client, ...data });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'diagnose_leads_at_zero',
+  definition: {
+    name: 'diagnose_leads_at_zero',
+    description: `Discriminate between look-alike causes for a client's "leads at zero" symptom, per connected Meta ad account. Admin-only, read-only.
+
+Evaluates five causes — pixel_capi_broken, landing_page_unreachable, budget_exhausted, genuine_demand_drop, normal_variance — using monitor_lead_volume and the tracking-health sweep as evidence, and applies a strict discrimination gate: 'determined' is only returned when exactly one cause has DIRECT supporting evidence and every other checkable cause has been ruled out. 'budget_exhausted' has no evidence source anywhere in this system today and is always reported as 'unchecked'. 'genuine_demand_drop' can be ruled out but never confirmed here either — a real drought requires a Conversion Tracking Validator pass this tool cannot run, so it stops at 'unchecked' rather than a confident but unvalidated 'supported'. Neither blocks a determined diagnosis on a different, well-evidenced cause — both are always disclosed.
+
+⚠ When the result is 'could_not_determine', do NOT pick a cause anyway and do NOT recommend an action — report it as an honest diagnosis gap, listing which causes remain live/unchecked. A confidently wrong diagnosis is worse than an honest "could not determine" — this is the one thing this tool must never be used to work around.
+
+Returns one diagnosis per connected Meta ad account, each with: outcome ('determined'|'could_not_determine'), concludedCause (null unless determined), causes (every cause evaluated, with its verdict and evidence — always read this, not just the top-line outcome), and reason (populated only when could_not_determine).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/l2-diagnose/leads-at-zero/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'monitor_lead_volume',
+  definition: {
+    name: 'monitor_lead_volume',
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+
+Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
+
+⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.
+
+⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
+
+Returns one report per connected Meta ad account for the client.
+
+⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: {
+          type: 'string',
+          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+        },
+        until: {
+          type: 'string',
+          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = new URLSearchParams();
+    if (args.since) query.set('since', args.since);
+    if (args.until) query.set('until', args.until);
+    const qs = query.toString();
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/lead-volume-monitor/${encodeURIComponent(args.client_name_or_email)}${qs ? `?${qs}` : ''}`,
       context: ctx(context)
     });
     return jsonResult(data);

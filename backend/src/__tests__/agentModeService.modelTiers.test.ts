@@ -1,21 +1,54 @@
-import { AgentModeService, tierFromCostScore } from '../services/agentModeService';
+import { AgentModeService, tierFromCostScore, tierFromQualityScore } from '../services/agentModeService';
 import * as llmPricing from '../utils/llmPricing';
 
 // Pins the exact band boundaries (revised 2026-08-19, three times in one
 // session — this is why a direct unit test exists now instead of only
-// being covered incidentally through registry-level tests).
+// being covered incidentally through registry-level tests). Re-cut
+// 2026-09-05 (ENG-1784), Harsha: Flagship ("frontier") is everything 64 and
+// up — so GPT-5.6 Sol (71) and Claude Opus 5 (70) share it — Pro 58–63,
+// Medium 53–57, Cheap 31–52, Very Cheap unchanged (≤30).
 describe('tierFromCostScore', () => {
-  it('matches the documented thresholds: 71/64/51/31/0', () => {
+  it('matches the documented thresholds: 64/58/53/31/0', () => {
     expect(tierFromCostScore(100)).toBe('ultra_premium');
-    expect(tierFromCostScore(71)).toBe('ultra_premium');
-    expect(tierFromCostScore(70)).toBe('pro');
-    expect(tierFromCostScore(64)).toBe('pro');
-    expect(tierFromCostScore(63)).toBe('medium');
-    expect(tierFromCostScore(51)).toBe('medium');
-    expect(tierFromCostScore(50)).toBe('cheap');
+    expect(tierFromCostScore(71)).toBe('ultra_premium'); // GPT-5.6 Sol
+    expect(tierFromCostScore(70)).toBe('ultra_premium'); // Claude Opus 5
+    expect(tierFromCostScore(64)).toBe('ultra_premium');
+    expect(tierFromCostScore(63)).toBe('pro');
+    expect(tierFromCostScore(58)).toBe('pro');
+    expect(tierFromCostScore(57)).toBe('medium');
+    expect(tierFromCostScore(53)).toBe('medium');
+    expect(tierFromCostScore(52)).toBe('cheap');
     expect(tierFromCostScore(31)).toBe('cheap');
     expect(tierFromCostScore(30)).toBe('ultra_cheap');
     expect(tierFromCostScore(0)).toBe('ultra_cheap');
+  });
+});
+
+// ENG-1789 (2026-09-06), Harsha: "fable + astra are flagship, opus + 5.6 sol
+// are pro, sonnet + 5.6 terra are mid, haiku + 5.6 luna are low" — a
+// SEPARATE axis from cost. Thresholds solved against the live AA v4.2
+// qualityScores of those 8 named models (Fable 57, Astra 55, Opus 5 54,
+// Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43); ties resolve to the
+// higher band (Harsha, 2026-09-06).
+describe('tierFromQualityScore', () => {
+  it('matches the documented thresholds: 55/51/45/17/0', () => {
+    expect(tierFromQualityScore(100)).toBe('ultra_premium');
+    expect(tierFromQualityScore(57)).toBe('ultra_premium'); // Claude Fable 5.1
+    expect(tierFromQualityScore(55)).toBe('ultra_premium'); // GPT-6 Astra
+    expect(tierFromQualityScore(54)).toBe('pro'); // Claude Opus 5
+    expect(tierFromQualityScore(51)).toBe('pro'); // GPT-5.6 Sol
+    expect(tierFromQualityScore(47)).toBe('medium'); // GPT-5.6 Terra
+    expect(tierFromQualityScore(45)).toBe('medium'); // Claude Sonnet 5
+    expect(tierFromQualityScore(43)).toBe('cheap'); // GPT-5.6 Luna
+    expect(tierFromQualityScore(17)).toBe('cheap'); // Claude Haiku 4.5
+    expect(tierFromQualityScore(16)).toBe('ultra_cheap');
+    expect(tierFromQualityScore(0)).toBe('ultra_cheap');
+  });
+
+  it('resolves a tie at the boundary to the higher band', () => {
+    // Grok 4.6 ties GPT-5.6 Sol at 51 — both go to 'pro', not the 'medium'
+    // one boundary down would suggest.
+    expect(tierFromQualityScore(51)).toBe('pro');
   });
 });
 
@@ -135,20 +168,40 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
 
   // FAIL case 5: a model with real quality/cost scores must surface them
   // (and their source notes) to the picker — never rounded/reinterpreted
-  // here, that's the frontend meter's job.
-  it('surfaces qualityScore/costScore and their source notes when present', async () => {
+  // here, that's the frontend meter's job. qualityTier (ENG-1789) is a
+  // separate derived field alongside cost-driven tier.
+  it('surfaces qualityScore/costScore, qualityTier, and their source notes when present', async () => {
     const result = await svc.getSupportedModelsWithMetadata(false);
     const scored = result.find((m: any) => m.id === 'scored-model');
     const expectedCostScore = llmPricing.costScoreFromPrice(SCORED_MODEL_PRICE);
     expect(scored).toEqual({
       // tier is 'ultra_premium', not the fixture's static 'pro' — once a
       // price is available, tier is derived from the real costScore, and
-      // this fixture's price computes to 95 (>=71 -> ultra_premium).
+      // this fixture's price computes to 95 (>=64 -> ultra_premium).
       id: 'scored-model', name: 'Scored Model', tier: 'ultra_premium', description: 'Scored', provider: 'anthropic',
+      // qualityScore 96 >= 55 -> 'ultra_premium' on the quality bands too,
+      // independently of the cost-derived tier above (they happen to agree
+      // here; QUALITY_SCORE_BANDS assertions live in the tierFromQualityScore
+      // describe block above).
+      qualityTier: 'ultra_premium',
       qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
       costScore: expectedCostScore,
       costScoreSource: expect.any(String),
     });
+  });
+
+  // A model with a qualityScore but no cost price still gets a qualityTier —
+  // the two axes are independent, so a missing cost score never suppresses it.
+  it('computes qualityTier from qualityScore even when costScore is unavailable', async () => {
+    svc.llmModels['quality-only-model'] = {
+      client: null, supportsTemperature: true,
+      tier: 'medium', description: 'Quality only', name: 'Quality Only Model', provider: 'google',
+      qualityScore: 45, qualityScoreSource: 'AA Intelligence Index v4.2, snapshot 2026-09-05',
+    };
+    const result = await svc.getSupportedModelsWithMetadata(false);
+    const model = result.find((m: any) => m.id === 'quality-only-model');
+    expect(model.qualityTier).toBe('medium');
+    expect(model).not.toHaveProperty('costScore');
   });
 
   // A model with no scores omits the keys entirely (never a guessed 0 or null).

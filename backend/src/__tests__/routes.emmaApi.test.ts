@@ -132,7 +132,12 @@ describe('Emma API Routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.results).toHaveLength(1);
-      expect(mockService.youSearchWeb).toHaveBeenCalledWith('test query', 5);
+      /*
+       * youSearchWeb gained freshness/includeDomains/userId (and a purpose default) on main; the
+       * route passes them and only this assertion was left at the old arity. Production is
+       * correct — the userId is what lets the search be attributed and billed to the caller.
+       */
+      expect(mockService.youSearchWeb).toHaveBeenCalledWith('test query', 5, undefined, undefined, 'user-123');
     });
   });
 
@@ -335,6 +340,76 @@ describe('Emma API Routes', () => {
 
       expect(res.status).toBe(403);
       expect(mockService.callMetaMarketingApi).not.toHaveBeenCalled();
+    });
+  });
+
+  /*
+   * ENG-1725: this route used to destructure parent_id/entity_id/fields off the request body and
+   * pass them positionally into callMetaMarketingApi's (campaign_id, ad_set_id, ad_id) slots —
+   * none of those names exist in call_meta_marketing_api's own published tool schema
+   * (emma/tools.ts), which documents campaign_id/ad_set_id/ad_id, and whose execute() handler (the
+   * path every LLM/agent tool call actually takes) already passed those through correctly. `fields`
+   * in particular was never an id at all — a caller supplying it could have it silently occupy the
+   * ad_id slot. These pin that the route now reads the documented names directly, matching the
+   * agent tool-calling path it was previously out of sync with.
+   */
+  describe('POST /api/emma/meta-ads/marketing-api — id field mapping (ENG-1725)', () => {
+    it('threads campaign_id straight through to the campaign_id slot', async () => {
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'CAMPAIGN', action: 'UPDATE', account_id: 'acct-1', campaign_id: 'camp-9', params: { status: 'PAUSED' } });
+
+      expect(res.status).toBe(200);
+      expect(mockService.callMetaMarketingApi).toHaveBeenCalledWith(
+        'user-123', 'CAMPAIGN', 'UPDATE', 'acct-1', 'camp-9', undefined, undefined, { status: 'PAUSED' }, undefined,
+      );
+    });
+
+    it('threads ad_set_id straight through to the ad_set_id slot', async () => {
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'AD_SET', action: 'UPDATE', account_id: 'acct-1', ad_set_id: 'adset-9', params: { status: 'PAUSED' } });
+
+      expect(res.status).toBe(200);
+      expect(mockService.callMetaMarketingApi).toHaveBeenCalledWith(
+        'user-123', 'AD_SET', 'UPDATE', 'acct-1', undefined, 'adset-9', undefined, { status: 'PAUSED' }, undefined,
+      );
+    });
+
+    it('threads ad_id straight through to the ad_id slot', async () => {
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'AD', action: 'DELETE', account_id: 'acct-1', ad_id: 'ad-9' });
+
+      expect(res.status).toBe(200);
+      expect(mockService.callMetaMarketingApi).toHaveBeenCalledWith(
+        'user-123', 'AD', 'DELETE', 'acct-1', undefined, undefined, 'ad-9', undefined, undefined,
+      );
+    });
+
+    it('never lets params.fields land in an id slot', async () => {
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({
+          entity_type: 'CAMPAIGN', action: 'LIST', account_id: 'acct-1',
+          fields: 'id,name,status', // a genuine field-selection value, shaped nothing like an id
+        });
+
+      expect(res.status).toBe(200);
+      const call = mockService.callMetaMarketingApi.mock.calls[0];
+      // campaign_id, ad_set_id, ad_id (positions 4-6) must all stay undefined — `fields` has no
+      // slot in this call at all anymore, so it cannot land in any of them.
+      expect(call[4]).toBeUndefined();
+      expect(call[5]).toBeUndefined();
+      expect(call[6]).toBeUndefined();
     });
   });
 });

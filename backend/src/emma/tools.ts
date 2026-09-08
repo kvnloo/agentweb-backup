@@ -24,6 +24,7 @@ import {
   AskUserQuestionError,
   type AskUserQuestionOption,
 } from '../services/agentMode/core/askUserQuestion';
+import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -495,13 +496,14 @@ Actions:
 - search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school, company_size_min/company_size_max. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. COMPANY SIZE: there is no native LinkedIn/Unipile filter for a person's employer headcount, so company_size_min/max is a post-filter applied after the search — it can meaningfully shrink the result count (candidates whose employer size can't be verified are excluded, not guessed at), and the response may report companySizeFiltered with a count and a message when this happens. Only pass it when the user actually asked for a size constraint (e.g. "at startups", "at large companies") — it costs extra lookups per search. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
-- list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
+- list-sent-invitations: List this account's PENDING connection requests. Always returns a named outcome — never a bare empty result. "source" is 'live' (read from LinkedIn just now), 'cache' (our own ledger, refreshed every ~10 minutes — used when the live read was unavailable or returned nothing while we still hold records), or 'none'. "notice" explains the outcome in plain language and MUST be relayed to the user rather than summarised away. "totalPending" is how many pending invitations we know about, which may exceed the returned "items". When "totalPendingIsLowerBound" is true the account has MORE pages than were read, so treat totalPending as "at least this many" and never quote it as the exact backlog — pass "cursor" back to read further. Each item carries "sent_at", so stale invitations can be picked by age and withdrawn with cancel-invitation. CRITICAL: source 'none' WITH liveUnavailable:true means we could NOT read the backlog — it is NOT evidence the account has none, and must never be reported as "no pending invitations". Only source 'none' WITHOUT liveUnavailable means genuinely nothing is tracked here, in which case the backlog was likely built outside AgentWeb and only the account owner can clear it from LinkedIn directly.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree. CRM ATTRIBUTION: when you are running outreach for a CRM lead list, ALWAYS pass list_id with send-invite, plus the invitee's own first_name/last_name/company/title when you actually know them for THAT person (from search-people or get-profile) — never reuse the filters you searched with, or the lead is stamped with the wrong employer/title. The invite is then mirrored into that list — the person is created as a lead if absent, marked contacted, and logged with a linkedin.invite.sent engagement — so contact volume is attributed and follow-up cadence can fire. Also pass lead_id when you already know the CRM lead.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
 - cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+- withdraw-stale-invitations: Bulk-withdraw the account's OLDEST pending connection requests to reclaim capacity. Requires older_than_days (minimum 1); optional max_withdrawals (default and hard maximum 40 per run) and list_id. Use this instead of looping cancel-invitation when a backlog of pending invitations is throttling sends. Withdraws oldest-first, paces every withdrawal, and does NOT consume the account's daily invite budget. It ALWAYS returns a "notice" you must relay rather than summarise away, plus "withdrawn" (each with the invitee and when the invite was originally sent), "failed", "remainingStale", "totalPending", and "stopReason". stopReason 'paced' means the account hit its write-pacing ceiling and the run stopped deliberately: this is NOT a failure and NOT a LinkedIn rejection — do NOT retry in the same run, report how far it got and leave the rest for the next one. IMPORTANT: withdrawing stale invitations does NOT lift the stricter throttle a NEWLY connected LinkedIn account is under — that is about the account's age, not its pending count — so do not offer it as a remedy for a brand-new connection being limited.
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations. CRM ATTRIBUTION IS OPT-IN, ON YOU: accepting an inbound request does NOT automatically make someone a lead — unlike sending an invite (always a deliberate targeting choice), an inbound accept could be a genuine prospect or an unrelated personal connection, and nothing gets logged unless you decide it belongs somewhere. If — and only if — this person is actually relevant to a specific CRM campaign, pass list_id for that list; the connection's identity is looked up automatically from LinkedIn's own record of this invitation (not from anything else you pass), so list_id is the only extra thing needed. Omit list_id for a connection that isn't a lead — the accept still succeeds, nothing gets mirrored, no false attribution. If you judge someone a good potential lead but have no specific list to attach them to (the task didn't name one), do NOT let that pass silently — call it out explicitly in your final report (e.g. "N accepted connections look like good fits for X but I had no target list — let me know where to add them") so it's visible and actionable, not just accepted-and-forgotten.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
@@ -519,7 +521,7 @@ For target person identification (send-invite, send-message, get-profile, update
       properties: {
         action: {
           type: 'string',
-          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'list-received-invitations', 'send-invite', 'send-message', 'send-inmail', 'get-company', 'cancel-invitation', 'accept-invitation', 'update-conversation-history', 'search-parameters', 'set-daily-invite-cap', 'withdraw-stale-invitations'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -541,6 +543,14 @@ For target person identification (send-invite, send-message, get-profile, update
         message: {
           type: 'string',
           description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: aim for 200 characters or fewer (300 on Premium). The backend auto-trims an over-limit note on a word boundary before sending, so the send never fails on length — but a note you keep within the limit stays complete.'
+        },
+        older_than_days: {
+          type: 'number',
+          description: 'For withdraw-stale-invitations only: withdraw pending invitations sent more than this many days ago. Minimum 1. Oldest are withdrawn first.'
+        },
+        max_withdrawals: {
+          type: 'number',
+          description: 'For withdraw-stale-invitations only: how many to withdraw in this run. Defaults to 40, which is also the hard per-run maximum — a drain is paced, so a larger number would simply hit the pacing ceiling and stop.'
         },
         on_note_quota: {
           type: 'string',
@@ -866,19 +876,28 @@ emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
-    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics. Admin-only: pass client_id to run against a specific client\'s account instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: {
           type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
-        }
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
+        },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: []
     }
   },
   execute: async (args, context) => {
+    if (args.client_id) {
+      return await agentModeService.listMetaAdsCampaignsNew(
+        context?.userId,
+        args.account_id,
+        {},
+        { clientId: args.client_id, toolName: 'list_meta_ads_campaigns' }
+      );
+    }
     return args.account_id
       ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
       : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
@@ -1022,7 +1041,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
-                        NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
+                        Dayparting/ad scheduling (adset_schedule, pacing_type) IS supported but requires lifetime_budget (never daily_budget) plus end_time — Meta silently ignores the schedule and delivers 24/7 on a daily-budget ad set, so that combination is REJECTED, naming the requirement. pacing_type defaults to ['day_parting'] automatically whenever adset_schedule is present and pacing_type is omitted. start_time/end_time are the flight window, not dayparting, and remain independent (ENG-842).
                         After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
@@ -1434,6 +1453,7 @@ emmaToolRegistry.register({
           description:
             "Server-side filters to narrow results before aggregation.",
         },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: ["account_id", "object_type", "fields"],
     },
@@ -1476,8 +1496,9 @@ emmaToolRegistry.register({
         },
         account_id: {
           type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
-        }
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
+        },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       }
     }
   },
@@ -1487,6 +1508,16 @@ emmaToolRegistry.register({
       args.campaign_ids,
       args.campaign_id,
     );
+
+    if (args.client_id) {
+      return await agentModeService.getMetaAdsMetrics(
+        args.timeframe || '7d',
+        context?.userId,
+        normalizedCampaignIds,
+        args.account_id,
+        { clientId: args.client_id, toolName: 'get_meta_ads_metrics' },
+      );
+    }
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
@@ -6239,7 +6270,7 @@ emmaToolRegistry.register({
   name: 'launch_predefined_work_plan',
   definition: {
     name: 'launch_predefined_work_plan',
-    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. If a work plan is already active in this session, the call returns requiresConfirmation — confirm with the user, then call again with force=true to replace it.',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Two distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -7347,6 +7378,9 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
+  'check_account_tracking_health',
+  'diagnose_leads_at_zero',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
@@ -9626,24 +9660,43 @@ emmaToolRegistry.register({
       throw new Error('account_id is required — get it from list_connected_accounts.');
     }
 
+    // Reads behind this audit can stop at a page or wall-clock bound. Collect that here so a
+    // partial read is never presented as a clean bill of health.
+    const completeness: { incomplete?: boolean; campaignListIncomplete?: boolean } = {};
     const campaigns = await auditCampaigns(
       platform as AdPlatform,
       context.userId,
       accountId,
       port,
+      completeness,
     );
 
     const needingAction = campaigns.filter((c) => !c.tagged);
     const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
 
+    /*
+     * "All N campaign(s) carry UTM tracking" is a claim about everything, so it may only be
+     * made from a read that saw everything. Under truncation the audit found nothing wrong in
+     * the part it read, which is a different statement — and reporting the stronger one is
+     * exactly how a bounded read told a customer something did not exist (ENG-1584).
+     */
+    const incompleteNote = completeness.incomplete
+      ? (completeness.campaignListIncomplete
+          ? ` ⚠ The campaign list stopped at a read bound, so campaigns beyond it were never audited.`
+          : ` ⚠ At least one campaign's ad list stopped at a read bound, so some ads were never audited.`) +
+        ` Treat this as "nothing wrong in what was read", not a clean bill of health.`
+      : '';
+
     // Say the unreadable count out loud. Silently folding it into "untagged" would send
     // someone to swap a creative we never actually managed to read.
-    const message = needingAction.length === 0
-      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+    const message = (needingAction.length === 0
+      ? (completeness.incomplete
+          ? `No UTM problems found in the ${campaigns.length} campaign(s) read on ${platform}.`
+          : `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`)
       : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
         (unreadableCount > 0
           ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
-          : '');
+          : '')) + incompleteNote;
 
     return {
       success: true,
@@ -9653,6 +9706,8 @@ emmaToolRegistry.register({
       totalCampaigns: campaigns.length,
       campaignsNeedingAction: needingAction.length,
       unreadableAdCount: unreadableCount,
+      ...(completeness.incomplete ? { readIncomplete: true } : {}),
+      ...(completeness.campaignListIncomplete ? { campaignListIncomplete: true } : {}),
       campaigns,
     };
   },

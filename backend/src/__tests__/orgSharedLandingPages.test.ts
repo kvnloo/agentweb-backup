@@ -657,8 +657,16 @@ describe("Landing page edit endpoints — editor permission across routes", () =
       .post(`/api/landing-pages/v0/generated/${myPage.id}/iterate`)
       .send({ message: "tweak hero" });
     expect(res.status).toBe(200);
-    // Service must be invoked with the PAGE OWNER's userId (not the caller's)
-    expect(iterateLandingPage).toHaveBeenCalledWith(myPage.id, mockUserId, "tweak hero");
+    /*
+     * The OWNER's userId is what loads the record (`getLandingPage(id, userId)` returns null
+     * unless they match), and the ACTOR arrives separately.
+     *
+     * This assertion stopped at three arguments, which was right until ENG-694 AC5 (8dc071dca)
+     * added `actingUserId` so a delegated edit could be attributed to the org member who made
+     * it rather than to the page owner. The route passes it; only the assertion was left behind,
+     * so this suite has been failing on main since that commit.
+     */
+    expect(iterateLandingPage).toHaveBeenCalledWith(myPage.id, mockUserId, "tweak hero", mockEditorId);
   });
 
   it("POST /:id/deploy — editor can deploy another member's page", async () => {

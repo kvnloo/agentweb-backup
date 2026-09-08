@@ -50,10 +50,65 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
     assert captured["max_retries"] == 1
     assert captured["temperature"] == 0.0
     assert os.environ["OPENAI_API_KEY"] == "direct-openai-key"
+    # ENG-1820: require_parameters=True no longer applies -- it made OpenRouter hard-reject
+    # every request carrying parallel_tool_calls (auto-added by browser-use's real
+    # with_structured_output(method="function_calling") call), since that parameter isn't
+    # declared as supported by essentially any model in OpenRouter's catalog. Broke the first
+    # real action of every task, on every model. tool_choice alone still guarantees
+    # single-tool-call behavior for this usage pattern.
     assert captured["extra_body"] == {
-        "provider": {"allow_fallbacks": True, "require_parameters": True},
+        "provider": {"allow_fallbacks": True},
         "plugins": [{"id": "context-compression"}],
     }
+
+
+def test_gateway_sets_an_explicit_bounded_request_timeout(monkeypatch):
+    # ENG-1822: langchain_openai.ChatOpenAI's `request_timeout` field defaults
+    # to None, and that None gets forwarded verbatim to openai.OpenAI(timeout=...)
+    # -- which, because it's an *explicit* None rather than an omitted kwarg,
+    # skips the openai SDK's own 600s DEFAULT_TIMEOUT fallback and lands on
+    # httpx.Client(timeout=None), i.e. no timeout at all. Confirmed live in
+    # production: a single browser-use per-step LLM call took ~7m45s to
+    # return (and was still unbounded -- it could have hung indefinitely).
+    # Guard that the gateway always passes a concrete, finite timeout.
+    gateway = load_gateway()
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(gateway, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    gateway.create_openrouter_llm("openai/gpt-4.1")
+
+    assert "timeout" in captured
+    assert captured["timeout"] is not None
+    assert 0 < captured["timeout"] <= 300, (
+        "request timeout should be short enough to fail fast on a "
+        "slow/degraded provider (browser-use's per-step call is a single "
+        "forced tool-call with a small bounded output, not a long "
+        "streaming generation)"
+    )
+
+
+def test_gateway_client_has_no_unbounded_timeout(monkeypatch):
+    # Same regression as above, but end-to-end through the real ChatOpenAI/
+    # openai/httpx construction path (no mocking of ChatOpenAI) -- this is
+    # the same three-library interaction that silently produced an unbounded
+    # timeout in production, so assert directly against the constructed
+    # client's actual underlying httpx timeout rather than just the kwarg
+    # we passed in, in case a future langchain_openai/openai upgrade changes
+    # how `timeout` is threaded through.
+    gateway = load_gateway()
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    llm = gateway.create_openrouter_llm("openai/gpt-4.1")
+    underlying_timeout = llm.client._client.timeout
+
+    assert underlying_timeout is not None
+    assert underlying_timeout == gateway.REQUEST_TIMEOUT_SECONDS
 
 
 def test_reasoning_routes_omit_temperature(monkeypatch):

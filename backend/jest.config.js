@@ -5,6 +5,14 @@ module.exports = {
   testMatch: ['**/__tests__/**/*.test.ts'],
   clearMocks: true,
   verbose: false,
+  // Jest's 5000ms default is too tight for this machine's full-512-suite pre-push run:
+  // observed 4 distinct, unrelated test files (metaLaunchGate.test.ts,
+  // metaLaunchGateWiring.test.ts, and others) trip the identical "exceeded timeout" symptom on a
+  // test whose own logic is mock-only with no real I/O — each one passes cleanly in isolation.
+  // Not a per-test defect to patch one file at a time; raising the default gives every test the
+  // same headroom rather than chasing each new file that happens to land on a slow scheduling
+  // slot. A genuinely hung test still times out, just later.
+  testTimeout: 15000,
   maxWorkers: 2, // Limit to 2 workers to reduce memory usage in CI
   // ENG-1277: NOT a GC trigger despite the old comment. jest-worker checks each
   // worker's heapUsed after every test file and restarts the child process (full

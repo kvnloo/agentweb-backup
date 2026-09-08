@@ -346,3 +346,16 @@ describe('POST /api/integrations/linear/webhook — signature and error handling
     expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /api/integrations/linear/webhook — fail-closed when LINEAR_WEBHOOK_SECRET unset (ENG-1754)', () => {
+  it('returns 503 and never processes the payload, even with a well-formed signature header', async () => {
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await post(transitionIntoDone());
+
+    expect(res.status).toBe(503);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+});
