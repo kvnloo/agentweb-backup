@@ -5,6 +5,10 @@ for attribution and backwards compatibility. Only this module translates them
 to OpenRouter upstream IDs and constructs a client.
 """
 
+import asyncio
+import queue
+import threading
+
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
@@ -54,7 +58,148 @@ _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 # cleaner browser-use-level failure. Still strictly bounded either way,
 # unlike the pre-fix indefinite hang, but worth knowing the effective ceiling
 # is a multiple of REQUEST_TIMEOUT_SECONDS, not the value itself.
+#
+# ENG-1822 FOLLOW-UP -- this constant alone does NOT bound real wall-clock
+# call duration, despite everything above and despite being verified live on
+# a real constructed client (`llm.client._client.timeout == 120.0`). Root
+# cause, verified directly against the exact pinned versions running in
+# production (httpx==0.28.1, httpcore==1.0.9): httpx's `timeout=<float>`
+# expands to Timeout(connect=T, read=T, write=T, pool=T) (httpx/_config.py),
+# and httpcore's `read` timeout is NOT a deadline on total response time --
+# it's a budget on each individual low-level socket read, reset every time
+# ANY bytes arrive. Confirmed at the actual enforcement point: both
+# httpcore/_backends/sync.py (`self._sock.settimeout(timeout)` called fresh
+# before every single `sock.recv()`) and .../_backends/anyio.py (`with
+# anyio.fail_after(timeout): return await self._stream.receive(...)`, same
+# per-call reset) rearm the same `timeout` value before *every* chunk read
+# in HTTP11Connection._receive_event's loop (httpcore/_sync|_async/http11.py).
+# So a provider that trickles the response slowly enough -- periodic
+# anti-idle bytes, partial headers, whatever -- never lets any single read()
+# call exceed `timeout`, and the overall call can run arbitrarily long even
+# though `timeout` is genuinely, correctly wired. Re-verified this is real
+# and not just a theoretical httpx quirk: after this fix's predecessor
+# (REQUEST_TIMEOUT_SECONDS itself) shipped and was deployed, a live
+# production re-test (2026-09-08, execution 1788881552500) still ran
+# ~15:32:33 to ~15:40:40 wall clock (~7m -- confirmed via journalctl on the
+# VM: the log-sync heartbeat that ticks every 30s regardless shows the
+# browser_use log file's content hash genuinely did not change from
+# 15:33:03 to 15:40:03, i.e. the subprocess was alive but made zero progress
+# for ~7 continuous minutes), with the identical failure signature as the
+# original pre-fix incident (empty response body, `Expecting value: line 1
+# column 1 (char 0)`, browser-use's own retry then getting a fast but
+# structurally-garbled response). Same class of evidence as the original
+# incident's py-spy dump (blocked in asyncio's select(), live ESTAB
+# connection, zero CPU) -- this is a real in-process network stall, not a
+# task-scheduling artifact (checked and ruled out: task_monitor.py's own
+# "Running command:" log line shows the subprocess was launched within ~1s
+# of task creation, not picked up late).
+#
+# Ruled out as alternative explanations: (1) a write-timeout gap -- the
+# outbound payload is a small JSON POST, and a write timeout would raise
+# before any response is seen, which contradicts the observed "got an empty
+# but complete response after minutes" symptom; (2) openai SDK retry
+# swallowing/miscounting the timeout -- read openai/_base_client.py directly:
+# `except httpx.TimeoutException` is the correct catch (covers httpx's
+# ReadTimeout/WriteTimeout/ConnectTimeout/PoolTimeout), and since httpcore
+# never actually raises that exception here (reads keep "succeeding" on
+# trickled bytes), the SDK's retry path is never even entered -- there's
+# only one physical HTTP attempt per call, which is consistent with the
+# hang being one continuous read wait rather than stacked retries; (3) a
+# hidden langchain-level retry wrapper -- grepped langchain_openai and
+# langchain_core's BaseChatModel for automatic retry decorators around
+# invoke/ainvoke; `with_retry()` exists but is opt-in and unused here; (4)
+# stale pooled connection -- not applicable to the incidents analyzed, both
+# were a task's first LLM call on a freshly-constructed client/connection.
+#
+# The fix: HARD_DEADLINE_SECONDS + the invoke/ainvoke wrapping below enforce
+# a genuine wall-clock ceiling that doesn't care what the socket is doing,
+# instead of trusting httpx/httpcore's per-read timeout to ever fire.
 REQUEST_TIMEOUT_SECONDS = 120
+
+# Intentionally 2x REQUEST_TIMEOUT_SECONDS (+ a small buffer): this module's
+# own comment above already documents "~2x this value" as the *intended*
+# worst case for one call, covering the openai SDK's own max_retries=1
+# retry-on-timeout (verified against openai/_constants.py's
+# INITIAL_RETRY_DELAY=0.5s/MAX_RETRY_DELAY=8.0s: with max_retries=1 the
+# inter-retry sleep is ~0.4-0.5s, negligible next to REQUEST_TIMEOUT_SECONDS).
+# This deadline just makes that documented envelope a real, enforced ceiling
+# instead of an aspiration httpx's own timeout semantics don't actually
+# deliver -- it doesn't change the SDK's retry behavior or timing budget,
+# it only backstops it. The +15s covers JSON parsing/langchain overhead
+# around the two attempts, not another retry.
+HARD_DEADLINE_SECONDS = REQUEST_TIMEOUT_SECONDS * 2 + 15
+
+_HARD_DEADLINE_MESSAGE = (
+    "OpenRouter call exceeded the {deadline}s hard wall-clock deadline "
+    "(httpx/httpcore's own `timeout` does not bound total call duration when "
+    "a provider trickles response bytes -- see the ENG-1822 follow-up "
+    "comment on REQUEST_TIMEOUT_SECONDS in this module for why)"
+)
+
+
+def _enforce_hard_deadline(base_cls):
+    """Return a subclass of base_cls whose invoke/ainvoke enforce a real
+    wall-clock ceiling (HARD_DEADLINE_SECONDS), instead of relying on
+    httpx/httpcore's own per-read `timeout` -- proven insufficient in
+    production; see REQUEST_TIMEOUT_SECONDS's comment above.
+
+    Built dynamically off whatever `base_cls` is passed in (rather than a
+    plain module-level `class _X(ChatOpenAI):`) so it keeps working if
+    ChatOpenAI is substituted, e.g. by this module's own test suite
+    monkeypatching a fake constructor -- and calls `base_cls.ainvoke(self,
+    ...)`/`base_cls.invoke(self, ...)` directly rather than bare `super()`,
+    since the zero-argument `super()` shorthand only works for methods
+    defined lexically inside a `class` statement, not ones assigned into a
+    dynamically-built class's namespace via `type(...)`.
+    """
+
+    async def _hard_deadline_ainvoke(self, *args, **kwargs):
+        try:
+            return await asyncio.wait_for(
+                base_cls.ainvoke(self, *args, **kwargs), timeout=HARD_DEADLINE_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                _HARD_DEADLINE_MESSAGE.format(deadline=HARD_DEADLINE_SECONDS)
+            ) from exc
+
+    def _hard_deadline_invoke(self, *args, **kwargs):
+        # Plain sync code can't be preempted mid-blocking-read the way an
+        # `await` can be cancelled, so this runs the real call on a *daemon*
+        # thread and bounds how long the *caller* waits for it via
+        # Queue.get(timeout=...) -- daemon specifically so an abandoned
+        # thread (still stuck in the real call after we've already given up
+        # on it) can't block the interpreter's normal shutdown sequence the
+        # way a plain concurrent.futures.ThreadPoolExecutor worker would
+        # (those are non-daemon by default and get joined at exit). The
+        # thread itself is still bounded by the client's own `timeout`, so
+        # it can't leak forever -- this is the standard pattern for
+        # imposing a hard deadline on non-cooperative sync code.
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def _run():
+            try:
+                result.put(("ok", base_cls.invoke(self, *args, **kwargs)))
+            except BaseException as exc:  # noqa: BLE001 -- forward to the caller's thread
+                result.put(("error", exc))
+
+        threading.Thread(target=_run, daemon=True, name="openrouter-sync-invoke").start()
+        try:
+            status, payload = result.get(timeout=HARD_DEADLINE_SECONDS)
+        except queue.Empty:
+            raise TimeoutError(
+                _HARD_DEADLINE_MESSAGE.format(deadline=HARD_DEADLINE_SECONDS)
+            ) from None
+        if status == "error":
+            raise payload
+        return payload
+
+    return type(
+        f"HardDeadline{base_cls.__name__}",
+        (base_cls,),
+        {"ainvoke": _hard_deadline_ainvoke, "invoke": _hard_deadline_invoke},
+    )
+
 
 # Only aliases whose old upstream ID no longer exists on OpenRouter belong here.
 LEGACY_MODEL_UPGRADES = {
@@ -162,7 +307,17 @@ def create_openrouter_llm(model: str):
     # temperature=0 before the cutover, so retain it where the model accepts it.
     if not model.startswith(("openai/o", "openai/gpt-5")):
         kwargs["temperature"] = 0.0
-    return ChatOpenAI(**kwargs)
+
+    # ENG-1822 follow-up: wrap in a hard wall-clock deadline (see
+    # HARD_DEADLINE_SECONDS above) rather than trusting httpx/httpcore's own
+    # `timeout` to bound total call duration -- it doesn't, for a slow-
+    # trickling response. Guarded on ChatOpenAI actually being a class so
+    # this module's tests can still monkeypatch it with a bare fake
+    # constructor/lambda and get the unwrapped return value back untouched.
+    llm_cls = ChatOpenAI
+    if isinstance(llm_cls, type):
+        llm_cls = _enforce_hard_deadline(llm_cls)
+    return llm_cls(**kwargs)
 
 
 def browser_tool_calling_method(model: str) -> str:
