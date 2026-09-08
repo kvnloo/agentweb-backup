@@ -37,6 +37,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
+import { resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
@@ -14261,12 +14262,29 @@ export const agentModeController = {
         emailNotifications, dailyDigest, llmModel,
       } = req.body;
 
+      // ENG-1716: visibility is the only field here that grants reach beyond the
+      // owner, so it takes an AUTHORIZATION decision, not just a write. This route
+      // previously wrote whatever was sent behind an ownership check alone, so any
+      // authenticated user could promote their own template to `system`/`public`
+      // and put its agent prompt in every customer's picker — skipping the
+      // submit-for-review → admin-approve workflow one route over. Refused
+      // explicitly rather than silently dropped; a silent drop is how the
+      // manage_schedule_template confusion started.
+      const visibilityDecision = resolveVisibilityUpdate({
+        current: existing.visibility,
+        requested: visibility,
+        isAdmin: user.isAdmin === true,
+      });
+      if (!visibilityDecision.ok) {
+        return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
+      }
+
       const updates: any = { updatedAt: new Date().toISOString() };
 
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
       if (category !== undefined) updates.category = category;
-      if (visibility !== undefined) updates.visibility = visibility;
+      if (visibilityDecision.visibility !== undefined) updates.visibility = visibilityDecision.visibility;
       if (keywords !== undefined) updates.keywords = keywords;
       if (requiredFunctionCalls !== undefined) updates.requiredFunctionCalls = requiredFunctionCalls;
       if (functionCallMinCalls !== undefined) updates.functionCallMinCalls = functionCallMinCalls;

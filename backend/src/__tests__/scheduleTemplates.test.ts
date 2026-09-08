@@ -284,6 +284,96 @@ describe('Schedule Templates', () => {
 
   // ─── DELETE ───────────────────────────────────────────────────────────────
 
+  // ENG-1716: the update route wrote whatever `visibility` was sent behind an
+  // ownership check alone, so any authenticated user could publish their own
+  // template platform-wide and skip the review workflow.
+  describe('updateScheduleTemplate — visibility authorization (ENG-1716)', () => {
+    const owned = { templateId: 't1', createdBy: 'user-1', visibility: 'private', name: 'Mine' };
+    // The suite's default mockUser is an ADMIN, so an authorization test must name
+    // its caller explicitly or it silently exercises the privileged path.
+    const ownerNonAdmin = { userId: 'user-1', email: 'owner@example.com', isAdmin: false };
+
+    beforeEach(() => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(owned);
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockResolvedValue({});
+    });
+
+    it('THE BUG: refuses a non-admin promoting their own template to system/public', async () => {
+      for (const visibility of ['system', 'public']) {
+        (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+        const req = mockReq({ params: { templateId: 't1' }, body: { visibility }, user: ownerNonAdmin });
+        const res = mockRes();
+        await agentModeController.updateScheduleTemplate(req as any, res);
+
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(res.json).toHaveBeenCalledWith(
+          expect.objectContaining({ error: expect.stringContaining('administrator') }),
+        );
+        // Refused, not partially applied.
+        expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+      }
+    });
+
+    it('refuses the legacy "platform" alias too, which reads back as system', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'platform' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown visibility instead of persisting it', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'nonsense' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
+    it('AC #2: still lets the owner submit for review and withdraw', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'pending_review' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'pending_review' }),
+      );
+
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+      const req2 = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req2 as any, mockRes());
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'private' }),
+      );
+    });
+
+    it('AC #3: an admin may still publish through this route', async () => {
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { visibility: 'system' },
+        user: { userId: 'user-1', email: 'a@b.c', isAdmin: true },
+      });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'system' }),
+      );
+    });
+
+    it('leaves every non-visibility edit working for the owner', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { name: 'Renamed', category: 'SEO' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      const updates = (scheduleTemplateDb.updateTemplate as jest.Mock).mock.calls[0][1];
+      expect(updates).toEqual(expect.objectContaining({ name: 'Renamed', category: 'SEO' }));
+      expect(updates.visibility).toBeUndefined();
+    });
+  });
+
   describe('deleteScheduleTemplate', () => {
     it('should reject delete by non-owner', async () => {
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({
