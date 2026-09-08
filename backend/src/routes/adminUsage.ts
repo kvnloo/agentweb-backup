@@ -56,8 +56,11 @@ router.get(
       const { billingUserId } = req.params as { billingUserId: string };
       const month = String(req.query.month || "");
 
+      if (!BILLING_USER_ID_RE.test(billingUserId)) {
+        return res.status(400).json({ error: "billingUserId is not a valid identifier" });
+      }
       if (!MONTH_RE.test(month)) {
-        return res.status(400).json({ error: "month must be YYYY-MM" });
+        return res.status(400).json({ error: "month must be YYYY-MM with a real month" });
       }
 
       // The GSI is keyed on occurredAt, so the range is the calendar month.
@@ -92,7 +95,12 @@ router.get(
 
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const MONTH_RE = /^\d{4}-\d{2}$/;
+// 01-12 only. A bare \d{2} accepted 2026-00 and 2026-13, which reach the query
+// and return a successful EMPTY result instead of a 400 — a caller with a typo
+// gets "no spend" rather than "bad month" (CodeRabbit, PR #2811).
+const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+/** Ids are opaque but bounded: uuids, numeric ids, and `anon_<uuid>` sessions. */
+const BILLING_USER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 router.get(
   "/users/:userId/usage/by-model-day",

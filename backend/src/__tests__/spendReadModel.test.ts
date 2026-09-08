@@ -206,6 +206,27 @@ describe('explainPause', () => {
     expect(e.reason).toContain('$1.00');
   });
 
+  // CodeRabbit, PR #2811: a reservation can be what pushed an account over, and
+  // byProvider is sorted by SETTLED spend.
+  it('ranks contributors by committed spend, so a reservation-driven pause names its cause', () => {
+    const reservationDriven = buildSpendBreakdown('owner-1', '2026-09', [
+      anEvent({ eventId: '1', provider: 'you.com', costMicroUsd: 1_000_000 }),
+      anEvent({ eventId: '2', provider: 'v0', costMicroUsd: 9_000_000, lifecycle: 'reserved' }),
+    ]);
+
+    // Sorted by settled alone, v0 sits second at $0.00 despite causing the pause.
+    expect(reservationDriven.byProvider[0].key).toBe('you.com');
+
+    const e = explainPause(
+      aProjection({ policyMode: 'paused', settledMicroUsd: 1_000_000, reservedMicroUsd: 9_000_000 }),
+      reservationDriven,
+    );
+
+    expect(e.topProviders[0].key).toBe('v0');
+    expect(e.reason).toContain('v0 $9.00');
+    expect(e.reason).not.toContain('v0 $0.00');
+  });
+
   it('reads the projection\'s mode rather than recomputing it', () => {
     // An explanation that contradicts the decision it explains is worse than
     // none, so this must follow the projection even when the numbers alone

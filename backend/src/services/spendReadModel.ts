@@ -192,14 +192,26 @@ export function explainPause(
   breakdown: SpendBreakdown,
 ): PauseExplanation {
   const paused = projection.policyMode === "paused";
-  const topProviders = paused ? breakdown.byProvider.slice(0, 3) : [];
+
+  // Ranked by COMMITTED spend, not settled (CodeRabbit, PR #2811). A
+  // reservation can be what pushed an account over, and `byProvider` is sorted
+  // by settled — so the provider whose reservation caused the pause could be
+  // ranked below providers that spent less, or shown at $0.00, or dropped from
+  // the top three entirely. An explanation that omits the cause is worse than
+  // no explanation.
+  const committed = (s: SpendSlice) => s.settledMicroUsd + s.reservedMicroUsd;
+  const topProviders = paused
+    ? [...breakdown.byProvider]
+        .sort((a, b) => committed(b) - committed(a) || a.key.localeCompare(b.key))
+        .slice(0, 3)
+    : [];
 
   const usd = (micro: number) => `$${(micro / 1e6).toFixed(2)}`;
 
   let reason: string | null = null;
   if (paused) {
     const drivers = topProviders.length
-      ? ` Largest contributors: ${topProviders.map((p) => `${p.key} ${usd(p.settledMicroUsd)}`).join(", ")}.`
+      ? ` Largest contributors: ${topProviders.map((p) => `${p.key} ${usd(committed(p))}`).join(", ")}.`
       : "";
     const inFlightNote = projection.reservedMicroUsd
       ? ` ${usd(projection.reservedMicroUsd)} of that is in-flight and not yet settled.`
