@@ -11245,7 +11245,27 @@ export const scheduleTemplateDb = {
       usageCount: number;
       reviewFeedback: string;
       updatedAt: string;
-    }>
+    }>,
+    opts: {
+      /**
+       * ENG-1716: compare-and-swap on the stored `visibility`. When supplied, the
+       * update only lands if the row still carries this value — i.e. nothing has
+       * changed the template's visibility since the caller read it and decided the
+       * write was authorized.
+       *
+       * Needed because that decision is made against a SNAPSHOT: the owner route
+       * authorizes `pending_review -> private` from the row it just read, while the
+       * admin approval path reads `pending_review` and writes `public`. Without the
+       * condition an in-flight owner write silently overwrites the approval
+       * (CodeRabbit on PR #2810). Pass the empty string to require the attribute to
+       * be ABSENT, which is how legacy rows with no visibility read.
+       *
+       * On a lost race the thrown error carries `preconditionFailed` so the caller
+       * can report a conflict instead of pretending the write landed. Omit it for
+       * unconditional updates — behaviour is unchanged.
+       */
+      expectedVisibility?: string;
+    } = {}
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -11260,18 +11280,37 @@ export const scheduleTemplateDb = {
 
       if (updateExpressions.length === 0) return;
 
+      let conditionExpression: string | undefined;
+      if (opts.expectedVisibility !== undefined) {
+        expressionAttributeNames['#expectedVisibility'] = 'visibility';
+        if (opts.expectedVisibility === '') {
+          conditionExpression = 'attribute_not_exists(#expectedVisibility)';
+        } else {
+          conditionExpression = '#expectedVisibility = :expectedVisibility';
+          expressionAttributeValues[':expectedVisibility'] = opts.expectedVisibility;
+        }
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
         Key: { templateId },
         UpdateExpression: `SET ${updateExpressions.join(', ')}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
+        ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
         ReturnValues: 'ALL_NEW' as const,
       };
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      // A lost CAS is an expected outcome, not a database fault — surface it as a
+      // conflict the caller can report rather than swallowing it as a failed write.
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const conflict: any = new Error('Template visibility changed since it was read');
+        conflict.preconditionFailed = true;
+        throw conflict;
+      }
       handleDynamoDbError(error, "updateTemplate");
     }
   },
