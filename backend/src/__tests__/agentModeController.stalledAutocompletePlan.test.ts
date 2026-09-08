@@ -184,3 +184,68 @@ describe('hasStalledAutocompleteWorkPlan (ENG-1700 — all tool calls failed)', 
     expect(hasStalledAutocompleteWorkPlan(workPlan, mediaDeferredCalls)).toBe(false);
   });
 });
+
+/**
+ * ENG-1813 — found during round-4 review of PR agentweb#2808 (the ENG-1811 debt-ledger fix).
+ * An autocomplete plan's modify_work_plan call that deletes the LAST pending step while
+ * creating genuine ENG-1811 debt (a removed step's required function call that never actually
+ * succeeded) IS a successful tool call — the pre-fix ENG-1684/1700 short-circuit
+ * (`calls.some(toolCallSucceeded) -> not stalled`) would call this turn "not stalled" even
+ * though no real required work got done, so no further auto-continuation round would ever fire
+ * to go satisfy the debt. Fixed by checking workPlan.pendingRequiredFunctionCalls (resolved
+ * against real calledFunctions) BEFORE that short-circuit — outstanding debt always wins.
+ */
+describe('hasStalledAutocompleteWorkPlan (ENG-1813 — unresolved debt from a removed step)', () => {
+  it('fires when a modify_work_plan call succeeded this turn but left genuine ENG-1811 debt unresolved', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const succeededCalls = [{ name: 'modify_work_plan' }]; // no error -> counts as succeeded
+    expect(hasStalledAutocompleteWorkPlan(workPlan, succeededCalls, {})).toBe(true);
+    // Without the debt fix, the pre-existing short-circuit would have returned false here
+    // (a tool call succeeded) -- confirm the OLD behavior really would have missed it.
+    expect(hasStalledAutocompleteWorkPlan({ ...workPlan, pendingRequiredFunctionCalls: undefined }, succeededCalls, {})).toBe(false);
+  });
+
+  it('does not fire once the debt function has genuinely succeeded, even if calledFunctions is stale/unchecked elsewhere', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const succeededCalls = [{ name: 'modify_work_plan' }];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, succeededCalls, { list_html_templates: 1 })).toBe(false);
+  });
+
+  it('never fires for debt on an interactive (non-autocomplete) plan', () => {
+    const workPlan = {
+      autocomplete: false,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    expect(hasStalledAutocompleteWorkPlan(workPlan, [{ name: 'modify_work_plan' }], {})).toBe(false);
+  });
+
+  it('media-budget deferral still wins over unresolved debt — scheduleAutoMediaContinuation owns that turn', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: ['list_html_templates'],
+    };
+    const mediaDeferredCalls = [
+      { name: 'generate_image', result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ];
+    expect(hasStalledAutocompleteWorkPlan(workPlan, mediaDeferredCalls, {})).toBe(false);
+  });
+
+  it('an empty pendingRequiredFunctionCalls array behaves exactly like no debt at all', () => {
+    const workPlan = {
+      autocomplete: true,
+      steps: [{ stepCount: 1, status: 'completed' }],
+      pendingRequiredFunctionCalls: [],
+    };
+    expect(hasStalledAutocompleteWorkPlan(workPlan, [{ name: 'modify_work_plan' }], {})).toBe(false);
+  });
+});
