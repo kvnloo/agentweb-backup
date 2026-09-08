@@ -276,6 +276,29 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(text).toContain('skill-a');
       expect(text).toContain('requiredFunctionCalls');
     });
+
+    // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+    // catalog, reopening the same oversized-response risk this PR fixes, for a
+    // caller who usually only wants one template. plan_id scopes verbose to just
+    // the matching template(s) so the guided (verbose + plan_id) path never
+    // re-triggers that risk, while verbose alone (no plan_id) still returns
+    // everything, unchanged from the prior commit.
+    it('verbose=true with plan_id scopes the full-detail response to just the matching template', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      const onboarding = { id: 'wp-1', title: 'Onboarding', description: 'A'.repeat(500) };
+      const audit = { id: 'wp-2', title: 'GTM Audit', description: 'B'.repeat(500) };
+      mockMcpFetch.mockResolvedValue([onboarding, audit]);
+
+      const byId = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true, plan_id: 'wp-2' }, context);
+      expect(JSON.parse(byId.content[0].text as string)).toEqual([audit]);
+
+      const byTitle = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true, plan_id: 'Onboarding' }, context);
+      expect(JSON.parse(byTitle.content[0].text as string)).toEqual([onboarding]);
+
+      // verbose alone (no plan_id) is unchanged -- still returns the whole catalog.
+      const unscoped = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true }, context);
+      expect(JSON.parse(unscoped.content[0].text as string)).toEqual([onboarding, audit]);
+    });
   });
 
   describe('manage_predefined_work_plan - create', () => {

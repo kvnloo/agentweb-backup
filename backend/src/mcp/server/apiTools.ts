@@ -2205,11 +2205,12 @@ mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a specific template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls); prefer the default shape for browsing/matching, since a large catalog in verbose mode may exceed the response-size threshold and get offloaded to search_tool_response.',
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.',
     inputSchema: {
       type: 'object',
       properties: {
         verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+        plan_id: { type: 'string', description: 'Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog.' },
       },
       required: []
     }
@@ -2244,7 +2245,17 @@ mcpToolRegistry.register({
     // detail -- so the full legacy shape stays reachable behind an explicit opt-in
     // rather than being silently removed.
     if (args?.verbose === true) {
-      return jsonResult(data);
+      // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+      // catalog, reopening the same oversized-response/S3-offload mechanism this PR
+      // fixes -- for a caller who usually only wants one template's detail. plan_id
+      // scopes the response to just the matching template(s) so the common case
+      // (verbose + plan_id together) never re-triggers that risk; verbose alone with
+      // no plan_id is still allowed (there's a real, if rarer, use case for "diff
+      // every template's full detail at once") but isn't the guided default.
+      const scoped = args?.plan_id && Array.isArray(data)
+        ? data.filter((p: any) => p.id === args.plan_id || p.planId === args.plan_id || p.title === args.plan_id)
+        : data;
+      return jsonResult(scoped);
     }
     const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
     // Return only what a listing/matching consumer needs by default: the
