@@ -19,7 +19,8 @@ import {
   getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
-  resolveSlackFileUrl
+  resolveSlackFileUrl,
+  postSlackMessage
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -43,6 +44,22 @@ function citeForSlack(response: any): string {
 }
 
 const router = express.Router();
+
+// ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
+// can never share our own workspace's team_id — that's what Slack Connect means — so neither the
+// email-domain check nor the own-team_id fallback below can ever authorize them, even though
+// they're legitimately trusted. Slack reliably includes the author's home team on Connect-shared
+// app_mention events via user_team/source_team, delivered directly on the event payload — no
+// extra API call, and no dependency on users.info resolving anything (confirmed empirically:
+// Manan's own test in #agentweb-argusoft on 2026-09-03 got the profile-email field silently
+// omitted exactly as it did for Harsha/Fangfang, but user_team/source_team carried his real home
+// team, T093CUE1WGP, without incident). Comma-separated env override; defaults to Argusoft's team.
+const TRUSTED_EXTERNAL_SLACK_TEAM_IDS = new Set(
+  (process.env.AGENTWEB_TRUSTED_EXTERNAL_SLACK_TEAM_IDS || 'T093CUE1WGP') // Argusoft
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
@@ -463,7 +480,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files } = event;
+        const { text, user: slackUserId, channel, ts, files, user_team: userTeam, source_team: sourceTeam } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -519,7 +536,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            let canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail
+              || requesterEmail?.endsWith('@agentweb.pro')
+              || requesterEmail?.endsWith('@argusoft.com');
 
             // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
             // users:read.email bot scope and has empirically failed for verified AgentWeb admins
@@ -531,14 +550,26 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             // mention resolves to, but that's not the question here: targetEmail is typed
             // explicitly by the requester, so this only decides whether an AgentWeb workspace
             // member is allowed to run the link command at all — the same authorization the
-            // requesterEmail?.endsWith('@agentweb.pro') check above already grants to any
-            // internal admin, just via a signal that doesn't depend on the broken field.
+            // trusted-domain checks above already grant to any internal admin, just via a
+            // signal that doesn't depend on the broken field.
             if (!canLinkChannel) {
               const [senderTeamId, ownTeamId] = await Promise.all([
                 getSlackUserTeamId(slackUserId),
                 getOwnSlackTeamId(),
               ]);
               canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
+
+            // ENG-1294: the own-team_id check above only ever proves "same workspace as us" — a
+            // real Slack Connect guest can never pass it, no matter who they are. Trust a small,
+            // explicit allowlist of partner teams via user_team/source_team instead, which Slack
+            // hands us directly rather than requiring a lookup that may silently omit data for an
+            // external profile. Same authorization question as every check above (may this Slack
+            // user run the link command at all), never used to pick which AgentWeb account a
+            // mention resolves to.
+            if (!canLinkChannel) {
+              const externalTeamId = userTeam || sourceTeam;
+              canLinkChannel = !!externalTeamId && TRUSTED_EXTERNAL_SLACK_TEAM_IDS.has(externalTeamId);
             }
 
             if (!canLinkChannel) {
@@ -1352,8 +1383,39 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     } catch (alertError) {
                       console.error('❌ Error sending oncall alert:', alertError);
                     }
+                    // ENG-1741: the internal oncall alert above told nobody the reviewer is
+                    // actually waiting on — from their side, the revision just never came
+                    // back. Tell them directly, in addition to (not instead of) oncall.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
                   }
                 }).catch(async (error) => {
+                  // ENG-1719: expected, benign lock contention (a live chat turn or another
+                  // revision on the same session), not a real failure — paging on-call for
+                  // it was the exact false alarm this fix exists to stop.
+                  const { isSessionBusyError } = await import('../controllers/agentModeController');
+                  if (isSessionBusyError(error)) {
+                    console.warn(`⏳ Agent Mode revision for session ${agentSessionId} skipped — session was busy with another generation in progress.`);
+                    // ENG-1741: previously silent to the reviewer — only this log line existed.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                        'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1379,8 +1441,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   } catch (alertError) {
                     console.error('❌ Error sending oncall alert:', alertError);
                   }
+                  // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                  if (originalApproval.slackChannel) {
+                    await postSlackMessage(
+                      originalApproval.slackChannel,
+                      ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                      originalApproval.slackMessageTs || undefined,
+                    ).catch((slackErr: any) =>
+                      console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                    );
+                  }
                 });
-                
+
                 console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${agentSessionId}`);
               } catch (agentModeError) {
                 console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);
@@ -1581,8 +1653,37 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         } catch (alertError) {
                           console.error('❌ Error sending oncall alert:', alertError);
                         }
+                        // ENG-1741: notify the reviewer directly too, not just internal oncall.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
                       }
                     }).catch(async (error) => {
+                      // ENG-1719: expected, benign lock contention, not a real failure —
+                      // paging on-call for it was the exact false alarm this fix exists
+                      // to stop.
+                      const { isSessionBusyError } = await import('../controllers/agentModeController');
+                      if (isSessionBusyError(error)) {
+                        console.warn(`⏳ Agent Mode revision for session ${task.sessionId} skipped — session was busy with another generation in progress.`);
+                        // ENG-1741: previously silent to the reviewer — only this log line existed.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                            'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
+                        return;
+                      }
                       console.error('❌ Error in Agent Mode verified-generate:', error);
                       try {
                         const isSessionLimit = isSessionLimitError(error);
@@ -1609,8 +1710,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       } catch (alertError) {
                         console.error('❌ Error sending oncall alert:', alertError);
                       }
+                      // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                      if (originalApproval.slackChannel) {
+                        await postSlackMessage(
+                          originalApproval.slackChannel,
+                          ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                          originalApproval.slackMessageTs || undefined,
+                        ).catch((slackErr: any) =>
+                          console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                        );
+                      }
                     });
-                    
+
                     console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${task.sessionId}`);
                   } catch (agentModeError) {
                     console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);

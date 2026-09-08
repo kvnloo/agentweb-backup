@@ -26,11 +26,84 @@ import {
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
+import { listSpendEvents } from "../services/spendEventDb";
+import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
+import { projectMonth } from "../services/spendProjection";
+import { getSubscriptionTypeConfig } from "../services/subscriptionService";
+import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
+import { userDb } from "../services/db";
 
 const router = express.Router();
 
+/**
+ * ENG-1250 §7: the spend breakdown for one billing subject and month, built
+ * from the immutable ledger.
+ *
+ * Exists because §7's requirement is that "no admin should need direct
+ * DynamoDB inspection to explain a pause" — and until this, nothing outside
+ * the ledger modules could read AW-SpendEvents at all.
+ *
+ * READ-ONLY, and deliberately so: it reports what the ledger says and cannot
+ * pause, unpause, or alter a balance. ENG-1250 AC6 keeps enforcement with
+ * Harsha, and a read model must never become the thing that pauses an account.
+ */
+router.get(
+  "/users/:billingUserId/spend/breakdown",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { billingUserId } = req.params as { billingUserId: string };
+      const month = String(req.query.month || "");
+
+      if (!BILLING_USER_ID_RE.test(billingUserId)) {
+        return res.status(400).json({ error: "billingUserId is not a valid identifier" });
+      }
+      if (!MONTH_RE.test(month)) {
+        return res.status(400).json({ error: "month must be YYYY-MM with a real month" });
+      }
+
+      // The GSI is keyed on occurredAt, so the range is the calendar month.
+      // `-31` is safe for every month: it is an upper bound on a string
+      // comparison, not a date that has to exist.
+      const events = await listSpendEvents(billingUserId, `${month}-01`, `${month}-31`);
+      const breakdown = buildSpendBreakdown(billingUserId, month, events);
+
+      const allowance = await resolveAllowanceInputs(billingUserId, month, {
+        getUser: (id) => userDb.getUserById(id) as any,
+        getTierConfig: (tier) => getSubscriptionTypeConfig(tier) as any,
+        getCreditAdjustment: (ledger, m) => getLlmUsageCreditAdjustment(ledger as any, m),
+      });
+
+      // Computed from the SAME events the breakdown reports, so the
+      // explanation and the numbers behind it can never disagree.
+      // The policy MUST be threaded: without it projectMonth evaluates with no
+      // policy, returns full_choice unconditionally, and no pause is ever
+      // explained — the opposite of what this endpoint exists for.
+      const projection = projectMonth(billingUserId, month, events, allowance, allowance.policy as any);
+
+      return res.json({
+        ...breakdown,
+        allowance,
+        projection,
+        // §7: "no admin should need direct DynamoDB inspection to explain a pause"
+        pause: explainPause(projection, breakdown),
+      });
+    } catch (error: any) {
+      console.error("[adminUsage] spend breakdown failed:", error?.message || error);
+      return res.status(500).json({ error: "Failed to build spend breakdown" });
+    }
+  }
+);
+
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const MONTH_RE = /^\d{4}-\d{2}$/;
+// 01-12 only. A bare \d{2} accepted 2026-00 and 2026-13, which reach the query
+// and return a successful EMPTY result instead of a 400 — a caller with a typo
+// gets "no spend" rather than "bad month" (CodeRabbit, PR #2811).
+const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+/** Ids are opaque but bounded: uuids, numeric ids, and `anon_<uuid>` sessions. */
+const BILLING_USER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 router.get(
   "/users/:userId/usage/by-model-day",

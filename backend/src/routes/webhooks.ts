@@ -414,9 +414,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 // ONLY the optional, best-effort Meta CAPI send below (capiSendBudget), so the worst case of
 // hitting a limit is "this one submission doesn't get forwarded to Meta" — never a lost lead.
 //
-// (Keying any future request-level limiter here by IP would also be unsound: this app never
-// configures Express's `trust proxy`, so `req.ip` collapses to the same value for every
-// caller — confirmed live in both prod and the test env. See ENG-493.)
+// (A request-level limiter keyed by listId, as capiSendBudget is below, remains the right
+// call regardless: `req.ip` now resolves correctly since app.ts configures `trust proxy`
+// (ENG-493), but per-listId is still the meaningful boundary for this endpoint — a spike
+// from one list's real traffic shouldn't be able to starve every other list's budget.)
 
 // Public endpoint for forwarding leads to CRM
 router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
@@ -569,9 +570,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     //
     // Computed once here rather than inside the CAPI block below, because the lead write
     // needs them too and re-deriving the same value twice is how the two drift apart.
-    // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
-    // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
-    // handler.
+    // Reads x-forwarded-for directly rather than relying on req.ip: this endpoint is public
+    // and wants the ORIGINATING address (leftmost of the chain), which is what callers here
+    // expect regardless of the app-wide `trust proxy` hop count (ENG-493) used elsewhere for
+    // rate-limit keying.
     //
     // ⚠ Landing pages do NOT reach this route from the browser — they POST to their own
     // Next.js route, which calls us server-side from Vercel (both `hireemma.ai`'s

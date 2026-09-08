@@ -59,7 +59,8 @@ class TestBrowserUseIntegration(unittest.TestCase):
             task=self.test_task,
             llm=mock_llm,
             controller=self.controller,
-            browser=mock_browser
+            browser=mock_browser,
+            enable_memory=False  # ENG-1818: real OPENAI_API_KEY doesn't exist here
         )
         
         self.assertIsInstance(agent, Agent)
@@ -145,7 +146,8 @@ class TestBrowserUseIntegration(unittest.TestCase):
             task=self.test_task,
             llm=mock_llm,
             controller=self.controller,
-            browser=mock_browser
+            browser=mock_browser,
+            enable_memory=False  # ENG-1818: real OPENAI_API_KEY doesn't exist here
         )
         
         # Check that run method exists and is callable
@@ -190,18 +192,20 @@ class TestBrowserUseIntegration(unittest.TestCase):
             llm=mock_llm,
             controller=self.controller,
             browser=mock_browser,
-            use_vision=True
+            use_vision=True,
+            enable_memory=False  # ENG-1818: real OPENAI_API_KEY doesn't exist here
         )
-        
+
         self.assertIsInstance(agent_vision, Agent)
-        
+
         # Test with use_vision=False
         agent_no_vision = Agent(
             task=self.test_task,
             llm=mock_llm,
             controller=self.controller,
             browser=mock_browser,
-            use_vision=False
+            use_vision=False,
+            enable_memory=False  # ENG-1818: real OPENAI_API_KEY doesn't exist here
         )
         
         self.assertIsInstance(agent_no_vision, Agent)
@@ -247,7 +251,8 @@ class TestBrowserUseIntegration(unittest.TestCase):
             task=self.test_task,
             llm=mock_llm,
             controller=self.controller,
-            browser=mock_browser
+            browser=mock_browser,
+            enable_memory=False  # ENG-1818: real OPENAI_API_KEY doesn't exist here
         )
         
         # Check that run method can be called with max_steps

@@ -391,7 +391,18 @@ export interface OpenIssue {
 const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
 const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
 
-/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see OPEN_STATE_TYPES. */
+/**
+ * List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see
+ * OPEN_STATE_TYPES.
+ *
+ * ARCHIVED CANDIDACY (ENG-730): Linear's default `issues()` query already excludes archived
+ * issues (they only surface with the explicit `includeArchived: true` argument, which this query
+ * deliberately omits) — an archived canonical can therefore never come back as a match here,
+ * belt-and-braces confirmed by the `state.type` whitelist too (an archived issue's underlying
+ * workflow state can be anything, so the whitelist alone would not be a safe guard on its own).
+ * This is a candidacy EXCLUSION, not a post-selection filter (ENG-730 AC2): archived rows never
+ * enter the candidate list in the first place.
+ */
 export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
   const data = await linearGraphQL(
     `query($team: String!, $label: String!, $limit: Int!) {
@@ -408,6 +419,91 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
     { team: TEAM_KEY, label: labelName, limit },
   );
   return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Find the most-recently-archived issue carrying `labelName` whose title or body matches
+ * `isMatch` (ENG-730 AC3). Used ONLY to record lineage — "the archived predecessor this new
+ * canonical replaces" — on a freshly created canonical, never as a dedupe target: archived issues
+ * are permanently excluded from candidacy (see `listOpenIssuesByLabel`).
+ *
+ * `includeArchived: true` is the ONLY way to see archived rows through Linear's API — the default
+ * `issues()` query silently omits them. Best-effort by contract: a lookup failure (network,
+ * schema surprise) must never block filing the new canonical, so callers should catch and log,
+ * never let this throw into the intake path.
+ */
+export async function findMostRecentArchivedIssueByLabel(
+  labelName: string,
+  isMatch: (issue: OpenIssue) => boolean,
+  limit = 50,
+): Promise<OpenIssue | null> {
+  const data = await linearGraphQL(
+    `query($team: String!, $label: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        includeArchived: true,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $label } }
+        }
+      ) { nodes { id identifier title description archivedAt } }
+    }`,
+    { team: TEAM_KEY, label: labelName, limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  // Defense in depth: even though `includeArchived: true` widens the query to include archived
+  // rows, still-open issues remain in the page too — filter to ONLY archived ones so this can
+  // never accidentally be reused as a dedupe-candidate source.
+  const archived = nodes.filter((n) => !!n.archivedAt);
+  const candidate = archived
+    .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+    .find(isMatch);
+  return candidate || null;
+}
+
+/**
+ * Thrown when a mutation attempts to move an issue into Linear's `Duplicate` state (or otherwise
+ * create a duplicate relation) against a target that is archived. Linear hard-rejects this
+ * server-side ("Issues can only be moved to a duplicate state when a duplicate issue relation
+ * exists") because an archived issue cannot hold a duplicate relation — ENG-730's root cause.
+ * A distinct, named error class so callers can classify this failure instead of it surfacing as
+ * an opaque `Linear API error` string, and so it can never be silently swallowed (ENG-730 AC5).
+ */
+export class ArchivedDuplicateTargetError extends Error {
+  constructor(public readonly targetIssueId: string, cause: string) {
+    super(`Cannot mark duplicate against archived Linear issue ${targetIssueId}: ${cause}`);
+    this.name = 'ArchivedDuplicateTargetError';
+  }
+}
+
+const ARCHIVED_DUPLICATE_TARGET_RE = /can only be moved to a duplicate state when a duplicate issue relation exists/i;
+
+/**
+ * Create a "duplicate" relation from `issueId` onto `canonicalIssueId` (moves `issueId` toward
+ * Linear's Duplicate semantics). ENG-730 AC5: an archived `canonicalIssueId` is Linear's own
+ * hard-rejection case — that specific rejection is reclassified into `ArchivedDuplicateTargetError`
+ * (loud, named, catchable) instead of leaking as an undifferentiated `Linear API error` string that
+ * a caller could plausibly catch-and-ignore. Any other failure propagates unchanged.
+ */
+export async function markIssueDuplicateOf(issueId: string, canonicalIssueId: string): Promise<void> {
+  try {
+    const data = await linearGraphQL(
+      `mutation($input: IssueRelationCreateInput!) {
+        issueRelationCreate(input: $input) { success }
+      }`,
+      { input: { issueId, relatedIssueId: canonicalIssueId, type: 'duplicate' } },
+    );
+    if (!data?.issueRelationCreate?.success) {
+      throw new Error('Linear issueRelationCreate (duplicate) did not report success');
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (ARCHIVED_DUPLICATE_TARGET_RE.test(message)) {
+      throw new ArchivedDuplicateTargetError(canonicalIssueId, message);
+    }
+    throw error;
+  }
 }
 
 /**

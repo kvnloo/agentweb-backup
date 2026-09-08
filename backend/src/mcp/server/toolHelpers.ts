@@ -33,3 +33,12 @@ export function jsonResult(data: unknown) {
     ],
   };
 }
+
+// ENG-1801: moved from apiTools.ts so emma/tools.ts's Meta Ads tools can share
+// the identical admin-scoping param name/contract instead of keeping a second
+// copy that drifts (same reasoning as ctx/jsonResult above).
+export const CLIENT_ID_SCHEMA_PROPERTY = {
+  type: 'string' as const,
+  description:
+    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
+};

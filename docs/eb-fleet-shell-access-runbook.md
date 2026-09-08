@@ -1,0 +1,94 @@
+# EB fleet shell access (SSH closed — use SSM)
+
+SSH (port 22) is closed on all Elastic Beanstalk-managed environments as of 2026-08-09 (ENG-1009):
+production and all four other EB environments have zero `0.0.0.0/0:22` (or any) inbound SSH rules on
+their security groups. Reaching an instance shell now goes through AWS Systems Manager (SSM) Session
+Manager instead.
+
+## Why
+
+Every EB environment's security group had SSH open to the entire internet. Closing it removes a real
+attack surface (credential-stuffing, 0-days in `sshd`) without losing operator shell access — SSM
+Session Manager provides the same capability over an outbound-only, IAM-authenticated channel.
+Session start/stop is always recorded in CloudTrail; command-level shell content is only captured if
+the account has Session Manager logging (S3/CloudWatch) configured separately — check
+`aws ssm get-document --region us-west-2 --name SSM-SessionManagerRunShell` for the active preferences before relying on
+command-level forensic evidence. This check requires `ssm:GetDocument` on the caller's identity (see
+the grant list below) — without it, the logging-preferences check itself is denied.
+
+## Getting a shell
+
+1. Find the instance ID for the environment you need:
+   ```bash
+   aws elasticbeanstalk describe-environment-resources \
+     --region us-west-2 \
+     --environment-name <env-name> \
+     --query "EnvironmentResources.Instances[].Id" --output text
+   ```
+   (`<env-name>` is one of `Agentweb-backend-env-prod-3`, `Agentweb-backend-env-1` (staging), or the
+   other EB-managed environments.) A scaled environment returns multiple instance IDs — pick the one
+   you actually need before running `start-session` below.
+
+2. Start a session:
+   ```bash
+   aws ssm start-session --region us-west-2 --target <instance-id>
+   ```
+
+Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+installed locally (`session-manager-plugin`) and, on the **caller's own IAM identity** (user or role),
+an attached policy granting at minimum:
+- `ssm:StartSession` on the target instance (`arn:aws:ec2:us-west-2:*:instance/*`)
+- `ssm:StartSession` on the session document used to open the shell's data channel
+  (`arn:aws:ssm:us-west-2:*:document/SSM-SessionManagerRunShell`) — omitting this grant fails the
+  session establishment even though the instance-targeted grant above is present
+- `ssm:TerminateSession`/`ssm:ResumeSession` on `arn:aws:ssm:us-west-2:*:session/*` — do **not**
+  scope this to a caller-name prefix (`${aws:userid}-*` or `${aws:username}-*`). SSM names the
+  session resource from the STS role-session-name for an assumed role but from the IAM user name for
+  a direct IAM user, and neither `${aws:userid}` (which prepends the role's unique ID, e.g.
+  `AROAEXAMPLE:session-name`, not present in the session name) nor `${aws:username}` (unpopulated for
+  assumed-role callers) matches both caller types reliably. Scoping this grant by caller name has
+  broken resume/terminate for one or the other caller type on every past revision of this doc — the
+  session resource is inherently per-caller already (nobody else's session ID collides with yours),
+  so the wildcard costs nothing in practice.
+- `ssm:GetDocument` (resource `*`, it is a read-only account-level lookup) — required for the
+  `aws ssm get-document ... SSM-SessionManagerRunShell` logging-preferences check above; without it,
+  an operator with only the three session grants cannot confirm whether command-level shell content
+  is being recorded
+
+This is separate from the instance side: `AmazonSSMManagedInstanceCore` on the shared
+`aws-elasticbeanstalk-ec2-role` instance profile only lets the *instance* register with SSM and
+receive sessions — it grants nothing to the operator calling `aws ssm start-session`. If
+`start-session` fails with an authorization error, the caller's identity is missing one of the two
+`ssm:StartSession` grants above; request it before assuming the instance is unreachable.
+`ssm:TerminateSession`/`ssm:ResumeSession` failures point to the session grant instead, and a failed
+`ssm get-document` logging-preferences check points to the separate `ssm:GetDocument` grant — don't
+conflate the three when diagnosing a permission error.
+
+## Verifying the fleet is actually closed
+
+Raw check (works for any operator, no extra setup):
+
+```bash
+aws ec2 describe-security-groups --region us-west-2 \
+  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?IpProtocol=='-1' || (FromPort<=\`22\` && ToPort>=\`22\`)]}" \
+  --output json | jq '[.[] | select(.Rules | length > 0)]'
+```
+
+**Do not filter on `ip-permission.to-port,Values=22`** — that only matches rules whose `ToPort` is
+exactly 22 and silently misses a broader range (e.g. `FromPort=0, ToPort=65535`, or any range like
+`20-25`) that also permits port 22. The query above instead pulls every rule on each group and
+filters for any range that covers port 22 (`FromPort<=22 AND ToPort>=22`), which catches both an
+exact `22-22` rule and a wider range that includes it — **plus** an all-protocol rule
+(`IpProtocol: "-1"`), which AWS returns with no `FromPort`/`ToPort` at all, so the numeric range
+check alone would silently miss it even though it exposes port 22.
+
+An empty result (`[]`) means no security group in the region has any inbound rule covering port 22 —
+the expected state. Any group listed here is a regression (a redeployed environment somehow
+re-opening 22, a new environment created without this runbook in mind) and needs the rule removed.
+
+On the swarm box, `python3 ~/.agentweb-swarm/scripts/sg-guard.py --region us-west-2` runs the
+equivalent check across all world-open non-public ports (not just 22) and exits 0/clean or 1/findings.
+That script lives under `~/.agentweb-swarm/scripts/` on the swarm box only — it is not part of this
+repo, so it is not available to an operator working from a plain checkout.
+
+See ENG-1009 for the full incident/remediation history and CloudTrail evidence of the original revoke.

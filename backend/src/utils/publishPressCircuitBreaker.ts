@@ -76,6 +76,21 @@ function hasKnownEquivalenceRoute(name: string): boolean {
 }
 
 /**
+ * True when THIS breaker claims `name` — the single per-name condition
+ * `isPublishOnlyUnmet` applies below, exported so a sibling breaker can defer to
+ * it instead of re-deriving "is this publish-shaped" from its own rules.
+ *
+ * ENG-1715 needs exactly this: `send_email_from_sender` and `twitter_manage_post`
+ * are BOTH `isSendName` and claimed here (through the equivalence table, not
+ * through `isPublishName`), so the send breaker must recognise this module's real
+ * claim — not the narrower name check — or the two would race for the same turn
+ * and cut a publish stall short at the smaller send budget.
+ */
+export function isPublishPressClaimedName(name: string): boolean {
+  return typeof name === 'string' && (isPublishName(name) || hasKnownEquivalenceRoute(name));
+}
+
+/**
  * True when the ONLY thing a run still has outstanding is one or more
  * irreversible-write tools this module can reason about — i.e. the state in
  * which the next unmet-requirement retry would press for a publish (or a
@@ -108,9 +123,7 @@ function hasKnownEquivalenceRoute(name: string): boolean {
  */
 export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
   if (!Array.isArray(unmetRequiredFunctions) || unmetRequiredFunctions.length === 0) return false;
-  return unmetRequiredFunctions.every(
-    (name) => typeof name === 'string' && (isPublishName(name) || hasKnownEquivalenceRoute(name))
-  );
+  return unmetRequiredFunctions.every(isPublishPressClaimedName);
 }
 
 /**

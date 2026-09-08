@@ -183,6 +183,38 @@ export async function getSentInvitationByProfileUrlAndAccount(
 }
 
 /** Fetch all pending-invitation rows for an account. */
+/**
+ * How many PENDING invitations this account currently has, without fetching them.
+ *
+ * `Select: 'COUNT'` returns only the tally, so this stays cheap for the accounts
+ * that need it most: the backlogs this number exists to expose are the large ones
+ * (539 pending observed on one live account), and `getAllSentInvitationsByAccount`
+ * would page every row into memory purely to read `.length` (ENG-1717).
+ *
+ * A row existing means the invitation is still pending — the sync cron prunes
+ * accepted/withdrawn ones off Unipile's feed (see the module doc above).
+ *
+ * NOTE the ceiling this number is NOT compared against: LinkedIn does not publish
+ * its per-account pending-invitation cap and Unipile does not expose it, so there
+ * is nothing to divide this by. It is a reportable signal, never a gate.
+ */
+export async function countSentInvitationsByAccount(accountId: string): Promise<number> {
+  let count = 0;
+  let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  do {
+    const result = await dynamodb.query({
+      TableName: TABLE,
+      KeyConditionExpression: 'accountId = :aid',
+      ExpressionAttributeValues: { ':aid': accountId },
+      Select: 'COUNT',
+      ExclusiveStartKey: lastEvaluatedKey,
+    }).promise();
+    count += result.Count ?? 0;
+    lastEvaluatedKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
+  } while (lastEvaluatedKey);
+  return count;
+}
+
 export async function getAllSentInvitationsByAccount(accountId: string): Promise<UnipileSentInvitation[]> {
   const items: UnipileSentInvitation[] = [];
   let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;

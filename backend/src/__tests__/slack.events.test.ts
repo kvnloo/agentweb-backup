@@ -771,6 +771,101 @@ describe('Slack Events API', () => {
       }));
     });
 
+    it('ENG-1294: authorizes a link for a requester with a trusted @argusoft.com email', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue('operator@argusoft.com');
+      userDb.getUserByEmail.mockResolvedValue({ userId: 'user-matthew', email: 'matthew@agentweb.pro', slackChannels: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_ARGUSOFT',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_ARGUSOFT',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('matthew@agentweb.pro');
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_ARGUSOFT',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to matthew@agentweb.pro'),
+      }));
+    });
+
+    it('ENG-1294: authorizes a link via user_team/source_team for a Slack Connect guest whose email and own-team_id both fail (Manan\'s real repro, 2026-09-03)', async () => {
+      // Mirrors the actual production failure: a Slack Connect guest from Argusoft's own
+      // workspace (T093CUE1WGP) whose profile.email doesn't resolve, and whose own team_id can
+      // never equal ours since Slack Connect means a genuinely different home workspace.
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue(null);
+      getSlackUserTeamId.mockResolvedValue(null);
+      userDb.getUserByEmail.mockResolvedValue({ userId: 'user-matthew', email: 'matthew@agentweb.pro', slackChannels: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_MANAN',
+            user_team: 'T093CUE1WGP',
+            source_team: 'T093CUE1WGP',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_AGENTWEB_ARGUSOFT',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('matthew@agentweb.pro');
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_AGENTWEB_ARGUSOFT',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Linked this channel to matthew@agentweb.pro'),
+      }));
+    });
+
+    it('ENG-1294: does not authorize a link for a Slack Connect guest from an untrusted external team (no over-correction)', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      getSlackUserEmail.mockResolvedValue(null);
+      getSlackUserTeamId.mockResolvedValue(null);
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_RANDOM_GUEST',
+            user_team: 'TSOMEOTHERCOMPANY',
+            source_team: 'TSOMEOTHERCOMPANY',
+            text: '<@UEMMA123> for user matthew@agentweb.pro link to this channel',
+            channel: 'C_UNTRUSTED_GUEST',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C_UNTRUSTED_GUEST',
+        thread_ts: '1234567890.123456',
+        text: expect.stringContaining('Only AgentWeb admins or the target account owner can link'),
+      }));
+    });
+
     describe('Thread message handling', () => {
       it('should forward thread replies to existing Emma session', async () => {
         // Mock thread-to-session mapping exists

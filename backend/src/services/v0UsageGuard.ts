@@ -151,6 +151,19 @@ export function buildV0IdempotencyKey(input: {
   ].join('#');
 }
 
+/**
+ * The metering identity of one reservation: the guard's own key plus the
+ * moment the reservation was taken.
+ *
+ * Deliberately derived from the guard rather than invented alongside it. Two
+ * independent notions of "the same v0 call" would drift, and the failure would
+ * be silent -- the guard deduping while the ledger charged twice, or the
+ * reverse.
+ */
+export function meteringKeyFor(idempotencyKey: string, reservedAt: string): string {
+  return `v0:${idempotencyKey}#${reservedAt}`;
+}
+
 async function bestEffortPut(
   record: V0UsageRecord,
   opts?: {
@@ -273,7 +286,11 @@ export async function guardedV0ChatCreate<T = any>(input: {
   scopeId: string;
   slug?: string;
   prompt: string;
-  create: () => Promise<T>;
+  /**
+   * Receives the METERING key for this reservation (ENG-702 AC1). Existing
+   * `() => Promise<T>` callbacks stay assignable, so adoption is per-call-site.
+   */
+  create: (meteringKey: string) => Promise<T>;
 }): Promise<T | { id: string; reused: true }> {
   const idempotencyKey = buildV0IdempotencyKey(input);
   const existing = memoryUsage.get(idempotencyKey) || await bestEffortGet(idempotencyKey);
@@ -316,7 +333,12 @@ export async function guardedV0ChatCreate<T = any>(input: {
   }
 
   try {
-    const response = await input.create();
+    // The reservation's own timestamp discriminates attempts. Every retry
+    // inside ONE reservation shares this key and is charged once, which is the
+    // "duplicates under one reservation" defect ENG-702 names; a
+    // guard-permitted retry after a failure mints a new reservation, gets a new
+    // key, and is charged in full because it really did call v0 again.
+    const response = await input.create(meteringKeyFor(idempotencyKey, now));
     const chatId = (response as any)?.id;
     if (!chatId) throw new Error('v0 chat creation did not return an id');
     await save({ ...reserved, status: 'succeeded', chatId });
@@ -340,7 +362,8 @@ export async function guardedV0CorrectionMessage<T>(input: {
    * double-fire. (ENG-287 residual)
    */
   attempt?: number;
-  send: () => Promise<T>;
+  /** Receives the METERING key for this reservation (ENG-702 AC1). */
+  send: (meteringKey: string) => Promise<T>;
 }): Promise<T | { skipped: true }> {
   const idempotencyKey = buildV0IdempotencyKey({
     userId: input.userId,
@@ -381,7 +404,7 @@ export async function guardedV0CorrectionMessage<T>(input: {
   if (!reservedInDynamo) return { skipped: true };
 
   try {
-    const response = await input.send();
+    const response = await input.send(meteringKeyFor(idempotencyKey, now));
     await save({ ...reserved, status: 'succeeded' });
     return response;
   } catch (error: any) {
@@ -416,7 +439,8 @@ export async function guardedV0IterateMessage<T>(input: {
   scopeId: string;
   chatId: string;
   message: string;
-  send: () => Promise<T>;
+  /** Receives the METERING key for this reservation (ENG-702 AC1). */
+  send: (meteringKey: string) => Promise<T>;
 }): Promise<T | { skipped: true }> {
   const contentHash = hashV0Prompt(input.message);
   const idempotencyKey = buildV0IdempotencyKey({
@@ -459,7 +483,7 @@ export async function guardedV0IterateMessage<T>(input: {
   if (!reservedInDynamo) return { skipped: true };
 
   try {
-    const response = await input.send();
+    const response = await input.send(meteringKeyFor(idempotencyKey, now));
     await save({ ...reserved, status: 'succeeded' });
     return response;
   } catch (error: any) {

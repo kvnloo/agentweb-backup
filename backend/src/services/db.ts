@@ -151,6 +151,8 @@ export interface User {
   emailUndeliverableAt?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
+  emailNotificationsEnabled?: boolean; // Portal Settings > Preferences toggle (ENG-1316). Absent = enabled (default).
+  emmaTipsEnabled?: boolean; // Portal Settings > Preferences toggle + tip-card "don't show again" (ENG-188). Absent = enabled (default).
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // @deprecated legacy single sending domain — kept for the task/subscriber-notification fallback sender (emailService.ts, dripSequenceWorker.ts legacyDefaultSender); CRM sending domains live in emailDomains[] (ENG-265)
@@ -11159,15 +11161,36 @@ export const scheduleTemplateDb = {
     reviewFeedback?: string;
     createdAt: string;
     updatedAt: string;
-  }) {
+  }, opts: {
+    /**
+     * ENG-1722: refuse to overwrite an existing row with this `templateId`.
+     *
+     * The seed script used to check-then-create with a freshly generated id on
+     * every run, so two concurrent runs could both observe "absent" and create
+     * DUPLICATE system templates — each visible to every customer — which is
+     * exactly the idempotence contract the seed is supposed to hold (CodeRabbit).
+     * A stable id plus this condition makes the create itself the uniqueness
+     * check, so there is no window between the two.
+     *
+     * On a collision the thrown error carries `alreadyExists`, which a seeder can
+     * treat as success rather than as a fault.
+     */
+    onlyIfAbsent?: boolean;
+  } = {}) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
         Item: template,
+        ...(opts.onlyIfAbsent ? { ConditionExpression: 'attribute_not_exists(templateId)' } : {}),
       };
       await dynamodb.put(params).promise();
       return template;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const exists: any = new Error(`Schedule template ${template.templateId} already exists`);
+        exists.alreadyExists = true;
+        throw exists;
+      }
       handleDynamoDbError(error, "createTemplate");
     }
   },
@@ -11243,7 +11266,27 @@ export const scheduleTemplateDb = {
       usageCount: number;
       reviewFeedback: string;
       updatedAt: string;
-    }>
+    }>,
+    opts: {
+      /**
+       * ENG-1716: compare-and-swap on the stored `visibility`. When supplied, the
+       * update only lands if the row still carries this value — i.e. nothing has
+       * changed the template's visibility since the caller read it and decided the
+       * write was authorized.
+       *
+       * Needed because that decision is made against a SNAPSHOT: the owner route
+       * authorizes `pending_review -> private` from the row it just read, while the
+       * admin approval path reads `pending_review` and writes `public`. Without the
+       * condition an in-flight owner write silently overwrites the approval
+       * (CodeRabbit on PR #2810). Pass the empty string to require the attribute to
+       * be ABSENT, which is how legacy rows with no visibility read.
+       *
+       * On a lost race the thrown error carries `preconditionFailed` so the caller
+       * can report a conflict instead of pretending the write landed. Omit it for
+       * unconditional updates — behaviour is unchanged.
+       */
+      expectedVisibility?: string;
+    } = {}
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -11258,18 +11301,37 @@ export const scheduleTemplateDb = {
 
       if (updateExpressions.length === 0) return;
 
+      let conditionExpression: string | undefined;
+      if (opts.expectedVisibility !== undefined) {
+        expressionAttributeNames['#expectedVisibility'] = 'visibility';
+        if (opts.expectedVisibility === '') {
+          conditionExpression = 'attribute_not_exists(#expectedVisibility)';
+        } else {
+          conditionExpression = '#expectedVisibility = :expectedVisibility';
+          expressionAttributeValues[':expectedVisibility'] = opts.expectedVisibility;
+        }
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
         Key: { templateId },
         UpdateExpression: `SET ${updateExpressions.join(', ')}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
+        ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
         ReturnValues: 'ALL_NEW' as const,
       };
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
-    } catch (error) {
+    } catch (error: any) {
+      // A lost CAS is an expected outcome, not a database fault — surface it as a
+      // conflict the caller can report rather than swallowing it as a failed write.
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const conflict: any = new Error('Template visibility changed since it was read');
+        conflict.preconditionFailed = true;
+        throw conflict;
+      }
       handleDynamoDbError(error, "updateTemplate");
     }
   },

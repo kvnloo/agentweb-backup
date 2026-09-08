@@ -54,6 +54,18 @@ If a production bug happens:
 | PR research index | [pr-research-index.md](./pr-research-index.md) | Filled | Traceability from shipped integration PRs to contract rules. |
 | Other integrations | [external-integrations-map.md](./external-integrations-map.md) | Map only | Source files and risks are identified; full contracts should be added as those areas are touched. |
 
+## Operational Runbooks
+
+Not every integration doc fits the code-contract format above — some
+integrations need a one-time external setup step (registering a developer app,
+provisioning a webhook subscription) that lives outside the repo. These are
+runbooks, not contracts: they document how to do that setup, not what the
+code believes about the vendor's API shape.
+
+| Integration | Runbook | What it covers |
+| --- | --- | --- |
+| Attio | [attio-app-setup.md](./attio-app-setup.md) | Registering/managing the Attio OAuth developer app: redirect URIs, required scopes, Secrets Manager credential storage, end-to-end verification. |
+
 ## Template
 
 Use [integration-contract-template.md](./integration-contract-template.md) for

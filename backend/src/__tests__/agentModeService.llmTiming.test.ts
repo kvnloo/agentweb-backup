@@ -423,7 +423,10 @@ describe('AgentModeService - LLM Timing Metadata', () => {
       expect(result.toolCalls[0]).toMatchObject({
         id: 'tc-unavailable',
         name: 'update_html_file',
-        error: 'Tool "update_html_file" is not available. You must install the required skill first using install_skills.',
+        // Prefix-matched, not exact: the gate error now also carries an explicit directive
+        // about what to do when the install itself fails. What this test pins is that an
+        // unavailable tool is COUNTED as a failed call, not the wording of the message.
+        error: expect.stringContaining('Tool "update_html_file" is not available. You must install the required skill first using install_skills.'),
         duration: 0,
       });
       expect(chatbotDb.incrementFailedFunctions).toHaveBeenCalledWith(

@@ -99,6 +99,37 @@ describe('AgentModeController - getPredefinedWorkPlan (ENG-1469)', () => {
     expect(result.display.nextPlanIds).toEqual(['plan-2']);
   });
 
+  // ENG-1802: the title match used to be `.toLowerCase()` only, so a plan
+  // stored with underscore-joined title never resolved against the natural,
+  // spaced phrasing a user/model would type. Switched to
+  // normalizeWorkPlanTitleForMatch, the same separator/case normalization
+  // applyPredefinedWorkPlan already uses (ENG-1794).
+  it('resolves a stored underscore-joined title against a spaced, mixed-case lookup (ENG-1802)', async () => {
+    const plan = {
+      planId: 'plan-1',
+      title: 'Founder_Linkedin_Sales_Readiness_Audit',
+      description: 'Audit the founder profile',
+      steps: [{ stepCount: 1, title: 'Step 1' }],
+      showInAgentMode: true,
+      visibility: 'system' as const,
+      isBuiltIn: true,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    };
+    mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (visibility: string) =>
+      visibility === 'system' ? [plan] : [],
+    );
+
+    const req = mockRequest('Founder LinkedIn Sales Readiness Audit');
+    const res = mockResponse();
+
+    await agentModeController.getPredefinedWorkPlan(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(404);
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    expect(result.id).toBe('plan-1');
+  });
+
   it('returns 404 for an unknown plan title without throwing', async () => {
     const req = mockRequest('Does Not Exist');
     const res = mockResponse();

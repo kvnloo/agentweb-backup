@@ -33,6 +33,9 @@ import {
 } from '../../../../utils/toolOutputContract';
 import { extractToolContent } from '../../../../utils/extractToolContent';
 import { classifyToolErrorClass } from '../../../../utils/toolErrorClassifier';
+// The REAL downgrade the dispatcher is wired with in production, so the install_skills ledger
+// shape below is established rather than assumed.
+import { toolResultError as realToolResultError } from '../../../../utils/toolResultError';
 
 /** Build a model tool_call in the shape the loop emits. */
 function toolCall(id: string, name: string, args: string) {
@@ -102,6 +105,133 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  /*
+   * Observed live (delegated session a1a6345a, Phoenix): this gate refused
+   * `audit_ad_utm_coverage`, the `install_skills` fallback was refused by subscription, and the
+   * model then ran an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary —
+   * PASS, 6/6 tagged" table built from it, as though the audit had run and passed. A downstream
+   * truthfulness guard appended a correction, but BELOW the fabricated table.
+   *
+   * The gate error told the model to install the skill and said nothing about what to do when
+   * the install itself fails — so it improvised. These pin the instruction it now carries.
+   */
+  describe('a skill-gated tool refusal', () => {
+    const gatedInput = (ports: any) =>
+      makeInput([toolCall('g', 'audit_ad_utm_coverage', '{}')], ports, {
+        publishedSkillsCount: 1,
+        sessionAssociatedSkillIdsCount: 1,
+        allowedToolNames: new Set<string>(['read_brand_guidelines']),
+      });
+
+    it('forbids substituting another tool and presenting it as this tool having run', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      expect(err).toMatch(/do not run a different tool/i);
+      expect(err).toMatch(/substituting other data makes the claim false/i);
+    });
+
+    it('says what to do when the install itself cannot succeed', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      expect(err).toMatch(/unavailable on their plan/i);
+    });
+
+    it('keeps the prefix that classifyToolErrorClass keys tool_unavailable off', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      const err = String(input.toolCallsLedger[0]?.error ?? '');
+      // Appending guidance must not change how the error is classified upstream.
+      expect(err).toContain('is not available. You must install the required skill first using install_skills.');
+      expect(classifyToolErrorClass(new Error(err))).toBe('tool_unavailable');
+    });
+
+    it('still does not execute the gated tool', async () => {
+      const ports = makePorts();
+      const input = gatedInput(ports);
+
+      await executePreparedTools(input);
+
+      expect((ports as any).__execOrder ?? []).not.toContain('audit_ad_utm_coverage');
+    });
+
+    /*
+     * What a REFUSED install_skills actually looks like in the ledger, established here rather
+     * than assumed anywhere downstream.
+     *
+     * `installSkills` never throws — every refusal returns `{ success: false, message }` and so
+     * travels the dispatcher's SUCCESS path. The claim that this therefore reaches the ledger
+     * with neither an `error` nor a `success: false` is WRONG, and worth pinning so nobody
+     * re-derives it: the downgrade below (the REAL `toolResultError`, wired as the production
+     * port is) converts a `success: false` result into a tool failure first, so the entry does
+     * carry an `error`.
+     *
+     * Anything reading the ledger to decide whether the install worked keys off exactly that,
+     * so this test is what keeps the two from drifting: unwire the downgrade and it fails here,
+     * not silently in production.
+     */
+    it('a refused install_skills reaches the ledger as a failure, not a bare success', async () => {
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => ({
+          success: false,
+          message: 'The requested skills are not available with your current subscription.',
+        }),
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.name).toBe('install_skills');
+      expect(String(entry.error)).toMatch(/not available with your current subscription/i);
+    });
+
+    /*
+     * The gap the downgrade genuinely cannot cover. A PARTIAL install returns `success: true` —
+     * something did install — so `toolResultError` raises nothing and the entry is an ordinary
+     * success. Only the minimized RESULT can say that the skill the gated tool needed may have
+     * been the one refused, which is why extractMinimalToolResult keeps `rejectedSkillIds`.
+     */
+    it('a PARTIAL install reaches the ledger as a success, so the result must carry the refusal', async () => {
+      const partial = {
+        success: true,
+        message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+        installedSkills: ['Some Other Skill'],
+        rejectedSkillIds: ['utm-audit'],
+        // The tool names installSkills resolved rejectedSkillIds to (agentModeService.ts) —
+        // what buildUnavailableCapabilityNotice's per-tool scoping keys off. Included here so
+        // this test proves it reaches the ledger through the actual dispatch boundary, not
+        // just through extractMinimalToolResult called directly.
+        rejectedToolNames: ['audit_ad_utm_coverage'],
+      };
+      const ports = makePorts({
+        toolResultError: realToolResultError,
+        executePreparedAgentTool: async () => partial,
+      });
+      const input = makeInput([toolCall('i', 'install_skills', '{"skillIds":["a","utm-audit"]}')], ports);
+
+      await executePreparedTools(input);
+
+      const entry = input.toolCallsLedger[0];
+      expect(entry.error).toBeUndefined();
+      expect(entry.result.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+      // makePorts' minimizer is identity, so this asserts the FIELD survives to the minimizer.
+      // agentModeService.skills.test.ts pins that the real minimizer keeps it.
+      expect(entry.result.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+  });
+
   it('executes a batch and appends tool messages in original order', async () => {
     const ports = makePorts();
     const input = makeInput(
