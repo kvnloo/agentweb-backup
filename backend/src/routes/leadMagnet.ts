@@ -98,8 +98,7 @@ router.post('/execute', async (req, res) => {
     }
 
     // Rate limiting — IP (5 per day)
-    // Note: req.ip returns ::1 or ::ffff:127.0.0.1 behind a proxy without 'trust proxy' set.
-    // If running behind nginx/ALB, ensure app.set('trust proxy', 1) is configured in server.ts.
+    // req.ip resolves to the real client IP via app.ts's `trust proxy` setting (ENG-493).
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     if (isIpRateLimited(clientIp)) {
       return res.status(429).json({
