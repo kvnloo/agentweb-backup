@@ -380,6 +380,25 @@ describe('ENG-1807 — scheduled-chat run interrupted mid-flight reconstructs th
     expect(result.functionCallMisses).toEqual(['get_marketing_tips']);
   });
 
+  it('does not crash and falls back to the safe pre-fix result when getChatSession throws SYNCHRONOUSLY (not a rejected promise)', async () => {
+    // The `.catch(() => null)` on getChatSession only catches a REJECTED promise — a
+    // synchronous throw (e.g. a broken client that throws before ever returning a
+    // promise to call .catch() on) is a genuinely different failure mode that only the
+    // OUTER try/catch protects against. Review flagged that the malformed-messages test
+    // above is fully absorbed by the Array.isArray guard alone and never actually drives
+    // execution into the outer catch branch — this test specifically forces that branch.
+    mockChatbotDb.getChatSession.mockImplementation(() => {
+      throw new Error('Synchronous client failure — no promise ever returned');
+    });
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(baseSchedule as any, mockUserId, true);
+
+    expect(result.passed).toBe(false);
+    expect(result.actualFunctionCalls).toEqual([]);
+    expect(result.functionCallMisses).toEqual(['get_marketing_tips']);
+  });
+
   it('excludes a publish-capable requirement the schedule was never authorized for from the recovered functionCallMisses, matching the success path\'s own authorization scoping', async () => {
     // requirePublishApproval:true outranks everything else in resolveSchedulePublishAuthorization
     // — an explicit, unambiguous UNAUTHORIZED, unlike the legacy opt-out default (which
