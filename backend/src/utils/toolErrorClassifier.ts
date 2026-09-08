@@ -14,7 +14,7 @@
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
- *   scope_refused
+ *   scope_refused | publisher_refused
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -123,6 +123,27 @@ function classFromMessage(message: string): string | null {
     if (/do not retry this same call|stop in the same place every time/.test(m)) return 'read_bounded';
     return 'read_incomplete';
   }
+
+  /*
+   * ENG-1162: a PUBLISHER (not an AgentWeb-connected account) refused or failed to serve a
+   * plain external fetch — a 401/403 from read_file_content's own marker (see its catch
+   * block), or one of a specific set of Chromium/Playwright network-level navigation failures
+   * (net::ERR_EMPTY_RESPONSE, net::ERR_CONNECTION_REFUSED, net::ERR_CONNECTION_RESET,
+   * net::ERR_CONNECTION_CLOSED) — a server hangup or reset before any HTTP response, common for
+   * anti-bot filtering and frequently recurring for the same URL rather than a one-off blip.
+   * Deliberately narrower than every net::ERR_* code: ERR_NAME_NOT_RESOLVED (DNS), ERR_ABORTED,
+   * and ERR_CERT_* are different failure modes with no bearing on whether the publisher refused
+   * to serve content, and the "NOT evidence the content does not exist" guidance below is wrong
+   * for at least DNS/cert failures.
+   *
+   * Checked ahead of the embedded-HTTP-status regex below, which would otherwise catch the
+   * literal "403"/"401" inside read_file_content's own marker text and mis-route it to 'auth' —
+   * whose guidance ("reconnect the account or fix permissions") is nonsensical for an anonymous
+   * external read and was exactly what let a browser/publisher block masquerade as OUR
+   * credentials problem. Neither case is evidence the source doesn't exist — see
+   * NEXT_STEP_BY_CLASS.
+   */
+  if (/the publisher refused this fetch|net::err_(empty_response|connection_refused|connection_reset|connection_closed)/.test(m)) return 'publisher_refused';
 
   // HTTP status embedded in the message ("status code 429", "503 Service…").
   const statusMatch = m.match(/(?:status(?:\s+code)?\s+|^|\s)([45]\d{2})(?:\s|$|[^\d])/);

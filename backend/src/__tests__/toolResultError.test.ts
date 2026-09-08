@@ -160,6 +160,71 @@ describe('toolResultError', () => {
     });
   });
 
+  describe('ENG-1162 — read_file_content publisher-refusal result through toolResultError (raw agentModeService shape)', () => {
+    it('classifies a 403 publisher refusal as publisher_refused, not auth', () => {
+      // The exact shape readFileContent's catch block returns for a 401/403 from
+      // an external publisher (agentModeService.ts) — no numeric code/status/
+      // statusCode field, by design: a future field with one of those names
+      // would let toolResultError's withCode() attach it, and
+      // classifyToolErrorClass checks the numeric-status branch BEFORE the
+      // message-based publisher_refused match, silently reintroducing the
+      // 'auth' misclassification this ticket fixed.
+      //
+      // NOTE: this is agentModeService.readFileContent's RAW return value.
+      // Nothing calls toolResultError on that raw shape in production — see the
+      // "REAL emma/tools.ts wrapped shape" block below for what actually reaches
+      // this pipeline.
+      const result = {
+        success: false,
+        message: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        error: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        file_url: 'https://files.gao.gov/example.pdf',
+      };
+
+      const err = toolResultError(result);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as { code?: number })?.code).toBeUndefined();
+      expect(classifyToolErrorClass(err)).toBe('publisher_refused');
+    });
+  });
+
+  describe('ENG-1162 — the REAL emma/tools.ts wrapped shape also classifies correctly, end to end', () => {
+    it('classifies a 403 publisher refusal after emma/tools.ts read_file_content.execute reshapes it into {content, isError}', () => {
+      // emma/tools.ts's read_file_content.execute never hands readFileContent's raw
+      // {success:false, message, error} object to toolResultError — it first
+      // reshapes any failure into the MCP tool-result convention:
+      //   { content: [{ type: 'text', text: `Error: ${message}\n${error}` }], isError: true }
+      // toolResultError's obj.isError===true branch reads this via
+      // extractToolResultMessage's Array.isArray(obj.content) join, a different
+      // codepath than the raw-shape test above (which hits the plain-string
+      // obj.error read). Both must independently classify correctly, or a
+      // regression in the wrapping layer (e.g. a future numeric field added
+      // there) could silently reintroduce the 'auth' misclassification even
+      // with the raw-shape test still green.
+      const readFileContentResult = {
+        success: false,
+        message: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        error: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        file_url: 'https://files.gao.gov/example.pdf',
+      };
+      // Mirrors emma/tools.ts's read_file_content.execute wrapping exactly.
+      const wrapped = {
+        content: [
+          {
+            type: 'text',
+            text: `Error: ${readFileContentResult.message}\n${readFileContentResult.error || ''}`,
+          },
+        ],
+        isError: true,
+      };
+
+      const err = toolResultError(wrapped);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as { code?: number })?.code).toBeUndefined();
+      expect(classifyToolErrorClass(err)).toBe('publisher_refused');
+    });
+  });
+
   describe('ENG-1300 CodeRabbit follow-up — a numeric `statusCode` field (AWS SDK v2 convention) is preferred', () => {
     it('attaches a top-level numeric statusCode to the reconstructed Error', () => {
       const err = toolResultError({ success: false, statusCode: 403, error: 'Access Denied' });
