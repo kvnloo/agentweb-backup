@@ -6427,7 +6427,10 @@ export async function runScheduledChat(
     // Convert result to scheduled chat format. This list is the AUDIT record of what
     // the model called, so it deliberately keeps failed attempts — "it tried and the
     // tool errored" is exactly what someone reading run history needs to see.
-    const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
+    // ENG-1807 follow-up: prepend resumePriorToolCalls, same as finalFunctionCallDetails
+    // below already does — otherwise a resumed run's stored raw call list under-reports
+    // what actually happened relative to the `passed` verdict computed from it.
+    const actualFunctionCalls = [...resumePriorToolCalls, ...result.toolCalls].map((call: any) => call.name).filter(Boolean);
 
     // Calculate final function call details. ENG-1045/ENG-947: counted through the
     // same outcome-aware helper the checker uses (countCallsSatisfyingRequirement),
@@ -7096,19 +7099,43 @@ export async function runScheduledChat(
       }
     }
 
+    // ENG-1807: an exception here does not mean the run did nothing.
+    // persistIncrementally already wrote every settled turn to the session before a
+    // LATER step (title generation, self-improvement reflection, etc.) hit the error —
+    // e.g. a worker-drain mid-deploy. Hardcoding an empty ledger below would discard
+    // that real, already-persisted work. Reconstruct what actually happened from the
+    // session's own messages, the same way a RESUMED run already credits its abandoned
+    // portion (`reconstructPriorToolCalls`, used above at the resume-claim path) —
+    // this makes a run that quietly finished everything required stop being recorded
+    // as a permanent, empty failure just because a trailing step errored afterward.
+    // Guarded on recoveredToolCalls.length > 0: a schedule with zero required function
+    // calls must not flip to `passed: true` merely because there is nothing to miss —
+    // only genuine evidence of recovered activity can turn this into a pass.
+    let recoveredToolCalls: RequiredCallLedgerEntry[] = [];
+    if (sessionId) {
+      const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
+      recoveredToolCalls = reconstructPriorToolCalls(recoverySession?.messages || []);
+    }
+    const recoveredRequiredNames = schedule.requiredFunctionCalls || [];
+    const recoveredMinCalls = schedule.functionCallMinCalls || {};
+    const recoveredMatches = recoveredRequiredNames.filter((name: string) =>
+      countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
+    );
+    const recoveredMisses = recoveredRequiredNames.filter((name: string) => !recoveredMatches.includes(name));
+
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
-      passed: false,
+      passed: recoveredToolCalls.length > 0 && recoveredMisses.length === 0,
       actualResponse: `Error during execution: ${errorMessage}`,
-      actualFunctionCalls: [],
+      actualFunctionCalls: recoveredToolCalls.map((call) => call.name).filter((n): n is string => Boolean(n)),
       keywordMatches: [],
       keywordMisses: schedule.keywords || [],
-      functionCallMatches: [],
-      functionCallMisses: schedule.requiredFunctionCalls || [],
+      functionCallMatches: recoveredMatches,
+      functionCallMisses: recoveredMisses,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
