@@ -160,6 +160,29 @@ describe('toolResultError', () => {
     });
   });
 
+  describe('ENG-1162 — read_file_content publisher-refusal result through the real pipeline', () => {
+    it('classifies a 403 publisher refusal as publisher_refused, not auth, end to end', () => {
+      // The exact shape readFileContent's catch block returns for a 401/403 from
+      // an external publisher (agentModeService.ts) — no numeric code/status/
+      // statusCode field, by design: a future field with one of those names
+      // would let toolResultError's withCode() attach it, and
+      // classifyToolErrorClass checks the numeric-status branch BEFORE the
+      // message-based publisher_refused match, silently reintroducing the
+      // 'auth' misclassification this ticket fixed.
+      const result = {
+        success: false,
+        message: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        error: 'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+        file_url: 'https://files.gao.gov/example.pdf',
+      };
+
+      const err = toolResultError(result);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as { code?: number })?.code).toBeUndefined();
+      expect(classifyToolErrorClass(err)).toBe('publisher_refused');
+    });
+  });
+
   describe('ENG-1300 CodeRabbit follow-up — a numeric `statusCode` field (AWS SDK v2 convention) is preferred', () => {
     it('attaches a top-level numeric statusCode to the reconstructed Error', () => {
       const err = toolResultError({ success: false, statusCode: 403, error: 'Access Denied' });
