@@ -550,5 +550,35 @@ describe('AgentModeService - predefined work plan templates', () => {
         expect.objectContaining({ templatePlanId: 'plan-dup-a' })
       );
     });
+
+    // Round-3 review finding: the near-duplicate half of the ambiguity check
+    // already guards against an empty normalized title (areNearDuplicateWorkPlanTitles
+    // returns false when both sides normalize to ''), but the exact-duplicate half
+    // originally had no equivalent guard -- two unrelated, degenerately-titled
+    // (blank/separator-only) templates would normalize to the same '' and falsely
+    // pair up as ambiguous siblings. Nothing in workPlanService.ts rejects a blank
+    // title on create, so this is reachable, not just theoretical. Fails safe either
+    // way (an unwanted confirmation prompt, never a wrong launch) -- this test locks
+    // in the fixed, non-blocking behavior.
+    it('ENG-1814: does not treat two unrelated blank/separator-only titles as an ambiguous pair', async () => {
+      const planA: any = { ...systemTemplate, planId: 'plan-blank-a', title: '   ', visibility: 'system' };
+      const planB: any = { ...systemTemplate, planId: 'plan-blank-b', title: '___', visibility: 'private' };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [planA] : []
+      );
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([planB]);
+
+      const result = await service.applyPredefinedWorkPlan('   ', sessionId, 'user-1');
+
+      // Whichever candidate the resolver happens to order first is fine to launch
+      // directly here -- the point of this test is that it launches at all (no
+      // false "ambiguous" block), not which of the two degenerately-titled plans wins.
+      expect(result.success).toBe(true);
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: expect.stringMatching(/^plan-blank-[ab]$/) })
+      );
+    });
   });
 });

@@ -32666,9 +32666,14 @@ ${strippedHtml}`;
       // Nothing in workPlanService.ts enforces title uniqueness across visibility scopes,
       // so this is a real (if narrow) possibility, not just theoretical.
       if (!matchedByPlanId) {
+        const normalizedTargetTitle = normalizeWorkPlanTitleForMatch(predefinedPlan.title);
         const ambiguousSibling = candidates.find((p) =>
           p.planId !== predefinedPlan.planId && p.title
-            && (normalizeWorkPlanTitleForMatch(p.title) === normalizeWorkPlanTitleForMatch(predefinedPlan.title)
+            // Exact-duplicate check needs the same empty-guard the near-duplicate
+            // check already has -- otherwise two degenerately-titled (blank/
+            // separator-only) but genuinely unrelated templates normalize to the
+            // same '' and falsely pair up as ambiguous siblings.
+            && ((normalizedTargetTitle !== '' && normalizeWorkPlanTitleForMatch(p.title) === normalizedTargetTitle)
               || areNearDuplicateWorkPlanTitles(p.title, predefinedPlan.title))
         );
         if (ambiguousSibling) {

@@ -2223,6 +2223,7 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
     // ENG-1814: the raw HTTP response carries every step's full body (description,
     // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
     // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
@@ -2248,7 +2249,12 @@ mcpToolRegistry.register({
           category: p.category,
           autocomplete: p.autocomplete,
           visibility: p.visibility,
-          display: p.display,
+          // Non-admin already carries the computed ENG-1469 projection under
+          // `display`. Admin (raw WorkPlan records) only ever has the raw,
+          // often-undefined WorkPlanDisplayMetadataV1 shape (`stepLabels`, not
+          // `steps`) -- compute the same projection here so admin/delegated
+          // listings get equally useful disambiguating context.
+          display: p.display?.steps ? p.display : (projectWorkPlanForCustomer(p) ?? p.display),
         }))
       : data;
     return jsonResult(compact);

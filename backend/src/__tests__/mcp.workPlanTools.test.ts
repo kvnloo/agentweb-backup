@@ -140,6 +140,32 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(JSON.parse(text)[0].id).toBe('wp-admin-1');
     });
 
+    // Round-3 review finding: the admin route's raw WorkPlan records carry
+    // `display.stepLabels?: string[]` (often absent), not the computed
+    // `display.steps: [{position, label}]` shape the non-admin route already
+    // returns via projectWorkPlanForCustomer. Passing the raw `display` through
+    // unconditionally left admin/delegated listings with materially less
+    // disambiguating context than non-admin ones -- same mismatch class as the
+    // `id`/`planId` bug above, independently reverified before fixing.
+    it('computes the same display projection for admin listings as the non-admin path, not a raw stepLabels shape', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+      mockMcpFetch.mockResolvedValue([{
+        planId: 'wp-admin-2',
+        title: 'Weekly Content Recap',
+        visibility: 'system',
+        steps: [{ title: 'Draft the recap' }, { title: 'Send for review' }],
+      }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'admin-1' });
+      const plan = JSON.parse(result.content[0].text as string)[0];
+
+      expect(plan.display.steps).toEqual([
+        { position: 1, label: 'Draft the recap' },
+        { position: 2, label: 'Send for review' },
+      ]);
+      expect(plan.display.stepLabels).toBeUndefined();
+    });
+
     it('admin-delegated sessions get the admin list without a user lookup', async () => {
       mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
 
