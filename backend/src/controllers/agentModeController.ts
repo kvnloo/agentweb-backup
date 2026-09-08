@@ -7108,20 +7108,39 @@ export async function runScheduledChat(
     // portion (`reconstructPriorToolCalls`, used above at the resume-claim path) —
     // this makes a run that quietly finished everything required stop being recorded
     // as a permanent, empty failure just because a trailing step errored afterward.
-    // Guarded on recoveredToolCalls.length > 0: a schedule with zero required function
-    // calls must not flip to `passed: true` merely because there is nothing to miss —
-    // only genuine evidence of recovered activity can turn this into a pass.
+    // Keywords are reconstructed the same way `runVerifiedChatInner` scores them on the
+    // success path (`allContent.toLowerCase().includes(keyword.toLowerCase())`, see
+    // ~line 4297) — otherwise a schedule using keyword criteria could recover
+    // `passed: true` sitting next to a `keywordMisses` list still hardcoded to "every
+    // keyword missed", the exact self-contradicting-record shape ENG-827 exists to
+    // prevent elsewhere in this file.
     let recoveredToolCalls: RequiredCallLedgerEntry[] = [];
+    let recoveredContent = '';
     if (sessionId) {
       const recoverySession = await chatbotDb.getChatSession(sessionId).catch(() => null);
-      recoveredToolCalls = reconstructPriorToolCalls(recoverySession?.messages || []);
+      const recoveredMessages = recoverySession?.messages || [];
+      recoveredToolCalls = reconstructPriorToolCalls(recoveredMessages);
+      recoveredContent = recoveredMessages
+        .filter((m: any) => m?.role === 'assistant' && typeof m.content === 'string')
+        .map((m: any) => m.content)
+        .join('\n\n');
     }
     const recoveredRequiredNames = schedule.requiredFunctionCalls || [];
     const recoveredMinCalls = schedule.functionCallMinCalls || {};
-    const recoveredMatches = recoveredRequiredNames.filter((name: string) =>
+    const recoveredFunctionMatches = recoveredRequiredNames.filter((name: string) =>
       countCallsSatisfyingRequirement(name, recoveredToolCalls, recoveredRequiredNames) >= (recoveredMinCalls[name] || 1)
     );
-    const recoveredMisses = recoveredRequiredNames.filter((name: string) => !recoveredMatches.includes(name));
+    const recoveredFunctionMisses = recoveredRequiredNames.filter((name: string) => !recoveredFunctionMatches.includes(name));
+    const recoveredKeywords: string[] = schedule.keywords || [];
+    const recoveredKeywordMatches = recoveredKeywords.filter((keyword: string) =>
+      recoveredContent.toLowerCase().includes(keyword.toLowerCase())
+    );
+    const recoveredKeywordMisses = recoveredKeywords.filter((keyword: string) => !recoveredKeywordMatches.includes(keyword));
+    // Evidence of genuine recovered activity — either dimension counts, so a
+    // keyword-only or function-call-only schedule can each still recover a pass. A
+    // schedule with NEITHER configured must not flip to `passed: true` on an exception
+    // merely because empty requirement lists are vacuously satisfied.
+    const hasRecoveredEvidence = recoveredToolCalls.length > 0 || recoveredContent.trim().length > 0;
 
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -7129,13 +7148,13 @@ export async function runScheduledChat(
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
-      passed: recoveredToolCalls.length > 0 && recoveredMisses.length === 0,
+      passed: hasRecoveredEvidence && recoveredFunctionMisses.length === 0 && recoveredKeywordMisses.length === 0,
       actualResponse: `Error during execution: ${errorMessage}`,
       actualFunctionCalls: recoveredToolCalls.map((call) => call.name).filter((n): n is string => Boolean(n)),
-      keywordMatches: [],
-      keywordMisses: schedule.keywords || [],
-      functionCallMatches: recoveredMatches,
-      functionCallMisses: recoveredMisses,
+      keywordMatches: recoveredKeywordMatches,
+      keywordMisses: recoveredKeywordMisses,
+      functionCallMatches: recoveredFunctionMatches,
+      functionCallMisses: recoveredFunctionMisses,
       executionTime: Date.now() - now.getTime(),
       sessionId: sessionId || '',
       attempt: 0,
