@@ -4112,6 +4112,24 @@ class WebAgent:
             "tool_calling_method": browser_tool_calling_method(
                 getattr(self.llm, "model_name", "")
             ),
+            # ENG-1818: every model here is actually langchain_openai.ChatOpenAI
+            # under the hood (openrouter_gateway.py routes every provider through
+            # OpenRouter's OpenAI-compatible API), so self.llm.__class__.__name__
+            # is always "ChatOpenAI" regardless of the real provider. browser-use's
+            # Agent defaults enable_memory=True and, when unset, infers the memory
+            # embedder from that class name -- so it always defaults to mem0's
+            # OpenAI embedder, which requires a real OPENAI_API_KEY that doesn't
+            # exist anywhere in this codebase (everything routes through
+            # OPENROUTER_API_KEY by design). That mem0 embedder construction is
+            # not wrapped in the surrounding except ImportError, so it raises
+            # straight through Agent.__init__ and aborts every single task before
+            # any real work starts -- confirmed via a direct repro against the
+            # real production environment, root-caused to
+            # mem0/embeddings/openai.py's OpenAI(api_key=...) call. Memory was
+            # never an intentionally used feature here; disable it explicitly
+            # rather than relying on a library default that silently assumes a
+            # real OpenAI account exists.
+            "enable_memory": False,
         }
 
         self.agent = Agent(**agent_kwargs)
