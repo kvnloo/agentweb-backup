@@ -386,7 +386,11 @@ import {
   setDailyInviteCap,
   type ResolvedLinkedInAccount,
 } from './agentMode/linkedInDailyVolumeGate';
-import { routeLinkedInWriteToAccountWithHeadroom } from './agentMode/linkedInAccountRouting';
+import {
+  routeLinkedInWriteToAccountWithHeadroom,
+  withAccountRoutingDisclosure,
+  type AccountRoutingDisclosure,
+} from './agentMode/linkedInAccountRouting';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -35998,7 +36002,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // No-op for accept/cancel-invitation (not volume-classed) and for a
     // single-account customer (no alternate exists): today's behavior is
     // unchanged in both cases.
-    let accountRouting: { fromAccountId: string; toAccountId: string; reason: string } | null = null;
+    let accountRouting: AccountRoutingDisclosure | null = null;
     if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
       const routed = await routeLinkedInWriteToAccountWithHeadroom(userId, action, account_id, resolvedLinkedInAccount);
       if (routed) {
@@ -36008,9 +36012,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         resolvedLinkedInAccount = routed.account;
       }
     }
-    const withRouting = (data: any) => (
-      accountRouting && data && typeof data === 'object' ? { ...data, accountRouting } : data
-    );
+    const withRouting = (data: any) => withAccountRoutingDisclosure(accountRouting, data);
 
     // For read-only actions (get-profile, search-people, get-company), fall back to
     // site-wide Unipile accounts when the user has no personally-connected account.

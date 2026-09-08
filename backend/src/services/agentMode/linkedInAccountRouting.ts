@@ -121,3 +121,23 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
 
   return null;
 }
+
+/**
+ * AC3 disclosure payload: which account a write actually went through and why,
+ * when routing substituted it for the one the caller named. Never present when
+ * no rerouting occurred.
+ */
+export interface AccountRoutingDisclosure {
+  fromAccountId: string;
+  toAccountId: string;
+  reason: string;
+}
+
+/**
+ * Attach `accountRouting` to a response payload when rerouting occurred, on
+ * every return path (success or refusal) — never a silent fallback in the
+ * ENG-1198 sense. `null`/non-object payloads pass through unchanged.
+ */
+export function withAccountRoutingDisclosure(accountRouting: AccountRoutingDisclosure | null, data: any): any {
+  return accountRouting && data && typeof data === 'object' ? { ...data, accountRouting } : data;
+}
