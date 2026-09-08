@@ -16998,16 +16998,104 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  private async getMetaCredentials(userId: string, accountId?: string) {
+  /**
+   * ENG-1801: resolve WHICH userId's Meta credentials getMetaCredentials should
+   * read, given an optional admin-only client_id scope override.
+   *
+   * In-process pattern (no delegate token, no HTTP self-call) — mirrors
+   * assessClientHealth (clientHealthService.ts) / diagnoseLeadsAtZero
+   * (l2DiagnoseService.ts), which already read a resolved TARGET's own
+   * connected_accounts by userId rather than the caller's. Unscoped
+   * (clientId undefined/null) passes the caller straight through — zero
+   * behavior change from before this fix. Scoped calls fail loud — never
+   * silently substitute the caller's own account — on a non-admin caller, a
+   * blank client_id, an unresolvable client_id, or a target without
+   * customer-portal access.
+   */
+  private async resolveMetaCredentialScope(
+    callerUserId: string,
+    clientId: unknown,
+    callerIsAdminHint: boolean | undefined,
+    toolName: string
+  ): Promise<{ effectiveUserId: string; strict: boolean }> {
+    if (clientId === undefined || clientId === null) {
+      return { effectiveUserId: callerUserId, strict: false };
+    }
+    if (typeof clientId !== 'string' || !clientId.trim()) {
+      throw this.makeMetaAuthError(
+        `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+      );
+    }
+
     const { userDb } = await import('./db');
-    const user = await userDb.getUserById(userId);
-    if (!user) throw this.makeMetaAuthError('User not found');
+    const caller = await userDb.getUserById(callerUserId);
+    const isAdmin = callerIsAdminHint !== undefined ? callerIsAdminHint : caller?.isAdmin === true;
+    if (!isAdmin) {
+      throw this.makeMetaAuthError('client_id is admin-only — this account is not an admin.');
+    }
+
+    const trimmed = clientId.trim();
+    const target = trimmed.includes('@')
+      ? await userDb.getUserByEmail(trimmed)
+      : await userDb.getUserById(trimmed);
+    if (!target) {
+      throw this.makeMetaAuthError(`No client account found for "${trimmed}".`);
+    }
+    if (!(target as any).roles?.includes('customer')) {
+      throw this.makeMetaAuthError(`"${trimmed}" does not have customer portal access — cannot scope Meta Ads tools to it.`);
+    }
+
+    const { recordAdminAudit } = await import('./adminAuditLog');
+    recordAdminAudit({
+      actorUserId: callerUserId,
+      actorEmail: caller?.email,
+      action: 'meta_ads_client_scope',
+      tool: toolName,
+      targetUserId: (target as any).userId,
+      targetEmail: (target as any).email,
+    });
+
+    return { effectiveUserId: (target as any).userId, strict: true };
+  }
+
+  // ENG-1801: `clientScope` must never be wired from a write/mutate Meta tool
+  // (createMetaAdsCampaign, updateMetaAdsAd, deleteMetaAdsCampaign, etc.) without
+  // its own fresh authorization decision — this function is the shared resolver
+  // for 30+ call sites, and only the 3 read-only reporting tools
+  // (listMetaAdsCampaignsNew, getMetaAdsMetrics, callMetaAdsInsightsApiWrapper)
+  // are meant to ever construct and pass this argument today.
+  private async getMetaCredentials(
+    userId: string,
+    accountId?: string,
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string }
+  ) {
+    const { effectiveUserId, strict } = await this.resolveMetaCredentialScope(
+      userId,
+      clientScope?.clientId,
+      clientScope?.callerIsAdmin,
+      clientScope?.toolName ?? 'meta_ads_tool'
+    );
+
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field — both fallback branches below are only reachable via
+    // the `!accountId` path, so this one guard structurally disables both for
+    // the scoped path while leaving the unscoped path's fallback code untouched.
+    if (strict && !accountId) {
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call list_meta_ads_campaigns or list_connected_accounts with client_id="${clientScope?.clientId}" first to find it.`
+      );
+    }
+
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(effectiveUserId);
+    if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
 
     // Source ad accounts from the org-shared set so a teammate's Meta ad account
     // shared with the org (sharedWithOrg=true) is usable, not just visible. The
     // legacy `user.adAccount` fallback below intentionally stays caller-scoped.
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
-    const connectedAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+    const connectedAccounts = await getAccountsWithOwnerIncludingOrgShared(effectiveUserId);
 
     // Helper to strip 'act_' prefix
     const clean = (id: string) => (id || '').replace('act_', '');
@@ -17025,15 +17113,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
       // have adAccount configured (e.g. Waldium-style agency-managed accounts).
-      const legacyAccountId = (user.adAccount || '').replace('act_', '').trim();
-      if (legacyAccountId) {
-        const { getMetaAccessToken } = await import('../utils/secretsManager');
-        const accessToken = await getMetaAccessToken();
-        console.log(`[AgentMode] No connected Meta account for user ${userId}; falling back to legacy adAccount ${legacyAccountId}`);
-        return { accountId: legacyAccountId, accessToken };
+      // ENG-1801: never for a client_id-scoped call — see guard above's doc comment.
+      if (!strict) {
+        const legacyAccountId = (user.adAccount || '').replace('act_', '').trim();
+        if (legacyAccountId) {
+          const { getMetaAccessToken } = await import('../utils/secretsManager');
+          const accessToken = await getMetaAccessToken();
+          console.log(`[AgentMode] No connected Meta account for user ${effectiveUserId}; falling back to legacy adAccount ${legacyAccountId}`);
+          return { accountId: legacyAccountId, accessToken };
+        }
       }
-      console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
-      throw this.makeMetaAuthError('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
+      console.error(`[AgentMode] No valid Meta connected account found for user ${effectiveUserId}`);
+      throw this.makeMetaAuthError(
+        strict
+          ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
+          : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
+      );
     }
 
     // 2. Handle specific account selection if accountId is provided
@@ -17042,10 +17137,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const selected = fbAccounts.find(acc => clean(acc.account_id || acc.config?.ad_account_id) === cleanTargetId);
 
       if (!selected) {
-        throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
+        throw this.makeMetaAuthError(
+          strict
+            ? `Meta ad account with ID "${accountId}" was not found among "${user.email || effectiveUserId}"'s connected accounts.`
+            : `Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`
+        );
       }
 
-      await this.ensureUsableMetaToken(selected, selected.userId || userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || effectiveUserId);
       await this.assertMetaAdsScope(selected);
 
       return {
@@ -17055,7 +17154,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     }
 
-    // 3. Handle multiple accounts ambiguity
+    // 3. Handle multiple accounts ambiguity (strict === false past this point —
+    // a client_id-scoped call without accountId already threw above)
     if (fbAccounts.length > 1) {
       const accountList = fbAccounts
         .map(acc => {
@@ -17069,10 +17169,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, selected.userId || userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || effectiveUserId);
     await this.assertMetaAdsScope(selected);
 
-    console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
+    console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${effectiveUserId} (Account: ${selected.account_name})`);
 
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -17097,6 +17197,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       breakdowns?: string[];
       action_breakdowns?: string[];
       filtering?: any[];
+      client_id?: string;
     }
   ): Promise<any> {
     try {
@@ -17111,6 +17212,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         breakdowns,
         action_breakdowns,
         filtering,
+        client_id,
       } = args;
 
       if (!ALLOWED_NODE_TYPES.includes(object_type)) {
@@ -17218,7 +17320,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const normalizedFiltering = normalizeMetaInsightsFiltering(filtering);
 
       const { accountId, accessToken } =
-        await this.getMetaCredentials(userId, account_id);
+        await this.getMetaCredentials(
+          userId,
+          account_id,
+          client_id ? { clientId: client_id, toolName: 'call_meta_ads_insights_api' } : undefined
+        );
 
       const actualNodeId =
         object_type === "account"
@@ -17963,11 +18069,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async listMetaAdsCampaignsNew(
     userId: string,
     account_id?: string,
-    options: { campaignId?: string; fields?: string | string[] } = {}
+    options: { campaignId?: string; fields?: string | string[] } = {},
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string }
   ): Promise<any> {
     let connection: any;
     try {
-      const credentials = await this.getMetaCredentials(userId, account_id);
+      const credentials = await this.getMetaCredentials(userId, account_id, clientScope);
       const { accountId, accessToken } = credentials;
       connection = (credentials as any).connection;
       // Only forward the read-options bag when the caller supplied a campaign_id filter or
@@ -19472,6 +19579,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     campaign_ids: string[] | string,
     requestedAccountId?: string,
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string },
   ): Promise<any> {
     try {
       const campaignFilterIds = normalizeMetaCampaignIds(campaign_ids);
@@ -19491,7 +19599,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let accountId: string;
       let accessToken: string;
       try {
-        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId, clientScope));
       } catch (error: any) {
         const credentialFailure =
           error?.isMetaAuthError ||
