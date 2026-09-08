@@ -43,6 +43,7 @@ import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlocked
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import { CapacityGateResult, SEND_CAPACITY_EXHAUSTED_STATUS, buildCapacitySkipReason, evaluateCapacityGate } from '../utils/scheduledRunCapacityGate';
+import { evaluateLinkedInSendRequirement, linkedInOutreachArgs, normalizeLinkedInOutreachAction } from '../utils/linkedInSendRequirement';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -678,29 +679,17 @@ const LINKEDIN_INVITE_CAP_BLOCK_RE =
 
 type LinkedInInviteSendBlock = {
   notice: string;
-  successfulInviteSends: number;
   // ENG-1657 (AC3): the Unipile account the blocked send-invite call targeted, when
   // the tool arguments carried one. Used only to key the internal oncall alert's
   // per-account/day dedupe — never surfaced to the customer.
   accountId?: string;
 };
 
-function linkedInOutreachArgs(call: any): Record<string, any> | null {
-  const args = call?.arguments;
-  if (args && typeof args === 'object') return args;
-  if (typeof args !== 'string') return null;
-  try {
-    const parsed = JSON.parse(args);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function linkedInOutreachAction(call: any): string {
-  const args = linkedInOutreachArgs(call);
-  return args ? String(args.action || '').toLowerCase() : '';
-}
+// ENG-1720: `linkedInOutreachArgs` / `normalizeLinkedInOutreachAction` now live in
+// utils/linkedInSendRequirement.ts, shared with the action-aware requirement check
+// below. The local copies folded case only, so a `send_invite` (underscore) argument
+// — which the dispatcher routes to the very same send handler, see its
+// `action.replace(/_/g, '-')` — was not recognised as an invite here at all.
 
 /**
  * Detect a schedule-wide LinkedIn invitation block from the executed tool ledger.
@@ -709,11 +698,17 @@ function linkedInOutreachAction(call: any): string {
  * sending account, not just the recipient. Treating an attempted send as a clean
  * required-function match therefore reports a run as underway while every later
  * invite is guaranteed to fail (ENG-1132).
+ *
+ * ENG-1720: this is now a LABELLING decision, not the pass/fail one. It chooses the
+ * plain-language sentence the owner reads and keys the dedicated oncall page; whether
+ * the run met its `linkedin_outreach` requirement is decided by
+ * `evaluateLinkedInSendRequirement` on the ACTION, so a send failing in a way this
+ * pattern does not recognise still fails the run.
  */
 function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): LinkedInInviteSendBlock | null {
   if (!Array.isArray(toolCalls)) return null;
   const inviteCalls = toolCalls.filter(
-    (call: any) => call?.name === 'linkedin_outreach' && linkedInOutreachAction(call) === 'send-invite',
+    (call: any) => call?.name === 'linkedin_outreach' && normalizeLinkedInOutreachAction(call) === 'send-invite',
   );
   const blockedCall = inviteCalls.find((call: any) => {
     if (toolCallSucceeded(call)) return false;
@@ -736,7 +731,6 @@ function detectLinkedInInviteSendBlock(toolCalls: any[] | undefined | null): Lin
     notice:
       `LinkedIn send-invite was blocked by ${reason}. ` +
       'No further send-invite actions will succeed until it clears; the remaining invitations were not sent.',
-    successfulInviteSends: inviteCalls.filter(toolCallSucceeded).length,
   };
 }
 
@@ -6508,24 +6502,36 @@ export async function runScheduledChat(
       };
     });
 
-    // An account-wide cooldown/pacing refusal is not a successful send. The
-    // verifier historically counted every non-publish call by name, so correct
-    // Schedules contract by tool name rather than action, so successful
-    // non-invite LinkedIn calls count too. Count every successful call from
-    // the combined ledger, rather than treating one such call as enough for
-    // a schedule that requires multiple calls.
+    // ENG-1720: a `linkedin_outreach` requirement is satisfied by a SEND that
+    // happened, not by any call that shares the tool's name.
+    //
+    // This branch used to count successful calls by NAME and only engaged when
+    // `LINKEDIN_INVITE_CAP_BLOCK_RE` had recognised a cooldown/pacing phrasing.
+    // Both halves leaked: ONE successful `search-people` satisfied `min: 1` while
+    // every `send-invite` was refused (the shape all 8 production schedules that
+    // declare this requirement are defeated by), and a send failing any OTHER way
+    // — "recipient cannot be reached", provider errors, the class ENG-1640 saw
+    // live — never reached the check at all. `evaluateLinkedInSendRequirement`
+    // decides on the ACTION, so the block regex is now only choosing which
+    // sentence the owner reads, not whether the run passed. See that module's
+    // docblock for why a run that attempted NO send keeps the name-keyed count
+    // (AC #3: read-only LinkedIn schedules are not newly broken) and why the
+    // nudge loop is deliberately left alone (press amplification, ENG-1715).
     const requiredLinkedInCalls = functionCallMinCalls.linkedin_outreach || 1;
-    const successfulLinkedInCalls = linkedInOutcomeToolCalls.filter(
-      (call: any) => call?.name === 'linkedin_outreach' && toolCallSucceeded(call),
-    );
+    const linkedInRequirementHeld = heldToFunctionNames.includes('linkedin_outreach');
+    const linkedInSendVerdict = evaluateLinkedInSendRequirement(linkedInOutcomeToolCalls, requiredLinkedInCalls);
     const linkedInInviteSendRequirementMissed = Boolean(
-      linkedInInviteSendBlock
-      && heldToFunctionNames.includes('linkedin_outreach')
-      && successfulLinkedInCalls.length < requiredLinkedInCalls,
+      linkedInRequirementHeld && linkedInSendVerdict.requirementMissed,
     );
-    if (linkedInInviteSendRequirementMissed) {
+    // Report the action-aware count on EVERY send run, not only a failing one.
+    // Leaving the name-keyed count on a passing send run would persist
+    // `{ actual: 7, required: 1 }` for a run that sent once — and on a failing one
+    // it produced `{ actual: 2, required: 1 }` sitting beside a functionCallMisses
+    // entry naming the same tool, the self-contradicting record ENG-827/ENG-1045
+    // spent two issues removing.
+    if (linkedInRequirementHeld && linkedInSendVerdict.reportedActual !== null) {
       finalFunctionCallDetails.linkedin_outreach = {
-        actual: successfulLinkedInCalls.length,
+        actual: linkedInSendVerdict.reportedActual,
         required: requiredLinkedInCalls,
       };
     }
@@ -6719,7 +6725,12 @@ export async function runScheduledChat(
         // linkedin_invite_blocked alert — sending this generic alert too would
         // double-page a single blocked run (CodeRabbit). The issue is still
         // filed unconditionally above so tracking stays intact either way.
-        .then(() => linkedInInviteSendRequirementMissed ? undefined : sendAgentModeOncallAlert({
+        // ENG-1720: keyed to `linkedInInviteSendBlock` — the condition that actually
+        // fired the dedicated `linkedin_invite_blocked` page above — not to the
+        // requirement verdict. Those two used to be the same condition; now that a
+        // send failing for a NON-cooldown reason also misses the requirement,
+        // suppressing on the verdict would silence the only page such a run gets.
+        .then(() => linkedInInviteSendBlock ? undefined : sendAgentModeOncallAlert({
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
           message: scheduledChatFailureDescription,
           sessionId,

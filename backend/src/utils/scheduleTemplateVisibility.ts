@@ -101,7 +101,16 @@ export function resolveVisibilityUpdate(params: {
   // A no-op restatement of the existing value is never a promotion, so it needs
   // no privilege — this keeps a client that PUTs the whole object back (the
   // common shape) working without having to strip the field.
-  if (next === current) return { ok: true, visibility: next };
+  //
+  // It must also emit NO WRITE (CodeRabbit on PR #2797's stale diff). Returning a
+  // visibility here looked harmless, but for a legacy stored `'platform'` both
+  // sides canonicalize to `'system'`, so the caller wrote `visibility` while its
+  // own "is this changing?" test — which compares the same canonical values —
+  // found them equal and SKIPPED the compare-and-swap. An owner's stale request
+  // could then restore `system` after an administrator had demoted the template.
+  // Normalising a legacy value belongs in a migration, not in an unguarded write
+  // on the user route.
+  if (next === current) return { ok: true };
 
   if (isAdmin) return { ok: true, visibility: next };
 
