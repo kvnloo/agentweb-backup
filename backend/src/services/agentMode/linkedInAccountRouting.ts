@@ -10,10 +10,23 @@
  * observed cost: a customer's invite capacity reads as "exhausted" for four
  * consecutive runs while a second, sharable account sits unused.
  *
+ * Two independent things can make the requested account unusable, and both
+ * are checked here: (1) our own configured `daily_invite_cap`/hourly ceiling
+ * (`reserveDailyVolumeSlot`), and (2) LinkedIn's own account-level invitation
+ * cooldown ("Cannot resend yet"), tracked in-process by
+ * `linkedInOutreachService.isUnderInvitationCooldown`. Re-pulling the actual
+ * production sessions behind ENG-1132/ENG-1614 (2026-08-25/26, iTrials) shows
+ * every real failure was the cooldown breaker, never the daily cap — so
+ * routing only around the cap would have fixed zero live incidents. Cooldown
+ * is a `send-invite`-only concept (it is never armed or checked for
+ * send-message/send-inmail/cancel/accept), so it only gates routing for that
+ * one action.
+ *
  * This module adds selection ON TOP of the existing pacing — it never
  * changes what `reserveWriteSlot`/`reserveDailyVolumeSlot` enforce for
- * whichever account is ultimately used, it only decides WHICH account a
- * write should be checked against. Candidates come from
+ * whichever account is ultimately used, and it never clears or shortens the
+ * cooldown breaker for any account; it only decides WHICH account a write
+ * should be checked against. Candidates come from
  * `getAccountsWithOwnerIncludingOrgShared`, the same lookup
  * `resolveLinkedInAccountForWrite` uses — own accounts, plus a teammate's
  * account only when that teammate explicitly set `sharedWithOrg: true`.
@@ -23,6 +36,7 @@
 
 import { getAccountsWithOwnerIncludingOrgShared } from '../connectedAccountsDb';
 import { reserveDailyVolumeSlot } from '../linkedInWritePacer';
+import { linkedInOutreachService } from '../linkedInOutreachService';
 import type { ResolvedLinkedInAccount } from './linkedInDailyVolumeGate';
 
 export interface LinkedInAccountRoutingDecision {
@@ -32,21 +46,23 @@ export interface LinkedInAccountRoutingDecision {
 }
 
 /**
- * If `requestedAccount` already has daily-volume headroom for `action` (or
- * `action` isn't a volume-classed action at all — cancel/accept-invitation),
- * returns `null`: nothing to route, today's single-account behavior is
- * unchanged.
+ * If `requestedAccount` already has daily-volume headroom for `action` and
+ * (for `send-invite`) isn't under LinkedIn's own account-level invitation
+ * cooldown, returns `null`: nothing to route, today's single-account
+ * behavior is unchanged. Also `null` for actions that are neither
+ * volume-classed nor cooldown-classed (cancel/accept-invitation).
  *
  * Otherwise looks across the caller's other connected/shared unipile
  * accounts (excluding `requestedAccountId`) for the first one with headroom
- * under its OWN configured cap, and returns a routing decision naming it.
- * Returns `null` again if none has headroom either — the caller falls
- * through to the existing refusal, which is exactly today's single-account
- * behavior when nothing can help.
+ * under its OWN configured cap AND (for `send-invite`) not itself under
+ * cooldown, and returns a routing decision naming it. Returns `null` again
+ * if none qualifies — the caller falls through to the existing refusal,
+ * which is exactly today's single-account behavior when nothing can help.
  *
  * Read-only: does not call `reserveWriteSlot`/persist any daily-volume
- * state. The caller still must run the full pace/reserve flow against
- * whichever account this returns.
+ * state, and does not arm, clear, or otherwise touch the cooldown breaker
+ * for any account. The caller still must run the full pace/reserve flow
+ * against whichever account this returns.
  */
 export async function routeLinkedInWriteToAccountWithHeadroom(
   callerUserId: string,
@@ -54,17 +70,20 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
   requestedAccountId: string,
   requestedAccount: ResolvedLinkedInAccount,
 ): Promise<LinkedInAccountRoutingDecision | null> {
+  const isInvite = action === 'send-invite';
+  const requestedUnderCooldown = isInvite && linkedInOutreachService.isUnderInvitationCooldown(requestedAccountId);
   const requestedHasHeadroom = reserveDailyVolumeSlot(
     action,
     requestedAccount.configuredDailyInviteCap,
     requestedAccount.dailyVolumeState,
   ).allowed;
-  if (requestedHasHeadroom) return null;
+  if (requestedHasHeadroom && !requestedUnderCooldown) return null;
 
   const accounts = await getAccountsWithOwnerIncludingOrgShared(callerUserId);
   for (const candidate of accounts) {
     const candidateAccountId = (candidate as any).account_id;
     if ((candidate as any).platform !== 'unipile' || candidateAccountId === requestedAccountId) continue;
+    if (isInvite && linkedInOutreachService.isUnderInvitationCooldown(candidateAccountId)) continue;
 
     const account: ResolvedLinkedInAccount = {
       ownerUserId: (candidate as any).userId,
@@ -74,10 +93,13 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
     const slot = reserveDailyVolumeSlot(action, account.configuredDailyInviteCap, account.dailyVolumeState);
     if (!slot.allowed) continue;
 
+    const requestedReason = requestedUnderCooldown
+      ? 'was under an active LinkedIn invitation cooldown'
+      : `was at its daily cap for "${action}"`;
     return {
       accountId: candidateAccountId,
       account,
-      reason: `Account ${requestedAccountId} was at its daily cap for "${action}"; routed to connected account `
+      reason: `Account ${requestedAccountId} ${requestedReason}; routed to connected account `
         + `${candidateAccountId} (${(candidate as any).userId === callerUserId ? 'your own' : 'org-shared'} account), which has headroom.`,
     };
   }
