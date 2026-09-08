@@ -511,6 +511,79 @@ describe('Schedule Templates', () => {
       expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1');
     });
 
+    // ENG-1722 (ENG-1609 AC #2): variables alone must be sufficient — no freehand
+    // conversation. Run against the REAL seeded template, not a fixture, so a
+    // change to the shipped prompt or variable list is caught here.
+    it('ENG-1722: builds a working daily schedule from the real LinkedIn outreach template with variables alone', async () => {
+      const { buildLinkedInOutreachTemplate } = require('../scripts/seed-eng1609-linkedin-outreach-template');
+      const template = buildLinkedInOutreachTemplate();
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(template);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: template.templateId },
+        body: {
+          variableValues: {
+            icp_description: 'Heads of Clinical Operations at US biotechs, 50-500 staff',
+            daily_connection_target: '10',
+            message_template: 'default',
+            lead_list_id: 'create new',
+          },
+        },
+      });
+      const res = mockRes();
+      await agentModeController.createScheduleFromTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+
+      // Ready to run: nothing is pending a human, so the first fire is not parked.
+      expect(created.variableRequestStatus).toBe('provided');
+      expect(created.status).toBe('active');
+      expect(created.frequency).toBe('daily');
+
+      // The validation wiring survives the copy — this is the field ENG-1132's
+      // whole block-detection chain is gated on.
+      expect(created.requiredFunctionCalls).toEqual(['linkedin_outreach']);
+      expect(created.functionCallMinCalls).toEqual({ linkedin_outreach: 1 });
+
+      // Every placeholder has a value, so none reaches the model unsubstituted and
+      // the pre-run missing-variable gate cannot fire.
+      const stillUnfilled = (created.startingMessage.match(/\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g) || [])
+        .filter((ph: string) => {
+          const name = ph.replace(/[{}\s]/g, '');
+          return !created.variableValues[name];
+        });
+      expect(stillUnfilled).toEqual([]);
+    });
+
+    it('ENG-1722: parks the run when a variable is left blank — there are no optional variables', async () => {
+      const { buildLinkedInOutreachTemplate } = require('../scripts/seed-eng1609-linkedin-outreach-template');
+      const template = buildLinkedInOutreachTemplate();
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(template);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: template.templateId },
+        body: {
+          variableValues: {
+            icp_description: 'Heads of Clinical Operations',
+            daily_connection_target: '10',
+            // message_template and lead_list_id omitted — the two the parent
+            // ticket calls "optional". They are not, which is why each carries a
+            // documented literal default instead.
+          },
+        },
+      });
+      const res = mockRes();
+      await agentModeController.createScheduleFromTemplate(req as any, res);
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.variableRequestStatus).toBe('pending');
+    });
+
     it('should allow overriding frequency and model', async () => {
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(baseTemplate);
       (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});

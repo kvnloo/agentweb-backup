@@ -69,6 +69,12 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
   // "an identical retry is known-pointless".
   'read_bounded',
+  // publisher_refused is deliberately excluded (ENG-1162): read_file_content's publisher-refusal
+  // message doesn't embed the URL, so two different blocked sources (e.g. two different hosts)
+  // collide on the same breaker key — fast-tripping would trip the breaker across legitimately
+  // different resources, the same same-error-text-different-args hazard empty_result/not_found
+  // are excluded for above. It stays out of RETRYABLE_ERROR_CLASSES too, so it still falls to the
+  // conservative default (NOT retryable) via the normal 3-strike threshold.
 ]);
 
 export function isRetryableErrorClass(errorClass: string): boolean {
@@ -103,6 +109,12 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',
   empty_result: 'the call succeeded but returned nothing. Do NOT repeat the identical call — broaden the query or try a different source.',
+  // ENG-1162: a publisher-side refusal (bot-block/WAF/paywall 401/403, or a
+  // browser navigation net::ERR_* failure) is not an AgentWeb account problem
+  // and, critically, is NOT proof the content is missing — the failure mode
+  // this ticket exists to fix was a run silently treating a blocked fetch as
+  // if the source didn't exist and quietly falling back to search.
+  publisher_refused: 'the publisher refused or failed to serve this content (bot-block, WAF, paywall, or a dropped/empty response) — this is NOT an AgentWeb account or permissions problem, and NOT evidence the content does not exist. If a different fetch path exists (another tool, a cached/alternate URL, or a search result covering the same content) try that once; otherwise report this source as UNVERIFIED rather than silently dropping the candidate or treating a search summary as equivalent verification.',
   truncated_response: 'your previous response for this call was cut off mid-generation — there is nothing wrong with the arguments themselves. Retry the SAME tool call and emit the complete arguments in one go, including every required field.',
 };
 

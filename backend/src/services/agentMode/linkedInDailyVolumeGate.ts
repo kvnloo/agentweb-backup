@@ -50,6 +50,12 @@ export interface ResolvedLinkedInAccount {
   ownerUserId: string;
   configuredDailyInviteCap: number | null | undefined;
   dailyVolumeState: DailyVolumeState | null | undefined;
+  /**
+   * ENG-1721: when this LinkedIn account was first connected, driving the
+   * warm-up ramp. Read from the stored `created_at`, which survives re-OAuth, so
+   * an established account that reconnects does not restart its ramp.
+   */
+  connectedAt: string | null | undefined;
 }
 
 /**
@@ -69,6 +75,7 @@ export async function resolveLinkedInAccountForWrite(
     ownerUserId: (matched as any).userId,
     configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
     dailyVolumeState: (matched as any)?.config?.daily_volume,
+    connectedAt: (matched as any)?.created_at,
   };
 }
 
@@ -100,7 +107,12 @@ export async function paceLinkedInWrite(
 ): Promise<PaceLinkedInWriteResult> {
   if (!PACED_WRITE_ACTIONS.has(action)) return { refusal: null };
 
-  const dailySlot = reserveDailyVolumeSlot(action, account.configuredDailyInviteCap, account.dailyVolumeState);
+  const dailySlot = reserveDailyVolumeSlot(
+    action,
+    account.configuredDailyInviteCap,
+    account.dailyVolumeState,
+    { connectedAt: account.connectedAt },
+  );
   if (!dailySlot.allowed) {
     console.log(`[linkedInDailyVolumeGate] ${action} on ${accountId} refused by daily volume cap — ${dailySlot.reason}`);
     return {
@@ -149,6 +161,13 @@ export async function paceLinkedInWrite(
         action,
         freshConfig.daily_invite_cap,
         freshConfig.daily_volume,
+        // ENG-1721: the ramp must apply on the DURABLE re-check too. `created_at`
+        // lives on the account row, not in its config, and cannot change during a
+        // single call — so it comes from the already-resolved account rather than
+        // from `freshConfig`. Omitting it here would have re-checked against the
+        // unramped cap and committed a reservation the first check had just
+        // refused.
+        { connectedAt: account.connectedAt },
       );
       if (!freshDailySlot.allowed) {
         durableRefusalReason = freshDailySlot.reason;

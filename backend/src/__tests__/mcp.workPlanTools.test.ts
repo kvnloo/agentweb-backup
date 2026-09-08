@@ -120,6 +120,52 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(result.content[0].text).toContain('pending_review');
     });
 
+    // ENG-1814 round-2 review finding: the admin route (getAllWorkPlans, backed by the
+    // raw WorkPlan interface in workPlanService.ts) never returns an `id` field at all --
+    // only `planId`, its actual primary key -- unlike the non-admin route's already-
+    // remapped shape (`id: 'wp-1'` above). The compact-listing map's `id: p.id` alone
+    // silently dropped the identifier entirely for every admin/delegated listing
+    // (JSON.stringify drops an undefined key), worse than the pre-fix raw passthrough --
+    // confirmed live-code-trace by an independent reviewer, and independently reverified
+    // here before fixing. This is the realistic admin-shape repro; the test above uses
+    // `id` (matching the non-admin remap) deliberately, not as an oversight.
+    it('preserves the plan identifier for admin listings, which only carry planId (not id)', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+      mockMcpFetch.mockResolvedValue([{ planId: 'wp-admin-1', title: 'Onboarding', visibility: 'pending_review' }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'admin-1' });
+      const text = result.content[0].text as string;
+
+      expect(text).toContain('wp-admin-1');
+      expect(JSON.parse(text)[0].id).toBe('wp-admin-1');
+    });
+
+    // Round-3 review finding: the admin route's raw WorkPlan records carry
+    // `display.stepLabels?: string[]` (often absent), not the computed
+    // `display.steps: [{position, label}]` shape the non-admin route already
+    // returns via projectWorkPlanForCustomer. Passing the raw `display` through
+    // unconditionally left admin/delegated listings with materially less
+    // disambiguating context than non-admin ones -- same mismatch class as the
+    // `id`/`planId` bug above, independently reverified before fixing.
+    it('computes the same display projection for admin listings as the non-admin path, not a raw stepLabels shape', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+      mockMcpFetch.mockResolvedValue([{
+        planId: 'wp-admin-2',
+        title: 'Weekly Content Recap',
+        visibility: 'system',
+        steps: [{ title: 'Draft the recap' }, { title: 'Send for review' }],
+      }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'admin-1' });
+      const plan = JSON.parse(result.content[0].text as string)[0];
+
+      expect(plan.display.steps).toEqual([
+        { position: 1, label: 'Draft the recap' },
+        { position: 2, label: 'Send for review' },
+      ]);
+      expect(plan.display.stepLabels).toBeUndefined();
+    });
+
     it('admin-delegated sessions get the admin list without a user lookup', async () => {
       mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
 
@@ -142,6 +188,116 @@ describe('Predefined Work Plan MCP Tools', () => {
         method: 'GET',
         path: '/api/agent-mode/public/plans',
       }));
+    });
+
+    // ENG-1814: the raw HTTP response carries every step's full body for every
+    // accessible template — trivially exceeds the platform's 8,000-char
+    // tool-response-to-S3 threshold for any non-trivial catalog, forcing the model
+    // into a fragile multi-step search_tool_response detour (the mechanism behind
+    // the live-reproduced wrong-template incident). Confirms the tool actually
+    // strips the bloated legacy fields and keeps only what a listing/matching
+    // consumer needs, using the already-built ENG-1469 `display` projection.
+    it('strips the bloated legacy per-step fields and keeps only the compact listing shape', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      mockMcpFetch.mockResolvedValue([{
+        id: 'wp-1',
+        title: 'Onboarding',
+        category: 'Client Success',
+        autocomplete: true,
+        visibility: 'system',
+        description: 'A'.repeat(500),
+        welcomeMessage: 'Welcome!',
+        thumbnail_url: 'https://example.com/thumb.png',
+        thumbnail_alt_text: 'thumbnail',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            description: 'B'.repeat(500),
+            userInstructions: 'C'.repeat(500),
+            skillIds: ['skill-a', 'skill-b'],
+            requiredFunctionCalls: ['read_brand_guidelines'],
+          },
+        ],
+        display: { id: 'wp-1', title: 'Onboarding', summary: 'Short summary', categories: [], steps: [{ position: 1, label: 'Step 1' }], nextPlanIds: [], visibility: 'system' },
+      }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, context);
+      const text = result.content[0].text as string;
+
+      // Compact fields survive.
+      expect(text).toContain('Onboarding');
+      expect(text).toContain('Client Success');
+      expect(text).toContain('Short summary');
+      // Bloated legacy fields do not.
+      expect(text).not.toContain('A'.repeat(500));
+      expect(text).not.toContain('B'.repeat(500));
+      expect(text).not.toContain('C'.repeat(500));
+      expect(text).not.toContain('skill-a');
+      expect(text).not.toContain('requiredFunctionCalls');
+      expect(text).not.toContain('welcomeMessage');
+      expect(text).not.toContain('thumbnail_url');
+    });
+
+    // Real external MCP clients (claude_ai via OAuth, confirmed via mcp_tool_used
+    // telemetry) call this tool too, and unlike launch_predefined_work_plan (which
+    // never consumes this tool's output), an external end user reading the response
+    // through their own client's LLM could legitimately want a template's full
+    // per-step detail. verbose=true keeps that capability reachable instead of
+    // silently removing it -- confirms it bypasses the compact map entirely and
+    // returns the raw fetch result untouched.
+    it('verbose=true returns the full untrimmed legacy shape instead of the compact listing', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      const raw = [{
+        id: 'wp-1',
+        title: 'Onboarding',
+        category: 'Client Success',
+        autocomplete: true,
+        visibility: 'system',
+        description: 'A'.repeat(500),
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            description: 'B'.repeat(500),
+            userInstructions: 'C'.repeat(500),
+            skillIds: ['skill-a', 'skill-b'],
+            requiredFunctionCalls: ['read_brand_guidelines'],
+          },
+        ],
+      }];
+      mockMcpFetch.mockResolvedValue(raw);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true }, context);
+      const text = result.content[0].text as string;
+
+      expect(JSON.parse(text)).toEqual(raw);
+      expect(text).toContain('A'.repeat(500));
+      expect(text).toContain('skill-a');
+      expect(text).toContain('requiredFunctionCalls');
+    });
+
+    // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+    // catalog, reopening the same oversized-response risk this PR fixes, for a
+    // caller who usually only wants one template. plan_id scopes verbose to just
+    // the matching template(s) so the guided (verbose + plan_id) path never
+    // re-triggers that risk, while verbose alone (no plan_id) still returns
+    // everything, unchanged from the prior commit.
+    it('verbose=true with plan_id scopes the full-detail response to just the matching template', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      const onboarding = { id: 'wp-1', title: 'Onboarding', description: 'A'.repeat(500) };
+      const audit = { id: 'wp-2', title: 'GTM Audit', description: 'B'.repeat(500) };
+      mockMcpFetch.mockResolvedValue([onboarding, audit]);
+
+      const byId = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true, plan_id: 'wp-2' }, context);
+      expect(JSON.parse(byId.content[0].text as string)).toEqual([audit]);
+
+      const byTitle = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true, plan_id: 'Onboarding' }, context);
+      expect(JSON.parse(byTitle.content[0].text as string)).toEqual([onboarding]);
+
+      // verbose alone (no plan_id) is unchanged -- still returns the whole catalog.
+      const unscoped = await mcpToolRegistry.execute('list_predefined_work_plans', { verbose: true }, context);
+      expect(JSON.parse(unscoped.content[0].text as string)).toEqual([onboarding, audit]);
     });
   });
 

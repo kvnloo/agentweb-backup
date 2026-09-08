@@ -876,7 +876,7 @@ describe('recordInviteWithdrawnInCrm', () => {
       userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
     });
 
-    expect(res).toEqual({ leadId: 'lead_w1', listId: LIST });
+    expect(res).toEqual({ leadId: 'lead_w1', listId: LIST, engagementLogged: true });
     // One failed attempt, then the duplicate check stops it — no blind second append.
     expect(addLeadEngagement).toHaveBeenCalledTimes(1);
   });
