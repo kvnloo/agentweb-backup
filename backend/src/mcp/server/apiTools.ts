@@ -2223,7 +2223,28 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    return jsonResult(data);
+    // ENG-1814: the raw HTTP response carries every step's full body (description,
+    // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
+    // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
+    // non-trivial catalog, forcing the model into a fragile multi-step
+    // search_tool_response/read_tool_response detour just to find a specific title (the
+    // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
+    // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
+    // this tool's output -- it re-fetches its own candidates independently -- so nothing
+    // needs the full shape here. Return only what a listing/matching consumer needs: the
+    // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
+    // top-level fields launch/recommend calls actually reference.
+    const compact = Array.isArray(data)
+      ? data.map((p: any) => ({
+          id: p.id,
+          title: p.title,
+          category: p.category,
+          autocomplete: p.autocomplete,
+          visibility: p.visibility,
+          display: p.display,
+        }))
+      : data;
+    return jsonResult(compact);
   }
 });
 

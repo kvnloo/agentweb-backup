@@ -143,6 +143,55 @@ describe('Predefined Work Plan MCP Tools', () => {
         path: '/api/agent-mode/public/plans',
       }));
     });
+
+    // ENG-1814: the raw HTTP response carries every step's full body for every
+    // accessible template — trivially exceeds the platform's 8,000-char
+    // tool-response-to-S3 threshold for any non-trivial catalog, forcing the model
+    // into a fragile multi-step search_tool_response detour (the mechanism behind
+    // the live-reproduced wrong-template incident). Confirms the tool actually
+    // strips the bloated legacy fields and keeps only what a listing/matching
+    // consumer needs, using the already-built ENG-1469 `display` projection.
+    it('strips the bloated legacy per-step fields and keeps only the compact listing shape', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'user-123', isAdmin: false });
+      mockMcpFetch.mockResolvedValue([{
+        id: 'wp-1',
+        title: 'Onboarding',
+        category: 'Client Success',
+        autocomplete: true,
+        visibility: 'system',
+        description: 'A'.repeat(500),
+        welcomeMessage: 'Welcome!',
+        thumbnail_url: 'https://example.com/thumb.png',
+        thumbnail_alt_text: 'thumbnail',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Step 1',
+            description: 'B'.repeat(500),
+            userInstructions: 'C'.repeat(500),
+            skillIds: ['skill-a', 'skill-b'],
+            requiredFunctionCalls: ['read_brand_guidelines'],
+          },
+        ],
+        display: { id: 'wp-1', title: 'Onboarding', summary: 'Short summary', categories: [], steps: [{ position: 1, label: 'Step 1' }], nextPlanIds: [], visibility: 'system' },
+      }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, context);
+      const text = result.content[0].text as string;
+
+      // Compact fields survive.
+      expect(text).toContain('Onboarding');
+      expect(text).toContain('Client Success');
+      expect(text).toContain('Short summary');
+      // Bloated legacy fields do not.
+      expect(text).not.toContain('A'.repeat(500));
+      expect(text).not.toContain('B'.repeat(500));
+      expect(text).not.toContain('C'.repeat(500));
+      expect(text).not.toContain('skill-a');
+      expect(text).not.toContain('requiredFunctionCalls');
+      expect(text).not.toContain('welcomeMessage');
+      expect(text).not.toContain('thumbnail_url');
+    });
   });
 
   describe('manage_predefined_work_plan - create', () => {
