@@ -189,8 +189,14 @@ def test_hard_deadline_invoke_passes_through_fast_sync_calls(monkeypatch):
     assert wrapped.invoke("hello", extra="world") == "got:hello:world"
 
 
-@pytest.mark.asyncio
-async def test_hard_deadline_ainvoke_passes_through_fast_async_calls(monkeypatch):
+def test_hard_deadline_ainvoke_passes_through_fast_async_calls(monkeypatch):
+    # No pytest.mark.asyncio here: pytest-asyncio isn't a project dependency
+    # (not in environment.yml, not installed in the real production conda
+    # env) -- confirmed by running this file against the actual deployed
+    # agent-engine env, where every @pytest.mark.asyncio test errored out
+    # with "async def functions are not natively supported" instead of
+    # running. asyncio.run() exercises the exact same coroutine with zero
+    # new dependencies, consistent with the rest of this file's sync tests.
     gateway = load_gateway()
     monkeypatch.setattr(gateway, "HARD_DEADLINE_SECONDS", 5)
 
@@ -199,7 +205,8 @@ async def test_hard_deadline_ainvoke_passes_through_fast_async_calls(monkeypatch
             return f"got:{message}:{extra}"
 
     wrapped = gateway._enforce_hard_deadline(_FastBase)()
-    assert await wrapped.ainvoke("hello", extra="world") == "got:hello:world"
+    result = asyncio.run(wrapped.ainvoke("hello", extra="world"))
+    assert result == "got:hello:world"
 
 
 def test_hard_deadline_invoke_bounds_a_sync_call_that_never_returns(monkeypatch):
@@ -224,8 +231,7 @@ def test_hard_deadline_invoke_bounds_a_sync_call_that_never_returns(monkeypatch)
     assert elapsed < 1.0
 
 
-@pytest.mark.asyncio
-async def test_hard_deadline_ainvoke_bounds_an_async_call_that_never_returns(monkeypatch):
+def test_hard_deadline_ainvoke_bounds_an_async_call_that_never_returns(monkeypatch):
     gateway = load_gateway()
     monkeypatch.setattr(gateway, "HARD_DEADLINE_SECONDS", 0.2)
 
@@ -238,7 +244,7 @@ async def test_hard_deadline_ainvoke_bounds_an_async_call_that_never_returns(mon
 
     start = time.monotonic()
     with pytest.raises(TimeoutError):
-        await wrapped.ainvoke("hi")
+        asyncio.run(wrapped.ainvoke("hi"))
     elapsed = time.monotonic() - start
 
     assert elapsed < 1.0
@@ -303,6 +309,26 @@ def test_create_openrouter_llm_preserves_isinstance_of_real_chatopenai(monkeypat
 
     assert isinstance(llm, gateway.ChatOpenAI)
     assert type(llm).__bases__ == (gateway.ChatOpenAI,)
+
+
+def test_create_openrouter_llm_preserves_class_name_for_browser_use_env_var_lookup(monkeypatch):
+    """browser-use's Agent._verify_llm_connection() looks up required env
+    vars via REQUIRED_LLM_API_ENV_VARS.get(self.llm.__class__.__name__, []),
+    keyed on the literal string "ChatOpenAI" (confirmed against the real
+    installed browser_use source). _enforce_hard_deadline's dynamic subclass
+    must not shadow that with a distinct name like "HardDeadlineChatOpenAI",
+    or that lookup silently misses on every task (this deployment doesn't
+    set SKIP_LLM_API_KEY_VERIFICATION, so the check genuinely runs) and
+    quietly drops its own connection-failure error log.
+    """
+    gateway = load_gateway()
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    llm = gateway.create_openrouter_llm("openai/gpt-4.1")
+
+    assert type(llm).__name__ == gateway.ChatOpenAI.__name__ == "ChatOpenAI"
+    assert type(llm).__qualname__ == gateway.ChatOpenAI.__qualname__
+    assert type(llm).__module__ == gateway.ChatOpenAI.__module__
     assert callable(llm.invoke) and callable(llm.ainvoke)
 
 
@@ -388,8 +414,7 @@ def test_httpx_read_timeout_does_not_bound_a_trickling_response():
     assert elapsed > num_chunks * chunk_interval * 0.75
 
 
-@pytest.mark.asyncio
-async def test_hard_deadline_bounds_a_real_trickling_socket_response(monkeypatch):
+def test_hard_deadline_bounds_a_real_trickling_socket_response(monkeypatch):
     """The actual fix, proven against the exact reproduction above: even
     though the trickling server defeats httpx's own read timeout (previous
     test), wrapping the call in _enforce_hard_deadline still cuts it off at
@@ -416,7 +441,7 @@ async def test_hard_deadline_bounds_a_real_trickling_socket_response(monkeypatch
     try:
         start = time.monotonic()
         with pytest.raises(TimeoutError):
-            await wrapped.ainvoke()
+            asyncio.run(wrapped.ainvoke())
         elapsed = time.monotonic() - start
     finally:
         server_sock.close()
@@ -428,8 +453,7 @@ async def test_hard_deadline_bounds_a_real_trickling_socket_response(monkeypatch
     assert elapsed < num_chunks * chunk_interval * 0.75
 
 
-@pytest.mark.asyncio
-async def test_create_openrouter_llm_end_to_end_bounds_a_trickling_response(monkeypatch):
+def test_create_openrouter_llm_end_to_end_bounds_a_trickling_response(monkeypatch):
     """Maximum-rigor version of the two tests above: goes through the real
     create_openrouter_llm() -> real ChatOpenAI -> real openai SDK -> real
     httpx client, all pointed at the real trickling socket, rather than a
@@ -459,7 +483,66 @@ async def test_create_openrouter_llm_end_to_end_bounds_a_trickling_response(monk
     try:
         start = time.monotonic()
         with pytest.raises(TimeoutError):
-            await llm.ainvoke([HumanMessage(content="hi")])
+            asyncio.run(llm.ainvoke([HumanMessage(content="hi")]))
+        elapsed = time.monotonic() - start
+    finally:
+        server_sock.close()
+
+    assert elapsed < hard_deadline + 1.0
+    assert elapsed < num_chunks * chunk_interval * 0.75
+
+
+def test_create_openrouter_llm_with_structured_output_bounds_a_trickling_response(monkeypatch):
+    """Closes a real gap left by the test above: that test calls llm.ainvoke()
+    directly, but browser-use never does -- it always goes through
+    llm.with_structured_output(AgentOutput, include_raw=True,
+    method="function_calling").ainvoke(...), which returns a RunnableMap/
+    RunnableSequence composition, not the ChatOpenAI instance itself. Whether
+    the hard deadline still applies through that composition was previously
+    established only by a one-off manual trace (monkeypatching a spy onto
+    type(llm).ainvoke against the real production environment and confirming
+    it fired) -- not by an automated regression test. This test proves the
+    same claim mechanically, against the same real trickling socket used
+    above, so a future change (e.g. a langchain_openai/langchain_core version
+    bump that alters RunnableBinding's internal dispatch) can't silently
+    regress this without failing CI.
+
+    Confirmed by reading langchain_core's actual with_structured_output
+    source on the production install (langchain-core==0.3.49): with
+    include_raw=True it builds `RunnableMap(raw=llm) | parser_with_fallback`.
+    The `with_fallbacks(exception_key="parsing_error")` wrapping only applies
+    to the *parser* step (`parser_assign`) -- the raw `llm` call inside the
+    RunnableMap is not wrapped in any fallback/try-except, so a TimeoutError
+    raised by our overridden ainvoke propagates untouched through the
+    RunnableMap and out of the whole composition's ainvoke.
+    """
+    from langchain_core.messages import HumanMessage
+    from pydantic import BaseModel
+
+    class Answer(BaseModel):
+        """Minimal stand-in for browser-use's AgentOutput schema -- only the
+        composition shape matters for this test, not the field contents."""
+
+        result: str
+
+    gateway = load_gateway()
+    hard_deadline = 0.4
+    monkeypatch.setattr(gateway, "HARD_DEADLINE_SECONDS", hard_deadline)
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    num_chunks, chunk_interval = 20, 0.1  # ~2s of trickle -- comfortably
+    # inside openai's own default per-read timeout too, so nothing but the
+    # wrapper can save this call.
+    url, server_sock = _start_trickle_server(num_chunks=num_chunks, chunk_interval=chunk_interval)
+    monkeypatch.setattr(gateway, "OPENROUTER_BASE_URL", url)
+
+    llm = gateway.create_openrouter_llm("openai/gpt-4.1")
+    structured_llm = llm.with_structured_output(Answer, include_raw=True, method="function_calling")
+
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            asyncio.run(structured_llm.ainvoke([HumanMessage(content="hi")]))
         elapsed = time.monotonic() - start
     finally:
         server_sock.close()
