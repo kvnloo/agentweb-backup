@@ -825,6 +825,22 @@ async function extractWithJSDOM(
     try {
       htmlContent = await fetchFreshHtmlFromValidatedUrl(url.toString());
     } catch (error: any) {
+      // ENG-1162: this JSDOM fallback runs its own anonymous axios.get and is
+      // reached specifically when extractWithPuppeteer ALSO just failed — often
+      // the same anti-bot block hitting both the headless browser and this plain
+      // fetch. A 401/403 here means the PUBLISHER refused the request, not an
+      // AgentWeb auth/permission problem. Re-wrapping as a bare "Failed to fetch
+      // URL: Request failed with status code 403" loses the axios status/isAxiosError
+      // info and lets classifyToolErrorClass's embedded-status regex sweep it into
+      // the generic 'auth' class (see agentModeService.ts readFileContent's catch
+      // block for the same fix, applied there first). Marker text must match the
+      // regex in toolErrorClassifier.ts's classFromMessage.
+      const status = error?.response?.status;
+      if (error?.isAxiosError && (status === 401 || status === 403)) {
+        throw new Error(
+          `The publisher refused this fetch (HTTP ${status}: ${error.response.statusText}) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.`
+        );
+      }
       throw new Error(`Failed to fetch URL: ${error.message}`);
     }
   }
