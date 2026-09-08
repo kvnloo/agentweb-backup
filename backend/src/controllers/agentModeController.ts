@@ -37,6 +37,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
+import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
@@ -880,12 +881,19 @@ const AUTO_WORK_PLAN_CONTINUATION_MESSAGE =
  * rather than a feature.
  */
 export function hasStalledAutocompleteWorkPlan(
-  workPlan: { autocomplete?: boolean; steps?: Array<{ status?: string }> } | undefined | null,
+  workPlan: { autocomplete?: boolean; steps?: Array<{ status?: string }>; pendingRequiredFunctionCalls?: string[] } | undefined | null,
   toolCalls: unknown[] | undefined | null,
+  calledFunctions?: Record<string, number>,
 ): boolean {
   if (!workPlan?.autocomplete) return false;
   const calls = Array.isArray(toolCalls) ? toolCalls : [];
   if (hasDeferredMediaBudgetToolCall(calls as any[])) return false;
+  // ENG-1813: a modify_work_plan call that deletes the last pending step while creating
+  // genuine ENG-1811 debt is itself a "successful tool call" -- the short-circuit below would
+  // otherwise call this turn "not stalled" even though no real required work got done, and no
+  // further auto-continuation round would ever fire to go satisfy the debt. Checked before that
+  // short-circuit so outstanding debt always wins regardless of what else happened this turn.
+  if (workPlanHasUnresolvedDebt(workPlan, calledFunctions)) return true;
   if (calls.some((tc) => toolCallSucceeded(tc))) return false;
   return workPlanHasPendingStep(workPlan);
 }
@@ -899,6 +907,30 @@ function workPlanHasPendingStep(
 ): boolean {
   const steps = Array.isArray(workPlan?.steps) ? workPlan!.steps : [];
   return steps.some((s) => s?.status !== 'completed' && s?.status !== 'skipped');
+}
+
+/** ENG-1813: whether a work plan has an ENG-1811 debt-ledger entry (a removed step's required
+ * function call) that hasn't genuinely succeeded yet, resolved against real calledFunctions --
+ * not just "does the ledger have entries" (an entry auto-clears once satisfied, so a stale-but-
+ * already-resolved entry must not count as still stalled). */
+function workPlanHasUnresolvedDebt(
+  workPlan: { pendingRequiredFunctionCalls?: string[] } | undefined | null,
+  calledFunctions?: Record<string, number>,
+): boolean {
+  const debt = workPlan?.pendingRequiredFunctionCalls;
+  if (!Array.isArray(debt) || debt.length === 0) return false;
+  const called = calledFunctions || {};
+  return debt.some((fn) => (called[fn] || 0) === 0);
+}
+
+/** ENG-1813: combined "is there still unfinished autocomplete work" check -- a pending step OR
+ * unresolved ENG-1811 debt. Use this (not the bare workPlanHasPendingStep) at any call site that
+ * decides whether to keep pushing an autocomplete work plan forward. */
+function workPlanHasUnfinishedAutocompleteWork(
+  workPlan: { steps?: Array<{ status?: string }>; pendingRequiredFunctionCalls?: string[] } | undefined | null,
+  calledFunctions?: Record<string, number>,
+): boolean {
+  return workPlanHasPendingStep(workPlan) || workPlanHasUnresolvedDebt(workPlan, calledFunctions);
 }
 
 /**
@@ -1543,7 +1575,8 @@ async function scheduleAutoWorkPlanContinuation(
   });
   if (
     !currentSessionLookupFailed &&
-    (!currentSession?.workPlan?.autocomplete || !workPlanHasPendingStep(currentSession.workPlan))
+    (!currentSession?.workPlan?.autocomplete
+      || !workPlanHasUnfinishedAutocompleteWork(currentSession.workPlan, currentSession.calledFunctions))
   ) {
     autoContinuationSessions.delete(sessionId);
     releaseSessionGeneration(sessionId);
@@ -1572,7 +1605,7 @@ async function scheduleAutoWorkPlanContinuation(
     sessionId
   )
     .then(async (resolved) => {
-      stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls);
+      stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.content) {
         const { io } = await import('../server');
         io.to(`user:${userId}`).emit('session-message-appended', {
@@ -1605,7 +1638,7 @@ async function scheduleAutoWorkPlanContinuation(
           const timedOutSession = await chatbotDb.getChatSessionRecord(sessionId);
           stillStalled =
             timedOutSession?.workPlan?.autocomplete === true &&
-            workPlanHasPendingStep(timedOutSession.workPlan);
+            workPlanHasUnfinishedAutocompleteWork(timedOutSession.workPlan, timedOutSession.calledFunctions);
         } catch (rereadErr) {
           console.error(
             `AgentMode: work-plan auto-continuation could not re-read session ${sessionId} after a ` +
@@ -9016,7 +9049,7 @@ export const agentModeController = {
             if (
               !mediaContinuationWillFire &&
               timedOutSession?.workPlan?.autocomplete === true &&
-              workPlanHasPendingStep(timedOutSession.workPlan)
+              workPlanHasUnfinishedAutocompleteWork(timedOutSession.workPlan, timedOutSession.calledFunctions)
             ) {
               setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
                 console.error(`AgentMode: work-plan auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
@@ -9111,7 +9144,7 @@ export const agentModeController = {
       // "retry" instead of just continuing per the plan's own "never wait on the user"
       // contract, and the session then sat idle for 3+ hours. Auto-fire the continuation
       // ourselves, same setImmediate-after-release pattern as the media case above.
-      if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls)) {
+      if (hasStalledAutocompleteWorkPlan(response.workPlan, response.toolCalls, response.calledFunctions)) {
         setImmediate(() => scheduleAutoWorkPlanContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
           console.error(`AgentMode: work-plan auto-continuation failed for session ${sessionId}:`, err),
         ));
@@ -14285,12 +14318,29 @@ export const agentModeController = {
         emailNotifications, dailyDigest, llmModel,
       } = req.body;
 
+      // ENG-1716: visibility is the only field here that grants reach beyond the
+      // owner, so it takes an AUTHORIZATION decision, not just a write. This route
+      // previously wrote whatever was sent behind an ownership check alone, so any
+      // authenticated user could promote their own template to `system`/`public`
+      // and put its agent prompt in every customer's picker — skipping the
+      // submit-for-review → admin-approve workflow one route over. Refused
+      // explicitly rather than silently dropped; a silent drop is how the
+      // manage_schedule_template confusion started.
+      const visibilityDecision = resolveVisibilityUpdate({
+        current: existing.visibility,
+        requested: visibility,
+        isAdmin: user.isAdmin === true,
+      });
+      if (!visibilityDecision.ok) {
+        return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
+      }
+
       const updates: any = { updatedAt: new Date().toISOString() };
 
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
       if (category !== undefined) updates.category = category;
-      if (visibility !== undefined) updates.visibility = visibility;
+      if (visibilityDecision.visibility !== undefined) updates.visibility = visibilityDecision.visibility;
       if (keywords !== undefined) updates.keywords = keywords;
       if (requiredFunctionCalls !== undefined) updates.requiredFunctionCalls = requiredFunctionCalls;
       if (functionCallMinCalls !== undefined) updates.functionCallMinCalls = functionCallMinCalls;
@@ -14319,7 +14369,36 @@ export const agentModeController = {
         updates.variables = variables;
       }
 
-      await scheduleTemplateDb.updateTemplate(templateId, updates);
+      // ENG-1716: when this write CHANGES visibility, bind it to the snapshot the
+      // authorization decision was made against. The owner route authorizes
+      // `pending_review -> private` from the row it just read, while the admin
+      // approval path reads `pending_review` and writes `public` — so without the
+      // condition an in-flight owner write silently overwrites an approval
+      // (CodeRabbit). A non-admin still cannot reach system/public through this
+      // race (those are refused whatever the current value), so this is integrity,
+      // not escalation: it stops an owner undoing an administrator's decision.
+      //
+      // Only guarded when visibility is actually changing — an edit that leaves it
+      // alone has no snapshot to lose, and conditioning those would make ordinary
+      // renames fail whenever an admin happened to be reviewing.
+      const visibilityIsChanging = visibilityDecision.visibility !== undefined
+        && visibilityDecision.visibility !== canonicalizeVisibility(existing.visibility);
+      try {
+        await scheduleTemplateDb.updateTemplate(
+          templateId,
+          updates,
+          visibilityIsChanging ? { expectedVisibility: existing.visibility ?? '' } : {},
+        );
+      } catch (err: any) {
+        if (err?.preconditionFailed) {
+          return res.status(409).json({
+            error:
+              'This template\'s visibility changed while you were editing it — an administrator may have '
+              + 'just approved or rejected it. Reload the template and try again.',
+          });
+        }
+        throw err;
+      }
 
       res.json({ message: 'Schedule template updated successfully' });
     } catch (error) {

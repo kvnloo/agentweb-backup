@@ -777,7 +777,11 @@ mcpToolRegistry.register({
         name: { type: 'string', description: 'Template name (create/update)' },
         description: { type: 'string', description: 'Template description (create/update)' },
         category: { type: 'string', description: 'Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)' },
-        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Visibility: system (admin-created, always visible), private (only visible to creator), public (approved, visible to all), pending_review (submitted for admin review). Default: private. (create/update)' },
+        visibility: { type: 'string', enum: ['private', 'pending_review'], description: "Visibility, on 'update' only. 'create' ALWAYS produces a private template and ignores this field. "
+          + "Only these two are settable here: 'private' (visible to you alone) and 'pending_review' "
+          + "(submitted for an administrator to approve). 'system' and 'public' are platform-wide and "
+          + "admin-only — asking for them is refused, not silently downgraded. To share a template with "
+          + "everyone, set 'pending_review' and an administrator approves or rejects it (ENG-1716)." },
         starting_message: { type: 'string', description: 'The prompt/message template. Use {{variable_name}} for variables. (create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, type: { type: 'string', enum: ['text', 'long_text', 'file'] } }, required: ['name'] }, description: 'Variable definitions (auto-extracted from message if not provided)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to verify in scheduled chat output (create/update)' },
