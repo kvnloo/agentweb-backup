@@ -14,6 +14,32 @@ import secrets_manager
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 
+# ENG-1822: langchain_openai.ChatOpenAI's `request_timeout` field defaults to
+# None and gets forwarded to `openai.OpenAI(timeout=...)` as an *explicit*
+# None, not omitted. openai's own SDK only substitutes its 600s DEFAULT_TIMEOUT
+# when the `timeout` kwarg is genuinely unset (its own `NotGiven` sentinel,
+# see openai/_utils/_utils.py's `is_given`); an explicit None is passed
+# straight through to httpx.Client(timeout=None), which httpx's own docs
+# define as "No timeouts." -- confirmed empirically against the exact
+# package versions running in production (langchain-openai==0.3.11,
+# openai==1.109.1, httpx==0.28.1): the constructed client's underlying httpx
+# timeout was literally `None` with no `timeout` kwarg passed here, i.e. this
+# gateway has never had ANY effective request timeout, bounded only by
+# task_monitor.py's 900s/1800s process-level kill switch. Live-verified in
+# production (execution 1788877994807): a single browser-use per-step
+# get_next_action() call took ~7m45s before returning a malformed response
+# after ENG-1820 removed require_parameters. browser-use's per-step call is
+# `with_structured_output(..., method="function_calling")`, a single
+# tool_choice-forced call with a small bounded JSON output (not a long
+# streaming generation), so a short bound is correct for it; the other two
+# call sites through this same gateway (task_utils.check_new_information's
+# short comparison, and task_monitor's end-of-task knowledge-base-summary
+# regeneration) are both non-interactive, backgrounded, and already wrapped
+# in broad try/except that degrades gracefully on failure -- so one shared,
+# generous-but-bounded timeout is safe for all current callers without
+# needing per-call-site plumbing.
+REQUEST_TIMEOUT_SECONDS = 120
+
 # Only aliases whose old upstream ID no longer exists on OpenRouter belong here.
 LEGACY_MODEL_UPGRADES = {
     "anthropic.claude-3-5-sonnet-20241022-v2:0": "claude-sonnet-4.6",
@@ -81,6 +107,21 @@ def create_openrouter_llm(model: str):
         # name) is what actually guarantees single-tool-call behavior here and
         # stays enforced regardless; parallel_tool_calls was redundant for this
         # usage pattern, not the real safety mechanism.
+        #
+        # ENG-1822: don't re-add require_parameters here. Confirmed against
+        # OpenRouter's own docs that it's genuinely all-or-nothing across
+        # *every* parameter in the request -- there's no way to require
+        # tool_choice/tools support while excluding parallel_tool_calls, so
+        # turning it back on would just resurrect the ENG-1820 404. OpenRouter
+        # already applies a documented soft preference for providers that
+        # support `tools`/`response_format` even with require_parameters=false,
+        # so routing isn't fully unconstrained today. REQUEST_TIMEOUT_SECONDS
+        # above is the actual fix for the slow/degraded-provider hang this
+        # ticket investigates; scoping provider selection further (e.g.
+        # `provider.order`/`provider.only` allow-listing known-good providers
+        # per model family) is a plausible follow-up but needs live-traffic
+        # validation this investigation couldn't do (no OPENROUTER_API_KEY
+        # access), so it's deliberately left out of this change.
         "provider": {"allow_fallbacks": True},
         "plugins": [{"id": "context-compression"}],
     }
@@ -91,6 +132,10 @@ def create_openrouter_llm(model: str):
         # One SDK retry covers transient network/gateway failures. Agent Engine
         # has no provider-specific transport retry loop.
         "max_retries": 1,
+        # ENG-1822: see REQUEST_TIMEOUT_SECONDS above -- without this, the
+        # client has no request timeout at all (not even the openai SDK's own
+        # 600s default), so a slow/degraded provider can block indefinitely.
+        "timeout": REQUEST_TIMEOUT_SECONDS,
         "default_headers": {
             "HTTP-Referer": "https://app.agentweb.pro",
             "X-Title": "AgentWeb Agent Engine",
