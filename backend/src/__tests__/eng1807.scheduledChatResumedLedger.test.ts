@@ -134,7 +134,10 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { getAllowedFunctionCalls } from '../services/subscriptionService';
 import { runScheduledChat } from '../controllers/agentModeController';
+
+const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -357,6 +360,62 @@ describe('ENG-1807 — scheduled-chat run interrupted mid-flight reconstructs th
     expect(result.keywordMatches).toEqual(['tips']);
     expect(result.keywordMisses).toEqual([]);
     expect(result.functionCallMisses).toEqual([]);
+    expect(result.passed).toBe(true);
+  });
+
+  it('does not crash and falls back to the safe pre-fix result when the recovered session has a malformed (non-array) messages field', async () => {
+    // A real-world corrupted/legacy record — messages present but not an array. The
+    // recovery block must degrade to the old safe behavior, not throw a NEW error out
+    // of the one place (an error handler) that must never itself crash.
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: { notAnArray: true } as any,
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(baseSchedule as any, mockUserId, true);
+
+    expect(result.passed).toBe(false);
+    expect(result.actualFunctionCalls).toEqual([]);
+    expect(result.functionCallMisses).toEqual(['get_marketing_tips']);
+  });
+
+  it('excludes a publish-capable requirement the schedule was never authorized for from the recovered functionCallMisses, matching the success path\'s own authorization scoping', async () => {
+    // requirePublishApproval:true outranks everything else in resolveSchedulePublishAuthorization
+    // — an explicit, unambiguous UNAUTHORIZED, unlike the legacy opt-out default (which
+    // would otherwise auto-authorize post_on_connected_account simply for being listed
+    // in requiredFunctionCalls). So post_on_connected_account must be excluded from what
+    // this run is even held to, the same way heldToFunctionNames excludes it on the
+    // success path. Reporting it as a genuine "miss" here would falsely imply the run
+    // failed to do something it was never allowed to attempt.
+    const publishSchedule = {
+      ...baseSchedule,
+      requiredFunctionCalls: ['get_marketing_tips', 'post_on_connected_account'],
+      requirePublishApproval: true,
+    };
+    // Otherwise the subscription-allowlist gate rejects post_on_connected_account before
+    // ever reaching runInWorker or this fix's recovery code — a real, earlier, unrelated
+    // short-circuit this test must get past to exercise the authorization-scoping fix.
+    mockedGetAllowedFunctionCalls.mockResolvedValue(['get_marketing_tips', 'analyze_competitors', 'post_on_connected_account']);
+    mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        { role: 'user', content: 'Please run the report.' },
+        {
+          role: 'assistant',
+          content: 'Fetching marketing tips.',
+          metadata: { toolCalls: [{ id: 'c1', name: 'get_marketing_tips', arguments: {} }] },
+        },
+      ],
+    } as any);
+    mockWorker.runInWorker.mockRejectedValue(new Error('Worker is draining — no new requests accepted'));
+
+    const result = await runScheduledChat(publishSchedule as any, mockUserId, true);
+
+    // The unauthorized publish requirement is excluded entirely — not present as a miss.
+    expect(result.functionCallMisses).toEqual([]);
+    expect(result.functionCallMatches).toEqual(['get_marketing_tips']);
     expect(result.passed).toBe(true);
   });
 });
