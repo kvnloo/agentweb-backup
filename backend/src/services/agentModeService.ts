@@ -17083,7 +17083,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // the scoped path while leaving the unscoped path's fallback code untouched.
     if (strict && !accountId) {
       throw this.makeMetaAuthError(
-        `client_id-scoped calls require an explicit account_id — call list_meta_ads_campaigns or list_connected_accounts with client_id="${clientScope?.clientId}" first to find it.`
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
       );
     }
 

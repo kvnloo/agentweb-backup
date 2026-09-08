@@ -136,6 +136,24 @@ describe('ENG-1801 — admin client_id scoping (canonical, all 3 wrapper entry p
       expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
     });
 
+    it('rejects a non-string client_id', async () => {
+      await expectRejection(call(service, 'admin-1', 12345 as any), /non-blank/i);
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
+    });
+
+    it('rejects an admin targeting another admin who lacks the customer role (admin-targets-admin)', async () => {
+      const peerAdmin = { ...adminCaller, userId: 'admin-2', email: 'admin2@agentweb.pro' };
+      mockUsers(adminCaller, nonAdminCaller, targetUser, peerAdmin);
+      await expectRejection(call(service, 'admin-1', 'admin2@agentweb.pro'), /customer portal access/i);
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
+    });
+
+    it('rejects an admin self-targeting via client_id when their own account lacks the customer role', async () => {
+      mockUsers(adminCaller, nonAdminCaller, targetUser);
+      await expectRejection(call(service, 'admin-1', 'admin@agentweb.pro'), /customer portal access/i);
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
+    });
+
     it('mutation: suppresses the legacy adAccount fallback under client_id scope', async () => {
       const targetWithLegacyOnly = { ...targetUser, connected_accounts: [], adAccount: '883347640787043' };
       mockUsers(adminCaller, nonAdminCaller, targetWithLegacyOnly);
