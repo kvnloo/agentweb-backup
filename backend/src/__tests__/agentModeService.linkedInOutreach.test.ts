@@ -2375,6 +2375,7 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     afterEach(() => {
       delete process.env.LINKEDIN_DAILY_INVITE_ABSOLUTE_MAX;
       __resetWritePacerForTests();
+      mockIsUnderInvitationCooldown.mockReturnValue(false);
     });
 
     const routingInviteArgs = {
@@ -2492,7 +2493,47 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       mockProbeAccountSession.mockResolvedValue('connected');
     });
 
-    it('discloses the routing decision on the invitation-cooldown refusal, not just on success (AC3)', async () => {
+    it('routes send-invite to another account when the requested one is under LinkedIn\'s own invitation cooldown, even with daily-cap headroom to spare (ENG-1132 root cause, not just AC1\'s daily-cap case)', async () => {
+      // The real production incidents behind this ticket (iTrials/Sweta, Hannah K)
+      // were all this in-process "Cannot resend yet" breaker — never the
+      // daily_invite_cap. An account can have plenty of daily headroom left and
+      // still be unusable this run once LinkedIn itself has rejected one send.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        {
+          platform: 'unipile',
+          account_id: 'capped-account',
+          userId: 'user-1',
+          config: { daily_invite_cap: 10, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'headroom-account',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 1, windowStartedAt: Date.now() } } },
+        },
+      ]);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockImplementation((accountId: string) => accountId === 'capped-account');
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed-cooldown' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation.mock.calls[0][0]).toBe('headroom-account');
+      expect(result.data.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('cooldown'),
+      });
+    });
+
+    it('does not route to a candidate that is itself under cooldown — falls through to the requested account\'s own refusal (AC5-style: no viable candidate means unchanged behavior)', async () => {
+      // Both accounts are compromised, just for different reasons: capped-account
+      // is at its daily cap, headroom-account has daily headroom but is ALSO under
+      // an active cooldown. Routing to a candidate that is doomed to fail anyway
+      // would misreport what actually happened, so it must not be selected —
+      // the refusal stays on the originally-requested account's real state.
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
       mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
       mockIsUnderInvitationCooldown.mockImplementation((accountId: string) => accountId === 'headroom-account');
@@ -2500,14 +2541,9 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       const result = await service.linkedinOutreach('user-1', routingInviteArgs);
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('Cannot resend yet');
-      expect(result.accountRouting).toEqual({
-        fromAccountId: 'capped-account',
-        toAccountId: 'headroom-account',
-        reason: expect.stringContaining('headroom-account'),
-      });
+      expect(result.message).toBe('LinkedIn daily volume limit reached');
+      expect(result.accountRouting).toBeUndefined();
       expect(mockSendInvitation).not.toHaveBeenCalled();
-      mockIsUnderInvitationCooldown.mockReturnValue(false);
     });
 
     it('discloses the routing decision on the hourly/burst pacer refusal, not just on success (AC2 + AC3)', async () => {

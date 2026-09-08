@@ -14,6 +14,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 import { routeLinkedInWriteToAccountWithHeadroom } from '../services/agentMode/linkedInAccountRouting';
 import type { ResolvedLinkedInAccount } from '../services/agentMode/linkedInDailyVolumeGate';
+import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
   const CALLER = 'user-1';
@@ -66,6 +67,102 @@ describe('routeLinkedInWriteToAccountWithHeadroom (ENG-1614)', () => {
     expect(result!.account.ownerUserId).toBe('teammate-2');
     expect(result!.reason).toContain('acct-A');
     expect(result!.reason).toContain('acct-B');
+  });
+
+  describe('LinkedIn account-level invitation cooldown ("Cannot resend yet")', () => {
+    // ENG-1132/ENG-1614 root-cause check: the real production incidents behind this
+    // ticket (iTrials/Sweta, Hannah K) were all this in-process breaker, not the
+    // daily_invite_cap — an account with plenty of daily headroom left still fails
+    // every send once LinkedIn itself has rejected one with "Cannot resend yet".
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    const headroomAccount: ResolvedLinkedInAccount = {
+      ownerUserId: CALLER,
+      configuredDailyInviteCap: 10,
+      dailyVolumeState: { invite: { count: 1, windowStartedAt: Date.now() } },
+    };
+
+    it('routes send-invite to another account when the requested one is under cooldown despite having daily headroom', async () => {
+      jest.spyOn(linkedInOutreachService, 'isUnderInvitationCooldown').mockImplementation(
+        (accountId: string) => accountId === 'acct-A',
+      );
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 10 } },
+        {
+          platform: 'unipile',
+          account_id: 'acct-B',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+      ]);
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', headroomAccount);
+
+      expect(result).not.toBeNull();
+      expect(result!.accountId).toBe('acct-B');
+      expect(result!.reason).toContain('cooldown');
+    });
+
+    it('does not route a cooldown on send-message/send-inmail/cancel/accept-invitation — cooldown is invite-only', async () => {
+      const cooldownSpy = jest.spyOn(linkedInOutreachService, 'isUnderInvitationCooldown').mockReturnValue(true);
+
+      for (const action of ['send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation']) {
+        const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, action, 'acct-A', headroomAccount);
+        expect(result).toBeNull();
+      }
+      // send-message/send-inmail ARE volume-classed (unlike cancel/accept), so the
+      // headroom check itself still runs; only the cooldown gate must skip them.
+      expect(cooldownSpy).not.toHaveBeenCalledWith('acct-A');
+    });
+
+    it('skips a candidate that is itself under cooldown and falls through to one that is not', async () => {
+      jest.spyOn(linkedInOutreachService, 'isUnderInvitationCooldown').mockImplementation(
+        (accountId: string) => accountId === 'acct-A' || accountId === 'acct-B',
+      );
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 10 } },
+        {
+          platform: 'unipile',
+          account_id: 'acct-B',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+        {
+          platform: 'unipile',
+          account_id: 'acct-C',
+          userId: 'teammate-3',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 0, windowStartedAt: Date.now() } } },
+        },
+      ]);
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', headroomAccount);
+
+      expect(result).not.toBeNull();
+      expect(result!.accountId).toBe('acct-C');
+    });
+
+    it('returns null when every other account is also under cooldown — existing single-account-style refusal still applies', async () => {
+      jest.spyOn(linkedInOutreachService, 'isUnderInvitationCooldown').mockReturnValue(true);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { platform: 'unipile', account_id: 'acct-A', userId: CALLER, config: { daily_invite_cap: 10 } },
+        {
+          platform: 'unipile',
+          account_id: 'acct-B',
+          userId: 'teammate-2',
+          sharedWithOrg: true,
+          config: { daily_invite_cap: 30, daily_volume: { invite: { count: 2, windowStartedAt: Date.now() } } },
+        },
+      ]);
+
+      const result = await routeLinkedInWriteToAccountWithHeadroom(CALLER, 'send-invite', 'acct-A', headroomAccount);
+
+      expect(result).toBeNull();
+    });
   });
 
   it('never routes to a teammate account that is not sharedWithOrg — AC4', async () => {
