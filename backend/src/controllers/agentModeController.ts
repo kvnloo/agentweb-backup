@@ -37,6 +37,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
+import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
@@ -14317,12 +14318,29 @@ export const agentModeController = {
         emailNotifications, dailyDigest, llmModel,
       } = req.body;
 
+      // ENG-1716: visibility is the only field here that grants reach beyond the
+      // owner, so it takes an AUTHORIZATION decision, not just a write. This route
+      // previously wrote whatever was sent behind an ownership check alone, so any
+      // authenticated user could promote their own template to `system`/`public`
+      // and put its agent prompt in every customer's picker — skipping the
+      // submit-for-review → admin-approve workflow one route over. Refused
+      // explicitly rather than silently dropped; a silent drop is how the
+      // manage_schedule_template confusion started.
+      const visibilityDecision = resolveVisibilityUpdate({
+        current: existing.visibility,
+        requested: visibility,
+        isAdmin: user.isAdmin === true,
+      });
+      if (!visibilityDecision.ok) {
+        return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
+      }
+
       const updates: any = { updatedAt: new Date().toISOString() };
 
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
       if (category !== undefined) updates.category = category;
-      if (visibility !== undefined) updates.visibility = visibility;
+      if (visibilityDecision.visibility !== undefined) updates.visibility = visibilityDecision.visibility;
       if (keywords !== undefined) updates.keywords = keywords;
       if (requiredFunctionCalls !== undefined) updates.requiredFunctionCalls = requiredFunctionCalls;
       if (functionCallMinCalls !== undefined) updates.functionCallMinCalls = functionCallMinCalls;
@@ -14351,7 +14369,36 @@ export const agentModeController = {
         updates.variables = variables;
       }
 
-      await scheduleTemplateDb.updateTemplate(templateId, updates);
+      // ENG-1716: when this write CHANGES visibility, bind it to the snapshot the
+      // authorization decision was made against. The owner route authorizes
+      // `pending_review -> private` from the row it just read, while the admin
+      // approval path reads `pending_review` and writes `public` — so without the
+      // condition an in-flight owner write silently overwrites an approval
+      // (CodeRabbit). A non-admin still cannot reach system/public through this
+      // race (those are refused whatever the current value), so this is integrity,
+      // not escalation: it stops an owner undoing an administrator's decision.
+      //
+      // Only guarded when visibility is actually changing — an edit that leaves it
+      // alone has no snapshot to lose, and conditioning those would make ordinary
+      // renames fail whenever an admin happened to be reviewing.
+      const visibilityIsChanging = visibilityDecision.visibility !== undefined
+        && visibilityDecision.visibility !== canonicalizeVisibility(existing.visibility);
+      try {
+        await scheduleTemplateDb.updateTemplate(
+          templateId,
+          updates,
+          visibilityIsChanging ? { expectedVisibility: existing.visibility ?? '' } : {},
+        );
+      } catch (err: any) {
+        if (err?.preconditionFailed) {
+          return res.status(409).json({
+            error:
+              'This template\'s visibility changed while you were editing it — an administrator may have '
+              + 'just approved or rejected it. Reload the template and try again.',
+          });
+        }
+        throw err;
+      }
 
       res.json({ message: 'Schedule template updated successfully' });
     } catch (error) {
