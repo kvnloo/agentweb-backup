@@ -314,9 +314,20 @@ async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: D
     // fires precisely when there is evidence the rail is healthy again.
     flushDroppedWriteAlerts();
   } catch (error) {
-    // Exhausted, or permanent. Surfaced as a counted, aggregated alert rather
-    // than thrown: every caller is fire-and-forget, so throwing would be an
-    // unhandled rejection and take the process down (ENG-1804).
+    // The transaction failed after retries. Fall back to the pre-ENG-702 path so
+    // the LIVE rail still gets its row: a spend-ledger outage must not also stop
+    // the metering that predates it, which would turn one table's problem into
+    // lost attribution on both.
+    //
+    // The fallback leaves the rails divergent — live row, no event — which is
+    // exactly what §8 reports as `unmirroredGroups`. Detectable and honest,
+    // where a silent double-failure would not be.
+    await recordVendorUsageLegacy(ctx, now, false);
+
+    // Still counted: the ledger write was lost even though the aggregate landed.
+    // Surfaced as an aggregated alert rather than thrown — every caller is
+    // fire-and-forget, so throwing would be an unhandled rejection and take the
+    // process down (ENG-1804).
     recordDroppedWrite({
       provider: ctx.provider,
       operation: ctx.operation,
@@ -355,14 +366,41 @@ function buildVendorIncrement(
 export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
   const now = new Date();
 
-  // ENG-702 AC1. With a token, both rails move together under one condition:
-  // a replay skips the spend event and the aggregate's contribution as a unit.
-  // Without one, the legacy path below keeps today's behaviour — unconditional
-  // aggregate write, then a fail-open shadow mirror.
-  if (ctx.idempotencyKey) {
-    await recordVendorUsageIdempotent(ctx, now);
-    return;
-  }
+  // ENG-702 AC1 / ENG-1250 §6. EVERY vendor call takes the atomic path now, not
+  // only the ones whose call site supplies a token.
+  //
+  // Threading a token through the remaining adapters was the obvious plan and
+  // the wrong one: none of them has a natural pre-call identifier, and none
+  // re-enters metering on a retry (twitter meters only on success; apollo's and
+  // enrich.so's `attempt` loops are DynamoDB bookkeeping; the search providers
+  // have no retry at all). A call-site token there would be a freshly minted
+  // nonce — exactly what buildShadowEvent already mints — delivered by editing
+  // eleven sites across six files for no semantic gain.
+  //
+  // What the atomic path actually buys them is worth having: the aggregate row
+  // and the spend event move together instead of as two independent writes, and
+  // AC3's retry becomes safe because a replay cannot double-count. Both hold
+  // whether the token is deterministic or minted, and both now extend to any
+  // vendor added later with no further edit.
+  //
+  // A call-site token still wins where one genuinely exists — v0 supplies the
+  // guard's key (ENG-1812), which collapses retries within one reservation.
+  // This does not replace that; it raises the floor for everyone else.
+  await recordVendorUsageIdempotent(ctx, now);
+}
+
+/** The pre-ENG-702 behaviour, retained as the fallback used above. */
+async function recordVendorUsageLegacy(
+  ctx: RecordVendorUsageContext,
+  now: Date,
+  /**
+   * False when called as the fallback below, whose own catch already records
+   * the loss. Without this a single failed write is counted TWICE — inflating
+   * the lost-dollars figure that AC3 exists to make trustworthy, which is a
+   * worse outcome than not counting it at all.
+   */
+  countLoss = true,
+): Promise<void> {
 
   try {
     const userId = ctx.userId || "system";
@@ -394,16 +432,16 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
     // ENG-702 AC3: counted even here, so an outage's cost is visible whether or
     // not the call site has adopted a token. NOT retried, though: this path's
     // aggregate write is an unconditional ADD, so a retry after a lost response
-    // double-counts -- the exact failure AC1 exists to prevent. Failing toward
-    // under-counting is recoverable through reconciliation; over-charging a
-    // customer is not.
-    recordDroppedWrite({
-      provider: ctx.provider,
-      operation: ctx.operation,
-      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
-      billingUserId: ctx.billingUserId || ctx.userId || "system",
-      reason: error instanceof Error ? error.message : String(error),
-    });
+    // double-counts — the exact failure AC1 exists to prevent.
+    if (countLoss) {
+      recordDroppedWrite({
+        provider: ctx.provider,
+        operation: ctx.operation,
+        costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+        billingUserId: ctx.billingUserId || ctx.userId || "system",
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
     // Do NOT mirror a row the live rail failed to write (CodeRabbit, PR #2793).
     // The shadow exists to measure ONE difference -- all-vendor spend against
     // LLM-only -- and a ledger row with no matching usage record is not that
