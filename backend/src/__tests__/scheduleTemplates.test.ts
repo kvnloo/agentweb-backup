@@ -278,7 +278,7 @@ describe('Schedule Templates', () => {
       const res = mockRes();
       await agentModeController.updateScheduleTemplate(req as any, res);
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('updated') }));
-      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ name: 'Updated', category: 'SEO' }));
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ name: 'Updated', category: 'SEO' }), {});
     });
   });
 
@@ -337,7 +337,7 @@ describe('Schedule Templates', () => {
       const res = mockRes();
       await agentModeController.updateScheduleTemplate(req as any, res);
       expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
-        't1', expect.objectContaining({ visibility: 'pending_review' }),
+        't1', expect.objectContaining({ visibility: 'pending_review' }), { expectedVisibility: 'private' },
       );
 
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
@@ -345,7 +345,7 @@ describe('Schedule Templates', () => {
       const req2 = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
       await agentModeController.updateScheduleTemplate(req2 as any, mockRes());
       expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
-        't1', expect.objectContaining({ visibility: 'private' }),
+        't1', expect.objectContaining({ visibility: 'private' }), { expectedVisibility: 'pending_review' },
       );
     });
 
@@ -359,8 +359,53 @@ describe('Schedule Templates', () => {
       await agentModeController.updateScheduleTemplate(req as any, res);
 
       expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
-        't1', expect.objectContaining({ visibility: 'system' }),
+        't1', expect.objectContaining({ visibility: 'system' }), { expectedVisibility: 'private' },
       );
+    });
+
+    // CodeRabbit on PR #2810: the authorization decision is made against a
+    // SNAPSHOT. The owner route authorizes pending_review -> private from the row
+    // it just read, while admin approval reads pending_review and writes public —
+    // so an in-flight owner write could silently overwrite the approval.
+    it('binds a visibility CHANGE to the snapshot it was authorized against', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'private' }), { expectedVisibility: 'pending_review' },
+      );
+    });
+
+    it('reports a lost race as a conflict instead of pretending the write landed', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      const lost: any = new Error('changed'); lost.preconditionFailed = true;
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockRejectedValue(lost);
+
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('changed while you were editing') }),
+      );
+    });
+
+    it('does NOT condition an edit that leaves visibility alone', async () => {
+      // Conditioning those would make ordinary renames fail whenever an admin
+      // happened to be reviewing the template.
+      const req = mockReq({ params: { templateId: 't1' }, body: { name: 'Renamed' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.any(Object), {});
+    });
+
+    it('does NOT condition a no-op restatement of the same visibility', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.any(Object), {});
     });
 
     it('leaves every non-visibility edit working for the owner', async () => {
