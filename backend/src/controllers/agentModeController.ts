@@ -7152,8 +7152,15 @@ export async function runScheduledChat(
     // for in the first place is correctly excluded here exactly as it is on the success
     // path (`heldToFunctionNames` above). This does NOT track a mid-run revocation the
     // way `effectivePublishAuthorization`'s live narrowing does (that state is try-block
-    // local and genuinely unreachable from here) — a narrower, disclosed residual gap,
-    // acceptable because this only feeds a diagnostic record, never a real publish.
+    // local and genuinely unreachable from here) — a narrower, disclosed residual gap.
+    // Acceptable because `narrowPublishAuthorization` is strictly monotonic (only ever
+    // REMOVES tools, never adds — see its own doc comment), so the admission-time scope
+    // used here is always a superset of whatever the live value would have narrowed to.
+    // That can only push the recovered verdict toward MORE misses, never toward crediting
+    // a publish that didn't happen — a match still requires an actual persisted, succeeded
+    // tool-call entry regardless. This DOES reach the owner via
+    // `sendScheduledChatResultEmail` (not merely internal logging), so "safe direction of
+    // error" is the actual guarantee being relied on here, not "nobody sees it".
     const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
     const recoveredHeldToNames = filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization);
 
