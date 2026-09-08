@@ -28313,6 +28313,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // degraded to search instead of reporting the source as unverified).
       // Named here so classifyToolErrorClass can match the marker and route to
       // 'publisher_refused' instead.
+      //
+      // This rewrite is local to THIS call site, not a systemic guard — the
+      // classifier can only recognize the marker text below, not "this was an
+      // anonymous unauthenticated fetch" in the abstract. Any other tool that
+      // anonymously fetches an arbitrary external URL (not S3, not a connected
+      // account) and forwards a bare `HTTP ${status}: ...`-shaped message on a
+      // 401/403 will fall right back into classifyToolErrorClass's generic
+      // embedded-status regex and get the wrong 'auth'/"reconnect the account"
+      // guidance. Apply the same isAxiosError-gated rewrite there too.
       const isPublisherRefusal = error.isAxiosError && (statusCode === 401 || statusCode === 403);
       if (isPublisherRefusal) {
         errorMessage = `The publisher refused this fetch (${errorMessage}) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.`;

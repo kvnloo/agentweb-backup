@@ -88,8 +88,12 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   // 2. Working-as-designed: a policy/validator deliberately rejected the call,
   //    or an upstream returned a benign empty result. 'upstream_rejected' =
   //    provider business-rule refusal (LinkedIn cadence); 'empty_result' = the
-  //    call succeeded but yielded no data — neither is a tool bug.
-  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result') return 'by_design';
+  //    call succeeded but yielded no data. 'publisher_refused' (ENG-1162) = a
+  //    third-party site's own anti-bot/WAF block on our anonymous fetch — the
+  //    tool executed correctly, an external party outside our control declined
+  //    it, and there is no credential/config on our side that would fix it, so
+  //    it belongs here rather than 'config'. None of these are a tool bug.
+  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused') return 'by_design';
   if (BY_DESIGN_RE.test(msg)) return 'by_design';
 
   // 3. Arguments rejected by schema validation before execution.
