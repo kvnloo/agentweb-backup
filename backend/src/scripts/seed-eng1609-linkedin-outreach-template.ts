@@ -31,8 +31,6 @@
  * Idempotent: skips if a template with this exact name already exists, so running
  * it twice leaves exactly one row.
  */
-import { v4 as uuidv4 } from 'uuid';
-
 export const LINKEDIN_OUTREACH_TEMPLATE_NAME = 'Daily LinkedIn Connection + Outreach Agent';
 
 /**
@@ -43,6 +41,22 @@ export const LINKEDIN_OUTREACH_TEMPLATE_NAME = 'Daily LinkedIn Connection + Outr
  * account is removed.
  */
 export const SYSTEM_TEMPLATE_CREATOR = 'system';
+
+/**
+ * STABLE identity, deliberately not a fresh uuid per run (CodeRabbit on PR #2799).
+ *
+ * The seed used to check "does a system template with this name exist?" and then
+ * create one with a new id. Those are two operations, so two concurrent runs could
+ * both observe "absent" and create DUPLICATE system templates — each visible to
+ * every customer, and each a separate `startingMessage` that
+ * `createScheduleFromTemplate` would go on copying. A fixed id turns the create
+ * itself into the uniqueness check (`attribute_not_exists(templateId)`), leaving no
+ * window between the two, and makes the row identifiable across environments.
+ *
+ * Never change this value: a new id would seed a SECOND template rather than
+ * update the existing one.
+ */
+export const LINKEDIN_OUTREACH_TEMPLATE_ID = 'eng1609-linkedin-outreach-agent';
 
 /**
  * `category` is the RANGE key of VisibilityCategoryIndex, which is how
@@ -221,7 +235,7 @@ export function buildLinkedInOutreachTemplate(now: string = new Date().toISOStri
   });
 
   return {
-    templateId: uuidv4(),
+    templateId: LINKEDIN_OUTREACH_TEMPLATE_ID,
     createdBy: SYSTEM_TEMPLATE_CREATOR,
     name: LINKEDIN_OUTREACH_TEMPLATE_NAME,
     description:
@@ -262,17 +276,21 @@ export function buildLinkedInOutreachTemplate(now: string = new Date().toISOStri
 export async function main() {
   const { scheduleTemplateDb } = await import('../services/db');
 
-  const existing = await scheduleTemplateDb.getTemplatesByVisibility('system');
-  const already = (existing || []).find((t: any) => t?.name === LINKEDIN_OUTREACH_TEMPLATE_NAME);
-  if (already) {
-    console.log(
-      `Schedule template "${LINKEDIN_OUTREACH_TEMPLATE_NAME}" already exists (id: ${already.templateId}). Skipping.`
-    );
-    return;
-  }
-
+  // The conditional create IS the existence check — no check-then-act window, so
+  // two concurrent runs cannot both decide the row is absent.
   const template = buildLinkedInOutreachTemplate();
-  await scheduleTemplateDb.createTemplate(template);
+  try {
+    await scheduleTemplateDb.createTemplate(template, { onlyIfAbsent: true });
+  } catch (err: any) {
+    if (err?.alreadyExists) {
+      console.log(
+        `Schedule template "${LINKEDIN_OUTREACH_TEMPLATE_NAME}" already exists `
+        + `(id: ${LINKEDIN_OUTREACH_TEMPLATE_ID}). Nothing to do.`
+      );
+      return;
+    }
+    throw err;
+  }
   console.log(`Seeded schedule template "${template.name}" with id: ${template.templateId}`);
   console.log(`  visibility: ${template.visibility} | category: ${template.category}`);
   console.log(`  variables:  ${template.variables.map((v) => v.name).join(', ')}`);

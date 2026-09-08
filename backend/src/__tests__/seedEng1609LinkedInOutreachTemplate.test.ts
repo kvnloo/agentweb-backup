@@ -13,6 +13,7 @@ jest.mock('../services/db', () => ({
 
 import { scheduleTemplateDb } from '../services/db';
 import {
+  LINKEDIN_OUTREACH_TEMPLATE_ID,
   LINKEDIN_OUTREACH_TEMPLATE_NAME,
   LINKEDIN_OUTREACH_TEMPLATE_CATEGORY,
   LINKEDIN_OUTREACH_STARTING_MESSAGE,
@@ -39,9 +40,14 @@ describe('template shape (AC #1)', () => {
     expect(template.suggestedFrequency).toBe('daily');
   });
 
-  it('carries a usable description and a fresh id per build', () => {
+  it('carries a usable description and a STABLE id across builds', () => {
+    // Stable, not per-run (CodeRabbit): a fresh id each run meant two concurrent
+    // seeds could both pass a check-then-create and publish DUPLICATE system
+    // templates. The fixed id makes the conditional create itself the uniqueness
+    // check. Changing it would seed a second template rather than update this one.
     expect(template.description.length).toBeGreaterThan(40);
-    expect(template.templateId).not.toBe(buildLinkedInOutreachTemplate().templateId);
+    expect(template.templateId).toBe(LINKEDIN_OUTREACH_TEMPLATE_ID);
+    expect(buildLinkedInOutreachTemplate().templateId).toBe(LINKEDIN_OUTREACH_TEMPLATE_ID);
   });
 });
 
@@ -187,53 +193,51 @@ describe('seed idempotency (AC #6)', () => {
     jest.spyOn(console, 'log').mockImplementation(() => {});
   });
 
-  it('writes exactly one row on a clean table', async () => {
-    mockDb.getTemplatesByVisibility.mockResolvedValue([] as any);
+  it('writes exactly one row on a clean table, conditionally', async () => {
+    mockDb.createTemplate.mockResolvedValue(undefined as any);
 
     await runSeed();
 
     expect(mockDb.createTemplate).toHaveBeenCalledTimes(1);
     expect(mockDb.createTemplate).toHaveBeenCalledWith(
       expect.objectContaining({
+        templateId: LINKEDIN_OUTREACH_TEMPLATE_ID,
         name: LINKEDIN_OUTREACH_TEMPLATE_NAME,
         visibility: 'system',
         requiredFunctionCalls: ['linkedin_outreach'],
-      })
+      }),
+      // The condition is what makes it safe against a concurrent second run.
+      { onlyIfAbsent: true },
     );
   });
 
   it('running it twice leaves exactly one row', async () => {
     const seeded: any[] = [];
-    mockDb.getTemplatesByVisibility.mockImplementation(async () => seeded as any);
-    mockDb.createTemplate.mockImplementation(async (t: any) => { seeded.push(t); return t; });
+    mockDb.createTemplate.mockImplementation(async (t: any) => {
+      if (seeded.some((x) => x.templateId === t.templateId)) {
+        const e: any = new Error('exists'); e.alreadyExists = true; throw e;
+      }
+      seeded.push(t); return t;
+    });
 
     await runSeed();
     await runSeed();
 
-    expect(mockDb.createTemplate).toHaveBeenCalledTimes(1);
     expect(seeded).toHaveLength(1);
   });
 
-  it('does not re-seed when the row exists under a different id', async () => {
-    mockDb.getTemplatesByVisibility.mockResolvedValue([
-      { templateId: 'seeded-elsewhere', name: LINKEDIN_OUTREACH_TEMPLATE_NAME },
-    ] as any);
+  it('a CONCURRENT second run loses the race cleanly instead of duplicating', async () => {
+    // The case a check-then-create could not survive: both runs see an empty table.
+    const e: any = new Error('exists'); e.alreadyExists = true;
+    mockDb.createTemplate.mockRejectedValue(e);
 
-    await runSeed();
-
-    expect(mockDb.createTemplate).not.toHaveBeenCalled();
+    await expect(runSeed()).resolves.toBeUndefined();
   });
 
-  it('is not confused by an unrelated system template, or by a missing result', async () => {
-    mockDb.getTemplatesByVisibility.mockResolvedValue([{ templateId: 'x', name: 'Something Else' }] as any);
-    await runSeed();
-    expect(mockDb.createTemplate).toHaveBeenCalledTimes(1);
-
-    jest.clearAllMocks();
-    // getTemplatesByVisibility swallows its own errors and returns [] — but an
-    // undefined here must not crash the seed either.
-    mockDb.getTemplatesByVisibility.mockResolvedValue(undefined as any);
-    await runSeed();
-    expect(mockDb.createTemplate).toHaveBeenCalledTimes(1);
+  it('a real database error is NOT swallowed as "already exists"', async () => {
+    mockDb.createTemplate.mockRejectedValue(new Error('dynamo down'));
+    await expect(runSeed()).rejects.toThrow('dynamo down');
   });
+
+
 });
