@@ -93,18 +93,19 @@ def create_jwt_token(user_id: str) -> str:
     """
     try:
         import jwt
-        from datetime import datetime, timedelta
-        
+        from datetime import datetime, timedelta, timezone
+
         jwt_secret = secrets_manager.get_jwt_secret()
         if not jwt_secret:
             logger.error("JWT_SECRET environment variable not set")
             return None
-            
+
         # Create payload with user_id and expiration
+        now = datetime.now(timezone.utc)
         payload = {
             'userId': user_id,
-            'exp': datetime.utcnow() + timedelta(hours=1),  # Token expires in 1 hour
-            'iat': datetime.utcnow()
+            'exp': now + timedelta(hours=1),  # Token expires in 1 hour
+            'iat': now
         }
         
         # Create JWT token
