@@ -398,8 +398,34 @@ describe('AgentModeService - predefined work plan templates', () => {
         );
       });
 
-      it('resolves a spaced, mixed-case title argument to the matching Eval template, not the Audit one', async () => {
+      // ENG-1814 (2026-09-08): title-matching correctness (this describe block's own
+      // subject) is no longer sufficient by itself -- a genuinely CORRECT normalized-title
+      // match can still be the WRONG template if the model picked that title while
+      // confused by a near-duplicate sibling upstream (the live-reproduced ENG-1814
+      // incident: asked for Audit, model's own tool argument said Eval, and the matcher
+      // correctly launched exactly what it was given). These two tests used to assert a
+      // direct launch; now that a same-word-count, one-word-different sibling exists in
+      // the accessible set for BOTH titles, applyPredefinedWorkPlan asks for confirmation
+      // instead, regardless of which of the two was requested. See the "ENG-1814" describe
+      // block below for the dedicated ambiguity-guard coverage.
+      it('ENG-1814: a near-duplicate sibling now blocks even a normalized-correct Eval match, asking for confirmation instead of launching', async () => {
         const result = await service.applyPredefinedWorkPlan('Founder LinkedIn Sales Readiness Eval', sessionId, 'user-1');
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('ENG-1814: a near-duplicate sibling now blocks even a normalized-correct Audit match, asking for confirmation instead of launching', async () => {
+        const result = await service.applyPredefinedWorkPlan('Founder LinkedIn Sales Readiness Audit', sessionId, 'user-1');
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('ENG-1814: once disambiguated, launching by planId bypasses the ambiguity guard entirely', async () => {
+        const result = await service.applyPredefinedWorkPlan('plan-linkedin-eval', sessionId, 'user-1');
 
         expect(result.success).toBe(true);
         expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
@@ -407,24 +433,21 @@ describe('AgentModeService - predefined work plan templates', () => {
           expect.objectContaining({ templatePlanId: 'plan-linkedin-eval', title: 'Founder_Linkedin_Sales_Readiness_Eval' })
         );
       });
-
-      it('resolves a spaced, mixed-case title argument to the matching Audit template, not the Eval one', async () => {
-        const result = await service.applyPredefinedWorkPlan('Founder LinkedIn Sales Readiness Audit', sessionId, 'user-1');
-
-        expect(result.success).toBe(true);
-        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
-          sessionId,
-          expect.objectContaining({ templatePlanId: 'plan-linkedin-audit', title: 'Founder_Linkedin_Sales_Readiness_Audit' })
-        );
-      });
     });
 
-    // ENG-1794 regression guard: the sibling pair from the same production
-    // sweep whose welcomeMessage text DIFFERS between templates ("evaluate"
-    // vs "audit" your GTM positioning) already resolved correctly before this
-    // fix. Pinned here so the title-normalization change above can never
-    // regress this already-working case.
-    it('ENG-1794: still resolves correctly when near-duplicate titles have DIFFERING welcomeMessage text', async () => {
+    // ENG-1794 regression guard (title-matching correctness), retained: the sibling pair
+    // whose welcomeMessage text DIFFERS between templates still resolves correctly via
+    // normalizeWorkPlanTitleForMatch on the first call -- title-normalization itself
+    // still works exactly as ENG-1794 fixed it.
+    //
+    // ENG-1814 update (2026-09-08): differing welcomeMessage text does NOT make this pair
+    // safe from the ambiguity guard -- the model never reads welcomeMessage while
+    // confusing two titles during a list/search detour, so this pair is exactly as
+    // dangerous as the LinkedIn one from that specific failure mode's perspective. This
+    // test's own premise (differing content = no extra disambiguation needed) no longer
+    // holds and is updated accordingly, per CLAUDE.md: an invariant that no longer applies
+    // is updated with the reason recorded, not quietly forced green.
+    it('ENG-1794/1814: title-normalization still resolves the GTM pair correctly, but the ambiguity guard now requires confirmation before launching either one', async () => {
       const gtmEval: any = {
         ...systemTemplate,
         planId: 'plan-gtm-eval',
@@ -443,10 +466,118 @@ describe('AgentModeService - predefined work plan templates', () => {
 
       const result = await service.applyPredefinedWorkPlan('AI GTM Position Eval', sessionId, 'user-1');
 
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
+      expect(result.requiresConfirmation).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+
+      // The retry-by-planId escape hatch still works for this pair too.
+      const retried = await service.applyPredefinedWorkPlan('plan-gtm-eval', sessionId, 'user-1');
+      expect(retried.success).toBe(true);
       expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
         sessionId,
         expect.objectContaining({ templatePlanId: 'plan-gtm-eval', title: 'AI_GTM_Position_Eval' })
+      );
+    });
+
+    // ENG-1814: the ambiguity guard must not over-trigger on templates that are simply
+    // unrelated -- only a same-word-count, exactly-one-word-different sibling counts.
+    describe('ENG-1814: ambiguity guard does not fire on genuinely distinct templates', () => {
+      it('launches directly when no other accessible template has a similar title at all', async () => {
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+          v === 'system' ? [systemTemplate, templateWithInputRequest] : []
+        );
+
+        const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(result.requiresConfirmation).toBeUndefined();
+      });
+
+      it('does not flag two titles that differ in MORE than one word as near-duplicates', async () => {
+        const planA: any = { ...systemTemplate, planId: 'plan-a', title: 'Weekly_Product_Updates_Eval' };
+        const planB: any = { ...systemTemplate, planId: 'plan-b', title: 'Monthly_Sales_Report_Audit' };
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+          v === 'system' ? [planA, planB] : []
+        );
+
+        const result = await service.applyPredefinedWorkPlan('Weekly Product Updates Eval', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(result.requiresConfirmation).toBeUndefined();
+      });
+
+      it('does not flag two titles with a different word count as near-duplicates', async () => {
+        const planA: any = { ...systemTemplate, planId: 'plan-a', title: 'Founder_Linkedin_Sales_Readiness_Eval' };
+        const planB: any = { ...systemTemplate, planId: 'plan-b', title: 'Founder_Linkedin_Readiness_Eval' };
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+          v === 'system' ? [planA, planB] : []
+        );
+
+        const result = await service.applyPredefinedWorkPlan('Founder Linkedin Sales Readiness Eval', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(result.requiresConfirmation).toBeUndefined();
+      });
+    });
+
+    // ENG-1814 round-2 review finding: a DIFFERENT candidate whose normalized title is
+    // IDENTICAL (not just one-word-different) is at least as dangerous as a near-duplicate
+    // sibling -- normalizeWorkPlanTitleForMatch resolves both equally, and the plain
+    // `.find()` that resolves `predefinedPlan` silently picks whichever happens to come
+    // first in the candidates array, with zero signal distinguishing intent. Nothing in
+    // workPlanService.ts enforces title uniqueness across visibility scopes (e.g. a private
+    // plan can share a title with a system plan), so this is a real possibility, not just
+    // theoretical.
+    it('ENG-1814: also blocks an EXACT-duplicate title across two different planIds, not just a near-duplicate', async () => {
+      const planA: any = { ...systemTemplate, planId: 'plan-dup-a', title: 'Weekly_Content_Recap', visibility: 'system' };
+      const planB: any = { ...systemTemplate, planId: 'plan-dup-b', title: 'Weekly_Content_Recap', visibility: 'private' };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [planA] : []
+      );
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([planB]);
+
+      const result = await service.applyPredefinedWorkPlan('Weekly Content Recap', sessionId, 'user-1');
+
+      expect(result.success).toBe(false);
+      expect(result.requiresConfirmation).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+
+      // The retry-by-planId escape hatch still works.
+      const retried = await service.applyPredefinedWorkPlan('plan-dup-a', sessionId, 'user-1');
+      expect(retried.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-dup-a' })
+      );
+    });
+
+    // Round-3 review finding: the near-duplicate half of the ambiguity check
+    // already guards against an empty normalized title (areNearDuplicateWorkPlanTitles
+    // returns false when both sides normalize to ''), but the exact-duplicate half
+    // originally had no equivalent guard -- two unrelated, degenerately-titled
+    // (blank/separator-only) templates would normalize to the same '' and falsely
+    // pair up as ambiguous siblings. Nothing in workPlanService.ts rejects a blank
+    // title on create, so this is reachable, not just theoretical. Fails safe either
+    // way (an unwanted confirmation prompt, never a wrong launch) -- this test locks
+    // in the fixed, non-blocking behavior.
+    it('ENG-1814: does not treat two unrelated blank/separator-only titles as an ambiguous pair', async () => {
+      const planA: any = { ...systemTemplate, planId: 'plan-blank-a', title: '   ', visibility: 'system' };
+      const planB: any = { ...systemTemplate, planId: 'plan-blank-b', title: '___', visibility: 'private' };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [planA] : []
+      );
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([planB]);
+
+      const result = await service.applyPredefinedWorkPlan('   ', sessionId, 'user-1');
+
+      // Whichever candidate the resolver happens to order first is fine to launch
+      // directly here -- the point of this test is that it launches at all (no
+      // false "ambiguous" block), not which of the two degenerately-titled plans wins.
+      expect(result.success).toBe(true);
+      expect(result.requiresConfirmation).toBeUndefined();
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: expect.stringMatching(/^plan-blank-[ab]$/) })
       );
     });
   });

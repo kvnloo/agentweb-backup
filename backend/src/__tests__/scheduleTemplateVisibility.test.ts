@@ -92,12 +92,18 @@ describe('resolveVisibilityUpdate — what a non-admin owner may still do (AC #2
     if (!d.ok) expect(d.status).toBe(403);
   });
 
-  it('restating the existing value is never a promotion, so it needs no privilege', () => {
+  it('restating the existing value emits NO write, so the CAS can never be skipped', () => {
     // A client that PUTs the whole object back must keep working without stripping
-    // the field.
+    // the field — but it must not produce a write either. CodeRabbit: returning a
+    // visibility here meant a legacy stored 'platform' (which canonicalizes to
+    // 'system', same as the request) was WRITTEN while the caller's own
+    // is-this-changing test found them equal and skipped the compare-and-swap.
     TEMPLATE_VISIBILITIES.forEach((v) => {
-      expect(decide(v, v)).toEqual({ ok: true, visibility: v });
+      expect(decide(v, v)).toEqual({ ok: true });
     });
+    // The legacy alias is the case that made it dangerous.
+    expect(decide('platform', 'system')).toEqual({ ok: true });
+    expect(decide('platform', 'platform')).toEqual({ ok: true });
   });
 
   it('leaves the field alone when the caller sends none', () => {
@@ -115,7 +121,10 @@ describe('resolveVisibilityUpdate — what a non-admin owner may still do (AC #2
 describe('resolveVisibilityUpdate — admins (AC #3)', () => {
   it('may set any valid visibility', () => {
     TEMPLATE_VISIBILITIES.forEach((v) => {
-      expect(decide('private', v, true)).toEqual({ ok: true, visibility: v });
+      // 'private' is the current value here, so it is a no-op and emits no write.
+      expect(decide('private', v, true)).toEqual(
+        v === 'private' ? { ok: true } : { ok: true, visibility: v },
+      );
     });
     expect(decide('private', 'platform', true)).toEqual({ ok: true, visibility: 'system' });
   });
