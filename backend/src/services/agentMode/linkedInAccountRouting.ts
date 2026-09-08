@@ -70,12 +70,20 @@ export interface LinkedInAccountRoutingDecision {
  * state, and does not arm, clear, or otherwise touch the cooldown breaker
  * for any account. The caller still must run the full pace/reserve flow
  * against whichever account this returns.
+ *
+ * `preFetchedAccounts`: the caller (agentModeService.ts) already runs
+ * `getAccountsWithOwnerIncludingOrgShared` once to resolve the REQUESTED
+ * account before this is ever called — that helper scans every org member's
+ * connected accounts, so pass that same list through rather than repeating
+ * the scan on every routed write. Falls back to fetching it here so this
+ * function stays independently callable (e.g. from tests).
  */
 export async function routeLinkedInWriteToAccountWithHeadroom(
   callerUserId: string,
   action: string,
   requestedAccountId: string,
   requestedAccount: ResolvedLinkedInAccount,
+  preFetchedAccounts?: any[],
 ): Promise<LinkedInAccountRoutingDecision | null> {
   const isInvite = action === 'send-invite';
   const requestedUnderCooldown = isInvite && linkedInOutreachService.isUnderInvitationCooldown(requestedAccountId);
@@ -87,7 +95,7 @@ export async function routeLinkedInWriteToAccountWithHeadroom(
   ).allowed;
   if (requestedHasHeadroom && !requestedUnderCooldown) return null;
 
-  const accounts = await getAccountsWithOwnerIncludingOrgShared(callerUserId);
+  const accounts = preFetchedAccounts ?? await getAccountsWithOwnerIncludingOrgShared(callerUserId);
   for (const candidate of accounts) {
     const candidateAccountId = (candidate as any).account_id;
     if ((candidate as any).platform !== 'unipile' || candidateAccountId === requestedAccountId) continue;

@@ -383,6 +383,7 @@ import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
 import {
   paceLinkedInWrite,
   resolveLinkedInAccountForWrite,
+  resolveLinkedInAccountFromList,
   setDailyInviteCap,
   type ResolvedLinkedInAccount,
 } from './agentMode/linkedInDailyVolumeGate';
@@ -35983,12 +35984,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // consume a slot on top of the one each individual withdrawal already reserves
     // inside the drain.
     let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    // Fetched once here (only for the PACED_WRITE_ACTIONS branch, which is the
+    // only one that can also route below) and reused for the routing scan
+    // instead of making it repeat the same org-member fetch a second time.
+    let linkedInAccountsForRouting: any[] | undefined;
     if (
       PACED_WRITE_ACTIONS.has(action)
       || action === 'set-daily-invite-cap'
       || action === 'withdraw-stale-invitations'
     ) {
-      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (PACED_WRITE_ACTIONS.has(action)) {
+        const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+        linkedInAccountsForRouting = await getAccountsWithOwnerIncludingOrgShared(userId);
+        resolvedLinkedInAccount = resolveLinkedInAccountFromList(linkedInAccountsForRouting, account_id);
+      } else {
+        resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      }
       if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
@@ -36004,7 +36015,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // unchanged in both cases.
     let accountRouting: AccountRoutingDisclosure | null = null;
     if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
-      const routed = await routeLinkedInWriteToAccountWithHeadroom(userId, action, account_id, resolvedLinkedInAccount);
+      const routed = await routeLinkedInWriteToAccountWithHeadroom(
+        userId, action, account_id, resolvedLinkedInAccount, linkedInAccountsForRouting,
+      );
       if (routed) {
         console.log(`[AgentMode] linkedinOutreach: ${routed.reason}`);
         accountRouting = { fromAccountId: account_id, toAccountId: routed.accountId, reason: routed.reason };
@@ -36554,12 +36567,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -36655,12 +36668,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 sentAt: pending.sentAt,
                 invitationId: pending.invitationId,
               });
-              return {
+              return withRouting({
                 success: true,
                 alreadyInvited: true,
                 message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
                 data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
-              };
+              });
             }
           }
 
@@ -36736,7 +36749,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               // send-invite with on_note_quota. In a scheduled run there is no one to
               // answer, so the agent stops here and the invite is simply left un-sent
               // (the lead stays eligible); the customer resolves it by reopening the chat.
-              return {
+              return withRouting({
                 success: false,
                 requiresDecision: true,
                 noteQuotaExceeded: true,
@@ -36744,7 +36757,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
                   `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
                   `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
-              };
+              });
             }
             throw inviteErr;
           }
@@ -36778,11 +36791,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
               if (!syncAt || syncAt < oneDayAgo) {
-                return {
+                return withRouting({
                   success: false,
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
-                };
+                });
               }
 
               // Anti-spam: check if this exact message was already sent to this lead.
@@ -36804,12 +36817,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 );
                 if (duplicateEvent) {
                   console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
-                  return {
+                  return withRouting({
                     success: false,
                     error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
                     duplicate: true,
                     alreadySentAt: duplicateEvent.createdAt,
-                  };
+                  });
                 }
               }
             }
@@ -36829,12 +36842,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -37174,7 +37187,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // and reports proactively. The raw phrase is preserved in the body so the
       // error classifier still buckets this as an upstream_rejected business rule.
       if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
-        return {
+        return withRouting({
           success: false,
           message: 'LinkedIn invitation limit reached',
           error: [
@@ -37185,7 +37198,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
           ].join('\n'),
           accountThrottled: true,
-        };
+        });
       }
 
       // ENG-1300: LinkedInOutreachService.handleError already classifies the
@@ -37193,12 +37206,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // reconnect-detection logic above — read the same field here so the
       // generic fallback path also reaches the tool-error classifier as
       // auth/rate_limit/etc. instead of a bare Error/bug.
-      return {
+      return withRouting({
         success: false,
         message: 'LinkedIn outreach action failed',
         error: errorMessage,
         code: (error as any)?.code ?? structuredError?.status
-      };
+      });
     }
   }
 

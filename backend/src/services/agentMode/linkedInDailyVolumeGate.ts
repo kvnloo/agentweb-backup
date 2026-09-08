@@ -59,6 +59,27 @@ export interface ResolvedLinkedInAccount {
 }
 
 /**
+ * Same resolution as `resolveLinkedInAccountForWrite`, against an already-fetched
+ * accounts list — for a caller (ENG-1614's account-routing layer) that needs to
+ * resolve the requested account AND scan every other candidate in the same
+ * request, so it should fetch `getAccountsWithOwnerIncludingOrgShared` once and
+ * reuse it rather than repeating the same org-member scan per lookup.
+ */
+export function resolveLinkedInAccountFromList(
+  accounts: any[],
+  accountId: string,
+): ResolvedLinkedInAccount | null {
+  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
+  if (!matched) return null;
+  return {
+    ownerUserId: (matched as any).userId,
+    configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
+    dailyVolumeState: (matched as any)?.config?.daily_volume,
+    connectedAt: (matched as any)?.created_at,
+  };
+}
+
+/**
  * Resolve the owner + daily-cap config for a unipile account the caller is
  * authorized to use (their own, or shared with their org). Returns `null`
  * when the account isn't connected/accessible to the caller at all — the
@@ -69,14 +90,7 @@ export async function resolveLinkedInAccountForWrite(
   accountId: string,
 ): Promise<ResolvedLinkedInAccount | null> {
   const accounts = await getAccountsWithOwnerIncludingOrgShared(callerUserId);
-  const matched = accounts.find((a: any) => a.platform === 'unipile' && a.account_id === accountId);
-  if (!matched) return null;
-  return {
-    ownerUserId: (matched as any).userId,
-    configuredDailyInviteCap: (matched as any)?.config?.daily_invite_cap,
-    dailyVolumeState: (matched as any)?.config?.daily_volume,
-    connectedAt: (matched as any)?.created_at,
-  };
+  return resolveLinkedInAccountFromList(accounts, accountId);
 }
 
 export type PaceLinkedInWriteResult =
