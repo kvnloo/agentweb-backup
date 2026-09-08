@@ -1528,6 +1528,72 @@ emmaToolRegistry.register({
   }
 });
 
+// ENG-918: read the resolved per-client detection thresholds (creative fatigue, campaign health)
+// for one of the caller's own connected ad accounts. Mirrors GET /api/ads-thresholds/:platform/:accountId
+// (routes/adsThresholds.ts) exactly — same ownership check, same service calls — so a skill reading
+// through this tool and an admin reading through the REST route always see the identical resolved set.
+emmaToolRegistry.register({
+  name: 'get_ads_thresholds',
+  definition: {
+    name: 'get_ads_thresholds',
+    description: 'Get the resolved detection thresholds (creative fatigue, campaign health) configured for one of your connected ad accounts — the client\'s own customized values where set, platform defaults otherwise. Call this before evaluating fatigue or health signals; never use a hardcoded percentage instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platform: {
+          type: 'string',
+          enum: ['meta'],
+          description: "Ad platform. Only 'meta' is supported today."
+        },
+        account_id: {
+          type: 'string',
+          description: 'Ad account ID from list_connected_accounts.'
+        }
+      },
+      required: ['platform', 'account_id']
+    }
+  },
+  execute: async (args, context) => {
+    if (args.platform !== 'meta') {
+      return { success: false, error: `platform '${args.platform}' is not supported yet — only 'meta' has a connected-account ownership check` };
+    }
+
+    const user = await userDb.getUserById(context?.userId);
+    if (!user) return { success: false, error: 'User not found' };
+
+    const { cleanAccountId, getConnectedMetaAccountsList } = await import('../services/metaAccountCredentials');
+    const cleaned = cleanAccountId(args.account_id);
+    const owned = getConnectedMetaAccountsList(user).some((acc: any) => acc.accountId === cleaned);
+    if (!owned) {
+      return { success: false, error: 'Ad account is not one of your connected accounts' };
+    }
+
+    const { getThresholdsForAccount } = await import('../services/adsThresholdsDb');
+    const { resolveThresholds, THRESHOLD_REGISTRY } = await import('../services/adsThresholds');
+    const stored = await getThresholdsForAccount('meta', cleaned);
+    const resolved = resolveThresholds(stored);
+
+    return {
+      success: true,
+      platform: 'meta',
+      account_id: cleaned,
+      parameters: Object.entries(resolved).map(([key, value]) => {
+        const definition = THRESHOLD_REGISTRY.get(key)!;
+        return {
+          key,
+          value: value.value,
+          source: value.source,
+          defaultValue: definition.defaultValue,
+          min: definition.min,
+          max: definition.max,
+          unit: definition.unit,
+          description: definition.description,
+        };
+      }),
+    };
+  }
+});
+
 // --- LinkedIn Ads Tools ---
 emmaToolRegistry.register({
   name: 'call_linkedin_marketing_api',
