@@ -50,8 +50,14 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
     assert captured["max_retries"] == 1
     assert captured["temperature"] == 0.0
     assert os.environ["OPENAI_API_KEY"] == "direct-openai-key"
+    # ENG-1820: require_parameters=True no longer applies -- it made OpenRouter hard-reject
+    # every request carrying parallel_tool_calls (auto-added by browser-use's real
+    # with_structured_output(method="function_calling") call), since that parameter isn't
+    # declared as supported by essentially any model in OpenRouter's catalog. Broke the first
+    # real action of every task, on every model. tool_choice alone still guarantees
+    # single-tool-call behavior for this usage pattern.
     assert captured["extra_body"] == {
-        "provider": {"allow_fallbacks": True, "require_parameters": True},
+        "provider": {"allow_fallbacks": True},
         "plugins": [{"id": "context-compression"}],
     }
 

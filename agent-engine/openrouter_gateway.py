@@ -68,7 +68,20 @@ def create_openrouter_llm(model: str):
         raise ValueError("OPENROUTER_API_KEY is not set")
 
     extra_body = {
-        "provider": {"allow_fallbacks": True, "require_parameters": True},
+        # ENG-1820: require_parameters=True made OpenRouter hard-reject any request
+        # carrying a parameter the target model doesn't explicitly declare as
+        # supported. browser-use's real per-step call
+        # (with_structured_output(method="function_calling")) always adds
+        # parallel_tool_calls=false, and OpenRouter's own /models/{id}/endpoints
+        # metadata doesn't list parallel_tool_calls as supported for essentially
+        # any model in the catalog (confirmed directly for gpt-4.1, gpt-5,
+        # gpt-5.1, gpt-5.4, gpt-5.6-terra, gpt-5.6-luna) -- so with this flag on,
+        # the first real action of every task, on every model, got 0 matching
+        # providers and a 404. tool_choice (forcing one specific function by
+        # name) is what actually guarantees single-tool-call behavior here and
+        # stays enforced regardless; parallel_tool_calls was redundant for this
+        # usage pattern, not the real safety mechanism.
+        "provider": {"allow_fallbacks": True},
         "plugins": [{"id": "context-compression"}],
     }
     kwargs = {
