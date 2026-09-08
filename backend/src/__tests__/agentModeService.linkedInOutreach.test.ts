@@ -2589,6 +2589,68 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
         delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
       }
     });
+
+    it('discloses the routing decision on the already-pending refusal, not just on the eventual send (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue({ sentAt: '2026-09-01T00:00:00.000Z' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.alreadyInvited).toBe(true);
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('discloses the routing decision on the note-quota decision-gate hold, not just on a clean send (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      const quotaErr: any = new Error('note quota exceeded');
+      quotaErr.noteQuotaExceeded = true;
+      mockSendInvitation.mockRejectedValue(quotaErr);
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.requiresDecision).toBe(true);
+      expect(result.noteQuotaExceeded).toBe(true);
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('discloses the routing decision on an unexpected/generic send failure, not just the classified refusal paths (CodeRabbit finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockRejectedValue(new Error('unexpected upstream failure'));
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn outreach action failed');
+      expect(result.accountRouting).toEqual({
+        fromAccountId: 'capped-account',
+        toAccountId: 'headroom-account',
+        reason: expect.stringContaining('headroom-account'),
+      });
+    });
+
+    it('fetches the org account list only once for a routed write, not once to resolve the account and again to scan candidates (CodeRabbit performance finding on PR #2742)', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue(routedAccounts);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-routed' });
+
+      const result = await service.linkedinOutreach('user-1', routingInviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
