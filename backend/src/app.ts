@@ -145,9 +145,12 @@ const app = express();
 // resolves to the real client instead of collapsing to one value for every caller.
 //
 // Prod topology is ALB -> nginx -> Node, all on the same EB instance, with nginx
-// proxying to Node over loopback. nginx's own default proxy config (see
-// .platform/nginx/conf.d/elasticbeanstalk/websocket.conf for the directive this mirrors)
-// sets `X-Forwarded-For: $proxy_add_x_forwarded_for`, which APPENDS nginx's own
+// proxying to Node over loopback. The EB-platform-managed nginx config for the general
+// proxy location isn't in this repo (only .platform/nginx/conf.d/elasticbeanstalk/
+// websocket.conf's /socket.io/ location is, as an analogous example of the same directive
+// — it does not itself govern the routes below), so this is confirmed against live prod
+// rather than static config: nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for`,
+// which APPENDS nginx's own
 // connecting address (the ALB's private IP) to whatever X-Forwarded-For it received —
 // and the ALB itself already sets X-Forwarded-For to the real client IP before that.
 // So by the time Express sees the request: the socket is loopback (hop 1, nginx) and
