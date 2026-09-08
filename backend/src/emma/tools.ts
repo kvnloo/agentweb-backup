@@ -24,6 +24,7 @@ import {
   AskUserQuestionError,
   type AskUserQuestionOption,
 } from '../services/agentMode/core/askUserQuestion';
+import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -875,19 +876,28 @@ emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
-    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics. Admin-only: pass client_id to run against a specific client\'s account instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: {
           type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
-        }
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
+        },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: []
     }
   },
   execute: async (args, context) => {
+    if (args.client_id) {
+      return await agentModeService.listMetaAdsCampaignsNew(
+        context?.userId,
+        args.account_id,
+        {},
+        { clientId: args.client_id, toolName: 'list_meta_ads_campaigns' }
+      );
+    }
     return args.account_id
       ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
       : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
@@ -1443,6 +1453,7 @@ emmaToolRegistry.register({
           description:
             "Server-side filters to narrow results before aggregation.",
         },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: ["account_id", "object_type", "fields"],
     },
@@ -1485,8 +1496,9 @@ emmaToolRegistry.register({
         },
         account_id: {
           type: 'string',
-          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
-        }
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available. REQUIRED when client_id is also provided — a client-scoped call never auto-selects an account.'
+        },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       }
     }
   },
@@ -1496,6 +1508,16 @@ emmaToolRegistry.register({
       args.campaign_ids,
       args.campaign_id,
     );
+
+    if (args.client_id) {
+      return await agentModeService.getMetaAdsMetrics(
+        args.timeframe || '7d',
+        context?.userId,
+        normalizedCampaignIds,
+        args.account_id,
+        { clientId: args.client_id, toolName: 'get_meta_ads_metrics' },
+      );
+    }
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',

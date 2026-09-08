@@ -17,16 +17,10 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
-import { ctx, jsonResult } from './toolHelpers';
+import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 import { resolveClientScopedContext } from './adminClientScope';
 import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
-
-const CLIENT_ID_SCHEMA_PROPERTY = {
-  type: 'string' as const,
-  description:
-    "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
-};
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
