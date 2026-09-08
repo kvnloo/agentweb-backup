@@ -202,6 +202,21 @@ describe('publisher_refused → by_design, not config or bug (ENG-1162)', () => 
       ),
     ).toBe('by_design');
   });
+
+  it('still classifies as by_design from the MESSAGE alone, without errorClass — the marker text contains "Forbidden", which would otherwise match CONFIG_RE and silently fall to config', () => {
+    expect(
+      classifyToolFailureType(
+        '',
+        'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+      ),
+    ).toBe('by_design');
+    expect(
+      classifyToolFailureType(
+        undefined,
+        'Error: browserBackend.callTool: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/example',
+      ),
+    ).toBe('by_design');
+  });
 });
 
 describe('quota_exceeded → config, not bug (ENG-1220)', () => {
