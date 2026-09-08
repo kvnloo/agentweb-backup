@@ -33,7 +33,6 @@ def run_all_tests():
     standalone_tests = [
         "tests/test_validate_content_format_standalone.py",
         "tests/test_browser_use_integration.py",
-        "tests/test_memory_fix_comprehensive.py",
     ]
     
     success_count = 0

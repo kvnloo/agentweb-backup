@@ -136,10 +136,7 @@ def generate_content_hash(content: Any) -> str:
 
 def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str] = None) -> str:
     """Get the downloads path for storing task outputs
-    
-    This is a shared utility function used by both web_agent.py and deep_research_agent.py
-    to ensure consistent file storage location.
-    
+
     Args:
         user_id: Optional user ID to create user-specific directory
         execution_id: Optional execution ID to create execution-specific directory
