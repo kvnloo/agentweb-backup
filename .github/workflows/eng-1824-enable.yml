@@ -1,0 +1,31 @@
+name: ENG-1824 production flag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      - name: Enable outreach schedule auto-create
+        run: |
+          set -euo pipefail
+          aws elasticbeanstalk update-environment \
+            --environment-name Agentweb-backend-env-prod-3 \
+            --option-settings Namespace=aws:elasticbeanstalk:application:environment,OptionName=OUTREACH_SCHEDULE_AUTO_CREATE_ENABLED,Value=true
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names Agentweb-backend-env-prod-3
+          test "$(aws elasticbeanstalk describe-configuration-settings \
+            --application-name Agentweb-backend \
+            --environment-name Agentweb-backend-env-prod-3 \
+            --query 'ConfigurationSettings[0].OptionSettings[?Namespace==`aws:elasticbeanstalk:application:environment` && OptionName==`OUTREACH_SCHEDULE_AUTO_CREATE_ENABLED`].Value | [0]' \
+            --output text)" = true
