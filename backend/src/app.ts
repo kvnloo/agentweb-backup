@@ -140,6 +140,24 @@ import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
 
+// ENG-493: trust the first 2 hops in front of this process so `req.ip` (and everything
+// keyed off it, e.g. express-rate-limit's default per-IP keying in routes/auth.ts)
+// resolves to the real client instead of collapsing to one value for every caller.
+//
+// Prod topology is ALB -> nginx -> Node, all on the same EB instance, with nginx
+// proxying to Node over loopback. nginx's own default proxy config (see
+// .platform/nginx/conf.d/elasticbeanstalk/websocket.conf for the directive this mirrors)
+// sets `X-Forwarded-For: $proxy_add_x_forwarded_for`, which APPENDS nginx's own
+// connecting address (the ALB's private IP) to whatever X-Forwarded-For it received —
+// and the ALB itself already sets X-Forwarded-For to the real client IP before that.
+// So by the time Express sees the request: the socket is loopback (hop 1, nginx) and
+// X-Forwarded-For is "<real client>, <ALB private IP>" (hop 2 is the ALB). Trusting 2
+// hops skips both and leaves the real client as `req.ip` — confirmed against a live prod
+// nginx access log, where every request's ALB-set X-Forwarded-For field is a distinct
+// public client IP while nginx's own $remote_addr is always one of exactly 2 known
+// internal ALB addresses.
+app.set('trust proxy', 2);
+
 // Security hardening (TAC Security report — Low findings):
 //   1. Remove the default "X-Powered-By: Express" header so the framework is not
 //      disclosed to unauthenticated clients (fingerprinting aid).
