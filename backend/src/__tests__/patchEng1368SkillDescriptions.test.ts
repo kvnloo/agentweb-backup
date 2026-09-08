@@ -33,7 +33,7 @@ describe('patch-eng1368-skill-descriptions', () => {
 
   it('Cross-Channel Budget Engine description matches ENG-1368 verbatim', () => {
     expect(SKILL_DESCRIPTION_UPDATES['ca99eb0c-5d69-41d4-8997-516b5bb2d228']).toBe(
-      "Cross-channel paid media budget optimizer — compares ROAS and performance across Google Ads, Meta Ads, and LinkedIn Ads, then recommends where the next dollar should go. Uses marginal-return-aware reallocation math to shift budget from diminishing-return campaigns to high-return ones. Use when asked \"where should I spend more\", \"which channel is working\", \"reallocate my budget\", or for monthly/quarterly budget reviews. Recommendation-only: never auto-executes budget changes."
+      "Cross-channel paid media budget optimizer — compares ROAS and performance across Google Ads, Meta Ads, and LinkedIn Ads, then recommends where the next dollar should go. Uses marginal-return-aware reallocation math to shift budget from diminishing-return campaigns to high-return ones. Use when asked \"where should I spend more\", \"which channel is working\", \"reallocate my budget\", or for monthly/quarterly budget reviews. Recommendation-only; never auto-executes budget changes."
     );
   });
 
