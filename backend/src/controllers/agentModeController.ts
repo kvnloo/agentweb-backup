@@ -31,6 +31,7 @@ import { cronJobRegistry } from '../utils/cronJobRegistry';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, hasUnmetPublishRequirement, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { MAX_READ_ONLY_PRESS_ATTEMPTS, isReadOnlyOnlyUnmet, shouldStopPressingForReadOnly } from '../utils/readOnlyPressCircuitBreaker';
+import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } from '../utils/sendPressCircuitBreaker';
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
@@ -3527,7 +3528,33 @@ type RunVerifiedChatResult = {
   // a read-only tool carries no external write, so a schedule's own deliverable
   // can be complete and correct even though this one minimum stayed unmet.
   readOnlyRequirementWaived?: boolean;
+  // ENG-1715: set when the run spent its send-press budget with a send requirement
+  // (per isSendName — linkedin_outreach, send_email, …) still unmet, and stopped
+  // instead of re-pressing to maxAttempts. Like the publish markers and UNLIKE
+  // readOnlyRequirementWaived, the run still FAILED: a send that did not happen is
+  // real work left undone, so nothing is waived here. This only records WHY it
+  // ended early.
+  sendPressExhausted?: boolean;
 };
+
+// ENG-1811: is this work plan ACTUALLY finished -- every step terminal AND no
+// outstanding debt from a removed step's required function call that never
+// genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against
+// real calledFunctions, not just "does anything remain marked pending").
+// Inlined here (rather than calling AgentModeService.isWorkPlanFullyResolved)
+// because ~150 test files in this suite mock '../services/agentModeService' as
+// a bare { agentModeService: {...} } object with no AgentModeService class
+// export -- depending on that class from this heavily-mocked controller file
+// breaks any of them that happen to exercise this retry loop.
+function workPlanCompletedWithoutDebt(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+  if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+  const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+  if (!allStepsTerminal) return false;
+  const called = calledFunctions || {};
+  const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+    .filter((fn: string) => (called[fn] || 0) === 0);
+  return unresolvedPendingDebt.length === 0;
+}
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
@@ -3713,6 +3740,11 @@ async function runVerifiedChatInner(
   // TYPE because a run can pass through the publish-only-unmet state and the
   // read-only-only-unmet state at different points as requirements clear.
   let readOnlyPressAttempts = 0;
+  // ENG-1715: third press counter, same reasoning as the two above. Mutually
+  // exclusive with both by construction — the send-only gate below is suppressed
+  // when the publish gate claims the turn, and no name is both a send and
+  // read-only — so at most one of the three increments per attempt.
+  let sendPressAttempts = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -4170,7 +4202,7 @@ async function runVerifiedChatInner(
         // Check work plan status
         const session = await chatbotDb.getChatSession(sessionId);
         const workPlan = session?.workPlan;
-        const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+        const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, session?.calledFunctions);
 
         if (workPlan && !workPlanCompleted) {
           // Remind to complete pending steps
@@ -4250,7 +4282,7 @@ async function runVerifiedChatInner(
 
       // Check work plan status
       const workPlan = response.workPlan;
-      const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
+      const workPlanCompleted = workPlan && workPlanCompletedWithoutDebt(workPlan, response.calledFunctions);
 
       // Only evaluate keywords and function calls if work plan is completed or doesn't exist
       let keywordMatches: string[] = [];
@@ -4436,6 +4468,27 @@ async function runVerifiedChatInner(
       if (readOnlyIsTheOnlyThingLeft) {
         readOnlyPressAttempts++;
       }
+      // ENG-1715: sibling gate for a stalled SEND requirement (linkedin_outreach,
+      // send_email, …) — the class that is neither publish nor read-only and so had
+      // no breaker at all, taking the full 20-attempt press.
+      //
+      // Suppressed when the publish gate has already claimed this turn. The two
+      // classifiers do not overlap by name, but `publishIsTheOnlyThingLeft` also
+      // fires via the ENG-930 branch (a genuinely withheld publish whose requirement
+      // was excluded from scope), and THAT can be true while `functionCallMisses`
+      // holds only a send — a schedule requiring both a publish and a send. Publish
+      // wins there: it carries the richer verdict and the larger budget, and letting
+      // both counters advance on one turn would spend two budgets for one press.
+      const sendIsTheOnlyThingLeft =
+        !publishIsTheOnlyThingLeft &&
+        completionGate &&
+        !allFunctionCallsMet &&
+        allKeywordsMet &&
+        (!workPlan || workPlanCompleted) &&
+        isSendOnlyUnmet(functionCallMisses);
+      if (sendIsTheOnlyThingLeft) {
+        sendPressAttempts++;
+      }
       // A stalled publish requirement has three causes and they need different
       // things from the owner, so the marker must not conflate them. Only
       // SUCCEEDED external writes count as evidence the run published — a failed
@@ -4529,6 +4582,54 @@ async function runVerifiedChatInner(
             : toolFailing
             ? { publishToolFailing: true }
             : { publishRequirementMismatch: true }),
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches,
+          functionCallMisses,
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return {
+              functionName: reqFunc.functionName,
+              requiredCount: reqFunc.minCount,
+              actualCount,
+              met: actualCount >= reqFunc.minCount,
+            };
+          }),
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
+      // ENG-1715: the send press circuit breaker. Checked BEFORE the read-only
+      // breaker below, deliberately: read-only WAIVES its requirement and returns
+      // `success: true`, and a send that did not happen must never be waived that
+      // way. The two cannot both fire today (no name is both a send and read-only,
+      // pinned by a drift-guard test), so the ordering is a guarantee against a
+      // future classifier change, not a live tie-break.
+      //
+      // Like the read-only case there is no "why" to classify — a send has no
+      // "held for approval" or "wrote through an equivalent route" nuance — so a
+      // send-only-unmet stall has exactly one outcome (stop) once the budget is
+      // spent. Unlike it, the run is still a FAILURE with the requirement named:
+      // this changes only how much is spent reaching that verdict.
+      if (
+        sendIsTheOnlyThingLeft &&
+        shouldStopPressingForSend({ pressAttempt: sendPressAttempts, unmetRequiredFunctions: functionCallMisses })
+      ) {
+        console.warn(
+          `AgentMode runVerifiedChat: session ${sessionId} spent its send-press budget ` +
+          `(${sendPressAttempts}/${MAX_SEND_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
+          `with [${functionCallMisses.join(', ')}] still unmet. Ending the run instead of re-pressing to ` +
+          `${maxAttempts} attempts — a send refused by an account-level cooldown or a daily pacing cap ` +
+          `will be refused identically on every later attempt in this run, and pressing an irreversible ` +
+          `external send that the run has already correctly stopped attempting risks a duplicate contact ` +
+          `to a real person on an account the provider is already throttling (ENG-1715).`
+        );
+        return {
+          success: false,
+          sendPressExhausted: true,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -5146,6 +5247,11 @@ export async function runScheduledChat(
   // budget with a read-only tool still uncalled. Unlike the publish markers
   // above, this is a SUCCESSFUL run — no external write was left undone.
   readOnlyRequirementWaived?: boolean;
+  // ENG-1715: present only when the run stopped early on the send-press budget
+  // with a send tool (linkedin_outreach, send_email, …) still under-called. A
+  // `failure`, like the publish markers and unlike readOnlyRequirementWaived —
+  // the contact never went out.
+  sendPressExhausted?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -6467,6 +6573,13 @@ export async function runScheduledChat(
       // either: reporting it as held-for-approval sends them to an approval queue
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
+      // ENG-1715: the run ended early because its send-press budget ran out with a
+      // send requirement still under-called — an account-level cooldown or pacing
+      // cap stopped it, and re-pressing an irreversible external send would only
+      // risk a duplicate contact. Still a `failure` (the sends did not happen, so
+      // the streak/oncall escalation must keep firing), marked so it is
+      // distinguishable from a run that exhausted all 20 attempts some other way.
+      ...(result.sendPressExhausted ? { sendPressExhausted: true } : {}),
     };
     const scheduledChatFailureDescription =
       `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\n` +
@@ -7569,6 +7682,10 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  // ENG-1811: raw session.calledFunctions snapshot alongside workPlan, so a caller
+  // checking "is the plan done" can resolve pendingRequiredFunctionCalls debt against
+  // real call history instead of inferring completion from step status alone.
+  calledFunctions?: Record<string, number>;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
   // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
   // and was truncated before emitting the final deliverable. The scheduled-run
@@ -7933,6 +8050,7 @@ export async function generateSessionResponse(
   return {
     ...response,
     workPlan: finalSession?.workPlan,
+    calledFunctions: finalSession?.calledFunctions,
     skills
   };
 }

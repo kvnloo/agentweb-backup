@@ -3474,7 +3474,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -5523,6 +5523,29 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1811: is this work plan ACTUALLY finished — every step terminal AND no
+   * outstanding debt from a removed step's required function call that never
+   * genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against real
+   * session.calledFunctions, not just "does anything remain marked pending").
+   *
+   * The debt ledger's only *enforcement* point is setWorkPlanStatusAttempt, which
+   * nothing calls once no steps remain pending — so every OTHER place in the codebase
+   * that infers "plan done" from `steps.every(completed|skipped)` alone can be fooled
+   * by deleting the last pending step(s) via modify_work_plan and never re-adding them.
+   * Use this helper (not a bare `.every(...)`) anywhere that inference feeds a
+   * user-facing "done" claim or gates a retry loop.
+   */
+  public static isWorkPlanFullyResolved(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+    if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    if (!allStepsTerminal) return false;
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    return unresolvedPendingDebt.length === 0;
+  }
+
+  /**
    * Render a session work plan into LLM context message(s).
    *
    * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
@@ -5547,8 +5570,17 @@ export class AgentModeService {
    * stay byte-for-byte identical to current production behavior (header + step list +
    * the ORIGINAL autocomplete wording, nothing else). This keeps Emma's surface
    * unchanged while still fixing the agent-mode loop.
+   *
+   * `calledFunctions` (optional, session.calledFunctions) resolves ENG-1811 debt
+   * (`workPlan.pendingRequiredFunctionCalls`) against real call history. Without it, a
+   * caller that deletes the last pending step(s) via modify_work_plan (never re-adding
+   * them, never calling set_work_plan_status again) makes every step terminal while
+   * debt from the removed step was never satisfied — the ONLY enforcement point for
+   * that ledger is setWorkPlanStatusAttempt, which nothing here ever invokes again, so
+   * the "ALL STEPS ARE DONE" branch below would tell the model to stop and declare
+   * victory despite the outstanding requirement (found live via subagent review, PR #2808).
    */
-  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true, calledFunctions?: Record<string, number>): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -5560,10 +5592,22 @@ export class AgentModeService {
     };
 
     // Check if all steps are terminal (completed or skipped) — no pending work remains
-    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt: string[] = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    const allStepsDone = allStepsTerminal && unresolvedPendingDebt.length === 0;
 
     let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
     workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsTerminal && unresolvedPendingDebt.length > 0) {
+      // Every step looks terminal, but a step that got removed via modify_work_plan
+      // required a function call that never actually succeeded (ENG-1811 debt ledger).
+      // Do NOT tell the model the plan is done — that would silently launder the debt.
+      workPlanContent += `❌ This plan is NOT actually finished: ${unresolvedPendingDebt.join(', ')} ${unresolvedPendingDebt.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded. Call it for real, or use modify_work_plan to add back a step that genuinely does this work, before treating this plan as complete or reporting it to the user as done.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
 
     if (allStepsDone) {
       // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
@@ -5771,7 +5815,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5929,7 +5973,7 @@ export class AgentModeService {
     // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames, true, calledFunctions));
     } else {
       // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
       // scenario), a run that timed out mid-batch leaves already-generated images in
@@ -32889,21 +32933,49 @@ ${strippedHtml}`;
       const workPlan = { ...session.workPlan };
 
       // Snapshot of every step as it existed before this call's removeStepCounts
-      // filtering runs below, keyed by stepCount. Used further down to detect
-      // and protect against "remove step N via removeStepCounts, then add a
-      // fresh step N back in the same steps[] array" -- a step reaching the
-      // "add new step" branch is otherwise treated as having no prior history
-      // at all, even when this exact call just removed the real history one
-      // line below. Live-verified on test-env1, 2026-09-07 (unprompted,
-      // organic model behavior, not a scripted repro): the model removed steps
-      // 2 and 3 via removeStepCounts and added a single new step 2 with
-      // requiredFunctionCalls: [], silently dropping list_html_templates and
-      // create_html_from_template -- both genuinely never called -- with zero
-      // protection, even though the ENG-1799/1800 merge guards were already
-      // active for ordinary same-step edits.
+      // filtering runs below, keyed by stepCount. Still used further down for
+      // expectedAssetCount/expectedAssetCountTools: when a step reusing a
+      // just-removed stepCount reaches the "add new step" branch in THIS SAME
+      // call, reattach the pre-removal asset-count requirement instead of
+      // treating it as having no history. (requiredFunctionCalls no longer
+      // uses this snapshot -- see pendingRequiredFunctionCalls below, which
+      // closes the same gap completely instead of only within one call.)
       const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
         workPlan.steps.map((s: any) => [s.stepCount, s]),
       );
+
+      // ENG-1811: before removing anything, carry forward any genuinely
+      // unresolved requiredFunctionCalls from the steps about to be removed
+      // into a session-lifetime, stepCount-agnostic debt ledger
+      // (workPlan.pendingRequiredFunctionCalls). This is deliberately NOT
+      // scoped to "does a later step reuse this same stepCount" -- that
+      // per-call/per-stepCount approach (the first attempt at this fix) was
+      // itself defeated live, unprompted, on test-env1: the model removed
+      // steps 2 and 3 via removeStepCounts in one modify_work_plan call, then
+      // re-added them with omitted requiredFunctionCalls in a SEPARATE, LATER
+      // call that didn't mention removeStepCounts at all -- that later call's
+      // own invocation has no memory of the earlier removal, so a per-call
+      // snapshot can never see across it. A plain session-level ledger does,
+      // because workPlan (and this field on it) is the one thing every
+      // invocation reads fresh and writes back. See setWorkPlanStatusAttempt
+      // for where this is enforced: it blocks a batch from resolving the LAST
+      // remaining pending step(s) (finishing the plan) while any entry here
+      // still hasn't succeeded, regardless of which step (if any) still lists
+      // it as required.
+      const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
+      if (removeStepCounts && removeStepCounts.length > 0) {
+        const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        for (const step of workPlan.steps) {
+          if (!removeStepCounts.includes(step.stepCount)) continue;
+          for (const fn of step.requiredFunctionCalls || []) {
+            if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
+              newlyUnresolved.add(fn);
+            }
+          }
+        }
+        workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
+      }
 
       // Update autocomplete if explicitly provided
       if (autocomplete !== undefined) {
@@ -33100,28 +33172,26 @@ ${strippedHtml}`;
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan).
           //
-          // If this stepCount was just removed via removeStepCounts in this
-          // same call, this is really an edit wearing a "new step" costume --
-          // apply the same merge protection as the existingIndex>=0 branch
-          // above, using the pre-removal step as the baseline, so removing and
-          // re-adding a step can't be used to launder away an unresolved
-          // requirement (see the comment on originalStepsBeforeRemoval above).
-          // A genuinely new stepCount (never existed before this call) has no
-          // history to protect, so it's unaffected.
+          // requiredFunctionCalls is taken as given here, unprotected -- ENG-1811's
+          // pendingRequiredFunctionCalls ledger (populated above whenever a step is
+          // removed) is what actually guarantees a genuinely unresolved requirement
+          // can't be walked away from, enforced at completion time in
+          // setWorkPlanStatusAttempt regardless of which step (if any) still lists
+          // it. That covers this stepCount being reused in this same call, a later
+          // separate call, or never being reused at all -- strictly more than a
+          // per-call reattachment here could.
+          //
+          // expectedAssetCount/expectedAssetCountTools have no equivalent
+          // session-level ledger yet (the "produced count" calculation is inherently
+          // step-relative, not easily genericized the way a function name is) -- if
+          // this stepCount was just removed via removeStepCounts in THIS SAME call,
+          // still reattach its pre-removal asset-count requirement as a best-effort
+          // guard using the pre-removal step as the baseline. A genuinely new
+          // stepCount, or one whose removal happened in an earlier, separate call,
+          // has no such reattachment (a known, narrower residual gap -- see ENG-1808).
           const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
             ? originalStepsBeforeRemoval.get(newStep.stepCount)
             : undefined;
-          // When removedOriginal exists, the merge functions must run
-          // UNCONDITIONALLY, not only when the caller explicitly supplied the
-          // corresponding field. mergeExpectedAssetCount/Tools already handle
-          // requested === undefined correctly (return the existing value) --
-          // exactly like the existingIndex>=0 branch above, which calls them
-          // unconditionally for the same reason. Gating the call itself on
-          // `newStep.expectedAssetCount !== undefined` (the old pattern, still
-          // correct for a genuinely new step with no removedOriginal) would
-          // let a reused stepCount that simply OMITS the field skip protection
-          // entirely -- the asset-count gate would never even activate on the
-          // re-added step, a strictly worse bypass than an explicit lowering.
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -33130,9 +33200,7 @@ ${strippedHtml}`;
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: removedOriginal
-              ? mergeRequiredFunctionCalls(removedOriginal.requiredFunctionCalls, newStep.requiredFunctionCalls)
-              : newStep.requiredFunctionCalls,
+            requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
             ...(removedOriginal
               ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
@@ -33572,6 +33640,58 @@ ${strippedHtml}`;
         insufficientAssets,
         formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
       };
+    }
+
+    // ENG-1811: a step removed via modify_work_plan's removeStepCounts can carry
+    // requiredFunctionCalls that never succeeded -- genuinely necessary work that
+    // was never done. Refuse to let this batch finish the WHOLE plan (resolve the
+    // last remaining pending step(s)) while any such debt is still outstanding,
+    // regardless of whether any current step still lists it as required. Scoped to
+    // "finishing the plan" rather than every individual step transition so
+    // unrelated, still-in-progress steps keep completing normally in the
+    // meantime -- only the moment the run would otherwise look fully done is
+    // gated, which is the only place a silently-dropped requirement actually
+    // matters.
+    //
+    // Reads session.calledFunctions directly (the raw, never-mutated snapshot
+    // from the top of this function), NOT the local calledFunctionCounts copy --
+    // that copy gets decremented in-place, once per required call, as THIS SAME
+    // batch's own steps pass their gates above (the pre-existing ENG-1698
+    // credit-consumption mechanic). A debt name that's ALSO genuinely required
+    // and satisfied by an ordinary step completing earlier in this very loop
+    // would decrement calledFunctionCounts back toward 0, making a real success
+    // moments earlier look like it never happened -- a real bug found by review,
+    // reproduced standalone before this comment was written: a session with a
+    // pending debt for `list_html_templates`, a single step requiring exactly
+    // that function, called exactly once and genuinely succeeding, still got
+    // permanently blocked from ever finishing. The real persisted decrement
+    // (decrementCalledFunctionsClamped) only runs after this whole gate passes
+    // anyway, so there's no correctness reason to consult the hypothetical
+    // post-decrement value at decision time -- only whether the function
+    // actually succeeded at all this session.
+    const rawCalledFunctionCounts = session.calledFunctions || {};
+    const unresolvedPendingRequiredFunctionCalls = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter(fn => (rawCalledFunctionCounts[fn] || 0) === 0);
+    if (unresolvedPendingRequiredFunctionCalls.length > 0) {
+      const noStepsRemainPending = !workPlan.steps.some(s => s.status === 'pending');
+      if (noStepsRemainPending) {
+        return {
+          success: false,
+          // ENG-1626: deliberate gate, see the out-of-order gate above for why
+          // blocked/reason is set here.
+          blocked: true,
+          reason: 'workplan_unresolved_removed_requirements',
+          message: 'Cannot finish this work plan. A required function call from a removed step was never made.',
+          pendingRequiredFunctionCalls: unresolvedPendingRequiredFunctionCalls,
+          formattedContent: `❌ Cannot mark this plan finished yet: ${unresolvedPendingRequiredFunctionCalls.join(', ')} ${unresolvedPendingRequiredFunctionCalls.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded.\n\nCall it for real, or use modify_work_plan to add back a step that genuinely does this work, before finishing the plan.`
+        };
+      }
+    }
+    // Auto-clear any debts that have since genuinely succeeded (by any means --
+    // not necessarily via the stepCount that originally required them), so the
+    // ledger doesn't grow stale forever once real work actually happens.
+    if (workPlan.pendingRequiredFunctionCalls && workPlan.pendingRequiredFunctionCalls.length > 0) {
+      workPlan.pendingRequiredFunctionCalls = unresolvedPendingRequiredFunctionCalls;
     }
 
     // Check if any steps were not found
@@ -35660,8 +35780,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // the account still needs to be the caller's own/shared account) but is
     // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
     // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    // ENG-1719: withdraw-stale-invitations shares the ownership check for the same
+    // reason set-daily-invite-cap does — it writes to the account, so it must be the
+    // caller's own or org-shared one. It is deliberately NOT in PACED_WRITE_ACTIONS:
+    // the umbrella call itself performs no LinkedIn write, and pacing it here would
+    // consume a slot on top of the one each individual withdrawal already reserves
+    // inside the drain.
     let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
-    if (PACED_WRITE_ACTIONS.has(action) || action === 'set-daily-invite-cap') {
+    if (
+      PACED_WRITE_ACTIONS.has(action)
+      || action === 'set-daily-invite-cap'
+      || action === 'withdraw-stale-invitations'
+    ) {
       resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
       if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
@@ -36657,6 +36787,64 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
           );
           return { success: true, data: cancelResult };
+        }
+
+        // ENG-1719 / ENG-1609 AC #8: bulk-withdraw the oldest pending invitations.
+        //
+        // Routed through paceLinkedInWrite per withdrawal, exactly like the
+        // single-shot cancel-invitation above, so the drain inherits the spacing
+        // gap and the hourly ceiling instead of working around them — and,
+        // because dailyVolumeClassFor returns null for cancel, does not consume
+        // the account's daily invite budget.
+        case 'withdraw-stale-invitations': {
+          const {
+            withdrawStaleInvitations,
+            DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+          } = await import('./agentMode/linkedInStaleInvitationDrain');
+          const {
+            getAllSentInvitationsByAccount,
+            deleteSentInvitationByInvitationId,
+          } = await import('./unipileSentInvitationsDb');
+
+          const rawDays = Number(args.older_than_days);
+          if (!Number.isFinite(rawDays) || rawDays < 1) {
+            throw new Error('older_than_days is required for withdraw-stale-invitations and must be at least 1');
+          }
+          const rawMax = Number(args.max_withdrawals);
+
+          const result = await withdrawStaleInvitations({
+            accountId: account_id,
+            olderThanDays: rawDays,
+            maxWithdrawals: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+            deps: {
+              fetchPending: (acc) => getAllSentInvitationsByAccount(acc),
+              // The pacer's own refusal text, or null to proceed. Reusing
+              // paceLinkedInWrite rather than reserveWriteSlot directly keeps the
+              // drain on the identical path every other LinkedIn write takes.
+              pace: async (acc) => {
+                const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
+                // resolvedLinkedInAccount is non-null here: this action is in the
+                // ownership gate above, which returns early when it cannot resolve.
+                return paced.refusal ? paced.refusal.error : null;
+              },
+              cancel: async (invitationId, acc) => {
+                await linkedInOutreachService.cancelInvitation(invitationId, acc);
+              },
+              forget: (acc, invitationId) => deleteSentInvitationByInvitationId(acc, invitationId),
+              recordWithdrawal: async (candidate) => {
+                const { recordInviteWithdrawnInCrm } = await import('./linkedInInviteCrmMirror');
+                return recordInviteWithdrawnInCrm({
+                  userId,
+                  accountId: account_id,
+                  linkedinUrl: candidate.publicProfileUrl,
+                  invitationId: candidate.invitationId,
+                  sentAt: candidate.sentAt,
+                  ...(args.list_id ? { listId: args.list_id } : {}),
+                });
+              },
+            },
+          });
+          return { success: true, data: result };
         }
 
         case 'search-parameters': {
