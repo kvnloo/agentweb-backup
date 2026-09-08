@@ -411,3 +411,30 @@ describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
     expect(classifyToolErrorClass(err)).toBe('rate_limit');
   });
 });
+
+// ENG-1162: a publisher (not an AgentWeb-connected account) refusing or failing to serve a
+// plain external fetch — read_file_content's own 401/403 marker, or a Chromium/Playwright
+// browser-navigation net-error — must not be swept into 'auth' ("reconnect the account" is
+// nonsensical for an anonymous read) nor left in the unclassified legacy fallback (no signal
+// that the failed read is not evidence the content is missing).
+describe('publisher_refused — publisher/site blocks on a plain external fetch (ENG-1162)', () => {
+  it('classifies a browser navigation net::ERR_* failure as publisher_refused, not the legacy fallback', () => {
+    expect(classifyToolErrorClass(err(
+      'page.goto: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/hhs-working-to-strike-medicaid-work-requirement-deal-with-blue-states/'
+    ))).toBe('publisher_refused');
+    expect(classifyToolErrorClass(err('net::ERR_CONNECTION_REFUSED at https://example.com/'))).toBe('publisher_refused');
+  });
+
+  it('classifies read_file_content\'s publisher-refusal marker as publisher_refused, not auth', () => {
+    expect(classifyToolErrorClass(err(
+      'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block '
+      + '(bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.'
+    ))).toBe('publisher_refused');
+  });
+
+  it('leaves an unrelated bare 401/403 (e.g. a connected-account API) classified as auth', () => {
+    expect(classifyToolErrorClass(err('HTTP 403: Forbidden'))).toBe('auth');
+    expect(classifyToolErrorClass(err('403 Forbidden'))).toBe('auth');
+    expect(classifyToolErrorClass(err('Request failed with status code 401'))).toBe('auth');
+  });
+});
