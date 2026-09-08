@@ -140,6 +140,38 @@ import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
 
+// ENG-493: trust the first 2 hops in front of this process so `req.ip` (and everything
+// keyed off it, e.g. express-rate-limit's default per-IP keying in routes/auth.ts)
+// resolves to the real client instead of collapsing to one value for every caller.
+//
+// Prod topology is ALB -> nginx -> Node, all on the same EB instance, with nginx
+// proxying to Node over loopback. The EB-platform-managed nginx config for the general
+// proxy location isn't in this repo (only .platform/nginx/conf.d/elasticbeanstalk/
+// websocket.conf's /socket.io/ location is, as an analogous example of the same directive
+// — it does not itself govern the routes below), so this is confirmed against live prod
+// rather than static config: nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for`,
+// which APPENDS nginx's own
+// connecting address (the ALB's private IP) to whatever X-Forwarded-For it received —
+// and the ALB itself already sets X-Forwarded-For to the real client IP before that.
+// So by the time Express sees the request: the socket is loopback (hop 1, nginx) and
+// X-Forwarded-For is "<real client>, <ALB private IP>" (hop 2 is the ALB). Trusting 2
+// hops skips both and leaves the real client as `req.ip` — confirmed by spoofing
+// X-Forwarded-For against live prod and reading the raw header chain Node received:
+// exactly 2 trailing hops, no CDN/WAF in front. nginx's own $remote_addr is always one
+// of a small set of internal ALB addresses, but that set churns across AZs, so this is
+// keyed on a numeric hop count, never an IP allowlist.
+//
+// This is load-bearing on the ALB's own X-Forwarded-For handling, not just nginx's:
+//   - routing.http.xff_header_processing.mode must stay "append" (the default). If it's
+//     ever changed to "preserve", the ALB stops appending the real client IP and the
+//     chain collapses to "<attacker-supplied XFF>, <ALB private IP>" — hop count 2 would
+//     then resolve `req.ip` straight to an attacker-controlled value instead of skipping
+//     past it, the exact spoofing class this fix (and its rework test) exists to prevent.
+//   - routing.http.xff_client_port.enabled must stay disabled — enabling it appends
+//     "ip:port" entries that `proxy-addr` doesn't parse as a plain address.
+// Both are ALB load balancer attributes, not app code — nothing here enforces them.
+app.set('trust proxy', 2);
+
 // Security hardening (TAC Security report — Low findings):
 //   1. Remove the default "X-Powered-By: Express" header so the framework is not
 //      disclosed to unauthenticated clients (fingerprinting aid).
