@@ -7,7 +7,12 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByEmail: jest.fn(),
   },
+}));
+
+jest.mock('../services/adminAuditLog', () => ({
+  recordAdminAudit: jest.fn(),
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -225,6 +230,93 @@ describe('AgentModeService get_meta_ads_metrics account resolution', () => {
     expect(result).toEqual(expect.objectContaining({
       success: false,
       error: 'Invalid campaign_ids',
+    }));
+    expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentModeService get_meta_ads_metrics client_id scoping (ENG-1801)', () => {
+  let service: AgentModeService;
+
+  const targetAccount = {
+    platform: 'meta',
+    account_id: 'target-account-id',
+    account_name: "Client's Account",
+    userId: 'target-1',
+    config: {
+      account_type: 'ad_account',
+      ad_account_id: 'target-account-id',
+      access_token: 'target-token',
+    },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    jest.spyOn(service, 'formatMetricsSummary').mockResolvedValue('formatted metrics');
+    (userDb.getUserById as jest.Mock).mockImplementation(async (id: string) => {
+      if (id === 'admin-1') return { id: 'admin-1', userId: 'admin-1', email: 'admin@agentweb.pro', isAdmin: true, adAccount: '' };
+      if (id === 'target-1') return { id: 'target-1', userId: 'target-1', email: 'client@example.com', roles: ['customer'], adAccount: '' };
+      return null;
+    });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) => {
+      if (email === 'client@example.com') return { id: 'target-1', userId: 'target-1', email: 'client@example.com', roles: ['customer'], adAccount: '' };
+      return null;
+    });
+    (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockImplementation(async (userId: string) => {
+      if (userId === 'admin-1') return [connectedMetaAccount];
+      if (userId === 'target-1') return [targetAccount];
+      return [];
+    });
+    (fetchWithRetryAndPaging as jest.Mock).mockImplementation(async (url: string) => {
+      if (url.includes('/campaigns?')) return { data: [] };
+      return emptyMetaResponse;
+    });
+  });
+
+  it('returns an admin-only connection error for a non-admin caller passing client_id', async () => {
+    (userDb.getUserById as jest.Mock).mockImplementation(async (id: string) => {
+      if (id === 'caller-1') return { id: 'caller-1', userId: 'caller-1', isAdmin: false };
+      if (id === 'target-1') return { id: 'target-1', userId: 'target-1', email: 'client@example.com', roles: ['customer'] };
+      return null;
+    });
+
+    const result = await service.getMetaAdsMetrics(
+      '7d', 'caller-1', ['campaign-1'], 'target-account-id',
+      { clientId: 'client@example.com', toolName: 'get_meta_ads_metrics' },
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      errorType: 'connection',
+      error: expect.stringMatching(/admin/i),
+    }));
+    expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
+  });
+
+  it('resolves a named client cross-tenant and queries THEIR account, not the caller\'s', async () => {
+    const result = await service.getMetaAdsMetrics(
+      '7d', 'admin-1', ['campaign-1'], 'target-account-id',
+      { clientId: 'client@example.com', toolName: 'get_meta_ads_metrics' },
+    );
+
+    expect(result.success).toBe(true);
+    for (const [url] of (fetchWithRetryAndPaging as jest.Mock).mock.calls) {
+      expect(url).toContain('/act_target-account-id/');
+      expect(url).toContain('access_token=target-token');
+    }
+  });
+
+  it('requires an explicit account_id when client_id is present, even with exactly one target account', async () => {
+    const result = await service.getMetaAdsMetrics(
+      '7d', 'admin-1', ['campaign-1'], undefined,
+      { clientId: 'client@example.com', toolName: 'get_meta_ads_metrics' },
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      errorType: 'connection',
+      error: expect.stringMatching(/explicit account_id/i),
     }));
     expect(fetchWithRetryAndPaging).not.toHaveBeenCalled();
   });
