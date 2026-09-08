@@ -27,7 +27,11 @@ import {
 import { twitterService } from "../services/twitterService";
 import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
 import { listSpendEvents } from "../services/spendEventDb";
-import { buildSpendBreakdown } from "../services/spendReadModel";
+import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
+import { projectMonth } from "../services/spendProjection";
+import { getSubscriptionTypeConfig } from "../services/subscriptionService";
+import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
+import { userDb } from "../services/db";
 
 const router = express.Router();
 
@@ -60,8 +64,25 @@ router.get(
       // `-31` is safe for every month: it is an upper bound on a string
       // comparison, not a date that has to exist.
       const events = await listSpendEvents(billingUserId, `${month}-01`, `${month}-31`);
+      const breakdown = buildSpendBreakdown(billingUserId, month, events);
 
-      return res.json(buildSpendBreakdown(billingUserId, month, events));
+      const allowance = await resolveAllowanceInputs(billingUserId, month, {
+        getUser: (id) => userDb.getUserById(id) as any,
+        getTierConfig: (tier) => getSubscriptionTypeConfig(tier) as any,
+        getCreditAdjustment: (ledger, m) => getLlmUsageCreditAdjustment(ledger as any, m),
+      });
+
+      // Computed from the SAME events the breakdown reports, so the
+      // explanation and the numbers behind it can never disagree.
+      const projection = projectMonth(billingUserId, month, events, allowance);
+
+      return res.json({
+        ...breakdown,
+        allowance,
+        projection,
+        // §7: "no admin should need direct DynamoDB inspection to explain a pause"
+        pause: explainPause(projection, breakdown),
+      });
     } catch (error: any) {
       console.error("[adminUsage] spend breakdown failed:", error?.message || error);
       return res.status(500).json({ error: "Failed to build spend breakdown" });

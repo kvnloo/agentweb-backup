@@ -8,7 +8,7 @@
  * as spend, and that the pause explanation cannot contradict the decision it
  * explains.
  */
-import { buildSpendBreakdown, explainPause } from '../services/spendReadModel';
+import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from '../services/spendReadModel';
 import { SpendEvent } from '../services/spendEventDb';
 import { MonthlyProjection } from '../services/spendProjection';
 
@@ -216,5 +216,62 @@ describe('explainPause', () => {
     );
 
     expect(e.paused).toBe(false);
+  });
+});
+
+describe('resolveAllowanceInputs', () => {
+  const adjustment = { purchasedMicroUsd: 2_000_000, adminGrantedMicroUsd: 500_000, migrationOffsetMicroUsd: 300_000 };
+  const deps = (over: Partial<Parameters<typeof resolveAllowanceInputs>[2]> = {}) => ({
+    getUser: async () => ({ subscriptionType: 'Pro', llmUsageCredits: {} }),
+    getTierConfig: async () => ({ llmUsagePolicy: { hardCostThresholdMicroUsd: 200_000_000 } }),
+    getCreditAdjustment: () => adjustment,
+    ...over,
+  });
+
+  it('reads every input from the same places the live gate reads them', async () => {
+    const a = await resolveAllowanceInputs('owner-1', '2026-09', deps());
+
+    expect(a).toEqual({
+      includedAllowanceMicroUsd: 200_000_000,
+      purchasedCreditsMicroUsd: 2_000_000,
+      adminAdjustmentMicroUsd: 500_000,
+      migrationAdjustmentMicroUsd: 300_000,
+      unlimited: false,
+    });
+  });
+
+  it('ADDS the migration offset rather than subtracting it', async () => {
+    // The unit-economics report applies the same adjustment by reducing SPEND;
+    // the projection applies it by raising the ALLOWANCE. Same inequality,
+    // opposite sides — flipping the sign here would silently double the error.
+    const a = await resolveAllowanceInputs('owner-1', '2026-09', deps());
+
+    expect(a.migrationAdjustmentMicroUsd).toBe(+300_000);
+  });
+
+  it('marks a tier with no policy as unlimited, not as zero allowance', async () => {
+    // Defaulting to 0 would report every uncapped account as massively
+    // overspent and paused — the opposite of the truth.
+    const a = await resolveAllowanceInputs('owner-1', '2026-09', deps({ getTierConfig: async () => ({}) } as any));
+
+    expect(a.unlimited).toBe(true);
+  });
+
+  it('handles a user with no subscription type without calling the tier lookup', async () => {
+    const getTierConfig = jest.fn();
+    const a = await resolveAllowanceInputs('owner-1', '2026-09', deps({
+      getUser: async () => ({}),
+      getTierConfig,
+    } as any));
+
+    expect(getTierConfig).not.toHaveBeenCalled();
+    expect(a.unlimited).toBe(true);
+  });
+
+  it('passes the requested month through to the credit ledger', async () => {
+    const getCreditAdjustment = jest.fn().mockReturnValue(adjustment);
+    await resolveAllowanceInputs('owner-1', '2026-07', deps({ getCreditAdjustment } as any));
+
+    expect(getCreditAdjustment).toHaveBeenCalledWith(expect.anything(), '2026-07');
   });
 });

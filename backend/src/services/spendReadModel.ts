@@ -219,3 +219,56 @@ export function explainPause(
     topProviders,
   };
 }
+
+/**
+ * Resolve the allowance side of the projection for one billing subject and
+ * month (ENG-1250 §3), so `explainPause` has something to explain against.
+ *
+ * Every input is read from the SAME places the live gate reads them —
+ * `getSubscriptionTypeConfig` for the tier's policy and
+ * `getLlmUsageCreditAdjustment` for credits, grants and the migration offset.
+ * Resolving them independently would create a second definition of "what this
+ * account is allowed to spend", and the two would drift silently: the pause
+ * explanation would then contradict the pause.
+ *
+ * One sign convention needs care. The unit-economics report applies the
+ * migration offset by REDUCING spend (`llmCost - migrationOffset`), while the
+ * projection applies it by RAISING the allowance. Those are the same
+ * adjustment on opposite sides of the same inequality, so the offset is added
+ * here rather than subtracted — flipping it would silently double the error.
+ */
+export async function resolveAllowanceInputs(
+  billingUserId: string,
+  month: string,
+  deps: {
+    getUser: (id: string) => Promise<{ subscriptionType?: string; llmUsageCredits?: unknown } | null | undefined>;
+    getTierConfig: (tier: string) => Promise<{ llmUsagePolicy?: { hardCostThresholdMicroUsd: number } | null } | null | undefined>;
+    getCreditAdjustment: (
+      ledger: unknown,
+      month: string,
+    ) => { purchasedMicroUsd: number; adminGrantedMicroUsd: number; migrationOffsetMicroUsd: number };
+  },
+): Promise<{
+  includedAllowanceMicroUsd: number;
+  purchasedCreditsMicroUsd: number;
+  adminAdjustmentMicroUsd: number;
+  migrationAdjustmentMicroUsd: number;
+  /** True when the tier has no configured cap — an unlimited account cannot be paused by spend. */
+  unlimited: boolean;
+}> {
+  const user = await deps.getUser(billingUserId);
+  const config = user?.subscriptionType ? await deps.getTierConfig(user.subscriptionType) : null;
+  const policy = config?.llmUsagePolicy ?? null;
+  const adjustment = deps.getCreditAdjustment(user?.llmUsageCredits, month);
+
+  return {
+    // A tier with no policy is uncapped, not zero-allowance. Defaulting to 0
+    // would report every such account as massively overspent and paused, which
+    // is the opposite of the truth.
+    includedAllowanceMicroUsd: policy?.hardCostThresholdMicroUsd ?? 0,
+    purchasedCreditsMicroUsd: adjustment.purchasedMicroUsd,
+    adminAdjustmentMicroUsd: adjustment.adminGrantedMicroUsd,
+    migrationAdjustmentMicroUsd: adjustment.migrationOffsetMicroUsd,
+    unlimited: policy == null,
+  };
+}
