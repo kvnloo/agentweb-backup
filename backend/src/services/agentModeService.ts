@@ -32657,14 +32657,24 @@ ${strippedHtml}`;
       // with the user. A planId-based match is exempt — an id is unambiguous by
       // construction, and this is exactly the retry path this response's own message
       // points the model at once the user disambiguates.
+      //
+      // Round-2 review: also catches an EXACT-duplicate title (a different planId whose
+      // normalized title is identical, not just one-word-different) -- arguably more
+      // dangerous than a near-duplicate, since normalizeWorkPlanTitleForMatch resolves
+      // both candidates equally and `.find()` above silently picked whichever happened
+      // to come first in the candidates array, with zero signal distinguishing intent.
+      // Nothing in workPlanService.ts enforces title uniqueness across visibility scopes,
+      // so this is a real (if narrow) possibility, not just theoretical.
       if (!matchedByPlanId) {
-        const nearDuplicateSibling = candidates.find((p) =>
-          p.planId !== predefinedPlan.planId && p.title && areNearDuplicateWorkPlanTitles(p.title, predefinedPlan.title)
+        const ambiguousSibling = candidates.find((p) =>
+          p.planId !== predefinedPlan.planId && p.title
+            && (normalizeWorkPlanTitleForMatch(p.title) === normalizeWorkPlanTitleForMatch(predefinedPlan.title)
+              || areNearDuplicateWorkPlanTitles(p.title, predefinedPlan.title))
         );
-        if (nearDuplicateSibling) {
+        if (ambiguousSibling) {
           return {
             success: false,
-            message: `"${predefinedPlan.title}" has a similarly-named template ("${nearDuplicateSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
             requiresConfirmation: true,
           };
         }

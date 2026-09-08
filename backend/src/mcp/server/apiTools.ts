@@ -2236,7 +2236,14 @@ mcpToolRegistry.register({
     // top-level fields launch/recommend calls actually reference.
     const compact = Array.isArray(data)
       ? data.map((p: any) => ({
-          id: p.id,
+          // Non-admin (getAllPredefinedWorkPlans) already remaps to `id`. Admin
+          // (getAllWorkPlans -> raw WorkPlan records) never has `id` at all -- only
+          // `planId`, the interface's actual primary key (workPlanService.ts) -- so
+          // `p.id` alone silently dropped the identifier entirely for every
+          // admin/delegated listing (JSON.stringify drops an undefined key), worse
+          // than the pre-fix raw passthrough. Fall back to `planId` so both shapes
+          // keep a real identifier under the `id` key recommend/launch expect.
+          id: p.id ?? p.planId,
           title: p.title,
           category: p.category,
           autocomplete: p.autocomplete,

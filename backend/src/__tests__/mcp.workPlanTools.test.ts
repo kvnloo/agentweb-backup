@@ -120,6 +120,26 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(result.content[0].text).toContain('pending_review');
     });
 
+    // ENG-1814 round-2 review finding: the admin route (getAllWorkPlans, backed by the
+    // raw WorkPlan interface in workPlanService.ts) never returns an `id` field at all --
+    // only `planId`, its actual primary key -- unlike the non-admin route's already-
+    // remapped shape (`id: 'wp-1'` above). The compact-listing map's `id: p.id` alone
+    // silently dropped the identifier entirely for every admin/delegated listing
+    // (JSON.stringify drops an undefined key), worse than the pre-fix raw passthrough --
+    // confirmed live-code-trace by an independent reviewer, and independently reverified
+    // here before fixing. This is the realistic admin-shape repro; the test above uses
+    // `id` (matching the non-admin remap) deliberately, not as an oversight.
+    it('preserves the plan identifier for admin listings, which only carry planId (not id)', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+      mockMcpFetch.mockResolvedValue([{ planId: 'wp-admin-1', title: 'Onboarding', visibility: 'pending_review' }]);
+
+      const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, { userId: 'admin-1' });
+      const text = result.content[0].text as string;
+
+      expect(text).toContain('wp-admin-1');
+      expect(JSON.parse(text)[0].id).toBe('wp-admin-1');
+    });
+
     it('admin-delegated sessions get the admin list without a user lookup', async () => {
       mockMcpFetch.mockResolvedValue([{ id: 'wp-1', title: 'Onboarding' }]);
 

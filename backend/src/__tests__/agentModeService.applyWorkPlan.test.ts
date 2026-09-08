@@ -519,5 +519,36 @@ describe('AgentModeService - predefined work plan templates', () => {
         expect(result.requiresConfirmation).toBeUndefined();
       });
     });
+
+    // ENG-1814 round-2 review finding: a DIFFERENT candidate whose normalized title is
+    // IDENTICAL (not just one-word-different) is at least as dangerous as a near-duplicate
+    // sibling -- normalizeWorkPlanTitleForMatch resolves both equally, and the plain
+    // `.find()` that resolves `predefinedPlan` silently picks whichever happens to come
+    // first in the candidates array, with zero signal distinguishing intent. Nothing in
+    // workPlanService.ts enforces title uniqueness across visibility scopes (e.g. a private
+    // plan can share a title with a system plan), so this is a real possibility, not just
+    // theoretical.
+    it('ENG-1814: also blocks an EXACT-duplicate title across two different planIds, not just a near-duplicate', async () => {
+      const planA: any = { ...systemTemplate, planId: 'plan-dup-a', title: 'Weekly_Content_Recap', visibility: 'system' };
+      const planB: any = { ...systemTemplate, planId: 'plan-dup-b', title: 'Weekly_Content_Recap', visibility: 'private' };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [planA] : []
+      );
+      mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([planB]);
+
+      const result = await service.applyPredefinedWorkPlan('Weekly Content Recap', sessionId, 'user-1');
+
+      expect(result.success).toBe(false);
+      expect(result.requiresConfirmation).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+
+      // The retry-by-planId escape hatch still works.
+      const retried = await service.applyPredefinedWorkPlan('plan-dup-a', sessionId, 'user-1');
+      expect(retried.success).toBe(true);
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ templatePlanId: 'plan-dup-a' })
+      );
+    });
   });
 });
