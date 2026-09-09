@@ -3,6 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 
 import SpendLedgerBody, {
+  MAX_ROWS_PER_CUT,
   usdFromMicro,
   committedMicroUsd,
   committedPercent,
@@ -259,6 +260,58 @@ describe("SpendLedgerBody", () => {
     }
     expect(screen.getByTestId("spend-ledger-daily")).toHaveTextContent("2026-09-04");
     expect(within(screen.getByTestId("spend-slice-byProvider")).getByText("apollo")).toBeInTheDocument();
+  });
+
+  it("caps an unbounded cut and counts the tail rather than dropping it", () => {
+    // bySession is one row per session in the month. Rendering all of them is a
+    // slow modal; hiding them silently would make the visible rows look like the
+    // whole month, so the remainder is stated and the totals still include it.
+    const many = Array.from({ length: MAX_ROWS_PER_CUT + 7 }, (_, i) => ({
+      key: `session-${i}`,
+      settledMicroUsd: 1_000,
+      reservedMicroUsd: 0,
+      eventCount: 1,
+      percentOfSettled: 1,
+    }));
+    render(<SpendLedgerBody data={payload({ bySession: many })} />);
+
+    const cut = screen.getByTestId("spend-slice-bySession");
+    expect(within(cut).getAllByText(/^session-/)).toHaveLength(MAX_ROWS_PER_CUT);
+    const more = screen.getByTestId("spend-slice-bySession-more");
+    expect(more).toHaveTextContent("7 more");
+    expect(more).toHaveTextContent("included in every total above");
+  });
+
+  it("caps the open-reservations table the same way", () => {
+    const many = Array.from({ length: MAX_ROWS_PER_CUT + 3 }, (_, i) => ({
+      eventId: `evt-${i}`,
+      occurredAt: "2026-09-04T10:00:00.000Z",
+      provider: "v0",
+      operation: "landing_page_generation",
+      costMicroUsd: 1_000,
+      actingUserId: "member-1",
+    }));
+    render(
+      <SpendLedgerBody
+        data={payload({
+          inFlight: many,
+          inFlightMicroUsd: many.length * 1_000,
+          projection: projection({ reservedMicroUsd: many.length * 1_000, reservedEventCount: many.length }),
+        })}
+      />,
+    );
+
+    const table = screen.getByTestId("spend-ledger-inflight-table");
+    expect(within(table).getAllByText("v0")).toHaveLength(MAX_ROWS_PER_CUT);
+    expect(screen.getByTestId("spend-ledger-inflight-more")).toHaveTextContent("3 more not shown");
+    // The headline still counts every reservation, capped rendering or not.
+    expect(screen.getByTestId("spend-ledger-inflight")).toHaveTextContent("$0.0280");
+  });
+
+  it("adds no remainder note when a cut fits", () => {
+    render(<SpendLedgerBody data={payload()} />);
+    expect(screen.queryByTestId("spend-slice-byProvider-more")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("spend-ledger-inflight-more")).not.toBeInTheDocument();
   });
 
   it("states an empty cut instead of rendering an empty table", () => {

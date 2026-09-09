@@ -176,9 +176,23 @@ const SLICE_TITLES: Record<string, { title: string; caption: string }> = {
   bySession: { title: "By session", caption: "Which run or chat it belonged to" },
 };
 
+/**
+ * Rows rendered per cut before the tail is summarised.
+ *
+ * `bySession` is one row per session in the month and `inFlight` one per open
+ * reservation — both unbounded for a busy billing root, unlike `daily` (~31),
+ * `byProvider` (the vendor set) and `byFeature`. Rendering thousands of rows in
+ * a modal is a slow render, not wrong data, so the tail is COUNTED rather than
+ * dropped: an omitted row that nothing mentions would make the visible rows
+ * look like the whole month (CodeRabbit, PR #2843).
+ */
+export const MAX_ROWS_PER_CUT = 25;
+
 const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) => {
   const meta = SLICE_TITLES[id];
   const max = Math.max(...rows.map((r) => r.settledMicroUsd + r.reservedMicroUsd), 0);
+  const shown = rows.slice(0, MAX_ROWS_PER_CUT);
+  const hidden = rows.length - shown.length;
 
   return (
     <Box sx={{ mb: 2 }} data-testid={`spend-slice-${id}`}>
@@ -206,7 +220,7 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
             </TableRow>
           </TableHead>
           <TableBody>
-            {rows.map((r) => (
+            {shown.map((r) => (
               <TableRow key={r.key} hover>
                 <TableCell>
                   {r.key}
@@ -232,6 +246,12 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
             ))}
           </TableBody>
         </Table>
+      )}
+      {hidden > 0 && (
+        <Typography variant="caption" color="text.secondary" data-testid={`spend-slice-${id}-more`}>
+          Showing the {MAX_ROWS_PER_CUT} largest of {rows.length.toLocaleString()} — {hidden.toLocaleString()} more
+          not shown, but included in every total above.
+        </Typography>
       )}
     </Box>
   );
@@ -429,7 +449,7 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {data.inFlight.map((r) => (
+                  {data.inFlight.slice(0, MAX_ROWS_PER_CUT).map((r) => (
                     <TableRow key={r.eventId} hover>
                       <TableCell>{shortInstant(r.occurredAt)}</TableCell>
                       <TableCell>
@@ -447,6 +467,14 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                   ))}
                 </TableBody>
               </Table>
+              {data.inFlight.length > MAX_ROWS_PER_CUT && (
+                <Typography variant="caption" color="text.secondary" data-testid="spend-ledger-inflight-more">
+                  Showing the {MAX_ROWS_PER_CUT} most recent of{" "}
+                  {data.inFlight.length.toLocaleString()} open reservations —{" "}
+                  {(data.inFlight.length - MAX_ROWS_PER_CUT).toLocaleString()} more not shown, but the
+                  in-flight total above counts all of them.
+                </Typography>
+              )}
             </Box>
           )}
 
