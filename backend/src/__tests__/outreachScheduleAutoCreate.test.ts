@@ -234,6 +234,29 @@ describe('autoCreateOutreachSchedule', () => {
     expect(deps.countTemplateUse).toHaveBeenCalledWith('tpl-1');
   });
 
+  // Found in production 2026-09-09: the row was written perfectly and the schedule
+  // still never ran. `runScheduledChats` accepts prefilled variables only through
+  // `prefilledWithoutRequest` = `!variableRequestSentAt && variableValuesUpdatedAt`,
+  // so an absent timestamp fails the gate despite `variableRequestStatus: 'provided'`
+  // and every value being present. The schedule then emails its owner asking for the
+  // ICP they just supplied at onboarding, advances nextRunTime a day, and repeats
+  // forever. Checking the written row is NOT the same as checking it runs.
+  it('stamps variableValuesUpdatedAt, without which the schedule never runs', async () => {
+    process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
+    const deps = makeDeps();
+    await autoCreateOutreachSchedule({
+      userId: 'user-1', leadListId: 'list-1', icpDescription: 'Heads of Clinical Ops', deps,
+    });
+
+    const created = (deps.createSchedule as jest.Mock).mock.calls[0][0];
+    expect(typeof created.variableValuesUpdatedAt).toBe('string');
+    expect(created.variableValuesUpdatedAt).not.toBe('');
+    expect(Number.isNaN(Date.parse(created.variableValuesUpdatedAt))).toBe(false);
+    // The gate also requires that no variable request was ever sent for a prefilled
+    // schedule, so this path must not set that marker.
+    expect(created.variableRequestSentAt).toBeUndefined();
+  });
+
   it('fills EVERY template variable — a blank one hard-fails the first run', async () => {
     process.env[OUTREACH_AUTO_CREATE_FLAG] = 'true';
     const deps = makeDeps();

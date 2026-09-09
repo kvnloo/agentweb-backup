@@ -523,6 +523,30 @@ describe('Schedule Templates', () => {
       expect(res.status).toHaveBeenCalledWith(404);
     });
 
+    // Found in production 2026-09-09: a schedule created here with every variable
+    // supplied still never ran. `runScheduledChats` accepts prefilled values only via
+    // `prefilledWithoutRequest` = `!variableRequestSentAt && variableValuesUpdatedAt`,
+    // so omitting the timestamp fails the gate even with `variableRequestStatus:
+    // 'provided'`. The schedule emails its owner for the values it already holds and
+    // pushes nextRunTime out one interval, every interval.
+    it('stamps variableValuesUpdatedAt, without which the schedule never runs', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(baseTemplate);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { variableValues: { website: 'https://example.com' } },
+      });
+      await agentModeController.createScheduleFromTemplate(req as any, mockRes());
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.variableRequestStatus).toBe('provided');
+      expect(typeof created.variableValuesUpdatedAt).toBe('string');
+      expect(Number.isNaN(Date.parse(created.variableValuesUpdatedAt))).toBe(false);
+      expect(created.variableRequestSentAt).toBeUndefined();
+    });
+
     it('should create scheduled chat from template with variable values', async () => {
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(baseTemplate);
       (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});

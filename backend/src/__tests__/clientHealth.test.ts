@@ -34,11 +34,16 @@ jest.mock('../services/adsThresholdsDb', () => ({
   getThresholdsForAccount: jest.fn().mockResolvedValue([]),
 }));
 
+jest.mock('../services/metaTokenRefresh', () => ({
+  ensureFreshMetaAdAccountToken: jest.fn().mockResolvedValue({ attempted: false, refreshed: false }),
+}));
+
 import { assessClientHealth, listAllClients } from '../services/clientHealthService';
 
 const { userDb } = require('../services/db');
 const { getAccountsByUserId } = require('../services/connectedAccountsDb');
 const { getLandingPagesByOwner, getLandingPagesByOrg } = require('../services/v0Service');
+const { ensureFreshMetaAdAccountToken } = require('../services/metaTokenRefresh');
 
 describe('Client Health - assessClientHealth', () => {
   beforeEach(() => {
@@ -173,6 +178,223 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.creative_variety.distinct_creatives).toBe(3);
     expect(result.health.status).toBeDefined();
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
+  });
+
+  // ENG-1767: the client's OWN connected Meta token, account id resolution, and precedence
+  // against the legacy `adAccount` field.
+  describe('ENG-1767 — connected-account token and account-id precedence', () => {
+    const { getMetaAccessToken } = require('../utils/secretsManager');
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+
+    function mockAdmin() {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    }
+
+    it('uses the client\'s own connected token, not the shared app-wide token', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-999',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '999999', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_999999/campaigns')
+      );
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('access_token=clients-own-token')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('999999');
+    });
+
+    it('falls back to the shared token only when there is no connected Meta account (legacy-only)', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '777777',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).toHaveBeenCalledTimes(1);
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_777777/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('777777');
+    });
+
+    it('mutation: prefers the connected account over a DIFFERING legacy adAccount field, consistently everywhere the id is used', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '111111', // legacy field — must NOT win when a connected account exists
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-222',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      // The connected account's id must win — in the fetch URL AND in the reported ad_account_id —
+      // never the legacy field, and never disagreeing between the two.
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_222222/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('222222');
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+    });
+
+    // Review-flagged bug: id and token were previously resolved as two INDEPENDENT `||` chains,
+    // not a genuine matched pair. A connected account with a real ad_account_id but an empty
+    // access_token would pick the connected id (only checked ad_account_id) paired with the
+    // SHARED token (access_token was falsy) — silently reintroducing the exact bug this PR fixes.
+    it('falls back to the legacy id + shared token TOGETHER when the connected account has no usable token, never mixing the two', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '333333',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-444',
+          account_name: 'Client Meta Ads',
+          // ad_account_id is real, but access_token is falsy — must NOT be treated as usable.
+          config: { account_type: 'ad_account', ad_account_id: '444444', access_token: '' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      // Must use the LEGACY id (333333), not the connected account's id (444444) — using
+      // 444444 with the shared token would be exactly the bug this PR exists to fix.
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_333333/campaigns')
+      );
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalledWith(
+        expect.stringContaining('act_444444')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('333333');
+      expect(getMetaAccessToken).toHaveBeenCalledTimes(1);
+      expect(ensureFreshMetaAdAccountToken).not.toHaveBeenCalled();
+    });
+
+    it('refreshes the connected token before reading it, and uses the REFRESHED value, not the stale pre-refresh one', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '',
+      });
+      const connectedAccount = {
+        platform: 'meta',
+        account_id: 'meta-555',
+        account_name: 'Client Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '555555', access_token: 'stale-token' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      };
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([connectedAccount]);
+      // Simulate a successful refresh: ensureFreshMetaAdAccountToken mutates config in place,
+      // exactly like the real implementation does on success.
+      (ensureFreshMetaAdAccountToken as jest.Mock).mockImplementationOnce(async (account: any) => {
+        account.config.access_token = 'freshly-refreshed-token';
+        return { attempted: true, refreshed: true };
+      });
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(ensureFreshMetaAdAccountToken).toHaveBeenCalledWith(connectedAccount, 'client-user');
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('access_token=freshly-refreshed-token')
+      );
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalledWith(
+        expect.stringContaining('access_token=stale-token')
+      );
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    });
+
+    it('uses the resolved account id for the thresholds lookup too (the third reuse site), not just the campaigns fetch', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '666666', // legacy field — a differing id, must NOT be what thresholds are looked up under
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-888',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '888888', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      // Need at least one ACTIVE ad with a creative for `activeAds.length > 0`, which is what
+      // gates the thresholds lookup — an empty-campaigns response never exercises this branch.
+      (fetchWithRetryAndPaging as jest.Mock)
+        .mockResolvedValueOnce({
+          data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        })
+        .mockResolvedValueOnce({
+          data: [
+            { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+          ],
+        });
+      const { getThresholdsForAccount } = require('../services/adsThresholdsDb');
+
+      await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(getThresholdsForAccount).toHaveBeenCalledWith('meta', '888888');
+      expect(getThresholdsForAccount).not.toHaveBeenCalledWith('meta', '666666');
+    });
   });
 
   // Fatigue detection: frequency ceiling (default 3.5), CTR-drop / CPM-rise vs prior-period
