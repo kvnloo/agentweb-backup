@@ -14631,6 +14631,16 @@ export const agentModeController = {
         variables: templateVars,
         variableValues: normalizedVariableValues,
         variableRequestStatus: missingVars.length > 0 ? 'pending' : (templateVars.length > 0 ? 'provided' : 'idle'),
+        // Without this the schedule NEVER RUNS. runScheduledChats treats prefilled
+        // values as satisfied only via `prefilledWithoutRequest`, which is
+        // `!variableRequestSentAt && variableValuesUpdatedAt` — so an absent
+        // timestamp fails the gate even though `variableRequestStatus` is
+        // 'provided' and every value is present. The schedule then emails its owner
+        // asking for the variables it already holds, advances nextRunTime by one
+        // interval, and repeats that forever. `createScheduledChat`,
+        // `updateScheduledChat` and both `submitScheduledChatVariables` paths all
+        // stamp it; this path and the ENG-1723 auto-create were the two that did not.
+        variableValuesUpdatedAt: now.toISOString(),
       };
 
       await scheduleDb.createSchedule(scheduledChat);

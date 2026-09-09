@@ -358,6 +358,12 @@ export async function autoCreateOutreachSchedule(params: {
     variables: template!.variables || [],
     variableValues,
     variableRequestStatus: 'provided',
+    // Required, or this schedule never runs — see agentModeController's
+    // `createScheduleFromTemplate` for the full explanation. runScheduledChats
+    // accepts prefilled values only when `variableValuesUpdatedAt` is set, so
+    // without it the customer gets an auto-created schedule that silently never
+    // fires and instead emails them for the ICP they just supplied at onboarding.
+    variableValuesUpdatedAt: now.toISOString(),
     // AC #4: the idempotency key. Stamped rather than inferred from the name, so
     // a customer renaming their schedule cannot cause a duplicate to be created.
     autoCreatedFromTemplateId: template!.templateId,
