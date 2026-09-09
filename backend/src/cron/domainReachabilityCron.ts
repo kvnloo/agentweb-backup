@@ -108,6 +108,26 @@ async function mapLimit<T, R>(
   return results;
 }
 
+/*
+ * KNOWN GAP — no prober-health circuit breaker.
+ *
+ * The confirmation threshold defends against a per-domain blip. It does nothing about a fault
+ * in the PROBER: an egress DNS failure, a NAT/proxy outage, or a security-group change on the
+ * EB instance makes every probe fail at once, and the sweep would eventually tell every
+ * customer their page is unreachable. A monitor that cries wolf gets tuned out, which is the
+ * same way the original bug survived.
+ *
+ * Not fixed here, deliberately, because the blast radius is already bounded: every error code
+ * such an outage produces — ENOTFOUND, ECONNRESET, ECONNREFUSED, ETIMEDOUT, EAI_AGAIN,
+ * TIMEOUT — is classified SUSPECT, never DEFINITIVE, and unknown codes default to suspect too.
+ * So nothing is shown to any customer until THREE consecutive hourly rounds have failed. A
+ * transient outage self-heals long before that, and a three-hour total egress failure is an
+ * incident someone is already looking at.
+ *
+ * The real fix is a batch-level guard: if a sweep's failure ratio exceeds ~50%, treat the
+ * prober as suspect and skip persisting verdicts for that round. It needs a two-phase
+ * restructure (probe all, then decide), which is why it is not bolted on here.
+ */
 export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
   const summary: SweepSummary = {
     considered: 0,
