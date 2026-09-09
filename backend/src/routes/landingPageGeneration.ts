@@ -1832,23 +1832,56 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
-    const checksRes = await axios.get<any>(
-      `${repoBase}/commits/${draftSha}/check-runs`,
-      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
-    );
-    const testsCheck = (checksRes.data.check_runs || []).find(
+    // Does this repository have ANY CI at all?
+    //
+    // The required-`Tests` gate below is correct for a repo that runs tests, and unsatisfiable
+    // for one that does not. Generated landing-page repos contain no `.github/workflows`, so no
+    // check named "Tests" can ever appear and publish returned 409 `required_tests_pending`
+    // forever — the error even said "retry after GitHub starts it", which GitHub never would.
+    // That is one of the reasons a customer's rebuilt page could not be published at all.
+    //
+    // FAIL CLOSED: the gate is skipped only when GitHub POSITIVELY reports zero workflows. If
+    // the lookup errors for any reason, `hasCi` stays true and the gate applies exactly as
+    // before — an unreadable answer must never be mistaken for "no tests to run".
+    let hasCi = true;
+    try {
+      const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {
+        headers: ghHeaders,
+        timeout: GITHUB_TIMEOUT_MS,
+      });
+      hasCi = (workflowsRes.data?.total_count ?? 1) > 0;
+    } catch (wfErr: any) {
+      console.warn(
+        `[LP GENERATION] Could not list workflows for ${owner}/${repoName}; ` +
+          `keeping the required-Tests gate: ${wfErr.message}`
+      );
+    }
+
+    const checksRes = hasCi
+      ? await axios.get<any>(`${repoBase}/commits/${draftSha}/check-runs`, {
+          headers: ghHeaders,
+          timeout: GITHUB_TIMEOUT_MS,
+        })
+      : null;
+    const testsCheck = (checksRes?.data.check_runs || []).find(
       (check: { name?: string }) => check.name === "Tests"
     );
 
-    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
+    if (!hasCi) {
+      console.log(
+        `[LP GENERATION] ${owner}/${repoName} defines no workflows — no Tests check can exist, ` +
+          `so the required-Tests gate does not apply to this publish.`
+      );
+    } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
       const message = !testsCheck
         ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
         : testsCheck.conclusion === "cancelled"
           ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
         : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
       return res.status(409).json({ error: "required_tests_pending", message });
-    }
-    if (testsCheck.conclusion !== "success") {
+    } else if (testsCheck.conclusion !== "success") {
+      // Chained onto the branch above: when there is no CI, `testsCheck` is undefined and
+      // reading `.conclusion` here would throw.
       return res.status(409).json({
         error: "required_tests_failed",
         message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
