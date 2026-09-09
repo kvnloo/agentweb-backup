@@ -2930,14 +2930,38 @@ describe("v0Service - resolveLandingPageLiveUrl", () => {
 
   it("prefers a verified custom domain over a managed subdomain when adopting", async () => {
     mockListDomains.mockResolvedValueOnce([
-      { domain: "old.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },
-      { domain: "landing.every.io", vercelProjectId: "proj-1", type: "custom", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "old.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+      { domain: "landing.every.io", vercelProjectId: "proj-1", type: "custom", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
     ]);
     const url = await resolveLandingPageLiveUrl({
       vercelProjectId: "proj-1",
       userId: "owner-1",
     });
     expect(url).toBe("https://landing.every.io");
+  });
+
+  /*
+   * ENG-1839. The test above carried this exact name while its fixture set no `status` at
+   * all, so it passed identically whether or not the code checked verification — it could
+   * never have caught the bug its own name describes.
+   *
+   * This is the case that was actually broken: `resolveLandingPageLiveUrl` feeds `live_url`
+   * on publish/edit and the "Your site at … will update shortly." message, so an unverified
+   * custom domain winning here told the customer their site was live at a host with no DNS
+   * — while the list route, already fixed, correctly showed the working subdomain.
+   */
+  it("does NOT adopt a custom domain that is still pending verification", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "works.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", status: "active", updatedAt: "2026-01-01T00:00:00Z" },
+      // Newer, so an `updatedAt` tiebreak would pick it — a two-tier fix is not enough.
+      { domain: "newsite.acme.io", vercelProjectId: "proj-1", type: "custom", status: "pending_verification", updatedAt: "2026-06-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+      slug: "acme",
+    });
+    expect(url).toBe("https://works.agentwebforms.com/acme");
   });
 
   it("breaks ties between managed subdomains by most-recently-updated", async () => {
