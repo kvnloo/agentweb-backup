@@ -265,8 +265,13 @@ build when an allowlisted module starts metering** — so the allowlist cannot r
   asserts the registry and the adapters agree in both directions.
 - **`availableProviders`** on the response — the picker's option list, computed over the
   **unfiltered** window so it does not collapse to whatever is selected. Union of the registry
-  and the providers actually present, which covers both a vendor with no spend yet and a vendor
+  and the vendors actually present, which covers both a vendor with no spend yet and a vendor
   whose adapter shipped after the registry was last edited.
+  ⚠️ **"Present" must mean `isVendorEntry` (provider AND unit), not `provider` alone.**
+  [[ENG-693]] gave LLM rows a `provider` too, so keying on it put `bedrock`, `gemini`, `openai`,
+  `azure-openai` and `openrouter` into a per-unit vendor picker — shipped to production and
+  caught in the post-deploy check, not by tests, whose fixtures only set `provider` on vendor
+  rows. The option list and the `"llm"` filter must share one discriminator.
 - **`provider` semantics — already generic:**
   - `"llm"` (**default**, so the LLM Costs tab that sends no param never sees vendor rows),
   - `"all"` — no filter,
@@ -807,3 +812,4 @@ anything else.
 | 2026-09-09 | Claude (Opus 5, same session) | §10.6 corrected: CI runs no jest job at all (builds only) — the earlier "CI path-filters the portal tests" wording implied they run somewhere. |
 | 2026-09-09 | Claude (Opus 5, same session) | CodeRabbit PR #2841: scrubbed real billing-subject ids and per-customer spend from §1 and §7 (kept the divergence shape, pointed at the access-controlled ENG-1250 comment); replaced machine-specific absolute paths in §0/§9 with repo-relative ones. |
 | 2026-09-09 | Claude (Opus 5, same session) | ENG-1837 shipped (PR #2841): `N-READ-AGGREGATION` gains `METERED_VENDOR_PROVIDERS` + `availableProviders`; `N-UI-ADMIN-USAGECOST` is no longer X-pinned; §5 row 4 closed. |
+| 2026-09-09 | Claude (Opus 5, same session) | Recorded the `provider`-alone vs `isVendorEntry` discriminator in `N-READ-AGGREGATION` after LLM providers leaked into the picker in production. |

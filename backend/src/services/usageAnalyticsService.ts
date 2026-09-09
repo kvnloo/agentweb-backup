@@ -353,18 +353,27 @@ export const METERED_VENDOR_PROVIDERS = [
 export const AGGREGATION_SCOPES = ["all", "llm"] as const;
 
 /**
- * The provider a ledger row belongs to, or undefined when it is an LLM row.
+ * The VENDOR a ledger row belongs to, or undefined when it is an LLM row.
  *
- * Reads BOTH signals `recordVendorUsage` writes — the `provider` attribute and
+ * Reads both signals `recordVendorUsage` writes — the `provider` attribute and
  * the `"{provider}:{operation}"` model namespace — because the filter in
  * getCostAggregation matches on either. Deriving the option list from only one
- * of them would drop a provider from the dropdown while its rows stayed
- * perfectly filterable, which is worse than not offering it at all.
+ * of them would drop a vendor from the dropdown while its rows stayed perfectly
+ * filterable, which is worse than not offering it at all.
+ *
+ * `provider` alone is NOT sufficient, and assuming it was shipped a bug to
+ * production: ENG-693 gave LLM rows a `provider` too, so `bedrock`, `gemini`,
+ * `openai`, `azure-openai` and `openrouter` all arrived in a picker that offers
+ * per-unit vendors. The discriminator is the same one the "llm" scope filters
+ * on — `isVendorEntry` needs provider AND unit — so the option list and the
+ * filter cannot disagree about what counts as a vendor.
  */
 function providerOfRow(row: UsageRecordRow): string | undefined {
-  if (row.provider) return row.provider;
-  if (!isVendorNamespacedModel(row.model)) return undefined;
-  return (row.model || "").slice(0, (row.model || "").indexOf(":"));
+  if (isVendorEntry(row)) return row.provider;
+  if (isVendorNamespacedModel(row.model)) {
+    return (row.model || "").slice(0, (row.model || "").indexOf(":"));
+  }
+  return undefined;
 }
 
 /**
