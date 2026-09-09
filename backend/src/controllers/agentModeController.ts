@@ -1370,9 +1370,18 @@ async function scheduleAutoMediaContinuation(
       stillDeferred = hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
       if (resolved?.content) {
         const { io } = await import('../server');
+        // ENG-1495: resolved is this call's own generateSessionResponse result, so its
+        // responseMessages already carries the messageIndex stamped during persistence.
+        const continuationMessageIndex = [...(resolved?.responseMessages || [])]
+          .reverse()
+          .find((m: any) => m?.role === 'assistant')?.messageIndex;
         io.to(`user:${userId}`).emit('session-message-appended', {
           sessionId,
-          message: { role: 'assistant', content: resolved.content },
+          message: {
+            role: 'assistant',
+            content: resolved.content,
+            ...(typeof continuationMessageIndex === 'number' ? { messageIndex: continuationMessageIndex } : {}),
+          },
         });
       } else if (resolved?.cancelled) {
         // ENG-1239 (rework, found live): a continuation preempted by a genuine customer
@@ -1602,9 +1611,17 @@ async function scheduleAutoWorkPlanContinuation(
       stillStalled = hasStalledAutocompleteWorkPlan(resolved?.workPlan, resolved?.toolCalls, resolved?.calledFunctions);
       if (resolved?.content) {
         const { io } = await import('../server');
+        // ENG-1495: same reasoning as the media auto-continuation emit above.
+        const continuationMessageIndex = [...(resolved?.responseMessages || [])]
+          .reverse()
+          .find((m: any) => m?.role === 'assistant')?.messageIndex;
         io.to(`user:${userId}`).emit('session-message-appended', {
           sessionId,
-          message: { role: 'assistant', content: resolved.content },
+          message: {
+            role: 'assistant',
+            content: resolved.content,
+            ...(typeof continuationMessageIndex === 'number' ? { messageIndex: continuationMessageIndex } : {}),
+          },
         });
       }
     })
@@ -7805,6 +7822,11 @@ export async function generateSessionResponse(
   // Enforce a provider-independent structured outcome on workplan progression
   // turns (step completion or a persisted input/question request).
   requireWorkPlanDisposition: boolean = false,
+  // ENG-1495: client-generated id for the optimistic user bubble the frontend
+  // rendered before this request was even sent. Stamped onto the persisted user
+  // message and echoed back nowhere else needed -- the caller already knows its
+  // own clientId, only messageIndex (assigned server-side) needs to come back.
+  clientId?: string,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -7829,6 +7851,10 @@ export async function generateSessionResponse(
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
   cancelled?: boolean;
   workPlanTurnDisposition?: WorkPlanTurnDisposition;
+  // ENG-1495: messageIndex of the persisted user message this turn saved (undefined
+  // when reusingDanglingDirective skipped the save). Lets the caller echo a stable id
+  // for the user's own optimistic bubble without waiting for a session refetch.
+  userMessageIndex?: number;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -7890,7 +7916,9 @@ export async function generateSessionResponse(
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.
       ...(userMessageKind ? { kind: userMessageKind } : {})
-    }
+    },
+    // ENG-1495: top-level, not metadata — mirrors messageIndex's own placement.
+    ...(clientId ? { clientId } : {})
   };
 
   // Check if this is the first user message (excluding system message)
@@ -8033,6 +8061,8 @@ export async function generateSessionResponse(
       return priorLast?.role === 'user' && (priorLast.metadata as any)?.kind === 'auto-continuation';
     })();
 
+  // ENG-1495: messageIndex of the just-persisted user message, for the return value.
+  let userMessageIndex: number | undefined;
   if (!reusingDanglingDirective) {
     // Add user message to session in database
     console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
@@ -8040,7 +8070,11 @@ export async function generateSessionResponse(
       attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
       attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
     });
-    await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+    const userMessageSaveResult = await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+    // Defensive: real addMessageToSession always resolves the full session, but plenty
+    // of existing tests mock it to resolve undefined since they don't care about the
+    // return value — don't let this new read throw for them.
+    userMessageIndex = userMessageSaveResult?.messages?.[userMessageSaveResult.messages.length - 1]?.messageIndex;
     console.log('AgentMode generateSessionResponse: User message saved successfully');
   } else {
     console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
@@ -8150,7 +8184,22 @@ export async function generateSessionResponse(
       // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
       // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
       try {
-        await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+        const saveResult = await chatbotDb.addMessagesToSession(sessionId, persistableMessages);
+        // ENG-1495: stripImageDataForPersistence is a pure 1:1 .map(), and this is the
+        // only writer of this tail, so saveResult's last persistableMessages.length
+        // entries correspond positionally to remainingMessages (== response.responseMessages
+        // starting at alreadyPersisted). Patch messageIndex back onto response.responseMessages
+        // in place so it survives into the `return {...response, ...}` below and reaches
+        // the HTTP/socket response, instead of only being available on a later refetch.
+        // Defensive on saveResult?.messages: real addMessagesToSession always resolves
+        // the full session, but plenty of existing tests mock it to resolve undefined
+        // since they don't care about the return value -- skip the echo rather than
+        // throw (falls back to the next full refetch resolving messageIndex, same as
+        // pre-fix behavior).
+        const stampedTail = saveResult?.messages?.slice(-persistableMessages.length) || [];
+        stampedTail.forEach((stamped, i) => {
+          response.responseMessages[alreadyPersisted + i].messageIndex = stamped.messageIndex;
+        });
       } catch (saveError) {
         console.error('AgentMode: Failed to persist response messages to session — response will still be returned to caller:', saveError);
       }
@@ -8181,7 +8230,8 @@ export async function generateSessionResponse(
     ...response,
     workPlan: finalSession?.workPlan,
     calledFunctions: finalSession?.calledFunctions,
-    skills
+    skills,
+    userMessageIndex
   };
 }
 
@@ -8656,7 +8706,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, clientId } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -9033,6 +9083,7 @@ export const agentModeController = {
         undefined, // approvedRevisionImageSources
         undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
+        typeof clientId === 'string' ? clientId : undefined, // ENG-1495
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -9291,12 +9342,22 @@ export const agentModeController = {
         .reverse()
         .find((m: any) => m?.role === 'assistant')?.metadata?.citations;
 
+      // ENG-1495: same "last assistant message" lookup as liveCitations above — the
+      // frontend's optimistic assistant bubble is keyed to this turn's single `content`
+      // string, so a stable id for it means the messageIndex of the last persisted
+      // assistant message in this turn's responseMessages.
+      const assistantMessageIndex = [...(response.responseMessages || [])]
+        .reverse()
+        .find((m: any) => m?.role === 'assistant')?.messageIndex;
+
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         ...(Array.isArray(liveCitations) && liveCitations.length > 0 ? { citations: liveCitations } : {}),
+        ...(typeof assistantMessageIndex === 'number' ? { messageIndex: assistantMessageIndex } : {}),
+        ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
@@ -10064,7 +10125,7 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, llmModel, attachments = [], workPlanInputAnswer } = req.body;
+      const { userMessage, llmModel, attachments = [], workPlanInputAnswer, clientId } = req.body;
       let effectiveUserMessage = userMessage;
 
       if (!userMessage) {
@@ -10223,17 +10284,24 @@ export const agentModeController = {
           undefined, // approvedRevisionImageSources
           undefined, // userMessageKind
           Boolean(workPlanInputAnswer),
+          typeof clientId === 'string' ? clientId : undefined, // ENG-1495
         ),
         session.sessionId
       );
 
       markProgressComplete(session.sessionId);
 
+      const sharedAssistantMessageIndex = [...(response.responseMessages || [])]
+        .reverse()
+        .find((m: any) => m?.role === 'assistant')?.messageIndex;
+
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
+        ...(typeof sharedAssistantMessageIndex === 'number' ? { messageIndex: sharedAssistantMessageIndex } : {}),
+        ...(typeof response.userMessageIndex === 'number' ? { userMessageIndex: response.userMessageIndex } : {}),
         workPlan: response.workPlan,
         skills: response.skills,
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
