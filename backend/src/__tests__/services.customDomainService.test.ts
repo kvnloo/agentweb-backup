@@ -55,6 +55,8 @@ import {
   getDomain,
   verifyDomain,
   generateSubdomain,
+  MAX_SUBDOMAIN_LABEL_LENGTH,
+  SUBDOMAIN_BASE,
   CustomDomainRecord,
 } from "../services/customDomainService";
 
@@ -79,10 +81,53 @@ describe("customDomainService", () => {
       expect(result).toMatch(/^page-/);
     });
 
-    it("should truncate long names", () => {
-      const longName = "a".repeat(100);
-      const result = generateSubdomain(longName);
-      expect(result.length).toBeLessThanOrEqual(63);
+    // ENG-1839. This previously asserted `<= 63` (the DNS label limit), which is not the
+    // binding constraint: the cert is issued for `<label>.<SUBDOMAIN_BASE>` and the CN caps
+    // at 64, so a 63-char label produces an 81-char FQDN no cert can be issued for. The
+    // failure is silent — DNS resolves and the record reads "deployed" while the TLS
+    // handshake is closed. Assert the FQDN, so a regression to 63 fails here.
+    it("truncates long names so the resulting FQDN can be certificated", () => {
+      const result = generateSubdomain("a".repeat(100));
+      expect(result.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${result}.${SUBDOMAIN_BASE}`.length).toBeLessThanOrEqual(64);
+    });
+
+    it("derives the ceiling from SUBDOMAIN_BASE rather than hardcoding it", () => {
+      expect(MAX_SUBDOMAIN_LABEL_LENGTH).toBe(64 - 1 - SUBDOMAIN_BASE.length);
+    });
+
+    it("does not leave a trailing hyphen when truncation lands on one", () => {
+      // "ab-ab-ab-..." — truncation at an even boundary would otherwise cut mid-separator,
+      // producing a label validateSubdomain's own pattern rejects.
+      const result = generateSubdomain("ab ".repeat(60).trim());
+      expect(result).not.toMatch(/-$/);
+      expect(result).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
+    });
+  });
+
+  describe("subdomain length enforcement (ENG-1839)", () => {
+    const overLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH + 1);
+
+    it("rejects a label whose FQDN would exceed the cert CN limit", async () => {
+      await expect(
+        addSubdomain("user-1", "prj_test", overLimit)
+      ).rejects.toThrow(/certificate cannot be issued/i);
+    });
+
+    it("accepts a label exactly at the limit", () => {
+      const atLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${atLimit}.${SUBDOMAIN_BASE}`.length).toBe(64);
+    });
+
+    it("reproduces the two domains that shipped broken", () => {
+      // Both live pages that could never get a cert. 59-char labels -> 77-char FQDNs.
+      for (const label of [
+        "create-a-high-converting-mobile-first-emergency-home-servic",
+        "build-a-single-page-pricing-focused-landing-page-called-pro",
+      ]) {
+        expect(label.length).toBeGreaterThan(MAX_SUBDOMAIN_LABEL_LENGTH);
+        expect(`${label}.${SUBDOMAIN_BASE}`.length).toBeGreaterThan(64);
+      }
     });
   });
 
