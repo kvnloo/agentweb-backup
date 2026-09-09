@@ -7,6 +7,7 @@ import {
   Collapse,
   Grid,
   IconButton,
+  MenuItem,
   Paper,
   Table,
   TableBody,
@@ -14,6 +15,7 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TextField,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -74,6 +76,12 @@ export interface CostAggregation {
   userCount?: number;
   /** Per-X-account spend with @handle enrichment (ENG-664). */
   byXAccount?: CostByXAccountRow[];
+  /**
+   * Provider scopes the picker may offer, computed server-side over the
+   * UNFILTERED window (ENG-1837). Optional: an older backend omits it and the
+   * client falls back to deriving options from the rows it can see.
+   */
+  availableProviders?: string[];
 }
 
 // ── X reconciliation, mirroring GET /api/admin/usage/x-reconciliation ─────────
@@ -163,20 +171,53 @@ export function providerOfModel(model: string): string {
 
 const TWITTER_PROVIDER_KEY = "twitter";
 
+/** Selected on first load (ENG-1837): the tab answers "who spent our vendor
+ *  budget", and opening on one vendor hides the total. X is one click away. */
+export const DEFAULT_PROVIDER = "all";
+
 /**
- * Provider options for the filter: "all" first, then the providers present in
- * the data. "twitter" is ALWAYS offered even with no X rows — this tab exists for
- * X metering, so the X filter must be discoverable before any X usage accrues
+ * Scopes, not vendors. Always offered, because no row implies them: "llm" would
+ * vanish from a vendor-scoped response even though it is always selectable.
+ * Mirrors the backend's AGGREGATION_SCOPES.
+ */
+const AGGREGATION_SCOPES = ["all", "llm"] as const;
+
+/**
+ * Provider options for the filter.
+ *
+ * Prefers the server's `availableProviders` (ENG-1837), computed over the
+ * unfiltered window, so the list does not collapse to whatever is selected.
+ *
+ * Falls back to deriving options from the rows in hand, which is what makes the
+ * backend and portal deploys order-independent. The fallback is *cumulative*:
+ * `known` carries the options discovered so far, because a scoped response only
+ * contains its own vendor's rows. Deriving from it alone would delete every
+ * other option the moment one was picked — the picker would offer a way in and
+ * no way back, which is worse than not broadening the tab at all (CodeRabbit,
+ * PR #2841). The server list, when present, replaces `known` rather than
+ * merging with it: it is authoritative and complete.
+ *
+ * "twitter" is ALWAYS offered in the fallback: this tab began as X-only
+ * (ENG-664), so the X filter must stay discoverable before any X usage accrues
  * (selecting it then shows the empty state rather than hiding the option).
  */
-export function providersInData(agg: CostAggregation | null): string[] {
-  const set = new Set<string>([TWITTER_PROVIDER_KEY]);
-  if (agg) {
-    for (const u of agg.topUsers) {
-      for (const m of u.byModel) set.add(providerOfModel(m.model));
+export function providersInData(
+  agg: CostAggregation | null,
+  known: readonly string[] = []
+): string[] {
+  if (agg?.availableProviders?.length) return agg.availableProviders;
+  const vendors = new Set<string>([TWITTER_PROVIDER_KEY]);
+  for (const p of known) {
+    if (!(AGGREGATION_SCOPES as readonly string[]).includes(p)) vendors.add(p);
+  }
+  for (const u of agg?.topUsers ?? []) {
+    for (const m of u.byModel) {
+      const p = providerOfModel(m.model);
+      // "llm" is a scope, already fixed above — not a vendor to sort among them.
+      if (p !== "llm") vendors.add(p);
     }
   }
-  return ["all", ...[...set].sort()];
+  return [...AGGREGATION_SCOPES, ...[...vendors].sort()];
 }
 
 export interface UserRowView {
@@ -218,9 +259,26 @@ export function rankedUserRows(
     .sort((a, b) => b.costUsd - a.costUsd || a.userId.localeCompare(b.userId));
 }
 
-/** X spend is an allocated estimate (see twitterPricing) — flag it in the UI. */
-export function providerIsAllocatedEstimate(provider: string): boolean {
-  return provider === "twitter";
+/**
+ * X charges a repeat read of the SAME resource within a UTC day only once, and
+ * we do not track resource ids — so our X figure is an allocated UPPER BOUND.
+ *
+ * X-specific on purpose. No other metered vendor dedups, so generalising this
+ * caveat would attach a qualifier to figures it is not true of (ENG-1837 AC5).
+ */
+export function providerHasDedupCaveat(provider: string): boolean {
+  return provider === TWITTER_PROVIDER_KEY || provider === "all";
+}
+
+/**
+ * ElevenLabs, 2captcha and Placid have rates but no metering adapter yet
+ * (ENG-698, blocked on the ENG-1598 Placid credential), so an all-vendor total
+ * omits them. Say so rather than letting the figure read as complete.
+ *
+ * DELETE this and its usage when ENG-698 ships.
+ */
+export function providerTotalIsUndercount(provider: string): boolean {
+  return provider === "all";
 }
 
 /** Format a Date as local YYYY-MM-DD (no UTC shift — matches what the user picks). */
@@ -264,11 +322,30 @@ function rangeDaysBack(days: number): { start: string; end: string } {
 function usd(n: number): string {
   return `$${(n || 0).toFixed(n < 1 ? 4 : 2)}`;
 }
-function providerLabel(p: string): string {
-  if (p === "all") return "All providers";
-  if (p === "llm") return "LLM (tokens)";
-  if (p === "twitter") return "X (Twitter)";
-  return p;
+const PROVIDER_LABELS: Record<string, string> = {
+  all: "All providers",
+  llm: "LLM (tokens)",
+  twitter: "X (Twitter)",
+  v0: "v0 (Vercel)",
+  "you.com": "You.com search",
+  google_cse: "Google Custom Search",
+  apollo: "Apollo",
+  "enrich.so": "enrich.so",
+  remotion: "Remotion Lambda",
+};
+
+/** An unknown key falls through unchanged — a new vendor is listed by its raw
+ *  key rather than being hidden until someone adds a label. */
+export function providerLabel(p: string): string {
+  return PROVIDER_LABELS[p] ?? p;
+}
+
+/** Header for the drill-down's first column. A vendor row is a TOOL, not a
+ *  model — labelling it "Model" is the mis-read ENG-1519 was filed for. */
+export function breakdownColumnLabel(provider: string): string {
+  if (provider === "llm") return "Model";
+  if (provider === "all") return "Tool / model";
+  return "Tool";
 }
 
 const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string }> = ({
@@ -310,7 +387,7 @@ const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string 
               <Table size="small" data-testid={`breakdown-${row.userId}`}>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Tool / model</TableCell>
+                    <TableCell>{breakdownColumnLabel(provider)}</TableCell>
                     <TableCell align="right">Calls</TableCell>
                     <TableCell align="right">Cost</TableCell>
                   </TableRow>
@@ -456,7 +533,7 @@ const XAccountTable: React.FC<{ accounts: XAccountRow[] }> = ({ accounts }) => {
   return (
     <Box sx={{ mt: 3 }} data-testid="x-account-table">
       <Typography variant="subtitle1" fontWeight={600} sx={{ mb: 1 }}>
-        By X account
+        By X account <Typography component="span" variant="caption" color="text.secondary">(X spend only)</Typography>
       </Typography>
       <TableContainer component={Paper} variant="outlined">
         <Table size="small">
@@ -497,29 +574,37 @@ export default function UsageCostByUserTab() {
   const { token } = useAuth();
   const [start, setStart] = useState(defaultStartDate);
   const [end, setEnd] = useState(() => formatDateInput(new Date()));
-  // X (Twitter)-only for now (ENG-664). The provider machinery (providersInData,
-  // userRowForProvider, providerLabel) is retained so this tab can broaden to other
-  // metered vendors later — just restore the Provider selector and default to "all".
-  const provider = TWITTER_PROVIDER_KEY;
+  // ENG-1837: was pinned to X. Every metered vendor writes to the same ledger,
+  // and the server scopes the aggregation, so this is now a selection.
+  const [provider, setProvider] = useState<string>(DEFAULT_PROVIDER);
   const [agg, setAgg] = useState<CostAggregation | null>(null);
+  // Accumulated across loads, so a vendor-scoped response from an older backend
+  // cannot erase the options discovered by the first `provider=all` load.
+  const [providerOptions, setProviderOptions] = useState<string[]>(() => providersInData(null));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const loadAggregation = async (s: string = start, e: string = end) => {
+  // `p` is passed explicitly by the selector rather than read from state: a
+  // change handler runs before its setState has settled, so relying on `provider`
+  // here would fetch the PREVIOUS selection.
+  const loadAggregation = async (s: string = start, e: string = end, p: string = provider) => {
     setLoading(true);
     setError(null);
     try {
       const response = await axios.get<CostAggregation>(
         buildApiUrl(
-          // provider=twitter: this tab is X-only (ENG-664), so the server scopes
-          // every cut to X rows. Broaden this when the tab expands to other vendors.
+          // The server scopes every cut (totals, byModel, byFeature, topUsers,
+          // userCount, byXAccount) to `provider` before aggregating, so nothing
+          // is re-derived client-side — notably userCount, which cannot be
+          // recovered from the capped topUsers slice (ENG-664 review round).
           `/api/admin/usage/cost-aggregation?start=${encodeURIComponent(
             s
-          )}&end=${encodeURIComponent(e)}&topUsers=100&provider=${TWITTER_PROVIDER_KEY}`
+          )}&end=${encodeURIComponent(e)}&topUsers=100&provider=${encodeURIComponent(p)}`
         ),
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setAgg(response.data);
+      setProviderOptions((prev) => providersInData(response.data, prev));
     } catch (err: any) {
       setError(
         err?.response?.data?.message ||
@@ -542,7 +627,7 @@ export default function UsageCostByUserTab() {
   // Headline totals come from the server's COMPLETE aggregation (agg.totals),
   // not a sum over `rows` — `rows` is the capped topUsers slice and would
   // understate cost/calls once spenders exceed the server's topUsers limit.
-  // The tab requests provider=twitter, so agg.totals is already X-scoped.
+  // The request carries the selection, so agg.totals is already provider-scoped.
   const filteredTotals = useMemo(
     () => ({ costUsd: agg?.totals.costUsd ?? 0, callCount: agg?.totals.callCount ?? 0 }),
     [agg]
@@ -552,10 +637,12 @@ export default function UsageCostByUserTab() {
     <Box>
       <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2, mb: 2 }}>
         <Box>
-          <Typography variant="h6">X (Twitter) usage &amp; cost by user</Typography>
+          <Typography variant="h6">
+            {providerLabel(provider)} usage &amp; cost by user
+          </Typography>
           <Typography variant="body2" color="text.secondary">
-            Allocated X (Twitter) API $ cost each user has spent, by account and tool, over the
-            selected range. Other metered vendors will be added here later.
+            Allocated $ cost each user has spent, by tool, over the selected range. Pick a
+            vendor to scope every figure on this page.
           </Typography>
         </Box>
         <Button startIcon={<RefreshIcon />} variant="outlined" onClick={() => loadAggregation()} disabled={loading}>
@@ -565,7 +652,29 @@ export default function UsageCostByUserTab() {
 
       <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
         <Grid container spacing={2} alignItems="center">
-          <Grid item xs={12} md={4}>
+          <Grid item xs={12} md={3}>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="Provider"
+              value={provider}
+              onChange={(e) => {
+                const next = e.target.value;
+                setProvider(next);
+                void loadAggregation(start, end, next);
+              }}
+              disabled={loading}
+              data-testid="provider-select"
+            >
+              {providerOptions.map((p) => (
+                <MenuItem key={p} value={p}>
+                  {providerLabel(p)}
+                </MenuItem>
+              ))}
+            </TextField>
+          </Grid>
+          <Grid item xs={12} md={3}>
             <DatePicker
               label="Start"
               value={parseDateInput(start)}
@@ -574,7 +683,7 @@ export default function UsageCostByUserTab() {
               slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
-          <Grid item xs={12} md={4}>
+          <Grid item xs={12} md={3}>
             <DatePicker
               label="End"
               value={parseDateInput(end)}
@@ -583,7 +692,7 @@ export default function UsageCostByUserTab() {
               slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
-          <Grid item xs={12} md={4}>
+          <Grid item xs={12} md={3}>
             <Button fullWidth variant="contained" onClick={() => loadAggregation()} disabled={loading}>
               Apply range
             </Button>
@@ -614,13 +723,33 @@ export default function UsageCostByUserTab() {
         </Grid>
       </Paper>
 
-      <XReconciliationPanel />
+      {/* X-only: it reconciles against X's OWN billing cycle, which has no
+          meaning under another vendor — and it costs a second request. */}
+      {provider === TWITTER_PROVIDER_KEY && <XReconciliationPanel />}
 
-      {providerIsAllocatedEstimate(provider) && (
-        <Alert severity="info" icon={<InfoIcon />} sx={{ mb: 2 }}>
-          X (Twitter) cost is <strong>allocated</strong> — X publishes no per-call price, so this applies
-          X&apos;s pay-per-use rate card to our call counts. It is an upper-bound estimate (X charges a
-          repeat read of the same resource within a UTC day only once), not the console-billed figure.
+      {/* Unconditional, and that is the point: EVERY figure on this tab is
+          allocated — our rate card applied to a call count — including LLM
+          dollars, which always were (ENG-693 AC3) and never said so. The old
+          `providerIsAllocatedEstimate` predicate hardcoded "twitter", so every
+          other vendor's cost read as vendor-measured. Deleted rather than
+          generalised: a predicate that is always true is a lie with a signature.
+          The dedup sentence below stays conditional, because it is X-specific. */}
+      <Alert severity="info" icon={<InfoIcon />} sx={{ mb: 2 }} data-testid="allocated-caveat">
+        These are <strong>allocated</strong> costs — our own rate card applied to metered usage,
+        never a vendor-invoiced amount. True of LLM dollars too (ENG-693).
+        {providerHasDedupCaveat(provider) && (
+          <>
+            {" "}
+            X (Twitter) is additionally an <strong>upper bound</strong>: X charges a repeat read of
+            the same resource within a UTC day only once, and we do not track resource ids.
+          </>
+        )}
+      </Alert>
+
+      {providerTotalIsUndercount(provider) && (
+        <Alert severity="warning" sx={{ mb: 2 }} data-testid="undercount-caveat">
+          ElevenLabs, 2captcha and Placid are not metered yet (ENG-698), so an all-vendor total is
+          an <strong>undercount</strong>.
         </Alert>
       )}
 
@@ -696,7 +825,11 @@ export default function UsageCostByUserTab() {
             </TableContainer>
           )}
 
-          <XAccountTable accounts={xAccounts} />
+          {/* An X-only cut. Under "all" the X rows are in scope so it still
+              renders, and the heading says which spend it covers. */}
+          {(provider === TWITTER_PROVIDER_KEY || provider === "all") && (
+            <XAccountTable accounts={xAccounts} />
+          )}
         </>
       )}
     </Box>
