@@ -2964,6 +2964,29 @@ describe("v0Service - resolveLandingPageLiveUrl", () => {
     expect(url).toBe("https://works.agentwebforms.com/acme");
   });
 
+  /*
+   * ENG-1839. The three-tier rank is a COMPARATOR, not a filter: `let best = domains[0]`
+   * seeds unconditionally, so rank 0 means "loses a comparison", never "is rejected". With a
+   * pending custom domain as the project's ONLY row there is nothing to lose to, and it was
+   * still adopted — reporting a host with no DNS as the live URL, which is the exact failure
+   * the ranking exists to prevent.
+   *
+   * Reachable in production: `DELETE /api/domains/:id`, the page-subdomain cascade cleanup,
+   * and the detach/re-add window inside this PR's own repair-overlong-subdomains script all
+   * leave a project in this shape.
+   */
+  it("falls back to the deployed URL when the only attached domain is unverified", async () => {
+    mockListDomains.mockResolvedValueOnce([
+      { domain: "newsite.acme.io", vercelProjectId: "proj-1", type: "custom", status: "pending_verification", updatedAt: "2026-06-01T00:00:00Z" },
+    ]);
+    const url = await resolveLandingPageLiveUrl({
+      vercelProjectId: "proj-1",
+      userId: "owner-1",
+      deployedUrl: "https://lp-acme.vercel.app",
+    });
+    expect(url).toBe("https://lp-acme.vercel.app");
+  });
+
   it("breaks ties between managed subdomains by most-recently-updated", async () => {
     mockListDomains.mockResolvedValueOnce([
       { domain: "older.agentwebforms.com", vercelProjectId: "proj-1", type: "subdomain", updatedAt: "2026-01-01T00:00:00Z" },

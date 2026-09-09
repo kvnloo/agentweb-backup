@@ -583,6 +583,20 @@ describe("POST /publish", () => {
 
 
   // ENG-1488's gate itself — three refusal branches, none of which had a test.
+  /*
+   * NOTE on what this actually exercises, post-ENG-1839: with zero check runs the route now
+   * makes a further call to `actions/workflows` to ask whether the repo has any CI at all.
+   * This test's queue is exhausted by then, so that call throws and the FAIL-CLOSED catch
+   * keeps the gate. The 409 is real and worth pinning, but it arrives via the error path, not
+   * via the gate evaluating a repo that genuinely has CI.
+   *
+   * Deliberately not "fixed" by queueing a workflows response. The queue positions in this
+   * suite are load-bearing — an earlier draft of the gate added one call and silently broke
+   * 10 tests here, and CI runs no jest, so nothing would have caught it. The positive path
+   * (`total_count: 0` → gate skipped) and the fail-closed paths are covered directly in
+   * `routes.landingPageGeneration.test.ts`, where the mocks are reset per test rather than
+   * queued.
+   */
   it("ENG-1488 GATE: refuses to merge when the Tests check has not started", async () => {
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "pre-merge-sha" } }));
     queueTestsCheck(null); // no check_runs at all

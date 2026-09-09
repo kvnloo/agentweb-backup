@@ -1715,6 +1715,38 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(page.customDomainUrl).toBe("https://acme.agentwebforms.com");
   });
 
+  it("an unverified custom domain alone must not become the page's reported host", async () => {
+    /*
+     * ENG-1839. `rank` is a COMPARATOR, not a filter, and the winner is seeded
+     * unconditionally — so rank 0 means "loses a comparison", never "is rejected". With a
+     * pending custom domain as the project's only attached row there is nothing to lose to,
+     * so it was adopted anyway and the page reported a host with no DNS. Exactly the failure
+     * the three tiers exist to prevent, surviving in the one shape where ranking never runs.
+     *
+     * Production reaches this shape via `DELETE /api/domains/:id`, the page-subdomain cascade
+     * cleanup, and the detach/re-add window in this PR's own repair script.
+     */
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      {
+        id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1",
+        status: "deployed", deployedUrl: "https://lp-acme.vercel.app",
+      },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    expect(page.domainHost).toBeUndefined();
+    expect(page.customDomainUrl).toBeUndefined();
+  });
+
   it("FAIL: org member viewing a shared page → enriched from the page OWNER's domains", async () => {
     // The caller (member) owns no domains; the shared page's owner does. The
     // member must see the same attached subdomain the owner sees, not a stale
