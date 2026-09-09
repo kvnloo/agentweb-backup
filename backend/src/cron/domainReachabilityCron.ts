@@ -56,15 +56,31 @@ async function scanAll(table: string): Promise<any[]> {
  */
 export function selectDomainsToProbe(domains: any[], pages: any[]): any[] {
   const deployedHosts = new Set<string>();
+  // Deployed pages that store NO url. Their working URL comes from the domain row itself
+  // (assignManagedSubdomain persists the page url in a separate write that can fail), so
+  // matching only on stored hosts would leave exactly the legacy/broken population unmonitored.
+  const deployedProjects = new Set<string>();
+
   for (const p of pages) {
-    if (p.status !== "deployed" || !p.customDomainUrl) continue;
+    if (p.status !== "deployed") continue;
+    if (!p.customDomainUrl) {
+      if (p.vercelProjectId) deployedProjects.add(p.vercelProjectId);
+      continue;
+    }
     try {
       deployedHosts.add(new URL(p.customDomainUrl).host);
     } catch {
-      /* unparseable stored URL — cannot be matched, and is not this job's problem */
+      /* unparseable stored URL — fall back to project matching below */
+      if (p.vercelProjectId) deployedProjects.add(p.vercelProjectId);
     }
   }
-  return domains.filter((d) => d.domain && deployedHosts.has(d.domain));
+
+  return domains.filter(
+    (d) =>
+      d.domain &&
+      (deployedHosts.has(d.domain) ||
+        (d.vercelProjectId !== undefined && deployedProjects.has(d.vercelProjectId)))
+  );
 }
 
 /** Run `worker` over `items` with at most `limit` in flight. */
@@ -112,26 +128,33 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
       if (verdict.state === "reachable") summary.reachable++;
 
       const now = new Date().toISOString();
-      const names: Record<string, string> = {};
       const values: Record<string, any> = {
         ":checkedAt": now,
         ":fails": decision.consecutiveFailures,
       };
-      // lastReachabilityCheckAt is stamped on EVERY outcome, including failures. Without that
-      // a record that always fails looks permanently unchecked and is re-selected forever.
-      let expr = "SET lastReachabilityCheckAt = :checkedAt, consecutiveFailures = :fails";
+      // Reachability is written to its OWN attribute, never to `status`.
+      //
+      // `status` is the Vercel VERIFICATION state, owned by addCustomDomain, addSubdomain and
+      // verifyDomain. getProjectDomain selects `active` then `pending_verification`, so a
+      // record set to "error" matches neither and returns null — which renders a customer's
+      // custom domain as "not configured" in the portal. Three 5xx responses from their own
+      // site would have been enough to trigger that.
+      //
+      // lastReachabilityCheckAt is stamped on EVERY outcome including failures, so a record
+      // that always fails cannot look permanently unchecked and be re-selected forever.
+      let expr =
+        "SET lastReachabilityCheckAt = :checkedAt, consecutiveFailures = :fails";
 
       if (decision.nextStatus) {
-        names["#status"] = "status";
-        values[":status"] = decision.nextStatus;
-        expr += ", #status = :status";
+        values[":reach"] = decision.nextStatus === "active" ? "reachable" : "unreachable";
+        expr += ", reachabilityStatus = :reach";
         if (decision.nextStatus === "error") {
           values[":reason"] = decision.errorMessage;
-          expr += ", errorMessage = :reason";
-          if (rec.status !== "error") summary.markedUnhealthy++;
+          expr += ", reachabilityError = :reason";
+          if (rec.reachabilityStatus !== "unreachable") summary.markedUnhealthy++;
         } else {
-          expr += " REMOVE errorMessage";
-          if (rec.status === "error") summary.recovered++;
+          expr += " REMOVE reachabilityError";
+          if (rec.reachabilityStatus === "unreachable") summary.recovered++;
         }
       } else {
         summary.stillSuspect++;
@@ -142,7 +165,6 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
           TableName: DOMAINS_TABLE,
           Key: { id: rec.id },
           UpdateExpression: expr,
-          ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
           ExpressionAttributeValues: values,
         })
         .promise();

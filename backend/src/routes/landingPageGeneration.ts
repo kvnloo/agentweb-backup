@@ -842,10 +842,15 @@ router.get("/generated", async (req, res: Response) => {
         // enrichment, so it costs no extra calls and triggers no verification of its own.
         // (An earlier version fired verification from this read — see the sweep's header for
         // why that was wrong.)
-        page.domainStatus = best.status;
+        // Reachability, written by the hourly sweep to its own attribute. Deliberately NOT
+        // `best.status` — that is the Vercel verification state, and conflating the two made a
+        // transient 5xx render a customer's custom domain as "not configured".
         page.domainHost = best.domain;
-        if (best.status === "error" && best.errorMessage) {
-          page.domainErrorMessage = best.errorMessage;
+        if (best.reachabilityStatus === "unreachable") {
+          page.domainStatus = "error";
+          if (best.reachabilityError) page.domainErrorMessage = best.reachabilityError;
+        } else if (best.reachabilityStatus === "reachable") {
+          page.domainStatus = "active";
         }
         // Sub-pages have a slug and live at /{slug} under the attached domain.
         const targetUrl = page.slug

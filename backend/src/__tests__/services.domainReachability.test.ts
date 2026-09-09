@@ -24,8 +24,8 @@ const suspect: ReachabilityVerdict = {
 const definitive: ReachabilityVerdict = {
   state: "unreachable",
   definitive: true,
-  reason: "The domain does not resolve in DNS.",
-  code: "ENOTFOUND",
+  reason: "The SSL certificate does not cover this domain.",
+  code: "ERR_TLS_CERT_ALTNAME_INVALID",
 };
 
 describe("decideFromVerdict — a single blip must not reach the customer", () => {
@@ -60,15 +60,18 @@ describe("decideFromVerdict — a single blip must not reach the customer", () =
     // certain answer.
     const d = decideFromVerdict(definitive, 0);
     expect(d.nextStatus).toBe("error");
-    expect(d.errorMessage).toMatch(/does not resolve/i);
+    expect(d.errorMessage).toMatch(/certificate does not cover/i);
   });
 });
 
 describe("probeDomain — classification", () => {
-  it("treats a name that cannot resolve as definitive", async () => {
+  it("treats a name that cannot resolve as SUSPECT, not definitive", async () => {
+    // ENOTFOUND must go through the threshold: a domain attached moments ago has not
+    // propagated yet, and flipping it to unreachable on the first probe is exactly the false
+    // positive the threshold exists to prevent.
     const v = await probeDomain("this-host-does-not-exist.agentwebforms.invalid", 5000);
-    expect(v.state).toBe("unreachable");
-    if (v.state === "unreachable") expect(v.definitive).toBe(true);
+    expect(v.state).toBe("suspect");
+    expect(decideFromVerdict(v, 0).nextStatus).toBeNull();
   }, 15000);
 
   it("never throws — every outcome is a verdict", async () => {

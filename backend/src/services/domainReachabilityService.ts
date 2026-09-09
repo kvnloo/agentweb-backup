@@ -48,7 +48,9 @@ export type ReachabilityVerdict =
  * network fault produces, so it is classified `suspect` and must repeat to be believed.
  */
 const DEFINITIVE: Record<string, string> = {
-  ENOTFOUND: "The domain does not resolve in DNS.",
+  // ENOTFOUND is deliberately NOT here. A domain attached moments ago has not propagated yet,
+  // and flipping it to unreachable on the first probe is precisely the false positive the
+  // threshold exists to prevent. It goes through SUSPECT like any other transient condition.
   ERR_TLS_CERT_ALTNAME_INVALID: "The SSL certificate does not cover this domain.",
   CERT_HAS_EXPIRED: "The SSL certificate has expired.",
   DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
@@ -57,6 +59,7 @@ const DEFINITIVE: Record<string, string> = {
 };
 
 const SUSPECT: Record<string, string> = {
+  ENOTFOUND: "The domain does not resolve in DNS.",
   ECONNRESET:
     "The connection closed during the SSL handshake — the site has no usable certificate.",
   EPROTO: "The SSL handshake failed.",

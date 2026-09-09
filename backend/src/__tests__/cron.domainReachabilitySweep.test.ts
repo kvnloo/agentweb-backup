@@ -47,8 +47,26 @@ describe("selectDomainsToProbe", () => {
     expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
   });
 
+  it("probes a domain whose deployed page stores NO url (M1)", () => {
+    // assignManagedSubdomain persists the page url in a write separate from creating the
+    // domain record, so a failure between the two leaves a deployed page whose only working
+    // URL comes from the domain row. Matching solely on stored hosts would leave exactly that
+    // legacy/broken population unmonitored — the population most likely to be broken.
+    const domains = [dom("d1", "legacy.agentwebforms.com")];
+    const pages = [{ status: "deployed", vercelProjectId: "p" }];
+    expect(selectDomainsToProbe(domains, pages).map((d) => d.id)).toEqual(["d1"]);
+  });
+
+  it("does not probe on project fallback when the page is not deployed", () => {
+    const domains = [dom("d1", "legacy.agentwebforms.com")];
+    const pages = [{ status: "generating", vercelProjectId: "p" }];
+    expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
+  });
+
   it("tolerates missing and malformed page URLs without throwing", () => {
     const domains = [dom("d1", "live.agentwebforms.com")];
+    // No vercelProjectId on the url-less entries, so the M1 project fallback cannot fire and
+    // only the host-matching path is under test.
     const pages = [
       { status: "deployed" },
       { status: "deployed", customDomainUrl: "" },

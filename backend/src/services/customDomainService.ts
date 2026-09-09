@@ -35,21 +35,26 @@ export interface CustomDomainRecord {
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
+
+  /**
+   * Whether the domain actually SERVES, written by the hourly reachability sweep (ENG-1839).
+   *
+   * Deliberately separate from `status`. That field is the Vercel VERIFICATION state, owned by
+   * addCustomDomain / addSubdomain / verifyDomain, and `getProjectDomain` selects on it — so
+   * writing a reachability verdict there makes a live custom domain render as "not configured"
+   * in the portal after a few transient 5xx responses from the customer's own site.
+   */
+  reachabilityStatus?: "reachable" | "unreachable";
+  reachabilityError?: string;
+  lastReachabilityCheckAt?: string;
+  /** Consecutive non-reachable probes. A success resets it to 0. */
+  consecutiveFailures?: number;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Certificates cap the Common Name at 64 characters, and every managed subdomain is issued a
- * cert for `<label>.<SUBDOMAIN_BASE>`. So a label that fits DNS's own 63-character limit can
- * still produce an FQDN no certificate can be issued for: DNS resolves, the TLS handshake is
- * closed, and the page is unreachable while its record still reads `deployed` (ENG-1839).
- *
- * Derived from SUBDOMAIN_BASE rather than hardcoded so it stays correct if the apex domain
- * ever changes. For "agentwebforms.com" this is 46.
- */
 /**
  * Conservative FQDN ceiling for certificate issuance.
  *
