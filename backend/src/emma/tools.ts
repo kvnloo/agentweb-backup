@@ -697,6 +697,7 @@ Actions:
 - get_retweeters: List users who retweeted a tweet. Requires tweet_id.
 - get_liking_users: List users who liked a tweet. Requires tweet_id.
 - get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
+- assess_post_performance: Score how a post is likely to rank, using the same signal categories X's own ranking algorithm scores on (favorite/reply/retweet/quote/share/report probabilities). Pass text for a DRAFT post (predicted score, via Grok). Pass tweet_id instead for an ALREADY-PUBLISHED post (actual score, from its real metrics). Provide exactly one of text or tweet_id.
 
 For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
     inputSchema: {
@@ -710,6 +711,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
             'like', 'unlike', 'retweet', 'unretweet',
             'get_tweet_metrics', 'list_replies',
             'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+            'assess_post_performance',
           ],
           description: 'The X post action to perform.'
         },
@@ -719,11 +721,11 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
         },
         text: {
           type: 'string',
-          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary. For assess_post_performance, pass the DRAFT text to score (mutually exclusive with tweet_id there).'
         },
         tweet_id: {
           type: 'string',
-          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
+          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets. For assess_post_performance, pass this instead of text to score an ALREADY-PUBLISHED post from its real metrics.'
         },
         in_reply_to_tweet_id: {
           type: 'string',

@@ -456,6 +456,13 @@ import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecond
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
+import {
+  buildXAssessmentPrompt,
+  parseXAssessmentResponse,
+  computeWeightedXScore,
+  computeActualXScore,
+  scoreTier,
+} from '../utils/xPostRankingScore';
 
 type MetaApiResult = {
   success: boolean;
@@ -37417,6 +37424,46 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'assess-post-performance': {
+          if (text && tweet_id) throw new Error('assess_post_performance takes text OR tweet_id, not both');
+          if (!text && !tweet_id) throw new Error('assess_post_performance requires text (draft) or tweet_id (published post)');
+
+          if (tweet_id) {
+            const [metric]: any[] = await twitterService.getTweetMetrics(ownerUserId, account_id, [tweet_id]);
+            const pm = metric?.public_metrics || {};
+            const actualScore = computeActualXScore({
+              likeCount: pm.like_count || 0,
+              replyCount: pm.reply_count || 0,
+              retweetCount: pm.retweet_count || 0,
+              quoteCount: pm.quote_count || 0,
+              impressionCount: pm.impression_count || 0,
+            });
+            if (actualScore === null) {
+              return { success: false, error: 'No impression data available for this tweet yet — actual score requires impressions.' };
+            }
+            return { success: true, data: { mode: 'actual', tweet_id, score: actualScore, tier: scoreTier(actualScore), metrics: pm } };
+          }
+
+          const { system, user } = buildXAssessmentPrompt(text);
+          const res: any = await this.callLLM(
+            'openrouter/x-ai/grok-4.6',
+            [
+              { role: 'system', content: system },
+              { role: 'user', content: user },
+            ],
+            {
+              temperature: 0,
+              max_completion_tokens: 200,
+              response_format: { type: 'json_object' },
+              taskClass: 'nonstandard_consumer',
+            },
+          );
+          const raw = res?.choices?.[0]?.message?.content ?? '';
+          const probs = parseXAssessmentResponse(raw);
+          const predictedScore = computeWeightedXScore(probs);
+          return { success: true, data: { mode: 'predicted', score: predictedScore, tier: scoreTier(predictedScore), signals: probs } };
+        }
+
         default: {
           const validActions = [
             'reply', 'post-thread', 'quote-tweet',
@@ -37424,6 +37471,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'like', 'unlike', 'retweet', 'unretweet',
             'list-replies', 'get-tweet-metrics',
             'get-retweeters', 'get-liking-users', 'get-quote-tweets',
+            'assess-post-performance',
           ];
           throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }

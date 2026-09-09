@@ -112,6 +112,7 @@ export const ACTION_SCOPED_PUBLISH_TOOLS: Record<string, { publishing: string[];
     nonPublishing: [
       'delete_tweet', 'like', 'unlike', 'unretweet',
       'get_tweet_metrics', 'list_replies', 'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+      'assess_post_performance',
     ],
   },
   linkedin_manage_post: {
