@@ -158,4 +158,36 @@ export const htmlTemplateService = {
     await writeRow(USER_KEY(userId), [], updatedBy);
     return all.length;
   },
+
+  /**
+   * ENG-1552: create or update a row in `templates_public` by a caller-supplied,
+   * STABLE `template_id` — no other code path writes this key at all (`createTemplate`
+   * above only ever targets `USER_KEY`), so seed scripts are the only writer and must
+   * supply their own fixed id (same convention as ENG-1609's schedule-template seed) to
+   * stay idempotent across re-runs, rather than minting a fresh uuid each time.
+   */
+  async upsertPublicTemplate(
+    template: Omit<HtmlTemplate, "created_at" | "updated_at"> & { template_id: string },
+    updatedBy: string,
+    options: { onlyIfAbsent?: boolean } = {},
+  ): Promise<{ template: HtmlTemplate; created: boolean }> {
+    const all = await readRow(PUBLIC_KEY);
+    const idx = all.findIndex((t) => t.template_id === template.template_id);
+    const now = new Date().toISOString();
+
+    if (idx !== -1) {
+      if (options.onlyIfAbsent) {
+        return { template: all[idx], created: false };
+      }
+      const next: HtmlTemplate = { ...all[idx], ...template, updated_at: now };
+      all[idx] = next;
+      await writeRow(PUBLIC_KEY, all, updatedBy);
+      return { template: next, created: false };
+    }
+
+    const tpl: HtmlTemplate = { ...template, created_at: now, updated_at: now };
+    all.push(tpl);
+    await writeRow(PUBLIC_KEY, all, updatedBy);
+    return { template: tpl, created: true };
+  },
 };
