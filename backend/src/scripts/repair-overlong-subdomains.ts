@@ -18,13 +18,15 @@
  *   The portal's own subdomain editor did the opposite and could strand a page with no domain
  *   at all; do not repeat that ordering here. If the add fails, nothing has changed.
  *
- * - PREFIXES COME FROM THE ACCOUNT'S OWN DOMAIN, not from the page name. Deriving from the
- *   page name is what produces "create-a-high-converting-mobile-first-emergenc", and a guess
- *   from the page TITLE already went wrong once on this ticket ("waterheater" for a customer
- *   whose product domain is smartwaterheater.ai). The account's `productDomain` is the
- *   customer's own declared identity — data, not inference — and it yields exactly the prefix
- *   a human would have chosen. `--map` still overrides per record when someone wants
- *   something specific.
+ * - PREFIXES ARE NEVER SET FOR THE CUSTOMER. Every applied prefix must be passed explicitly
+ *   via --map. A landing page URL is the customer's to choose, and they can set it themselves:
+ *   Site Config -> Default Subdomain is self-serve and user-authenticated.
+ *
+ *   The dry-run does print a SUGGESTION derived from the account's own `productDomain`
+ *   ("https://smartwaterheater.ai/" -> "smartwaterheater"), because the alternative reference
+ *   point is the page name, which yields "create-a-high-converting-mobile-first-emergenc". A
+ *   guess from the page TITLE already went wrong once here ("waterheater" for a customer whose
+ *   product domain is smartwaterheater.ai). It remains a suggestion; nothing applies it.
  *
  * - IDEMPOTENT. Records already within the ceiling are skipped, so a re-run is a no-op.
  */
@@ -211,9 +213,9 @@ async function main() {
 
   let repaired = 0;
   for (const rec of broken) {
-    // Derived by default; --map overrides when someone wants something specific.
-    const derived = derivePrefix(userById.get(rec.userId), rec.id);
-    const chosen = map[rec.id] ?? derived;
+    // Suggestion only — never applied. The customer chooses their own URL.
+    const suggestion = derivePrefix(userById.get(rec.userId), rec.id);
+    const chosen = map[rec.id];
     const { isOrphan, affectedPages, projectPagesWithoutUrl, cascade } = classifyRecord(rec, pages);
 
     // A broken record that NO page references is an orphan: attached to Vercel, unreachable,
@@ -227,8 +229,7 @@ async function main() {
         (isOrphan
           ? `   action  : detach only — no page references this host, so a replacement would go unused` +
             `${removeOld ? "" : " (pass --remove-old to actually detach)"}\n`
-          : `   new     : ${chosen}.${SUBDOMAIN_BASE}` +
-            `${map[rec.id] ? " (from --map)" : " (derived from the account's own domain)"}\n`) +
+          : `   new     : ${chosen ? `${chosen}.${SUBDOMAIN_BASE} (from --map)` : `(none given — suggestion: ${suggestion})`}\n`) +
         `   pages   : ${affectedPages.length ? affectedPages.map((p) => p.id).join(", ") : "(none)"}` +
         (projectPagesWithoutUrl.length
           ? `\n   note    : ${projectPagesWithoutUrl.length} page(s) on this project store no URL ` +
@@ -246,6 +247,15 @@ async function main() {
     );
 
     if (!apply) continue;
+
+    if (!isOrphan && !chosen) {
+      console.error(
+        `   ✗ skipped — no --map=${rec.id}=<prefix> given. A landing page URL belongs to the ` +
+          `customer, so this script never picks one. Either pass --map, or have them set it ` +
+          `themselves in Site Config -> Default Subdomain (self-serve).`
+      );
+      continue;
+    }
 
     if (isOrphan) {
       if (!removeOld) {
@@ -337,9 +347,9 @@ async function main() {
   console.log(`\n[repair] ${apply ? "repaired" : "would repair"} ${repaired} record(s).`);
   if (!apply) {
     console.log(
-      "[repair] dry-run only. Re-run with --apply to make these changes. Prefixes above are " +
-        "derived from each account's own domain; override any of them with " +
-        "--map=<domainId>=<prefix>."
+      "[repair] dry-run only. Suggestions above are derived from each account's own domain " +
+        "and are NOT applied — pass --map=<domainId>=<prefix> with the customer's chosen " +
+        "prefix, or have them set it in Site Config -> Default Subdomain."
     );
   }
 }
