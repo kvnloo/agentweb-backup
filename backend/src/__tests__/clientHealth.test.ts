@@ -175,6 +175,105 @@ describe('Client Health - assessClientHealth', () => {
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
   });
 
+  // ENG-1767: the client's OWN connected Meta token, account id resolution, and precedence
+  // against the legacy `adAccount` field.
+  describe('ENG-1767 — connected-account token and account-id precedence', () => {
+    const { getMetaAccessToken } = require('../utils/secretsManager');
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+
+    function mockAdmin() {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    }
+
+    it('uses the client\'s own connected token, not the shared app-wide token', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-999',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '999999', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_999999/campaigns')
+      );
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('access_token=clients-own-token')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('999999');
+    });
+
+    it('falls back to the shared token only when there is no connected Meta account (legacy-only)', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '777777',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).toHaveBeenCalledTimes(1);
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_777777/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('777777');
+    });
+
+    it('mutation: prefers the connected account over a DIFFERING legacy adAccount field, consistently everywhere the id is used', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '111111', // legacy field — must NOT win when a connected account exists
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-222',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      // The connected account's id must win — in the fetch URL AND in the reported ad_account_id —
+      // never the legacy field, and never disagreeing between the two.
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_222222/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('222222');
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+    });
+  });
+
   // Fatigue detection: frequency ceiling (default 3.5), CTR-drop / CPM-rise vs prior-period
   // baseline (defaults 20% / 15%) — resolved from ENG-918's threshold store (mocked empty here,
   // so registry defaults apply).
