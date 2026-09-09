@@ -50,19 +50,56 @@ export interface CustomDomainRecord {
  * Derived from SUBDOMAIN_BASE rather than hardcoded so it stays correct if the apex domain
  * ever changes. For "agentwebforms.com" this is 46.
  */
+/**
+ * Conservative FQDN ceiling for certificate issuance.
+ *
+ * MEASURED (ENG-1839): FQDNs of 28/34/57/59 characters serve fine; two separate 77-character
+ * FQDNs fail the TLS handshake outright while DNS resolves. No existing subdomain falls
+ * between 60 and 76, so the true boundary is somewhere in that gap and is NOT pinned.
+ *
+ * 64 is chosen because it is the X.509 Common Name upper bound (RFC 5280) and is consistent
+ * with every observation — but treat that as a working hypothesis, not an established cause.
+ * Let's Encrypt omits the CN for long names and relies on SAN, which would argue against it,
+ * so the real constraint may lie elsewhere in Vercel's issuance path.
+ *
+ * Erring low is deliberate. Rejecting a name that would have worked produces a clear,
+ * immediate, recoverable error; accepting one that does not produces a silently unreachable
+ * page whose record still reads `deployed` — the failure this ticket exists to stop, and one
+ * that went unnoticed on live customer sites for months.
+ *
+ * If the boundary is ever measured properly, raise this and keep the asymmetry.
+ */
 const MAX_CERT_CN_LENGTH = 64;
 const MAX_DNS_LABEL_LENGTH = 63;
-export const MAX_SUBDOMAIN_LABEL_LENGTH = Math.min(
-  MAX_DNS_LABEL_LENGTH,
-  MAX_CERT_CN_LENGTH - 1 - SUBDOMAIN_BASE.length
-);
 
 /**
- * Truncate a label to the certifiable maximum, dropping any trailing hyphen the cut leaves
- * behind — a trailing hyphen is rejected by validateSubdomain's own pattern.
+ * Longest label that still yields a certifiable FQDN under `base`.
+ *
+ * Parameterised because the base is NOT always SUBDOMAIN_BASE: setPageSubdomain issues certs
+ * under the customer's own domain. Validating that path against SUBDOMAIN_BASE would both
+ * miss over-length FQDNs on long customer domains and falsely reject legal ones on short
+ * domains, with an error naming a domain the user never mentioned.
+ *
+ * Math.max(1, …) matters: a base of 63+ characters drives the CN term to zero or negative,
+ * and a negative length would flow into String.slice, which treats it as an offset from the
+ * end rather than erroring — silently producing a leading-hyphen label.
+ */
+function maxLabelLengthFor(base: string): number {
+  return Math.max(
+    1,
+    Math.min(MAX_DNS_LABEL_LENGTH, MAX_CERT_CN_LENGTH - 1 - base.length)
+  );
+}
+
+/** The ceiling for MANAGED subdomains (SUBDOMAIN_BASE). Other bases: maxLabelLengthFor. */
+export const MAX_SUBDOMAIN_LABEL_LENGTH = maxLabelLengthFor(SUBDOMAIN_BASE);
+
+/**
+ * Truncate a label to `max`, dropping any trailing hyphen the cut leaves behind — a trailing
+ * hyphen is rejected by validateSubdomain's own pattern.
  */
 function truncateLabel(label: string, max: number = MAX_SUBDOMAIN_LABEL_LENGTH): string {
-  return label.slice(0, max).replace(/-+$/, "");
+  return label.slice(0, Math.max(0, max)).replace(/-+$/, "");
 }
 
 /**
@@ -93,21 +130,27 @@ export function generateSubdomain(name: string): string {
  * Validate a subdomain string (alphanumeric + hyphens, length bounded so the resulting
  * FQDN can actually receive a certificate).
  */
-function validateSubdomain(subdomain: string): void {
+function validateSubdomain(subdomain: string, base: string = SUBDOMAIN_BASE): void {
   if (!subdomain || subdomain.length === 0) {
     throw new Error("Invalid subdomain: cannot be empty");
   }
-  if (subdomain.length > MAX_SUBDOMAIN_LABEL_LENGTH) {
-    const fqdnLength = subdomain.length + 1 + SUBDOMAIN_BASE.length;
-    throw new Error(
-      `Invalid subdomain: "${subdomain}.${SUBDOMAIN_BASE}" is ${fqdnLength} characters, ` +
-        `but a certificate cannot be issued above ${MAX_CERT_CN_LENGTH}. ` +
-        `Use at most ${MAX_SUBDOMAIN_LABEL_LENGTH} characters.`
-    );
-  }
+  // Charset before length: a name typed with spaces or punctuation is the common mistake, and
+  // reporting it as a length problem sends the user to fix the wrong thing.
   if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(subdomain)) {
     throw new Error(
       "Invalid subdomain: must contain only lowercase letters, numbers, and hyphens"
+    );
+  }
+  const maxLabel = maxLabelLengthFor(base);
+  if (subdomain.length > maxLabel) {
+    const fqdnLength = subdomain.length + 1 + base.length;
+    // Bound the echo — this message is returned to the browser and logged, and the raw value
+    // is unbounded user input.
+    const shown = subdomain.length > 80 ? `${subdomain.slice(0, 80)}…` : subdomain;
+    throw new Error(
+      `Invalid subdomain: "${shown}.${base}" is ${fqdnLength} characters. ` +
+        `Names above ${MAX_CERT_CN_LENGTH} characters have failed SSL certificate issuance, ` +
+        `which leaves the site unreachable. Use at most ${maxLabel} characters.`
     );
   }
 }
@@ -209,18 +252,24 @@ export async function addSubdomain(
           // Truncate the BASE to leave room for the suffix, rather than truncating the
           // joined string — the latter can cut into the suffix and destroy the uniqueness
           // it exists to provide, or leave a trailing hyphen that validateSubdomain rejects.
-          const suffix = Math.random().toString(16).slice(2, 6);
-          const base = truncateLabel(
+          // padEnd: Math.random() can yield a short or empty fractional part ((0).toString(16)
+          // is "0", so .slice(2,6) is ""), which would otherwise emit a trailing hyphen.
+          const suffix = Math.random().toString(16).slice(2, 6).padEnd(4, "0");
+          const stem = truncateLabel(
             cleanSubdomain,
             MAX_SUBDOMAIN_LABEL_LENGTH - suffix.length - 1
           );
-          finalSubdomain = `${base}-${suffix}`;
+          finalSubdomain = stem ? `${stem}-${suffix}` : suffix;
           continue;
         }
       }
       throw err; // Not a conflict or out of retries — propagate
     }
   }
+
+  // The retry path rebuilds the label, so re-assert the invariants before it is persisted and
+  // sent to Vercel. Nothing downstream re-checks it.
+  validateSubdomain(finalSubdomain);
 
   const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
 
@@ -566,7 +615,9 @@ export async function setPageSubdomain(
   mainDomain: string
 ): Promise<{ fullDomain: string }> {
   const cleanPrefix = subdomainPrefix.toLowerCase().trim();
-  validateSubdomain(cleanPrefix);
+  // Validate against the domain the cert will actually cover, not SUBDOMAIN_BASE — this path
+  // issues under the customer's own `mainDomain`.
+  validateSubdomain(cleanPrefix, mainDomain);
 
   const fullDomain = `${cleanPrefix}.${mainDomain}`;
   const headers = await getVercelHeaders();

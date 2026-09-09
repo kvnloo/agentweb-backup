@@ -55,6 +55,7 @@ import {
   getDomain,
   verifyDomain,
   generateSubdomain,
+  setPageSubdomain,
   MAX_SUBDOMAIN_LABEL_LENGTH,
   SUBDOMAIN_BASE,
   CustomDomainRecord,
@@ -82,10 +83,10 @@ describe("customDomainService", () => {
     });
 
     // ENG-1839. This previously asserted `<= 63` (the DNS label limit), which is not the
-    // binding constraint: the cert is issued for `<label>.<SUBDOMAIN_BASE>` and the CN caps
-    // at 64, so a 63-char label produces an 81-char FQDN no cert can be issued for. The
-    // failure is silent — DNS resolves and the record reads "deployed" while the TLS
-    // handshake is closed. Assert the FQDN, so a regression to 63 fails here.
+    // binding constraint: the cert covers `<label>.<SUBDOMAIN_BASE>`, so a 63-char label
+    // yields an 81-char FQDN that has been observed to fail issuance. The failure is silent —
+    // DNS resolves and the record reads "deployed" while the TLS handshake is closed.
+    // Assert the FQDN, so a regression to 63 fails here.
     it("truncates long names so the resulting FQDN can be certificated", () => {
       const result = generateSubdomain("a".repeat(100));
       expect(result.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
@@ -97,9 +98,13 @@ describe("customDomainService", () => {
     });
 
     it("does not leave a trailing hyphen when truncation lands on one", () => {
-      // "ab-ab-ab-..." — truncation at an even boundary would otherwise cut mid-separator,
-      // producing a label validateSubdomain's own pattern rejects.
-      const result = generateSubdomain("ab ".repeat(60).trim());
+      // The slug must be chosen so the cut ACTUALLY lands on a hyphen at the current ceiling,
+      // otherwise this passes with or without the strip and pins nothing. "a-b-a-b-…" has
+      // period 2, so an odd ceiling (46 - 1 = index 45) cuts on a separator.
+      const slug = "a b ".repeat(40).trim();
+      expect(slug.replace(/ /g, "-").slice(0, MAX_SUBDOMAIN_LABEL_LENGTH)).toMatch(/-$/);
+
+      const result = generateSubdomain(slug);
       expect(result).not.toMatch(/-$/);
       expect(result).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
     });
@@ -108,26 +113,72 @@ describe("customDomainService", () => {
   describe("subdomain length enforcement (ENG-1839)", () => {
     const overLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH + 1);
 
-    it("rejects a label whose FQDN would exceed the cert CN limit", async () => {
+    it("rejects a label whose FQDN would exceed the safe ceiling", async () => {
       await expect(
         addSubdomain("user-1", "prj_test", overLimit)
-      ).rejects.toThrow(/certificate cannot be issued/i);
+      ).rejects.toThrow(/failed SSL certificate issuance/i);
     });
 
-    it("accepts a label exactly at the limit", () => {
+    it("accepts a label exactly at the limit", async () => {
       const atLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
       expect(`${atLimit}.${SUBDOMAIN_BASE}`.length).toBe(64);
+
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+      const record = await addSubdomain("user-1", "prj_test", atLimit);
+      expect(record.domain).toBe(`${atLimit}.${SUBDOMAIN_BASE}`);
     });
 
-    it("reproduces the two domains that shipped broken", () => {
+    it("rejects the two labels that shipped broken", async () => {
       // Both live pages that could never get a cert. 59-char labels -> 77-char FQDNs.
       for (const label of [
         "create-a-high-converting-mobile-first-emergency-home-servic",
         "build-a-single-page-pricing-focused-landing-page-called-pro",
       ]) {
-        expect(label.length).toBeGreaterThan(MAX_SUBDOMAIN_LABEL_LENGTH);
-        expect(`${label}.${SUBDOMAIN_BASE}`.length).toBeGreaterThan(64);
+        await expect(addSubdomain("user-1", "prj_test", label)).rejects.toThrow(
+          /failed SSL certificate issuance/i
+        );
       }
+    });
+
+    it("reports a bad charset as a charset problem, not a length problem", async () => {
+      await expect(
+        addSubdomain("user-1", "prj_test", "My Very Long Brand Name With Spaces".repeat(3))
+      ).rejects.toThrow(/lowercase letters, numbers, and hyphens/i);
+    });
+
+    it("validates against the customer's own domain, not SUBDOMAIN_BASE", async () => {
+      // setPageSubdomain issues under `mainDomain`. A prefix legal for a short customer
+      // domain must not be rejected by the (longer) managed-base ceiling, and one that
+      // overflows a long customer domain must be caught even though it fits that ceiling.
+      const prefix = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH + 4); // > managed ceiling
+      expect(`${prefix}.acme.io`.length).toBeLessThanOrEqual(64);
+
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+      const ok = await setPageSubdomain("user-1", "prj_test", prefix, "acme.io");
+      expect(ok.fullDomain).toBe(`${prefix}.acme.io`);
+
+      const longBase = "pages.internationalfacilitiesmanagement.co.uk";
+      const fits = "commercial-hvac-maintenance-quote"; // under the managed ceiling
+      expect(fits.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${fits}.${longBase}`.length).toBeGreaterThan(64);
+      await expect(
+        setPageSubdomain("user-1", "prj_test", fits, longBase)
+      ).rejects.toThrow(/failed SSL certificate issuance/i);
+    });
+
+    it("keeps the suffix intact when a collision forces a retry", async () => {
+      const near = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      mockAxiosGet.mockRejectedValueOnce(new Error("not on this project"));
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+
+      const record = await addSubdomain("user-1", "prj_test", near);
+      const label = record.domain.replace(`.${SUBDOMAIN_BASE}`, "");
+
+      // The 4-char suffix must survive truncation, and the result must still be legal.
+      expect(label).toMatch(/-[0-9a-f]{4}$/);
+      expect(label.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(label).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
     });
   });
 
