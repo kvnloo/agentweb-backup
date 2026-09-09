@@ -8,9 +8,26 @@
  */
 import { selectDomainsToProbe } from "../cron/domainReachabilityCron";
 
-const dom = (id: string, domain: string) => ({ id, domain, vercelProjectId: "p" });
+const dom = (id: string, domain: string, over: Record<string, any> = {}) =>
+  ({ id, domain, vercelProjectId: "p", status: "active", ...over });
 
 describe("selectDomainsToProbe", () => {
+  it("skips a custom domain that Vercel has not verified yet", () => {
+    // A domain at `pending_verification` has no DNS pointed at it, so it WILL fail a probe —
+    // an expected failure. Probing it means a normal domain-setup flow shows "this page may
+    // not be reachable" three hours in. Same signal-quality reasoning that excludes
+    // not-yet-deployed pages.
+    const domains = [dom("d1", "new.acme.io", { type: "custom", status: "pending_verification" })];
+    const pages = [{ status: "deployed", customDomainUrl: "https://new.acme.io" }];
+    expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
+  });
+
+  it("skips a domain already marked errored by verification", () => {
+    const domains = [dom("d1", "bad.acme.io", { status: "error" })];
+    const pages = [{ status: "deployed", customDomainUrl: "https://bad.acme.io" }];
+    expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
+  });
+
   it("probes a domain backing a deployed page", () => {
     const domains = [dom("d1", "live.agentwebforms.com")];
     const pages = [{ status: "deployed", customDomainUrl: "https://live.agentwebforms.com" }];

@@ -388,6 +388,14 @@ export async function addCustomDomain(
           domain: v.domain,
           value: v.value,
         })),
+    // Carry reachability forward, exactly as addSubdomain does. This is a full-item put, so
+    // omitting these ERASES them: a customer re-adding an already-confirmed-unreachable domain
+    // would clear the warning and reset the failure count to zero, hiding a known-bad state
+    // behind an ordinary user action.
+    reachabilityStatus: existing?.reachabilityStatus,
+    reachabilityError: existing?.reachabilityError,
+    lastReachabilityCheckAt: existing?.lastReachabilityCheckAt,
+    consecutiveFailures: existing?.consecutiveFailures,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
