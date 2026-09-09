@@ -56,9 +56,6 @@ import {
   verifyDomain,
   generateSubdomain,
   setPageSubdomain,
-  selectStaleDomains,
-  DOMAIN_VERIFY_TTL_MS,
-  DOMAIN_VERIFY_BATCH,
   MAX_SUBDOMAIN_LABEL_LENGTH,
   SUBDOMAIN_BASE,
   CustomDomainRecord,
@@ -512,100 +509,6 @@ describe("customDomainService", () => {
     });
   });
 
-  describe("domain health is persisted in both directions (ENG-1839)", () => {
-    const brokenRecord = {
-      Item: {
-        id: "dom-broken",
-        userId: "user-1",
-        domain: "way-too-long.agentwebforms.com",
-        type: "subdomain",
-        status: "active", // optimistic value written at creation
-        vercelProjectId: "proj-1",
-      },
-    };
-
-    it("DEMOTES a record that fails verification, instead of discarding the result", async () => {
-      // The original implementation only ever wrote the upgrade to "active". A domain that
-      // failed was never written back, so status could go up but never down — which is why
-      // all 58 production records read "active" including ones whose TLS handshake failed.
-      mockGet.mockReturnValueOnce({ promise: () => Promise.resolve(brokenRecord) });
-      mockAxiosGet.mockResolvedValueOnce({ data: { verified: false } });
-
-      const result = await verifyDomain("dom-broken", "user-1");
-      expect(result.verified).toBe(false);
-
-      const call = mockUpdate.mock.calls.at(-1)?.[0];
-      expect(call.ExpressionAttributeValues[":status"]).toBe("pending_verification");
-      expect(call.ExpressionAttributeValues[":reason"]).toMatch(/not verified/i);
-      expect(call.ExpressionAttributeValues[":checkedAt"]).toEqual(expect.any(String));
-    });
-
-    it("records WHY it is unhealthy when ownership passes but DNS does not resolve", async () => {
-      mockGet.mockReturnValueOnce({ promise: () => Promise.resolve(brokenRecord) });
-      mockAxiosGet
-        .mockResolvedValueOnce({ data: { verified: true } })
-        .mockResolvedValueOnce({ data: { misconfigured: true } });
-
-      await verifyDomain("dom-broken", "user-1");
-      const call = mockUpdate.mock.calls.at(-1)?.[0];
-      expect(call.ExpressionAttributeValues[":status"]).toBe("pending_verification");
-      expect(call.ExpressionAttributeValues[":reason"]).toMatch(/DNS does not resolve/i);
-    });
-
-    it("stamps lastVerifiedAt even when the status is unchanged", async () => {
-      // Without this, nothing can distinguish "checked and healthy" from "never checked",
-      // and the staleness selection below has nothing to work from.
-      mockGet.mockReturnValueOnce({
-        promise: () => Promise.resolve({ Item: { ...brokenRecord.Item, status: "active" } }),
-      });
-      mockAxiosGet
-        .mockResolvedValueOnce({ data: { verified: true } })
-        .mockResolvedValueOnce({ data: { misconfigured: false } });
-
-      await verifyDomain("dom-broken", "user-1");
-      const call = mockUpdate.mock.calls.at(-1)?.[0];
-      expect(call.ExpressionAttributeValues[":checkedAt"]).toEqual(expect.any(String));
-      expect(call.UpdateExpression).toContain("lastVerifiedAt");
-    });
-  });
-
-  describe("selectStaleDomains (ENG-1839)", () => {
-    const now = new Date("2026-09-09T12:00:00Z").getTime();
-    const rec = (id: string, lastVerifiedAt?: string) =>
-      ({ id, userId: "u", domain: `${id}.agentwebforms.com`, type: "subdomain", status: "active", vercelProjectId: "p", createdAt: "", updatedAt: "", lastVerifiedAt } as any);
-
-    it("prioritises never-checked records — the pre-fix state of every row", () => {
-      const picked = selectStaleDomains(
-        [rec("fresh", new Date(now - 1000).toISOString()), rec("never")],
-        now
-      );
-      expect(picked.map((r) => r.id)).toEqual(["never"]);
-    });
-
-    it("re-checks records older than the TTL and leaves fresh ones alone", () => {
-      const stale = new Date(now - DOMAIN_VERIFY_TTL_MS - 1000).toISOString();
-      const fresh = new Date(now - 1000).toISOString();
-      const picked = selectStaleDomains([rec("stale", stale), rec("fresh", fresh)], now);
-      expect(picked.map((r) => r.id)).toEqual(["stale"]);
-    });
-
-    it("caps the batch so a page load cannot fan out unboundedly to Vercel", () => {
-      const many = Array.from({ length: 50 }, (_, i) => rec(`d${i}`));
-      expect(selectStaleDomains(many, now)).toHaveLength(DOMAIN_VERIFY_BATCH);
-    });
-
-    it("treats an unparseable lastVerifiedAt as stale rather than skipping it forever", () => {
-      expect(selectStaleDomains([rec("bad", "not-a-date")], now).map((r) => r.id)).toEqual(["bad"]);
-    });
-
-    it("orders oldest-first so the most out-of-date records are refreshed first", () => {
-      const older = new Date(now - DOMAIN_VERIFY_TTL_MS - 90_000).toISOString();
-      const old = new Date(now - DOMAIN_VERIFY_TTL_MS - 1_000).toISOString();
-      const picked = selectStaleDomains([rec("old", old), rec("older", older)], now);
-      expect(picked.map((r) => r.id)).toEqual(["older", "old"]);
-    });
-  });
-
   describe("verifyDomain", () => {
     it("should check Vercel verification status and update record", async () => {
       mockGet.mockReturnValueOnce({
@@ -664,16 +567,8 @@ describe("customDomainService", () => {
       const result = await verifyDomain("dom-1", "user-123");
       expect(result.verified).toBe(false);
       expect(result.status).toBe("pending_verification");
-
-      // The invariant here is "must not have flipped the record to active". That was
-      // previously asserted as "wrote nothing at all", which only held while the sole write
-      // path was the active-upgrade. ENG-1839 adds a deliberate demotion write, so the old
-      // proxy no longer expresses the invariant. Assert the invariant itself — what was
-      // written — which is strictly stronger than asserting that nothing was.
-      const call = mockUpdate.mock.calls.at(-1)?.[0];
-      expect(call).toBeDefined();
-      expect(call.ExpressionAttributeValues[":status"]).not.toBe("active");
-      expect(call.ExpressionAttributeValues[":status"]).toBe("pending_verification");
+      // Must not have flipped the record to active.
+      expect(mockUpdate).not.toHaveBeenCalled();
     });
 
     it("should return not verified when DNS is not configured", async () => {

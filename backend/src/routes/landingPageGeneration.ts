@@ -56,7 +56,7 @@ import { injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/go
 import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
-import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE, refreshStaleDomainsInBackground } from "../services/customDomainService";
+import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
 
@@ -832,29 +832,10 @@ router.get("/generated", async (req, res: Response) => {
         }
       }
 
-      // ENG-1839: kick off re-verification of stale domains without awaiting it. The response
-      // carries the currently stored status; the refreshed truth appears on the next load.
-      // Before this, nothing ever re-checked a domain, so every record read "active" whether
-      // or not it could actually serve — an unreachable page looked healthy indefinitely.
-      try {
-        refreshStaleDomainsInBackground([...bestByOwnerProject.values()]);
-      } catch {
-        /* selection must never break a page listing */
-      }
-
       for (const page of pages) {
         if (!page.vercelProjectId || !page.userId) continue;
         const best = bestByOwnerProject.get(`${page.userId}::${page.vercelProjectId}`);
         if (!best) continue;
-
-        // Surface the domain's health so the UI can warn. The record is already loaded here,
-        // so this costs nothing extra.
-        page.domainStatus = best.status;
-        page.domainHost = best.domain;
-        page.domainLastVerifiedAt = best.lastVerifiedAt ?? null;
-        if (best.status !== "active" && best.errorMessage) {
-          page.domainErrorMessage = best.errorMessage;
-        }
         // Sub-pages have a slug and live at /{slug} under the attached domain.
         const targetUrl = page.slug
           ? `https://${best.domain}/${page.slug}`

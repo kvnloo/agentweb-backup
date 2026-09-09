@@ -35,13 +35,6 @@ export interface CustomDomainRecord {
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
-  /**
-   * When verifyDomain last actually checked this domain against Vercel. Absent on records
-   * that have never been checked — which, before ENG-1839, was all of them: `status` was
-   * written optimistically at creation and only ever upgraded to "active", never demoted, so
-   * it could not distinguish "verified healthy" from "never looked at".
-   */
-  lastVerifiedAt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -552,51 +545,18 @@ export async function verifyDomain(
     : true;
   const isActive = isVerified && !misconfigured;
 
-  // ENG-1839: persist the result in BOTH directions, and always stamp lastVerifiedAt.
-  //
-  // This previously wrote only the upgrade to "active". A domain that failed verification was
-  // never written back, so `status` could go up but never down — every record in the table
-  // read "active" regardless of the truth, including domains whose TLS handshake was closed.
-  // A check whose negative result is discarded cannot surface anything, which is why an
-  // unreachable page went unnoticed on live customer sites for months.
-  const now = new Date().toISOString();
-  const nextStatus: CustomDomainRecord["status"] = isActive
-    ? "active"
-    : "pending_verification";
-
-  if (isActive) {
+  if (isActive && record.status !== "active") {
+    // Update DynamoDB to active
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id: domainId },
         UpdateExpression:
-          "SET #status = :status, updatedAt = :updatedAt, lastVerifiedAt = :checkedAt " +
-          "REMOVE verificationRecords, errorMessage",
+          "SET #status = :status, updatedAt = :updatedAt REMOVE verificationRecords",
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
-          ":status": nextStatus,
-          ":updatedAt": now,
-          ":checkedAt": now,
-        },
-      })
-      .promise();
-  } else {
-    const reason = !isVerified
-      ? "Domain ownership is not verified with Vercel."
-      : "DNS does not resolve to Vercel, so no certificate can be issued.";
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id: domainId },
-        UpdateExpression:
-          "SET #status = :status, updatedAt = :updatedAt, lastVerifiedAt = :checkedAt, " +
-          "errorMessage = :reason",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": nextStatus,
-          ":updatedAt": now,
-          ":checkedAt": now,
-          ":reason": reason,
+          ":status": "active",
+          ":updatedAt": new Date().toISOString(),
         },
       })
       .promise();
@@ -613,62 +573,6 @@ export async function verifyDomain(
           value: v.value,
         })),
   };
-}
-
-/** How long a verification result is trusted before the domain is re-checked. */
-export const DOMAIN_VERIFY_TTL_MS = 6 * 60 * 60 * 1000;
-/** Upper bound on domains re-checked per triggering request, to cap Vercel API fan-out. */
-export const DOMAIN_VERIFY_BATCH = 5;
-
-/**
- * Pick the domains most worth re-checking: never-checked first, then oldest.
- *
- * Pure and exported so the selection can be tested without touching Vercel or DynamoDB.
- */
-export function selectStaleDomains(
-  records: CustomDomainRecord[],
-  now: number = Date.now(),
-  ttlMs: number = DOMAIN_VERIFY_TTL_MS,
-  limit: number = DOMAIN_VERIFY_BATCH
-): CustomDomainRecord[] {
-  return records
-    .filter((r) => {
-      if (!r.lastVerifiedAt) return true; // never checked — the pre-ENG-1839 state of every row
-      const age = now - new Date(r.lastVerifiedAt).getTime();
-      return Number.isNaN(age) || age > ttlMs;
-    })
-    .sort((a, b) => {
-      const at = a.lastVerifiedAt ? new Date(a.lastVerifiedAt).getTime() : 0;
-      const bt = b.lastVerifiedAt ? new Date(b.lastVerifiedAt).getTime() : 0;
-      return at - bt;
-    })
-    .slice(0, limit);
-}
-
-/**
- * Re-verify stale domains in the background.
- *
- * Deliberately NOT awaited by callers: verification hits the Vercel API and DNS, and this is
- * triggered from a user-facing list read. The response returns the currently stored status;
- * the refreshed truth shows on a subsequent load. That keeps a page listing fast while making
- * the stored status self-healing instead of permanently optimistic.
- *
- * Every rejection is swallowed — a failed background check must never surface as a failed
- * page load, and an unhandled rejection would take the process down.
- */
-export function refreshStaleDomainsInBackground(
-  records: CustomDomainRecord[],
-  now: number = Date.now()
-): CustomDomainRecord[] {
-  const stale = selectStaleDomains(records, now);
-  for (const rec of stale) {
-    verifyDomain(rec.id, rec.userId).catch((err) => {
-      console.warn(
-        `[CUSTOM DOMAINS] background verify failed for ${rec.domain}: ${err?.message}`
-      );
-    });
-  }
-  return stale;
 }
 
 /**
