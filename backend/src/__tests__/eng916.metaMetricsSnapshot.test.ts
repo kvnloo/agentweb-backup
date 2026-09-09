@@ -699,6 +699,50 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
       expect(mockGetCreds).not.toHaveBeenCalledWith(expect.anything(), 'later-user', expect.anything());
     });
 
+    // Review finding: the tie-break's own edge cases (an exact tie, and every candidate
+    // missing created_at) were correct by hand-trace but had no direct test — closing that
+    // gap here rather than leaving the correctness unverified.
+    it('an exact created_at tie still resolves to exactly one canonical user, without crashing', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-x', accountId: 'tied-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
+        makeSingleAccountUser({ userId: 'user-y', accountId: 'tied-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
+      ] as any);
+      mockGetCreds.mockResolvedValue({ accountId: 'tied-acct', accessToken: 'tok', accountName: 'Test' });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      // Exactly one resolution — a tie must still dedupe to a single canonical user, not
+      // snapshot the account twice or throw.
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      const [, resolvedUserId] = mockGetCreds.mock.calls[0];
+      expect(['user-x', 'user-y']).toContain(resolvedUserId);
+    });
+
+    it('every candidate missing created_at still resolves to exactly one canonical user', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-a', accountId: 'undated-acct', createdAt: '' }),
+        makeSingleAccountUser({ userId: 'user-b', accountId: 'undated-acct', createdAt: '' }),
+      ] as any);
+      mockGetCreds.mockResolvedValue({ accountId: 'undated-acct', accessToken: 'tok', accountName: 'Test' });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      // Missing created_at must not crash the Date.parse/Infinity comparison, and must
+      // still dedupe to exactly one resolution rather than skipping the account entirely
+      // or double-snapshotting it.
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      const [, resolvedUserId] = mockGetCreds.mock.calls[0];
+      expect(['user-a', 'user-b']).toContain(resolvedUserId);
+    });
+
     it('excludes an account id in EXCLUDED_META_ACCOUNT_IDS entirely — no credential resolution, no rows', async () => {
       mockUserDb.getAllUsers.mockResolvedValue([
         makeSingleAccountUser({ userId: 'every-io-user', accountId: '1358071355944019' }),
