@@ -816,7 +816,28 @@ router.get("/generated", async (req, res: Response) => {
       // Prefer a verified custom domain over a managed subdomain; break ties by
       // most-recently-updated.
       const bestByOwnerProject = new Map<string, CustomDomainRecord>();
-      const rank = (d: CustomDomainRecord) => (d.type === "custom" ? 1 : 0);
+      // A custom domain outranks a managed subdomain only once it is VERIFIED. Ranking on
+      // type alone let a `pending_verification` custom domain win, and since the reachability
+      // sweep deliberately does not probe unverified domains, the winning row could never
+      // carry a verdict — so a managed subdomain confirmed UNREACHABLE went unreported for as
+      // long as a custom domain sat half-configured on the same project. It also rewrote the
+      // page's URL from the working subdomain to a host with no DNS. Mirrors
+      // getProjectDomain's own active-first ordering.
+      // Three tiers, not two. A verified custom domain is what the customer wants shown; a
+      // managed subdomain is the working fallback; a custom domain that is not verified yet
+      // cannot serve at all and must never be picked.
+      //
+      // Ranking on type alone let a `pending_verification` custom domain win. Since the
+      // reachability sweep deliberately does not probe unverified domains, that winning row
+      // could never carry a verdict — so a managed subdomain confirmed UNREACHABLE went
+      // unreported for as long as a custom domain sat half-configured on the same project, and
+      // the page's URL was rewritten to a host with no DNS. Demoting it to the subdomain's own
+      // tier is not enough either: the tie then breaks on `updatedAt`, and the freshly-added
+      // custom domain is always the newer row.
+      const rank = (d: CustomDomainRecord) => {
+        if (d.type === "custom") return d.status === "active" ? 2 : 0;
+        return 1; // managed subdomain — addSubdomain writes these active unconditionally
+      };
       for (const [ownerId, domains] of domainsByOwner) {
         for (const d of domains) {
           if (!d.vercelProjectId) continue;

@@ -1545,6 +1545,43 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(res.body.pages[0].customDomainUrl).toBe("https://hireemma.ai");
   });
 
+  it("FAIL: a half-configured custom domain must not hide a broken subdomain's warning", async () => {
+    // ENG-1839. The reachability sweep deliberately does not probe an unverified domain — a
+    // pending custom domain has no DNS yet, so failing it would be an expected failure
+    // reported as a fault. But `rank` preferred `type: "custom"` regardless of status, so a
+    // pending custom domain won, and the winning row could never carry a verdict. Result: a
+    // managed subdomain CONFIRMED unreachable went unreported for as long as a custom domain
+    // sat half-configured on the same project — the ticket's own "stops watching the broken
+    // thing" failure, moved from the write path to the read path. It also rewrote the page's
+    // URL from the working subdomain to a host with no DNS.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-sub", domain: "acme.agentwebforms.com", vercelProjectId: "proj-1",
+        type: "subdomain", status: "active", updatedAt: "2026-02-01T00:00:00Z",
+        reachabilityStatus: "unreachable",
+        reachabilityError: "The connection closed during the SSL handshake.",
+      },
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    // The warning must still reach the customer.
+    expect(page.domainStatus).toBe("error");
+    expect(page.domainErrorMessage).toMatch(/SSL handshake/i);
+    // ...and the reported URL must stay on the host that actually resolves.
+    expect(page.domainHost).toBe("acme.agentwebforms.com");
+    expect(page.customDomainUrl).toBe("https://acme.agentwebforms.com");
+  });
+
   it("FAIL: org member viewing a shared page → enriched from the page OWNER's domains", async () => {
     // The caller (member) owns no domains; the shared page's owner does. The
     // member must see the same attached subdomain the owner sees, not a stale

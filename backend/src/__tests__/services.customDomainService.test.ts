@@ -359,6 +359,41 @@ describe("customDomainService", () => {
       );
     });
 
+    it("carries reachability forward on a re-add instead of erasing it", async () => {
+      // addCustomDomain is a full-item put, so omitting these ERASES them: a customer
+      // re-adding an already-confirmed-unreachable domain would clear the warning and reset
+      // the counter to zero. addSubdomain was taught this by an earlier fix; its sibling was
+      // missed, and no test caught it — this bug class has been found by review twice and by
+      // tests never.
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-custom-id",
+                userId: "user-123",
+                domain: "landing.example.com",
+                type: "custom",
+                status: "active",
+                vercelProjectId: "proj-id",
+                createdAt: "2020-01-01T00:00:00Z",
+                updatedAt: "2020-01-01T00:00:00Z",
+                reachabilityStatus: "unreachable",
+                reachabilityError: "The domain does not resolve in DNS.",
+                consecutiveFailures: 4,
+              },
+            ],
+          }),
+      });
+      mockAxiosPost.mockResolvedValueOnce({ data: { name: "landing.example.com", verified: false } });
+
+      const rec = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+
+      expect(rec.reachabilityStatus).toBe("unreachable");
+      expect(rec.reachabilityError).toMatch(/does not resolve/i);
+      expect(rec.consecutiveFailures).toBe(4);
+    });
+
     it("should reuse the existing DynamoDB record id on a re-add (no duplicate)", async () => {
       mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
       mockAxiosGet.mockResolvedValueOnce({
