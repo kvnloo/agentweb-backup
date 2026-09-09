@@ -420,13 +420,40 @@ describe('usageAnalyticsService', () => {
       expect(agg.availableProviders).toContain('newvendor');
     });
 
+    it('excludes LLM providers, which also carry a `provider` since ENG-693', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // Real shape of an LLM row after ENG-693: it HAS a provider, but no
+        // unit, and its model is not vendor-namespaced. Returning row.provider
+        // unconditionally put bedrock/gemini/openai/azure-openai/openrouter into
+        // the per-unit vendor picker in production (ENG-1837 follow-up).
+        aggRow({ model: 'anthropic.claude-opus-5', provider: 'bedrock', costMicroUsd: 3_000_000 }),
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 1_000_000 }),
+        aggRow({ model: 'gpt-5.5', provider: 'azure-openai', costMicroUsd: 500_000 }),
+        // A genuine vendor row, so the assertion is not vacuous.
+        xRow('apollo:email_reveal', { provider: 'apollo', unit: 'reveal', costMicroUsd: 49_500 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+
+      expect(agg.availableProviders).toContain('apollo');
+      for (const llmProvider of ['bedrock', 'gemini', 'azure-openai', 'openai', 'openrouter']) {
+        expect(agg.availableProviders).not.toContain(llmProvider);
+      }
+      // The registry entries are still offered — this narrows what the WINDOW
+      // contributes, not what the registry guarantees.
+      expect(agg.availableProviders).toEqual([
+        'all', 'llm', 'apollo', 'enrich.so', 'google_cse', 'remotion', 'twitter', 'v0', 'you.com',
+      ]);
+    });
+
     it('detects a vendor by model namespace when the provider attribute is absent', async () => {
       mockGetAccountById.mockResolvedValue(null);
       mockScan.mockResolvedValue([
         // No `provider` attribute, but the filter would still match this row on
         // its "{provider}:" model prefix — so the option list must too, or the
         // vendor is filterable yet unlistable.
-        aggRow({ model: 'legacyvendor:op', costMicroUsd: 1_000 }),
+        aggRow({ model: 'legacyvendor:op', costMicroUsd: 1_000 }),  // no provider, no unit
       ]);
       const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
       expect(agg.availableProviders).toContain('legacyvendor');
