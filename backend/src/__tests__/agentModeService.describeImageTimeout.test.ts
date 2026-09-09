@@ -55,6 +55,14 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
   // A promise that never resolves — simulates a hung/overloaded vision model.
   const neverResolves = () => new Promise<any>(() => {});
 
+  // Per-test budget. The code under test finishes in ~50ms (the timeout is set to
+  // that below), so this is NOT about the timeout path: `new AgentModeService()`
+  // in beforeEach imports and constructs a ~37k-line module for every test, and
+  // that construction is what consumes the budget. At the previous 10s it left
+  // barely a second of headroom and flaked on a loaded machine — observed failing
+  // inside a full parallel sweep while passing in isolation at 8.9s.
+  const CONSTRUCTION_BUDGET_MS = 30000;
+
   beforeEach(() => {
     jest.clearAllMocks();
     // Short timeout keeps the test fast while exercising the real timeout path.
@@ -81,7 +89,7 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/temporarily unavailable/i);
     expect(callLLMSpy).toHaveBeenCalledTimes(1);
-  }, 10000);
+  }, CONSTRUCTION_BUDGET_MS);
 
   it('returns a friendly failure when the vision request hangs', async () => {
     jest.spyOn(service, 'callLLM').mockImplementation(neverResolves);
@@ -90,7 +98,7 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/temporarily unavailable/i);
-  }, 10000);
+  }, CONSTRUCTION_BUDGET_MS);
 
   it('does not time out a fast vision call', async () => {
     const callLLMSpy = jest
@@ -172,5 +180,5 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/temporarily unavailable/i);
     expect(callLLMSpy).toHaveBeenCalledTimes(1);
-  }, 10000);
+  }, CONSTRUCTION_BUDGET_MS);
 });
