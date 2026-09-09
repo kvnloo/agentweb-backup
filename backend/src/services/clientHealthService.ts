@@ -249,6 +249,15 @@ export async function assessClientHealth(
     );
     const hasAds = metaAdAccounts.length > 0 || (client.adAccount && client.adAccount.trim() !== '');
 
+    // ENG-1767: resolve the account id ONCE, preferring the client's own connected Meta account
+    // over the legacy `adAccount` field — same precedence `getMetaCredentials` already uses and
+    // already has tests for ("connected_accounts over adAccount fallback when both exist").
+    // Reused below for the campaigns/insights fetches, the reported ad_account_id, and the
+    // thresholds lookup, replacing three independent re-derivations that previously disagreed on
+    // which field won and could silently drift out of sync with each other.
+    const resolvedAdAccountId: string | undefined =
+      (metaAdAccounts[0]?.config as any)?.ad_account_id || client.adAccount || undefined;
+
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
     /*
@@ -267,9 +276,15 @@ export async function assessClientHealth(
         const { getMetaAccessToken } = await import('../utils/secretsManager');
         const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-        const accessToken = await getMetaAccessToken();
+        // ENG-1767: use the client's OWN connected token when they have a connected Meta account
+        // — previously this always used the shared app-wide token regardless, which can silently
+        // see zero campaigns for an account the shared token isn't granted access to even though
+        // the client's own OAuth grant works fine (confirmed live: a real account with real spend
+        // read zero campaigns through the shared token, no error). Only falls back to the shared
+        // token for the legacy-only case (no real connected account at all).
+        const accessToken = metaAdAccounts[0]?.config?.access_token || await getMetaAccessToken();
         const apiVersion = process.env.META_API_VERSION || 'v25.0';
-        const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
+        const adAccountId = resolvedAdAccountId;
 
         // Current 14-day window and the prior 14-day window immediately preceding it, used as
         // the baseline for CTR-drop / CPM-rise fatigue checks. Fetched via the Graph API's
@@ -366,7 +381,7 @@ export async function assessClientHealth(
 
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
-      ad_account_id: client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id,
+      ad_account_id: resolvedAdAccountId,
       active_campaigns: activeCampaigns.length,
       campaigns: activeCampaigns.map((c: any) => ({
         id: c.id,
@@ -437,7 +452,7 @@ export async function assessClientHealth(
     if (activeAds.length > 0) {
       // Resolved once per assessment (not per-creative) — same thresholds apply to every
       // creative in this ad account.
-      const adAccountIdForThresholds = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
+      const adAccountIdForThresholds = resolvedAdAccountId;
       let resolvedThresholds: Record<string, { value: number; source: string }> = {};
       if (adAccountIdForThresholds) {
         try {
