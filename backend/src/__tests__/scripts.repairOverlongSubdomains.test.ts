@@ -103,7 +103,7 @@ describe("repair-overlong-subdomains — classifyRecord", () => {
       expect(classifyRecord(rec(), pages).cascade).toHaveLength(0);
     });
 
-    it("is empty for all three records actually found in production", () => {
+    it("is empty for the production fixture", () => {
       // Guards the specific detach we intend to run. If this ever fails, the data changed and
       // the detach must be re-reviewed before running.
       const prod = [
@@ -119,16 +119,49 @@ describe("repair-overlong-subdomains — classifyRecord", () => {
     });
   });
 
-  it("tolerates missing and malformed customDomainUrl without throwing", () => {
+  it("tolerates malformed customDomainUrl without throwing", () => {
+    // Pages on a DIFFERENT project, so only the parsing behaviour is under test here.
     const pages = [
-      { id: "p-none", vercelProjectId: PROJ },
-      { id: "p-bad", vercelProjectId: PROJ, customDomainUrl: "not a url" },
-      { id: "p-empty", vercelProjectId: PROJ, customDomainUrl: "" },
+      { id: "p-bad", vercelProjectId: "prj_other", customDomainUrl: "not a url" },
+      { id: "p-empty2", vercelProjectId: "prj_other", customDomainUrl: "" },
     ];
     const { isOrphan, affectedPages, cascade } = classifyRecord(rec(), pages);
     expect(isOrphan).toBe(true);
     expect(affectedPages).toHaveLength(0);
     expect(cascade).toHaveLength(0);
+  });
+
+  describe("a same-project page with no stored URL blocks the detach", () => {
+    // This previously asserted the OPPOSITE — that such a page leaves the record an orphan —
+    // which pinned a defect rather than a behaviour. `assignManagedSubdomain` creates the
+    // domain record and persists the page's customDomainUrl in a SEPARATE write, so a failure
+    // between the two leaves a deployed page whose only working URL comes from the domain row.
+    // Detaching it destroys that page's URL, silently, which is the same failure shape as the
+    // bug this whole ticket is about.
+
+    it("is NOT an orphan when a same-project page stores no URL", () => {
+      const pages = [{ id: "p-legacy", vercelProjectId: PROJ }];
+      const c = classifyRecord(rec(), pages);
+      expect(c.isOrphan).toBe(false);
+      expect(c.projectPagesWithoutUrl.map((p) => p.id)).toEqual(["p-legacy"]);
+    });
+
+    it("does not try to rewrite it — there is no stored URL to rewrite", () => {
+      const pages = [{ id: "p-legacy", vercelProjectId: PROJ }];
+      expect(classifyRecord(rec(), pages).affectedPages).toHaveLength(0);
+    });
+
+    it("still treats a no-URL page on a DIFFERENT project as irrelevant", () => {
+      const pages = [{ id: "p-elsewhere", vercelProjectId: "prj_other" }];
+      expect(classifyRecord(rec(), pages).isOrphan).toBe(true);
+    });
+
+    it("ignores a page with no vercelProjectId at all", () => {
+      // A failed generation can leave a page with neither field; it belongs to no project and
+      // must not block an unrelated record's detach.
+      const pages = [{ id: "p-orphaned-page" }];
+      expect(classifyRecord(rec(), pages).isOrphan).toBe(true);
+    });
   });
 });
 
