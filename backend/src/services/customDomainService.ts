@@ -260,16 +260,16 @@ export async function addSubdomain(
             MAX_SUBDOMAIN_LABEL_LENGTH - suffix.length - 1
           );
           finalSubdomain = stem ? `${stem}-${suffix}` : suffix;
+          // Assert the rebuilt label BEFORE the next iteration hands it to Vercel. Validating
+          // after the loop would run only once the POST had already succeeded, so a throw
+          // would leave the domain attached to the project with no record written for it.
+          validateSubdomain(finalSubdomain);
           continue;
         }
       }
       throw err; // Not a conflict or out of retries — propagate
     }
   }
-
-  // The retry path rebuilds the label, so re-assert the invariants before it is persisted and
-  // sent to Vercel. Nothing downstream re-checks it.
-  validateSubdomain(finalSubdomain);
 
   const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
 
