@@ -816,13 +816,6 @@ router.get("/generated", async (req, res: Response) => {
       // Prefer a verified custom domain over a managed subdomain; break ties by
       // most-recently-updated.
       const bestByOwnerProject = new Map<string, CustomDomainRecord>();
-      // A custom domain outranks a managed subdomain only once it is VERIFIED. Ranking on
-      // type alone let a `pending_verification` custom domain win, and since the reachability
-      // sweep deliberately does not probe unverified domains, the winning row could never
-      // carry a verdict — so a managed subdomain confirmed UNREACHABLE went unreported for as
-      // long as a custom domain sat half-configured on the same project. It also rewrote the
-      // page's URL from the working subdomain to a host with no DNS. Mirrors
-      // getProjectDomain's own active-first ordering.
       // Three tiers, not two. A verified custom domain is what the customer wants shown; a
       // managed subdomain is the working fallback; a custom domain that is not verified yet
       // cannot serve at all and must never be picked.
@@ -834,6 +827,12 @@ router.get("/generated", async (req, res: Response) => {
       // the page's URL was rewritten to a host with no DNS. Demoting it to the subdomain's own
       // tier is not enough either: the tie then breaks on `updatedAt`, and the freshly-added
       // custom domain is always the newer row.
+      //
+      // NOT the same ordering as `getProjectDomain`, despite the similar shape: that helper
+      // returns active-custom → pending-custom → null and never considers subdomains at all,
+      // so it still answers with the pending custom exactly where this ranking prefers the
+      // working subdomain. Deliberate — it answers "which custom domain is attached", this
+      // answers "what should we show the customer".
       const rank = (d: CustomDomainRecord) => {
         if (d.type === "custom") return d.status === "active" ? 2 : 0;
         return 1; // managed subdomain — addSubdomain writes these active unconditionally
