@@ -384,6 +384,61 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(mockGetQuoteTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', 5);
   });
 
+  // ── assess_post_performance (ENG-56) ──
+  it('assess_post_performance requires exactly one of text or tweet_id', async () => {
+    const neither = await service.twitterManagePost('u', { action: 'assess_post_performance' });
+    expect(neither.success).toBe(false);
+    expect(neither.error).toMatch(/text.*tweet_id|tweet_id.*text/i);
+
+    const both = await service.twitterManagePost('u', { action: 'assess_post_performance', text: 'hi', tweet_id: 'tw1' });
+    expect(both.success).toBe(false);
+    expect(both.error).toMatch(/not both/i);
+  });
+
+  it('predicted mode (text) calls Grok and returns a weighted score from its signal estimates', async () => {
+    jest.spyOn(service, 'callLLM').mockResolvedValue({
+      choices: [{ message: { content: '{"favorite":0.2,"reply":0.05,"retweet":0.02,"quote":0.01,"share":0.03,"report":0}' } }],
+    } as any);
+
+    const res = await service.twitterManagePost('u', { action: 'assess_post_performance', text: 'a great draft tweet' });
+
+    expect(service.callLLM).toHaveBeenCalledWith(
+      'openrouter/x-ai/grok-4.6',
+      expect.arrayContaining([expect.objectContaining({ role: 'user', content: expect.stringContaining('a great draft tweet') })]),
+      expect.objectContaining({ response_format: { type: 'json_object' } }),
+    );
+    expect(res.success).toBe(true);
+    expect(res.data.mode).toBe('predicted');
+    expect(res.data.score).toBeCloseTo(0.5 * 0.2 + 5.0 * 0.05 + 1.0 * 0.02 + 5.0 * 0.01 + 2.0 * 0.03, 10);
+  });
+
+  it('predicted mode fails closed when Grok returns unparsable content', async () => {
+    jest.spyOn(service, 'callLLM').mockResolvedValue({ choices: [{ message: { content: 'not json' } }] } as any);
+    const res = await service.twitterManagePost('u', { action: 'assess_post_performance', text: 'draft' });
+    expect(res.success).toBe(false);
+  });
+
+  it('actual mode (tweet_id) scores from real getTweetMetrics counts, no LLM call', async () => {
+    const callLLMSpy = jest.spyOn(service, 'callLLM');
+    const res = await service.twitterManagePost('u', { action: 'assess_post_performance', tweet_id: 'tw1' });
+
+    expect(mockGetTweetMetrics).toHaveBeenCalledWith(OWNER, 'tw1', ['tw1']);
+    expect(callLLMSpy).not.toHaveBeenCalled();
+    expect(res.success).toBe(true);
+    expect(res.data.mode).toBe('actual');
+    // from the shared mockGetTweetMetrics fixture: like 5, reply 1, retweet 2, quote 0, impressions 100
+    expect(res.data.score).toBeCloseTo(0.5 * (5 / 100) + 5.0 * (1 / 100) + 1.0 * (2 / 100) + 5.0 * (0 / 100), 10);
+  });
+
+  it('actual mode fails closed when the tweet has no impression data', async () => {
+    mockGetTweetMetrics.mockResolvedValueOnce([
+      { id: 'tw1', public_metrics: { retweet_count: 0, reply_count: 0, like_count: 0, quote_count: 0, impression_count: 0 } },
+    ]);
+    const res = await service.twitterManagePost('u', { action: 'assess_post_performance', tweet_id: 'tw1' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/impression/i);
+  });
+
   // ── CRM logging ──
   it('logs a quote-tweet to CRM when list_id/lead_id/lead_email present', async () => {
     await service.twitterManagePost('u', {
