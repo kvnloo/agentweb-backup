@@ -923,6 +923,20 @@ function pdfPageRender(pageData: any): Promise<string> {
 interface LLMModelConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
+  /**
+   * False when the model's OpenRouter entry omits `tool_choice` from
+   * `supported_parameters`. Optional and defaulting to TRUE: every other model in
+   * this registry accepts it, so only the exceptions carry the flag.
+   *
+   * This is the same class of defect as `supportsTemperature`, one parameter
+   * over, and it fails LOUDER: an unsupported `tool_choice` makes OpenRouter's
+   * provider router find no endpoint at all and return
+   * `404 No endpoints found that can handle the requested parameters`, so every
+   * agent-mode turn on that model 500s. Mirror the model page rather than
+   * assuming parity with a sibling — Claude Fable 5.1 omits `tool_choice` while
+   * Claude Fable 5 and both `:batch` variants support it.
+   */
+  supportsToolChoice?: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
   /**
@@ -2570,7 +2584,7 @@ export class AgentModeService {
     // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
     // cost caps already exist and apply automatically to every model priced
     // in llmPricing.ts, this one included.
-    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
+    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsToolChoice: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
     'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
     'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
     // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
@@ -3016,7 +3030,14 @@ export class AgentModeService {
     }
     // A server-only tool is selected by OpenRouter. Preserve the historical
     // `auto` default only for caller-supplied function tools.
-    if (callerTools.length > 0) {
+    //
+    // ENG-199: gated on `supportsToolChoice` because a model whose OpenRouter
+    // entry omits `tool_choice` cannot be routed AT ALL when we send it — the
+    // gateway answers `404 No endpoints found that can handle the requested
+    // parameters` rather than ignoring the field. Agent mode always supplies
+    // caller tools, so for such a model every turn failed. Defaults to true, so
+    // this changes nothing for the rest of the registry.
+    if (callerTools.length > 0 && this.llmModels[model].supportsToolChoice !== false) {
       params.tool_choice = tool_choice || 'auto';
     }
 
