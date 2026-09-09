@@ -113,6 +113,7 @@ jest.mock('../services/db', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
+import { computePredictedXScore, computeActualXScore } from '../utils/xPostRankingScore';
 
 const OWNER = 'owner-1';
 const SINGLE_ACCOUNT = [{ platform: 'twitter', account_id: 'tw1', userId: OWNER }];
@@ -395,9 +396,10 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(both.error).toMatch(/not both/i);
   });
 
-  it('predicted mode (text) calls Grok and returns a weighted score from its signal estimates', async () => {
+  it('predicted mode (text) calls Grok and returns a score from the real formula over its signal estimates', async () => {
+    const mockedProbs = { favorite: 0.2, reply: 0.05, retweet: 0.02, quote: 0.01, share: 0.03, report: 0 };
     jest.spyOn(service, 'callLLM').mockResolvedValue({
-      choices: [{ message: { content: '{"favorite":0.2,"reply":0.05,"retweet":0.02,"quote":0.01,"share":0.03,"report":0}' } }],
+      choices: [{ message: { content: JSON.stringify(mockedProbs) } }],
     } as any);
 
     const res = await service.twitterManagePost('u', { action: 'assess_post_performance', text: 'a great draft tweet' });
@@ -409,7 +411,7 @@ describe('AgentModeService.twitterManagePost', () => {
     );
     expect(res.success).toBe(true);
     expect(res.data.mode).toBe('predicted');
-    expect(res.data.score).toBeCloseTo(0.5 * 0.2 + 5.0 * 0.05 + 1.0 * 0.02 + 5.0 * 0.01 + 2.0 * 0.03, 10);
+    expect(res.data.score).toBeCloseTo(computePredictedXScore(mockedProbs), 10);
   });
 
   it('predicted mode fails closed when Grok returns unparsable content', async () => {
@@ -427,7 +429,10 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.success).toBe(true);
     expect(res.data.mode).toBe('actual');
     // from the shared mockGetTweetMetrics fixture: like 5, reply 1, retweet 2, quote 0, impressions 100
-    expect(res.data.score).toBeCloseTo(0.5 * (5 / 100) + 5.0 * (1 / 100) + 1.0 * (2 / 100) + 5.0 * (0 / 100), 10);
+    expect(res.data.score).toBeCloseTo(
+      computeActualXScore({ likeCount: 5, replyCount: 1, retweetCount: 2, quoteCount: 0, impressionCount: 100 })!,
+      10,
+    );
   });
 
   it('actual mode fails closed when the tweet has no impression data', async () => {

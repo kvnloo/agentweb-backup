@@ -697,7 +697,7 @@ Actions:
 - get_retweeters: List users who retweeted a tweet. Requires tweet_id.
 - get_liking_users: List users who liked a tweet. Requires tweet_id.
 - get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
-- assess_post_performance: Score how a post is likely to rank, using the same signal categories X's own ranking algorithm scores on (favorite/reply/retweet/quote/share/report probabilities). Pass text for a DRAFT post (predicted score, via Grok). Pass tweet_id instead for an ALREADY-PUBLISHED post (actual score, from its real metrics). Provide exactly one of text or tweet_id.
+- assess_post_performance: Score a post using X's own real ranking weights and combination formula (ported from X's published algorithm source, not approximated) over the signal categories a viewer's reaction can be judged on from content alone (favorite/reply/retweet/quote/click/link-click/profile-click/follow/share incl. DM+copy-link/negative-feedback probabilities). Returns a comparative score plus whether it's net-positive (predicted positive engagement outweighs predicted negative feedback) — a relative signal for comparing drafts against each other, NOT a literal prediction of X's placement, since that also depends on telemetry (dwell time, watch time) and per-viewer/per-request ranking context this tool has no way to know. Pass text for a DRAFT post (predicted, via Grok). Pass tweet_id instead for an ALREADY-PUBLISHED post (actual, from its real metrics — covers only favorite/reply/retweet/quote, the categories X's API exposes counts for). Provide exactly one of text or tweet_id.
 
 For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
     inputSchema: {

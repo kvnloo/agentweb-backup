@@ -459,9 +459,9 @@ import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/le
 import {
   buildXAssessmentPrompt,
   parseXAssessmentResponse,
-  computeWeightedXScore,
+  computePredictedXScore,
   computeActualXScore,
-  scoreTier,
+  isNetPositive,
 } from '../utils/xPostRankingScore';
 
 type MetaApiResult = {
@@ -37441,7 +37441,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             if (actualScore === null) {
               return { success: false, error: 'No impression data available for this tweet yet — actual score requires impressions.' };
             }
-            return { success: true, data: { mode: 'actual', tweet_id, score: actualScore, tier: scoreTier(actualScore), metrics: pm } };
+            return { success: true, data: { mode: 'actual', tweet_id, score: actualScore, netPositive: isNetPositive(actualScore), metrics: pm } };
           }
 
           const { system, user } = buildXAssessmentPrompt(text);
@@ -37453,15 +37453,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             ],
             {
               temperature: 0,
-              max_completion_tokens: 200,
+              max_completion_tokens: 400,
               response_format: { type: 'json_object' },
               taskClass: 'nonstandard_consumer',
             },
           );
           const raw = res?.choices?.[0]?.message?.content ?? '';
-          const probs = parseXAssessmentResponse(raw);
-          const predictedScore = computeWeightedXScore(probs);
-          return { success: true, data: { mode: 'predicted', score: predictedScore, tier: scoreTier(predictedScore), signals: probs } };
+          const probs = parseXAssessmentResponse(raw, text);
+          const predictedScore = computePredictedXScore(probs);
+          return { success: true, data: { mode: 'predicted', score: predictedScore, netPositive: isNetPositive(predictedScore), signals: probs } };
         }
 
         default: {
