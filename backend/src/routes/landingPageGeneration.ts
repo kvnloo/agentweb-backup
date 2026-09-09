@@ -1832,45 +1832,54 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
-    // Does this repository have ANY CI at all?
-    //
-    // The required-`Tests` gate below is correct for a repo that runs tests, and unsatisfiable
-    // for one that does not. Generated landing-page repos contain no `.github/workflows`, so no
-    // check named "Tests" can ever appear and publish returned 409 `required_tests_pending`
-    // forever — the error even said "retry after GitHub starts it", which GitHub never would.
-    // That is one of the reasons a customer's rebuilt page could not be published at all.
-    //
-    // FAIL CLOSED: the gate is skipped only when GitHub POSITIVELY reports zero workflows. If
-    // the lookup errors for any reason, `hasCi` stays true and the gate applies exactly as
-    // before — an unreadable answer must never be mistaken for "no tests to run".
-    let hasCi = true;
-    try {
-      const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {
-        headers: ghHeaders,
-        timeout: GITHUB_TIMEOUT_MS,
-      });
-      hasCi = (workflowsRes.data?.total_count ?? 1) > 0;
-    } catch (wfErr: any) {
-      console.warn(
-        `[LP GENERATION] Could not list workflows for ${owner}/${repoName}; ` +
-          `keeping the required-Tests gate: ${wfErr.message}`
-      );
-    }
+    // Fetch the checks for this draft first — unchanged position, so a repo that DOES report a
+    // Tests check behaves exactly as before and makes no extra API call.
+    const checksRes = await axios.get<any>(
+      `${repoBase}/commits/${draftSha}/check-runs`,
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+    const checkRuns = checksRes.data?.check_runs || [];
+    const testsCheck = checkRuns.find((check: { name?: string }) => check.name === "Tests");
 
-    const checksRes = hasCi
-      ? await axios.get<any>(`${repoBase}/commits/${draftSha}/check-runs`, {
+    // Is this a repo that can never produce a Tests check at all?
+    //
+    // The gate is correct for a repo that runs tests and UNSATISFIABLE for one that does not.
+    // Generated landing-page repos contain no `.github/workflows`, so no check named "Tests"
+    // can appear and publish returned 409 required_tests_pending forever — its own message
+    // said "retry after GitHub starts it", which GitHub never would. That blocked a customer's
+    // rebuilt page from being published at all.
+    //
+    // Requires BOTH signals. `actions/workflows` enumerates GitHub ACTIONS only, so a repo
+    // whose checks come from a GitHub App (CircleCI, Buildkite, a bespoke checker) reports
+    // total_count 0 while real checks exist — keying off that alone would skip a gate that was
+    // doing its job. Demanding zero check runs as well means the gate is skipped only when
+    // nothing has reported anything at all.
+    //
+    // FAIL CLOSED: the workflow count is consulted only when no check reported, and any error
+    // leaves it non-zero so the gate applies. "Could not determine whether this repo has CI"
+    // must never be read as "it has none".
+    let noCiAtAll = false;
+    if (!testsCheck && checkRuns.length === 0) {
+      let workflowCount = 1;
+      try {
+        const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {
           headers: ghHeaders,
           timeout: GITHUB_TIMEOUT_MS,
-        })
-      : null;
-    const testsCheck = (checksRes?.data.check_runs || []).find(
-      (check: { name?: string }) => check.name === "Tests"
-    );
+        });
+        workflowCount = workflowsRes.data?.total_count ?? 1;
+      } catch (wfErr: any) {
+        console.warn(
+          `[LP GENERATION] Could not list workflows for ${owner}/${repoName}; ` +
+            `keeping the required-Tests gate: ${wfErr.message}`
+        );
+      }
+      noCiAtAll = workflowCount === 0;
+    }
 
-    if (!hasCi) {
+    if (noCiAtAll) {
       console.log(
-        `[LP GENERATION] ${owner}/${repoName} defines no workflows — no Tests check can exist, ` +
-          `so the required-Tests gate does not apply to this publish.`
+        `[LP GENERATION] ${owner}/${repoName} reported no check runs and no workflows, so no ` +
+          `Tests check can exist — the required-Tests gate does not apply to this publish.`
       );
     } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
       const message = !testsCheck

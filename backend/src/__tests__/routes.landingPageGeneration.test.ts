@@ -1026,7 +1026,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
       })
@@ -1197,7 +1196,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // initial draft ref
       .mockResolvedValueOnce({ data: [] }) // no existing PR
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
       })
@@ -1214,7 +1212,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({ data: { check_runs: [{ name: "Tests", ...check }] } });
     mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
   };
@@ -1225,7 +1222,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({ data: { check_runs: [] } });
     mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
 
@@ -1314,7 +1310,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "tested-draft-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
       })
@@ -1346,7 +1341,8 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 0 } }) // no CI in this repo
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported at all
+      .mockResolvedValueOnce({ data: { total_count: 0 } })   // ...and no workflows exist
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
     mockAxios.post
@@ -1363,9 +1359,12 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockAxios.post).toHaveBeenCalledWith(
       expect.stringContaining("/merges"), expect.anything(), expect.anything()
     );
-    // It must not even ask for check-runs when there is provably no CI.
-    expect(mockAxios.get).not.toHaveBeenCalledWith(
+    // Both signals must have been consulted before skipping the gate.
+    expect(mockAxios.get).toHaveBeenCalledWith(
       expect.stringContaining("/check-runs"), expect.anything()
+    );
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
     );
   });
 
@@ -1376,8 +1375,8 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockRejectedValueOnce(new Error("GitHub 502")) // workflow list unreadable
-      .mockResolvedValueOnce({ data: { check_runs: [] } }); // gate still consulted
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported
+      .mockRejectedValueOnce(new Error("GitHub 502"));       // workflow list unreadable
     mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
 
     const res = await request(app)
@@ -1391,6 +1390,57 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     );
   });
 
+  it("FAIL-CLOSED: a 200 with no total_count keeps the gate", async () => {
+    // The `?? 1` default IS the fail-closed guarantee, and mutation testing showed nothing
+    // pinned it — changing it to `?? 0` left the whole suite green. A proxy or a changed API
+    // shape returning 200 with an unexpected body must not be read as "this repo has no CI".
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })
+      .mockResolvedValueOnce({ data: {} }); // 200, but no total_count
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("keeps the gate when checks come from a GitHub App rather than Actions", async () => {
+    // actions/workflows enumerates GitHub ACTIONS only. A repo whose CI is a GitHub App
+    // reports total_count 0 while real checks exist — keying off that alone would skip a gate
+    // that was doing its job and merge an untested draft to a customer's live site. Requiring
+    // zero check runs as well is what closes that hole.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        // An App reported a check, and it is not named "Tests".
+        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success" }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    // It must not even ask about workflows — a check reported, so the repo demonstrably has CI.
+    expect(mockAxios.get).not.toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
   it("still blocks a repo WITH CI whose Tests check has not completed", async () => {
     // The gate must keep working where it was always meaningful.
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
@@ -1398,7 +1448,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { total_count: 3 } }) // repo HAS CI
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "in_progress", conclusion: null }] },
       });
@@ -1420,7 +1469,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({ data: [{ number: 456 }] })
-      .mockResolvedValueOnce({ data: { total_count: 5 } }) // actions/workflows — repo HAS CI
       .mockResolvedValueOnce({
         data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
       })
