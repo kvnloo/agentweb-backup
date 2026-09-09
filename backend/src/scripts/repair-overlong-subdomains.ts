@@ -18,11 +18,13 @@
  *   The portal's own subdomain editor did the opposite and could strand a page with no domain
  *   at all; do not repeat that ordering here. If the add fails, nothing has changed.
  *
- * - PREFIXES ARE NOT DERIVED. Every prefix must be passed explicitly via --map. These are
- *   customer-facing URLs and the obvious auto-derivation is wrong: generateSubdomain() would
- *   truncate the page's LLM-authored name, and a human guess already went wrong once on this
- *   ticket ("waterheater" for a customer whose product domain is smartwaterheater.ai). The
- *   dry-run prints a suggestion; a human chooses.
+ * - PREFIXES COME FROM THE ACCOUNT'S OWN DOMAIN, not from the page name. Deriving from the
+ *   page name is what produces "create-a-high-converting-mobile-first-emergenc", and a guess
+ *   from the page TITLE already went wrong once on this ticket ("waterheater" for a customer
+ *   whose product domain is smartwaterheater.ai). The account's `productDomain` is the
+ *   customer's own declared identity — data, not inference — and it yields exactly the prefix
+ *   a human would have chosen. `--map` still overrides per record when someone wants
+ *   something specific.
  *
  * - IDEMPOTENT. Records already within the ceiling are skipped, so a re-run is a no-op.
  */
@@ -41,6 +43,7 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 const PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const DOMAINS_TABLE = `${PREFIX}AW-CustomDomains`;
 const PAGES_TABLE = `${PREFIX}AW-LandingPages`;
+const USERS_TABLE = `${PREFIX}AW-Users`;
 
 /** Cert ceiling, mirroring customDomainService. A record is broken when its FQDN exceeds it. */
 const MAX_FQDN = MAX_SUBDOMAIN_LABEL_LENGTH + 1 + SUBDOMAIN_BASE.length;
@@ -54,11 +57,43 @@ interface DomainRecord {
   status?: string;
 }
 
+interface UserRecord {
+  userId?: string;
+  email?: string;
+  companyName?: string;
+  productDomain?: string;
+}
+
 interface PageRecord {
   id: string;
   customDomainUrl?: string;
   subdomainPrefix?: string;
   vercelProjectId?: string;
+}
+
+/**
+ * The prefix a record should move to, derived from the account's own identity.
+ *
+ * Order matters: `productDomain` is the customer's declared product URL and gives the cleanest
+ * answer ("https://smartwaterheater.ai/" -> "smartwaterheater"). `companyName` is a fallback
+ * for accounts that never set one. The page id is a last resort — ugly but unique, valid, and
+ * still infinitely better than a URL that cannot be issued a certificate.
+ *
+ * Whatever comes out still goes through generateSubdomain (lowercased, stripped, truncated to
+ * the certifiable ceiling) and then addSubdomain's own validation, so this cannot produce an
+ * invalid or over-length label.
+ */
+export function derivePrefix(user: UserRecord | undefined, domainId: string): string {
+  const fromDomain = (user?.productDomain || "")
+    .replace(/^https?:\/\//, "")
+    .split("/")[0]
+    .replace(/^www\./, "")
+    .split(".")[0];
+  if (fromDomain) return generateSubdomain(fromDomain);
+
+  if (user?.companyName) return generateSubdomain(user.companyName);
+
+  return generateSubdomain(`lp-${domainId.slice(0, 8)}`);
 }
 
 /** Host of a URL, or "" when it is absent or unparseable. */
@@ -170,11 +205,15 @@ async function main() {
 
   // Pages are matched by host so a page whose customDomainUrl carries a path is still found.
   const pages = (await scanAll(PAGES_TABLE)) as PageRecord[];
+  // Accounts, so a prefix can be derived from each owner's own declared domain.
+  const users = (await scanAll(USERS_TABLE)) as UserRecord[];
+  const userById = new Map(users.filter((u) => u.userId).map((u) => [u.userId as string, u]));
 
   let repaired = 0;
   for (const rec of broken) {
-    const suggestion = generateSubdomain(rec.domain.replace(`.${SUBDOMAIN_BASE}`, ""));
-    const chosen = map[rec.id];
+    // Derived by default; --map overrides when someone wants something specific.
+    const derived = derivePrefix(userById.get(rec.userId), rec.id);
+    const chosen = map[rec.id] ?? derived;
     const { isOrphan, affectedPages, projectPagesWithoutUrl, cascade } = classifyRecord(rec, pages);
 
     // A broken record that NO page references is an orphan: attached to Vercel, unreachable,
@@ -188,7 +227,8 @@ async function main() {
         (isOrphan
           ? `   action  : detach only — no page references this host, so a replacement would go unused` +
             `${removeOld ? "" : " (pass --remove-old to actually detach)"}\n`
-          : `   new     : ${chosen ? `${chosen}.${SUBDOMAIN_BASE}` : `(none given — suggestion: ${suggestion})`}\n`) +
+          : `   new     : ${chosen}.${SUBDOMAIN_BASE}` +
+            `${map[rec.id] ? " (from --map)" : " (derived from the account's own domain)"}\n`) +
         `   pages   : ${affectedPages.length ? affectedPages.map((p) => p.id).join(", ") : "(none)"}` +
         (projectPagesWithoutUrl.length
           ? `\n   note    : ${projectPagesWithoutUrl.length} page(s) on this project store no URL ` +
@@ -227,14 +267,6 @@ async function main() {
       } catch (e: any) {
         console.error(`   ✗ ${rec.id}: ${e.message}`);
       }
-      continue;
-    }
-
-    if (!chosen) {
-      console.error(
-        `   ✗ skipped — no --map=${rec.id}=<prefix> given. Prefixes are customer-facing and ` +
-          `are never derived automatically; pass one explicitly.`
-      );
       continue;
     }
 
@@ -305,7 +337,9 @@ async function main() {
   console.log(`\n[repair] ${apply ? "repaired" : "would repair"} ${repaired} record(s).`);
   if (!apply) {
     console.log(
-      "[repair] dry-run only. Re-run with --apply and a --map=<domainId>=<prefix> per record."
+      "[repair] dry-run only. Re-run with --apply to make these changes. Prefixes above are " +
+        "derived from each account's own domain; override any of them with " +
+        "--map=<domainId>=<prefix>."
     );
   }
 }

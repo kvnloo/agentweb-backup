@@ -10,6 +10,7 @@
  */
 import {
   classifyRecord,
+  derivePrefix,
   hostOfUrl,
 } from "../scripts/repair-overlong-subdomains";
 
@@ -162,6 +163,61 @@ describe("repair-overlong-subdomains — classifyRecord", () => {
       const pages = [{ id: "p-orphaned-page" }];
       expect(classifyRecord(rec(), pages).isOrphan).toBe(true);
     });
+  });
+});
+
+describe("derivePrefix — the account's own identity, not the page name", () => {
+  // Deriving from the PAGE name is what produces "create-a-high-converting-mobile-first-
+  // emergenc", and a guess from the page title already went wrong once on this ticket
+  // ("waterheater" for a customer whose product domain is smartwaterheater.ai). The account's
+  // productDomain is the customer's own declared identity — data, not inference.
+
+  it("uses the registrable name from productDomain", () => {
+    expect(derivePrefix({ productDomain: "https://smartwaterheater.ai/" }, "dom-1")).toBe(
+      "smartwaterheater"
+    );
+  });
+
+  it("strips www and any path", () => {
+    expect(derivePrefix({ productDomain: "https://www.argusoft.com/pricing" }, "dom-1")).toBe(
+      "argusoft"
+    );
+  });
+
+  it("tolerates a bare host with no scheme", () => {
+    expect(derivePrefix({ productDomain: "openfutureforum.com" }, "dom-1")).toBe(
+      "openfutureforum"
+    );
+  });
+
+  it("falls back to companyName when no productDomain is set", () => {
+    expect(derivePrefix({ companyName: "Acme Widgets Inc." }, "dom-1")).toBe("acme-widgets-inc");
+  });
+
+  it("falls back to the record id when the account has neither", () => {
+    const p = derivePrefix({}, "6f5e0a2d-7ea9-4d88-8391-b2197f409271");
+    expect(p).toBe("lp-6f5e0a2d");
+  });
+
+  it("falls back when the account is missing entirely", () => {
+    expect(derivePrefix(undefined, "6f5e0a2d-7ea9")).toBe("lp-6f5e0a2d");
+  });
+
+  it("always yields a label that fits the certifiable ceiling", () => {
+    // The whole point of the ticket: whatever comes out must not recreate the bug.
+    const long = derivePrefix({ companyName: "A".repeat(300) }, "dom-1");
+    expect(`${long}.agentwebforms.com`.length).toBeLessThanOrEqual(64);
+  });
+
+  it("always yields a label the validator accepts", () => {
+    for (const u of [
+      { productDomain: "https://Foo-Bar.Example.com/" },
+      { companyName: "Weird!! Name?? Ltd." },
+      { companyName: "---" },
+      {},
+    ]) {
+      expect(derivePrefix(u, "abcdefgh-1234")).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
+    }
   });
 });
 
