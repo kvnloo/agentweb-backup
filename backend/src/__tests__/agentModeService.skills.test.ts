@@ -56,6 +56,7 @@ jest.mock('../mcp/client/toolRegistry', () => ({
 
 // Import the mocked modules to access the mock functions
 import { skillService } from '../services/skillService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { chatbotDb } from '../services/chatbotService';
 
 
@@ -99,6 +100,12 @@ describe('AgentModeService - Skills', () => {
       expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['skill-1', 'skill-2']);
     });
 
+    /*
+     * ENG-1795. This test previously asserted the SUBSCRIPTION message for an id it names
+     * "invalid" — the conflation, written down as an expectation. An unknown id is an ID
+     * failure; reporting it as a plan limitation sends a paying customer to sales for
+     * something sales cannot fix.
+     */
     it('should return error for invalid skill IDs', async () => {
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
 
@@ -108,8 +115,86 @@ describe('AgentModeService - Skills', () => {
         'session-123'
       );
 
-      expect(result.message).toContain('not available with your current subscription');
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).toContain('invalid-skill-1');
+      expect(result.unresolvedSkillIds).toEqual(['invalid-skill-1']);
+      // The whole point: no billing claim reaches the customer for a lookup failure.
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
+      expect(result.message).not.toMatch(/not on their plan/i);
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+    });
+
+    /*
+     * ENG-1795 — the branch that had NO coverage at all.
+     *
+     * `getAllowedSkills` is mocked to `['*']` suite-wide, so every pre-existing test that
+     * asserted "not available with your current subscription" was run against a user entitled
+     * to everything. The message was pinned in five places and the condition it describes was
+     * never once constructed. These two tests build the real thing: a published skill that
+     * exists and is deliberately NOT in the account's allowedSkills.
+     */
+    describe('refusal cause is reported accurately (ENG-1795)', () => {
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      const gatedSkill = {
+        skillId: 'premium-ads', name: 'Premium Ads', description: 'Paid tier only',
+        toolNames: ['run_premium_ad'], isPublished: true, visibility: 'public',
+      };
+
+      afterEach(() => {
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      });
+
+      it('reports a genuinely un-entitled skill as a subscription limit', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gatedSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gatedSkill]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['some-other-skill']);
+
+        const result = await agentModeService.installSkills(['premium-ads'], 'user-123', 'session-123');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('not available with your current subscription');
+        expect(result.message).toContain('premium-ads');
+        expect(result.unentitledSkillIds).toEqual(['premium-ads']);
+        // This branch is the one where the plan claim is TRUE — it must survive the split.
+        expect(result.message).toMatch(/not on their plan/i);
+        expect(result.message).not.toMatch(/could not resolve/i);
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('subscription_blocked');
+      });
+
+      it('keeps the causes separate when one call mixes them', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gatedSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gatedSkill]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['some-other-skill']);
+
+        const result = await agentModeService.installSkills(
+          ['premium-ads', 'no-such-skill'], 'user-123', 'session-123'
+        );
+
+        expect(result.unentitledSkillIds).toEqual(['premium-ads']);
+        expect(result.unresolvedSkillIds).toEqual(['no-such-skill']);
+        /*
+         * The ids must not be pooled under one verdict. A mixed refusal classified
+         * `subscription_blocked` would put `no-such-skill` back under a billing verdict —
+         * the exact conflation this change removes — so the unknown id wins the classification.
+         */
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('invalid_args');
+      });
+
+      it('makes no billing claim when the catalog lookup itself fails', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+
+        const result = await agentModeService.installSkills(['premium-ads'], 'user-123', 'session-123');
+
+        /*
+         * An unproven absence must never be reported as an entitlement failure. If we cannot
+         * read the catalog we cannot know why the id was rejected, so the one thing we must
+         * not do is assert the customer's plan is at fault.
+         */
+        expect(result.success).toBe(false);
+        expect(result.message).not.toMatch(/not available with your current subscription/i);
+        expect(result.message).not.toMatch(/not on their plan/i);
+        expect(result.unentitledSkillIds).toBeUndefined();
+      });
     });
 
     /*
@@ -138,8 +223,17 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
 
+      /*
+       * The no-substitution instruction is the invariant here, and it must hold on EVERY
+       * refusal branch — the Phoenix session's fabricated audit table did not depend on which
+       * reason the install was refused for. ENG-1795 split one refusal into three; the clause
+       * is appended once, outside the branch, so this assertion now covers all of them.
+       */
       expect(result.message).toMatch(/do not substitute/i);
-      expect(result.message).toMatch(/not on their plan/i);
+      // Was `/not on their plan/i`: this fixture is an entitled-but-empty `__other_skills__`,
+      // which is not a plan limitation at all, so asserting that phrasing pinned the bug.
+      expect(result.message).toMatch(/currently unavailable to install/i);
+      expect(result.message).not.toMatch(/not on their plan/i);
     });
 
     /*
@@ -164,7 +258,10 @@ describe('AgentModeService - Skills', () => {
 
       expect(ledgerResult.success).toBe(false);
       // The refusal must still be readable in the ledger, not just in the returned object.
-      expect(String(ledgerResult.message)).toMatch(/not available with your current subscription/i);
+      // (ENG-1795: `__other_skills__` with an empty pool is the UNAVAILABLE branch, not the
+      // subscription one — what this test guards is that a refusal survives minimization at
+      // all, which is independent of which branch produced it.)
+      expect(String(ledgerResult.message)).toMatch(/currently unavailable to install/i);
     });
 
     it('a PARTIAL install survives minimization as partial, not as a clean success', async () => {
@@ -465,7 +562,14 @@ describe('AgentModeService - Skills', () => {
         'session-xyz'
       );
 
-      expect(result.message).toContain('not available with your current subscription');
+      /*
+       * ENG-1795: "could not resolve" is both more accurate AND less leaky here. The old
+       * subscription wording implicitly confirmed to an outsider that `org-private-skill-1`
+       * exists and is merely unpurchased; an unresolvable id reveals nothing about another
+       * org's private catalog.
+       */
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
     it('rejects a same-org private skill when skill sharing is disabled', async () => {
@@ -475,7 +579,9 @@ describe('AgentModeService - Skills', () => {
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
       const result = await agentModeService.installSkills(['org-private'], 'member-1', 'session-1');
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
-      expect(result.message).toContain('not available with your current subscription');
+      // ENG-1795: sharing being switched off is a config state, not a billing one.
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
 
