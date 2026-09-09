@@ -286,3 +286,98 @@ describe("getPublicTemplates", () => {
     expect(mockGetSetting).toHaveBeenCalledWith("templates_public");
   });
 });
+
+// ── upsertPublicTemplate (ENG-1552) ─────────────────────────────────────────
+// The only writer of templates_public anywhere in this codebase — createTemplate
+// above only ever targets USER_KEY. Callers (seed scripts) supply their own
+// STABLE template_id rather than relying on a fresh uuid, so re-running a seed
+// is idempotent instead of accumulating duplicate public rows.
+describe("upsertPublicTemplate", () => {
+  const PUB_TPL = {
+    template_id: "eng1552-fixed-id",
+    template_name: "multi_campaign_performance_report",
+    type: ["landing_page"] as ("email" | "landing_page")[],
+    subject: "Report",
+    html_content: "<p>{{report_title}}</p>",
+    variables: ["report_title"],
+    arrayVariables: [],
+  };
+
+  it("creates a new row on an empty templates_public table", async () => {
+    mockGetSetting.mockResolvedValue(null);
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+    );
+
+    expect(created).toBe(true);
+    expect(template.template_id).toBe("eng1552-fixed-id");
+    expect(template.created_at).toBeTruthy();
+    expect(template.updated_at).toBeTruthy();
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      "templates_public",
+      expect.any(String),
+      "User templates",
+      "system",
+    );
+    const written = JSON.parse(mockSetSetting.mock.calls[0][1]);
+    expect(written).toHaveLength(1);
+    expect(written[0].template_id).toBe("eng1552-fixed-id");
+  });
+
+  it("with onlyIfAbsent:true, skips the write entirely when the id already exists", async () => {
+    const existing = { ...PUB_TPL, created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" };
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([existing]),
+    });
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+      { onlyIfAbsent: true },
+    );
+
+    expect(created).toBe(false);
+    expect(template.updated_at).toBe("2026-01-01T00:00:00.000Z");
+    expect(mockSetSetting).not.toHaveBeenCalled();
+  });
+
+  it("without onlyIfAbsent, overwrites the existing row in place rather than duplicating it", async () => {
+    const existing = { ...PUB_TPL, html_content: "<p>OLD</p>", created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" };
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([existing]),
+    });
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+    );
+
+    expect(created).toBe(false);
+    expect(template.html_content).toBe(PUB_TPL.html_content);
+    expect(template.created_at).toBe("2026-01-01T00:00:00.000Z");
+    const written = JSON.parse(mockSetSetting.mock.calls[0][1]);
+    expect(written).toHaveLength(1);
+    expect(written[0].html_content).toBe(PUB_TPL.html_content);
+  });
+
+  it("never writes to a per-user key — only templates_public", async () => {
+    mockGetSetting.mockResolvedValue(null);
+    await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      "templates_public",
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+    );
+    expect(mockSetSetting).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^templates_(?!public)/),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});
