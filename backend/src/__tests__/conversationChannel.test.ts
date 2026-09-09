@@ -99,6 +99,37 @@ describe('handleSessionResponse — FAIL cases', () => {
     chatbotDb.createOrReuseInteractiveShare.mockResolvedValue('https://ishare/1');
   });
 
+  // CodeRabbit, PR #2393: removing the thinking placeholder is best-effort cleanup.
+  // Before the guard, a rejection there discarded an answer that had already been
+  // generated — and in the error path, swallowed the error reply too, leaving the
+  // customer with a "thinking" message and nothing else. Behaviour inherited from
+  // the pre-extraction Slack code; fixed here because both transports now share it.
+  it('still delivers a successful response when removing the thinking message fails', async () => {
+    generateSessionResponse.mockResolvedValue({ content: 'done' });
+    const adapter = makeAdapter({
+      deleteMessage: jest.fn().mockRejectedValue(new Error('message_not_found')),
+    });
+
+    await expect(handleSessionResponse(baseParams(), adapter)).resolves.toBeUndefined();
+
+    expect(adapter.deleteMessage).toHaveBeenCalledWith(REF, { id: 'think-1' });
+    expect(adapter.postReply).toHaveBeenCalledWith(REF, 'done');
+  });
+
+  it('still delivers the error reply when removing the thinking message also fails', async () => {
+    generateSessionResponse.mockRejectedValue(new Error('boom'));
+    const adapter = makeAdapter({
+      deleteMessage: jest.fn().mockRejectedValue(new Error('message_not_found')),
+    });
+
+    await expect(handleSessionResponse(baseParams(), adapter)).resolves.toBeUndefined();
+
+    expect(adapter.postReply).toHaveBeenCalledWith(
+      REF,
+      'Sorry, I encountered an error while processing your request. Please try again.'
+    );
+  });
+
   it('reports the failure into the thread instead of throwing when generation rejects', async () => {
     generateSessionResponse.mockRejectedValue(new Error('boom'));
     const adapter = makeAdapter();

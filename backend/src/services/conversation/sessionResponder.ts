@@ -14,7 +14,26 @@
  * reference Slack or Teams by name outside of comments.
  */
 
-import type { ConversationChannelAdapter, ConversationRef, InboundAttachment } from './channelPort';
+import type { ConversationChannelAdapter, ConversationRef, InboundAttachment, MessageHandle } from './channelPort';
+
+/**
+ * Removing the "thinking" placeholder is best-effort cleanup, not part of delivering
+ * the answer. An unguarded await here means a transport hiccup on the delete discards
+ * a response that was generated successfully — and in the error path, swallows the
+ * error reply too, so the customer sees nothing at all. Log and carry on.
+ */
+async function removeThinkingMessage(
+  adapter: ConversationChannelAdapter,
+  ref: ConversationRef,
+  thinking: MessageHandle | null,
+): Promise<void> {
+  if (!thinking) return;
+  try {
+    await adapter.deleteMessage(ref, thinking);
+  } catch (deleteError) {
+    console.error('⚠️ Non-blocking: Failed to remove the thinking message:', deleteError);
+  }
+}
 
 export interface SessionResponseParams {
   session: any;
@@ -102,9 +121,7 @@ export async function handleSessionResponse(
     ));
 
     // Remove the thinking message
-    if (thinking) {
-      await adapter.deleteMessage(ref, thinking);
-    }
+    await removeThinkingMessage(adapter, ref, thinking);
 
     // Post the response to the thread
     if (response.content) {
@@ -132,9 +149,7 @@ export async function handleSessionResponse(
       }
     }
 
-    if (thinking) {
-      await adapter.deleteMessage(ref, thinking);
-    }
+    await removeThinkingMessage(adapter, ref, thinking);
     await adapter.postReply(ref, 'Sorry, I encountered an error while processing your request. Please try again.');
 
     // Save error message to session so ishare viewers see the failure rather than an orphaned user message
