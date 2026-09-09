@@ -12,6 +12,7 @@ import {
   classifyRecord,
   derivePrefix,
   hostOfUrl,
+  isRepairableSubdomain,
 } from "../scripts/repair-overlong-subdomains";
 
 const PROJ = "prj_KGnTpOQtOJ1I1zYl302YRgS8itLj";
@@ -23,6 +24,52 @@ const rec = (over: Partial<any> = {}) => ({
   domain: LONG,
   vercelProjectId: PROJ,
   ...over,
+});
+
+/*
+ * Scope selection. This runs BEFORE any classification, so anything it wrongly admits is
+ * already inside a script whose `--remove-old` orphan branch deletes from Vercel with no
+ * `--map` and no per-record confirmation. Getting this wrong destroys data that was never
+ * ours to touch.
+ */
+describe("repair-overlong-subdomains — isRepairableSubdomain", () => {
+  const OVERLONG_CUSTOM = "landing-pages-for-our-north-american-division.myagentwebforms.com";
+
+  it("selects an over-length MANAGED subdomain", () => {
+    expect(isRepairableSubdomain(rec({ type: "subdomain" }) as any)).toBe(true);
+  });
+
+  it("ignores a managed subdomain that is within the ceiling", () => {
+    expect(
+      isRepairableSubdomain(rec({ type: "subdomain", domain: "short.agentwebforms.com" }) as any)
+    ).toBe(false);
+  });
+
+  it("NEVER selects a customer's own custom domain, however long", () => {
+    /*
+     * `addCustomDomain` has no length ceiling — `validateDomain` checks format only — so a
+     * customer can store a domain longer than the cert limit. It is still theirs. Selecting it
+     * put it on the orphan path, which deletes from Vercel irreversibly.
+     */
+    expect(isRepairableSubdomain(rec({ type: "custom", domain: OVERLONG_CUSTOM }) as any)).toBe(false);
+    // Even one that genuinely sits under our base domain is not ours to rewrite.
+    expect(isRepairableSubdomain(rec({ type: "custom" }) as any)).toBe(false);
+  });
+
+  it("does not match a look-alike registrable domain", () => {
+    /*
+     * The bug this pins: `endsWith("agentwebforms.com")` with no leading dot also matches
+     * `myagentwebforms.com`, an unrelated domain that merely ends in the same letters.
+     */
+    expect(OVERLONG_CUSTOM.endsWith("agentwebforms.com")).toBe(true); // the trap
+    expect(
+      isRepairableSubdomain(rec({ type: "subdomain", domain: OVERLONG_CUSTOM }) as any)
+    ).toBe(false);
+  });
+
+  it("ignores a record with no domain", () => {
+    expect(isRepairableSubdomain(rec({ type: "subdomain", domain: undefined }) as any)).toBe(false);
+  });
 });
 
 describe("repair-overlong-subdomains — classifyRecord", () => {

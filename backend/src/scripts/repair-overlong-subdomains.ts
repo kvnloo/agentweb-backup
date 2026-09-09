@@ -116,6 +116,33 @@ export function hostOfUrl(url: string | undefined): string {
  * + subdomainPrefix on any whose customDomainUrl CONTAINS the removed domain as a substring.
  * A non-empty cascade means detaching would damage those pages.
  */
+/**
+ * Is this record one this script is allowed to touch?
+ *
+ * Both conditions are load-bearing, and this script DELETES from Vercel irreversibly.
+ *
+ *   `type === "subdomain"` — only MANAGED subdomains are ours to rewrite. `addCustomDomain`
+ *   applies no length ceiling of its own (`validateDomain` is format-only), so a customer can
+ *   legitimately store a domain of their own longer than the cert ceiling. Without this check
+ *   such a row lands in scope, and the ORPHAN branch of `--remove-old` needs neither `--map`
+ *   nor a per-record opt-in — it would delete the customer's own domain outright.
+ *
+ *   The leading dot — `endsWith("agentwebforms.com")` also matches
+ *   `…division.myagentwebforms.com`, an unrelated registrable domain that merely ends in the
+ *   same letters. Suffix matching on a bare domain string is substring matching with extra
+ *   steps, and here the consequence is deleting something that was never ours.
+ *
+ * Exported solely so the predicate is testable; `main()` is the only production caller.
+ */
+export function isRepairableSubdomain(d: DomainRecord): boolean {
+  return Boolean(
+    d.domain &&
+      d.type === "subdomain" &&
+      d.domain.endsWith(`.${SUBDOMAIN_BASE}`) &&
+      d.domain.length > MAX_FQDN
+  );
+}
+
 export function classifyRecord(
   rec: DomainRecord,
   pages: PageRecord[]
@@ -191,9 +218,7 @@ async function main() {
   const map = parseMap();
 
   const domains = (await scanAll(DOMAINS_TABLE)) as DomainRecord[];
-  const broken = domains.filter(
-    (d) => d.domain && d.domain.endsWith(SUBDOMAIN_BASE) && d.domain.length > MAX_FQDN
-  );
+  const broken = domains.filter(isRepairableSubdomain);
 
   console.log(
     `[repair] ceiling: label ${MAX_SUBDOMAIN_LABEL_LENGTH}, FQDN ${MAX_FQDN}. ` +
