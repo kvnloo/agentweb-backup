@@ -718,6 +718,54 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.ads_layer.campaigns_complete).toBe(false);
   });
 
+  /*
+   * ENG-1767 follow-up: `fetchWithRetryAndPaging` does not throw on a Graph API error — per its
+   * own documented contract it RESOLVES with the parsed `{ error: {...} }` body, no `data` array,
+   * no `pagingTruncated` flag. The truncation-only check above missed this case entirely: a real
+   * permission error came back as `active_campaigns: 0, campaigns_complete: true` — confirmed live
+   * against a real account whose stored token had lost Graph access. Same silent-wrong-zero shape
+   * this whole ticket exists to eliminate, via a different trigger than the original bug.
+   */
+  it('does not report campaigns_complete:true when the campaigns fetch resolves with a Graph API error', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({
+      error: { message: 'Ad account owner has NOT grant ads_management or ads_read permission', code: 200 },
+    });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(0);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+  });
+
   it('should detect a deployed landing page owned by another member of the client org', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
       userId: 'admin-user',
