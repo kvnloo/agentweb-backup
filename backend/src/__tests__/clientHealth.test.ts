@@ -766,6 +766,107 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.ads_layer.campaigns_complete).toBe(false);
   });
 
+  /*
+   * Sibling of the campaigns_complete gap above, found by the same review: the ad-level insights
+   * fetch (creative-fatigue/cannibalization source data) has the identical failure mode and, before
+   * this fix, NO completeness signal at all — not even a flawed one. A failed read after a
+   * successful campaigns fetch silently reported zero warnings with full confidence, which can make
+   * a client's health look BETTER than it is, not just incomplete.
+   */
+  it('does not report creative_data_complete:true when the ad-level insights fetch resolves with a Graph API error', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      .mockResolvedValueOnce({
+        error: { message: 'Ad account owner has NOT grant ads_management or ads_read permission', code: 200 },
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    // The campaigns read itself succeeded cleanly — this must NOT be conflated with the
+    // ad-level failure below.
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(false);
+    expect(result.health.creative_variety.cannibalization_warning).toBe(false);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
+  });
+
+  it('reports creative_data_complete:true for a genuinely clean, successful ad-level read', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      .mockResolvedValueOnce({
+        data: [
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.creative_data_complete).toBe(true);
+  });
+
   it('should detect a deployed landing page owned by another member of the client org', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
       userId: 'admin-user',
