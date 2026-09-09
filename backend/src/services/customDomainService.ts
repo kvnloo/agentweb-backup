@@ -42,8 +42,33 @@ export interface CustomDomainRecord {
 // ---------------------------------------------------------------------------
 
 /**
+ * Certificates cap the Common Name at 64 characters, and every managed subdomain is issued a
+ * cert for `<label>.<SUBDOMAIN_BASE>`. So a label that fits DNS's own 63-character limit can
+ * still produce an FQDN no certificate can be issued for: DNS resolves, the TLS handshake is
+ * closed, and the page is unreachable while its record still reads `deployed` (ENG-1839).
+ *
+ * Derived from SUBDOMAIN_BASE rather than hardcoded so it stays correct if the apex domain
+ * ever changes. For "agentwebforms.com" this is 46.
+ */
+const MAX_CERT_CN_LENGTH = 64;
+const MAX_DNS_LABEL_LENGTH = 63;
+export const MAX_SUBDOMAIN_LABEL_LENGTH = Math.min(
+  MAX_DNS_LABEL_LENGTH,
+  MAX_CERT_CN_LENGTH - 1 - SUBDOMAIN_BASE.length
+);
+
+/**
+ * Truncate a label to the certifiable maximum, dropping any trailing hyphen the cut leaves
+ * behind — a trailing hyphen is rejected by validateSubdomain's own pattern.
+ */
+function truncateLabel(label: string, max: number = MAX_SUBDOMAIN_LABEL_LENGTH): string {
+  return label.slice(0, max).replace(/-+$/, "");
+}
+
+/**
  * Generate a clean subdomain slug from a brand/page name.
- * Strips special characters, lowercases, and truncates to 63 chars (DNS limit).
+ * Strips special characters, lowercases, and truncates to a length whose FQDN can be
+ * certificated (see MAX_SUBDOMAIN_LABEL_LENGTH).
  */
 export function generateSubdomain(name: string): string {
   if (!name || !name.trim()) {
@@ -61,18 +86,24 @@ export function generateSubdomain(name: string): string {
     return `page-${uuidv4().slice(0, 8)}`;
   }
 
-  return slug.slice(0, 63);
+  return truncateLabel(slug) || `page-${uuidv4().slice(0, 8)}`;
 }
 
 /**
- * Validate a subdomain string (alphanumeric + hyphens, 1-63 chars).
+ * Validate a subdomain string (alphanumeric + hyphens, length bounded so the resulting
+ * FQDN can actually receive a certificate).
  */
 function validateSubdomain(subdomain: string): void {
   if (!subdomain || subdomain.length === 0) {
     throw new Error("Invalid subdomain: cannot be empty");
   }
-  if (subdomain.length > 63) {
-    throw new Error("Invalid subdomain: exceeds 63 character limit");
+  if (subdomain.length > MAX_SUBDOMAIN_LABEL_LENGTH) {
+    const fqdnLength = subdomain.length + 1 + SUBDOMAIN_BASE.length;
+    throw new Error(
+      `Invalid subdomain: "${subdomain}.${SUBDOMAIN_BASE}" is ${fqdnLength} characters, ` +
+        `but a certificate cannot be issued above ${MAX_CERT_CN_LENGTH}. ` +
+        `Use at most ${MAX_SUBDOMAIN_LABEL_LENGTH} characters.`
+    );
   }
   if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(subdomain)) {
     throw new Error(
@@ -175,8 +206,15 @@ export async function addSubdomain(
           // Domain is on a different project — retry with a suffix
         }
         if (attempt < MAX_RETRIES) {
+          // Truncate the BASE to leave room for the suffix, rather than truncating the
+          // joined string — the latter can cut into the suffix and destroy the uniqueness
+          // it exists to provide, or leave a trailing hyphen that validateSubdomain rejects.
           const suffix = Math.random().toString(16).slice(2, 6);
-          finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
+          const base = truncateLabel(
+            cleanSubdomain,
+            MAX_SUBDOMAIN_LABEL_LENGTH - suffix.length - 1
+          );
+          finalSubdomain = `${base}-${suffix}`;
           continue;
         }
       }
