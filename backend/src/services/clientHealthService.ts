@@ -46,6 +46,11 @@ interface CreativeVariety {
     name: string;
     reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
   }>;
+  // Sibling of ads_layer.campaigns_complete: false when the ad-level insights read (the
+  // creative-fatigue/cannibalization source data) failed or was truncated despite active
+  // campaigns existing. Without this, a failed read reports zero warnings with full confidence
+  // — a client's health can look BETTER than it is, not just incomplete.
+  creative_data_complete?: boolean;
 }
 
 interface PaymentInfo {
@@ -272,14 +277,28 @@ export async function assessClientHealth(
 
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
+    // Defaults true: trivially complete when the ad-level fetch is never attempted (no active
+    // campaigns to look up, or the campaigns fetch itself already failed — that failure is
+    // already signalled via campaigns_complete below, and creative_variety derives from
+    // active_campaigns, so a reader who already distrusts one already knows to distrust both).
+    // Only flips false when the ad-level fetch is attempted AND it independently fails/truncates.
+    let adLevelDataComplete = true;
     /*
      * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
      * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
-     * after a campaigns read actually succeeds without truncation, below. Before this fix it
-     * defaulted to true unconditionally and only flipped FALSE on a truncated success — a fetch
-     * that THREW (network error, expired token) fell through to the catch block below, which
-     * only logs, leaving activeCampaigns empty and campaignsComplete still true: a fetch that
-     * read NOTHING reported as "confirmed zero campaigns, complete."
+     * after a campaigns read actually succeeds cleanly, below. Before this fix it defaulted to
+     * true unconditionally and only flipped FALSE on a truncated success — a fetch that THREW
+     * (network error, expired token) fell through to the catch block below, which only logs,
+     * leaving activeCampaigns empty and campaignsComplete still true: a fetch that read NOTHING
+     * reported as "confirmed zero campaigns, complete."
+     *
+     * ENG-1767 follow-up: `fetchWithRetryAndPaging` does not throw on a Graph API error (bad
+     * token, permission revoked, etc.) — by its own documented contract it RETURNS the parsed
+     * `{ error: {...} }` body instead, with no `data` array and no `pagingTruncated` flag.
+     * Checking only `pagingTruncated` missed exactly this case: a real permission error came back
+     * as `activeCampaigns: [], campaignsComplete: true` — confirmed live against a real account
+     * whose stored token had lost Graph access — the same "silent wrong zero" failure shape this
+     * ticket exists to eliminate, just via a first-page API error instead of a wrong token source.
      */
     let campaignsComplete = !hasAds;
 
@@ -344,7 +363,7 @@ export async function assessClientHealth(
           activeCampaigns = (campaignsData.data || []).filter(
             (c: any) => c.status === 'ACTIVE'
           );
-          campaignsComplete = campaignsData.pagingTruncated !== true;
+          campaignsComplete = campaignsData.pagingTruncated !== true && !campaignsData.error;
 
           // Fetch ad-level data for creative variety + fatigue analysis, requesting both the
           // current and prior 14-day windows via `time_ranges` in one `insights` edge call —
@@ -375,6 +394,11 @@ export async function assessClientHealth(
               encodeURIComponent('insights.time_ranges(') +
               encodeURIComponent(timeRanges) +
               encodeURIComponent(`){${insightsFields}}`);
+            // Pessimistic the moment we decide to attempt this fetch — mirrors campaignsComplete's
+            // own pattern (starts false, only flips true after a full clean read). If the transform
+            // below throws on malformed data, this stays false rather than reverting to the outer
+            // "nothing to check" default, which would otherwise misreport a crashed read as complete.
+            adLevelDataComplete = false;
             const adData = await fetchWithRetryAndPaging(
               `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,${creativeSelector},status,` +
                 `${insightsSelector}` +
@@ -401,6 +425,12 @@ export async function assessClientHealth(
                 prior_insights: prior ? { data: [prior] } : undefined,
               };
             });
+            // Only reached once the fetch AND the transform above both completed without
+            // throwing — same shape as campaigns_complete: fetchWithRetryAndPaging resolves with
+            // {error:{...}} rather than throwing on a Graph API error, so this must be checked
+            // explicitly rather than relying on the catch block below, which never runs for that
+            // case.
+            adLevelDataComplete = adData.pagingTruncated !== true && !adData.error;
           }
         }
       } catch (err) {
@@ -571,6 +601,12 @@ export async function assessClientHealth(
       fatigue_warning: fatigueWarning,
       top_creatives: topCreatives,
       fatigued_creatives: fatiguedCreatives,
+      // ANDed with campaignsComplete: the ad-level fetch can succeed cleanly on its own while
+      // still being built from a truncated/errored campaigns list (fetchWithRetryAndPaging keeps
+      // whatever partial data it already has rather than discarding it on truncation) — that
+      // input incompleteness has to propagate here too, not just report the ad-level fetch's own
+      // isolated success.
+      creative_data_complete: adLevelDataComplete && campaignsComplete,
     };
 
     // --- Overall Status ---
