@@ -867,6 +867,114 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.creative_variety.creative_data_complete).toBe(true);
   });
 
+  /*
+   * Review finding on the fix above: fetchWithRetryAndPaging keeps whatever partial `data` it
+   * already fetched when it truncates (it does not discard the page it did read) — so a truncated
+   * campaigns read can still return real ACTIVE campaigns and feed a genuinely clean, successful
+   * ad-level fetch. Before this, creative_data_complete reported its own isolated success (true)
+   * with no reflection of the incomplete campaign list it was built from. Now ANDed with
+   * campaigns_complete so incompleteness upstream propagates downstream too.
+   */
+  it('reports creative_data_complete:false when built from a truncated (but non-empty) campaigns read, even if the ad-level fetch itself is clean', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        pagingTruncated: true,
+      })
+      .mockResolvedValueOnce({
+        data: [
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(1);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
+  });
+
+  /*
+   * Review finding: adLevelDataComplete used to be assigned BEFORE the ad-level transform ran, so
+   * a throw during that transform (malformed data from Graph) left the flag at whatever it was
+   * already set to, misreporting a crashed read as complete. Now assigned pessimistic (false) the
+   * moment the fetch is attempted, only flipping true after fetch AND transform both succeed — a
+   * throw here should leave it false, caught by the outer catch, not silently true.
+   */
+  it('does not report creative_data_complete:true when the ad-level transform itself throws on malformed data', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      // A malformed `null` entry — `ad.insights?.data` throws on `null.insights` inside the
+      // transform, since the optional chaining only guards insights -> data, not `ad` itself.
+      .mockResolvedValueOnce({ data: [null] });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
+  });
+
   it('should detect a deployed landing page owned by another member of the client org', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
       userId: 'admin-user',
