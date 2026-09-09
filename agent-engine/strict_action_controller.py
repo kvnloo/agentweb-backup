@@ -26,8 +26,9 @@ so the framework's own already-existing step-error/retry machinery
 (`Agent._handle_step_error`, bounded by the same `max_failures`/`retry_delay`
 already configured in `web_agent.py`) handles recovery -- no new retry logic
 needed. Deliberately a subclass, not a monkeypatch of `Controller` itself:
-`self.controller` (constructed once per `WebAgent.setup()`, one OS subprocess
-per task) is the only instance that matters here, confirmed via `grep` that
+`self.controller` (constructed once in `WebAgent.__init__`, never reassigned,
+one OS subprocess per task) is the only instance that matters here,
+confirmed via `grep` that
 `Controller.act(` has exactly one call site in the whole installed
 `browser_use` package -- a global class-level patch would carry needless
 blast radius a subclass doesn't.
@@ -38,6 +39,20 @@ unlike the multi-field case, it falls through to a harmless no-op
 agent just proceeds to the next step rather than fabricating anything --
 not observed in production, and not worth guarding against a hypothetical
 that isn't actually dangerous.
+
+One related crash mode is worth naming precisely rather than hand-waved:
+`ActionModel.set_index()` does `next(iter(action_data.keys()))`, which would
+raise `StopIteration` on a genuinely empty (all-unset) action. Its only call
+site in the package is `Agent._update_action_indices()`, reachable only
+through `Agent._execute_history_step()`, reachable only through
+`rerun_history()`/`load_and_rerun()` -- a history-replay feature agent-engine
+never calls anywhere (confirmed: zero references in this codebase). That
+code path is fully dead here today, which is the actual reason a
+zero-populated `ActionModel` can't crash in production right now -- not
+because anything in that method gates on the *count* of populated fields
+(it doesn't: the comparison it runs fires for a `None` old index same as
+any other mismatch). If agent-engine ever starts using history replay,
+this dead path would need its own guard; it's out of scope for this fix.
 """
 from typing import List, Tuple
 

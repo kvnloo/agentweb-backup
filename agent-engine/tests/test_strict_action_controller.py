@@ -79,6 +79,38 @@ class TestStrictActionController(unittest.TestCase):
 
         mock_act.assert_called_once()
 
+    def test_still_correct_once_agent_engine_custom_actions_are_registered(self):
+        # web_agent.py's own _register_actions() adds ~20 custom actions
+        # (write_file, search_web, run_integration_test, ...) via
+        # @self.controller.registry.action(...) on top of browser-use's
+        # built-ins, changing the real production ActionModel's field count
+        # and order from what _build_action_model_cls() alone produces.
+        # Mirrors that exact decorator pattern to confirm the count/raise
+        # logic is generic over registry contents, not accidentally tied to
+        # the bare-Controller field set the other tests use.
+        controller = StrictActionController()
+
+        @controller.registry.action("Custom action for this test")
+        async def custom_test_action(some_param: str):
+            return None
+
+        ActionModelCls = controller.registry.create_action_model()
+        self.assertIn("custom_test_action", ActionModelCls.model_fields)
+
+        action = ActionModelCls(
+            done={"text": "fabricated result", "success": True},
+            custom_test_action={"some_param": "x"},
+        )
+
+        async def run():
+            await controller.act(action, None)
+
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(run())
+        self.assertIn("2 actions were populated simultaneously", str(ctx.exception))
+        self.assertIn("done", str(ctx.exception))
+        self.assertIn("custom_test_action", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
