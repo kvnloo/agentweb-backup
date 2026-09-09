@@ -1198,11 +1198,19 @@ function attachInProcessCompletion(
       const claimed = await claimCompletion(pageId);
       if (!claimed) return; // the poller already delivered this one
       const { io } = await import('../server');
+      // ENG-1495: resolved is generateResponse's own genPromise, reattached after a
+      // timeout -- the same generateSessionResponse() result the primary response
+      // path would have used, so its responseMessages already carries the
+      // messageIndex stamped during persistence.
+      const completionMessageIndex = [...(resolved?.responseMessages || [])]
+        .reverse()
+        .find((m: any) => m?.role === 'assistant')?.messageIndex;
       io.to(`user:${userId}`).emit('session-message-appended', {
         sessionId,
         message: {
           role: 'assistant',
           content: resolved?.content || '✅ Your landing page is ready.',
+          ...(typeof completionMessageIndex === 'number' ? { messageIndex: completionMessageIndex } : {}),
         },
       });
     })
