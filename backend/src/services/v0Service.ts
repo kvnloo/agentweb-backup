@@ -428,6 +428,17 @@ export interface GeneratedLandingPage {
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  /**
+   * Whether the domain this page is served from actually responds (ENG-1839). Written by the
+   * hourly reachability sweep and attached by the list route; never persisted on the page.
+   *
+   * `status` above describes the BUILD. A page can read "deployed" while its domain has no
+   * usable certificate and no browser can open it — which is exactly how three live customer
+   * pages went unnoticed.
+   */
+  domainStatus?: "active" | "pending_verification" | "error";
+  domainHost?: string;
+  domainErrorMessage?: string;
   pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;

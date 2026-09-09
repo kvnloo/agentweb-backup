@@ -836,6 +836,17 @@ router.get("/generated", async (req, res: Response) => {
         if (!page.vercelProjectId || !page.userId) continue;
         const best = bestByOwnerProject.get(`${page.userId}::${page.vercelProjectId}`);
         if (!best) continue;
+
+        // ENG-1839: surface whether the domain actually serves. The value is written by the
+        // hourly reachability sweep; this only reads what is already loaded here for URL
+        // enrichment, so it costs no extra calls and triggers no verification of its own.
+        // (An earlier version fired verification from this read — see the sweep's header for
+        // why that was wrong.)
+        page.domainStatus = best.status;
+        page.domainHost = best.domain;
+        if (best.status === "error" && best.errorMessage) {
+          page.domainErrorMessage = best.errorMessage;
+        }
         // Sub-pages have a slug and live at /{slug} under the attached domain.
         const targetUrl = page.slug
           ? `https://${best.domain}/${page.slug}`
