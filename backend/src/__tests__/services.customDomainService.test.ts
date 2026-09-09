@@ -166,6 +166,42 @@ describe("customDomainService", () => {
       ).rejects.toThrow(/failed SSL certificate issuance/i);
     });
 
+    it("reuses the existing row when the same host is added again", async () => {
+      // A retried repair run, or a re-assignment after a partial failure, re-adds the same
+      // host. Writing a second row makes `bestByOwnerProject` tie-breaking and
+      // getProjectSubdomain's `find` arbitrary — whichever duplicate wins is luck.
+      // addCustomDomain already reuses; addSubdomain did not.
+      const host = `reused.${SUBDOMAIN_BASE}`;
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-row-id",
+                userId: "user-1",
+                domain: host,
+                type: "subdomain",
+                status: "active",
+                vercelProjectId: "prj_test",
+                createdAt: "2020-01-01T00:00:00Z",
+                updatedAt: "2020-01-01T00:00:00Z",
+                consecutiveFailures: 2,
+                reachabilityStatus: "unreachable",
+              },
+            ],
+          }),
+      });
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+
+      const rec = await addSubdomain("user-1", "prj_test", "reused");
+
+      expect(rec.id).toBe("existing-row-id");
+      expect(rec.createdAt).toBe("2020-01-01T00:00:00Z"); // not reset
+      // Reachability is the sweep's to own — a re-add must not blank a known-bad verdict.
+      expect(rec.consecutiveFailures).toBe(2);
+      expect(rec.reachabilityStatus).toBe("unreachable");
+    });
+
     it("keeps the suffix intact when a collision forces a retry", async () => {
       const near = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
       mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });

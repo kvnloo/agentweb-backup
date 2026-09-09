@@ -278,15 +278,30 @@ export async function addSubdomain(
 
   const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
 
+  // Reuse an existing record for this user+domain rather than writing a second row, matching
+  // addCustomDomain. Without this, any re-add of the same host — a retried repair run, a
+  // re-assignment after a partial failure — silently created a duplicate, and duplicates
+  // perturb both `bestByOwnerProject` tie-breaking in the landing-pages list route and
+  // `getProjectSubdomain`'s `find`, so which row wins becomes arbitrary.
+  const existing = (await listDomains(userId, vercelProjectId)).find(
+    (d) => d.type === "subdomain" && d.domain === fullDomain
+  );
+
   const now = new Date().toISOString();
   const record: CustomDomainRecord = {
-    id: uuidv4(),
+    id: existing?.id ?? uuidv4(),
     userId,
     domain: fullDomain,
     type: "subdomain",
     status: "active", // Subdomains are active immediately (DNS is pre-configured)
     vercelProjectId,
-    createdAt: now,
+    // Carry reachability forward: it is owned by the sweep, and a re-add of the same host must
+    // not silently reset a known-unreachable domain to looking unmonitored.
+    reachabilityStatus: existing?.reachabilityStatus,
+    reachabilityError: existing?.reachabilityError,
+    lastReachabilityCheckAt: existing?.lastReachabilityCheckAt,
+    consecutiveFailures: existing?.consecutiveFailures,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
 
