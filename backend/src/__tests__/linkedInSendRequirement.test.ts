@@ -10,6 +10,7 @@ import {
   isLinkedInSendCall,
   linkedInOutreachArgs,
   normalizeLinkedInOutreachAction,
+  isDeliveredSend,
 } from '../utils/linkedInSendRequirement';
 
 const read = (action = 'search-people') => ({
@@ -167,5 +168,60 @@ describe('evaluateLinkedInSendRequirement', () => {
         expect.objectContaining({ isSendRun: false, requirementMissed: false, reportedActual: null }),
       );
     });
+  });
+});
+
+// Found in production 2026-09-09. `send-invite` de-duplicates against the sent
+// ledger and returns `{ success: true, alreadyInvited: true }` — "Skipped to avoid
+// a duplicate — no invite quota was used". `toolCallSucceeded` sees success:true,
+// so two skipped sends were counted as two deliveries: a scheduled run that
+// contacted NOBODY was stored status success / passed true / { actual: 2,
+// required: 1 } / misses []. That is this module's own founding bug, one layer down.
+describe('a de-duplicated send is an attempt, not a delivery (ENG-1720)', () => {
+  const skipped = {
+    name: 'linkedin_outreach',
+    arguments: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/someone/' },
+    result: {
+      success: true,
+      alreadyInvited: true,
+      message: 'A LinkedIn connection invitation is already pending for this profile. Skipped to avoid a duplicate — no invite quota was used.',
+      data: { alreadyInvited: true, sentAt: '2026-09-09T13:32:45.644Z' },
+    },
+  };
+  const delivered = {
+    name: 'linkedin_outreach',
+    arguments: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/other/' },
+    result: { success: true, data: { invitationId: '123' } },
+  };
+
+  it('THE BUG: two skipped sends must not satisfy min: 1', () => {
+    const v = evaluateLinkedInSendRequirement([skipped, skipped], 1);
+    expect(v.isSendRun).toBe(true);
+    expect(v.attemptedSends).toBe(2);
+    expect(v.successfulSends).toBe(0);
+    expect(v.requirementMissed).toBe(true);
+    expect(v.reportedActual).toBe(0);
+  });
+
+  it('counts a real delivery alongside a skip', () => {
+    const v = evaluateLinkedInSendRequirement([skipped, delivered], 1);
+    expect(v.attemptedSends).toBe(2);
+    expect(v.successfulSends).toBe(1);
+    expect(v.requirementMissed).toBe(false);
+    expect(v.reportedActual).toBe(1);
+  });
+
+  it('a skip still makes it a SEND run — it must not fall back to the name-keyed count', () => {
+    // Otherwise an all-skipped run would be scored by tool name and pass again,
+    // which is the same false success by a different route.
+    expect(evaluateLinkedInSendRequirement([skipped], 1).isSendRun).toBe(true);
+    expect(evaluateLinkedInSendRequirement([skipped], 1).reportedActual).toBe(0);
+  });
+
+  it('isDeliveredSend rejects both the top-level and nested alreadyInvited shapes', () => {
+    expect(isDeliveredSend(skipped)).toBe(false);
+    expect(isDeliveredSend({ ...skipped, result: { success: true, alreadyInvited: true } })).toBe(false);
+    expect(isDeliveredSend({ ...skipped, result: { success: true, data: { alreadyInvited: true } } })).toBe(false);
+    expect(isDeliveredSend(delivered)).toBe(true);
   });
 });

@@ -121,6 +121,40 @@ export function isLinkedInSendCall(call: any): boolean {
   return isLinkedInOutreachCall(call) && LINKEDIN_SEND_ACTIONS.has(normalizeLinkedInOutreachAction(call));
 }
 
+/**
+ * Did this send call actually put an invitation in front of a new person?
+ *
+ * `toolCallSucceeded` is not enough on its own. `send-invite` de-duplicates
+ * against the sent-invitations ledger and, when the profile already has a
+ * pending invite, returns `{ success: true, alreadyInvited: true }` with a
+ * message that says in as many words "Skipped to avoid a duplicate — no invite
+ * quota was used". That is a deliberate no-op, not a delivery: the pacer's daily
+ * volume does not move and no ledger row is written.
+ *
+ * Counting it as a send reproduced this module's own founding bug one layer
+ * down. Observed in production 2026-09-09: a scheduled run made two `send-invite`
+ * calls, both skipped as duplicates, delivered nothing — and was stored
+ * `status: 'success'`, `passed: true`, `functionCallDetails { actual: 2,
+ * required: 1 }`, `functionCallMisses: []`. The owner would be told their
+ * outreach ran when nobody was contacted.
+ *
+ * Kept as an ATTEMPT (so `isSendRun` stays true and the run is scored on sends
+ * rather than silently falling back to the name-keyed count) but not a success.
+ * A run whose every target was already pending therefore fails its requirement,
+ * which is correct — it contacted no one — and is exactly the case ENG-1715's
+ * send-press breaker exists to stop from looping.
+ */
+export function isDeliveredSend(call: any): boolean {
+  if (!toolCallSucceeded(call)) return false;
+  const result = (call as any)?.result;
+  if (result && typeof result === 'object') {
+    if (result.alreadyInvited === true) return false;
+    const data = (result as any).data;
+    if (data && typeof data === 'object' && data.alreadyInvited === true) return false;
+  }
+  return true;
+}
+
 export interface LinkedInSendRequirementVerdict {
   /** The run tried to contact at least one person, so its sends are what count. */
   isSendRun: boolean;
@@ -156,7 +190,7 @@ export function evaluateLinkedInSendRequirement(
   const entries = Array.isArray(toolCalls) ? toolCalls : [];
   const sendCalls = entries.filter(isLinkedInSendCall);
   const attemptedSends = sendCalls.length;
-  const successfulSends = sendCalls.filter(toolCallSucceeded).length;
+  const successfulSends = sendCalls.filter(isDeliveredSend).length;
   const isSendRun = attemptedSends > 0;
   // A non-positive/NaN minimum is treated as 1, matching the caller's own
   // `functionCallMinCalls.linkedin_outreach || 1` default: a requirement that is
