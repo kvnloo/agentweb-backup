@@ -54,6 +54,48 @@ interface DomainRecord {
   status?: string;
 }
 
+interface PageRecord {
+  id: string;
+  customDomainUrl?: string;
+  subdomainPrefix?: string;
+  vercelProjectId?: string;
+}
+
+/** Host of a URL, or "" when it is absent or unparseable. */
+export function hostOfUrl(url: string | undefined): string {
+  try {
+    return new URL(url as string).host;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Decide what a record needs, without touching anything. Exported so the risky part — orphan
+ * classification and the removeDomain cascade blast radius — is unit-testable away from AWS.
+ *
+ * `cascade` mirrors removeDomain()'s own side effect: it deletes the domain row, then scans
+ * pages on the SAME vercelProjectId that HAVE a `subdomainPrefix`, and blanks customDomainUrl
+ * + subdomainPrefix on any whose customDomainUrl CONTAINS the removed domain as a substring.
+ * A non-empty cascade means detaching would damage those pages.
+ */
+export function classifyRecord(
+  rec: DomainRecord,
+  pages: PageRecord[]
+): { isOrphan: boolean; affectedPages: PageRecord[]; cascade: PageRecord[] } {
+  const affectedPages = pages.filter(
+    (p) => p.customDomainUrl && hostOfUrl(p.customDomainUrl) === rec.domain
+  );
+  const cascade = pages.filter(
+    (p) =>
+      p.vercelProjectId === rec.vercelProjectId &&
+      p.subdomainPrefix !== undefined &&
+      typeof p.customDomainUrl === "string" &&
+      p.customDomainUrl.includes(rec.domain)
+  );
+  return { isOrphan: affectedPages.length === 0, affectedPages, cascade };
+}
+
 async function scanAll(table: string): Promise<any[]> {
   const out: any[] = [];
   let lek: any = undefined;
@@ -98,31 +140,61 @@ async function main() {
   }
 
   // Pages are matched by host so a page whose customDomainUrl carries a path is still found.
-  const pages = await scanAll(PAGES_TABLE);
-  const hostOf = (url: string): string => {
-    try {
-      return new URL(url).host;
-    } catch {
-      return "";
-    }
-  };
+  const pages = (await scanAll(PAGES_TABLE)) as PageRecord[];
 
   let repaired = 0;
   for (const rec of broken) {
     const suggestion = generateSubdomain(rec.domain.replace(`.${SUBDOMAIN_BASE}`, ""));
     const chosen = map[rec.id];
-    const affectedPages = pages.filter(
-      (p) => p.customDomainUrl && hostOf(p.customDomainUrl) === rec.domain
-    );
+    const { isOrphan, affectedPages, cascade } = classifyRecord(rec, pages);
+
+    // A broken record that NO page references is an orphan: attached to Vercel, unreachable,
+    // and unused. Minting a replacement would just create a second domain nobody points at.
+    // The correct action is to detach it, not repair it. One of the three records found in
+    // production is this case.
 
     console.log(
-      `\n[${apply ? "APPLY" : "DRY"}] ${rec.id}  user=${rec.userId}\n` +
+      `\n[${apply ? "APPLY" : "DRY"}] ${rec.id}  user=${rec.userId}  ${isOrphan ? "[ORPHAN]" : "[IN USE]"}\n` +
         `   current : ${rec.domain} (${rec.domain.length} chars — cannot be certificated)\n` +
-        `   new     : ${chosen ? `${chosen}.${SUBDOMAIN_BASE}` : `(none given — suggestion: ${suggestion})`}\n` +
-        `   pages   : ${affectedPages.length ? affectedPages.map((p) => p.id).join(", ") : "(none reference this host directly)"}`
+        (isOrphan
+          ? `   action  : detach only — no page references this host, so a replacement would go unused` +
+            `${removeOld ? "" : " (pass --remove-old to actually detach)"}\n`
+          : `   new     : ${chosen ? `${chosen}.${SUBDOMAIN_BASE}` : `(none given — suggestion: ${suggestion})`}\n`) +
+        `   pages   : ${affectedPages.length ? affectedPages.map((p) => p.id).join(", ") : "(none)"}` +
+        (() => {
+          const c = cascade;
+          return c.length
+            ? `\n   ⚠ CASCADE: detaching would ALSO blank customDomainUrl+subdomainPrefix on: ${c
+                .map((p) => p.id)
+                .join(", ")} — review before using --remove-old`
+            : `\n   cascade : none (no page on this project carries a subdomainPrefix matching this host)`;
+        })()
     );
 
     if (!apply) continue;
+
+    if (isOrphan) {
+      if (!removeOld) {
+        console.log(`   • left attached — re-run with --remove-old to detach this orphan`);
+        continue;
+      }
+      if (cascade.length) {
+        console.error(
+          `   ✗ REFUSING to detach — removeDomain would blank customDomainUrl on ` +
+            `${cascade.length} page(s): ${cascade.map((p) => p.id).join(", ")}. ` +
+            `Resolve those first.`
+        );
+        continue;
+      }
+      try {
+        await removeDomain(rec.id, rec.userId);
+        console.log(`   ✓ detached orphan ${rec.domain}`);
+        repaired++;
+      } catch (e: any) {
+        console.error(`   ✗ ${rec.id}: ${e.message}`);
+      }
+      continue;
+    }
 
     if (!chosen) {
       console.error(
@@ -141,13 +213,12 @@ async function main() {
 
       // 2. Re-point pages that referenced the broken host, preserving any path.
       for (const p of affectedPages) {
-        const path = (() => {
-          try {
-            return new URL(p.customDomainUrl).pathname;
-          } catch {
-            return "/";
-          }
-        })();
+        let path = "/";
+        try {
+          path = new URL(p.customDomainUrl as string).pathname;
+        } catch {
+          path = "/";
+        }
         const rewritten = path && path !== "/" ? `${newUrl}${path}` : newUrl;
         await dynamodb
           .update({
@@ -157,6 +228,9 @@ async function main() {
             ExpressionAttributeValues: { ":u": rewritten, ":t": new Date().toISOString() },
           })
           .promise();
+        // Keep the local snapshot in step with the write, so the pre-detach check below
+        // reflects what is actually stored rather than the pre-run state.
+        p.customDomainUrl = rewritten;
         console.log(`     ↳ page ${p.id} -> ${rewritten}`);
       }
 
@@ -164,8 +238,23 @@ async function main() {
       //    unreachable, so leaving it attached costs nothing, while removing it is an
       //    irreversible Vercel mutation. Opt in with --remove-old.
       if (removeOld) {
-        await removeDomain(rec.id, rec.userId);
-        console.log(`   ✓ detached ${rec.domain}`);
+        // Re-read the cascade AFTER the page rewrites above: those rewrites are precisely what
+        // makes the detach safe, because the pages no longer reference the old host. If any
+        // page still matches at this point, the rewrite did not take and detaching would blank
+        // it — leave the old domain attached instead. It is unreachable either way, so the
+        // conservative choice costs nothing.
+        const stale = pages
+          .filter((p) => affectedPages.some((a) => a.id === p.id))
+          .filter((p) => typeof p.customDomainUrl === "string" && p.customDomainUrl.includes(rec.domain));
+        if (stale.length) {
+          console.error(
+            `   ✗ NOT detaching — ${stale.length} page(s) still reference the old host in the ` +
+              `local snapshot: ${stale.map((p) => p.id).join(", ")}. Re-run to pick up fresh state.`
+          );
+        } else {
+          await removeDomain(rec.id, rec.userId);
+          console.log(`   ✓ detached ${rec.domain}`);
+        }
       } else {
         console.log(`   • left ${rec.domain} attached (pass --remove-old to detach)`);
       }
@@ -184,7 +273,13 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error("[repair] fatal:", e);
-  process.exit(1);
-});
+// Run ONLY when executed directly. Without this guard, merely importing the module — which
+// the unit tests do, and which any future caller might — executes main() against whatever
+// credentials and argv are in scope. For a script that attaches and detaches live customer
+// domains, an accidental import must never be able to mutate anything.
+if (require.main === module) {
+  main().catch((e) => {
+    console.error("[repair] fatal:", e);
+    process.exit(1);
+  });
+}
