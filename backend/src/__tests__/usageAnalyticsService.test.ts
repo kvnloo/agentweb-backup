@@ -386,6 +386,76 @@ describe('usageAnalyticsService', () => {
       expect(all.totals.costUsd).toBeCloseTo(3.5, 6);
     });
 
+    // ── availableProviders: the admin picker's option list (ENG-1837) ────────
+    // AC1-3 of ENG-1837. The union of a registry and what the window actually
+    // contains, computed BEFORE the provider filter.
+
+    it('offers every metered vendor even when the ledger is empty (ENG-1837 AC2)', async () => {
+      mockScan.mockResolvedValue([]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      // A vendor with an adapter but no spend must still be SELECTABLE, so the
+      // admin gets an empty state instead of the option silently missing.
+      expect(agg.availableProviders).toEqual([
+        'all',
+        'llm',
+        'apollo',
+        'enrich.so',
+        'google_cse',
+        'remotion',
+        'twitter',
+        'v0',
+        'you.com',
+      ]);
+    });
+
+    it('includes a provider present in the window but absent from the registry (ENG-1837 AC3)', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'newvendor:lookup', provider: 'newvendor', unit: 'lookup', costMicroUsd: 1_000 }),
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      // A vendor whose adapter shipped after the registry was last edited must
+      // still surface — a forgotten registry entry degrades to a missing empty
+      // state, never to hidden spend.
+      expect(agg.availableProviders).toContain('newvendor');
+    });
+
+    it('detects a vendor by model namespace when the provider attribute is absent', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // No `provider` attribute, but the filter would still match this row on
+        // its "{provider}:" model prefix — so the option list must too, or the
+        // vendor is filterable yet unlistable.
+        aggRow({ model: 'legacyvendor:op', costMicroUsd: 1_000 }),
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      expect(agg.availableProviders).toContain('legacyvendor');
+    });
+
+    it('does not treat a Bedrock numeric version suffix as a provider', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-sonnet-4-5-20250929-v1:0', costMicroUsd: 2_000_000 }),
+      ]);
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+      expect(agg.availableProviders).not.toContain('anthropic.claude-sonnet-4-5-20250929-v1');
+    });
+
+    it('is computed over the UNFILTERED window, so selecting one provider does not collapse the list', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        aggRow({ costMicroUsd: 3_000_000 }),
+        xRow('twitter:post', { provider: 'twitter', unit: 'post', costMicroUsd: 500_000 }),
+        aggRow({ model: 'zzvendor:call', provider: 'zzvendor', unit: 'call', costMicroUsd: 1_000 }),
+      ]);
+      // Scoped to twitter: the ROWS are X-only...
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'twitter');
+      expect(agg.byModel.every((m) => m.model.startsWith('twitter:'))).toBe(true);
+      // ...but the picker must still offer everything, or switching away from a
+      // selection would be impossible once it was made.
+      expect(agg.availableProviders).toContain('zzvendor');
+      expect(agg.availableProviders).toContain('llm');
+    });
+
     it('"llm" scope excludes a twitter:* row even if it is missing the unit field, but keeps Bedrock :0 versions', async () => {
       mockGetAccountById.mockResolvedValue(null);
       mockScan.mockResolvedValue([
@@ -657,6 +727,20 @@ describe('usageAnalyticsService', () => {
         topUsers: [],
         userCount: 0,
         byXAccount: [],
+        // Not a spend figure: the picker's options are a capability list, so an
+        // empty window still offers every metered vendor (ENG-1837 AC2) rather
+        // than emptying the dropdown along with the data.
+        availableProviders: [
+          'all',
+          'llm',
+          'apollo',
+          'enrich.so',
+          'google_cse',
+          'remotion',
+          'twitter',
+          'v0',
+          'you.com',
+        ],
       });
       expect(mockGetUser).not.toHaveBeenCalled();
     });

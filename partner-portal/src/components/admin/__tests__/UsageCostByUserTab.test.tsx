@@ -14,7 +14,11 @@ import UsageCostByUserTab, {
   providersInData,
   userRowForProvider,
   rankedUserRows,
-  providerIsAllocatedEstimate,
+  providerHasDedupCaveat,
+  providerTotalIsUndercount,
+  providerLabel,
+  breakdownColumnLabel,
+  DEFAULT_PROVIDER,
   xAccountsFromFeatures,
   xAccountRows,
   xAccountLabel,
@@ -41,6 +45,10 @@ const AGG: CostAggregation = {
     { feature: "agent-chat", costUsd: 0.94, callCount: 22, totalTokens: 1000 },
   ],
   byXAccount: [{ accountId: "acc-1", handle: "alice", costUsd: 0.3, callCount: 18 }],
+  // What the server sends (ENG-1837): scopes first, then vendors alphabetically.
+  // Includes v0 with no rows in this window — a metered vendor stays selectable
+  // before it has any spend.
+  availableProviders: ["all", "llm", "apollo", "twitter", "v0"],
   topUsers: [
     {
       userId: "user-a",
@@ -80,26 +88,58 @@ const RECON = {
   },
 };
 
-// The tab requests provider=twitter, so a faithful backend response is already
-// X-scoped: totals reflect ONLY X spend across ALL users ($0.10 + $0.20), and
-// userCount is the true distinct-user count (not the capped topUsers slice).
+// What the server returns for provider=twitter: already X-scoped, so totals
+// reflect ONLY X spend across ALL users ($0.10 + $0.20), and userCount is the
+// true distinct-user count (not the capped topUsers slice).
 const AGG_XSCOPED: CostAggregation = {
   ...AGG,
   totals: { costUsd: 0.3, callCount: 18, totalTokens: 0 },
   userCount: 2,
+  // topUsers must be X-only too. Spreading AGG's mixed byModel here made the
+  // fixture unfaithful: the server filters BEFORE aggregating, so a scoped
+  // response cannot contain another provider's rows. It also silently defeated
+  // the picker-collapse regression test, which needs a payload that genuinely
+  // lacks the LLM rows to notice they were dropped from the options.
+  topUsers: AGG.topUsers.map((u) => ({
+    ...u,
+    byModel: u.byModel.filter((m) => m.model.startsWith("twitter:")),
+  })),
 };
 
-// Route axios by endpoint — the tab fetches cost-aggregation AND x-reconciliation.
-function routeAxios(opts?: { reconError?: any; agg?: CostAggregation; recon?: any }) {
+/**
+ * Route axios by endpoint AND by the requested provider, because the server
+ * scopes every cut before aggregating (ENG-1837). Returning one fixture for
+ * every provider would let a test pass while the tab sent the wrong scope.
+ */
+function routeAxios(opts?: {
+  reconError?: any;
+  agg?: CostAggregation;
+  xAgg?: CostAggregation;
+  recon?: any;
+}) {
   mockedAxios.get.mockImplementation((url: string) => {
     if (url.includes("/x-reconciliation")) {
       return opts?.reconError
         ? Promise.reject(opts.reconError)
         : Promise.resolve({ data: opts?.recon ?? RECON });
     }
-    return Promise.resolve({ data: opts?.agg ?? AGG_XSCOPED });
+    if (url.includes("provider=twitter")) {
+      return Promise.resolve({ data: opts?.xAgg ?? AGG_XSCOPED });
+    }
+    return Promise.resolve({ data: opts?.agg ?? AGG });
   });
 }
+
+/** Open the MUI provider select and pick an option by its visible label. */
+async function selectProvider(label: string) {
+  await userEvent.click(screen.getByLabelText("Provider"));
+  await userEvent.click(await screen.findByRole("option", { name: label }));
+}
+
+const aggUrls = () =>
+  mockedAxios.get.mock.calls
+    .map(([u]) => u as string)
+    .filter((u) => u.includes("/cost-aggregation"));
 
 describe("UsageCostByUserTab pure helpers", () => {
   it("classifies vendor-namespaced models by provider and plain ids as llm", () => {
@@ -116,12 +156,49 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerOfModel("you.com:search")).toBe("you.com");
   });
 
-  it("lists the providers present, 'all' first, and always offers twitter", () => {
-    expect(providersInData(AGG)).toEqual(["all", "llm", "twitter"]);
-    // twitter is always offered so the X filter is discoverable before any X usage.
-    expect(providersInData(null)).toEqual(["all", "twitter"]);
-    const noX = { ...AGG, topUsers: [{ ...AGG.topUsers[0], byModel: [{ model: "claude-opus-4-8", costUsd: 1, callCount: 1, totalTokens: 1 }] }] };
+  it("prefers the server's availableProviders, which is not limited to what the rows show", () => {
+    // "v0" has no row in AGG. It must still be offered, because the server
+    // computed the list over the UNFILTERED window (ENG-1837 AC2/AC3).
+    expect(providersInData(AGG)).toEqual(["all", "llm", "apollo", "twitter", "v0"]);
+  });
+
+  it("falls back to deriving options from the rows when the server omits the list", () => {
+    // Keeps an old backend working during the deploy window: the two projects
+    // ship separately, so the portal must not require the new field.
+    const legacy = { ...AGG, availableProviders: undefined };
+    expect(providersInData(legacy)).toEqual(["all", "llm", "twitter"]);
+    // "all" and "llm" are scopes, not vendors — always offered, even with no data.
+    expect(providersInData(null)).toEqual(["all", "llm", "twitter"]);
+    const noX = {
+      ...legacy,
+      topUsers: [{ ...AGG.topUsers[0], byModel: [{ model: "claude-opus-4-8", costUsd: 1, callCount: 1, totalTokens: 1 }] }],
+    };
     expect(providersInData(noX)).toEqual(["all", "llm", "twitter"]);
+  });
+
+  it("does not lose known options when a scoped response only contains one vendor", () => {
+    // CodeRabbit, PR #2841. Against an OLD backend (no availableProviders), the
+    // response for provider=apollo contains only apollo rows. Deriving from that
+    // alone deletes every other option, so the picker offers a way in and no way
+    // back. The options accumulate instead.
+    const scoped: CostAggregation = {
+      ...AGG,
+      availableProviders: undefined,
+      topUsers: [
+        { ...AGG.topUsers[0], byModel: [{ model: "apollo:email_reveal", costUsd: 1, callCount: 1, totalTokens: 0 }] },
+      ],
+    };
+    const known = providersInData({ ...AGG, availableProviders: undefined });
+    expect(known).toEqual(["all", "llm", "twitter"]);
+    expect(providersInData(scoped, known)).toEqual(["all", "llm", "apollo", "twitter"]);
+  });
+
+  it("lets an authoritative server list replace the accumulated one, rather than merging", () => {
+    // A stale vendor must be able to LEAVE the list once the server is the
+    // source of truth — a union would make every option permanent.
+    expect(providersInData(AGG, ["all", "llm", "goneaway"])).toEqual(
+      ["all", "llm", "apollo", "twitter", "v0"]
+    );
   });
 
   it("recomputes a user's cost/calls under a provider filter", () => {
@@ -138,9 +215,39 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(rows[0].costUsd).toBeCloseTo(0.2, 6);
   });
 
-  it("flags only twitter as an allocated estimate", () => {
-    expect(providerIsAllocatedEstimate("twitter")).toBe(true);
-    expect(providerIsAllocatedEstimate("llm")).toBe(false);
+  it("carries the same-resource dedup caveat for X only (ENG-1837 AC5)", () => {
+    // X dedups a repeat read within a UTC day; no other metered vendor does, so
+    // attaching this qualifier elsewhere would state something untrue of it.
+    expect(providerHasDedupCaveat("twitter")).toBe(true);
+    expect(providerHasDedupCaveat("all")).toBe(true); // X rows are in scope
+    expect(providerHasDedupCaveat("v0")).toBe(false);
+    expect(providerHasDedupCaveat("llm")).toBe(false);
+  });
+
+  it("marks only the all-vendor total as an undercount while ENG-698 is open", () => {
+    expect(providerTotalIsUndercount("all")).toBe(true);
+    expect(providerTotalIsUndercount("twitter")).toBe(false);
+  });
+
+  it("labels every metered vendor, and passes an unknown key through unchanged", () => {
+    expect(providerLabel("all")).toBe("All providers");
+    expect(providerLabel("llm")).toBe("LLM (tokens)");
+    expect(providerLabel("twitter")).toBe("X (Twitter)");
+    expect(providerLabel("v0")).toBe("v0 (Vercel)");
+    expect(providerLabel("you.com")).toBe("You.com search");
+    expect(providerLabel("google_cse")).toBe("Google Custom Search");
+    expect(providerLabel("apollo")).toBe("Apollo");
+    expect(providerLabel("enrich.so")).toBe("enrich.so");
+    expect(providerLabel("remotion")).toBe("Remotion Lambda");
+    // A vendor whose adapter shipped before anyone added a label is still listed.
+    expect(providerLabel("brandnew")).toBe("brandnew");
+  });
+
+  it("names the drill-down column for what the rows actually are", () => {
+    // A twitter:* row is a TOOL. Calling it a Model is the mis-read ENG-1519 fixed.
+    expect(breakdownColumnLabel("llm")).toBe("Model");
+    expect(breakdownColumnLabel("twitter")).toBe("Tool");
+    expect(breakdownColumnLabel("all")).toBe("Tool / model");
   });
 
   it("extracts per-X-account rollups from the feature dimension (handle null), skipping non-X features", () => {
@@ -166,15 +273,18 @@ describe("UsageCostByUserTab pure helpers", () => {
 describe("UsageCostByUserTab rendering", () => {
   beforeEach(() => jest.resetAllMocks());
 
-  it("renders per-user rows, the by-account table, and the reconciliation panel", async () => {
+  it("renders per-user rows, and under X the by-account table and reconciliation panel", async () => {
     routeAxios();
     render(<UsageCostByUserTab />);
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
     expect(screen.getByText("(no email on file)")).toBeInTheDocument();
-    // X-only tab: total is the twitter spend across users ($0.10 + $0.20), not the
-    // all-providers sum — LLM spend is excluded by the fixed twitter filter.
-    expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30");
+
+    await selectProvider("X (Twitter)");
+
+    // Scoped to X: the total is the twitter spend across users ($0.10 + $0.20),
+    // not the all-providers sum. The server did that scoping, not the client.
+    await waitFor(() => expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30"));
 
     // by-account cut — shows the enriched @handle (with the raw id alongside)
     const acctTable = await screen.findByTestId("x-account-table");
@@ -188,24 +298,125 @@ describe("UsageCostByUserTab rendering", () => {
     expect(screen.getByTestId("x-recon-dedup")).toHaveTextContent("859");
   });
 
-  it("is X-only by default: allocated caveat shown, no provider selector", async () => {
+  // SUPERSEDES "is X-only by default: allocated caveat shown, no provider selector".
+  // That test encoded ENG-664's deliberate X-only scoping; ENG-1837 AC1 reverses
+  // it now that six more vendors write to the same ledger.
+  it("offers a provider selector and opens on all providers (ENG-1837 AC1)", async () => {
     routeAxios();
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
 
-    // Twitter is fixed (ENG-664, X-only for now) — total reflects X spend only and
-    // the allocated caveat renders without any filtering.
-    expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30");
-    expect(screen.getAllByText(/allocated/i).length).toBeGreaterThan(0);
-    // The provider selector is removed while the tab is X-only.
-    expect(screen.queryByLabelText("Provider")).not.toBeInTheDocument();
+    expect(screen.getByTestId("provider-select")).toBeInTheDocument();
+    expect(DEFAULT_PROVIDER).toBe("all");
+    // The opening request carries the default, so the first paint is the total
+    // rather than one vendor's slice.
+    expect(aggUrls()[0]).toContain("provider=all");
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("$1.24");
+    expect(screen.getByTestId("allocated-caveat")).toBeInTheDocument();
+  });
+
+  it("lists every provider the server offers, including one with no spend this window", async () => {
+    routeAxios();
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByLabelText("Provider"));
+    const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
+    // "v0 (Vercel)" has no row in the fixture — a metered vendor must stay
+    // selectable before it accrues spend, or it reads as costing nothing.
+    expect(options).toEqual([
+      "All providers",
+      "LLM (tokens)",
+      "Apollo",
+      "X (Twitter)",
+      "v0 (Vercel)",
+    ]);
+  });
+
+  it("keeps every option in the picker after a scoped reload against an older backend", async () => {
+    // The deploy-window case: portal is new, backend has not shipped
+    // availableProviders yet. Selecting X returns an X-only payload; the picker
+    // must not shrink to what that payload happens to contain, or the admin is
+    // one click from a dead end (CodeRabbit, PR #2841).
+    // Apollo is discoverable ONLY from the rows here — it is not a fixed scope
+    // and not the always-offered twitter. It is therefore the option that
+    // actually disappears if the fallback rebuilds from a scoped payload.
+    const legacy: CostAggregation = {
+      ...AGG,
+      availableProviders: undefined,
+      topUsers: [
+        {
+          ...AGG.topUsers[0],
+          byModel: [
+            ...AGG.topUsers[0].byModel,
+            { model: "apollo:email_reveal", costUsd: 0.05, callCount: 1, totalTokens: 0 },
+          ],
+        },
+        AGG.topUsers[1],
+      ],
+    };
+    const legacyX: CostAggregation = { ...AGG_XSCOPED, availableProviders: undefined };
+    routeAxios({ agg: legacy, xAgg: legacyX });
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    await selectProvider("X (Twitter)");
+    await waitFor(() => expect(aggUrls().pop()).toContain("provider=twitter"));
+
+    await userEvent.click(screen.getByLabelText("Provider"));
+    const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
+    expect(options).toContain("All providers");
+    expect(options).toContain("LLM (tokens)");
+    expect(options).toContain("X (Twitter)");
+    // The one the scoped payload cannot re-derive.
+    expect(options).toContain("Apollo");
+  });
+
+  it("refetches server-side with the selected provider, rather than filtering in the browser", async () => {
+    routeAxios();
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+    const before = aggUrls().length;
+
+    await selectProvider("Apollo");
+
+    await waitFor(() => expect(aggUrls().length).toBe(before + 1));
+    expect(aggUrls().pop()).toContain("provider=apollo");
+  });
+
+  it("hides the X reconciliation panel and the X-account rollup under a non-X vendor", async () => {
+    routeAxios();
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    await selectProvider("Apollo");
+
+    // Both compare against X's own billing cycle / connected accounts, which say
+    // nothing about Apollo. Rendering them here would invite a false reading.
+    await waitFor(() => expect(screen.queryByTestId("x-recon-panel")).not.toBeInTheDocument());
+    expect(screen.queryByTestId("x-account-table")).not.toBeInTheDocument();
+    // The dedup caveat is X-specific and must not travel with the vendor change.
+    expect(screen.getByTestId("allocated-caveat")).not.toHaveTextContent("upper bound");
+  });
+
+  it("warns that an all-vendor total is an undercount while ENG-698 is open", async () => {
+    routeAxios();
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    // Default is "all". A figure that silently omits ElevenLabs, 2captcha and
+    // Placid would read as the vendor envelope being comfortably met.
+    expect(screen.getByTestId("undercount-caveat")).toHaveTextContent("undercount");
+
+    await selectProvider("X (Twitter)");
+    await waitFor(() => expect(screen.queryByTestId("undercount-caveat")).not.toBeInTheDocument());
   });
 
   it("uses the complete aggregation totals, not the capped top-users slice", async () => {
     // Server caps topUsers (here 2 rows) but reports the full totals + userCount.
     // The headline must reflect the complete figures, not a sum over the 2 rows.
     const agg: CostAggregation = {
-      ...AGG_XSCOPED,
+      ...AGG,
       totals: { costUsd: 42.5, callCount: 9999, totalTokens: 0 },
       userCount: 137,
     };
@@ -213,7 +424,7 @@ describe("UsageCostByUserTab rendering", () => {
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
 
-    // $0.30 would be the sum of the 2 visible rows; the complete total is $42.50.
+    // $1.24 would be the sum of the 2 visible rows; the complete total is $42.50.
     expect(screen.getByTestId("total-cost")).toHaveTextContent("$42.50");
     expect(screen.getByTestId("users-with-spend")).toHaveTextContent("137");
   });
@@ -232,6 +443,7 @@ describe("UsageCostByUserTab rendering", () => {
     routeAxios({ recon });
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+    await selectProvider("X (Twitter)");
 
     const gap = await screen.findByTestId("x-recon-gap");
     expect(gap).toHaveTextContent("141");
@@ -242,6 +454,7 @@ describe("UsageCostByUserTab rendering", () => {
     render(<UsageCostByUserTab />);
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+    await selectProvider("X (Twitter)");
     const err = await screen.findByTestId("x-recon-error");
     expect(err).toHaveTextContent("bearer token");
     // The rest of the tab still renders.
@@ -253,15 +466,16 @@ describe("UsageCostByUserTab rendering", () => {
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
 
-    const aggCalls = () =>
-      mockedAxios.get.mock.calls.filter(([u]) => (u as string).includes("/cost-aggregation")).length;
-    const before = aggCalls();
+    await selectProvider("X (Twitter)");
+    const before = aggUrls().length;
 
     await userEvent.click(screen.getByRole("button", { name: "30d" }));
 
-    await waitFor(() => expect(aggCalls()).toBe(before + 1));
-    const lastAgg = mockedAxios.get.mock.calls.filter(([u]) => (u as string).includes("/cost-aggregation")).pop();
-    expect(lastAgg?.[0]).toMatch(/start=\d{4}-\d{2}-\d{2}&end=\d{4}-\d{2}-\d{2}/);
+    await waitFor(() => expect(aggUrls().length).toBe(before + 1));
+    const lastAgg = aggUrls().pop();
+    expect(lastAgg).toMatch(/start=\d{4}-\d{2}-\d{2}&end=\d{4}-\d{2}-\d{2}/);
+    // A range change must not silently reset the scope back to the default.
+    expect(lastAgg).toContain("provider=twitter");
   });
 
   it("surfaces a load error for the main aggregation", async () => {

@@ -258,6 +258,15 @@ build when an allowlisted module starts metering** — so the allowlist cannot r
 - **Where:** `backend/src/services/usageAnalyticsService.ts:329`
 - **Route:** `GET /api/admin/usage/cost-aggregation` (`routes/adminUsage.ts:272`), admin-only,
   `provider` validated to `/^[a-z0-9._-]+$/`.
+- **`METERED_VENDOR_PROVIDERS`** (ENG-1837) — the vendors with a live adapter, and so the ones
+  the admin picker offers. **Not** derived from `vendorRateCard`'s `VendorRateProvider`: that
+  card prices ElevenLabs / 2captcha / Placid, which are priced but unmetered ([[ENG-698]]), and
+  an option that can only render empty reads as *this vendor costs nothing*. `N-GUARD-CI`
+  asserts the registry and the adapters agree in both directions.
+- **`availableProviders`** on the response — the picker's option list, computed over the
+  **unfiltered** window so it does not collapse to whatever is selected. Union of the registry
+  and the providers actually present, which covers both a vendor with no spend yet and a vendor
+  whose adapter shipped after the registry was last edited.
 - **`provider` semantics — already generic:**
   - `"llm"` (**default**, so the LLM Costs tab that sends no param never sees vendor rows),
   - `"all"` — no filter,
@@ -298,15 +307,22 @@ figure can now be recomputed; only [[ENG-698]]'s three vendors remain missing. �
 #### `N-UI-ADMIN-USAGECOST` — partner portal, `?tab=usage-cost`
 `agentweb/partner-portal/src/components/admin/UsageCostByUserTab.tsx` (704 lines), tab slug
 registered in `pages/adminNavigation.ts` (`Revenue & billing` → `tab('usage-cost', 25, …)`).
-- **Already generic, deliberately:** `providerOfModel` (`:155`), `providersInData` (`:172`),
-  `userRowForProvider` (`:197`), `rankedUserRows` (`:212`), `providerLabel` (`:267`).
-- **Hardcoded to X at `:503`:** `const provider = TWITTER_PROVIDER_KEY;` with the comment
-  *"The provider machinery … is retained so this tab can broaden to other vendors."*
-  **This is the exact seam the ask asked for.**
-- Fetches `…&provider=twitter`; renders totals, per-user table, per-tool drill-down,
-  `byXAccount` rollup, and the X reconciliation panel.
-- `providerIsAllocatedEstimate(p)` (`:222`) hardcodes `p === "twitter"` — wrong once other
-  vendors appear; **every** vendor row is `costSource: "allocated"`.
+- **Provider dropdown over every metered vendor** since ENG-1837 (PR #2841). Was pinned to
+  `TWITTER_PROVIDER_KEY`; now selection state, defaulting to `all`.
+- Helpers: `providerOfModel`, `providersInData`, `userRowForProvider`, `rankedUserRows`,
+  `providerLabel`, `breakdownColumnLabel`, `providerHasDedupCaveat`,
+  `providerTotalIsUndercount`.
+- **Server-scoped re-fetch, not client-side filtering.** `userCount` cannot be recovered from
+  the capped `topUsers` slice — that field exists because summing the slice understated the
+  headline past 100 spenders.
+- **The fallback option list is cumulative.** Against a backend without `availableProviders`, a
+  scoped response contains only its own vendor's rows, so rebuilding options from it alone
+  deletes every other option — a way in and no way back. `providersInData(agg, known)` unions
+  with what has been seen; the server list, when present, replaces it.
+- **Two caveats, not one.** *Allocated* is unconditional (true of LLM dollars too, [[ENG-693]]
+  AC3). *Upper bound* is X-only, because only X dedups. An `all` total also states it is an
+  undercount while [[ENG-698]] is open — delete that when 698 ships.
+- The X reconciliation panel and `byXAccount` rollup render only where they mean something.
 
 #### `N-UI-ADMIN-LLMCOSTS` — `?tab=costs` ([[ENG-353]]/[[ENG-366]])
 Sends no `provider`, so it gets the `"llm"` default. **Must stay LLM-scoped** — provider
@@ -443,7 +459,7 @@ path; it writes to `AW-Users` where no cost dashboard reads. [[ENG-1250]] AC7 re
 | 1 | Meter every paid vendor | **7/10 done** | ElevenLabs, 2captcha, Placid → [[ENG-698]], blocked on [[ENG-1598]] (Placid credential). |
 | 2 | Rates for every vendor unit | **done** | `N-RATE-VENDORCARD` v`2026-09-02` + `N-RATE-TWITTER`. Only the X-rate conflict (D4) is open. |
 | 3 | Admin API scoped by vendor | **done** | `getCostAggregation(provider)` already takes `llm | all | <vendor>`. |
-| 4 | **Admin vendor dropdown** | **NOT done** | `UsageCostByUserTab.tsx:503` pins `"twitter"`. Needs: fetch strategy for the option list, `providerIsAllocatedEstimate` generalised, `byXAccount` panel made conditional, X reconciliation panel shown only for X, `providerLabel` extended. |
+| 4 | **Admin vendor dropdown** | **done** — ENG-1837, PR #2841 | Shipped: server-supplied option list, cumulative fallback, per-provider caveats, X-only panels gated. |
 | 5 | Cumulative + per-vendor breakdown for admin | **partly** | `N-API-ADMIN-BREAKDOWN` already returns `byProvider` per billing subject from the immutable ledger — **but no partner-portal UI renders it.** Cheapest path to "cumulative + breakdown" is a UI over this existing endpoint. |
 | 6 | Unit economics incl. vendor half | **stale** | [[ENG-1139]] AC3 withheld the all-in figure because 4 of 5 slices were blocked. They landed. Recompute coverage; only [[ENG-698]] remains. |
 | 7 | **Customer sees vendor spend** | **partly, in shares** | "Tools & data" already ships ([[ENG-1519]]). **Dollars are blocked** by `N-CONSTRAINT-NO-DOLLARS` + `N-DECISION-CREDITS`. → D1. |
@@ -790,3 +806,4 @@ anything else.
 | 2026-09-09 | Claude (Opus 5, same session) | Added §10 — WS-1 implementation plan (fetch strategy resolved: server-scoped re-fetch + server-supplied `availableProviders`). Changelog renumbered §10 → §11. |
 | 2026-09-09 | Claude (Opus 5, same session) | §10.6 corrected: CI runs no jest job at all (builds only) — the earlier "CI path-filters the portal tests" wording implied they run somewhere. |
 | 2026-09-09 | Claude (Opus 5, same session) | CodeRabbit PR #2841: scrubbed real billing-subject ids and per-customer spend from §1 and §7 (kept the divergence shape, pointed at the access-controlled ENG-1250 comment); replaced machine-specific absolute paths in §0/§9 with repo-relative ones. |
+| 2026-09-09 | Claude (Opus 5, same session) | ENG-1837 shipped (PR #2841): `N-READ-AGGREGATION` gains `METERED_VENDOR_PROVIDERS` + `availableProviders`; `N-UI-ADMIN-USAGECOST` is no longer X-pinned; §5 row 4 closed. |
