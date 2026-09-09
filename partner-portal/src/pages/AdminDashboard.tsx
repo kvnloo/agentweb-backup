@@ -68,6 +68,7 @@ import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
 import XCostBreakdownBody, { XOrgUsageRollup } from "../components/admin/XCostBreakdownBody";
+import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLedgerBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -109,6 +110,7 @@ import {
   Search as SearchIcon,
   Email as EmailIcon,
   BarChart as BarChartIcon,
+  ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
@@ -938,6 +940,17 @@ export default function AdminDashboard() {
   const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
   const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
   const xBreakdownReqRef = useRef(0);
+
+  // ── Cross-vendor spend ledger (ENG-1838, over the ENG-1250 §7 read models) ──
+  // Sibling of the two breakdowns above, but sourced from the immutable
+  // AW-SpendEvents ledger rather than the daily aggregate: per-call, every
+  // metered vendor at once, and the only one that can show reservations.
+  const [spendLedgerUser, setSpendLedgerUser] = useState<User | null>(null);
+  const [spendLedgerMonth, setSpendLedgerMonth] = useState<string>("");
+  const [spendLedgerData, setSpendLedgerData] = useState<SpendLedgerPayload | null>(null);
+  const [spendLedgerLoading, setSpendLedgerLoading] = useState(false);
+  const [spendLedgerError, setSpendLedgerError] = useState<string | null>(null);
+  const spendLedgerReqRef = useRef(0);
   const [usageCreditDialogOpen, setUsageCreditDialogOpen] = useState(false);
   const [usageCreditUserId, setUsageCreditUserId] = useState<string | null>(null);
   const [usageCreditEmail, setUsageCreditEmail] = useState("");
@@ -1195,6 +1208,46 @@ export default function AdminDashboard() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xBreakdownUser?.userId, xBreakdownMonth]);
+
+  // ── Cross-vendor spend ledger (ENG-1838) ──
+  const fetchSpendLedger = async (userId: string, month: string) => {
+    const reqId = ++spendLedgerReqRef.current;
+    const isStale = () => reqId !== spendLedgerReqRef.current;
+    setSpendLedgerLoading(true);
+    setSpendLedgerError(null);
+    try {
+      // The route resolves the billing ROOT itself, so passing a member's id is
+      // safe and the response says whose ledger came back.
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/spend/breakdown`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
+      );
+      if (isStale()) return;
+      setSpendLedgerData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      setSpendLedgerData(null);
+      setSpendLedgerError(
+        error.response?.data?.error || error.response?.data?.message || "Failed to load the spend ledger"
+      );
+    } finally {
+      if (!isStale()) setSpendLedgerLoading(false);
+    }
+  };
+
+  const openSpendLedger = (user: User) => {
+    setSpendLedgerUser(user);
+    setSpendLedgerData(null);
+    setSpendLedgerError(null);
+    setSpendLedgerMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  useEffect(() => {
+    if (spendLedgerUser && spendLedgerMonth) {
+      fetchSpendLedger(spendLedgerUser.userId, spendLedgerMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spendLedgerUser?.userId, spendLedgerMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -5050,6 +5103,34 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                     </Box>
                                   </Grid>
                                 )}
+                                {/* Cross-vendor spend ledger (ENG-1838). Separate from the two
+                                    cost figures above because it answers a different question:
+                                    those are "what did this user burn on X / on models", this is
+                                    "where did this billing subject's whole month go, and why is
+                                    it paused" — from the immutable per-call ledger. */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <HelpCaption
+                                      label="Spend ledger"
+                                      help="Every AgentWeb-paid vendor call for this billing subject this month, from the immutable spend ledger: by vendor, feature, member and session, plus open reservations and — when the account is paused — why. Read-only; nothing here changes a balance."
+                                    />
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                      <Typography variant="body2" color="text.secondary">
+                                        all vendors, this month
+                                      </Typography>
+                                      <Tooltip title="Open the cross-vendor spend ledger">
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => openSpendLedger(user)}
+                                          color="primary"
+                                          data-testid={`open-spend-ledger-${user.userId}`}
+                                        >
+                                          <ReceiptLongIcon fontSize="small" />
+                                        </IconButton>
+                                      </Tooltip>
+                                    </Box>
+                                  </Grid>
+                                )}
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
                                   <Grid item xs={6}>
@@ -6972,6 +7053,39 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setXBreakdownUser(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Cross-vendor spend ledger (ENG-1838 / ENG-1250 §7) */}
+      <Dialog open={!!spendLedgerUser} onClose={() => setSpendLedgerUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>Spend ledger — {spendLedgerUser?.email}</span>
+          <TextField
+            select
+            size="small"
+            label="Month"
+            value={spendLedgerMonth}
+            onChange={(e) => setSpendLedgerMonth(e.target.value)}
+            sx={{ width: 170 }}
+          >
+            {recentMonthOptions(12).map((m) => (
+              <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+            ))}
+          </TextField>
+        </DialogTitle>
+        <DialogContent dividers>
+          {spendLedgerLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : spendLedgerError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }} data-testid="spend-ledger-error">
+              {spendLedgerError}
+            </Typography>
+          ) : (
+            <SpendLedgerBody data={spendLedgerData} />
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSpendLedgerUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
