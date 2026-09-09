@@ -428,6 +428,19 @@ export interface GeneratedLandingPage {
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  /**
+   * Health of the domain this page is served from (ENG-1839). Attached by the list route
+   * from the already-loaded domain record; never persisted on the page itself.
+   *
+   * `status` above describes the BUILD, not reachability — a page can be "deployed" while its
+   * domain cannot get a certificate and no browser can open it. These fields are what let the
+   * UI tell those apart.
+   */
+  domainStatus?: "active" | "pending_verification" | "error";
+  domainHost?: string;
+  domainErrorMessage?: string;
+  /** null when the domain has never been verified. */
+  domainLastVerifiedAt?: string | null;
   pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;
