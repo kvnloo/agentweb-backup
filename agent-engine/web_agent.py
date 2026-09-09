@@ -33,6 +33,7 @@ from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
 from task_completion_status import determine_task_completion_status
+from strict_action_controller import StrictActionController
 from datetime import datetime, timezone
 import PyPDF2
 import docx
@@ -270,7 +271,10 @@ class WebAgent:
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
         self.current_task_id = None
-        self.controller = Controller()
+        # ENG-1828: reject a malformed multi-action response instead of
+        # silently executing whichever one browser-use happens to find
+        # first (always `done`) -- see strict_action_controller.py.
+        self.controller = StrictActionController()
         self.question_count = 0  # Track number of questions asked
         self.s3_client = get_s3_client()
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
