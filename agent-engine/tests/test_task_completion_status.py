@@ -53,6 +53,20 @@ class TestDetermineTaskCompletionStatus(unittest.TestCase):
         self.assertFalse(task_is_done)
         self.assertFalse(task_succeeded)
 
+    def test_done_with_unset_success_is_not_reported_as_succeeded(self):
+        # Structurally unreachable today via the standard `done` action --
+        # confirmed against the real installed browser_use source that
+        # DoneAction.success is a required bool field with no default, so
+        # is_done()==True always pairs with a real True/False, never None.
+        # Still worth guarding defensively: determine_task_completion_status
+        # is a general, reusable function, and a hypothetical future
+        # Controller built with an output_model whose own `success` field
+        # carries a default (unlike DoneAction's) would make this reachable
+        # -- `is True` must fail closed on None just as it does on False.
+        task_is_done, task_succeeded = determine_task_completion_status(_result(True, None))
+        self.assertTrue(task_is_done)
+        self.assertFalse(task_succeeded)
+
 
 if __name__ == "__main__":
     unittest.main()
