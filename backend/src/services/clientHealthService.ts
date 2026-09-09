@@ -46,6 +46,11 @@ interface CreativeVariety {
     name: string;
     reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
   }>;
+  // Sibling of ads_layer.campaigns_complete: false when the ad-level insights read (the
+  // creative-fatigue/cannibalization source data) failed or was truncated despite active
+  // campaigns existing. Without this, a failed read reports zero warnings with full confidence
+  // — a client's health can look BETTER than it is, not just incomplete.
+  creative_data_complete?: boolean;
 }
 
 interface PaymentInfo {
@@ -272,6 +277,12 @@ export async function assessClientHealth(
 
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
+    // Defaults true: trivially complete when the ad-level fetch is never attempted (no active
+    // campaigns to look up, or the campaigns fetch itself already failed — that failure is
+    // already signalled via campaigns_complete below, and creative_variety derives from
+    // active_campaigns, so a reader who already distrusts one already knows to distrust both).
+    // Only flips false when the ad-level fetch is attempted AND it independently fails/truncates.
+    let adLevelDataComplete = true;
     /*
      * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
      * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
@@ -388,6 +399,10 @@ export async function assessClientHealth(
                 `${insightsSelector}` +
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
+            // Same shape as campaigns_complete above: fetchWithRetryAndPaging resolves with
+            // {error:{...}} rather than throwing on a Graph API error, so this must be checked
+            // explicitly rather than relying on a catch block that will never run for this case.
+            adLevelDataComplete = adData.pagingTruncated !== true && !adData.error;
             adLevelData = (adData.data || []).map((ad: any) => {
               // Matched by RELATIVE ORDER (newest date_start = current, oldest = prior), not by
               // exact string equality against our own UTC-computed date strings. Meta buckets
@@ -579,6 +594,7 @@ export async function assessClientHealth(
       fatigue_warning: fatigueWarning,
       top_creatives: topCreatives,
       fatigued_creatives: fatiguedCreatives,
+      creative_data_complete: adLevelDataComplete,
     };
 
     // --- Overall Status ---
