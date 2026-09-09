@@ -840,6 +840,14 @@ router.get("/generated", async (req, res: Response) => {
       for (const [ownerId, domains] of domainsByOwner) {
         for (const d of domains) {
           if (!d.vercelProjectId) continue;
+          /*
+           * `rank` is a comparator, not a filter, and the `!existing` seed below is
+           * unconditional — so rank 0 means "loses a comparison", never "is rejected". Skip
+           * these outright: a project whose only attached row is an unverified custom domain
+           * has nothing to lose to, and would otherwise be adopted as the page's reported host
+           * despite having no DNS. That is the failure this ranking exists to prevent.
+           */
+          if (rank(d) === 0) continue;
           const key = `${ownerId}::${d.vercelProjectId}`;
           const existing = bestByOwnerProject.get(key);
           if (

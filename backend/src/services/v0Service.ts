@@ -681,6 +681,14 @@ export async function resolveLandingPageLiveUrl(
       }
     }
 
+    /*
+     * `rank` is a comparator, not a filter — the seed above is unconditional, so rank 0 means
+     * "loses a comparison", never "is rejected". A project whose ONLY attached row is an
+     * unverified custom domain has nothing to lose to, so it would be adopted and reported as
+     * the live URL despite having no DNS. Reject it explicitly and keep the stored value.
+     */
+    if (rank(best) === 0) return fallback;
+
     const targetUrl = page.slug
       ? `https://${best.domain}/${page.slug}`
       : `https://${best.domain}`;
