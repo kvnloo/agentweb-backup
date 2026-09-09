@@ -32,6 +32,7 @@ from task_utils import get_downloads_path, upload_task_result_files, get_llm, va
 from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
+from task_completion_status import determine_task_completion_status
 from datetime import datetime, timezone
 import PyPDF2
 import docx
@@ -430,10 +431,15 @@ class WebAgent:
             logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
             result = await self.agent.run(max_steps=max_steps)
             
-            task_is_done = False  # Initialize task_is_done
+            # ENG-1823: task_is_done ("did the agent call `done` at all") and
+            # task_succeeded ("did that `done` call's own success field say
+            # True") are deliberately separate -- see task_completion_status.py.
+            # task_is_done stays the gate for the ENG-859 salvage path below
+            # (that logic only cares whether the run finished); task_succeeded
+            # is the one that belongs in the customer-facing/persisted result.
+            task_is_done, task_succeeded = determine_task_completion_status(result)
             agent_message = None
-            if result.is_done():
-                task_is_done = True
+            if task_is_done:
                 agent_message = result.history[-1].result[-1].extracted_content
 
             # ENG-859: a run that reached its step/time limit before the agent
@@ -527,8 +533,8 @@ class WebAgent:
                 result_files = upload_task_result_files(downloads_path, self.current_execution_id)
             
             return {
-                "success": task_is_done,
-                "summary" if task_is_done else "error": agent_message,
+                "success": task_succeeded,
+                "summary" if task_succeeded else "error": agent_message,
                 "partial": bool(partial_extraction) and not task_is_done,
                 "llmName": self.llm_name,
                 "result_files": result_files if result_files else None
