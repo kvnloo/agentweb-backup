@@ -394,15 +394,16 @@ export async function assessClientHealth(
               encodeURIComponent('insights.time_ranges(') +
               encodeURIComponent(timeRanges) +
               encodeURIComponent(`){${insightsFields}}`);
+            // Pessimistic the moment we decide to attempt this fetch — mirrors campaignsComplete's
+            // own pattern (starts false, only flips true after a full clean read). If the transform
+            // below throws on malformed data, this stays false rather than reverting to the outer
+            // "nothing to check" default, which would otherwise misreport a crashed read as complete.
+            adLevelDataComplete = false;
             const adData = await fetchWithRetryAndPaging(
               `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,${creativeSelector},status,` +
                 `${insightsSelector}` +
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
-            // Same shape as campaigns_complete above: fetchWithRetryAndPaging resolves with
-            // {error:{...}} rather than throwing on a Graph API error, so this must be checked
-            // explicitly rather than relying on a catch block that will never run for this case.
-            adLevelDataComplete = adData.pagingTruncated !== true && !adData.error;
             adLevelData = (adData.data || []).map((ad: any) => {
               // Matched by RELATIVE ORDER (newest date_start = current, oldest = prior), not by
               // exact string equality against our own UTC-computed date strings. Meta buckets
@@ -424,6 +425,12 @@ export async function assessClientHealth(
                 prior_insights: prior ? { data: [prior] } : undefined,
               };
             });
+            // Only reached once the fetch AND the transform above both completed without
+            // throwing — same shape as campaigns_complete: fetchWithRetryAndPaging resolves with
+            // {error:{...}} rather than throwing on a Graph API error, so this must be checked
+            // explicitly rather than relying on the catch block below, which never runs for that
+            // case.
+            adLevelDataComplete = adData.pagingTruncated !== true && !adData.error;
           }
         }
       } catch (err) {
@@ -594,7 +601,12 @@ export async function assessClientHealth(
       fatigue_warning: fatigueWarning,
       top_creatives: topCreatives,
       fatigued_creatives: fatiguedCreatives,
-      creative_data_complete: adLevelDataComplete,
+      // ANDed with campaignsComplete: the ad-level fetch can succeed cleanly on its own while
+      // still being built from a truncated/errored campaigns list (fetchWithRetryAndPaging keeps
+      // whatever partial data it already has rather than discarding it on truncation) — that
+      // input incompleteness has to propagate here too, not just report the ad-level fetch's own
+      // isolated success.
+      creative_data_complete: adLevelDataComplete && campaignsComplete,
     };
 
     // --- Overall Status ---
