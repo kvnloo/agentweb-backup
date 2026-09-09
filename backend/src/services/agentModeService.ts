@@ -383,9 +383,15 @@ import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
 import {
   paceLinkedInWrite,
   resolveLinkedInAccountForWrite,
+  resolveLinkedInAccountFromList,
   setDailyInviteCap,
   type ResolvedLinkedInAccount,
 } from './agentMode/linkedInDailyVolumeGate';
+import {
+  routeLinkedInWriteToAccountWithHeadroom,
+  withAccountRoutingDisclosure,
+  type AccountRoutingDisclosure,
+} from './agentMode/linkedInAccountRouting';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -35978,16 +35984,48 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // consume a slot on top of the one each individual withdrawal already reserves
     // inside the drain.
     let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    // Fetched once here (only for the PACED_WRITE_ACTIONS branch, which is the
+    // only one that can also route below) and reused for the routing scan
+    // instead of making it repeat the same org-member fetch a second time.
+    let linkedInAccountsForRouting: any[] | undefined;
     if (
       PACED_WRITE_ACTIONS.has(action)
       || action === 'set-daily-invite-cap'
       || action === 'withdraw-stale-invitations'
     ) {
-      resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      if (PACED_WRITE_ACTIONS.has(action)) {
+        const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+        linkedInAccountsForRouting = await getAccountsWithOwnerIncludingOrgShared(userId);
+        resolvedLinkedInAccount = resolveLinkedInAccountFromList(linkedInAccountsForRouting, account_id);
+      } else {
+        resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      }
       if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
+
+    // ENG-1132/ENG-1614: the requested account may be at its own daily
+    // invite/message cap while another account the org has connected and
+    // explicitly shared has headroom to spare. Route the WHOLE write there
+    // instead of failing — this only decides which account gets checked
+    // against the existing pacer/cap below; it never loosens either.
+    // No-op for accept/cancel-invitation (not volume-classed) and for a
+    // single-account customer (no alternate exists): today's behavior is
+    // unchanged in both cases.
+    let accountRouting: AccountRoutingDisclosure | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
+      const routed = await routeLinkedInWriteToAccountWithHeadroom(
+        userId, action, account_id, resolvedLinkedInAccount, linkedInAccountsForRouting,
+      );
+      if (routed) {
+        console.log(`[AgentMode] linkedinOutreach: ${routed.reason}`);
+        accountRouting = { fromAccountId: account_id, toAccountId: routed.accountId, reason: routed.reason };
+        account_id = routed.accountId;
+        resolvedLinkedInAccount = routed.account;
+      }
+    }
+    const withRouting = (data: any) => withAccountRoutingDisclosure(accountRouting, data);
 
     // For read-only actions (get-profile, search-people, get-company), fall back to
     // site-wide Unipile accounts when the user has no personally-connected account.
@@ -36065,7 +36103,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ownerUserId: userId,
         state: 'disconnected',
       });
-      return this.linkedInDisconnectedResponse();
+      return withRouting(this.linkedInDisconnectedResponse());
     }
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
@@ -36093,7 +36131,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
       const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
-      return result.refusal ? { refusal: result.refusal } : null;
+      return result.refusal ? { refusal: withRouting(result.refusal) } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -36529,12 +36567,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -36630,12 +36668,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 sentAt: pending.sentAt,
                 invitationId: pending.invitationId,
               });
-              return {
+              return withRouting({
                 success: true,
                 alreadyInvited: true,
                 message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
                 data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
-              };
+              });
             }
           }
 
@@ -36652,13 +36690,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // for the whole hour the breaker is armed, on every queued invite. Check it
           // here, before the slot is taken.
           if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
-            return {
+            return withRouting({
               success: false,
               error:
                 'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
                 + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
                 + 'Skip the remaining invites and report what was completed.',
-            };
+            });
           }
           // Past every skip path (already-pending, identity mismatch, cooldown): this
           // call is going to reach LinkedIn, so now is when it should cost a slot.
@@ -36704,14 +36742,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || undefined,
             });
 
-            return { success: true, data: inviteResult };
+            return { success: true, data: withRouting(inviteResult) };
           } catch (inviteErr: any) {
             if (inviteErr?.noteQuotaExceeded) {
               // Decision gate — do NOT decide for the customer. Ask them, then re-call
               // send-invite with on_note_quota. In a scheduled run there is no one to
               // answer, so the agent stops here and the invite is simply left un-sent
               // (the lead stays eligible); the customer resolves it by reopening the chat.
-              return {
+              return withRouting({
                 success: false,
                 requiresDecision: true,
                 noteQuotaExceeded: true,
@@ -36719,7 +36757,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
                   `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
                   `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
-              };
+              });
             }
             throw inviteErr;
           }
@@ -36753,11 +36791,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
               if (!syncAt || syncAt < oneDayAgo) {
-                return {
+                return withRouting({
                   success: false,
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
-                };
+                });
               }
 
               // Anti-spam: check if this exact message was already sent to this lead.
@@ -36779,12 +36817,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 );
                 if (duplicateEvent) {
                   console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
-                  return {
+                  return withRouting({
                     success: false,
                     error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
                     duplicate: true,
                     alreadySentAt: duplicateEvent.createdAt,
-                  };
+                  });
                 }
               }
             }
@@ -36804,12 +36842,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -36845,7 +36883,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: messageResponse };
+          return { success: true, data: withRouting(messageResponse) };
         }
 
         case 'send-inmail': {
@@ -36887,7 +36925,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: inmailResponse };
+          return { success: true, data: withRouting(inmailResponse) };
         }
 
         case 'update-conversation-history': {
@@ -37135,7 +37173,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           ownerUserId: userId,
           state: 'disconnected',
         });
-        return this.linkedInDisconnectedResponse();
+        return withRouting(this.linkedInDisconnectedResponse());
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
@@ -37149,7 +37187,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // and reports proactively. The raw phrase is preserved in the body so the
       // error classifier still buckets this as an upstream_rejected business rule.
       if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
-        return {
+        return withRouting({
           success: false,
           message: 'LinkedIn invitation limit reached',
           error: [
@@ -37160,7 +37198,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
           ].join('\n'),
           accountThrottled: true,
-        };
+        });
       }
 
       // ENG-1300: LinkedInOutreachService.handleError already classifies the
@@ -37168,12 +37206,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // reconnect-detection logic above — read the same field here so the
       // generic fallback path also reaches the tool-error classifier as
       // auth/rate_limit/etc. instead of a bare Error/bug.
-      return {
+      return withRouting({
         success: false,
         message: 'LinkedIn outreach action failed',
         error: errorMessage,
         code: (error as any)?.code ?? structuredError?.status
-      };
+      });
     }
   }
 

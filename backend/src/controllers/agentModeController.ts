@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
+import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
 import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
@@ -14423,10 +14423,20 @@ export const agentModeController = {
       // submit-for-review → admin-approve workflow one route over. Refused
       // explicitly rather than silently dropped; a silent drop is how the
       // manage_schedule_template confusion started.
+      // `isRealAdmin`, not `user.isAdmin`: for a delegate session the auth
+      // middleware rebuilds `req.user` from the TARGET user's DB record
+      // (`isAdmin: targetUser.isAdmin || false`), so delegating into an account
+      // that happens to be an admin hands the delegating session that account's
+      // admin bit. Elsewhere in this controller `user.isAdmin` only widens a
+      // READ; here it grants platform-wide reach, which is exactly the privilege
+      // `isRealAdmin` exists to withhold from a delegated session. A contractor
+      // may hold a delegate token for an assigned user (middleware/auth.ts), so
+      // this is the difference between "admins may publish" and "anyone who can
+      // delegate into an admin may publish".
       const visibilityDecision = resolveVisibilityUpdate({
         current: existing.visibility,
         requested: visibility,
-        isAdmin: user.isAdmin === true,
+        isAdmin: isRealAdmin(req),
       });
       if (!visibilityDecision.ok) {
         return res.status(visibilityDecision.status).json({ error: visibilityDecision.error });
