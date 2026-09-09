@@ -275,11 +275,19 @@ export async function assessClientHealth(
     /*
      * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
      * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
-     * after a campaigns read actually succeeds without truncation, below. Before this fix it
-     * defaulted to true unconditionally and only flipped FALSE on a truncated success — a fetch
-     * that THREW (network error, expired token) fell through to the catch block below, which
-     * only logs, leaving activeCampaigns empty and campaignsComplete still true: a fetch that
-     * read NOTHING reported as "confirmed zero campaigns, complete."
+     * after a campaigns read actually succeeds cleanly, below. Before this fix it defaulted to
+     * true unconditionally and only flipped FALSE on a truncated success — a fetch that THREW
+     * (network error, expired token) fell through to the catch block below, which only logs,
+     * leaving activeCampaigns empty and campaignsComplete still true: a fetch that read NOTHING
+     * reported as "confirmed zero campaigns, complete."
+     *
+     * ENG-1767 follow-up: `fetchWithRetryAndPaging` does not throw on a Graph API error (bad
+     * token, permission revoked, etc.) — by its own documented contract it RETURNS the parsed
+     * `{ error: {...} }` body instead, with no `data` array and no `pagingTruncated` flag.
+     * Checking only `pagingTruncated` missed exactly this case: a real permission error came back
+     * as `activeCampaigns: [], campaignsComplete: true` — confirmed live against a real account
+     * whose stored token had lost Graph access — the same "silent wrong zero" failure shape this
+     * ticket exists to eliminate, just via a first-page API error instead of a wrong token source.
      */
     let campaignsComplete = !hasAds;
 
@@ -344,7 +352,7 @@ export async function assessClientHealth(
           activeCampaigns = (campaignsData.data || []).filter(
             (c: any) => c.status === 'ACTIVE'
           );
-          campaignsComplete = campaignsData.pagingTruncated !== true;
+          campaignsComplete = campaignsData.pagingTruncated !== true && !campaignsData.error;
 
           // Fetch ad-level data for creative variety + fatigue analysis, requesting both the
           // current and prior 14-day windows via `time_ranges` in one `insights` edge call —
