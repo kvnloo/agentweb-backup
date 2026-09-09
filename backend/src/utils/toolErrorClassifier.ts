@@ -201,6 +201,16 @@ function classFromMessage(message: string): string | null {
   if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
+  /*
+   * ENG-1795: must be tested BEFORE the subscription pattern. A mixed refusal (some ids
+   * genuinely off-plan, some simply unknown) carries BOTH sentences, and classifying it
+   * `subscription_blocked` would put the unknown ids back under a billing verdict — the
+   * exact conflation this split exists to remove. Unknown ids are the actionable half:
+   * the model can retry with a correct id, which is what `invalid_args` signals.
+   */
+  if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
+  // Entitled and correctly named, but nothing installable behind it — not retryable, not billing.
+  if (/these skills are currently unavailable to install/.test(m)) return 'empty_result';
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';

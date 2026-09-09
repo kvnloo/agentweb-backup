@@ -160,6 +160,19 @@ import {
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+/*
+ * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
+ * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
+ * `invalid_args` instead of `subscription_blocked`, so it is a contract between the two
+ * files, not decoration — change it in both or in neither.
+ */
+export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+/*
+ * The skill exists and the account is entitled to it, but it is not installable right now
+ * (empty `__other_skills__` pool, a visibility filter, or an admin-only bundle). Routed to
+ * `empty_result` — retrying the same id cannot succeed, so `invalid_args` would be wrong too.
+ */
+export const SKILL_UNAVAILABLE_MARKER = "These skills are currently unavailable to install";
 // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
@@ -6521,6 +6534,74 @@ export class AgentModeService {
     return skills;
   }
 
+  /*
+   * ENG-1795. A rejected skill id has two causes that are NOT interchangeable to the
+   * person on the other end of the chat:
+   *
+   *   unentitled — the skill exists and is published, but this account's allowedSkills
+   *                does not unlock it. "Not on your plan" is TRUE, and sales can fix it.
+   *   unresolved — no such skill id exists: retired, renamed, a typo, a virtual bundle
+   *                with nothing in it, or an id the model invented. "Not on your plan"
+   *                is FALSE. Support can fix it; sales cannot.
+   *
+   * Both used to return the single subscription message, which did not merely misreport
+   * the cause — it INSTRUCTED the model to state the plan limitation to the customer as
+   * fact. That is how a lookup failure reaches a paying customer as a billing statement
+   * and sends them to the one team that cannot help them.
+   */
+  private async classifySkillRejections(
+    rejectedSkillIds: string[],
+    userId: string
+  ): Promise<{ unentitled: string[]; unavailable: string[]; unresolved: string[] }> {
+    let allowedIds: string[];
+    let existingIds: Set<string>;
+    try {
+      const [catalog, published] = await Promise.all([
+        this.loadAuthorizedSkillCatalog(userId),
+        skillService.getPublishedSkills(),
+      ]);
+      allowedIds = catalog.allowedIds;
+      existingIds = new Set(published.map(s => s.skillId));
+      // The virtual bundles are real ids with no catalog row; entitlement still governs them.
+      existingIds.add(OTHER_SKILLS_VIRTUAL_ID);
+      existingIds.add(ADMIN_SKILL_VIRTUAL_ID);
+    } catch (err) {
+      /*
+       * We could not read the catalog, so we cannot prove a skill is absent — and an
+       * unproven absence must not be reported as an entitlement failure. Fail into the
+       * branch that makes no claim about the customer's plan.
+       */
+      console.warn('[installSkills] skill catalog lookup failed while classifying a refusal:', err);
+      return { unentitled: [], unavailable: rejectedSkillIds, unresolved: [] };
+    }
+
+    const isWildcard = allowedIds.includes('*');
+    const allowedSet = new Set(allowedIds);
+    const unentitled: string[] = [];
+    const unavailable: string[] = [];
+    const unresolved: string[] = [];
+    for (const id of rejectedSkillIds) {
+      /*
+       * Admin Tools is gated on `user.isAdmin` / delegation, never on billing. Classifying it
+       * by entitlement would tell an ordinary user to go buy a plan that grants admin.
+       */
+      if (id === ADMIN_SKILL_VIRTUAL_ID) { unavailable.push(id); continue; }
+      if (!existingIds.has(id)) { unresolved.push(id); continue; }
+      if (!isWildcard && !allowedSet.has(id)) { unentitled.push(id); continue; }
+      /*
+       * Exists AND granted, yet absent from this user's catalog. Two real causes, neither
+       * billing and neither fixable by retrying the same id:
+       *   - `__other_skills__` whose unassociated-tool pool is currently empty. This is the
+       *     ENG-1237 production repro (harsha@agentweb.pro) — an unpublished org-shared skill
+       *     claimed the last remaining tools, the bundle vanished from the catalog, and the
+       *     refusal surfaced as "not available with your current subscription".
+       *   - a skill filtered by visibility (`pending_review`, owned by someone else).
+       */
+      unavailable.push(id);
+    }
+    return { unentitled, unavailable, unresolved };
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
@@ -6555,6 +6636,7 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
+          const { unentitled, unavailable, unresolved } = await this.classifySkillRejections(rejectedSkillIds, userId);
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -6562,11 +6644,38 @@ export class AgentModeService {
            * that is how a model ends up substituting another tool's output and presenting it
            * as the gated tool's result.
            */
+          const noSubstitution =
+            " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
+
+          const parts: string[] = [];
+          if (unentitled.length > 0) {
+            parts.push(
+              `The requested skills are not available with your current subscription: ${unentitled.join(', ')}.`
+              + " Tell the user plainly that this capability is not on their plan."
+            );
+          }
+          if (unresolved.length > 0) {
+            parts.push(
+              `${SKILL_UNRESOLVED_MARKER}: ${unresolved.join(', ')}.`
+              + " This is an ID problem, not a billing one — do NOT tell the user this capability is missing from their subscription."
+              + " Re-read the available skills list and retry with an exact ID from it."
+            );
+          }
+          if (unavailable.length > 0) {
+            parts.push(
+              `${SKILL_UNAVAILABLE_MARKER}: ${unavailable.join(', ')}.`
+              + " The ID is correct and this account is permitted to use it, so retrying the same ID will not help,"
+              + " and this is NOT a billing limitation — do NOT tell the user it is missing from their subscription."
+              + " Say the capability is unavailable right now and that support can look into it."
+            );
+          }
+
           return {
             success: false,
-            message: "The requested skills are not available with your current subscription."
-              + " Tell the user plainly that this capability is not on their plan."
-              + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+            message: parts.join(' ') + noSubstitution,
+            ...(unentitled.length > 0 ? { unentitledSkillIds: unentitled } : {}),
+            ...(unavailable.length > 0 ? { unavailableSkillIds: unavailable } : {}),
+            ...(unresolved.length > 0 ? { unresolvedSkillIds: unresolved } : {}),
           };
         }
         return { success: false, message: "No valid skills found for the provided IDs." };
