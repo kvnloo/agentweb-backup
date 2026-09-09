@@ -261,12 +261,8 @@ export async function addSubdomain(
           // it exists to provide, or leave a trailing hyphen that validateSubdomain rejects.
           // padEnd: Math.random() can yield a short or empty fractional part ((0).toString(16)
           // is "0", so .slice(2,6) is ""), which would otherwise emit a trailing hyphen.
-          const suffix = Math.random().toString(16).slice(2, 6).padEnd(4, "0");
-          const stem = truncateLabel(
-            cleanSubdomain,
-            MAX_SUBDOMAIN_LABEL_LENGTH - suffix.length - 1
-          );
-          finalSubdomain = stem ? `${stem}-${suffix}` : suffix;
+          const suffix = Math.random().toString(16).slice(2, 6);
+          finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
           // Assert the rebuilt label BEFORE the next iteration hands it to Vercel. Validating
           // after the loop would run only once the POST had already succeeded, so a throw
           // would leave the domain attached to the project with no record written for it.
