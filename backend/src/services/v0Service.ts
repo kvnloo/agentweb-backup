@@ -661,7 +661,16 @@ export async function resolveLandingPageLiveUrl(
     const domains = await listDomains(page.userId, page.vercelProjectId);
     if (domains.length === 0) return fallback;
 
-    const rank = (d: { type: string }) => (d.type === "custom" ? 1 : 0);
+    // Same three tiers as the list route's `bestByOwnerProject` (ENG-1839). This function is
+    // the sibling read path — it feeds `live_url` on publish/edit and the "Your site at … will
+    // update shortly" message — so a status-blind ranking here reported a `pending_verification`
+    // host with no DNS as the live URL even after the list route was corrected. The doc comment
+    // above has always promised a VERIFIED custom domain; this is the first version that
+    // delivers one.
+    const rank = (d: { type: string; status?: string }) => {
+      if (d.type === "custom") return d.status === "active" ? 2 : 0;
+      return 1; // managed subdomain — addSubdomain writes these active unconditionally
+    };
     let best = domains[0];
     for (const d of domains) {
       if (
