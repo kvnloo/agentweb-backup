@@ -166,10 +166,18 @@ export function buildXAssessmentPrompt(text: string): { system: string; user: st
   const system =
     `You assess how a draft X (Twitter) post is likely to perform, using the same signal ` +
     `categories X's own ranking algorithm scores posts on. For each of these, estimate the ` +
-    `probability (0 to 1) that a TYPICAL viewer in the post's likely audience performs that ` +
-    `action after seeing it: ${fields}. "notInterested"/"blockAuthor"/"muteAuthor"/"report" are ` +
-    `negative-feedback probabilities — near 0 for ordinary content, higher for spammy/offensive/` +
-    `repetitive content. "openLink" must be 0 if the post has no link.${hasLink ? '' : ' This post has no link.'} ` +
+    `probability (0 to 1) that a TYPICAL viewer among everyone the post is shown to (not just ` +
+    `people who'd bother reacting) performs that action after seeing it: ${fields}. ` +
+    `\n\nCALIBRATION — these are per-impression rates across X's entire real audience, not a ` +
+    `"how good does this feel" score. Actual X base rates are far lower than intuition suggests: ` +
+    `favorite is typically under 0.05 even for strong posts; reply/retweet/quote/share under 0.01; ` +
+    `click/profileClick a few hundredths at most. Negative-feedback rates are near-zero for ` +
+    `ordinary content — X's own data shows reporting is over 1000x rarer than favoriting. For ` +
+    `"notInterested"/"blockAuthor"/"muteAuthor"/"report": use under 0.0005 for unremarkable-but-fine ` +
+    `content, under 0.0001 for genuinely good content, and reserve anything above 0.001 for content ` +
+    `that is actually spammy, offensive, or abusive — being boring or low-effort is NOT the same as ` +
+    `being report-worthy, and must not inflate these. ` +
+    `"openLink" must be 0 if the post has no link.${hasLink ? '' : ' This post has no link.'} ` +
     `Respond with ONLY JSON mapping each field name above to its probability.`;
   const user = `Draft X post:\n${text}`;
   return { system, user };
