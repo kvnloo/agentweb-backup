@@ -103,7 +103,10 @@ export function selectDomainsToProbe(
        * once per period. It is NOT a substitute for a lock, and the difference matters:
        *
        *   It does nothing for instances sweeping SIMULTANEOUSLY — both scan before either
-       *   writes, so both see the same stale timestamps and both probe. Moving to a fixed
+       *   writes, so both see the same stale timestamps and both probe. (The MULTI-INSTANCE
+       *   bullet below is about the STAGGERED case, minutes apart, which is the one the guard
+       *   does prevent. Simultaneous and staggered fail differently: staggered double-counts,
+       *   simultaneous does not.) Moving to a fixed
        *   06:15 UTC schedule (see server.ts) actually makes simultaneous the normal case,
        *   where boot-relative scheduling used to stagger instances naturally. What saves us
        *   there is that `consecutiveFailures` is read-then-set: two instances both read the
@@ -178,16 +181,17 @@ async function mapLimit<T, R>(
  *
  * Not fixed here, deliberately, because the blast radius is bounded by the SUSPECT/DEFINITIVE
  * split: every failure a prober-side fault can produce is classified SUSPECT, so nothing
- * reaches a customer until THREE consecutive hourly rounds have failed. A transient outage
- * self-heals long before that, and a three-hour total egress failure is an incident someone is
- * already looking at.
+ * reaches a customer until UNREACHABLE_CONFIRMATIONS consecutive daily rounds have failed. A
+ * transient outage self-heals long before that, and a multi-day total egress failure is an
+ * incident someone is already looking at.
  *
- * That bound is only true because the certificate trust/validity codes were MOVED to SUSPECT
- * (see domainReachabilityService.ts). While they were definitive it was false — and false in
- * the worst direction, since `decideFromVerdict` commits an unreachable verdict before the
- * threshold is consulted. One round under an intercepting proxy, a broken CA store, or forward
- * clock skew would have told the entire customer base their own certificates were untrusted.
- * If a code is ever promoted back to DEFINITIVE, this paragraph stops being true with it.
+ * That bound holds only while the certificate trust/validity codes stay SUSPECT (see
+ * domainReachabilityService.ts) — `decideFromVerdict` commits an unreachable verdict BEFORE
+ * consulting the threshold, so a single definitive code bypasses this bound entirely. One round
+ * under an intercepting proxy, a broken CA store, or an expired root anywhere in the chain
+ * would otherwise tell the entire customer base their own certificates are bad. Promoting any
+ * of those codes back to DEFINITIVE invalidates this paragraph — and that has already been
+ * tried once with CERT_HAS_EXPIRED and reverted, so read that entry before trying again.
  *
  * The real fix is a batch-level guard: if a sweep's failure ratio exceeds ~50%, treat the
  * prober as suspect and skip persisting verdicts for that round. It needs a two-phase

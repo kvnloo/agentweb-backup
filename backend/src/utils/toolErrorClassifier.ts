@@ -14,7 +14,7 @@
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
- *   scope_refused | publisher_refused
+ *   scope_refused | publisher_refused | skill_install_refused
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -100,13 +100,13 @@ function classFromMessage(message: string): string | null {
    *      subscription sentence must not pull the whole message under a billing verdict. That
    *      conflation is the entire bug this ticket exists to remove.
    *
-   * `tool_unavailable` for the unavailable/forbidden cases is chosen for what it TELLS THE
-   * MODEL, not merely for its name: its next step ends "Do NOT present another tool's output as
-   * this tool's result". `empty_result` — the intuitive pick — says the opposite: "the call
-   * succeeded but returned nothing … broaden the query or try a different source". Appending
-   * that beneath a refusal whose own text forbids substitution is precisely how ENG-1625
-   * produced a fabricated audit table. It is also `by_design` in the failure taxonomy, which
-   * would have hidden the ENG-1237 class of defect from the investigate bucket entirely.
+   * `skill_install_refused` exists because no pre-existing class fit. `empty_result` says "the
+   * call succeeded but returned nothing … try a different source" — appending that beneath a
+   * refusal whose own text forbids substitution is precisely how ENG-1625 produced a fabricated
+   * audit table. `tool_unavailable` was tried next and is also wrong: its guidance opens with
+   * "this tool is not available in this session" (install_skills ran) and tells the model to
+   * "install the required skill via install_skills" (the call that just refused), and its
+   * failure type drops the bucket out of the investigate set.
    */
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';

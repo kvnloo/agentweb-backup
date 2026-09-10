@@ -73,25 +73,6 @@ const DEFINITIVE: Record<string, string> = {
   // and an intercepting proxy would not — a proxy mints a certificate FOR the hostname it was
   // asked for, so interception shows up as a trust-chain failure, not an altname failure.
   ERR_TLS_CERT_ALTNAME_INVALID: "The SSL certificate does not cover this domain.",
-  /*
-   * Expiry is definitive too, and the reason it is separated from the three trust-chain codes
-   * below is worth stating, because it was previously grouped WITH them and that shipped a
-   * latency regression.
-   *
-   * The concern was that forward clock skew on the prober expires every certificate at once.
-   * It cannot reach this code path: `runDomainReachabilitySweep` scans DynamoDB BEFORE any
-   * probe, on an aws-sdk v2 client with `correctClockSkew` unset (its default is false), and
-   * SigV4 rejects a request more than ~5 minutes off server time with RequestTimeTooSkewed. A
-   * prober skewed by days therefore throws on the scan and never probes anything. Skew small
-   * enough to pass SigV4 (<5 min) can only expire a certificate that was within 5 minutes of
-   * expiring anyway — a true positive, minutes early.
-   *
-   * That argument does NOT transfer to the trust-chain codes: an egress proxy or a CA
-   * regression breaks TLS without breaking SigV4, so those stay suspect. Grouping expiry with
-   * them cost two days of a customer staring at a browser interstitial on their own site, to
-   * defend against a fault this code path is structurally immune to.
-   */
-  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
 };
 
 const SUSPECT: Record<string, string> = {
@@ -112,10 +93,39 @@ const SUSPECT: Record<string, string> = {
    * that cries wolf gets tuned out, which is the same way the bug this service exists to catch
    * survived unnoticed in the first place.
    *
-   * The cost is real and accepted: a genuinely expired customer certificate now takes three
-   * hourly rounds to report instead of one. Against pages that sat broken for months, three
-   * hours is not the expensive direction to be wrong in.
+   * The cost is real and accepted: these failures now take UNREACHABLE_CONFIRMATIONS daily
+   * rounds to report rather than one probe. Against pages that sat broken for months — and
+   * against the alternative, which is accusing every customer at once when the fault is ours —
+   * that is not the expensive direction to be wrong in.
    */
+  /*
+   * CERT_HAS_EXPIRED belongs HERE, not in DEFINITIVE, and the reason is not the one that
+   * first suggests itself.
+   *
+   * The clock-skew objection is genuinely dead: the sweep scans DynamoDB before probing, on an
+   * aws-sdk v2 client with `correctClockSkew` unset (default false), and SigV4 rejects a
+   * request >5 minutes off — so a prober skewed by days throws on the scan and never probes.
+   * That argument is sound, and it is also beside the point.
+   *
+   * The real reason is that this code is not a statement about the CUSTOMER's certificate.
+   * OpenSSL reports error 10 for ANY expired certificate in the built chain, at any depth.
+   * Verified locally: a leaf valid for another year, chained to a root that has expired,
+   * yields `error 10 at 1 depth lookup: certificate has expired`. So an expired root in Node's
+   * bundled store, in the OS ca-certificates package, or in an egress proxy's CA makes EVERY
+   * domain report expiry at once — with a correct clock. That is the DST Root CA X3 shape from
+   * 2021: valid leaves, browsers fine, OpenSSL saying expired.
+   *
+   * Which means it fails this module's own membership test — our trust store CAN manufacture
+   * it — and it is the same mechanism that keeps the three codes below suspect. It was briefly
+   * promoted to DEFINITIVE to cut reporting latency; that traded a bounded delay for a
+   * fleet-wide false accusation, which is the wrong direction.
+   *
+   * Distinguishing leaf expiry from chain expiry is possible but not free: on this error Node
+   * populates only `err.code` — no `err.cert` — so it needs `rejectUnauthorized: false` plus
+   * `socket.getPeerCertificate(true)` and our own validity comparison. Worth doing; not worth
+   * bundling into this change.
+   */
+  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
   DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
   SELF_SIGNED_CERT_IN_CHAIN: "The SSL certificate is not trusted.",
   UNABLE_TO_VERIFY_LEAF_SIGNATURE: "The SSL certificate could not be verified.",

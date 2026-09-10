@@ -819,10 +819,12 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
      * refused — naming it here tells the user a tool was unavailable when what actually
      * happened is that it worked and reported a reason.
      *
-     * Load-bearing since ENG-1795 retargeted the install refusal's error class to
-     * `tool_unavailable` — chosen for its model-facing text, which forbids substitution. That
-     * is the exact class this filter keys on, so without this guard an install refusal
-     * arriving with no gated tool alongside it produces a banner where there was none before.
+     * Load-bearing, though no longer for install_skills' OWN refusals — those now classify
+     * `skill_install_refused` and never reach this filter. Four other install_skills failures
+     * still classify `tool_unavailable`, because the classifier matches the bare tool name
+     * inside the message: a gateway policy block, the repeated-failure breaker, an excludeTools
+     * removal, and a timeout. Any of them would otherwise name install_skills in a banner as a
+     * capability that "did not run".
      */
     if (name === 'install_skills') return;
     // Ran successfully at some point in the turn — the capability is present.

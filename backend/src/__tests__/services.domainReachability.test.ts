@@ -113,6 +113,7 @@ describe("detection latency — the monitor must actually report", () => {
 
 describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitive", () => {
   const proberFaultCodes = [
+    ["CERT_HAS_EXPIRED", "an expired root or intermediate ANYWHERE in the chain, including ours"],
     ["DEPTH_ZERO_SELF_SIGNED_CERT", "a TLS-intercepting egress proxy"],
     ["SELF_SIGNED_CERT_IN_CHAIN", "a TLS-intercepting egress proxy"],
     ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "a missing or broken CA trust store"],
@@ -143,7 +144,6 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
 
   it.each([
     ["ERR_TLS_CERT_ALTNAME_INVALID", "a mismatch describes what the REMOTE certificate contains"],
-    ["CERT_HAS_EXPIRED", "SigV4 rejects the skew needed to fake it before any probe runs"],
   ])("%s is DEFINITIVE — %s", (code) => {
     /*
      * Reported on the FIRST probe, no confirmation wait. Expiry belongs here despite looking
@@ -160,17 +160,6 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
     expect(decideFromVerdict(verdict, 0).nextStatus).toBe("error");
   });
 
-  it("a hostname mismatch stays DEFINITIVE — our side cannot fabricate it", () => {
-    /*
-     * The one code that survives the test. A mismatch is a statement about what the REMOTE
-     * certificate contains: our clock cannot forge it, our trust store cannot forge it, and an
-     * intercepting proxy mints a certificate FOR the requested hostname, so interception
-     * surfaces as a trust-chain failure rather than this.
-     */
-    const verdict = verdictForCode("ERR_TLS_CERT_ALTNAME_INVALID");
-    expect(verdict.state).toBe("unreachable");
-    expect(decideFromVerdict(verdict, 0).nextStatus).toBe("error");
-  });
 });
 
 describe("probeDomain — classification", () => {

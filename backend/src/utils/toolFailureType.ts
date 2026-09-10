@@ -86,7 +86,7 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
    * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
    * visible, which is where it was under the old single-message behaviour.
    */
-  if (errorClass === 'skill_install_refused') return 'bug';
+  if (errorClass?.toLowerCase() === 'skill_install_refused') return 'bug';
 
   const cls = (errorClass || '').toLowerCase();
   const msg = errorMessage || '';

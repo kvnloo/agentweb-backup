@@ -171,10 +171,11 @@ export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any
  * The skill exists and the account is entitled to it, but nothing is installable behind it
  * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
  *
- * Routed to `tool_unavailable`, chosen for what that class TELLS THE MODEL: its guidance ends
- * "Do NOT present another tool's output as this tool's result". `empty_result` looks like the
- * natural fit and is actively harmful here — it says "the call succeeded but returned nothing
- * … try a different source" directly beneath a refusal forbidding exactly that.
+ * Routed to `skill_install_refused`, a class that exists for this case: its guidance defers to
+ * this message for the reason and adds only the verdict — do not retry, do not substitute.
+ * `empty_result` is actively harmful here ("the call succeeded … try a different source",
+ * beneath a refusal forbidding exactly that) and `tool_unavailable` is false and circular
+ * ("this tool is not available", "install via install_skills" — on an install_skills failure).
  *
  * NOT visibility-filtered skills (those never reach this bucket — `getPublishedSkills` drops
  * `pending_review`, so they land in `unresolved`), and NOT the admin bundle (its own

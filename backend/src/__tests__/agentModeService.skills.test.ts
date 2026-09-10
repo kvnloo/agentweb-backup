@@ -59,6 +59,7 @@ import { skillService } from '../services/skillService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { retryabilityLine, isFastTripErrorClass } from '../services/agentMode/core/errorRetryability';
 import { classifyToolFailureType } from '../utils/toolFailureType';
+import { NON_DISPATCHABLE_FAILURE_TYPES } from '../loops/instances/agent-mode/failureRuleSet';
 import { chatbotDb } from '../services/chatbotService';
 
 
@@ -242,8 +243,16 @@ describe('AgentModeService - Skills', () => {
         expect(line).not.toMatch(/install the required skill via install_skills/i); // circular here
         expect(line).not.toMatch(/not available in this session/i);         // install_skills ran
 
-        // And it must stay in the investigate bucket: `unavailable` IS the ENG-1237 catalog bug.
-        expect(classifyToolFailureType(cls)).toBe('bug');
+        /*
+         * The guarantee is DISPATCHABILITY, not the literal string 'bug' — `bug` is already the
+         * default for an unrecognised class, so asserting it alone passes whether or not the
+         * mapping exists. What must hold is that this class stays OUT of
+         * NON_DISPATCHABLE_FAILURE_TYPES: `unavailable` IS the ENG-1237 catalog bug, and the
+         * previous class (`model_uninstalled_tool`) silently dropped it from the investigate set.
+         */
+        const ft = classifyToolFailureType(cls);
+        expect(ft).toBe('bug');
+        expect(NON_DISPATCHABLE_FAILURE_TYPES.has(ft)).toBe(false);
         expect(isFastTripErrorClass(cls)).toBe(true);
       });
 
