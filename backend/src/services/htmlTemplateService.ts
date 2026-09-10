@@ -215,7 +215,13 @@ export const htmlTemplateService = {
         : all.map((t, i) => (i === idx ? resultTemplate : t));
 
       try {
-        if (row?.settingValue) {
+        // Row EXISTENCE gates which write path is safe, not whether its value happens to be
+        // truthy — `row != null` (not `row?.settingValue`) so a row that exists with an
+        // empty-string settingValue still goes through the conditioned write. writeRow's own
+        // JSON.stringify(array) can never itself produce "" (its floor is "[]"), so this case
+        // is unreachable via this service's own writers today, but "row exists" and "row has
+        // a truthy value" are different questions and only the former is what CAS needs.
+        if (row != null) {
           await settingsService.setSettingIfValueMatches(
             PUBLIC_KEY,
             JSON.stringify(nextAll),
