@@ -1514,7 +1514,15 @@ async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> 
         { role: 'system', content: STOP_REQUEST_JUDGE_SYSTEM },
         { role: 'user', content: recent.content.slice(0, 2500) },
       ],
-      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
+      // ENG-1819 live-testing found gemini-3.1-flash-lite is a reasoning model (confirmed
+      // in this file's own llmModels registry) that can spend its whole completion budget on
+      // an internal reasoning trace before ever emitting "yes"/"no" -- a tight budget (the
+      // scheduledTurnDefersToUser precedent's max_completion_tokens: 3) came back
+      // finish_reason:"length" with content:null every time, which this function's own
+      // empty-string parse then (correctly, but unintentionally) treated as "no". 500 leaves
+      // headroom for a reasoning trace ahead of the one-word answer; cost scales with tokens
+      // actually generated, not this ceiling.
+      { temperature: 0, max_completion_tokens: 500, taskClass: 'scheduled_background' }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
