@@ -234,3 +234,45 @@ describe('buildUnavailableCapabilityNotice', () => {
     expect(notice).not.toContain('read_brand_guidelines');
   });
 });
+
+/*
+ * ENG-1795. Every case in this file uses the SUBSCRIPTION refusal as the install_skills error,
+ * which classifies `subscription_blocked` — the one refusal shape this notice's filter ignores.
+ * So when ENG-1795 retargeted the "unavailable" refusal to `tool_unavailable` (chosen for its
+ * model-facing text, which forbids substitution), install_skills began matching the filter and
+ * the whole suite stayed green while a false banner shipped.
+ */
+describe('buildUnavailableCapabilityNotice — the installer is never the missing capability', () => {
+  const UNAVAILABLE_REFUSAL =
+    'These skills are currently unavailable to install: __other_skills__. The ID is correct and '
+    + 'this account is permitted to use it, so retrying the same ID will not help.';
+  const FORBIDDEN_REFUSAL =
+    'These skills are currently unavailable to install: __admin_tools__. This requires admin '
+    + 'access — a role restriction, not a billing limit and not a temporary fault.';
+
+  it.each([
+    ['unavailable', UNAVAILABLE_REFUSAL],
+    ['forbidden', FORBIDDEN_REFUSAL],
+  ])('does not announce install_skills itself as unavailable (%s refusal)', (_label, refusal) => {
+    /*
+     * install_skills DID run — it ran and refused, with a reason. Naming it here tells the user
+     * a tool was unavailable when the truth is the opposite, and prepends that claim above an
+     * answer that may be entirely correct.
+     */
+    expect(buildUnavailableCapabilityNotice([{ name: 'install_skills', error: refusal }])).toBeNull();
+  });
+
+  it('still announces the genuinely gated tool alongside an install refusal', () => {
+    // The guard must be surgical: suppressing install_skills must not suppress the tool the
+    // model was actually denied, which is the entire point of the notice.
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'install_skills', error: UNAVAILABLE_REFUSAL },
+      {
+        name: 'audit_ad_utm_coverage',
+        error: 'Tool "audit_ad_utm_coverage" is not available. You must install the required skill first using install_skills.',
+      },
+    ]);
+    expect(notice).toContain('audit_ad_utm_coverage');
+    expect(notice).not.toContain('install_skills`');
+  });
+});

@@ -245,6 +245,70 @@ describe('AgentModeService - Skills', () => {
         }
       });
 
+      it('keeps admin tools a role restriction even when the catalog read fails', async () => {
+        /*
+         * The admin bucket is decided by a static id comparison that needs no catalog at all.
+         * Left below the try/catch, a catalog failure dropped it into the `unavailable`
+         * fallback — which asserts "this account is permitted to use it" and "support can look
+         * into it", the two false claims the forbidden bucket exists to remove. A failed lookup
+         * must not silently undo a decision that never depended on the lookup.
+         */
+        (skillService.getPublishedSkills as jest.Mock)
+          .mockResolvedValueOnce([])
+          .mockRejectedValue(new Error('dynamo down'));
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/permitted to use it/i);
+        expect(result.message).not.toMatch(/support can look into it/i);
+      });
+
+      it('PARTIAL install: the no-substitution instruction is present there too', async () => {
+        /*
+         * It matters MORE here than on the full-refusal branch. There, the dispatcher's
+         * downgrade attaches an error class whose retryability line carries its own stop
+         * signal. Here `success: true` means no class is ever assigned, so this sentence is the
+         * only thing between "the one skill the gated tool needed was the one refused" and the
+         * model presenting another tool's output as that tool's result.
+         */
+        const realSkill = {
+          skillId: 'crm-skill', name: 'CRM', description: 'CRM tools',
+          toolNames: ['search_leads'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([realSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([realSkill]);
+
+        const result = await agentModeService.installSkills(
+          ['crm-skill', 'no-such-id'], 'user-123', 'session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toMatch(/do not substitute/i);
+      });
+
+      it('does not let an un-entitled skill ID hijack the error class either', async () => {
+        /*
+         * The entitlement sentence was the one quarter left unguarded: it was matched by a
+         * pattern below the embedded-status regex, so a published skillId beginning with a
+         * "500"-shaped token classified `upstream_5xx` — which is RETRYABLE, appending "Wait
+         * briefly, then retry ONCE" beneath a permanent billing refusal.
+         */
+        const gated = {
+          skillId: '500-error-playbook', name: 'Playbook', description: 'x',
+          toolNames: ['t'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gated]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gated]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['something-else']);
+
+        const result = await agentModeService.installSkills(['500-error-playbook'], 'user-123', 'session-123');
+
+        expect(result.unentitledSkillIds).toEqual(['500-error-playbook']);
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('subscription_blocked');
+      });
+
       it('describes admin tools as a role restriction, not a billing or support matter', async () => {
         /*
          * __admin_tools__ is gated on isAdmin/delegation. Bucketing it as "unavailable" told a
