@@ -336,6 +336,40 @@ describe('AgentModeService - Skills', () => {
         expect(classifyToolErrorClass(new Error(result.message))).toBe('subscription_blocked');
       });
 
+      it('classifies a role refusal as by_design, not as a bug to investigate', async () => {
+        /*
+         * `forbidden` and `unavailable` share an error class, but they are opposite kinds of
+         * event. An admin-only bundle refused to a non-admin is a ROLE boundary working as
+         * designed — routing it to `bug` seeds an "investigate the handler + propose a
+         * robustness fix" proposal in failure triage for behaviour that is correct.
+         *
+         * `unavailable` must stay `bug`: it IS the ENG-1237 catalog defect.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const forbidden = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+        const fCls = classifyToolErrorClass(new Error(forbidden.message));
+        expect(classifyToolFailureType(fCls, forbidden.message)).toBe('by_design');
+        expect(NON_DISPATCHABLE_FAILURE_TYPES.has(classifyToolFailureType(fCls, forbidden.message))).toBe(true);
+
+        const unavailable = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+        const uCls = classifyToolErrorClass(new Error(unavailable.message));
+        expect(classifyToolFailureType(uCls, unavailable.message)).toBe('bug');
+      });
+
+      it('a MIXED refusal stays investigable — the catalog half is a real defect', () => {
+        /*
+         * One call rejecting both an admin bundle and an entitled-but-empty one carries both
+         * sentences. Under-investigating is the expensive direction, so `bug` wins.
+         */
+        const both =
+          'These skills are currently unavailable to install: __admin_tools__. This requires admin access — a role restriction. '
+          + 'These skills are currently unavailable to install: __other_skills__. The ID is correct and this account is permitted to use it.';
+        expect(classifyToolFailureType('skill_install_refused', both)).toBe('bug');
+        // And an absent message must never be read as "working as designed".
+        expect(classifyToolFailureType('skill_install_refused', undefined)).toBe('bug');
+      });
+
       it('describes admin tools as a role restriction, not a billing or support matter', async () => {
         /*
          * __admin_tools__ is gated on isAdmin/delegation. Bucketing it as "unavailable" told a

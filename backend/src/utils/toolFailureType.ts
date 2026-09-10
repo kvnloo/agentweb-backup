@@ -86,7 +86,28 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
    * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
    * visible, which is where it was under the old single-message behaviour.
    */
-  if (errorClass?.toLowerCase() === 'skill_install_refused') return 'bug';
+  if (errorClass?.toLowerCase() === 'skill_install_refused') {
+    /*
+     * Two buckets share this class, and they are opposite kinds of event.
+     *
+     *   forbidden   — `__admin_tools__` refused to a non-admin. A ROLE boundary working
+     *                 exactly as designed. Nothing to investigate; proposing a "robustness
+     *                 fix" for the install_skills handler here is pure triage noise.
+     *   unavailable — an entitled bundle whose tool pool emptied out. That IS the ENG-1237
+     *                 catalog defect, and it must stay in the investigate set.
+     *
+     * Distinguished by message rather than by a second error class, because both real callers
+     * (`runRecorder.ts`, `backfillFailureTypes.ts`) already pass errorMessage — so this needs
+     * no new routing, guidance text or consumer trace.
+     *
+     * A MIXED refusal, carrying both an admin id and an entitled-but-empty one, stays `bug`:
+     * the unavailable half is a genuine defect, and under-investigating is the expensive
+     * direction. Absent or unreadable message likewise falls through to `bug`.
+     */
+    const m = (errorMessage ?? '').toLowerCase();
+    const rolesOnly = m.includes('requires admin access') && !m.includes('permitted to use it');
+    return rolesOnly ? 'by_design' : 'bug';
+  }
 
   const cls = (errorClass || '').toLowerCase();
   const msg = errorMessage || '';
