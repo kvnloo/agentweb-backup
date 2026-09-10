@@ -15,6 +15,13 @@ jest.mock("../../../config", () => ({
   buildApiUrl: (path: string) => `http://localhost:3000${path}`,
 }));
 
+/**
+ * A Counters block from a dollar figure.
+ *
+ * `costMicroUsd` is derived rather than passed, so a fixture cannot express the
+ * one state the real ledger never produces — the two cost fields disagreeing —
+ * and a test can therefore never pass against an impossible row.
+ */
 const counters = (costUsd: number, calls = 1, tokens = 100) => ({
   inputTokens: tokens,
   outputTokens: 0,
