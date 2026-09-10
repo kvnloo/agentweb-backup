@@ -407,6 +407,41 @@ describe("upsertPublicTemplate", () => {
     await expect(htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system")).rejects.toThrow("dynamo down");
   });
 
+  // Review findings, both closed: (1) sustained contention was correct by hand-trace but
+  // undertested — this pins the actual bound; (2) an existing row with an empty-string
+  // settingValue (distinct from a genuinely absent row) must still go through the
+  // conditioned write, not the unconditioned bootstrap path.
+  it("throws a clear bounded error after exhausting all retry attempts under sustained contention", async () => {
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([{ ...PUB_TPL, html_content: "<p>OLD</p>" }]),
+    });
+    const conditionFailed: any = new Error("conflict");
+    conditionFailed.code = "ConditionalCheckFailedException";
+    mockSetSettingIfValueMatches.mockRejectedValue(conditionFailed);
+
+    await expect(htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system")).rejects.toThrow(
+      /exceeded 5 attempts/,
+    );
+    // Bounded, not runaway: exactly 5 reads and 5 conditioned write attempts, never more.
+    expect(mockGetSetting).toHaveBeenCalledTimes(5);
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(5);
+  });
+
+  it("an existing row with an empty-string settingValue still goes through the CONDITIONED write, not the unconditioned bootstrap path", async () => {
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: "", // row EXISTS, but its value is falsy — distinct from row being absent
+    });
+
+    const { created } = await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
+
+    expect(created).toBe(true); // parses to [] either way, so this is a create
+    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(1);
+    expect(mockSetSettingIfValueMatches.mock.calls[0][2]).toBe(""); // conditioned on the exact empty string read
+  });
+
   it("never writes to a per-user key — only templates_public", async () => {
     mockGetSetting.mockResolvedValue(null);
     await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
