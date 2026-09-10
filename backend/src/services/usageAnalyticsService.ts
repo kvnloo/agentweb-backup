@@ -201,6 +201,20 @@ export interface CostByModelRow extends CounterTotals {
   model: string;
 }
 
+/** One upstream provider's spend (ENG-1859). */
+export interface CostByProviderRow extends CounterTotals {
+  provider: string;
+}
+
+/**
+ * Rows written before ENG-1859... in fact before ENG-693, which is when the
+ * ledger started persisting `provider` at all. They are real spend with no
+ * provider recorded, so they get their own bucket: attributing them to a
+ * provider would invent data, and dropping them would make the provider rows
+ * sum to less than the headline with nothing saying why.
+ */
+export const PROVIDER_UNRECORDED = "(recorded before provider tracking)";
+
 export interface CostSeriesRow {
   date: string;
   model: string;
@@ -244,6 +258,12 @@ export interface CostAggregation {
   totals: CounterTotals;
   /** Sorted by spend, highest first. */
   byModel: CostByModelRow[];
+  /**
+   * Spend grouped by the upstream that served it (ENG-1859) — "which provider
+   * is our token spend going to", which by-model cannot answer once one model
+   * is reachable through more than one provider.
+   */
+  byProvider: CostByProviderRow[];
   /** Per (date, model) buckets, sorted by date then model — the time series. */
   series: CostSeriesRow[];
   /** Secondary cut over the stored feature dimension, sorted by spend. */
@@ -309,6 +329,32 @@ function bucketByModel(items: UsageRecordRow[]): CostByModelRow[] {
   rows.sort(
     (a, b) => b.costMicroUsd - a.costMicroUsd || a.model.localeCompare(b.model)
   );
+  return rows;
+}
+
+/**
+ * Spend by upstream provider (ENG-1859).
+ *
+ * Reads the `provider` attribute the ledger has persisted since ENG-693.
+ * Deliberately NOT derived from the model id: the same model is reachable
+ * through more than one upstream (`anthropic.claude-sonnet-4-6` via Bedrock and
+ * `anthropic/claude-sonnet-4.6` via OpenRouter), which is the whole reason this
+ * cut is not answerable from `byModel`.
+ */
+function bucketByProvider(items: UsageRecordRow[]): CostByProviderRow[] {
+  const byProvider = new Map<string, CostByProviderRow>();
+  for (const item of items) {
+    const provider = item.provider || PROVIDER_UNRECORDED;
+    let bucket = byProvider.get(provider);
+    if (!bucket) {
+      bucket = { provider, ...zeroTotals() };
+      byProvider.set(provider, bucket);
+    }
+    addInto(bucket, item);
+  }
+  const rows = [...byProvider.values()];
+  rows.forEach(finalizeUsd);
+  rows.sort((a, b) => b.costMicroUsd - a.costMicroUsd || a.provider.localeCompare(b.provider));
   return rows;
 }
 
@@ -452,6 +498,9 @@ export async function getCostAggregation(
   // Headline cut: spend by model.
   const byModel = bucketByModel(items);
 
+  // Sibling cut: spend by upstream provider (ENG-1859).
+  const byProvider = bucketByProvider(items);
+
   // Time series: per (date, model) buckets.
   const seriesBuckets = new Map<string, CostSeriesRow>();
   for (const item of items) {
@@ -550,6 +599,7 @@ export async function getCostAggregation(
     end,
     totals,
     byModel,
+    byProvider,
     series,
     byFeature,
     topUsers,

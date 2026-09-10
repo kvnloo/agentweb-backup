@@ -18,6 +18,7 @@ import UsageCostByUserTab, {
   providerTotalIsUndercount,
   providerLabel,
   breakdownColumnLabel,
+  unattributedUserLabel,
   DEFAULT_PROVIDER,
   xAccountsFromFeatures,
   xAccountRows,
@@ -250,6 +251,19 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(breakdownColumnLabel("all")).toBe("Tool / model");
   });
 
+  it("names what an unattributed row actually is, rather than reporting a missing email", () => {
+    // One blank-looking string covered four different situations in production
+    // and hid the one that matters — `system` was the largest call count on the
+    // page (ENG-1858) and read like a data-quality nit.
+    expect(unattributedUserLabel("system")).toBe("System (unattributed)");
+    expect(unattributedUserLabel("anon_618cab1a-7923-4e58-b0a7-8f557a651d2a")).toBe("Anonymous session");
+    // Real production ids that are neither: a feature name and a test harness.
+    expect(unattributedUserLabel("workplans")).toBe("Unknown or unresolved user");
+    expect(unattributedUserLabel("eng1223-live-readonly-check")).toBe("Unknown or unresolved user");
+    // Never asserts a cause it has not established — "deleted" is a guess.
+    expect(unattributedUserLabel("7173e485-e9fd-4e06-bb57-955648309a72")).not.toMatch(/deleted/i);
+  });
+
   it("extracts per-X-account rollups from the feature dimension (handle null), skipping non-X features", () => {
     const accts = xAccountsFromFeatures(AGG.byFeature);
     expect(accts).toEqual([{ accountId: "acc-1", handle: null, costUsd: 0.3, callCount: 18 }]);
@@ -278,7 +292,8 @@ describe("UsageCostByUserTab rendering", () => {
     render(<UsageCostByUserTab />);
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
-    expect(screen.getByText("(no email on file)")).toBeInTheDocument();
+    // user-b has no email on the fixture; it renders as a classified label now.
+    expect(screen.getByText("Unknown or unresolved user")).toBeInTheDocument();
 
     await selectProvider("X (Twitter)");
 
