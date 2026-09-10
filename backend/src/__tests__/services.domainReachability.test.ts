@@ -11,6 +11,7 @@
 import {
   decideFromVerdict,
   probeDomain,
+  verdictForCode,
   UNREACHABLE_CONFIRMATIONS,
   type ReachabilityVerdict,
 } from "../services/domainReachabilityService";
@@ -61,6 +62,54 @@ describe("decideFromVerdict — a single blip must not reach the customer", () =
     const d = decideFromVerdict(definitive, 0);
     expect(d.nextStatus).toBe("error");
     expect(d.errorMessage).toMatch(/certificate does not cover/i);
+  });
+});
+
+/*
+ * ENG-1839. The SUSPECT/DEFINITIVE split is a safety boundary, and the test for membership is
+ * NOT "how conclusive does this error sound" but "could OUR OWN infrastructure manufacture it?"
+ *
+ * `decideFromVerdict` commits an `unreachable` verdict BEFORE consulting the threshold, so a
+ * definitive code fires on the first probe. Any code a prober-side fault can produce therefore
+ * has fleet-wide blast radius: one sweep under a TLS-intercepting proxy, a broken CA trust
+ * store, or forward clock skew would tell every customer in the product that their own site's
+ * certificate is untrusted — text that blames them for our fault.
+ *
+ * Nothing pinned this before, so moving a code between the two tables was a silent change.
+ */
+describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitive", () => {
+  const proberFaultCodes = [
+    ["CERT_HAS_EXPIRED", "forward clock skew expires every certificate at once"],
+    ["DEPTH_ZERO_SELF_SIGNED_CERT", "a TLS-intercepting egress proxy"],
+    ["SELF_SIGNED_CERT_IN_CHAIN", "a TLS-intercepting egress proxy"],
+    ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "a missing or broken CA trust store"],
+    ["ENOTFOUND", "an egress DNS outage"],
+    ["ECONNRESET", "any transient network fault"],
+    ["ETIMEDOUT", "a NAT or routing failure"],
+    ["EAI_AGAIN", "an egress DNS outage"],
+  ] as const;
+
+  it.each(proberFaultCodes)(
+    "%s is SUSPECT — reproducible by %s",
+    (code) => {
+      const verdict = verdictForCode(code);
+      expect(verdict.state).toBe("suspect");
+      // Must survive two rounds without telling the customer anything.
+      expect(decideFromVerdict(verdict, 0).nextStatus).toBeNull();
+      expect(decideFromVerdict(verdict, 1).nextStatus).toBeNull();
+    }
+  );
+
+  it("a hostname mismatch stays DEFINITIVE — our side cannot fabricate it", () => {
+    /*
+     * The one code that survives the test. A mismatch is a statement about what the REMOTE
+     * certificate contains: our clock cannot forge it, our trust store cannot forge it, and an
+     * intercepting proxy mints a certificate FOR the requested hostname, so interception
+     * surfaces as a trust-chain failure rather than this.
+     */
+    const verdict = verdictForCode("ERR_TLS_CERT_ALTNAME_INVALID");
+    expect(verdict.state).toBe("unreachable");
+    expect(decideFromVerdict(verdict, 0).nextStatus).toBe("error");
   });
 });
 

@@ -63,7 +63,15 @@ function attributesWritten(): string[] {
     const removed: string[] = (expr.match(/REMOVE\s+([a-zA-Z][a-zA-Z0-9]*)/g) ?? []).map(
       (m: string) => m.split(/\s+/)[1]
     );
-    return [...set, ...removed];
+    /*
+     * ExpressionAttributeNames is where a real attribute name hides. `SET #st = :v` with
+     * `{"#st": "status"}` writes `status` while the expression text says "st" — so parsing the
+     * expression alone would pass vacuously on exactly the regression this file exists to
+     * catch. (The historical bug did use `#status`, which the text scan happens to catch, but
+     * that is luck, not coverage.)
+     */
+    const aliased: string[] = Object.values(c[0].ExpressionAttributeNames ?? {}) as string[];
+    return [...set, ...removed, ...aliased];
   });
 }
 
@@ -123,6 +131,31 @@ describe("runDomainReachabilitySweep — persistence", () => {
     // unchecked and be re-selected forever.
     expect(summary.stillSuspect).toBe(1);
     expect(summary.markedUnhealthy).toBe(0);
+  });
+
+  it("commits the verdict once an ambiguous failure crosses the threshold", async () => {
+    /*
+     * The suspect→commit crossing, which nothing else pinned. The first test in this file looks
+     * like it covers this (it sets consecutiveFailures: 2) but mocks an `unreachable` verdict,
+     * which commits immediately and makes the prior count inert. Proof the gap was real:
+     * setting UNREACHABLE_CONFIRMATIONS to 999 — a total defeat of the monitor, since no
+     * ambiguous failure would ever be reported — left every other test in this file green.
+     */
+    mockScan.mockReset();
+    mockScan
+      .mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [{ ...DOMAIN, consecutiveFailures: 2 }] }),
+      })
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [PAGE] }) });
+    mockProbeDomain.mockResolvedValue({ state: "suspect", reason: "DNS did not resolve." });
+
+    const summary = await runDomainReachabilitySweep();
+
+    const call = mockUpdate.mock.calls[0][0];
+    expect(call.ExpressionAttributeValues[":reach"]).toBe("unreachable");
+    expect(call.ExpressionAttributeValues[":fails"]).toBe(3);
+    expect(attributesWritten()).not.toContain("status");
+    expect(summary.markedUnhealthy).toBe(1);
   });
 
   it("clears the stored error when a previously-unreachable domain recovers", async () => {
