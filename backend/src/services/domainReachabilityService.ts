@@ -29,8 +29,23 @@
  */
 import https from "https";
 
-/** Consecutive ambiguous failures before a domain is believed unreachable. */
-export const UNREACHABLE_CONFIRMATIONS = 3;
+/**
+ * Consecutive ambiguous failures before a domain is believed unreachable.
+ *
+ * TWO, paired with the daily sweep cadence — so a domain is reported after roughly two days of
+ * continuous failure. It was three while the sweep ran hourly, where three strikes bought only
+ * three hours of evidence and a single bad afternoon could produce them.
+ *
+ * Consecutive DAILY failures are much stronger evidence than consecutive hourly ones: two
+ * probes a full day apart cannot both be caught by the same transient incident, so a lower
+ * count buys more confidence here, not less. Raising it to three would only add a day of a
+ * customer staring at a page that does not load.
+ *
+ * The output is a passive banner in the customer's portal, not an alert — nothing pages anyone
+ * — so the cost of being a day late is a day of silence, and the cost of being wrong is a
+ * customer told their working site is broken. Two balances those.
+ */
+export const UNREACHABLE_CONFIRMATIONS = 2;
 /** Per-probe timeout. A hung socket must not accumulate. */
 export const PROBE_TIMEOUT_MS = 8000;
 
@@ -67,8 +82,6 @@ const SUSPECT: Record<string, string> = {
    * them is producible by a fault on OUR side and is indistinguishable from the remote cause at
    * the socket:
    *
-   *   CERT_HAS_EXPIRED               ← forward clock skew on the prober expires every
-   *                                    certificate on the internet simultaneously
    *   DEPTH_ZERO_SELF_SIGNED_CERT    ← a TLS-intercepting egress proxy
    *   SELF_SIGNED_CERT_IN_CHAIN      ← the same
    *   UNABLE_TO_VERIFY_LEAF_SIGNATURE ← a missing or broken CA trust store
@@ -80,9 +93,37 @@ const SUSPECT: Record<string, string> = {
    * that cries wolf gets tuned out, which is the same way the bug this service exists to catch
    * survived unnoticed in the first place.
    *
-   * The cost is real and accepted: a genuinely expired customer certificate now takes three
-   * hourly rounds to report instead of one. Against pages that sat broken for months, three
-   * hours is not the expensive direction to be wrong in.
+   * The cost is real and accepted: these failures now take UNREACHABLE_CONFIRMATIONS daily
+   * rounds to report rather than one probe. Against pages that sat broken for months — and
+   * against the alternative, which is accusing every customer at once when the fault is ours —
+   * that is not the expensive direction to be wrong in.
+   */
+  /*
+   * CERT_HAS_EXPIRED belongs HERE, not in DEFINITIVE, and the reason is not the one that
+   * first suggests itself.
+   *
+   * The clock-skew objection is genuinely dead: the sweep scans DynamoDB before probing, on an
+   * aws-sdk v2 client with `correctClockSkew` unset (default false), and SigV4 rejects a
+   * request >5 minutes off — so a prober skewed by days throws on the scan and never probes.
+   * That argument is sound, and it is also beside the point.
+   *
+   * The real reason is that this code is not a statement about the CUSTOMER's certificate.
+   * OpenSSL reports error 10 for ANY expired certificate in the built chain, at any depth.
+   * Verified locally: a leaf valid for another year, chained to a root that has expired,
+   * yields `error 10 at 1 depth lookup: certificate has expired`. So an expired root in Node's
+   * bundled store, in the OS ca-certificates package, or in an egress proxy's CA makes EVERY
+   * domain report expiry at once — with a correct clock. That is the DST Root CA X3 shape from
+   * 2021: valid leaves, browsers fine, OpenSSL saying expired.
+   *
+   * Which means it fails this module's own membership test — our trust store CAN manufacture
+   * it — and it is the same mechanism that keeps the three codes below suspect. It was briefly
+   * promoted to DEFINITIVE to cut reporting latency; that traded a bounded delay for a
+   * fleet-wide false accusation, which is the wrong direction.
+   *
+   * Distinguishing leaf expiry from chain expiry is possible but not free: on this error Node
+   * populates only `err.code` — no `err.cert` — so it needs `rejectUnauthorized: false` plus
+   * `socket.getPeerCertificate(true)` and our own validity comparison. Worth doing; not worth
+   * bundling into this change.
    */
   CERT_HAS_EXPIRED: "The SSL certificate has expired.",
   DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
@@ -134,8 +175,24 @@ export function probeDomain(
       }
     };
 
+    /*
+     * Identify ourselves. A header-less HEAD from an unknown IP is exactly the shape a WAF or
+     * bot-protection layer is built to refuse, and a 503 from Cloudflare counts as a failed
+     * probe here — so an anonymous prober can conclude that a perfectly healthy customer site
+     * is unreachable, and say so to its owner. A real User-Agent with a contact URL means an
+     * operator seeing this traffic can identify and allow it instead of blocking it.
+     */
     const req = https.request(
-      { host: domain, path: "/", method: "HEAD", timeout: timeoutMs },
+      {
+        host: domain,
+        path: "/",
+        method: "HEAD",
+        timeout: timeoutMs,
+        headers: {
+          "User-Agent": "AgentWeb-DomainMonitor/1.0 (+https://agentweb.pro; uptime check)",
+          Accept: "*/*",
+        },
+      },
       (res) => {
         const status = res.statusCode ?? 0;
         res.resume(); // drain so the socket can be released

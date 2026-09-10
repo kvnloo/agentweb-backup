@@ -54,7 +54,27 @@ async function scanAll(table: string): Promise<any[]> {
  *
  * Pure and exported so the scoping rule is testable without AWS.
  */
-export function selectDomainsToProbe(domains: any[], pages: any[]): any[] {
+/**
+ * How recently a domain must have been checked for this sweep to skip it.
+ *
+ * Slightly under the 24h cadence so a run that fires a few minutes early — clock drift, a
+ * restart, a slow previous sweep — does not skip a whole day.
+ */
+export const MIN_RECHECK_INTERVAL_MS = 20 * 60 * 60 * 1000;
+
+/**
+ * How often the sweep runs. Declared HERE, not in server.ts, so the detection-latency test can
+ * derive the real cadence rather than hand-copying it — a copied literal keeps the promise
+ * "reported within 2 days" green while the schedule silently moves to weekly.
+ */
+export const REACHABILITY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+export function selectDomainsToProbe(
+  domains: any[],
+  pages: any[],
+  now: number = Date.now(),
+  minRecheckMs: number = MIN_RECHECK_INTERVAL_MS
+): any[] {
   const deployedHosts = new Set<string>();
   // Deployed pages that store NO url. Their working URL comes from the domain row itself
   // (assignManagedSubdomain persists the page url in a separate write that can fail), so
@@ -78,11 +98,53 @@ export function selectDomainsToProbe(domains: any[], pages: any[]): any[] {
   return domains.filter(
     (d) =>
       d.domain &&
+      /*
+       * Already checked within this period → skip. This makes the sweep safe to run more than
+       * once per period. It is NOT a substitute for a lock, and the difference matters:
+       *
+       *   It does nothing for instances sweeping SIMULTANEOUSLY — both scan before either
+       *   writes, so both see the same stale timestamps and both probe. (The MULTI-INSTANCE
+       *   bullet below is about the STAGGERED case, minutes apart, which is the one the guard
+       *   does prevent. Simultaneous and staggered fail differently: staggered double-counts,
+       *   simultaneous does not.) Moving to a fixed
+       *   06:15 UTC schedule (see server.ts) actually makes simultaneous the normal case,
+       *   where boot-relative scheduling used to stagger instances naturally. What saves us
+       *   there is that `consecutiveFailures` is read-then-set: two instances both read the
+       *   same prior and both write prior+1, so the lost update cancels the double-count and
+       *   the counter stays correct. The residual harm is duplicate probe traffic to customer
+       *   origins — the very thing the daily cadence was chosen to reduce — and duplicate
+       *   writes. Real coordination is still owed if this environment ever scales out.
+       *
+       * What the guard does cover:
+       *
+       *   - MULTI-INSTANCE. The cron is an in-process interval, so every instance runs its
+       *     own. `consecutiveFailures` is read-then-set, not an atomic ADD, so two instances
+       *     firing minutes apart would advance a domain's counter twice in one period and trip
+       *     the confirmation threshold early — telling a customer their site is down on the
+       *     strength of fewer real days of failure than the threshold claims.
+       *   - RESTARTS. A deploy or crash-loop restarts the timer; without this, each restart
+       *     re-probes every domain. That was previously papered over with a 10-minute boot
+       *     delay, which only narrowed the window.
+       *   - PARTIAL SWEEPS. If a sweep dies halfway, the domains it never stamped are still
+       *     due, so the next run picks up exactly the remainder. Self-healing, no lease to
+       *     expire or leak.
+       *
+       * A missing timestamp means never checked, which is always due.
+       */
+      (() => {
+        const last = d.lastReachabilityCheckAt ? Date.parse(d.lastReachabilityCheckAt) : NaN;
+        // A FUTURE timestamp means the stored value is wrong, not that the domain was checked.
+        // Without `last > now` the subtraction goes negative and the domain is skipped until
+        // wall-clock catches up — one bad write from a skewed clock silently retires it from
+        // monitoring for as long as the skew, with no log and no error: `targets` just gets
+        // shorter. Silence mistaken for health is the exact failure this monitor exists to end.
+        return Number.isNaN(last) || last > now || now - last >= minRecheckMs;
+      })() &&
       // Only domains Vercel considers verified. A custom domain sitting at
       // `pending_verification` because the customer has not pointed DNS yet WILL fail a probe,
       // and that failure is expected — the same reasoning that excludes not-yet-deployed pages.
-      // Without this, a normal domain-setup flow shows "this page may not be reachable" three
-      // hours in. Managed subdomains are written `status: "active"` unconditionally by
+      // Without this, a normal domain-setup flow shows "this page may not be reachable" a
+      // couple of days in. Managed subdomains are written `status: "active"` unconditionally by
       // addSubdomain, so this excludes nothing this ticket is about.
       d.status === "active" &&
       (deployedHosts.has(d.domain) ||
@@ -119,16 +181,17 @@ async function mapLimit<T, R>(
  *
  * Not fixed here, deliberately, because the blast radius is bounded by the SUSPECT/DEFINITIVE
  * split: every failure a prober-side fault can produce is classified SUSPECT, so nothing
- * reaches a customer until THREE consecutive hourly rounds have failed. A transient outage
- * self-heals long before that, and a three-hour total egress failure is an incident someone is
- * already looking at.
+ * reaches a customer until UNREACHABLE_CONFIRMATIONS consecutive daily rounds have failed. A
+ * transient outage self-heals long before that, and a multi-day total egress failure is an
+ * incident someone is already looking at.
  *
- * That bound is only true because the certificate trust/validity codes were MOVED to SUSPECT
- * (see domainReachabilityService.ts). While they were definitive it was false — and false in
- * the worst direction, since `decideFromVerdict` commits an unreachable verdict before the
- * threshold is consulted. One round under an intercepting proxy, a broken CA store, or forward
- * clock skew would have told the entire customer base their own certificates were untrusted.
- * If a code is ever promoted back to DEFINITIVE, this paragraph stops being true with it.
+ * That bound holds only while the certificate trust/validity codes stay SUSPECT (see
+ * domainReachabilityService.ts) — `decideFromVerdict` commits an unreachable verdict BEFORE
+ * consulting the threshold, so a single definitive code bypasses this bound entirely. One round
+ * under an intercepting proxy, a broken CA store, or an expired root anywhere in the chain
+ * would otherwise tell the entire customer base their own certificates are bad. Promoting any
+ * of those codes back to DEFINITIVE invalidates this paragraph — and that has already been
+ * tried once with CERT_HAS_EXPIRED and reverted, so read that entry before trying again.
  *
  * The real fix is a batch-level guard: if a sweep's failure ratio exceeds ~50%, treat the
  * prober as suspect and skip persisting verdicts for that round. It needs a two-phase
@@ -150,7 +213,8 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
 
   const targets = selectDomainsToProbe(domains, pages);
   console.log(
-    `[DomainReachability] ${targets.length} of ${domains.length} domain(s) back a deployed page`
+    `[DomainReachability] ${targets.length} of ${domains.length} domain(s) due this run ` +
+      `(in scope and not checked within ${Math.round(MIN_RECHECK_INTERVAL_MS / 3600000)}h)`
   );
 
   await mapLimit(targets, SWEEP_CONCURRENCY, async (rec) => {

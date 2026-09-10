@@ -15,6 +15,7 @@ import {
   UNREACHABLE_CONFIRMATIONS,
   type ReachabilityVerdict,
 } from "../services/domainReachabilityService";
+import { REACHABILITY_INTERVAL_MS } from "../cron/domainReachabilityCron";
 
 const reachable: ReachabilityVerdict = { state: "reachable", httpStatus: 200 };
 const suspect: ReachabilityVerdict = {
@@ -77,9 +78,42 @@ describe("decideFromVerdict — a single blip must not reach the customer", () =
  *
  * Nothing pinned this before, so moving a code between the two tables was a silent change.
  */
+/*
+ * Pins the VALUE, not just the mechanism.
+ *
+ * Every other threshold test here is written relative to UNREACHABLE_CONFIRMATIONS so it does
+ * not break when the number changes — which is right, but it means they all stay green at
+ * `999`, a setting under which no ambiguous failure is ever reported and the monitor is
+ * silently dead. A relative test cannot catch a defeated monitor; only an absolute bound can.
+ *
+ * The bound is a product decision, not an implementation detail: the sweep runs DAILY, and a
+ * customer whose page has stopped serving should be told within about two days. Confirmations
+ * multiplied by cadence is that promise, so it is asserted directly.
+ */
+describe("detection latency — the monitor must actually report", () => {
+  /*
+   * DERIVED from the scheduler's own constant, never hand-copied. A literal here would keep
+   * this test — and the promise it encodes — green while the cron quietly moved to weekly,
+   * which is the same drift that let the threshold tests stay green at 999.
+   */
+  const SWEEP_INTERVAL_DAYS = REACHABILITY_INTERVAL_MS / (24 * 60 * 60 * 1000);
+  const MAX_ACCEPTABLE_DAYS = 2;
+
+  it("confirms an unreachable domain within the agreed window", () => {
+    expect(UNREACHABLE_CONFIRMATIONS).toBeGreaterThanOrEqual(2); // one blip must never be enough
+    expect(UNREACHABLE_CONFIRMATIONS * SWEEP_INTERVAL_DAYS).toBeLessThanOrEqual(MAX_ACCEPTABLE_DAYS);
+  });
+
+  it("keeps the first failure silent", () => {
+    // The whole point of a threshold: a single bad probe never reaches the customer.
+    const suspectVerdict = verdictForCode("ECONNRESET");
+    expect(decideFromVerdict(suspectVerdict, 0).nextStatus).toBeNull();
+  });
+});
+
 describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitive", () => {
   const proberFaultCodes = [
-    ["CERT_HAS_EXPIRED", "forward clock skew expires every certificate at once"],
+    ["CERT_HAS_EXPIRED", "an expired root or intermediate ANYWHERE in the chain, including ours"],
     ["DEPTH_ZERO_SELF_SIGNED_CERT", "a TLS-intercepting egress proxy"],
     ["SELF_SIGNED_CERT_IN_CHAIN", "a TLS-intercepting egress proxy"],
     ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "a missing or broken CA trust store"],
@@ -94,23 +128,43 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
     (code) => {
       const verdict = verdictForCode(code);
       expect(verdict.state).toBe("suspect");
-      // Must survive two rounds without telling the customer anything.
-      expect(decideFromVerdict(verdict, 0).nextStatus).toBeNull();
-      expect(decideFromVerdict(verdict, 1).nextStatus).toBeNull();
+      /*
+       * Expressed relative to the threshold, not against a hardcoded count. Written as
+       * `(verdict, 1)` this asserted "still silent after two failures", which was true at a
+       * threshold of 3 and became false the moment it moved to 2 — a test that reads as a
+       * safety property but is really pinning the old constant.
+       */
+      for (let prior = 0; prior < UNREACHABLE_CONFIRMATIONS - 1; prior++) {
+        expect(decideFromVerdict(verdict, prior).nextStatus).toBeNull();
+      }
+      // ...and only the final consecutive failure commits it.
+      expect(decideFromVerdict(verdict, UNREACHABLE_CONFIRMATIONS - 1).nextStatus).toBe("error");
     }
   );
 
-  it("a hostname mismatch stays DEFINITIVE — our side cannot fabricate it", () => {
+  it.each([
+    ["ERR_TLS_CERT_ALTNAME_INVALID", "a mismatch describes what the REMOTE certificate contains"],
+  ])("%s is DEFINITIVE — %s", (code) => {
     /*
-     * The one code that survives the test. A mismatch is a statement about what the REMOTE
-     * certificate contains: our clock cannot forge it, our trust store cannot forge it, and an
-     * intercepting proxy mints a certificate FOR the requested hostname, so interception
-     * surfaces as a trust-chain failure rather than this.
+     * Reported on the FIRST probe, with no confirmation wait — which is why membership here is
+     * a safety decision, not a confidence one.
+     *
+     * A hostname mismatch is the only code that qualifies: it describes what the REMOTE
+     * certificate CONTAINS. Our clock cannot forge it, our trust store cannot forge it, and an
+     * intercepting proxy mints a certificate FOR the hostname it was asked for, so interception
+     * surfaces as a trust-chain failure instead.
+     *
+     * `CERT_HAS_EXPIRED` deliberately does NOT belong here, and this test is the place someone
+     * will look before trying to add it. It was promoted once and reverted: OpenSSL reports it
+     * for ANY expired certificate in the chain at any depth, so an expired root in our own
+     * trust store makes every domain report expiry at once, on the first probe. See the
+     * CERT_HAS_EXPIRED entry in domainReachabilityService.ts before touching this.
      */
-    const verdict = verdictForCode("ERR_TLS_CERT_ALTNAME_INVALID");
+    const verdict = verdictForCode(code);
     expect(verdict.state).toBe("unreachable");
     expect(decideFromVerdict(verdict, 0).nextStatus).toBe("error");
   });
+
 });
 
 describe("probeDomain — classification", () => {

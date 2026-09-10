@@ -35,9 +35,15 @@ const mockProbeDomain = jest.fn();
 jest.mock("../services/domainReachabilityService", () => ({
   probeDomain: (...a: unknown[]) => mockProbeDomain(...a),
   decideFromVerdict: jest.requireActual("../services/domainReachabilityService").decideFromVerdict,
+  // Must be re-exported: this module is mocked, so anything omitted here imports as `undefined`
+  // in the test — and `undefined - 1` is NaN, which silently fails every threshold comparison
+  // rather than erroring.
+  UNREACHABLE_CONFIRMATIONS: jest.requireActual("../services/domainReachabilityService")
+    .UNREACHABLE_CONFIRMATIONS,
 }));
 
 import { runDomainReachabilitySweep } from "../cron/domainReachabilityCron";
+import { UNREACHABLE_CONFIRMATIONS } from "../services/domainReachabilityService";
 
 const DOMAIN = {
   id: "dom-1",
@@ -144,7 +150,13 @@ describe("runDomainReachabilitySweep — persistence", () => {
     mockScan.mockReset();
     mockScan
       .mockReturnValueOnce({
-        promise: () => Promise.resolve({ Items: [{ ...DOMAIN, consecutiveFailures: 2 }] }),
+        promise: () =>
+          Promise.resolve({
+            // One short of the threshold, expressed relative to it — a hardcoded count would
+            // silently stop testing the CROSSING the moment the threshold changed, which is
+            // exactly what happened when the sweep moved from hourly/3 to daily/2.
+            Items: [{ ...DOMAIN, consecutiveFailures: UNREACHABLE_CONFIRMATIONS - 1 }],
+          }),
       })
       .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [PAGE] }) });
     mockProbeDomain.mockResolvedValue({ state: "suspect", reason: "DNS did not resolve." });
@@ -153,7 +165,7 @@ describe("runDomainReachabilitySweep — persistence", () => {
 
     const call = mockUpdate.mock.calls[0][0];
     expect(call.ExpressionAttributeValues[":reach"]).toBe("unreachable");
-    expect(call.ExpressionAttributeValues[":fails"]).toBe(3);
+    expect(call.ExpressionAttributeValues[":fails"]).toBe(UNREACHABLE_CONFIRMATIONS);
     expect(attributesWritten()).not.toContain("status");
     expect(summary.markedUnhealthy).toBe(1);
   });

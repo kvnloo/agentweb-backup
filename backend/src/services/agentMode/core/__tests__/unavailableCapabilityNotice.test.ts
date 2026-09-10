@@ -250,10 +250,35 @@ describe('buildUnavailableCapabilityNotice — the installer is never the missin
     'These skills are currently unavailable to install: __admin_tools__. This requires admin '
     + 'access — a role restriction, not a billing limit and not a temporary fault.';
 
+  /*
+   * These four are the ones that keep the guard load-bearing. install_skills' OWN refusals now
+   * classify `skill_install_refused` and never reach this filter — but a gateway policy block,
+   * the repeated-failure breaker, an excludeTools removal and a timeout all still classify
+   * `tool_unavailable`, because the classifier matches the bare tool name inside the message.
+   * Without the guard, any of them names install_skills in a banner as a capability that "did
+   * not run".
+   */
+  it.each([
+    ['gateway policy block', 'Tool "install_skills" is blocked by policy for this session.'],
+    ['repeated-failure breaker', 'install_skills exceeded its repeated-failure budget for this run.'],
+    ['excludeTools removal', 'Tool "install_skills" is not available in this context.'],
+    ['gateway policy', 'install_skills was blocked by Agent Tool Gateway policy: session limit.'],
+    ['timeout', 'install_skills timed out after 30000ms'],
+  ])('does not announce install_skills itself as unavailable (%s)', (_label, err) => {
+    expect(buildUnavailableCapabilityNotice([{ name: 'install_skills', error: err }])).toBeNull();
+  });
+
+  /*
+   * These two no longer exercise the guard: since ENG-1795 gave install refusals their own
+   * class, they classify `skill_install_refused` and are filtered out before it. Kept because
+   * the OUTCOME is the contract — an install refusal must never produce this banner — and they
+   * would catch a future re-route back to `tool_unavailable`. They document the outcome, not
+   * the mechanism; the four cases above are what pin the guard itself.
+   */
   it.each([
     ['unavailable', UNAVAILABLE_REFUSAL],
     ['forbidden', FORBIDDEN_REFUSAL],
-  ])('does not announce install_skills itself as unavailable (%s refusal)', (_label, refusal) => {
+  ])('an install refusal never produces the banner (%s)', (_label, refusal) => {
     /*
      * install_skills DID run — it ran and refused, with a reason. Naming it here tells the user
      * a tool was unavailable when the truth is the opposite, and prepends that claim above an

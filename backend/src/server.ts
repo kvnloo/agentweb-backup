@@ -669,16 +669,36 @@ createTestAccount().then(async () => {
       // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
       // Three landing pages sat unreachable while every record read healthy, one of them
       // unreported for months, because nothing ever asked whether the site loads.
-      //
-      // Hourly, not daily: a page that stops serving should surface the same working day, and
-      // a run of consecutive failures is what promotes a "suspect" domain to unhealthy — at a
-      // daily cadence that confirmation would take three days.
       try {
-        const REACHABILITY_INTERVAL_MS = 60 * 60 * 1000;
-        const { runDomainReachabilitySweep } = await import('./cron/domainReachabilityCron');
+        const { runDomainReachabilitySweep, REACHABILITY_INTERVAL_MS } =
+          await import('./cron/domainReachabilityCron');
 
-        // Deliberately not run at boot: a deploy restarts instances, and probing every domain
-        // on every restart is both noisy and a way to accumulate failures during a rollout.
+        /*
+         * DAILY at a fixed UTC time, not hourly-from-boot.
+         *
+         * Hourly meant we made an unsolicited HTTPS request to every customer's domain 24
+         * times a day. That is traffic they did not ask for, against their origin, and a WAF
+         * or bot-protection layer is entitled to start refusing it — at which point we would
+         * confidently report a working site as unreachable. Daily is enough: these are static
+         * landing pages, and the failure this watches for (a certificate that can never be
+         * issued) does not come and go.
+         *
+         * Fixed clock time rather than boot+offset, matching every other cron here. Under
+         * boot-relative scheduling the schedule reshuffles on every deploy, so "hourly" really
+         * meant "whenever this instance happened to start, then every hour after that" — which
+         * is neither predictable nor reproducible when reading the timestamps back.
+         */
+        const nowForReach = new Date();
+        const nextReachRun = new Date(nowForReach);
+        nextReachRun.setUTCHours(6, 15, 0, 0);
+        if (nextReachRun <= nowForReach) {
+          nextReachRun.setUTCDate(nextReachRun.getUTCDate() + 1);
+        }
+        const msUntilReach = nextReachRun.getTime() - nowForReach.getTime();
+
+        console.log(
+          `[DomainReachability] Initialized — first sweep at 06:15 UTC (in ${Math.round(msUntilReach / 60000)} min), then daily`,
+        );
         setTimeout(() => {
           if (!isCronEnabled()) return;
           cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
@@ -688,8 +708,7 @@ createTestAccount().then(async () => {
             cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
               .catch(e => console.error('[DomainReachability] Error:', e));
           }, REACHABILITY_INTERVAL_MS);
-        }, 10 * 60 * 1000);
-        console.log('[DomainReachability] Initialized — first sweep in 10 min, then hourly');
+        }, msUntilReach);
       } catch (error) {
         console.error('[DomainReachability] Failed to initialize:', error);
       }
