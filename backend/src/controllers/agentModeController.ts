@@ -1481,6 +1481,17 @@ async function scheduleAutoMediaContinuation(
 // error/timeout returns `false` (do NOT suppress), preserving ENG-1684's original guarantee
 // that a stalled autocomplete plan always gets its continuation even if this classifier
 // itself is broken.
+//
+// Deliberately reads with EVENTUAL consistency (does not pass consistentRead: true to
+// getMostRecentRealUserMessage), same reasoning as the pre-fire recheck's plain
+// getChatSessionRecord read a few lines below in scheduleAutoWorkPlanContinuation: by the
+// time this runs, the "stop" message being looked for was written by THIS SAME request's
+// own earlier, already-completed turn-processing step, not a concurrent write racing this
+// read — several real async operations (the LLM call, tool execution, response persistence)
+// separate the write from this check, which is itself deferred another tick via
+// setImmediate. A stale read here would, worst case, cost one harmless extra continuation
+// round before self-correcting on the next round's fresh check — not a silent, permanent
+// failure to ever honor the stop.
 const STOP_REQUEST_JUDGE_MODEL = 'gemini-3.1-flash-lite';
 const STOP_REQUEST_JUDGE_TIMEOUT_MS = 8000;
 const STOP_REQUEST_JUDGE_SYSTEM = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
