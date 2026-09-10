@@ -425,4 +425,30 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(minimalResult.plan).toBeUndefined();
     });
   });
+
+  // ENG-1720: the de-dupe outcome must survive the minimizer, or the requirement
+  // verdict cannot tell a skipped send from a delivered one. linkedin_outreach has
+  // no general branch, so anything not named here becomes the `{}` default — and a
+  // `{}` result reads as SUCCESS to toolCallSucceeded (no error, no success:false).
+  // That is how a run which contacted nobody stored passed:true / { actual: 2 }.
+  describe('linkedin_outreach de-duplicated send (ENG-1720)', () => {
+    it('preserves alreadyInvited so a skipped send is not scored as a delivery', () => {
+      const result = {
+        success: true,
+        alreadyInvited: true,
+        message: 'A LinkedIn connection invitation is already pending for this profile. Skipped to avoid a duplicate — no invite quota was used.',
+        data: { alreadyInvited: true, sentAt: '2026-09-09T13:32:45.644Z' },
+      };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal.alreadyInvited).toBe(true);
+      expect(minimal.success).toBe(true);
+    });
+
+    it('a real delivery is NOT marked alreadyInvited', () => {
+      const result = { success: true, data: { invitationId: '7503444979126583297' } };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal?.alreadyInvited).toBeFalsy();
+    });
+  });
+
 });
