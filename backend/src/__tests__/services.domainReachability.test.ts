@@ -15,6 +15,7 @@ import {
   UNREACHABLE_CONFIRMATIONS,
   type ReachabilityVerdict,
 } from "../services/domainReachabilityService";
+import { REACHABILITY_INTERVAL_MS } from "../cron/domainReachabilityCron";
 
 const reachable: ReachabilityVerdict = { state: "reachable", httpStatus: 200 };
 const suspect: ReachabilityVerdict = {
@@ -90,7 +91,12 @@ describe("decideFromVerdict — a single blip must not reach the customer", () =
  * multiplied by cadence is that promise, so it is asserted directly.
  */
 describe("detection latency — the monitor must actually report", () => {
-  const SWEEP_INTERVAL_DAYS = 1; // server.ts schedules this daily at 06:15 UTC
+  /*
+   * DERIVED from the scheduler's own constant, never hand-copied. A literal here would keep
+   * this test — and the promise it encodes — green while the cron quietly moved to weekly,
+   * which is the same drift that let the threshold tests stay green at 999.
+   */
+  const SWEEP_INTERVAL_DAYS = REACHABILITY_INTERVAL_MS / (24 * 60 * 60 * 1000);
   const MAX_ACCEPTABLE_DAYS = 2;
 
   it("confirms an unreachable domain within the agreed window", () => {
@@ -107,7 +113,6 @@ describe("detection latency — the monitor must actually report", () => {
 
 describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitive", () => {
   const proberFaultCodes = [
-    ["CERT_HAS_EXPIRED", "forward clock skew expires every certificate at once"],
     ["DEPTH_ZERO_SELF_SIGNED_CERT", "a TLS-intercepting egress proxy"],
     ["SELF_SIGNED_CERT_IN_CHAIN", "a TLS-intercepting egress proxy"],
     ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "a missing or broken CA trust store"],
@@ -135,6 +140,25 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
       expect(decideFromVerdict(verdict, UNREACHABLE_CONFIRMATIONS - 1).nextStatus).toBe("error");
     }
   );
+
+  it.each([
+    ["ERR_TLS_CERT_ALTNAME_INVALID", "a mismatch describes what the REMOTE certificate contains"],
+    ["CERT_HAS_EXPIRED", "SigV4 rejects the skew needed to fake it before any probe runs"],
+  ])("%s is DEFINITIVE — %s", (code) => {
+    /*
+     * Reported on the FIRST probe, no confirmation wait. Expiry belongs here despite looking
+     * like a clock-dependent judgement: the sweep scans DynamoDB before probing, aws-sdk v2
+     * leaves `correctClockSkew` false, and SigV4 refuses a request >5 minutes off — so a
+     * prober skewed by days throws on the scan and never probes. Skew under 5 minutes can only
+     * expire a cert already within 5 minutes of expiring.
+     *
+     * It was briefly SUSPECT, which combined with the daily sweep to put a two-day delay on an
+     * unambiguous failure whose visitors are already seeing a full-page browser interstitial.
+     */
+    const verdict = verdictForCode(code);
+    expect(verdict.state).toBe("unreachable");
+    expect(decideFromVerdict(verdict, 0).nextStatus).toBe("error");
+  });
 
   it("a hostname mismatch stays DEFINITIVE — our side cannot fabricate it", () => {
     /*

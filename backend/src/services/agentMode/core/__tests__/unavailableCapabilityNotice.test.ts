@@ -250,6 +250,23 @@ describe('buildUnavailableCapabilityNotice — the installer is never the missin
     'These skills are currently unavailable to install: __admin_tools__. This requires admin '
     + 'access — a role restriction, not a billing limit and not a temporary fault.';
 
+  /*
+   * These four are the ones that keep the guard load-bearing. install_skills' OWN refusals now
+   * classify `skill_install_refused` and never reach this filter — but a gateway policy block,
+   * the repeated-failure breaker, an excludeTools removal and a timeout all still classify
+   * `tool_unavailable`, because the classifier matches the bare tool name inside the message.
+   * Without the guard, any of them names install_skills in a banner as a capability that "did
+   * not run".
+   */
+  it.each([
+    ['gateway policy block', 'Tool "install_skills" is blocked by policy for this session.'],
+    ['repeated-failure breaker', 'install_skills exceeded its repeated-failure budget for this run.'],
+    ['excludeTools removal', 'Tool "install_skills" is not available. You must install the required skill first using install_skills.'],
+    ['timeout', 'install_skills timed out after 30000ms'],
+  ])('does not announce install_skills itself as unavailable (%s)', (_label, err) => {
+    expect(buildUnavailableCapabilityNotice([{ name: 'install_skills', error: err }])).toBeNull();
+  });
+
   it.each([
     ['unavailable', UNAVAILABLE_REFUSAL],
     ['forbidden', FORBIDDEN_REFUSAL],

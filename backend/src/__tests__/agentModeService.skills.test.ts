@@ -57,7 +57,8 @@ jest.mock('../mcp/client/toolRegistry', () => ({
 // Import the mocked modules to access the mock functions
 import { skillService } from '../services/skillService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
-import { retryabilityLine } from '../services/agentMode/core/errorRetryability';
+import { retryabilityLine, isFastTripErrorClass } from '../services/agentMode/core/errorRetryability';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 import { chatbotDb } from '../services/chatbotService';
 
 
@@ -225,8 +226,25 @@ describe('AgentModeService - Skills', () => {
 
         const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
 
-        expect(classifyToolErrorClass(new Error(result.message))).toBe('tool_unavailable');
-        expect(retryabilityLine('tool_unavailable')).toMatch(/do not present another tool's output/i);
+        const cls = classifyToolErrorClass(new Error(result.message));
+        expect(cls).toBe('skill_install_refused');
+
+        /*
+         * The class is not cosmetic — toolDispatch appends `retryabilityLine(cls)` directly
+         * beneath this message, so its text is read by the model as the verdict. Assert the
+         * PROPERTIES that matter rather than the wording, so a future rephrase does not have
+         * to touch this test but a semantic regression does:
+         */
+        const line = retryabilityLine(cls);
+        expect(line).toMatch(/do not substitute another tool's output/i);   // the ENG-1625 guard
+        expect(line).not.toMatch(/the call succeeded/i);                    // it did not
+        expect(line).not.toMatch(/try a different source/i);                // that IS substitution
+        expect(line).not.toMatch(/install the required skill via install_skills/i); // circular here
+        expect(line).not.toMatch(/not available in this session/i);         // install_skills ran
+
+        // And it must stay in the investigate bucket: `unavailable` IS the ENG-1237 catalog bug.
+        expect(classifyToolFailureType(cls)).toBe('bug');
+        expect(isFastTripErrorClass(cls)).toBe(true);
       });
 
       it('does not let a hallucinated skill ID hijack the error class', async () => {

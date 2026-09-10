@@ -128,6 +128,22 @@ describe("selectDomainsToProbe — recheck interval", () => {
     expect(selectDomainsToProbe([at(MIN_RECHECK_INTERVAL_MS + 1000)], deployedPages, NOW)).toHaveLength(1);
   });
 
+  it("treats a FUTURE timestamp as due, not as recently checked", () => {
+    /*
+     * `now - last` goes negative for a future timestamp, so a bare `>= minRecheckMs` skipped
+     * the domain until wall-clock caught up. One write from a forward-skewed clock could
+     * therefore retire a domain from monitoring for days — with no log and no error, just a
+     * shorter `targets` list. Silence read as health is the precise failure this monitor
+     * exists to end, so the guard must never manufacture it.
+     */
+    for (const msAhead of [60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000, 365 * 24 * 60 * 60 * 1000]) {
+      const future = dom("d1", "a.agentwebforms.com", {
+        lastReachabilityCheckAt: new Date(NOW + msAhead).toISOString(),
+      });
+      expect(selectDomainsToProbe([future], deployedPages, NOW)).toHaveLength(1);
+    }
+  });
+
   it("treats an unparseable timestamp as never checked rather than skipping forever", () => {
     // Failing open matters: skipping on a bad value would silently retire a domain from
     // monitoring with no error anywhere.
