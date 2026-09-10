@@ -31,6 +31,7 @@ import {
   getXAllocatedTotals,
   currentXBillingCycle,
   getUserXBreakdown,
+  PROVIDER_UNRECORDED,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -420,6 +421,51 @@ describe('usageAnalyticsService', () => {
       expect(agg.availableProviders).toContain('newvendor');
     });
 
+    // ── byProvider: spend by upstream (ENG-1859) ────────────────────────────
+
+    it('groups LLM spend by the provider that served it', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-opus-5', provider: 'bedrock', costMicroUsd: 3_000_000 }),
+        aggRow({ model: 'anthropic.claude-sonnet-5', provider: 'bedrock', costMicroUsd: 1_000_000 }),
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 500_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(agg.byProvider.map((p) => [p.provider, p.costUsd])).toEqual([
+        ['bedrock', 4],
+        ['gemini', 0.5],
+      ]);
+      // The cut must reconcile with the headline, or it is worse than absent.
+      expect(agg.byProvider.reduce((t, p) => t + p.costMicroUsd, 0)).toBe(agg.totals.costMicroUsd);
+    });
+
+    it('separates the same model served through two different providers', async () => {
+      // The reason this cut cannot be derived from byModel: one model, two
+      // upstreams, two different costs to us.
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'anthropic.claude-sonnet-4-6', provider: 'bedrock', costMicroUsd: 2_000_000 }),
+        aggRow({ model: 'anthropic/claude-sonnet-4.6', provider: 'openrouter', costMicroUsd: 700_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+      expect(agg.byProvider.map((p) => p.provider)).toEqual(['bedrock', 'openrouter']);
+    });
+
+    it('buckets pre-ENG-693 rows as unrecorded rather than inventing a provider', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ model: 'gpt-5-chat-2', costMicroUsd: 1_000_000 }), // no provider attribute
+        aggRow({ model: 'gemini-3.5-flash', provider: 'gemini', costMicroUsd: 500_000 }),
+      ]);
+
+      const agg = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      const unrecorded = agg.byProvider.find((p) => p.provider === PROVIDER_UNRECORDED);
+      expect(unrecorded?.costUsd).toBe(1);
+      // Not attributed to a provider, and not dropped — the rows still sum.
+      expect(agg.byProvider.reduce((t, p) => t + p.costMicroUsd, 0)).toBe(agg.totals.costMicroUsd);
+    });
+
     it('excludes LLM providers, which also carry a `provider` since ENG-693', async () => {
       mockGetAccountById.mockResolvedValue(null);
       mockScan.mockResolvedValue([
@@ -749,6 +795,7 @@ describe('usageAnalyticsService', () => {
           costUsd: 0,
         },
         byModel: [],
+        byProvider: [],
         series: [],
         byFeature: [],
         topUsers: [],

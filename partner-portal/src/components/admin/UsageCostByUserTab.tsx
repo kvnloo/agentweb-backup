@@ -340,6 +340,26 @@ export function providerLabel(p: string): string {
   return PROVIDER_LABELS[p] ?? p;
 }
 
+/**
+ * What a ledger row's user actually is when it has no email (ENG-1860).
+ *
+ * `(no email on file)` collapsed four genuinely different situations into one
+ * blank-looking string, and hid the one that matters: `system` is the single
+ * largest call count on the page — 29% of metered calls in the window checked
+ * on 2026-09-10 — and read like a data-quality nit rather than an attribution
+ * gap ([[ENG-1858]]).
+ *
+ * Classified on the id's SHAPE, so it costs no extra lookup. The raw id keeps
+ * rendering beneath the label either way.
+ */
+export function unattributedUserLabel(userId: string): string {
+  if (userId === "system") return "System (unattributed)";
+  if (userId.startsWith("anon_")) return "Anonymous session";
+  // Deliberately not "deleted": we know the lookup missed, not why. Asserting a
+  // cause we have not established would be a different kind of wrong.
+  return "Unknown or unresolved user";
+}
+
 /** Header for the drill-down's first column. A vendor row is a TOOL, not a
  *  model — labelling it "Model" is the mis-read ENG-1519 was filed for. */
 export function breakdownColumnLabel(provider: string): string {
@@ -368,7 +388,9 @@ const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string 
         </TableCell>
         <TableCell>{rank}</TableCell>
         <TableCell>
-          <Typography variant="body2">{row.email || "(no email on file)"}</Typography>
+          <Typography variant="body2" color={row.email ? undefined : "text.secondary"}>
+            {row.email || unattributedUserLabel(row.userId)}
+          </Typography>
           <Typography variant="caption" color="text.secondary">
             {row.userId}
           </Typography>
