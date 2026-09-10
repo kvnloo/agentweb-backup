@@ -57,6 +57,7 @@ jest.mock('../mcp/client/toolRegistry', () => ({
 // Import the mocked modules to access the mock functions
 import { skillService } from '../services/skillService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { retryabilityLine } from '../services/agentMode/core/errorRetryability';
 import { chatbotDb } from '../services/chatbotService';
 
 
@@ -181,7 +182,18 @@ describe('AgentModeService - Skills', () => {
       });
 
       it('makes no billing claim when the catalog lookup itself fails', async () => {
-        (skillService.getPublishedSkills as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+        /*
+         * The FIRST getPublishedSkills call must succeed: installSkills builds the display
+         * catalog (via getSkillsAvailableToUser, which the suite delegates to getPublishedSkills)
+         * before any rejection exists to classify. Rejecting from the start instead trips
+         * installSkills' own outer try/catch and returns "An error occurred while installing
+         * skills." — which passes every assertion below identically on unfixed code, and
+         * therefore proves nothing. Only the SECOND call, inside classifySkillRejections,
+         * exercises the branch under test.
+         */
+        (skillService.getPublishedSkills as jest.Mock)
+          .mockResolvedValueOnce([])
+          .mockRejectedValue(new Error('dynamo down'));
 
         const result = await agentModeService.installSkills(['premium-ads'], 'user-123', 'session-123');
 
@@ -191,9 +203,91 @@ describe('AgentModeService - Skills', () => {
          * not do is assert the customer's plan is at fault.
          */
         expect(result.success).toBe(false);
+        expect(result.message).toContain('These skills are currently unavailable to install');
         expect(result.message).not.toMatch(/not available with your current subscription/i);
         expect(result.message).not.toMatch(/not on their plan/i);
         expect(result.unentitledSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toEqual(['premium-ads']);
+        // Proves the classifier's catch ran, rather than installSkills' outer handler.
+        expect(result.message).not.toMatch(/an error occurred while installing skills/i);
+      });
+
+      it('routes an unavailable refusal to a class that FORBIDS substitution', async () => {
+        /*
+         * The class is not cosmetic — toolDispatch appends `retryabilityLine(class)` directly
+         * beneath this message. `empty_result`, the intuitive pick, says "the call succeeded
+         * but returned nothing … broaden the query or try a different source": it contradicts
+         * the refusal's own no-substitution sentence, and telling a model to try another
+         * source beneath a refusal is exactly how ENG-1625 produced a fabricated audit table.
+         * `tool_unavailable` ends "Do NOT present another tool's output as this tool's result".
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('tool_unavailable');
+        expect(retryabilityLine('tool_unavailable')).toMatch(/do not present another tool's output/i);
+      });
+
+      it('does not let a hallucinated skill ID hijack the error class', async () => {
+        /*
+         * Rejected ids are interpolated into the classified sentence, and on the unresolved
+         * path they are strings the MODEL invented. Before the markers were matched first,
+         * an id containing "403"/"500"/"404" was picked up by the embedded-status patterns —
+         * "500" yielded `upstream_5xx`, which is RETRYABLE, so a permanent refusal advertised
+         * itself as worth retrying.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        for (const badId of ['UTM Audit 404 Report', '500', 'ads 403 manager', 'install_skills_helper']) {
+          const result = await agentModeService.installSkills([badId], 'user-123', 'session-123');
+          expect(classifyToolErrorClass(new Error(result.message))).toBe('invalid_args');
+        }
+      });
+
+      it('describes admin tools as a role restriction, not a billing or support matter', async () => {
+        /*
+         * __admin_tools__ is gated on isAdmin/delegation. Bucketing it as "unavailable" told a
+         * non-admin "this account is permitted to use it … support can look into it" — both
+         * false, and the same species of error as the billing claim: it routes the user to a
+         * team that cannot help, and confirms the id is real and theirs to use.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/permitted to use it/i);
+        expect(result.message).not.toMatch(/support can look into it/i);
+        expect(result.message).not.toMatch(/not available with your current subscription/i);
+      });
+
+      it('PARTIAL install: a hallucinated ID is not reported as a billing limit', async () => {
+        /*
+         * The path the original split missed. It returns `success: true` because something
+         * installed, so toolResultError yields null and NO classifier runs — this prose is
+         * the only thing the model reads. It used to append a flat "N skill(s) were not
+         * available with your subscription" over every rejected id regardless of cause, so a
+         * made-up id reached a paying customer as a billing statement. `message` is in
+         * extractMinimalToolResult's allowlist, so it persisted into the ledger too.
+         */
+        const realSkill = {
+          skillId: 'crm-skill', name: 'CRM', description: 'CRM tools',
+          toolNames: ['search_leads'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([realSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([realSkill]);
+
+        const result = await agentModeService.installSkills(
+          ['crm-skill', 'no-such-id'], 'user-123', 'session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.installedSkills).toEqual(['CRM']);
+        expect(result.message).not.toMatch(/were not available with your subscription/i);
+        expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+        expect(result.unresolvedSkillIds).toEqual(['no-such-id']);
       });
     });
 
@@ -556,6 +650,10 @@ describe('AgentModeService - Skills', () => {
         shareSettings: { skills: { enabled: true, editors: [] } },
       }) };
 
+      // Pinned explicitly: without this the test inherits getPublishedSkills from an earlier
+      // case and would flip buckets if that unrelated fixture ever changed.
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
       const result = await agentModeService.installSkills(
         ['org-private-skill-1'],
         outsiderUserId,
@@ -577,6 +675,7 @@ describe('AgentModeService - Skills', () => {
       mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
       mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: false, editors: [] } } }) };
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
       const result = await agentModeService.installSkills(['org-private'], 'member-1', 'session-1');
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
       // ENG-1795: sharing being switched off is a config state, not a billing one.
