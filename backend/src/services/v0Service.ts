@@ -428,6 +428,17 @@ export interface GeneratedLandingPage {
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  /**
+   * Whether the domain this page is served from actually responds (ENG-1839). Written by the
+   * hourly reachability sweep and attached by the list route; never persisted on the page.
+   *
+   * `status` above describes the BUILD. A page can read "deployed" while its domain has no
+   * usable certificate and no browser can open it — which is exactly how three live customer
+   * pages went unnoticed.
+   */
+  domainStatus?: "active" | "pending_verification" | "error";
+  domainHost?: string;
+  domainErrorMessage?: string;
   pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;
@@ -650,7 +661,16 @@ export async function resolveLandingPageLiveUrl(
     const domains = await listDomains(page.userId, page.vercelProjectId);
     if (domains.length === 0) return fallback;
 
-    const rank = (d: { type: string }) => (d.type === "custom" ? 1 : 0);
+    // Same three tiers as the list route's `bestByOwnerProject` (ENG-1839). This function is
+    // the sibling read path — it feeds `live_url` on publish/edit and the "Your site at … will
+    // update shortly" message — so a status-blind ranking here reported a `pending_verification`
+    // host with no DNS as the live URL even after the list route was corrected. The doc comment
+    // above has always promised a VERIFIED custom domain; this is the first version that
+    // delivers one.
+    const rank = (d: { type: string; status?: string }) => {
+      if (d.type === "custom") return d.status === "active" ? 2 : 0;
+      return 1; // managed subdomain — addSubdomain writes these active unconditionally
+    };
     let best = domains[0];
     for (const d of domains) {
       if (
@@ -660,6 +680,14 @@ export async function resolveLandingPageLiveUrl(
         best = d;
       }
     }
+
+    /*
+     * `rank` is a comparator, not a filter — the seed above is unconditional, so rank 0 means
+     * "loses a comparison", never "is rejected". A project whose ONLY attached row is an
+     * unverified custom domain has nothing to lose to, so it would be adopted and reported as
+     * the live URL despite having no DNS. Reject it explicitly and keep the stored value.
+     */
+    if (rank(best) === 0) return fallback;
 
     const targetUrl = page.slug
       ? `https://${best.domain}/${page.slug}`

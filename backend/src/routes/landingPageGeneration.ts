@@ -816,10 +816,38 @@ router.get("/generated", async (req, res: Response) => {
       // Prefer a verified custom domain over a managed subdomain; break ties by
       // most-recently-updated.
       const bestByOwnerProject = new Map<string, CustomDomainRecord>();
-      const rank = (d: CustomDomainRecord) => (d.type === "custom" ? 1 : 0);
+      // Three tiers, not two. A verified custom domain is what the customer wants shown; a
+      // managed subdomain is the working fallback; a custom domain that is not verified yet
+      // cannot serve at all and must never be picked.
+      //
+      // Ranking on type alone let a `pending_verification` custom domain win. Since the
+      // reachability sweep deliberately does not probe unverified domains, that winning row
+      // could never carry a verdict — so a managed subdomain confirmed UNREACHABLE went
+      // unreported for as long as a custom domain sat half-configured on the same project, and
+      // the page's URL was rewritten to a host with no DNS. Demoting it to the subdomain's own
+      // tier is not enough either: the tie then breaks on `updatedAt`, and the freshly-added
+      // custom domain is always the newer row.
+      //
+      // NOT the same ordering as `getProjectDomain`, despite the similar shape: that helper
+      // returns active-custom → pending-custom → null and never considers subdomains at all,
+      // so it still answers with the pending custom exactly where this ranking prefers the
+      // working subdomain. Deliberate — it answers "which custom domain is attached", this
+      // answers "what should we show the customer".
+      const rank = (d: CustomDomainRecord) => {
+        if (d.type === "custom") return d.status === "active" ? 2 : 0;
+        return 1; // managed subdomain — addSubdomain writes these active unconditionally
+      };
       for (const [ownerId, domains] of domainsByOwner) {
         for (const d of domains) {
           if (!d.vercelProjectId) continue;
+          /*
+           * `rank` is a comparator, not a filter, and the `!existing` seed below is
+           * unconditional — so rank 0 means "loses a comparison", never "is rejected". Skip
+           * these outright: a project whose only attached row is an unverified custom domain
+           * has nothing to lose to, and would otherwise be adopted as the page's reported host
+           * despite having no DNS. That is the failure this ranking exists to prevent.
+           */
+          if (rank(d) === 0) continue;
           const key = `${ownerId}::${d.vercelProjectId}`;
           const existing = bestByOwnerProject.get(key);
           if (
@@ -836,6 +864,22 @@ router.get("/generated", async (req, res: Response) => {
         if (!page.vercelProjectId || !page.userId) continue;
         const best = bestByOwnerProject.get(`${page.userId}::${page.vercelProjectId}`);
         if (!best) continue;
+
+        // ENG-1839: surface whether the domain actually serves. The value is written by the
+        // hourly reachability sweep; this only reads what is already loaded here for URL
+        // enrichment, so it costs no extra calls and triggers no verification of its own.
+        // (An earlier version fired verification from this read — see the sweep's header for
+        // why that was wrong.)
+        // Reachability, written by the hourly sweep to its own attribute. Deliberately NOT
+        // `best.status` — that is the Vercel verification state, and conflating the two made a
+        // transient 5xx render a customer's custom domain as "not configured".
+        page.domainHost = best.domain;
+        if (best.reachabilityStatus === "unreachable") {
+          page.domainStatus = "error";
+          if (best.reachabilityError) page.domainErrorMessage = best.reachabilityError;
+        } else if (best.reachabilityStatus === "reachable") {
+          page.domainStatus = "active";
+        }
         // Sub-pages have a slug and live at /{slug} under the attached domain.
         const targetUrl = page.slug
           ? `https://${best.domain}/${page.slug}`
@@ -1832,23 +1876,65 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       }
     }
 
+    // Fetch the checks for this draft first — unchanged position, so a repo that DOES report a
+    // Tests check behaves exactly as before and makes no extra API call.
     const checksRes = await axios.get<any>(
       `${repoBase}/commits/${draftSha}/check-runs`,
       { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
     );
-    const testsCheck = (checksRes.data.check_runs || []).find(
-      (check: { name?: string }) => check.name === "Tests"
-    );
+    const checkRuns = checksRes.data?.check_runs || [];
+    const testsCheck = checkRuns.find((check: { name?: string }) => check.name === "Tests");
 
-    if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
+    // Is this a repo that can never produce a Tests check at all?
+    //
+    // The gate is correct for a repo that runs tests and UNSATISFIABLE for one that does not.
+    // Generated landing-page repos contain no `.github/workflows`, so no check named "Tests"
+    // can appear and publish returned 409 required_tests_pending forever — its own message
+    // said "retry after GitHub starts it", which GitHub never would. That blocked a customer's
+    // rebuilt page from being published at all.
+    //
+    // Requires BOTH signals. `actions/workflows` enumerates GitHub ACTIONS only, so a repo
+    // whose checks come from a GitHub App (CircleCI, Buildkite, a bespoke checker) reports
+    // total_count 0 while real checks exist — keying off that alone would skip a gate that was
+    // doing its job. Demanding zero check runs as well means the gate is skipped only when
+    // nothing has reported anything at all.
+    //
+    // FAIL CLOSED: the workflow count is consulted only when no check reported, and any error
+    // leaves it non-zero so the gate applies. "Could not determine whether this repo has CI"
+    // must never be read as "it has none".
+    let noCiAtAll = false;
+    if (!testsCheck && checkRuns.length === 0) {
+      let workflowCount = 1;
+      try {
+        const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {
+          headers: ghHeaders,
+          timeout: GITHUB_TIMEOUT_MS,
+        });
+        workflowCount = workflowsRes.data?.total_count ?? 1;
+      } catch (wfErr: any) {
+        console.warn(
+          `[LP GENERATION] Could not list workflows for ${owner}/${repoName}; ` +
+            `keeping the required-Tests gate: ${wfErr.message}`
+        );
+      }
+      noCiAtAll = workflowCount === 0;
+    }
+
+    if (noCiAtAll) {
+      console.log(
+        `[LP GENERATION] ${owner}/${repoName} reported no check runs and no workflows, so no ` +
+          `Tests check can exist — the required-Tests gate does not apply to this publish.`
+      );
+    } else if (!testsCheck || testsCheck.status !== "completed" || testsCheck.conclusion === "cancelled") {
       const message = !testsCheck
         ? "Required Tests check has not started for this draft yet. Keep the draft and retry publish after GitHub starts it."
         : testsCheck.conclusion === "cancelled"
           ? "Required Tests check was cancelled for this draft. Keep the draft and retry publish after Tests runs again."
         : "Required Tests check is still running for this draft. Keep the draft and retry publish when it completes."
       return res.status(409).json({ error: "required_tests_pending", message });
-    }
-    if (testsCheck.conclusion !== "success") {
+    } else if (testsCheck.conclusion !== "success") {
+      // Chained onto the branch above: when there is no CI, `testsCheck` is undefined and
+      // reading `.conclusion` here would throw.
       return res.status(409).json({
         error: "required_tests_failed",
         message: "Required Tests check failed for this draft. Fix the draft and retry publish after Tests passes.",
