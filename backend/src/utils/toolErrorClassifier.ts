@@ -82,6 +82,35 @@ function classFromStatus(status: number): string | null {
 function classFromMessage(message: string): string | null {
   const m = message.toLowerCase();
 
+  /*
+   * ENG-1795 — install_skills refusals, matched FIRST and deliberately so.
+   *
+   * These sentences are ours, emitted verbatim by installSkills, so their presence is
+   * definitive and nothing later can describe the failure better. Order matters twice over:
+   *
+   *   1. The refusal interpolates the REJECTED SKILL IDS, which on the `unresolved` path are
+   *      strings a model invented. An id like "UTM Audit 404 Report" or "ads 403 manager" would
+   *      otherwise be caught by the embedded-status and bare-substring patterns below and
+   *      classified `not_found` / `auth` / `upstream_5xx` — the last of which is RETRYABLE, so
+   *      a permanent refusal would advertise itself as worth retrying. Matching our own marker
+   *      first makes the classification independent of whatever the model put in the id.
+   *
+   *   2. A mixed refusal carries several of these sentences at once. Unknown ids are the
+   *      actionable half — the model can retry with a correct id — so they win, and the
+   *      subscription sentence must not pull the whole message under a billing verdict. That
+   *      conflation is the entire bug this ticket exists to remove.
+   *
+   * `tool_unavailable` for the unavailable/forbidden cases is chosen for what it TELLS THE
+   * MODEL, not merely for its name: its next step ends "Do NOT present another tool's output as
+   * this tool's result". `empty_result` — the intuitive pick — says the opposite: "the call
+   * succeeded but returned nothing … broaden the query or try a different source". Appending
+   * that beneath a refusal whose own text forbids substitution is precisely how ENG-1625
+   * produced a fabricated audit table. It is also `by_design` in the failure taxonomy, which
+   * would have hidden the ENG-1237 class of defect from the investigate bucket entirely.
+   */
+  if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
+  if (/these skills are currently unavailable to install/.test(m)) return 'tool_unavailable';
+
   // Hard quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
   // current quota, please check your plan and billing details") is a
   // permanent billing stop even though the provider surfaces it as HTTP 429 —
@@ -201,16 +230,6 @@ function classFromMessage(message: string): string | null {
   if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
-  /*
-   * ENG-1795: must be tested BEFORE the subscription pattern. A mixed refusal (some ids
-   * genuinely off-plan, some simply unknown) carries BOTH sentences, and classifying it
-   * `subscription_blocked` would put the unknown ids back under a billing verdict — the
-   * exact conflation this split exists to remove. Unknown ids are the actionable half:
-   * the model can retry with a correct id, which is what `invalid_args` signals.
-   */
-  if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
-  // Entitled and correctly named, but nothing installable behind it — not retryable, not billing.
-  if (/these skills are currently unavailable to install/.test(m)) return 'empty_result';
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';
