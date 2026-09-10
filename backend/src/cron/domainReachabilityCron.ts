@@ -143,8 +143,8 @@ export function selectDomainsToProbe(
       // Only domains Vercel considers verified. A custom domain sitting at
       // `pending_verification` because the customer has not pointed DNS yet WILL fail a probe,
       // and that failure is expected — the same reasoning that excludes not-yet-deployed pages.
-      // Without this, a normal domain-setup flow shows "this page may not be reachable" three
-      // hours in. Managed subdomains are written `status: "active"` unconditionally by
+      // Without this, a normal domain-setup flow shows "this page may not be reachable" a
+      // couple of days in. Managed subdomains are written `status: "active"` unconditionally by
       // addSubdomain, so this excludes nothing this ticket is about.
       d.status === "active" &&
       (deployedHosts.has(d.domain) ||

@@ -16,7 +16,8 @@
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
  *   scope_refused | publisher_refused | skill_install_refused
  *
- * The three trailing classes were added 2026-06-14 after a 7-day production
+ * `skill_install_refused` was added by ENG-1795; see its routing below for why no existing
+ * class fit. The three classes before it were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
  * 283 real failures with the prior patterns still left 63% in the generic
  * `Error` fallback (dev.md target was <20%). The real residual clusters were:

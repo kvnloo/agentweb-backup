@@ -143,8 +143,12 @@ describe('AgentModeService - Skills', () => {
         toolNames: ['run_premium_ad'], isPublished: true, visibility: 'public',
       };
 
+      const realUserDb = require('../services/db').userDb;
       afterEach(() => {
         (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+        // The admin-check mocks below mutate the db module in place. Without this they leak
+        // into every later test and silently change which bucket __admin_tools__ lands in.
+        require('../services/db').userDb = realUserDb;
       });
 
       it('reports a genuinely un-entitled skill as a subscription limit', async () => {
@@ -272,7 +276,46 @@ describe('AgentModeService - Skills', () => {
         }
       });
 
+      it('does NOT claim a role restriction when the admin check itself fails', async () => {
+        /*
+         * `getSkillsForDisplay` adds the admin bundle inside a try/catch that swallows a
+         * `getUserById` failure, so during a DynamoDB blip a REAL admin is refused exactly like
+         * a non-admin. Asserting a role restriction there tells them "not a temporary fault"
+         * when it is exactly that, and `by_design` hides the outage from triage.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+        const mockDb = require('../services/db');
+        mockDb.userDb = { getUserById: jest.fn().mockRejectedValue(new Error('dynamo down')) };
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).not.toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/not a temporary fault/i);
+        // ...and it must stay visible to triage rather than being filed as working-as-designed.
+        const cls = classifyToolErrorClass(new Error(result.message));
+        expect(classifyToolFailureType(cls, result.message)).toBe('bug');
+      });
+
+      it('a genuine admin installs the bundle rather than being refused at all', async () => {
+        // The counterpart to the case above: when the lookup SUCCEEDS and the user is an admin,
+        // getSkillsForDisplay puts the bundle in their catalog, so there is no refusal to
+        // classify. This pins that the refusal path is reached only when something is wrong.
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+        const mockDb = require('../services/db');
+        mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: true }) };
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.success).toBe(true);
+        expect(result.forbiddenSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toBeUndefined();
+      });
+
       it('keeps admin tools a role restriction even when the catalog read fails', async () => {
+        // Confirmed non-admin — the only state in which a role restriction may be asserted.
+        require('../services/db').userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: false }) };
         /*
          * The admin bucket is decided by a static id comparison that needs no catalog at all.
          * Left below the try/catch, a catalog failure dropped it into the `unavailable`
@@ -357,20 +400,38 @@ describe('AgentModeService - Skills', () => {
         expect(classifyToolFailureType(uCls, unavailable.message)).toBe('bug');
       });
 
-      it('a MIXED refusal stays investigable — the catalog half is a real defect', () => {
+      it('a MIXED refusal stays investigable — the catalog half is a real defect', async () => {
         /*
-         * One call rejecting both an admin bundle and an entitled-but-empty one carries both
-         * sentences. Under-investigating is the expensive direction, so `bug` wins.
+         * Built from REAL `installSkills` output, not a hand-written approximation.
+         *
+         * `classifyToolFailureType` distinguishes the two buckets by matching prose that
+         * `describeRejections` generates — "requires admin access" present, "permitted to use
+         * it" absent. A literal fixture pins the classifier against ITSELF and not against the
+         * producer, so rewording the unavailable sentence would silently flip a real mixed
+         * refusal from `bug` to `by_design` — dropping the ENG-1237 catalog half out of the
+         * investigate set — with no test failing. Deriving the fixture is what makes a reword
+         * break here instead of in production.
          */
-        const both =
-          'These skills are currently unavailable to install: __admin_tools__. This requires admin access — a role restriction. '
-          + 'These skills are currently unavailable to install: __other_skills__. The ID is correct and this account is permitted to use it.';
-        expect(classifyToolFailureType('skill_install_refused', both)).toBe('bug');
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const mixed = await agentModeService.installSkills(
+          ['__admin_tools__', '__other_skills__'], 'user-123', 'session-123'
+        );
+
+        // Both causes really are present in one message — otherwise this proves nothing.
+        expect(mixed.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(mixed.unavailableSkillIds).toEqual(['__other_skills__']);
+
+        const cls = classifyToolErrorClass(new Error(mixed.message));
+        expect(classifyToolFailureType(cls, mixed.message)).toBe('bug');
+
         // And an absent message must never be read as "working as designed".
         expect(classifyToolFailureType('skill_install_refused', undefined)).toBe('bug');
       });
 
       it('describes admin tools as a role restriction, not a billing or support matter', async () => {
+        // Confirmed non-admin — the only state in which a role restriction may be asserted.
+        require('../services/db').userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: false }) };
         /*
          * __admin_tools__ is gated on isAdmin/delegation. Bucketing it as "unavailable" told a
          * non-admin "this account is permitted to use it … support can look into it" — both

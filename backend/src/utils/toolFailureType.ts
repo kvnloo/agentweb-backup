@@ -86,7 +86,10 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
    * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
    * visible, which is where it was under the old single-message behaviour.
    */
-  if (errorClass?.toLowerCase() === 'skill_install_refused') {
+
+  const cls = (errorClass || '').toLowerCase();
+
+  if (cls === 'skill_install_refused') {
     /*
      * Two buckets share this class, and they are opposite kinds of event.
      *
@@ -104,12 +107,13 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
      * the unavailable half is a genuine defect, and under-investigating is the expensive
      * direction. Absent or unreadable message likewise falls through to `bug`.
      */
-    const m = (errorMessage ?? '').toLowerCase();
+    // `||`, not `??`: matches `cls` above, and coerces a non-string (0/false/NaN) that a
+    // historical DynamoDB row can hand `backfillFailureTypes.ts` — `?? ''` leaves those
+    // intact and `.toLowerCase()` then throws, aborting the whole backfill scan.
+    const m = (errorMessage || '').toLowerCase();
     const rolesOnly = m.includes('requires admin access') && !m.includes('permitted to use it');
     return rolesOnly ? 'by_design' : 'bug';
   }
-
-  const cls = (errorClass || '').toLowerCase();
   const msg = errorMessage || '';
 
   // 1. Model called a tool that isn't installed. Message-driven: pre-classifier

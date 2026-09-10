@@ -6577,8 +6577,39 @@ export class AgentModeService {
      * bucket exists to remove. A lookup failure must not silently undo a decision that never
      * depended on the lookup.
      */
-    const forbidden = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
+    const adminRejected = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
     const classifiable = rejectedSkillIds.filter((id) => id !== ADMIN_SKILL_VIRTUAL_ID);
+
+    /*
+     * `forbidden` asserts a ROLE RESTRICTION — permanent, nothing support can grant, and
+     * classified `by_design` so triage ignores it. That is only true if the caller genuinely is
+     * not an admin, so it is only claimed when we can CONFIRM that.
+     *
+     * The reason this needs confirming: `getSkillsForDisplay` adds the admin bundle inside a
+     * `try { getUserById } catch { }` that swallows a lookup failure. When DynamoDB blips, a
+     * real admin's request is rejected exactly like a non-admin's — and asserting a role
+     * restriction there tells them "not a temporary fault" when it is precisely that, while
+     * `by_design` hides the outage from triage. Unconfirmed cases go to `unavailable` instead,
+     * whose wording ("unavailable right now… support can look into it") is true either way and
+     * whose `bug` failure type keeps a real fault visible.
+     */
+    let forbidden: string[] = [];
+    const adminUnconfirmed: string[] = [];
+    if (adminRejected.length > 0) {
+      try {
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        if (user?.isAdmin === true) {
+          // An admin whose bundle was still refused: not a role boundary, so do not claim one.
+          adminUnconfirmed.push(...adminRejected);
+        } else {
+          forbidden = adminRejected;
+        }
+      } catch (err) {
+        console.warn('[installSkills] admin check failed while classifying a refusal:', err);
+        adminUnconfirmed.push(...adminRejected);
+      }
+    }
 
     let allowedIds: string[];
     let existingIds: Set<string>;
@@ -6614,7 +6645,12 @@ export class AgentModeService {
        * account IS permitted, which is unproven here — accepted as the lesser error, since
        * over-claiming entitlement misroutes nobody, while under-claiming it bills them.
        */
-      return { unentitled: [], unavailable: classifiable, unresolved: [], forbidden };
+      return {
+        unentitled: [],
+        unavailable: [...classifiable, ...adminUnconfirmed],
+        unresolved: [],
+        forbidden,
+      };
     }
 
     const isWildcard = allowedIds.includes('*');
@@ -6639,7 +6675,7 @@ export class AgentModeService {
        */
       unavailable.push(id);
     }
-    return { unentitled, unavailable, unresolved, forbidden };
+    return { unentitled, unavailable: [...unavailable, ...adminUnconfirmed], unresolved, forbidden };
   }
 
   /*

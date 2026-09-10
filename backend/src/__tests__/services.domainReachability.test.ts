@@ -146,14 +146,19 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
     ["ERR_TLS_CERT_ALTNAME_INVALID", "a mismatch describes what the REMOTE certificate contains"],
   ])("%s is DEFINITIVE — %s", (code) => {
     /*
-     * Reported on the FIRST probe, no confirmation wait. Expiry belongs here despite looking
-     * like a clock-dependent judgement: the sweep scans DynamoDB before probing, aws-sdk v2
-     * leaves `correctClockSkew` false, and SigV4 refuses a request >5 minutes off — so a
-     * prober skewed by days throws on the scan and never probes. Skew under 5 minutes can only
-     * expire a cert already within 5 minutes of expiring.
+     * Reported on the FIRST probe, with no confirmation wait — which is why membership here is
+     * a safety decision, not a confidence one.
      *
-     * It was briefly SUSPECT, which combined with the daily sweep to put a two-day delay on an
-     * unambiguous failure whose visitors are already seeing a full-page browser interstitial.
+     * A hostname mismatch is the only code that qualifies: it describes what the REMOTE
+     * certificate CONTAINS. Our clock cannot forge it, our trust store cannot forge it, and an
+     * intercepting proxy mints a certificate FOR the hostname it was asked for, so interception
+     * surfaces as a trust-chain failure instead.
+     *
+     * `CERT_HAS_EXPIRED` deliberately does NOT belong here, and this test is the place someone
+     * will look before trying to add it. It was promoted once and reverted: OpenSSL reports it
+     * for ANY expired certificate in the chain at any depth, so an expired root in our own
+     * trust store makes every domain report expiry at once, on the first probe. See the
+     * CERT_HAS_EXPIRED entry in domainReachabilityService.ts before touching this.
      */
     const verdict = verdictForCode(code);
     expect(verdict.state).toBe("unreachable");
