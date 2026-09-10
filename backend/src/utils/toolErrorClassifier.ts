@@ -110,6 +110,18 @@ function classFromMessage(message: string): string | null {
    */
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'tool_unavailable';
+  /*
+   * The entitlement sentence needs the same protection, and for the same reason. It was left
+   * to the generic pattern further down, below the embedded-status regex — so a real published
+   * skillId beginning with a "500"/"404"/"403"-shaped token classified `upstream_5xx` /
+   * `not_found` / `auth`. `upstream_5xx` is RETRYABLE, which appends "Wait briefly, then retry
+   * ONCE" beneath a permanent billing refusal. Lower likelihood than the unresolved case (these
+   * ids are admin-authored, not model-invented) but the identical defect, so it is closed here
+   * rather than left as the one unguarded quarter.
+   */
+  if (/not available with your current subscription|capability is not on their plan/.test(m)) {
+    return 'subscription_blocked';
+  }
 
   // Hard quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
   // current quota, please check your plan and billing details") is a
@@ -186,17 +198,6 @@ function classFromMessage(message: string): string | null {
   // user has not enabled; a config gap, not a failure of the tool itself.
   if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
 
-  /*
-   * install_skills refusals — the skill exists but the user's plan does not include it.
-   *
-   * Checked HERE, above the generic branches, because the refusal text is deliberately written
-   * to forbid substitution ("Do NOT substitute a different tool's output..."). Left unclassified
-   * it fell through to the legacy `Error` class, whose DEFAULT_NEXT_STEP ends "...use a different
-   * tool", so the retryability line appended by the dispatcher instructed the model to do the
-   * exact thing the refusal forbids. That contradiction is how a gated tool's absence turns into
-   * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
-   * a tool that never ran). Both strings below are ours, emitted by installSkills.
-   */
 
   /*
    * An ad-account scope refusal. Unclassified it fell to the legacy `Error` class, whose default
@@ -230,7 +231,8 @@ function classFromMessage(message: string): string | null {
   if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
-  if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
+  // (The subscription pattern that lived here now runs at the top of this function, with the
+  // other install_skills markers — see the ENG-1795 block for why order is load-bearing.)
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';
 

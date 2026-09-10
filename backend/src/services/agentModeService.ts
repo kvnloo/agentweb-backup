@@ -168,11 +168,26 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
  */
 export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
 /*
- * The skill exists and the account is entitled to it, but it is not installable right now
- * (empty `__other_skills__` pool, a visibility filter, or an admin-only bundle). Routed to
- * `empty_result` — retrying the same id cannot succeed, so `invalid_args` would be wrong too.
+ * The skill exists and the account is entitled to it, but nothing is installable behind it
+ * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
+ *
+ * Routed to `tool_unavailable`, chosen for what that class TELLS THE MODEL: its guidance ends
+ * "Do NOT present another tool's output as this tool's result". `empty_result` looks like the
+ * natural fit and is actively harmful here — it says "the call succeeded but returned nothing
+ * … try a different source" directly beneath a refusal forbidding exactly that.
+ *
+ * NOT visibility-filtered skills (those never reach this bucket — `getPublishedSkills` drops
+ * `pending_review`, so they land in `unresolved`), and NOT the admin bundle (its own
+ * `forbidden` bucket).
  */
 export const SKILL_UNAVAILABLE_MARKER = "These skills are currently unavailable to install";
+/*
+ * Appended to EVERY refusal, full or partial. The Phoenix session (delegated a1a6345a) showed
+ * a model answering a refused tool with an unrelated tool's output presented as that tool's
+ * result; this sentence is the direct countermeasure, so it must not be scoped to one branch.
+ */
+const SKILL_NO_SUBSTITUTION =
+  " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
 // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
@@ -6553,6 +6568,17 @@ export class AgentModeService {
     rejectedSkillIds: string[],
     userId: string
   ): Promise<{ unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] }> {
+    /*
+     * Partitioned BEFORE the catalog read, because this decision needs no catalog: it is a
+     * static id comparison. Left below the try/catch, a catalog failure dropped
+     * `__admin_tools__` into the `unavailable` fallback — which asserts "this account is
+     * permitted to use it" and "support can look into it", the two false claims the forbidden
+     * bucket exists to remove. A lookup failure must not silently undo a decision that never
+     * depended on the lookup.
+     */
+    const forbidden = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
+    const classifiable = rejectedSkillIds.filter((id) => id !== ADMIN_SKILL_VIRTUAL_ID);
+
     let allowedIds: string[];
     let existingIds: Set<string>;
     try {
@@ -6587,7 +6613,7 @@ export class AgentModeService {
        * account IS permitted, which is unproven here — accepted as the lesser error, since
        * over-claiming entitlement misroutes nobody, while under-claiming it bills them.
        */
-      return { unentitled: [], unavailable: rejectedSkillIds, unresolved: [], forbidden: [] };
+      return { unentitled: [], unavailable: classifiable, unresolved: [], forbidden };
     }
 
     const isWildcard = allowedIds.includes('*');
@@ -6595,16 +6621,7 @@ export class AgentModeService {
     const unentitled: string[] = [];
     const unavailable: string[] = [];
     const unresolved: string[] = [];
-    const forbidden: string[] = [];
-    for (const id of rejectedSkillIds) {
-      /*
-       * Admin Tools is gated on `user.isAdmin` / delegation, never on billing and never on
-       * anything support can grant. It needs its own bucket: describing it as "available but
-       * not right now, ask support" is the same species of lie as the billing claim — it
-       * routes the user to a team that cannot help, and it confirms to a non-admin that the
-       * id is real and they are entitled to it.
-       */
-      if (id === ADMIN_SKILL_VIRTUAL_ID) { forbidden.push(id); continue; }
+    for (const id of classifiable) {
       if (!existingIds.has(id)) { unresolved.push(id); continue; }
       if (!isWildcard && !allowedSet.has(id)) { unentitled.push(id); continue; }
       /*
@@ -6714,13 +6731,10 @@ export class AgentModeService {
            * that is how a model ends up substituting another tool's output and presenting it
            * as the gated tool's result.
            */
-          const noSubstitution =
-            " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
-
           const parts = this.describeRejections(buckets);
           return {
             success: false,
-            message: parts.join(' ') + noSubstitution,
+            message: parts.join(' ') + SKILL_NO_SUBSTITUTION,
             ...(unentitled.length > 0 ? { unentitledSkillIds: unentitled } : {}),
             ...(unavailable.length > 0 ? { unavailableSkillIds: unavailable } : {}),
             ...(unresolved.length > 0 ? { unresolvedSkillIds: unresolved } : {}),
@@ -6750,7 +6764,14 @@ export class AgentModeService {
          * ledger too.
          */
         const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
-        result.message += ' ' + this.describeRejections(partialBuckets).join(' ');
+        /*
+         * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
+         * the dispatcher's downgrade attaches an error class whose retryability line carries
+         * its own stop signal. Here `success: true` means no class is ever assigned, so this
+         * sentence is the only thing standing between "the one skill the gated tool needed was
+         * the one refused" and the model presenting another tool's output as that tool's result.
+         */
+        result.message += ' ' + this.describeRejections(partialBuckets).join(' ') + SKILL_NO_SUBSTITUTION;
         if (partialBuckets.unentitled.length > 0) result.unentitledSkillIds = partialBuckets.unentitled;
         if (partialBuckets.unavailable.length > 0) result.unavailableSkillIds = partialBuckets.unavailable;
         if (partialBuckets.unresolved.length > 0) result.unresolvedSkillIds = partialBuckets.unresolved;
