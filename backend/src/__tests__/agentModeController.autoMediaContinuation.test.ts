@@ -265,6 +265,54 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
   });
 
+  it('ENG-1495: the live-delivered continuation message carries the real persisted messageIndex, not just the content', async () => {
+    // The default beforeEach mocks addMessagesToSession to resolve undefined (most
+    // tests here don't care about the return value) -- override it for this test with
+    // a realistic persisted-session shape so the messageIndex genuinely flows through
+    // generateSessionResponse's own stamping into the socket emit, rather than only
+    // exercising the defensive undefined-fallback path every other test in this file does.
+    mockChatbotDb.addMessagesToSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        ...(mockSession.messages || []),
+        {
+          role: 'assistant',
+          content: 'All 4 creatives are ready.',
+          timestamp: '2026-08-14T18:20:51.000Z',
+          metadata: { timestamp: '2026-08-14T18:20:51.000Z' },
+          messageIndex: 42,
+        },
+      ],
+    } as any);
+
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      )
+      .mockResolvedValueOnce(
+        workerResponse('All 4 creatives are ready.', [
+          { ...imageToolCall(4) },
+        ]),
+      );
+
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+
+    expect(mockIoEmit).toHaveBeenCalledWith(
+      'session-message-appended',
+      expect.objectContaining({
+        sessionId: mockSessionId,
+        message: expect.objectContaining({
+          content: 'All 4 creatives are ready.',
+          messageIndex: 42,
+        }),
+      }),
+    );
+  });
+
   it('does not auto-continue when nothing was deferred (ordinary single-image turn)', async () => {
     mockWorkerService.runInWorker.mockResolvedValueOnce(
       workerResponse('Here is your image.', [imageToolCall(1)]),

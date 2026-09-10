@@ -93,6 +93,7 @@ export interface ChatMessage {
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls
   messageIndex?: number; // Index of message in the database (included when loading from DB)
+  clientId?: string; // ENG-1495: client-generated id, present only on messages the frontend created optimistically before a server round-trip (echoed back so it can key the same message stably across the refresh that resolves messageIndex)
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -1107,10 +1108,14 @@ export class ChatbotDB {
       // no ledger row, breaking ENG-200's rule that nothing is deducted without
       // also being recorded. Charge where you record: at the call site.
 
-      // Return session with updated messages (no need to update session table)
+      // ENG-1495: stamp messageIndex onto the returned message rather than the raw
+      // reference -- this is the same id getMessagesFromMessagesTable would produce on
+      // a fresh read, just computed once here instead of thrown away and re-derived
+      // later. Lets callers (the /generate response, the session-message-appended
+      // socket event) echo a stable id synchronously instead of only after a refetch.
       return {
         ...currentSession,
-        messages: [...currentMessages, message],
+        messages: [...currentMessages, { ...message, messageIndex }],
       };
     });
   }
@@ -1151,10 +1156,14 @@ export class ChatbotDB {
       // ENG-1134: no per-user quota charge here either — same reasoning as the
       // single-message path above. The batch variant double-charged identically.
 
-      // Return session with updated messages (no need to update session table)
+      // ENG-1495: same reasoning as addMessageToSession above -- stamp messageIndex on
+      // each returned message instead of the raw reference.
       return {
         ...currentSession,
-        messages: [...currentMessages, ...messages],
+        messages: [
+          ...currentMessages,
+          ...messages.map((m, i) => ({ ...m, messageIndex: messageIndex + i })),
+        ],
       };
     });
   }
