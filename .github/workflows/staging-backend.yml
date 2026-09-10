@@ -1,0 +1,125 @@
+name: Deploy backend to staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Repository git ref or full SHA to deploy to staging'
+        required: true
+        type: string
+
+# Reuse the former staging lane; refs must never deploy concurrently.
+concurrency:
+  group: backend-staging-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  backend-staging-deploy:
+    # Dispatch requires repository write access. Run the controls from main;
+    # the explicit input selects only the backend source, never the environment.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    environment: staging
+    env:
+      EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_APPLICATION_NAME }}
+      EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_ENVIRONMENT_NAME }}
+    steps:
+      - name: Validate explicit ref
+        env:
+          DEPLOY_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEPLOY_REF//[[:space:]]/}" ]]; then
+            echo "::error::An explicit deployment ref or SHA is required."
+            exit 1
+          fi
+
+      - name: Checkout deploy controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout deployment source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          persist-credentials: false
+
+      - name: Record deployment identity
+        id: version
+        run: |
+          set -euo pipefail
+          SHA="$(git -C source rev-parse HEAD)"
+          VERSION_LABEL="backend-staging-${SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
+          printf 'Staging backend SHA: %s\nApplication version: %s\n' "$SHA" "$VERSION_LABEL" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          cache-dependency-path: source/backend/package-lock.json
+
+      - name: Build and package
+        working-directory: source/backend
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+        run: |
+          set -euo pipefail
+          npm ci
+          NODE_OPTIONS="--max-old-space-size=4096" npm run build
+          cp ../test-env/user-data-dev-auto.sh dist/
+          mkdir -p builds
+          zip -r "builds/${VERSION_LABEL}.zip" dist docs package.json package-lock.json .env.example .platform .ebextensions
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload deployment package
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+        run: |
+          set -euo pipefail
+          aws s3 cp "source/backend/builds/${VERSION_LABEL}.zip" \
+            "s3://elasticbeanstalk-${AWS_REGION}-992382574572/builds/${VERSION_LABEL}.zip"
+
+      - name: Deploy and verify
+        timeout-minutes: 50
+        env:
+          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+          EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
+          EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
+          EB_TOTAL_TIMEOUT_SECONDS: '2700'
+          EB_SETTLE_TIMEOUT_SECONDS: '1200'
+        run: bash .github/scripts/eb-deploy.sh
+
+      # The shared script retains its bounded recovery logic. Staging evidence
+      # additionally requires a literal Green rollup on the exact new version.
+      - name: Confirm staging Ready and Green
+        env:
+          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+        run: |
+          set -euo pipefail
+          STATE="$(aws elasticbeanstalk describe-environments \
+            --application-name "$EB_APPLICATION_NAME" \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --query 'Environments[0].[Status,Health,VersionLabel]' --output text)"
+          if [[ "$STATE" != "$(printf 'Ready\tGreen\t%s' "$EB_VERSION_LABEL")" ]]; then
+            echo "::error::Staging verification failed: ${STATE}"
+            exit 1
+          fi
+          printf 'Verified staging %s: %s\n' "$EB_ENVIRONMENT_NAME" "$STATE" | tee -a "$GITHUB_STEP_SUMMARY"
