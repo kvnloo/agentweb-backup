@@ -160,6 +160,34 @@ import {
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+/*
+ * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
+ * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
+ * `invalid_args` instead of `subscription_blocked`, so it is a contract between the two
+ * files, not decoration — change it in both or in neither.
+ */
+export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+/*
+ * The skill exists and the account is entitled to it, but nothing is installable behind it
+ * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
+ *
+ * Routed to `tool_unavailable`, chosen for what that class TELLS THE MODEL: its guidance ends
+ * "Do NOT present another tool's output as this tool's result". `empty_result` looks like the
+ * natural fit and is actively harmful here — it says "the call succeeded but returned nothing
+ * … try a different source" directly beneath a refusal forbidding exactly that.
+ *
+ * NOT visibility-filtered skills (those never reach this bucket — `getPublishedSkills` drops
+ * `pending_review`, so they land in `unresolved`), and NOT the admin bundle (its own
+ * `forbidden` bucket).
+ */
+export const SKILL_UNAVAILABLE_MARKER = "These skills are currently unavailable to install";
+/*
+ * Appended to EVERY refusal, full or partial. The Phoenix session (delegated a1a6345a) showed
+ * a model answering a refused tool with an unrelated tool's output presented as that tool's
+ * result; this sentence is the direct countermeasure, so it must not be scoped to one branch.
+ */
+const SKILL_NO_SUBSTITUTION =
+  " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
 // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
@@ -6521,6 +6549,145 @@ export class AgentModeService {
     return skills;
   }
 
+  /*
+   * ENG-1795. A rejected skill id has two causes that are NOT interchangeable to the
+   * person on the other end of the chat:
+   *
+   *   unentitled — the skill exists and is published, but this account's allowedSkills
+   *                does not unlock it. "Not on your plan" is TRUE, and sales can fix it.
+   *   unresolved — no such skill id exists: retired, renamed, a typo, a virtual bundle
+   *                with nothing in it, or an id the model invented. "Not on your plan"
+   *                is FALSE. Support can fix it; sales cannot.
+   *
+   * Both used to return the single subscription message, which did not merely misreport
+   * the cause — it INSTRUCTED the model to state the plan limitation to the customer as
+   * fact. That is how a lookup failure reaches a paying customer as a billing statement
+   * and sends them to the one team that cannot help them.
+   */
+  private async classifySkillRejections(
+    rejectedSkillIds: string[],
+    userId: string
+  ): Promise<{ unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] }> {
+    /*
+     * Partitioned BEFORE the catalog read, because this decision needs no catalog: it is a
+     * static id comparison. Left below the try/catch, a catalog failure dropped
+     * `__admin_tools__` into the `unavailable` fallback — which asserts "this account is
+     * permitted to use it" and "support can look into it", the two false claims the forbidden
+     * bucket exists to remove. A lookup failure must not silently undo a decision that never
+     * depended on the lookup.
+     */
+    const forbidden = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
+    const classifiable = rejectedSkillIds.filter((id) => id !== ADMIN_SKILL_VIRTUAL_ID);
+
+    let allowedIds: string[];
+    let existingIds: Set<string>;
+    try {
+      /*
+       * `getAllowedSkills` directly, NOT `loadAuthorizedSkillCatalog` — the latter returns
+       * `allowedIds` verbatim from this same call, and the catalog half of its work would be
+       * discarded here. Building it costs `resolveUserSkillAccess` (getUserById + getOrgById),
+       * `getOrgMembers`, and one UNCACHED OwnerIndex query per org member — an N+1 on the
+       * refusal path for a value that is thrown away. `getPublishedSkills` is TTL-cached, so
+       * that half is genuinely cheap.
+       */
+      const [allowed, published] = await Promise.all([
+        getAllowedSkills(userId),
+        skillService.getPublishedSkills(),
+      ]);
+      allowedIds = allowed;
+      existingIds = new Set(published.map(s => s.skillId));
+      // The virtual bundles are real ids with no catalog row; entitlement still governs them.
+      existingIds.add(OTHER_SKILLS_VIRTUAL_ID);
+      existingIds.add(ADMIN_SKILL_VIRTUAL_ID);
+    } catch (err) {
+      /*
+       * We could not read the catalog, so we cannot prove a skill is absent — and an
+       * unproven absence must not be reported as an entitlement failure. Fail into the
+       * branch that makes no claim about the customer's plan.
+       */
+      console.warn('[installSkills] skill catalog lookup failed while classifying a refusal:', err);
+      /*
+       * We could not read the catalog, so we cannot prove WHY an id was rejected. The one
+       * thing we must not do is assert the customer's plan is at fault, so this falls to the
+       * non-billing branch. Note the honest limitation: `unavailable`'s wording claims the
+       * account IS permitted, which is unproven here — accepted as the lesser error, since
+       * over-claiming entitlement misroutes nobody, while under-claiming it bills them.
+       */
+      return { unentitled: [], unavailable: classifiable, unresolved: [], forbidden };
+    }
+
+    const isWildcard = allowedIds.includes('*');
+    const allowedSet = new Set(allowedIds);
+    const unentitled: string[] = [];
+    const unavailable: string[] = [];
+    const unresolved: string[] = [];
+    for (const id of classifiable) {
+      if (!existingIds.has(id)) { unresolved.push(id); continue; }
+      if (!isWildcard && !allowedSet.has(id)) { unentitled.push(id); continue; }
+      /*
+       * Exists AND granted, yet absent from this user's catalog: `__other_skills__` whose
+       * unassociated-tool pool is currently empty. This is the ENG-1237 production repro
+       * (harsha@agentweb.pro) — an unpublished org-shared skill claimed the last remaining
+       * tools, the bundle vanished from the catalog, and the refusal surfaced as "not
+       * available with your current subscription".
+       *
+       * NOT visibility-filtered skills, despite the obvious guess: `getPublishedSkills`
+       * already drops `pending_review`, so such an id never reaches `existingIds` and lands
+       * in `unresolved` instead. That is the better outcome anyway — it confirms nothing
+       * about another owner's draft.
+       */
+      unavailable.push(id);
+    }
+    return { unentitled, unavailable, unresolved, forbidden };
+  }
+
+  /*
+   * Prose for a set of rejected ids, shared by the full-refusal and PARTIAL-install paths.
+   *
+   * The partial path is why this is extracted. It returns `success: true` (something did
+   * install), so `toolResultError` yields null and no classifier ever runs — the prose IS what
+   * the model reads, unmediated. It used to append a flat
+   * "N skill(s) were not available with your subscription", which reproduced the exact false
+   * billing claim this ticket exists to remove, on a path the split never touched.
+   */
+  private describeRejections(buckets: {
+    unentitled: string[];
+    unavailable: string[];
+    unresolved: string[];
+    forbidden: string[];
+  }): string[] {
+    const parts: string[] = [];
+    if (buckets.unentitled.length > 0) {
+      parts.push(
+        `The requested skills are not available with your current subscription: ${buckets.unentitled.join(', ')}.`
+        + " Tell the user plainly that this capability is not on their plan."
+      );
+    }
+    if (buckets.unresolved.length > 0) {
+      parts.push(
+        `${SKILL_UNRESOLVED_MARKER}: ${buckets.unresolved.join(', ')}.`
+        + " This is an ID problem, not a billing one — do NOT tell the user this capability is missing from their subscription."
+        + " Re-read the available skills list and retry with an exact ID from it."
+      );
+    }
+    if (buckets.unavailable.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.unavailable.join(', ')}.`
+        + " The ID is correct and this account is permitted to use it, so retrying the same ID will not help,"
+        + " and this is NOT a billing limitation — do NOT tell the user it is missing from their subscription."
+        + " Say the capability is unavailable right now and that support can look into it."
+      );
+    }
+    if (buckets.forbidden.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.forbidden.join(', ')}.`
+        + " This requires admin access — a role restriction, not a billing limit and not a temporary fault."
+        + " Do NOT suggest upgrading a plan and do NOT suggest contacting support about it."
+      );
+    }
+    return parts;
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
@@ -6555,6 +6722,8 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
+          const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+          const { unentitled, unavailable, unresolved, forbidden } = buckets;
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -6562,11 +6731,14 @@ export class AgentModeService {
            * that is how a model ends up substituting another tool's output and presenting it
            * as the gated tool's result.
            */
+          const parts = this.describeRejections(buckets);
           return {
             success: false,
-            message: "The requested skills are not available with your current subscription."
-              + " Tell the user plainly that this capability is not on their plan."
-              + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+            message: parts.join(' ') + SKILL_NO_SUBSTITUTION,
+            ...(unentitled.length > 0 ? { unentitledSkillIds: unentitled } : {}),
+            ...(unavailable.length > 0 ? { unavailableSkillIds: unavailable } : {}),
+            ...(unresolved.length > 0 ? { unresolvedSkillIds: unresolved } : {}),
+            ...(forbidden.length > 0 ? { forbiddenSkillIds: forbidden } : {}),
           };
         }
         return { success: false, message: "No valid skills found for the provided IDs." };
@@ -6579,7 +6751,31 @@ export class AgentModeService {
       };
 
       if (rejectedSkillIds.length > 0) {
-        result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        /*
+         * ENG-1795. This path returns `success: true` — something DID install — so
+         * `toolResultError` yields null and no classifier ever runs. That makes this prose the
+         * only thing the model reads about the failure, unmediated by any error class.
+         *
+         * It used to be a flat "N skill(s) were not available with your subscription",
+         * asserted over every rejected id regardless of cause. So a hallucinated id reached a
+         * paying customer as a billing statement whenever at least one OTHER skill installed
+         * — the ticket's own premise, surviving on the path the original split never touched.
+         * `message` is in extractMinimalToolResult's allowlist, so it persisted into the
+         * ledger too.
+         */
+        const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        /*
+         * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
+         * the dispatcher's downgrade attaches an error class whose retryability line carries
+         * its own stop signal. Here `success: true` means no class is ever assigned, so this
+         * sentence is the only thing standing between "the one skill the gated tool needed was
+         * the one refused" and the model presenting another tool's output as that tool's result.
+         */
+        result.message += ' ' + this.describeRejections(partialBuckets).join(' ') + SKILL_NO_SUBSTITUTION;
+        if (partialBuckets.unentitled.length > 0) result.unentitledSkillIds = partialBuckets.unentitled;
+        if (partialBuckets.unavailable.length > 0) result.unavailableSkillIds = partialBuckets.unavailable;
+        if (partialBuckets.unresolved.length > 0) result.unresolvedSkillIds = partialBuckets.unresolved;
+        if (partialBuckets.forbidden.length > 0) result.forbiddenSkillIds = partialBuckets.forbidden;
         /*
          * The refusal has to be a FIELD, not just prose appended to `message`.
          *
@@ -7327,6 +7523,26 @@ export class AgentModeService {
         // install fail this turn" (buildUnavailableCapabilityNotice, synthesisResidue.ts).
         ...(Array.isArray(a.rejectedToolNames) && a.rejectedToolNames.length > 0
           ? { rejectedToolNames: a.rejectedToolNames }
+          : {}),
+        /*
+         * ENG-1795: WHY each id was refused, not just that it was. Carried for the same reason
+         * `rejectedSkillIds` is — a ledger-only reader cannot re-derive it, and the causes are
+         * not interchangeable: "your plan excludes this" is actionable by sales, "no such id"
+         * by the model retrying, and the other two by neither. Without these, anything reading
+         * the ledger can only ask "did an install fail", which is the coarse question that let
+         * a lookup failure be reported as a billing limit in the first place.
+         */
+        ...(Array.isArray(a.unentitledSkillIds) && a.unentitledSkillIds.length > 0
+          ? { unentitledSkillIds: a.unentitledSkillIds }
+          : {}),
+        ...(Array.isArray(a.unavailableSkillIds) && a.unavailableSkillIds.length > 0
+          ? { unavailableSkillIds: a.unavailableSkillIds }
+          : {}),
+        ...(Array.isArray(a.unresolvedSkillIds) && a.unresolvedSkillIds.length > 0
+          ? { unresolvedSkillIds: a.unresolvedSkillIds }
+          : {}),
+        ...(Array.isArray(a.forbiddenSkillIds) && a.forbiddenSkillIds.length > 0
+          ? { forbiddenSkillIds: a.forbiddenSkillIds }
           : {}),
       };
     }

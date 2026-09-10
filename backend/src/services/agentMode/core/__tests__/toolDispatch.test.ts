@@ -206,7 +206,7 @@ describe('executePreparedTools', () => {
     it('a PARTIAL install reaches the ledger as a success, so the result must carry the refusal', async () => {
       const partial = {
         success: true,
-        message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+        message: 'Successfully installed 1 skill(s). Could not resolve these skill IDs to any known skill: no-such-id. This is an ID problem, not a billing one.',
         installedSkills: ['Some Other Skill'],
         rejectedSkillIds: ['utm-audit'],
         // The tool names installSkills resolved rejectedSkillIds to (agentModeService.ts) —

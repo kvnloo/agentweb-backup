@@ -183,6 +183,29 @@ describe('classifyToolErrorClass', () => {
    * whose own text forbids substituting another tool's output. That contradiction is how the
    * absence of a gated tool becomes a fabricated result (ENG-1625).
    */
+  /*
+   * ENG-1795. Our own refusal is matched at the TOP of classFromMessage so a model-authored
+   * skill id cannot hijack the class. That hoist must stay ANCHORED to our full sentence:
+   * "not available with your current subscription" on its own is ordinary vendor English, and
+   * promoting it above the embedded-status guard reclassified a vendor 403 from `auth` to
+   * `subscription_blocked` — telling the model to say the capability is off the user's plan
+   * when the real remedy is reconnecting the account.
+   */
+  it('keeps a vendor 403 as auth, even when it mentions a subscription', () => {
+    expect(classifyToolErrorClass(err(
+      'Request failed with status code 403: this feature is not available with your current subscription.'
+    ))).toBe('auth');
+  });
+
+  it('classifies OUR refusal as subscription_blocked despite a status-shaped skill id', () => {
+    // The id is admin-authored and real; it just happens to start with digits that the
+    // embedded-status regex would read as an upstream 500 — which is RETRYABLE.
+    expect(classifyToolErrorClass(err(
+      'The requested skills are not available with your current subscription: 500-error-playbook.'
+      + ' Tell the user plainly that this capability is not on their plan.'
+    ))).toBe('subscription_blocked');
+  });
+
   it('classifies a plan-gated install_skills refusal as subscription_blocked', () => {
     expect(classifyToolErrorClass(err(
       "The requested skills are not available with your current subscription."
