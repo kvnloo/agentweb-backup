@@ -1528,6 +1528,17 @@ async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> 
       setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
     );
     const res: any = await Promise.race([llmPromise, timeoutPromise]);
+    // ENG-1819: this is exactly the failure mode live-testing found at
+    // max_completion_tokens: 3 -- a truncated reasoning trace silently reads as "no". 500
+    // makes truncation unlikely, but isn't a guarantee; log loudly instead of letting a
+    // recurrence go unnoticed again.
+    if (res?.choices?.[0]?.finish_reason === 'length') {
+      console.warn(
+        `AgentMode: work-plan auto-continuation stop-request judge for session ${sessionId} was ` +
+        `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+        `this may be silently missing a real stop request.`
+      );
+    }
     const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
     return raw.startsWith('yes');
   } catch (err) {
