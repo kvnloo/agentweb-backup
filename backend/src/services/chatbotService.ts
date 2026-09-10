@@ -1282,6 +1282,43 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1819: the most recent REAL (non-auto-continuation) user message's content, via
+   * a bounded, reverse-sorted query — not a full `getChatSession` hydration. Used by the
+   * work-plan auto-continuation stop-check, which needs to know whether the user's last
+   * actual instruction asked to stop, without paying the cost of the full message-table
+   * read/migration `getChatSession` performs (same reasoning as `getSessionPreview` and
+   * `getChatSessionRecord` above). `sessionId`(HASH)+`messageIndex`(RANGE) makes
+   * `ScanIndexForward: false` a direct, correct reverse-index read, not a scan.
+   *
+   * A server-injected auto-continuation directive is itself persisted as a `role: 'user'`
+   * message (see `AUTO_WORK_PLAN_CONTINUATION_MESSAGE`) so it is INDISTINGUISHABLE from a
+   * real user turn by role alone — it must be excluded by `metadata.kind` or a stale
+   * "stop" verdict from 2 rounds ago would keep re-triggering forever. `Limit: 20` is a
+   * generous bound: a real user message this recent should be within the last handful of
+   * auto-continuation rounds (`AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS` is single digits).
+   */
+  async getMostRecentRealUserMessage(sessionId: string, consistentRead = false): Promise<{ content: string; timestamp?: string } | null> {
+    try {
+      const result = await dynamodb.query({
+        TableName: this.messagesTableName,
+        KeyConditionExpression: 'sessionId = :sessionId',
+        ExpressionAttributeValues: { ':sessionId': sessionId },
+        ScanIndexForward: false,
+        Limit: 20,
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      }).promise();
+      const realUser = (result.Items || []).find((item: any) =>
+        item.message?.role === 'user' && item.message?.metadata?.kind !== 'auto-continuation'
+      );
+      if (!realUser?.message?.content) return null;
+      return { content: realUser.message.content as string, timestamp: realUser.message?.metadata?.timestamp };
+    } catch (error) {
+      console.error(`ChatbotDB: getMostRecentRealUserMessage failed for session ${sessionId}:`, error);
+      return null;
+    }
+  }
+
   // Get messages from AW-ChatMessages table
   async getMessagesFromMessagesTable(sessionId: string, consistentRead = false): Promise<ChatMessage[]> {
     const params = {

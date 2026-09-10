@@ -1471,6 +1471,52 @@ async function scheduleAutoMediaContinuation(
     });
 }
 
+// ENG-1819: LLM-judge check for whether the user's most recent REAL message explicitly
+// asked the assistant to stop / not do more work this turn, so auto-continuation can honor
+// it instead of firing anyway. Pure LLM classifier, no regex fast-path — unlike
+// scheduledTurnDefersToUser's opposite-direction check (where a false-negative just costs
+// one extra retry), a false-negative here means silently disobeying an explicit user
+// instruction, which is worse than the extra LLM call. A regex would also false-positive on
+// unrelated content that merely mentions "stop" non-instructionally. Fails SAFE: any
+// error/timeout returns `false` (do NOT suppress), preserving ENG-1684's original guarantee
+// that a stalled autocomplete plan always gets its continuation even if this classifier
+// itself is broken.
+const STOP_REQUEST_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+const STOP_REQUEST_JUDGE_TIMEOUT_MS = 8000;
+const STOP_REQUEST_JUDGE_SYSTEM = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+Decide whether the user's message explicitly asks the assistant to STOP or to NOT do any more work right now — as opposed to a normal instruction, question, or request to continue/proceed.
+
+Answer "yes" when the message clearly asks to halt, pause, wait, not continue, or do no further work without being asked again — even if phrased casually ("that's enough for now", "hold off", "don't keep going").
+
+Answer "no" for everything else, including ordinary requests, questions, corrections, or instructions that do not ask the assistant to stop.
+
+Reply with ONLY one word: yes or no.`;
+
+async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> {
+  try {
+    const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+    if (!recent?.content) return false;
+    const llmPromise = agentModeService.callLLM(
+      STOP_REQUEST_JUDGE_MODEL,
+      [
+        { role: 'system', content: STOP_REQUEST_JUDGE_SYSTEM },
+        { role: 'user', content: recent.content.slice(0, 2500) },
+      ],
+      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
+    );
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
+    );
+    const res: any = await Promise.race([llmPromise, timeoutPromise]);
+    const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+    return raw.startsWith('yes');
+  } catch (err) {
+    console.error(`AgentMode: work-plan auto-continuation stop-request judge failed for session ${sessionId}:`, err);
+    return false; // fail-safe: never suppress a continuation on judge failure
+  }
+}
+
 /**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
  * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
@@ -1589,6 +1635,40 @@ async function scheduleAutoWorkPlanContinuation(
     (!currentSession?.workPlan?.autocomplete
       || !workPlanHasUnfinishedAutocompleteWork(currentSession.workPlan, currentSession.calledFunctions))
   ) {
+    autoContinuationSessions.delete(sessionId);
+    releaseSessionGeneration(sessionId);
+    return;
+  }
+
+  // ENG-1819: honor an explicit "stop" instruction instead of firing anyway. Re-evaluated
+  // fresh on every round (this function re-reads session state each time it's called), so a
+  // user who says "stop" mid-chain is caught on the very next round automatically. Checked
+  // only here, on the rare already-decided-to-continue path — not on every ordinary turn.
+  if (await userExplicitlyRequestedStop(sessionId)) {
+    console.log(
+      `AgentMode: work-plan auto-continuation for session ${sessionId} suppressed — user's ` +
+      `most recent message explicitly asked to stop.`
+    );
+    const stoppedMsg =
+      `⏸️ Got it — pausing here since you asked me to stop. This work plan is paused, not ` +
+      `abandoned; whenever you're ready, just say so and I'll pick up right where it left off.`;
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content: stoppedMsg,
+      timestamp: new Date().toISOString(),
+      metadata: { timestamp: new Date().toISOString(), kind: 'work-plan-auto-continuation-stopped' },
+    }).catch((persistErr) =>
+      console.error('AgentMode: failed to persist work-plan-auto-continuation-stopped message:', persistErr),
+    );
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: { role: 'assistant', content: stoppedMsg },
+      });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit work-plan-auto-continuation-stopped message for session ${sessionId}:`, emitErr);
+    }
     autoContinuationSessions.delete(sessionId);
     releaseSessionGeneration(sessionId);
     return;
