@@ -666,6 +666,34 @@ createTestAccount().then(async () => {
         console.error('[ActivationCron] Failed to initialize:', error);
       }
 
+      // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
+      // Three landing pages sat unreachable while every record read healthy, one of them
+      // unreported for months, because nothing ever asked whether the site loads.
+      //
+      // Hourly, not daily: a page that stops serving should surface the same working day, and
+      // a run of consecutive failures is what promotes a "suspect" domain to unhealthy — at a
+      // daily cadence that confirmation would take three days.
+      try {
+        const REACHABILITY_INTERVAL_MS = 60 * 60 * 1000;
+        const { runDomainReachabilitySweep } = await import('./cron/domainReachabilityCron');
+
+        // Deliberately not run at boot: a deploy restarts instances, and probing every domain
+        // on every restart is both noisy and a way to accumulate failures during a rollout.
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+            .catch(e => console.error('[DomainReachability] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+              .catch(e => console.error('[DomainReachability] Error:', e));
+          }, REACHABILITY_INTERVAL_MS);
+        }, 10 * 60 * 1000);
+        console.log('[DomainReachability] Initialized — first sweep in 10 min, then hourly');
+      } catch (error) {
+        console.error('[DomainReachability] Failed to initialize:', error);
+      }
+
 
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
       // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run

@@ -32,6 +32,7 @@ import { projectMonth } from "../services/spendProjection";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { userDb } from "../services/db";
+import { resolveBillingUserId } from "../services/tokenUsageService";
 
 const router = express.Router();
 
@@ -53,15 +54,32 @@ router.get(
   isAdmin,
   async (req: AuthRequest, res: Response) => {
     try {
-      const { billingUserId } = req.params as { billingUserId: string };
+      const { billingUserId: requestedUserId } = req.params as { billingUserId: string };
       const month = String(req.query.month || "");
 
-      if (!BILLING_USER_ID_RE.test(billingUserId)) {
+      if (!BILLING_USER_ID_RE.test(requestedUserId)) {
         return res.status(400).json({ error: "billingUserId is not a valid identifier" });
       }
       if (!MONTH_RE.test(month)) {
         return res.status(400).json({ error: "month must be YYYY-MM with a real month" });
       }
+
+      // Resolve to the billing ROOT before reading the ledger (ENG-1838).
+      //
+      // Spend events are partitioned by billingUserId and buildSpendBreakdown
+      // filters on it exactly, so an org MEMBER's id matches nothing and the
+      // response is a complete, well-formed, entirely empty breakdown. That is
+      // the worst possible failure here: the screen exists to explain a pause,
+      // and it would answer "this account has spent nothing" about an account
+      // that has spent plenty.
+      //
+      // Nothing upstream guarantees the caller holds a billing root — the admin
+      // cost tables are keyed by the ACTING user (usageAnalyticsService groups
+      // topUsers on `item.userId`), so drilling in from one hands this route a
+      // member id routinely. Resolving is a no-op for a root and correct for a
+      // member, and it uses the same predicate the live gate bills through, so
+      // the two cannot disagree about who pays.
+      const billingUserId = await resolveBillingUserId(requestedUserId);
 
       // The GSI is keyed on occurredAt, so the range is the calendar month.
       // `-31` is safe for every month: it is an upper bound on a string
@@ -84,6 +102,10 @@ router.get(
 
       return res.json({
         ...breakdown,
+        // Echoed so the UI can say WHOSE ledger this is when the two differ —
+        // an admin who opened a member must see they are reading the org's
+        // spend, not that member's.
+        requestedUserId,
         allowance,
         projection,
         // §7: "no admin should need direct DynamoDB inspection to explain a pause"
