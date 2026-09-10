@@ -54,7 +54,20 @@ async function scanAll(table: string): Promise<any[]> {
  *
  * Pure and exported so the scoping rule is testable without AWS.
  */
-export function selectDomainsToProbe(domains: any[], pages: any[]): any[] {
+/**
+ * How recently a domain must have been checked for this sweep to skip it.
+ *
+ * Slightly under the 24h cadence so a run that fires a few minutes early — clock drift, a
+ * restart, a slow previous sweep — does not skip a whole day.
+ */
+export const MIN_RECHECK_INTERVAL_MS = 20 * 60 * 60 * 1000;
+
+export function selectDomainsToProbe(
+  domains: any[],
+  pages: any[],
+  now: number = Date.now(),
+  minRecheckMs: number = MIN_RECHECK_INTERVAL_MS
+): any[] {
   const deployedHosts = new Set<string>();
   // Deployed pages that store NO url. Their working URL comes from the domain row itself
   // (assignManagedSubdomain persists the page url in a separate write that can fail), so
@@ -78,6 +91,29 @@ export function selectDomainsToProbe(domains: any[], pages: any[]): any[] {
   return domains.filter(
     (d) =>
       d.domain &&
+      /*
+       * Already checked within this period → skip. This is what makes the sweep safe to run
+       * more than once per period, and it replaces the coordination a lock would otherwise
+       * need. Three things fall out of it:
+       *
+       *   - MULTI-INSTANCE. The cron is an in-process interval, so every instance runs its
+       *     own. `consecutiveFailures` is read-then-set, not an atomic ADD, so two instances
+       *     firing minutes apart would advance a domain's counter twice in one period and trip
+       *     the confirmation threshold early — telling a customer their site is down on the
+       *     strength of fewer real days of failure than the threshold claims.
+       *   - RESTARTS. A deploy or crash-loop restarts the timer; without this, each restart
+       *     re-probes every domain. That was previously papered over with a 10-minute boot
+       *     delay, which only narrowed the window.
+       *   - PARTIAL SWEEPS. If a sweep dies halfway, the domains it never stamped are still
+       *     due, so the next run picks up exactly the remainder. Self-healing, no lease to
+       *     expire or leak.
+       *
+       * A missing timestamp means never checked, which is always due.
+       */
+      (() => {
+        const last = d.lastReachabilityCheckAt ? Date.parse(d.lastReachabilityCheckAt) : NaN;
+        return Number.isNaN(last) || now - last >= minRecheckMs;
+      })() &&
       // Only domains Vercel considers verified. A custom domain sitting at
       // `pending_verification` because the customer has not pointed DNS yet WILL fail a probe,
       // and that failure is expected — the same reasoning that excludes not-yet-deployed pages.

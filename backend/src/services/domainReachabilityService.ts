@@ -29,8 +29,23 @@
  */
 import https from "https";
 
-/** Consecutive ambiguous failures before a domain is believed unreachable. */
-export const UNREACHABLE_CONFIRMATIONS = 3;
+/**
+ * Consecutive ambiguous failures before a domain is believed unreachable.
+ *
+ * TWO, paired with the daily sweep cadence — so a domain is reported after roughly two days of
+ * continuous failure. It was three while the sweep ran hourly, where three strikes bought only
+ * three hours of evidence and a single bad afternoon could produce them.
+ *
+ * Consecutive DAILY failures are much stronger evidence than consecutive hourly ones: two
+ * probes a full day apart cannot both be caught by the same transient incident, so a lower
+ * count buys more confidence here, not less. Raising it to three would only add a day of a
+ * customer staring at a page that does not load.
+ *
+ * The output is a passive banner in the customer's portal, not an alert — nothing pages anyone
+ * — so the cost of being a day late is a day of silence, and the cost of being wrong is a
+ * customer told their working site is broken. Two balances those.
+ */
+export const UNREACHABLE_CONFIRMATIONS = 2;
 /** Per-probe timeout. A hung socket must not accumulate. */
 export const PROBE_TIMEOUT_MS = 8000;
 
@@ -134,8 +149,24 @@ export function probeDomain(
       }
     };
 
+    /*
+     * Identify ourselves. A header-less HEAD from an unknown IP is exactly the shape a WAF or
+     * bot-protection layer is built to refuse, and a 503 from Cloudflare counts as a failed
+     * probe here — so an anonymous prober can conclude that a perfectly healthy customer site
+     * is unreachable, and say so to its owner. A real User-Agent with a contact URL means an
+     * operator seeing this traffic can identify and allow it instead of blocking it.
+     */
     const req = https.request(
-      { host: domain, path: "/", method: "HEAD", timeout: timeoutMs },
+      {
+        host: domain,
+        path: "/",
+        method: "HEAD",
+        timeout: timeoutMs,
+        headers: {
+          "User-Agent": "AgentWeb-DomainMonitor/1.0 (+https://agentweb.pro; uptime check)",
+          Accept: "*/*",
+        },
+      },
       (res) => {
         const status = res.statusCode ?? 0;
         res.resume(); // drain so the socket can be released
