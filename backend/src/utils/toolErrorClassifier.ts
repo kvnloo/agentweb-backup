@@ -111,15 +111,21 @@ function classFromMessage(message: string): string | null {
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
   if (/these skills are currently unavailable to install/.test(m)) return 'tool_unavailable';
   /*
-   * The entitlement sentence needs the same protection, and for the same reason. It was left
-   * to the generic pattern further down, below the embedded-status regex — so a real published
-   * skillId beginning with a "500"/"404"/"403"-shaped token classified `upstream_5xx` /
-   * `not_found` / `auth`. `upstream_5xx` is RETRYABLE, which appends "Wait briefly, then retry
-   * ONCE" beneath a permanent billing refusal. Lower likelihood than the unresolved case (these
-   * ids are admin-authored, not model-invented) but the identical defect, so it is closed here
-   * rather than left as the one unguarded quarter.
+   * The entitlement sentence needs the same protection, and for the same reason: a published
+   * skillId beginning with a "500"/"404"/"403"-shaped token would otherwise be caught by the
+   * embedded-status regex below and classified `upstream_5xx` / `not_found` / `auth`.
+   * `upstream_5xx` is RETRYABLE, appending "Wait briefly, then retry ONCE" beneath a permanent
+   * billing refusal.
+   *
+   * ANCHORED to our own full sentence, unlike the generic phrasing kept at its original
+   * position further down. "not available with your current subscription" is ordinary vendor
+   * English, not a string we own — matching it here would promote it above the read-bounded and
+   * ad-account guards that this file deliberately orders for truthfulness, and would reclassify
+   * a vendor 403 ("...status code 403: this feature is not available with your current
+   * subscription") from `auth` to `subscription_blocked`, telling the model to say the
+   * capability is off the user's plan instead of to reconnect the account.
    */
-  if (/not available with your current subscription|capability is not on their plan/.test(m)) {
+  if (/the requested skills are not available with your current subscription/.test(m)) {
     return 'subscription_blocked';
   }
 
@@ -231,8 +237,11 @@ function classFromMessage(message: string): string | null {
   if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
-  // (The subscription pattern that lived here now runs at the top of this function, with the
-  // other install_skills markers — see the ENG-1795 block for why order is load-bearing.)
+  // Generic vendor phrasing, kept exactly where it has always been — BELOW the embedded-status
+  // and ad-account guards, so a "403 ... not available with your current subscription" still
+  // classifies `auth`. Our own refusal is anchored and matched at the top of this function
+  // instead; the two are deliberately separate (ENG-1795).
+  if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';
 
