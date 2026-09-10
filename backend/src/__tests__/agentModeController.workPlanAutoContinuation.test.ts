@@ -21,6 +21,7 @@ import {
   AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS,
 } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { checkTokenUsage } from '../services/tokenUsageService';
@@ -36,6 +37,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
     getChatSessionRecord: jest.fn(),
+    getMostRecentRealUserMessage: jest.fn(),
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -63,6 +65,7 @@ jest.mock('../services/agentModeService', () => ({
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
     getSkillsForDisplay: jest.fn().mockResolvedValue([]),
+    callLLM: jest.fn(),
   },
   AgentModeService: jest.fn(),
 }));
@@ -124,6 +127,8 @@ const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 // `emitProgress(..., {status:'complete'})` then `progressStore.delete(sessionId)`).
 const mockProgressStoreDelete = (progressStore as any).delete as jest.Mock;
 const mockRequestCancel = requestCancel as jest.Mock;
+const mockGetMostRecentRealUserMessage = (mockChatbotDb as any).getMostRecentRealUserMessage as jest.Mock;
+const mockCallLLM = (agentModeService as any).callLLM as jest.Mock;
 
 describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1700/ENG-1699)', () => {
   const mockUserId = 'user-workplan-stall';
@@ -213,6 +218,11 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     mockChatbotDb.getChatSession.mockResolvedValue(baseSession(stalledWorkPlan) as any);
     (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(stalledWorkPlan) as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    // ENG-1819: no real user message found by default -- userExplicitlyRequestedStop
+    // short-circuits to false WITHOUT calling callLLM at all (see its own null-guard), so
+    // every pre-existing test above is unaffected by this new check unless it opts in.
+    mockGetMostRecentRealUserMessage.mockResolvedValue(null);
+    mockCallLLM.mockResolvedValue({ choices: [{ message: { content: 'no' } }] });
     mockChatbotDb.addMessageToSession.mockResolvedValue(baseSession(stalledWorkPlan) as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
@@ -592,6 +602,115 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
       expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
 
       consoleErrorSpy.mockRestore();
+    });
+  });
+
+  describe('ENG-1819: honors an explicit user "stop" request instead of firing anyway', () => {
+    it('suppresses the continuation and posts a visible pause message when the judge says the user asked to stop', async () => {
+      mockGetMostRecentRealUserMessage.mockResolvedValue({
+        content: 'stop, do not do any more work this turn',
+        timestamp: '2026-09-10T09:00:00Z',
+      });
+      mockCallLLM.mockResolvedValue({ choices: [{ message: { content: 'yes' } }] });
+      mockWorkerService.runInWorker.mockResolvedValueOnce(
+        workerResponse('Step 6 was interrupted.', [failedToolCall()]),
+      );
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+
+      await flush();
+
+      // No continuation round fired.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({
+          role: 'assistant',
+          content: expect.stringMatching(/pausing|stopping/i),
+          metadata: expect.objectContaining({ kind: 'work-plan-auto-continuation-stopped' }),
+        }),
+      );
+      expect(mockIoEmit).toHaveBeenCalledWith(
+        'session-message-appended',
+        expect.objectContaining({
+          sessionId: mockSessionId,
+          message: expect.objectContaining({ content: expect.stringMatching(/pausing|stopping/i) }),
+        }),
+      );
+      // Cleaned up exactly like every other bail-out branch in this function.
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
+    });
+
+    it('still continues normally when the user\'s most recent message does not ask to stop (no regression of ENG-1684)', async () => {
+      mockGetMostRecentRealUserMessage.mockResolvedValue({
+        content: 'can you also check the competitor pricing page',
+        timestamp: '2026-09-10T09:00:00Z',
+      });
+      mockCallLLM.mockResolvedValue({ choices: [{ message: { content: 'no' } }] });
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse('Steps 1-5 are done. Step 6 (HTML report) was interrupted.', [failedToolCall()]),
+        )
+        .mockImplementationOnce(async () => {
+          mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          return workerResponse('Report generated.', []);
+        });
+
+      await agentModeController.generateResponse(makeReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ metadata: expect.objectContaining({ kind: 'work-plan-auto-continuation-stopped' }) }),
+      );
+    });
+
+    it('fails safe (still continues) when the stop-judge itself errors', async () => {
+      mockGetMostRecentRealUserMessage.mockResolvedValue({
+        content: 'stop for now',
+        timestamp: '2026-09-10T09:00:00Z',
+      });
+      mockCallLLM.mockRejectedValue(new Error('judge model unavailable'));
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse('Steps 1-5 are done. Step 6 (HTML report) was interrupted.', [failedToolCall()]),
+        )
+        .mockImplementationOnce(async () => {
+          mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          return workerResponse('Report generated.', []);
+        });
+
+      await agentModeController.generateResponse(makeReq(), makeRes());
+      await flush();
+
+      // ENG-1684's original guarantee holds even though the new classifier is broken.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    });
+
+    it('fails safe (still continues) when no real user message can be found at all', async () => {
+      mockGetMostRecentRealUserMessage.mockResolvedValue(null);
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse('Steps 1-5 are done. Step 6 (HTML report) was interrupted.', [failedToolCall()]),
+        )
+        .mockImplementationOnce(async () => {
+          mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+          return workerResponse('Report generated.', []);
+        });
+
+      await agentModeController.generateResponse(makeReq(), makeRes());
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      // The judge must never even reach the LLM call when there's no real message to judge.
+      expect(mockCallLLM).not.toHaveBeenCalled();
     });
   });
 });
