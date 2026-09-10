@@ -6,7 +6,7 @@
  * tuned out, which is the same way the original bug survived — everything read healthy, so
  * nobody looked. Inverting that to "everything reads unhealthy" fails identically.
  */
-import { selectDomainsToProbe } from "../cron/domainReachabilityCron";
+import { selectDomainsToProbe, MIN_RECHECK_INTERVAL_MS } from "../cron/domainReachabilityCron";
 
 const dom = (id: string, domain: string, over: Record<string, any> = {}) =>
   ({ id, domain, vercelProjectId: "p", status: "active", ...over });
@@ -100,5 +100,63 @@ describe("selectDomainsToProbe", () => {
       { status: "deployed", customDomainUrl: "https://shared.agentwebforms.com/b" },
     ];
     expect(selectDomainsToProbe(domains, pages)).toHaveLength(1);
+  });
+});
+
+/*
+ * The period guard. This is what makes the sweep safe to run more than once per period, and it
+ * stands in for the coordination a distributed lock would otherwise need — the cron is an
+ * in-process interval, so EVERY instance runs its own copy.
+ */
+describe("selectDomainsToProbe — recheck interval", () => {
+  const NOW = Date.parse("2026-09-10T06:15:00.000Z");
+  const deployedPages = [{ status: "deployed", customDomainUrl: "https://a.agentwebforms.com" }];
+  const at = (msAgo: number) =>
+    dom("d1", "a.agentwebforms.com", {
+      lastReachabilityCheckAt: new Date(NOW - msAgo).toISOString(),
+    });
+
+  it("probes a domain that has never been checked", () => {
+    expect(selectDomainsToProbe([dom("d1", "a.agentwebforms.com")], deployedPages, NOW)).toHaveLength(1);
+  });
+
+  it("skips a domain already checked this period", () => {
+    expect(selectDomainsToProbe([at(60 * 60 * 1000)], deployedPages, NOW)).toHaveLength(0);
+  });
+
+  it("probes again once the interval has elapsed", () => {
+    expect(selectDomainsToProbe([at(MIN_RECHECK_INTERVAL_MS + 1000)], deployedPages, NOW)).toHaveLength(1);
+  });
+
+  it("treats an unparseable timestamp as never checked rather than skipping forever", () => {
+    // Failing open matters: skipping on a bad value would silently retire a domain from
+    // monitoring with no error anywhere.
+    const bad = dom("d1", "a.agentwebforms.com", { lastReachabilityCheckAt: "not-a-date" });
+    expect(selectDomainsToProbe([bad], deployedPages, NOW)).toHaveLength(1);
+  });
+
+  it("a SECOND instance sweeping minutes later selects nothing", () => {
+    /*
+     * The multi-instance case, concretely. `consecutiveFailures` is read-then-set, not an
+     * atomic ADD, so a second instance running after the first would read the freshly-written
+     * count and advance it again — tripping the confirmation threshold on fewer real days of
+     * failure than the threshold claims, and telling a customer their site is down early.
+     */
+    const afterFirstSweep = [at(0)];
+    const fiveMinutesLater = NOW + 5 * 60 * 1000;
+    expect(selectDomainsToProbe(afterFirstSweep, deployedPages, fiveMinutesLater)).toHaveLength(0);
+  });
+
+  it("picks up exactly the remainder when a previous sweep died partway", () => {
+    // Self-healing, and the reason this is better than a lease: no lock to expire or leak.
+    const domains = [
+      at(0),                                                        // stamped before the crash
+      dom("d2", "b.agentwebforms.com"),                             // never reached
+    ];
+    const pages = [
+      { status: "deployed", customDomainUrl: "https://a.agentwebforms.com" },
+      { status: "deployed", customDomainUrl: "https://b.agentwebforms.com" },
+    ];
+    expect(selectDomainsToProbe(domains, pages, NOW + 60_000).map((d) => d.id)).toEqual(["d2"]);
   });
 });

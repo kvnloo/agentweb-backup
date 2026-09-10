@@ -77,6 +77,34 @@ describe("decideFromVerdict — a single blip must not reach the customer", () =
  *
  * Nothing pinned this before, so moving a code between the two tables was a silent change.
  */
+/*
+ * Pins the VALUE, not just the mechanism.
+ *
+ * Every other threshold test here is written relative to UNREACHABLE_CONFIRMATIONS so it does
+ * not break when the number changes — which is right, but it means they all stay green at
+ * `999`, a setting under which no ambiguous failure is ever reported and the monitor is
+ * silently dead. A relative test cannot catch a defeated monitor; only an absolute bound can.
+ *
+ * The bound is a product decision, not an implementation detail: the sweep runs DAILY, and a
+ * customer whose page has stopped serving should be told within about two days. Confirmations
+ * multiplied by cadence is that promise, so it is asserted directly.
+ */
+describe("detection latency — the monitor must actually report", () => {
+  const SWEEP_INTERVAL_DAYS = 1; // server.ts schedules this daily at 06:15 UTC
+  const MAX_ACCEPTABLE_DAYS = 2;
+
+  it("confirms an unreachable domain within the agreed window", () => {
+    expect(UNREACHABLE_CONFIRMATIONS).toBeGreaterThanOrEqual(2); // one blip must never be enough
+    expect(UNREACHABLE_CONFIRMATIONS * SWEEP_INTERVAL_DAYS).toBeLessThanOrEqual(MAX_ACCEPTABLE_DAYS);
+  });
+
+  it("keeps the first failure silent", () => {
+    // The whole point of a threshold: a single bad probe never reaches the customer.
+    const suspectVerdict = verdictForCode("ECONNRESET");
+    expect(decideFromVerdict(suspectVerdict, 0).nextStatus).toBeNull();
+  });
+});
+
 describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitive", () => {
   const proberFaultCodes = [
     ["CERT_HAS_EXPIRED", "forward clock skew expires every certificate at once"],
@@ -94,9 +122,17 @@ describe("SUSPECT vs DEFINITIVE — only remote-caused failures may be definitiv
     (code) => {
       const verdict = verdictForCode(code);
       expect(verdict.state).toBe("suspect");
-      // Must survive two rounds without telling the customer anything.
-      expect(decideFromVerdict(verdict, 0).nextStatus).toBeNull();
-      expect(decideFromVerdict(verdict, 1).nextStatus).toBeNull();
+      /*
+       * Expressed relative to the threshold, not against a hardcoded count. Written as
+       * `(verdict, 1)` this asserted "still silent after two failures", which was true at a
+       * threshold of 3 and became false the moment it moved to 2 — a test that reads as a
+       * safety property but is really pinning the old constant.
+       */
+      for (let prior = 0; prior < UNREACHABLE_CONFIRMATIONS - 1; prior++) {
+        expect(decideFromVerdict(verdict, prior).nextStatus).toBeNull();
+      }
+      // ...and only the final consecutive failure commits it.
+      expect(decideFromVerdict(verdict, UNREACHABLE_CONFIRMATIONS - 1).nextStatus).toBe("error");
     }
   );
 
