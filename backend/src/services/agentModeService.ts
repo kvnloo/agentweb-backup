@@ -2665,11 +2665,9 @@ export class AgentModeService {
     // Transport: OpenRouter BYOK → our own Azure resource
     // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
     // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
-    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
-    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
-    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
-    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
-    // with Sol on the same path.
+    // day: response provider "Azure", usage.is_byok true, and an exact
+    // upstream inference cost. AgentMode meters that upstream value for BYOK
+    // calls so OpenRouter's long-context pricing overrides remain accurate.
     // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
     // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
     // Deliberately NO `family`: Astra and Sol are distinct product lines;
@@ -3161,9 +3159,15 @@ export class AgentModeService {
               cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               cacheWriteByTtl: usage.cache_creation_by_ttl,
               costUsdOverride:
-                usage.is_byok !== true && typeof usage.cost === 'number'
-                  ? usage.cost
-                  : undefined,
+                usage.is_byok === true
+                  ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                    Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                    usage.cost_details.upstream_inference_cost > 0
+                    ? usage.cost_details.upstream_inference_cost
+                    : undefined
+                  : typeof usage.cost === 'number'
+                    ? usage.cost
+                    : undefined,
             });
           }
         } catch {
