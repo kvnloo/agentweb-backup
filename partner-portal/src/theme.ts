@@ -34,7 +34,7 @@ const theme = createTheme({
       main: BRAND.dustyRed,
       light: '#CBA3AA',
       dark: '#A66F79',
-      contrastText: '#FFFFFF',
+      contrastText: '#111827',
     },
     warning: {
       main: BRAND.sunset,
@@ -42,7 +42,7 @@ const theme = createTheme({
     },
     success: {
       main: '#5C8A7E',
-      contrastText: '#FFFFFF',
+      contrastText: '#111827',
     },
     info: {
       main: BRAND.mutedPurple,
