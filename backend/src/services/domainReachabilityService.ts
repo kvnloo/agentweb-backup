@@ -51,15 +51,43 @@ const DEFINITIVE: Record<string, string> = {
   // ENOTFOUND is deliberately NOT here. A domain attached moments ago has not propagated yet,
   // and flipping it to unreachable on the first probe is precisely the false positive the
   // threshold exists to prevent. It goes through SUSPECT like any other transient condition.
+  //
+  // Only ONE code qualifies as definitive, and the test is not "how sure does this sound" but
+  // "could OUR side manufacture it?" A hostname mismatch is a statement about what the remote
+  // certificate CONTAINS. Our clock cannot fabricate it, our trust store cannot fabricate it,
+  // and an intercepting proxy would not — a proxy mints a certificate FOR the hostname it was
+  // asked for, so interception shows up as a trust-chain failure, not an altname failure.
   ERR_TLS_CERT_ALTNAME_INVALID: "The SSL certificate does not cover this domain.",
-  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
-  DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
-  SELF_SIGNED_CERT_IN_CHAIN: "The SSL certificate is not trusted.",
-  UNABLE_TO_VERIFY_LEAF_SIGNATURE: "The SSL certificate could not be verified.",
 };
 
 const SUSPECT: Record<string, string> = {
   ENOTFOUND: "The domain does not resolve in DNS.",
+  /*
+   * Certificate TRUST and VALIDITY failures live here, not in DEFINITIVE, because every one of
+   * them is producible by a fault on OUR side and is indistinguishable from the remote cause at
+   * the socket:
+   *
+   *   CERT_HAS_EXPIRED               ← forward clock skew on the prober expires every
+   *                                    certificate on the internet simultaneously
+   *   DEPTH_ZERO_SELF_SIGNED_CERT    ← a TLS-intercepting egress proxy
+   *   SELF_SIGNED_CERT_IN_CHAIN      ← the same
+   *   UNABLE_TO_VERIFY_LEAF_SIGNATURE ← a missing or broken CA trust store
+   *                                    (NODE_EXTRA_CA_CERTS, a ca-certificates regression)
+   *
+   * They were DEFINITIVE, and `decideFromVerdict` commits an `unreachable` verdict BEFORE
+   * consulting the threshold — so a single sweep under any of those faults would have told
+   * every customer in the product that their own site's certificate is untrusted. A monitor
+   * that cries wolf gets tuned out, which is the same way the bug this service exists to catch
+   * survived unnoticed in the first place.
+   *
+   * The cost is real and accepted: a genuinely expired customer certificate now takes three
+   * hourly rounds to report instead of one. Against pages that sat broken for months, three
+   * hours is not the expensive direction to be wrong in.
+   */
+  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
+  DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
+  SELF_SIGNED_CERT_IN_CHAIN: "The SSL certificate is not trusted.",
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: "The SSL certificate could not be verified.",
   ECONNRESET:
     "The connection closed during the SSL handshake — the site has no usable certificate.",
   EPROTO: "The SSL handshake failed.",
@@ -68,6 +96,24 @@ const SUSPECT: Record<string, string> = {
   TIMEOUT: "The server did not respond.",
   EAI_AGAIN: "DNS lookup failed temporarily.",
 };
+
+/**
+ * Which side of the SUSPECT/DEFINITIVE boundary a socket error falls on.
+ *
+ * Exported so the boundary itself is testable. It is a SAFETY boundary, not a confidence one:
+ * `decideFromVerdict` commits an `unreachable` verdict before consulting the confirmation
+ * threshold, so anything definitive reaches the customer on the FIRST probe. The membership
+ * test is therefore "could our own infrastructure manufacture this code?", never "how
+ * conclusive does it sound" — a code we can produce ourselves has fleet-wide blast radius.
+ *
+ * Unknown codes fall to suspect: an unrecognised failure is not evidence of a broken site.
+ */
+export function verdictForCode(code: string): ReachabilityVerdict {
+  if (DEFINITIVE[code]) {
+    return { state: "unreachable", definitive: true, reason: DEFINITIVE[code], code };
+  }
+  return { state: "suspect", reason: SUSPECT[code] ?? "The site could not be reached.", code };
+}
 
 /**
  * Probe one domain. Never throws — every outcome is a verdict.
@@ -113,16 +159,7 @@ export function probeDomain(
     });
 
     req.on("error", (err: NodeJS.ErrnoException) => {
-      const code = err.code ?? "UNKNOWN";
-      if (DEFINITIVE[code]) {
-        done({ state: "unreachable", definitive: true, reason: DEFINITIVE[code], code });
-        return;
-      }
-      done({
-        state: "suspect",
-        reason: SUSPECT[code] ?? "The site could not be reached.",
-        code,
-      });
+      done(verdictForCode(err.code ?? "UNKNOWN"));
     });
 
     req.end();

@@ -117,12 +117,18 @@ async function mapLimit<T, R>(
  * customer their page is unreachable. A monitor that cries wolf gets tuned out, which is the
  * same way the original bug survived.
  *
- * Not fixed here, deliberately, because the blast radius is already bounded: every error code
- * such an outage produces — ENOTFOUND, ECONNRESET, ECONNREFUSED, ETIMEDOUT, EAI_AGAIN,
- * TIMEOUT — is classified SUSPECT, never DEFINITIVE, and unknown codes default to suspect too.
- * So nothing is shown to any customer until THREE consecutive hourly rounds have failed. A
- * transient outage self-heals long before that, and a three-hour total egress failure is an
- * incident someone is already looking at.
+ * Not fixed here, deliberately, because the blast radius is bounded by the SUSPECT/DEFINITIVE
+ * split: every failure a prober-side fault can produce is classified SUSPECT, so nothing
+ * reaches a customer until THREE consecutive hourly rounds have failed. A transient outage
+ * self-heals long before that, and a three-hour total egress failure is an incident someone is
+ * already looking at.
+ *
+ * That bound is only true because the certificate trust/validity codes were MOVED to SUSPECT
+ * (see domainReachabilityService.ts). While they were definitive it was false — and false in
+ * the worst direction, since `decideFromVerdict` commits an unreachable verdict before the
+ * threshold is consulted. One round under an intercepting proxy, a broken CA store, or forward
+ * clock skew would have told the entire customer base their own certificates were untrusted.
+ * If a code is ever promoted back to DEFINITIVE, this paragraph stops being true with it.
  *
  * The real fix is a batch-level guard: if a sweep's failure ratio exceeds ~50%, treat the
  * prober as suspect and skip persisting verdicts for that round. It needs a two-phase
