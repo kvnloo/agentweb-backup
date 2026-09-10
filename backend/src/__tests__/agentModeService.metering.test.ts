@@ -203,10 +203,51 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('falls back to the price book for BYOK usage instead of recording OpenRouter billed cost as economic cost', async () => {
+  it('meters a long-context Astra BYOK call at its upstream inference cost', async () => {
+    const astraModel = 'openrouter/openai/gpt-6-astra';
+    create.mockResolvedValue({
+      id: 'gen-astra-byok',
+      usage: {
+        prompt_tokens: 300_000,
+        completion_tokens: 1_000,
+        cost: 0,
+        is_byok: true,
+        cost_details: { upstream_inference_cost: 6.05 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[astraModel].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(astraModel, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: astraModel,
+        provider: 'openrouter',
+        costUsdOverride: 6.05,
+      })
+    );
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['zero', 0],
+    ['NaN', Number.NaN],
+    ['negative', -1],
+  ])('falls back to the price book when BYOK upstream inference cost is %s', async (_label, upstreamCost) => {
     create.mockResolvedValue({
       id: 'gen-byok',
-      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: true },
+      usage: {
+        prompt_tokens: 9,
+        completion_tokens: 3,
+        cost: 0,
+        is_byok: true,
+        ...(upstreamCost === undefined
+          ? {}
+          : { cost_details: { upstream_inference_cost: upstreamCost } }),
+      },
       choices: [{ message: { content: 'ok' } }],
     });
     (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
