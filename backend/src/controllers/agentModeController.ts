@@ -1187,7 +1187,7 @@ const STILL_BUILDING_MESSAGE =
  * (b) push the result to the user's open session over Socket.IO. Best-effort:
  * any failure is logged, never thrown (this runs detached).
  */
-function attachInProcessCompletion(
+export function attachInProcessCompletion(
   genPromise: Promise<any>,
   pageId: string,
   userId: string,
