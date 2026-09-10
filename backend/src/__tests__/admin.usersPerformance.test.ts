@@ -18,10 +18,13 @@ import adminRoutes from '../routes/admin';
 import { settingsService } from '../services/settingsService';
 
 // Invoke the registered GET handler without opening a listening socket.
-const usersHandler = adminRoutes.stack.find(layer => layer.route?.path === '/users' && layer.route.methods.get)!.route.stack[0].handle;
+const usersRoute = (adminRoutes as any).stack.find(
+  (layer: any) => layer.route?.path === '/users' && layer.route.methods.get
+);
+const usersHandler = usersRoute.route.stack[0].handle;
 async function getAdminUsers() {
   const res = { json: jest.fn(), status: jest.fn().mockReturnThis() };
-  await usersHandler({ query: {} }, res, jest.fn());
+  await usersHandler({ query: {} } as any, res, jest.fn());
   expect(res.status).not.toHaveBeenCalled();
   return res.json.mock.calls[0][0];
 }
