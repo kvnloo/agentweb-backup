@@ -669,13 +669,9 @@ createTestAccount().then(async () => {
       // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
       // Three landing pages sat unreachable while every record read healthy, one of them
       // unreported for months, because nothing ever asked whether the site loads.
-      //
-      // Hourly, not daily: a page that stops serving should surface the same working day, and
-      // a run of consecutive failures is what promotes a "suspect" domain to unhealthy — at a
-      // daily cadence that confirmation would take three days.
       try {
-        const REACHABILITY_INTERVAL_MS = 24 * 60 * 60 * 1000;
-        const { runDomainReachabilitySweep } = await import('./cron/domainReachabilityCron');
+        const { runDomainReachabilitySweep, REACHABILITY_INTERVAL_MS } =
+          await import('./cron/domainReachabilityCron');
 
         /*
          * DAILY at a fixed UTC time, not hourly-from-boot.

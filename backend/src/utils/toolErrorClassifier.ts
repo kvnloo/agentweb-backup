@@ -109,7 +109,7 @@ function classFromMessage(message: string): string | null {
    * would have hidden the ENG-1237 class of defect from the investigate bucket entirely.
    */
   if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
-  if (/these skills are currently unavailable to install/.test(m)) return 'tool_unavailable';
+  if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';
   /*
    * The entitlement sentence needs the same protection, and for the same reason: a published
    * skillId beginning with a "500"/"404"/"403"-shaped token would otherwise be caught by the

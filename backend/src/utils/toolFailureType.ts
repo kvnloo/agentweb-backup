@@ -79,6 +79,15 @@ const CONFIG_RE =
  * @param errorMessage the tool's error message (may be '', undefined)
  */
 export function classifyToolFailureType(errorClass?: string, errorMessage?: string): ToolFailureType {
+  /*
+   * ENG-1795. Deliberately NOT `model_uninstalled_tool` ("not a tool bug; fix the catalog, not
+   * the tool"). The `unavailable` bucket IS a catalog bug — an entitled bundle whose tool pool
+   * emptied out, the ENG-1237 production defect — so routing it to a non-dispatchable type
+   * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
+   * visible, which is where it was under the old single-message behaviour.
+   */
+  if (errorClass === 'skill_install_refused') return 'bug';
+
   const cls = (errorClass || '').toLowerCase();
   const msg = errorMessage || '';
 

@@ -62,6 +62,13 @@ async function scanAll(table: string): Promise<any[]> {
  */
 export const MIN_RECHECK_INTERVAL_MS = 20 * 60 * 60 * 1000;
 
+/**
+ * How often the sweep runs. Declared HERE, not in server.ts, so the detection-latency test can
+ * derive the real cadence rather than hand-copying it — a copied literal keeps the promise
+ * "reported within 2 days" green while the schedule silently moves to weekly.
+ */
+export const REACHABILITY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 export function selectDomainsToProbe(
   domains: any[],
   pages: any[],
@@ -92,9 +99,20 @@ export function selectDomainsToProbe(
     (d) =>
       d.domain &&
       /*
-       * Already checked within this period → skip. This is what makes the sweep safe to run
-       * more than once per period, and it replaces the coordination a lock would otherwise
-       * need. Three things fall out of it:
+       * Already checked within this period → skip. This makes the sweep safe to run more than
+       * once per period. It is NOT a substitute for a lock, and the difference matters:
+       *
+       *   It does nothing for instances sweeping SIMULTANEOUSLY — both scan before either
+       *   writes, so both see the same stale timestamps and both probe. Moving to a fixed
+       *   06:15 UTC schedule (see server.ts) actually makes simultaneous the normal case,
+       *   where boot-relative scheduling used to stagger instances naturally. What saves us
+       *   there is that `consecutiveFailures` is read-then-set: two instances both read the
+       *   same prior and both write prior+1, so the lost update cancels the double-count and
+       *   the counter stays correct. The residual harm is duplicate probe traffic to customer
+       *   origins — the very thing the daily cadence was chosen to reduce — and duplicate
+       *   writes. Real coordination is still owed if this environment ever scales out.
+       *
+       * What the guard does cover:
        *
        *   - MULTI-INSTANCE. The cron is an in-process interval, so every instance runs its
        *     own. `consecutiveFailures` is read-then-set, not an atomic ADD, so two instances
@@ -112,7 +130,12 @@ export function selectDomainsToProbe(
        */
       (() => {
         const last = d.lastReachabilityCheckAt ? Date.parse(d.lastReachabilityCheckAt) : NaN;
-        return Number.isNaN(last) || now - last >= minRecheckMs;
+        // A FUTURE timestamp means the stored value is wrong, not that the domain was checked.
+        // Without `last > now` the subtraction goes negative and the domain is skipped until
+        // wall-clock catches up — one bad write from a skewed clock silently retires it from
+        // monitoring for as long as the skew, with no log and no error: `targets` just gets
+        // shorter. Silence mistaken for health is the exact failure this monitor exists to end.
+        return Number.isNaN(last) || last > now || now - last >= minRecheckMs;
       })() &&
       // Only domains Vercel considers verified. A custom domain sitting at
       // `pending_verification` because the customer has not pointed DNS yet WILL fail a probe,
@@ -186,7 +209,8 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
 
   const targets = selectDomainsToProbe(domains, pages);
   console.log(
-    `[DomainReachability] ${targets.length} of ${domains.length} domain(s) back a deployed page`
+    `[DomainReachability] ${targets.length} of ${domains.length} domain(s) due this run ` +
+      `(in scope and not checked within ${Math.round(MIN_RECHECK_INTERVAL_MS / 3600000)}h)`
   );
 
   await mapLimit(targets, SWEEP_CONCURRENCY, async (rec) => {

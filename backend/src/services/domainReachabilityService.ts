@@ -73,6 +73,25 @@ const DEFINITIVE: Record<string, string> = {
   // and an intercepting proxy would not — a proxy mints a certificate FOR the hostname it was
   // asked for, so interception shows up as a trust-chain failure, not an altname failure.
   ERR_TLS_CERT_ALTNAME_INVALID: "The SSL certificate does not cover this domain.",
+  /*
+   * Expiry is definitive too, and the reason it is separated from the three trust-chain codes
+   * below is worth stating, because it was previously grouped WITH them and that shipped a
+   * latency regression.
+   *
+   * The concern was that forward clock skew on the prober expires every certificate at once.
+   * It cannot reach this code path: `runDomainReachabilitySweep` scans DynamoDB BEFORE any
+   * probe, on an aws-sdk v2 client with `correctClockSkew` unset (its default is false), and
+   * SigV4 rejects a request more than ~5 minutes off server time with RequestTimeTooSkewed. A
+   * prober skewed by days therefore throws on the scan and never probes anything. Skew small
+   * enough to pass SigV4 (<5 min) can only expire a certificate that was within 5 minutes of
+   * expiring anyway — a true positive, minutes early.
+   *
+   * That argument does NOT transfer to the trust-chain codes: an egress proxy or a CA
+   * regression breaks TLS without breaking SigV4, so those stay suspect. Grouping expiry with
+   * them cost two days of a customer staring at a browser interstitial on their own site, to
+   * defend against a fault this code path is structurally immune to.
+   */
+  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
 };
 
 const SUSPECT: Record<string, string> = {
@@ -82,8 +101,6 @@ const SUSPECT: Record<string, string> = {
    * them is producible by a fault on OUR side and is indistinguishable from the remote cause at
    * the socket:
    *
-   *   CERT_HAS_EXPIRED               ← forward clock skew on the prober expires every
-   *                                    certificate on the internet simultaneously
    *   DEPTH_ZERO_SELF_SIGNED_CERT    ← a TLS-intercepting egress proxy
    *   SELF_SIGNED_CERT_IN_CHAIN      ← the same
    *   UNABLE_TO_VERIFY_LEAF_SIGNATURE ← a missing or broken CA trust store
@@ -99,7 +116,6 @@ const SUSPECT: Record<string, string> = {
    * hourly rounds to report instead of one. Against pages that sat broken for months, three
    * hours is not the expensive direction to be wrong in.
    */
-  CERT_HAS_EXPIRED: "The SSL certificate has expired.",
   DEPTH_ZERO_SELF_SIGNED_CERT: "The SSL certificate is not trusted.",
   SELF_SIGNED_CERT_IN_CHAIN: "The SSL certificate is not trusted.",
   UNABLE_TO_VERIFY_LEAF_SIGNATURE: "The SSL certificate could not be verified.",
