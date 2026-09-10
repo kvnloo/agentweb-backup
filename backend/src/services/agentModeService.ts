@@ -7189,6 +7189,26 @@ export class AgentModeService {
       return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
+    // ENG-1720: a `send-invite` that de-duplicates returns
+    // `{ success: true, alreadyInvited: true }` — "Skipped to avoid a duplicate,
+    // no invite quota was used". Nothing is delivered, the pacer's daily volume
+    // does not move, and no ledger row is written.
+    //
+    // Without this branch that outcome falls into the `{}` default above, and the
+    // stored ledger entry becomes indistinguishable from a real delivery: the
+    // requirement verdict reads `{}`, `toolCallSucceeded` finds no error and no
+    // `success: false`, and counts it as a send. Observed in production twice —
+    // a run that contacted nobody stored `status: success`, `passed: true`,
+    // `{ actual: 2, required: 1 }`, `functionCallMisses: []`.
+    //
+    // The predicate that consumes this (`isDeliveredSend`) cannot work on data
+    // that was erased before it was stored, so the flag has to survive the
+    // minimizer. `success` rides along for the same reason the branch above keeps
+    // it — a bare marker with no outcome is not enough to score on.
+    if (toolName === 'linkedin_outreach' && result?.alreadyInvited === true) {
+      return { success: result?.success, alreadyInvited: true };
+    }
+
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
     // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
     // unenrichable one and (b) pair previews to executes per list. The large `samples`
