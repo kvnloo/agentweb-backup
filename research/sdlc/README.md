@@ -12,7 +12,8 @@ This is a **parallel track** to the product queue (`QUEUE.md`). It does
 | `THESIS.md` | What to copy vs discard |
 | `COMPARISON.md` | Hermes / OMP / AgentWeb, with file-level numbers |
 | `queue.json` + `QUEUE.md` | A-items (architecture), not product ranks |
-| `../cycles/017-*.md` | First cycle receipt |
+| `A-007-split-map.md` | Section → file map; first slice is infrastructure.ts |
+| `../cycles/017-*.md` | First architecture cycle receipt |
 
 Product work when unlocked is still Q-014. This track answers “how the
 repo should be shaped so agents can change it.”

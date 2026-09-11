@@ -69,8 +69,10 @@ Order is process, not a rewrite:
    June baseline — the ratchet is not running.
 2. **Enforce the one good boundary.** CI check: `loops/core` must not
    import host services (A-002). Then the same rule for `agentMode/core`.
-3. **One-tool-per-file on MCP first (A-007).** Split `apiTools.ts` along
-   existing section headers; keep the barrel. Never `emma/tools.ts`
+3. **One-tool-per-file on MCP first (A-007).** Split `apiTools.ts` into
+   **section files** like `workflowTools.ts`, not 85 files in one PR.
+   First file is `tools/infrastructure.ts` (`generate_image` is **not** in
+   the Content section). Keep the barrel. Never `emma/tools.ts`
    while #2832 is open (A-004). A-005 (LOC ratchet) waits until seven
    open `agentModeService.ts` PRs shrink.
 4. **Keep deploy units at four.** A fifth service for images/video would

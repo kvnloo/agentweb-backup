@@ -77,5 +77,7 @@ That file is outside `core/`.
   imports in `loops/core`)
 - Does not touch `agentModeService.ts`
 
-Collision this cycle: **no** open PR on `loops/core`, `apiTools.ts`,
-`imageGeneration.ts`, `usageRecorderService.ts`, or `llmClients.ts`.
+Collision cycle 24: **no** open PR on `loops/core`, `apiTools.ts`,
+`imageGeneration.ts`, `agentMode/core`, or `brandLogo.ts` (20 open PRs
+on AgentWebPro/agentweb). A-007 first-slice map is `A-007-split-map.md`
+— not this guard.

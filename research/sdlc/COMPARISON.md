@@ -71,7 +71,9 @@ The mismatch is `utils/llmClients.ts` importing `services/usageRecorderService`
 
 - Do not copy Hermes’ Telegram adapter size into Emma.
 - Do not copy OMP’s Rust natives.
-- Do copy: **package boundaries, registry import DAG, one-tool-per-file,
-  keep the loop in-process, MCP as the *external* nanoservice bus.**
+- Do copy: **package boundaries, registry import DAG, section-file MCP
+  (ENG-982) then one-tool-per-file later, keep the loop in-process, MCP
+  as the *external* nanoservice bus.** Do not copy Hermes’ 1-file-per-tool
+  as the *first* A-007 PR (`A-007-split-map.md`).
 - `loops/core/ports.ts` is closer to OMP `pi-agent-core` than
   `agentModeService.ts` is. Promote that pattern; don’t invent K8s.

@@ -5,14 +5,15 @@ Product implementation order is still Q-001 → Q-014 → Q-003.
 `coding_unlocked: false`.
 
 Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
-`MODULE_MAP.md`. Services DAG: `SERVICES_DAG.md`.
+`MODULE_MAP.md`. Services DAG: `SERVICES_DAG.md`. A-007 map:
+`A-007-split-map.md`.
 
 ## Ranked (architecture track)
 
 | Rank | ID | Score | Status | Title |
 |---|---|---|---|---|
 | 1 | A-001 | 32 | **ready** | Modular monolith thesis (this folder) |
-| 2 | A-007 | 31 | **ready** | Split `apiTools.ts` into `mcp/server/tools/*` |
+| 2 | A-007 | 31 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` |
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
@@ -30,7 +31,9 @@ A-009 parked (utils importing the meter).
 1. **A-002** — AST import guard on `loops/core` only (copy
    `sdkConstructionGuard.test.ts`). Do **not** copy forbid-all-services
    onto `agentMode/core` (`toolDispatch` imports the gateway).
-2. **A-007** — barrel-split `apiTools.ts`.
+2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
+   tools including `generate_image`). Not `content.ts` (that section
+   dynamically imports `agentModeService`). Not 85 Hermes files.
 3. **A-008** — `services/creative/` with re-export + `creative ↛ agentModeService` test.
 4. **A-005** — only after the `agentModeService.ts` PR pile shrinks.
 

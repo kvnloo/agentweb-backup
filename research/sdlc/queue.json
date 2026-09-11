@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:08:00Z",
+  "updated_at": "2026-09-11T19:00:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -127,14 +127,14 @@
       "evidence": 5,
       "collision": 1,
       "score": 31,
-      "why": "Hermes one-file-per-tool without touching emma/tools.ts (#2832). 85 registers, 20+ section headers, ENG-982 already split workflowTools.ts. No open PR on apiTools.ts. Keep apiTools.ts as the barrel emma/tools.ts L7240 and tests import. Q-014 then edits tools/content.ts only.",
+      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 already split workflowTools.ts (5 registers). No open PR on apiTools.ts. Keep the apiTools.ts barrel (emma/tools.ts L7240). Q-014 then edits tools/infrastructure.ts (or apiTools.ts if A-007 has not landed).",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/mcpServerCore.ts",
         "backend/src/mcp/server/workflowTools.ts",
-        "research/sdlc/MODULE_MAP.md"
+        "research/sdlc/A-007-split-map.md"
       ],
-      "first_slice": "When coding unlocked, after or with Q-014: move one section (content: generate_image/send_email) to mcp/server/tools/content.ts, barrel-import from apiTools.ts, mcp.apiTools.test.ts still green. Do not edit emma/tools.ts.",
+      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Barrel via import './tools/infrastructure' in apiTools.ts only (do not also import from mcpServerCore). Leave Content/blog and install_skills in apiTools.ts (dynamic agentModeService). mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
       "harsha_db": false
     },
     {

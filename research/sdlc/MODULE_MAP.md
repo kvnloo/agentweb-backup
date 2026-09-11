@@ -31,15 +31,17 @@ Customer UI is **another GitHub repo**.
 
 Hottest edges: `routes → services` (398), `services → utils` (250),
 `emma → services` (38), `mcp → services` (17). MCP is supposed to go
-through REST (`apiTools.ts` header: no direct service calls). The 17
-`mcp → services` hits are usage/oauth/pr-digest — keep those, don’t
-open a back door to `agentModeService`.
+through REST (`apiTools.ts` header: no direct service calls). **Cycle 24:**
+that header is already false — four `await import('../../services/agentModeService')`
+in Content + install_skills (L1406, 1442, 1970, 1991), plus static
+`workPlanSteps` / `prDigestService`. Do not open more back doors. Do not
+move the Content section in A-007’s first slice.
 
 ## What a coding agent should open
 
 | Task | Open first | Do not open |
 |---|---|---|
-| MCP list / hide / generate_image | `mcp/server/apiTools.ts` + `registry.ts` | `emma/tools.ts` while #2832 is open |
+| MCP list / hide / generate_image | `mcp/server/apiTools.ts` L1996–2146 (infrastructure island) + `registry.ts` | `emma/tools.ts` while #2832 is open; do not open Content L1381 |
 | Loop termination / dispatch | `services/agentMode/core/*` | Adding to `agentModeService.ts` unless net-negative |
 | Closed-loop policy | `loops/core` + `loops/instances/<id>` | `agentModeService.ts` |
 | Billing / C2PA / logo | stop | `usageRecorderService`, `imageGeneration.ts` logo path |
@@ -77,9 +79,11 @@ mcp/server/tools/tasks.ts
 mcp/server/tools/schedules.ts
 mcp/server/tools/crm.ts
 mcp/server/tools/landing.ts
-mcp/server/tools/content.ts   ← generate_image, send_email (Q-014 lives here)
+mcp/server/tools/infrastructure.ts  ← generate_image, send_email, search (Q-014)
+mcp/server/tools/blog.ts           ← create/publish blog; PARK (imports agentModeService)
 mcp/server/tools/admin.ts
-mcp/server/apiTools.ts         ← barrel: import './tools/*'
+mcp/server/apiTools.ts             ← barrel: import './tools/infrastructure' (first slice)
 ```
 
-That is OMP `packages/` + Hermes `tools/*.py`, without a new deploy unit.
+That is ENG-982 section-files (not an 85-file Hermes clone) + OMP packages,
+without a new deploy unit. Full map: `A-007-split-map.md`.
