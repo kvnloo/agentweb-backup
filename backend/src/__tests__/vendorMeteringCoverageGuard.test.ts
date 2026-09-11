@@ -158,18 +158,6 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
  */
 const VENDOR_ALLOWLIST: AllowlistEntry[] = [
   {
-    path: 'services/voiceoverService.ts',
-    vendor: 'ElevenLabs',
-    issue: 'ENG-698',
-    reason: 'Text-to-speech calls are unmetered.',
-  },
-  {
-    path: 'emma/solveRecaptchaTool.ts',
-    vendor: '2captcha',
-    issue: 'ENG-698',
-    reason: 'submit2CaptchaTask solve calls are unmetered.',
-  },
-  {
     path: 'controllers/tasks.ts',
     vendor: 'Placid',
     issue: 'ENG-698',
@@ -569,8 +557,6 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     // shrink: a slice issue ships metering into the module, which the
     // staleness test above then requires removing the entry for.
     expect(VENDOR_ALLOWLIST.map((e) => `${e.vendor} (${e.path}) — ${e.issue}`).sort()).toEqual([
-      '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
-      'ElevenLabs (services/voiceoverService.ts) — ENG-698',
       'Placid (controllers/tasks.ts) — ENG-698',
     ]);
   });
