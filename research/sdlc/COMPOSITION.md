@@ -521,6 +521,11 @@ path-filter skip.** #2491 fixture L437 is `skipped` on a
 different check_suite; the gate PASSes (test L452). L974
 cannot tell a job-level `if` from a path-filter skip.
 
+Cycle 129: **GitHub treats a job-level `if` skip as Success.**
+Dependabot yml L46 is that skip. Workflow-level skip stays
+Pending and blocks. Docs vs API: merge Success; conclusion
+`skipped`. The REQUIRED comment only bites on Dependabot PRs.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

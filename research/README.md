@@ -386,6 +386,11 @@ path-filter skip.** The #2491 fixture includes
 `Dependabot Integrity Check` `skipped` (test L437, different
 check_suite) and PASSes (L452). L974 cannot tell that job-level
 `if` from a path-filter skip.
+Cycle 129: **GitHub treats a job-level `if` skip as Success.**
+Dependabot’s “REQUIRED” comment, if true, only bites on
+Dependabot PRs. Workflow-level skip stays Pending and blocks.
+Docs vs API: skipped reports Success for merge; API conclusion
+is still `skipped`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

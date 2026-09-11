@@ -211,6 +211,9 @@ adds Backend build to GitHub required contexts. Product READY
 unchanged.
 Cycle 128: merge-evidence labels Dependabot skip as a path-filter
 skip; #2491 PASSes with it skipped. Product READY unchanged.
+Cycle 129: GitHub treats a job-level `if` skip as Success;
+Dependabot’s REQUIRED comment only bites when the job runs.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

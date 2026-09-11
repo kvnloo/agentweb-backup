@@ -233,4 +233,7 @@ adds Backend build to GitHub required contexts. A-006 stays
 discarded.
 Cycle 128: merge-evidence labels Dependabot skip as a path-filter
 skip; #2491 PASSes with it skipped. A-006 stays discarded.
+Cycle 129: GitHub treats a job-level `if` skip as Success;
+Dependabot’s REQUIRED comment only bites when the job runs.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

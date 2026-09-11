@@ -481,6 +481,9 @@ Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
 adds Backend build to GitHub required contexts. A-006 discarded.
 Cycle 128: merge-evidence labels Dependabot skip as a path-filter
 skip; #2491 PASSes with it skipped. A-006 discarded.
+Cycle 129: GitHub treats a job-level `if` skip as Success;
+Dependabot’s REQUIRED comment only bites when the job runs.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

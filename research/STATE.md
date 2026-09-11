@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 128
+cycles_completed: 129
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 129
+next_cycle: 130
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 128: merge-evidence labels Dependabot skip as a path-filter
-  skip; #2491 PASSes with it skipped. Cycle 129: cheapest remaining.
-  Candidate: GitHub skip-of-required semantics vs this tree.
-  Job-level if skip is Success and does not block; workflow skip
-  stays Pending and does.
+  Cycle 129: GitHub treats a job-level if skip as Success;
+  Dependabot's REQUIRED comment only bites when the job runs.
+  Cycle 130: cheapest remaining. Candidate: the same GitHub
+  rule on Backend build (job-level if on path + draft) — ENG-1373
+  adding that name would still not gate partner-only PRs.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

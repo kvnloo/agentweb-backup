@@ -208,6 +208,9 @@ Backend build to GitHub required contexts. Do not add A-021.
 Cycle 128: merge-evidence labels Dependabot skip as a path-filter
 skip. #2491 PASSes with it skipped (test L437 / L452). Do not
 add A-021.
+Cycle 129: GitHub treats a job-level `if` skip as Success.
+Dependabot’s REQUIRED comment only bites when the job runs.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
