@@ -96,4 +96,23 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     expect(transactWrite.mock.calls.some(([params]) => params.TransactItems.some((w: any) => w.Put?.Item.action === 'revocation-cleanup-failed'))).toBe(true);
   });
 
+  it('provisioning freezes only a bounded approved packet with synthetic evaluation-scoped IDs', async () => {
+    const result = await store.provision('admin', { ...request, simulationPacket: { approved: true, objects: [{ key: 'case', kind: 'campaign', name: 'Approved', objective: 'LEADS', budget: 5000, budgetType: 'daily', metrics: { clicks: 30 } }] } });
+    const record = transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item.userId === result.userId && w.Put?.Item.simulation).Put.Item;
+    expect(record.simulation.seed).toEqual(record.simulation.objects);
+    expect(record.simulation.seed[0]).toMatchObject({ id: `sim_${result.userId}_seed_case`, metrics: { clicks: 30 } });
+    expect(record.provisionedBy).toBe('admin');
+  });
+  it.each([
+    { approved: false, objects: [] }, { approved: true, objects: [null] },
+    { approved: true, objects: [{ key: 'a', kind: 'campaign', name: 'x', objective: 'LEADS', accountId: 'act_123' }] },
+    { approved: true, objects: [{ key: 'a', kind: 'campaign', name: 'x', objective: 'LEADS', metrics: { clicks: '30' } }] },
+    { approved: true, objects: [{ key: 'a', kind: 'creative', name: 'x', text: 'https://example.invalid/private' }] },
+    { approved: true, objects: [{ key: 'a', kind: 'ad', name: 'x', parentKey: 'missing' }] },
+    { approved: true, objects: Array.from({length: 31}, (_, i) => ({ key: `a${i}`, kind: 'creative', name: 'x', text: 'safe' })) },
+  ])('rejects unsafe packet %p before creating an account', async simulationPacket => {
+    await expect(store.provision('admin', { ...request, simulationPacket } as any)).rejects.toThrow();
+    expect(transactWrite).not.toHaveBeenCalled();
+  });
+
 });

@@ -1,6 +1,7 @@
 import AWS from 'aws-sdk';
 import { randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
+import { applySimulation, createSimulation, validateSimulation, SimulationCommand, SimulationPacket, SimulationState } from './evaluationSimulation';
 import { EvaluationDenied, isEvaluationUser } from './evaluationPolicy';
 
 export interface EvaluationMaterial { title: string; text: string; approved: true }
@@ -11,8 +12,17 @@ export interface EvaluationRecord {
   expiresAt: number;
   remaining: number;
   materials: EvaluationMaterial[];
+  simulation?: SimulationState;
+  simulationRevision?: number;
+  artifactEpoch?: number;
+  resetArtifacts?: string[];
+  artifacts?: { artifactId: string; mime: string }[];
+  provisionedBy?: string;
+  reviewerUserIds?: string[];
 }
 export interface ProvisionEvaluation {
+  simulationPacket?: SimulationPacket;
+  reviewerUserIds?: string[];
   email: string;
   displayName: string;
   password: string;
@@ -35,7 +45,16 @@ export class EvaluationStore {
 
   async get(userId: string): Promise<EvaluationRecord | null> {
     const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
-    return (result.Item as EvaluationRecord) || null;
+    if (!result.Item) return null;
+    const record = result.Item as EvaluationRecord;
+    if (record.userId !== userId) throw new EvaluationDenied();
+    if (record.simulation !== undefined) validateSimulation(userId, record.simulation);
+    for (const count of [record.simulationRevision, record.artifactEpoch]) if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) throw new EvaluationDenied();
+    if (record.artifacts !== undefined && (!Array.isArray(record.artifacts) || record.artifacts.length > 100 ||
+      record.artifacts.some(a => !a || typeof a.artifactId !== 'string' || !/^[a-zA-Z0-9-]+$/.test(a.artifactId) || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(a.mime)))) throw new EvaluationDenied();
+    if (record.resetArtifacts !== undefined && (!Array.isArray(record.resetArtifacts) || record.resetArtifacts.length > 100 ||
+      record.resetArtifacts.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(id)))) throw new EvaluationDenied();
+    return record;
   }
 
   private audit(userId: string, actor: string, action: string, details: Record<string, unknown> = {}) {
@@ -53,10 +72,13 @@ export class EvaluationStore {
         !Array.isArray(input.materials) || input.materials.length > 10 ||
         input.materials.some(m => !m || typeof m !== 'object' || m.approved !== true || typeof m.title !== 'string' || !m.title || m.title.length > 100 || typeof m.text !== 'string' || m.text.length > 10000) ||
         JSON.stringify(input.materials).length > 30000) throw new EvaluationDenied();
+    if (input.reviewerUserIds !== undefined && (!Array.isArray(input.reviewerUserIds) || input.reviewerUserIds.length > 5 ||
+      input.reviewerUserIds.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(id)))) throw new EvaluationDenied();
     const userId = `eval_${randomUUID()}`;
+    const simulation = createSimulation(userId, input.simulationPacket);
     const email = input.email.toLowerCase();
     const record: EvaluationRecord = {
-      userId, email, status: 'active', expiresAt: input.expiresAt, remaining: input.generationBudget,
+      userId, email, status: 'active', provisionedBy: actor, reviewerUserIds: input.reviewerUserIds || [], simulation, simulationRevision: 0, artifactEpoch: 0, expiresAt: input.expiresAt, remaining: input.generationBudget,
       materials: input.materials.map(({ title, text }) => ({ title, text, approved: true })),
     };
     const audit = this.audit(userId, actor, 'provision');
@@ -74,6 +96,86 @@ export class EvaluationStore {
     return { userId, expiresAt: record.expiresAt, remaining: record.remaining, audit: audit.Put.Item };
   }
 
+  async simulate(userId: string, input: SimulationCommand) {
+    const record = await this.get(userId);
+    this.active(record, userId);
+    const { state, result } = applySimulation(userId, record.simulation || createSimulation(userId), input, (record.artifacts || []).map(a => a.artifactId));
+    if (['query', 'inspect'].includes(input.operation)) {
+      this.active(await this.get(userId), userId);
+      return result;
+    }
+    const revision = record.simulationRevision || 0;
+    const reset = input.operation === 'reset';
+    const artifacts = record.artifacts || [];
+    const pending = [...new Set([...(record.resetArtifacts || []), ...artifacts.map(a => a.artifactId)])];
+    if (pending.length > 100 || pending.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(id))) throw new EvaluationDenied();
+    const epoch = (record.artifactEpoch || 0) + 1;
+    const audit = this.audit(userId, userId, `simulation:${input.operation}`, {
+      ok: result.ok, errors: result.errors, warnings: result.warnings, objectId: result.object?.id || null,
+      object: result.object ? { ...result.object, ...(result.object.upload ? { upload: { mime: result.object.upload.mime, bytes: Buffer.from(result.object.upload.base64, 'base64').length } } : {}) } : null, revision: revision + 1,
+    });
+    await this.db.transactWrite({ TransactItems: [{ Update: {
+      TableName: this.table, Key: this.key(userId),
+      UpdateExpression: 'SET simulation = :simulation, simulationRevision = :next' + (reset ? ', artifacts = :empty, artifactEpoch = :epoch, resetArtifacts = :pending' : ''),
+      ConditionExpression: '#status = :active AND expiresAt > :now AND (simulationRevision = :revision OR (attribute_not_exists(simulationRevision) AND :revision = :zero))',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: { ':active': 'active', ':now': Date.now(), ':revision': revision, ':zero': 0, ':next': revision + 1,
+        ':simulation': state, ...(reset ? { ':empty': [], ':epoch': epoch, ':pending': pending } : {}) },
+    } }, audit] }).promise();
+    if (reset) {
+      // Access is already invalidated atomically. Keep cleanup intent durable for retries.
+      // Each batch also checks live policy/epoch, so revoke or another reset stops stale cleanup.
+      const guard = {
+        TableName: this.table, Key: this.key(userId),
+        ConditionExpression: '#status = :active AND expiresAt > :now AND artifactEpoch = :epoch',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':active': 'active', ':now': Date.now(), ':epoch': epoch },
+      };
+      for (let i = 0; i < pending.length; i += 99) {
+        await this.db.transactWrite({ TransactItems: [{ ConditionCheck: guard }, ...pending.slice(i, i + 99).map(id => ({
+          Delete: { TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/artifact/${id}` } },
+        }))] }).promise();
+      }
+      await this.db.transactWrite({ TransactItems: [{ Update: { ...guard, UpdateExpression: 'REMOVE resetArtifacts' } }] }).promise();
+    }
+    this.active(await this.get(userId), userId);
+    return result;
+  }
+
+  private active(record: EvaluationRecord | null, userId: string): asserts record is EvaluationRecord {
+    if (!record || record.userId !== userId || record.status !== 'active' || !Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) throw new EvaluationDenied();
+  }
+
+  /** Explicit assignment, never organization membership, authorizes reviewer access. */
+  async requireReview(actor: string, userId: string) {
+    const record = await this.get(userId);
+    if (!record || record.userId !== userId || (record.provisionedBy !== actor &&
+      (!Array.isArray(record.reviewerUserIds) || !record.reviewerUserIds.includes(actor)))) throw new EvaluationDenied();
+    return record;
+  }
+
+  async review(actor: string, userId: string) {
+    const record = await this.requireReview(actor, userId);
+    const audit: Record<string, unknown>[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    let pages = 0;
+    do {
+      const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
+        FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
+        ExpressionAttributeValues: { ':user': userId, ':prefix': `evaluation/${userId}/audit/` },
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      }).promise();
+      if (!Array.isArray(page.Items)) throw new EvaluationDenied();
+      for (const item of page.Items) {
+        if (!item || item.userId !== userId || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) throw new EvaluationDenied();
+        audit.push(item);
+      }
+      cursor = page.LastEvaluatedKey; pages++;
+    } while (cursor && audit.length < 1000 && pages < 100);
+    return { userId, status: record.status, simulation: record.simulation || createSimulation(userId), materials: record.materials,
+      artifacts: record.artifacts || [], audit, truncated: !!cursor };
+  }
+
   async reserve(userId: string) {
     await this.db.transactWrite({ TransactItems: [{ Update: {
       TableName: this.table, Key: this.key(userId),
@@ -84,15 +186,19 @@ export class EvaluationStore {
     } }, this.audit(userId, userId, 'generation-reserved')] }).promise();
   }
 
-  async saveArtifact(userId: string, content: Buffer, mime: 'text/plain' | 'image/jpeg' | 'application/octet-stream') {
+  async saveArtifact(userId: string, content: Buffer, mime: 'text/plain' | 'image/jpeg' | 'application/octet-stream', expectedEpoch?: number) {
     if (!Buffer.isBuffer(content) || content.length === 0 || content.length > 240000 || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(mime)) throw new EvaluationDenied();
+    const record = await this.get(userId);
+    this.active(record, userId);
+    const epoch = expectedEpoch ?? record.artifactEpoch ?? 0;
+    if (epoch !== (record.artifactEpoch || 0) || record.resetArtifacts !== undefined) throw new EvaluationDenied();
     const artifactId = randomUUID();
     await this.db.transactWrite({ TransactItems: [
       { Update: { TableName: this.table, Key: this.key(userId),
-        UpdateExpression: 'SET artifacts = list_append(if_not_exists(artifacts, :empty), :artifact)',
-        ConditionExpression: '#status = :active AND expiresAt > :now AND (attribute_not_exists(artifacts) OR size(artifacts) < :limit)',
+        UpdateExpression: 'SET artifacts = list_append(if_not_exists(artifacts, :empty), :artifact) ADD simulationRevision :one',
+        ConditionExpression: '#status = :active AND expiresAt > :now AND (attribute_not_exists(artifacts) OR size(artifacts) < :limit) AND attribute_not_exists(resetArtifacts) AND (artifactEpoch = :epoch OR (attribute_not_exists(artifactEpoch) AND :epoch = :zero))',
         ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':empty': [], ':artifact': [{ artifactId, mime }], ':active': 'active', ':now': Date.now(), ':limit': 100 },
+        ExpressionAttributeValues: { ':empty': [], ':artifact': [{ artifactId, mime }], ':active': 'active', ':now': Date.now(), ':limit': 100, ':epoch': epoch, ':zero': 0, ':one': 1 },
       } },
       { Put: { TableName: this.table, Item: { evaluationKey: `evaluation/${userId}/artifact/${artifactId}`, userId, content, mime }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } },
     ] }).promise();
@@ -102,8 +208,12 @@ export class EvaluationStore {
   async getArtifact(userId: string, artifactId: string) {
     this.key(userId);
     if (!/^[a-zA-Z0-9-]+$/.test(artifactId)) throw new EvaluationDenied();
+    const record = await this.get(userId);
+    if (!record || record.userId !== userId || !Array.isArray(record.artifacts) || !record.artifacts.some(a => a?.artifactId === artifactId)) throw new EvaluationDenied();
     const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/artifact/${artifactId}` }, ConsistentRead: true }).promise();
     if (!result.Item || result.Item.userId !== userId || !Buffer.isBuffer(result.Item.content) || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(result.Item.mime)) throw new EvaluationDenied();
+    const latest = await this.get(userId);
+    if (!latest || (latest.artifactEpoch || 0) !== (record.artifactEpoch || 0) || !latest.artifacts?.some(a => a.artifactId === artifactId)) throw new EvaluationDenied();
     return { content: result.Item.content as Buffer, mime: result.Item.mime as string };
   }
 

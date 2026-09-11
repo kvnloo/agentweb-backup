@@ -1,3 +1,5 @@
+import type { EvaluationRecord } from './evaluationStore';
+
 /** Reserved at provisioning; immutable identity survives stale user/credential indexes. */
 export function isEvaluationUser(userId: unknown): boolean {
   return typeof userId === 'string' && userId.startsWith('eval_');
@@ -33,4 +35,19 @@ export async function requireEvaluationAdmin(userId: string, context?: Record<st
   const { userDb } = await import('./db');
   const admin = await userDb.getUserByIdConsistent(userId);
   if (!admin || admin.userId !== userId || admin.isAdmin !== true || admin.isActive !== true) throw new EvaluationDenied();
+}
+
+/** Reviewers must be live, direct principals; the store checks explicit evaluation assignment. */
+export async function requireEvaluationReviewer(userId: string, context?: Record<string, unknown>) {
+  if (isEvaluationUser(userId) || context?.externalMcp || context?.isInternal || context?.delegateInfo ||
+      context?.isDelegatedAdmin || context?.isDelegatedAccess) throw new EvaluationDenied();
+  const { userDb } = await import('./db');
+  const reviewer = await userDb.getUserByIdConsistent(userId);
+  if (!reviewer || reviewer.userId !== userId || reviewer.isActive !== true) throw new EvaluationDenied();
+}
+
+/** Candidate-visible fields only; frozen data is queried explicitly through the simulator. */
+export function evaluationView(record: EvaluationRecord) {
+  return { userId: record.userId, status: record.status, expiresAt: record.expiresAt, remaining: record.remaining,
+    materials: record.materials, artifacts: record.artifacts || [], simulation: { objects: record.simulation?.objects || [] } };
 }

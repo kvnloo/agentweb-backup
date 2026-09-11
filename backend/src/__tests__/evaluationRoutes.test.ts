@@ -1,3 +1,4 @@
+import { EvaluationDenied } from '../services/evaluationPolicy';
 import { userDb } from '../services/db';
 import express from 'express';
 import request from 'supertest';
@@ -13,7 +14,7 @@ jest.mock('../services/db', () => ({ userDb: {
   getUserById: jest.fn(async (userId: string) => ({ userId, email: 'test@example.invalid', isAdmin: userId === 'admin' })),
   getUserByEmailConsistent: jest.fn(async () => ({ userId: 'eval_test', email: 'test@example.invalid', isActive: true, isAdmin: false })),
 } }));
-jest.mock('../services/evaluationStore', () => ({ evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), saveArtifact: jest.fn(), getArtifact: jest.fn() } }));
+jest.mock('../services/evaluationStore', () => ({ evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), saveArtifact: jest.fn(), getArtifact: jest.fn(), simulate: jest.fn(), review: jest.fn(), requireReview: jest.fn() } }));
 
 describe('ENG-1870 product lifecycle and artifact routes', () => {
   const app = express();
@@ -67,4 +68,53 @@ describe('ENG-1870 product lifecycle and artifact routes', () => {
     expect(response.headers['content-disposition']).toBe('attachment');
     expect(response.headers['content-security-policy']).toContain('sandbox');
   });
+  it('candidate API executes only its own simulator command', async () => {
+    (evaluationStore.simulate as jest.Mock).mockResolvedValue({ ok: true, disclosure: 'Simulation complete — not sent to Meta' });
+    const command = { operation: 'query', source: 'approved' };
+    const result = await request(app).post('/api/evaluation').set('Authorization', `Bearer ${token('eval_test')}`).send({ action: 'simulate', command });
+    expect(result.status).toBe(200);
+    expect(evaluationStore.simulate).toHaveBeenCalledWith('eval_test', command);
+    expect(result.body.disclosure).toBe('Simulation complete — not sent to Meta');
+  });
+  it('rejects simulator identity overrides', async () => {
+    const result = await request(app).post('/api/evaluation').set('Authorization', `Bearer ${token('eval_test')}`).send({ action: 'simulate', command: { operation: 'query' }, userId: 'eval_foreign' });
+    expect(result.status).toBe(403);
+    expect(evaluationStore.simulate).not.toHaveBeenCalled();
+  });
+  it('assigned reviewer reads simulation and private artifacts through scoped review authorization', async () => {
+    (evaluationStore.review as jest.Mock).mockResolvedValue({ userId: 'eval_test', simulation: { objects: [] }, audit: [] });
+    const result = await request(app).get('/api/admin/evaluations/eval_test').set('Authorization', `Bearer ${token('admin')}`);
+    expect(result.status).toBe(200);
+    expect(evaluationStore.review).toHaveBeenCalledWith('admin', 'eval_test');
+    expect(result.headers['cache-control']).toBe('no-store');
+  });
+
+  it('a non-admin explicitly assigned reviewer can inspect an evaluation', async () => {
+    (evaluationStore.review as jest.Mock).mockResolvedValueOnce({ userId: 'eval_test', audit: [] });
+    const result = await request(app).get('/api/admin/evaluations/eval_test').set('Authorization', `Bearer ${token('reviewer')}`);
+    expect(result.status).toBe(200);
+    expect(evaluationStore.review).toHaveBeenCalledWith('reviewer', 'eval_test');
+  });
+  it('foreign reviewer artifact requests stop before loading bytes', async () => {
+    (evaluationStore.requireReview as jest.Mock).mockRejectedValueOnce(new EvaluationDenied());
+    const result = await request(app).get('/api/admin/evaluations/eval_foreign/artifacts/file').set('Authorization', `Bearer ${token('reviewer')}`);
+    expect(result.status).toBe(403);
+    expect(evaluationStore.getArtifact).not.toHaveBeenCalled();
+  });
+  it('deactivated reviewers cannot read retained evaluation state', async () => {
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce({ userId: 'reviewer', isActive: false });
+    const result = await request(app).get('/api/admin/evaluations/eval_test').set('Authorization', `Bearer ${token('reviewer')}`);
+    expect(result.status).toBe(403);
+    expect(evaluationStore.review).not.toHaveBeenCalled();
+  });
+
+  it('candidate inspect hides reviewer assignments and internal cleanup/seed bookkeeping', async () => {
+    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: 'test@example.invalid', status: 'active', expiresAt: Date.now()+60000, materials: [], remaining: 5, provisionedBy: 'private-admin', reviewerUserIds: ['private-reviewer'], resetArtifacts: ['discarded'], simulation: { seed: [{ internal: 'seed' }], objects: [] } });
+    const result = await request(app).get('/api/evaluation').set('Authorization', `Bearer ${token('eval_test')}`);
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ materials: [], simulation: { objects: [] } });
+    for (const field of ['provisionedBy','reviewerUserIds','resetArtifacts']) expect(result.body[field]).toBeUndefined();
+    expect(result.body.simulation.seed).toBeUndefined();
+  });
+
 });

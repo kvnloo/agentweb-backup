@@ -95,4 +95,9 @@ describe('ENG-1870 approved-material-only generation and bounded spend', () => {
     expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'eval_test', feature: 'evaluation', costUsdOverride: expect.any(Number) }));
     expect((recordUsage as jest.Mock).mock.calls[0][0].costUsdOverride).toBeCloseTo(0.06824, 8);
   });
+  it('pins the pre-generation reset epoch so late output cannot repopulate a reset workspace', async () => {
+    await runEvaluation('eval_test', { action: 'analyze', prompt: 'Synthetic' });
+    expect(evaluationStore.saveArtifact).toHaveBeenCalledWith('eval_test', expect.any(Buffer), 'text/plain', 0);
+  });
+
 });

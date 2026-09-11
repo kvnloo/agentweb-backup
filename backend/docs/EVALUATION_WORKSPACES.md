@@ -29,7 +29,9 @@ cannot be overwritten. No invitation or email is sent. Give the evaluator the
 backend's `/evaluation` URL and temporary credentials through an approved private
 channel. Never include credentials in logs, issue comments, or PR evidence.
 
-The evaluator can inspect approved case material, ask Emma for strategy/analysis,
+The evaluator can inspect approved case material, query the frozen campaign dataset,
+create and update simulated campaigns/ad sets/ads/creatives, change budgets and schedules,
+and simulate publish/pause/activate. They can also ask Emma for strategy/analysis,
 generate an image, upload an opaque artifact, and download their own artifacts.
 The page holds its app token only in memory. The API is `/api/evaluation`; artifact
 downloads use `/api/evaluation/artifacts/<id>`. Generic chat, production tools,
@@ -43,6 +45,107 @@ and schedules. The response includes audit identifiers and cleanup counts. Retry
 revoke if cleanup fails: access remains denied and cleanup is idempotent. Cleanup failure receives its own audit event after the deny
 commit; incomplete cleanup is never reported as success. Revocation
 retains the policy, audit, and private artifacts; it is not a data-erasure operation.
+
+## Connector-free Meta simulation
+
+The product name is **Evaluation workspace**. Every simulator result includes
+**Simulation complete — not sent to Meta**. Publishing sets a simulated object to
+published/paused; activation changes its requested status. Effective status accounts
+for paused parents and future/ended schedules. It creates no delivery or scheduling job,
+spend, Meta review, or real object. Meta connectors/read/write APIs, org resources,
+production ad tables, credentials, and remote URL retrieval are never used.
+
+Provisioning accepts an optional `simulationPacket` containing the candidate packet's
+**explicitly approved, sanitized** snapshot. The operator supplies data inline; the
+server never retrieves packet links or imports raw Meta responses. For example:
+
+```json
+{
+  "approved": true,
+  "objects": [
+    {"key":"campaign","kind":"campaign","name":"Approved acquisition","objective":"LEADS","budget":5000,"budgetType":"daily","metrics":{"impressions":1000,"clicks":30,"spend":1200,"conversions":3}},
+    {"key":"audience","kind":"adset","name":"Approved audience","parentKey":"campaign","targeting":"Sanitized B2B audience"},
+    {"key":"creative","kind":"creative","name":"Approved message","text":"Sanitized creative copy"},
+    {"key":"ad","kind":"ad","name":"Approved ad","parentKey":"audience","creativeKey":"creative"}
+  ]
+}
+```
+
+This is the value of `simulationPacket` alongside the existing provisioning fields,
+not a separate provisioning endpoint. Up to 30 seed objects / 50 KB are accepted.
+Local packet keys become `sim_<evaluation-user-id>_seed_<key>` IDs; new objects receive
+`sim_<evaluation-user-id>_<UUID>` IDs. Raw account/object IDs, unknown properties,
+invalid relationships, unapproved packets, malformed metrics, and URL/credential
+fields are rejected before account creation. Optional seed `status` is DRAFT,
+PAUSED, or ACTIVE (default DRAFT); metrics are frozen nonnegative integer counts,
+with spend in USD cents. Without a packet, the starting simulation is empty.
+No candidate identity, email, campaign, or external URL is embedded in the feature.
+
+Use Emma's `evaluation_workspace` tool or POST `/api/evaluation` with:
+
+```json
+{"action":"simulate","command":{"operation":"query","source":"approved","kind":"campaign"}}
+```
+
+The same `command` supports:
+
+| Operation | Inputs | Result |
+|---|---|---|
+| `query` | optional `source` approved/current; optional `kind` | Frozen or current object list |
+| `inspect` | `id`; optional `source` | Object state and effective status |
+| `create` | `kind`, `fields` | New synthetic object |
+| `update` | `id`, `fields` | Updated object; immutable IDs and metrics |
+| `publish` / `activate` / `pause` | `id` | Validation, warnings, resulting delivery state |
+| `reset` | none | Restore the frozen seed and remove disposable artifacts |
+
+Editable fields: `name`; campaign `objective` AWARENESS/TRAFFIC/LEADS/SALES;
+campaign/ad set `budget` (100–100000000 integer USD cents) with `budgetType`
+(daily/lifetime); paired `startTime`/`endTime` in UTC ISO format with `.000Z`;
+ad set `parentId` (campaign) and sanitized `targeting` text; ad `parentId` (ad set)
+and `creativeId`; creative `text`, owned `artifactId`, or `upload: {mime,base64}`.
+Lifetime budgets require a schedule. Delivery requires an inherited or local budget;
+activation requires simulated publication. A paused ancestor yields a warning and
+`PARENT_PAUSED`, never a claim of delivery. No Meta API parity is claimed beyond
+these documented simulation rules.
+
+Inline uploads accept canonical base64 up to 24 KB with inert text/plain, image/png,
+image/jpeg, or application/octet-stream MIME types. For larger/generated images,
+use the existing private artifact upload and reference its returned ID. Uploaded
+bytes are never executed or fetched. The current simulation is capped at 50 objects;
+seed plus current state is capped at 150 KB. Validation failures return `ok:false`,
+`errors`, `warnings`, disclosure, and the unchanged existing object when available.
+Authorization/foreign destination overrides fail closed rather than being simulated.
+All mutations and rejected domain validations have actor-stamped revision audits,
+including resulting object fields (inline upload audit contains MIME/byte count).
+
+Reset is idempotent in resulting state and does not refund generation spend, extend
+expiry, restore grants, or reactivate a revoked evaluation. It atomically restores
+seed objects, clears artifact access, increments the artifact epoch, and records
+cleanup intent. Bounded conditional batches delete old bytes; a failed cleanup is
+retryable by repeating reset. Uploads are denied while cleanup is pending. Generation
+pins its starting epoch, so pre-reset output cannot repopulate the workspace. Audits
+and approved materials are retained. Revision checks prevent lost updates and reset
+races; a conflicting command is rejected and can be resubmitted after inspection.
+
+## Assigned review
+
+Provisioning may include up to five `reviewerUserIds` (internal user IDs, not emails).
+The provisioning administrator and these explicitly assigned, currently active,
+non-delegated users can inspect the evaluation. Being in the same organization or
+being an unrelated administrator grants no review access. Existing legacy evaluations
+without recorded assignment fail closed for review; disposable cases should be
+reprovisioned through the normal operation.
+
+Review through the same `/evaluation` page after reviewer login, through Emma with
+`{"action":"review","evaluation_user_id":"eval_..."}`, or GET
+`/api/admin/evaluations/<evaluation-user-id>`. Results include the frozen/current
+simulation, materials, private artifact manifest, and audit events. The audit scan is
+bounded to 100 pages / approximately 1000 events and reports `truncated` when incomplete;
+it never returns another evaluation's rows or a cross-evaluation cursor. Artifacts use
+GET `/api/admin/evaluations/<evaluation-user-id>/artifacts/<artifact-id>` or Emma review
+with `artifact_id`; bytes stay authenticated, attachment-only, and without public URLs.
+Reviewer inspection remains available after candidate revocation. Candidate access
+remains denied. Provision/revoke still require the existing current administrator gate.
 
 ## Security and spend invariants
 

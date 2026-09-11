@@ -16,6 +16,7 @@ export async function runEvaluation(userId: string, input: EvaluationAction) {
   const record = await requireActiveEvaluation(userId);
   if (!Array.isArray(record.materials) || record.materials.some(m => !m || m.approved !== true || typeof m.text !== 'string' || typeof m.title !== 'string')) throw new EvaluationDenied();
   // No refunds and no retries: even failed, timed-out, or abandoned requests consume admission.
+  if (record.resetArtifacts !== undefined) throw new EvaluationDenied();
   await evaluationStore.reserve(userId);
   const key = await getSecret(`${process.env.NODE_ENV === 'development' ? 'dev' : 'prod'}/AgentWeb/Google/Image`);
   const client = await getGeminiClient({ userId, feature: 'evaluation' }, key);
@@ -55,14 +56,14 @@ export async function runEvaluation(userId: string, input: EvaluationAction) {
       content = await sharp(source, { limitInputPixels: 16000000 }).resize({ width, height: width, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 75 }).toBuffer();
       if (content.length <= 240000) break;
     }
-    const artifact = await evaluationStore.saveArtifact(userId, content, 'image/jpeg');
+    const artifact = await evaluationStore.saveArtifact(userId, content, 'image/jpeg', record.artifactEpoch || 0);
     await requireActiveEvaluation(userId);
     return artifact;
   }
   if (parts.some(p => typeof p.text !== 'string' || p.functionCall || p.inlineData)) throw new EvaluationDenied();
   const text = parts.map(p => p.text).join('\n');
   if (!text.trim() || text.length > 32000) throw new EvaluationDenied();
-  const artifact = await evaluationStore.saveArtifact(userId, Buffer.from(text), 'text/plain');
+  const artifact = await evaluationStore.saveArtifact(userId, Buffer.from(text), 'text/plain', record.artifactEpoch || 0);
   await requireActiveEvaluation(userId);
   return { ...artifact, text };
 }

@@ -6,7 +6,7 @@ import { runEvaluation } from '../services/evaluationService';
 import '../mcp/server/evaluationTools';
 
 jest.mock('../services/evaluationStore', () => ({ evaluationStore: {
-  get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), saveArtifact: jest.fn(),
+  get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), saveArtifact: jest.fn(), simulate: jest.fn(), review: jest.fn(),
 } }));
 jest.mock('../services/db', () => ({ userDb: { getUserByIdConsistent: jest.fn() } }));
 jest.mock('../services/evaluationService', () => ({ runEvaluation: jest.fn() }));
@@ -53,4 +53,25 @@ describe('ENG-1870 Emma-operable lifecycle', () => {
     await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin', delegateInfo: { isDelegated: true } })).rejects.toThrow();
     expect(evaluationStore.revoke).not.toHaveBeenCalled();
   });
+  it.each([['Emma', emmaToolRegistry], ['MCP', mcpToolRegistry]] as const)('%s runs simulator commands through the evaluation boundary', async (_name, registry) => {
+    (evaluationStore.simulate as jest.Mock).mockResolvedValue({ ok: true, disclosure: 'Simulation complete — not sent to Meta' });
+    const command = { operation: 'create', kind: 'campaign', fields: { name: 'Proposal', objective: 'LEADS' } };
+    const response = await registry.execute('evaluation_workspace', { action: 'simulate', command }, { userId: 'eval_test' });
+    expect(evaluationStore.simulate).toHaveBeenCalledWith('eval_test', command);
+    expect(JSON.parse(response.content[0].text).disclosure).toBe('Simulation complete — not sent to Meta');
+    expect(runEvaluation).not.toHaveBeenCalled();
+  });
+  it('Emma exposes explicit review access without using an org or production tool', async () => {
+    (evaluationStore.review as jest.Mock).mockResolvedValue({ userId: 'eval_test', audit: [] });
+    await emmaToolRegistry.execute('evaluation_workspace', { action: 'review', evaluation_user_id: 'eval_test' }, { userId: 'admin' });
+    expect(evaluationStore.review).toHaveBeenCalledWith('admin', 'eval_test');
+  });
+
+  it('Emma candidate inspect exposes a safe view without review assignments', async () => {
+    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', expiresAt: Date.now()+60000, provisionedBy: 'private-admin', reviewerUserIds: ['private-reviewer'], simulation: { seed: [], objects: [] }, materials: [] });
+    const result = await emmaToolRegistry.execute('evaluation_workspace', { action: 'inspect' }, { userId: 'eval_test' });
+    const view = JSON.parse(result.content[0].text);
+    expect(view.reviewerUserIds).toBeUndefined(); expect(view.provisionedBy).toBeUndefined(); expect(view.simulation.seed).toBeUndefined();
+  });
+
 });
