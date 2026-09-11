@@ -67,6 +67,10 @@ barrel those tests and that bridge import.
 
 ## Proposed in-process packages (not HTTP)
 
+See `SERVICES_DAG.md` for `services/` clusters. Cheap folder: `creative/`
+(`imageGeneration.ts` is a leaf: no `db.ts`, 5 prod importers). Do not
+move `db.ts` or `agentModeService.ts`.
+
 ```
 mcp/server/tools/session.ts
 mcp/server/tools/tasks.ts

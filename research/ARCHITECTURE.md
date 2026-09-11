@@ -205,5 +205,5 @@ In-tree gold standard: `backend/src/loops/core` (ports; no `services/`
 imports; may import `loops/index` registry). Incomplete strangler:
 `agentMode/core` (`executeAgentStep` still throws). MCP already started
 the Hermes split (`workflowTools.ts`); `apiTools.ts` is 85 tools in one
-file (A-007). Folder map: `research/sdlc/MODULE_MAP.md`. Full thesis:
-`research/sdlc/THESIS.md`.
+Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
+`research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

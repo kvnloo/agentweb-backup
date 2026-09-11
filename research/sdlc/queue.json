@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T18:50:00Z",
+  "updated_at": "2026-09-11T18:55:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
-  "implementation_order_when_unlocked": ["A-002", "A-007", "A-005"],
+  "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
   "items": [
     {
       "id": "A-001",
@@ -94,6 +94,26 @@
         ".github/workflows/tests.yml"
       ],
       "first_slice": "PARK. After the agentModeService.ts PR set shrinks: LOC script + update AGENTMODE_MIGRATION.md scorecard in the same change.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-008",
+      "title": "Folder-move creative cluster to services/creative/ with re-export",
+      "status": "ready",
+      "leverage": 3,
+      "product": 2,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 1,
+      "score": 26,
+      "why": "Cycle 19. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports. usageRecorder stays shared. Not a new deploy unit. Re-export old path so Q-003 can keep importing services/imageGeneration.",
+      "files": [
+        "backend/src/services/imageGeneration.ts",
+        "backend/src/services/videoGeneration.ts",
+        "backend/src/services/remotionService.ts",
+        "research/sdlc/SERVICES_DAG.md"
+      ],
+      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from the old path. Do not extract HTTP. Do not move db.ts.",
       "harsha_db": false
     },
     {
