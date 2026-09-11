@@ -35,7 +35,10 @@ are ready to implement.
 5. Update `queue.json` then regenerate the top of `QUEUE.md`.
 6. Update `ARCHITECTURE.md` only where the cycle actually taught something.
 7. Commit, push, update the PR.
-8. If `cycles_completed >= target_cycles` **or** wall time past `stop_after`, set `coding_unlocked` (or `briefing_ready`) and stop the timer.
+8. If UTC now > `stop_after`, unsubscribe `agentweb-research-cycle`.
+   Do not unset `briefing_ready`. Do not set `coding_unlocked` unless
+   Kevin asked to code. Initialization is already complete
+   (`STATE.md` `initialization_complete`).
 
 ## How Kevin should use this
 

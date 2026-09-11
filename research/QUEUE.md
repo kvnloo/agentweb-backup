@@ -52,7 +52,8 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 
 ## First coding (when unlocked)
 
-1. **Q-001** — Hermes OAuth runbook / skill (no customer blast radius).
+1. **Q-001** — Kevin operator smoke on the existing `HERMES_MCP_OAUTH.md`
+   recipe (not another in-repo doc PR).
 2. **Q-014** — list `generate_image` on MCP (metering unchanged).
 3. **Q-003** — fail-open DesignArena mapper; Matt before flipping the
    production default to `gpt-image-2`.
