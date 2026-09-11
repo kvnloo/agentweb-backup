@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:56:00Z",
+  "updated_at": "2026-09-11T19:58:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -151,7 +151,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face, not in generateImage. Cycle 44: Emma chat already child_process.forks generateMarketingResponseWorker.ts which new AgentModeService() — same god object, event-loop isolation, not HTTP. MCP listing hits the parent; in-app generate_image runs in the worker. A sixth HTTP image process would be called from both. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–45: chat forks generateMarketingResponseWorker.ts (new AgentModeService); MCP server is parent-only (app.ts L204). Parent singleton still initialize()s for emmaApi + in-process chatbot. Both load vendor MCP clients (IS_MCP_SERVER unused). A sixth HTTP image process would be called from both instances. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",

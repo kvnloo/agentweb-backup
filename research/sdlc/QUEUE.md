@@ -26,9 +26,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 44: Emma chat already `fork`s `generateMarketingResponseWorker.ts`
-(same `AgentModeService`). MCP `generate_image` hits the **parent**.
-A-006 stays discard. Q-014 lists the parent face.
+Cycle 45: MCP **server** is parent-only (`app.ts` L204). Worker is a
+second `AgentModeService` + outbound MCP clients. Chatbot stays
+in-process on the parent (`server.ts` L288). A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

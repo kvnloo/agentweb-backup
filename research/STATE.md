@@ -7,14 +7,14 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 44
+cycles_completed: 45
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 45
+next_cycle: 46
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 44: loop already forks the same AgentModeService; MCP hits parent.
-  Cycle 45: collision-only unless a cheaper mapping exists. Do not un-ready
+  Cycle 45: MCP server parent-only; worker is a second AgentModeService.
+  Cycle 46: collision-only unless a cheaper mapping exists. Do not un-ready
   Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle

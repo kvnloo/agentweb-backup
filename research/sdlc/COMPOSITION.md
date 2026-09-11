@@ -39,15 +39,20 @@ agentModeService.generateImage  L28857
 imageService.generateImage  (meter L5 + C2PA L575–578 + CRITICAL LOGO L477–484)
 ```
 
-**Parent vs worker (cycle 44).** MCP’s hop above runs in the **EB
-parent** (Express). In-app Emma does **not** take that hop: 
+**Parent vs worker (cycle 44–45).** MCP’s hop above runs in the **EB
+parent** (Express + `app.ts` L204 `setupMcpServer`). In-app Emma Agent
+Mode does **not** take that hop:
 `generateSessionResponse` L8256 `runInWorker` →
 `child_process.fork` (`generateMarketingResponseWorkerService.ts` L98)
 → `workers/generateMarketingResponseWorker.ts` L16 `new AgentModeService()`
 then L123 `generateMarketingResponse`. Same 40k class, second OS
 process, 4GB heap, IPC for `publishAuthorizationOverride` /
 `approvedRevisionImageSources`. Health checks stay on the parent
-(L8254). Do not add HTTP in front of this fork.
+(L8254). Parent also keeps a **singleton** `agentModeService`
+(`server.ts` L6, `initialize()` L594) for chatbot-without-fork (L288)
+and `emmaApi`. Worker has no MCP HTTP server. `IS_MCP_SERVER` skip at
+`initialize()` L1593 is unused in-repo — both processes load vendor MCP
+clients. Do not add HTTP in front of this fork.
 
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at

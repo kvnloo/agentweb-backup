@@ -261,6 +261,9 @@ is the Slack channel-port extract — do not compete. A-006 discarded.
 Cycle 44: `generateSessionResponse` L8256 `runInWorker` forks
 `workers/generateMarketingResponseWorker.ts` (L16 `new AgentModeService()`).
 MCP listing stays on the parent. Do not add HTTP on top of the fork.
+Cycle 45: parent singleton (`server.ts` L6 / L594) still serves MCP
+server + chatbot-without-fork; worker has no `setupMcpServer`. Q-014 is
+parent `tools/list`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

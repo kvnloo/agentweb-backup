@@ -19,7 +19,7 @@ the chat loop is the same idea with more latency and a billing footgun.
 |---|---|---|
 | **Logical** | One operation, one contract, one test surface | Partial: `loops/core` ports, `agentMode/core/*` seams, MCP tool handlers |
 | **Package** | Import boundary an agent can hold in context | Missing: `backend/package.json` has no `workspaces` and no dependency-cruiser (cycle 38). Folders + A-002 AST guard first; do not extract npm workspaces instead of Q-014 |
-| **Process / deploy** | Independently shipped runtime | Already: backend EB **plus a `child_process.fork` worker that still `new AgentModeService()`** (cycle 44), partner-portal EB, agent-engine GCP, remotion-lambda. The fork is event-loop isolation, not a package boundary |
+| **Process / deploy** | Independently shipped runtime | Already: backend EB **plus a `child_process.fork` worker that still `new AgentModeService()`** (cycle 44–45: MCP *server* stays on the parent; worker is outbound MCP *clients* + chat loop), partner-portal EB, agent-engine GCP, remotion-lambda. The fork is event-loop isolation, not a package boundary |
 
 2026 writing that uses “nanoservice” (e.g. telemetryagent.dev) is
 explicit that this is **first a logical architecture**, compatible with
