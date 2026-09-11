@@ -260,3 +260,6 @@ reverted. Do not copy that as A-006.
 - Cycle 103: `emma_get_session` is listed, not internal, and
   GETs a handler the comment calls a “passive READ” that starts
   billed generation. Hermes poll during overlap. Not A-006.
+- Cycle 104: `emma_send_message` default mcpFetch 5 min;
+  `/generate` cancel-on-close; drain waiter 10 min. Image leaf
+  ignores abort. Not a send_message nanoservice.

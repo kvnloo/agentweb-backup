@@ -124,6 +124,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 101: /generate uses the session Set, not track().
   Cycle 102: auto-continuation re-fills the Set after release.
   Cycle 103: emma_get_session GET starts billed continuation.
+  Cycle 104: emma_send_message 5 min hop around /generate.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

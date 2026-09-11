@@ -277,6 +277,11 @@ not `internal`) mcpFetchs `GET /session/:id`. The handler
 comment says “passive READ” then `setImmediate`s a continuation.
 Hermes polling during overlap starts billed generation on this
 PORT. Do not hide the tool; A-019 `tryClaim` refuse is the gate.
+Cycle 104: listed `emma_send_message` (`apiTools.ts` L213–216)
+mcpFetchs POST `/generate` with **no** `timeoutMs` (5 min
+default). Inner `/generate` **does** cancel on `req.close`
+(L9094–9104). Q-014 `generate_image` mcpFetch does not cancel the
+leaf. Do not HTTP-split either hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

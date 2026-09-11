@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 103
+cycles_completed: 104
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 104
+next_cycle: 105
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 103: emma_get_session GET starts billed continuation.
-  Cycle 104: cheapest remaining. Candidate: emma_send_message
-  POST /generate during drain. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 104: emma_send_message is a 5 min hop around /generate.
+  Cycle 105: cheapest remaining. Candidate: loopback fetch failed
+  after server.close while Hermes is on the new instance. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
+  stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

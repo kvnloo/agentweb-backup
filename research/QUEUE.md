@@ -183,4 +183,6 @@ Cycle 102: auto-continuation re-fills the Set after release
 (`setImmediate` L9406, `tryClaim` L1350). A-006 stays discarded.
 Cycle 103: listed `emma_get_session` mcpFetchs that GET. A-006
 stays discarded.
+Cycle 104: `emma_send_message` 5 min mcpFetch around `/generate`
+(cancels on close). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

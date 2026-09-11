@@ -140,6 +140,9 @@ Cycle 102: auto-continuation re-fills that Set after release.
 `tryClaim` refuse is required, not optional.
 Cycle 103: listed MCP `emma_get_session` mcpFetchs the GET that
 starts that continuation. Do not HTTP-split the leaf.
+Cycle 104: listed `emma_send_message` is a 5 min mcpFetch around
+`/generate` that *does* cancel on abort. Q-014’s image hop does
+not. One process, two clocks.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

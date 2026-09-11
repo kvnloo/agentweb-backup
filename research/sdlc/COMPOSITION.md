@@ -378,6 +378,11 @@ Cycle 103: **`emma_get_session` is a GET that is not a read.**
 mcpFetch GET `/session/:id` → `setImmediate` continuation.
 Hermes during overlap starts Q-014’s leaf on this PORT.
 
+Cycle 104: **`emma_send_message` is a 5 min hop around `/generate`.**
+L213–216, no `timeoutMs`; `httpClient.ts` L205 default 5 min.
+Inner `req.on('close')` L9094–9104 `requestCancel`s. Inbound
+CallTool untracked. Q-014 image hop does not cancel the leaf.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
