@@ -20,6 +20,7 @@ jest.mock('../services/resendService', () => ({
 jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
+    getSettings: jest.fn(),
     setSetting: jest.fn(),
     getSettingsByPrefix: jest.fn(),
   },
@@ -82,20 +83,17 @@ describe('GET /api/admin/users - replay URLs', () => {
     mockUserDb.getAllUsers.mockResolvedValue(users as any);
 
     const replayUrl = 'https://clarity.microsoft.com/projects/view/proj123/impressions?CustomUserId=is%3Buser-1';
-    mockSettingsService.getSetting.mockImplementation((key: string) => {
-      if (key === 'replay_sessions_user-1') {
-        return Promise.resolve({
-          settingName: 'replay_sessions_user-1',
-          settingValue: JSON.stringify({
-            replayUrl,
-            clarityProjectId: 'proj123',
-            trackingUserId: 'user-1',
-            lastTracked: '2026-02-17T00:00:00Z',
-          }),
-        } as any);
-      }
-      return Promise.reject(new Error('Not found'));
-    });
+    mockSettingsService.getSettings.mockResolvedValue([
+      {
+        settingName: 'replay_sessions_user-1',
+        settingValue: JSON.stringify({
+          replayUrl,
+          clarityProjectId: 'proj123',
+          trackingUserId: 'user-1',
+          lastTracked: '2026-02-17T00:00:00Z',
+        }),
+      },
+    ] as any);
 
     const res = await request(app)
       .get('/api/admin/users')
@@ -112,7 +110,7 @@ describe('GET /api/admin/users - replay URLs', () => {
     ];
 
     mockUserDb.getAllUsers.mockResolvedValue(users as any);
-    mockSettingsService.getSetting.mockRejectedValue(new Error('Not found'));
+    mockSettingsService.getSettings.mockResolvedValue([]);
 
     const res = await request(app)
       .get('/api/admin/users')
@@ -128,10 +126,12 @@ describe('GET /api/admin/users - replay URLs', () => {
     ];
 
     mockUserDb.getAllUsers.mockResolvedValue(users as any);
-    mockSettingsService.getSetting.mockResolvedValue({
-      settingName: 'replay_sessions_user-1',
-      settingValue: 'not-valid-json',
-    } as any);
+    mockSettingsService.getSettings.mockResolvedValue([
+      {
+        settingName: 'replay_sessions_user-1',
+        settingValue: 'not-valid-json',
+      },
+    ] as any);
 
     const res = await request(app)
       .get('/api/admin/users')
@@ -154,7 +154,7 @@ describe('GET /api/admin/users - replay URLs', () => {
     ];
 
     mockUserDb.getAllUsers.mockResolvedValue(users as any);
-    mockSettingsService.getSetting.mockRejectedValue(new Error('Not found'));
+    mockSettingsService.getSettings.mockResolvedValue([]);
 
     const res = await request(app)
       .get('/api/admin/users')
@@ -197,7 +197,7 @@ describe('GET /api/admin/users - replay URLs', () => {
     ];
 
     mockUserDb.getAllUsers.mockResolvedValue(users as any);
-    mockSettingsService.getSetting.mockRejectedValue(new Error('Not found'));
+    mockSettingsService.getSettings.mockResolvedValue([]);
 
     const res = await request(app)
       .get('/api/admin/users')
