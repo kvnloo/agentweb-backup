@@ -228,6 +228,9 @@ do not HTTP-split; do not delay Q-014.
 Cycle 91: live MCP face is **`/mcp`** (`mcpServer.ts` L298).
 `package.json` `mcp:inspector` and `AGENT_API.md` L129 still say
 `/mcp/server`. Q-001 runbook already uses `/mcp`. Do not rewrite it.
+Cycle 92: that inspector is **SSE**. Live initialize is POST
+`/mcp` Streamable HTTP. GET `/mcp` without `mcp-session-id` is
+400 (`mcpServer.ts` L512–515). Do not HTTP-split to fix `npm run mcp:inspector`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

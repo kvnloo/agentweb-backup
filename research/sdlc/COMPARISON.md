@@ -223,3 +223,6 @@ reverted. Do not copy that as A-006.
 - Cycle 91: live face is `/mcp` (`mcpServer.ts` + OAuth metadata).
   `/mcp/server` is inspector + AGENT_API L129 drift. Q-001 runbook
   already matches. Do not HTTP-split a renamed URL.
+- Cycle 92: `mcp:inspector` is `--transport sse` against `/mcp/server`.
+  Live initialize is POST `/mcp`. GET `/mcp` without session is 400.
+  Do not HTTP-split to fix a script.

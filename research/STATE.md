@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 91
+cycles_completed: 92
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 92
+next_cycle: 93
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 91: live MCP face is /mcp; /mcp/server is stale.
-  Cycle 92: cheapest remaining. Candidate: mcp:inspector SSE vs
-  Streamable HTTP POST /mcp. Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 92: mcp:inspector is SSE against /mcp/server (dead).
+  Cycle 93: cheapest remaining. Candidate: mcpShutdown still
+  unused by runDrain, or OMP version reconfirm.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

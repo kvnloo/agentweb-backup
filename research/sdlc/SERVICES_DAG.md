@@ -112,6 +112,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 89: Hermes still MCP client; parallel opt-in default false.
   Cycle 90: self-MCP skip is file-config only; DB path can loopback.
   Cycle 91: live MCP face is /mcp; /mcp/server is stale.
+  Cycle 92: inspector is SSE against that dead path.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

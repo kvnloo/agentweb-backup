@@ -308,6 +308,12 @@ and OAuth metadata (`oauthRoutes.ts` L81) have no `/mcp/server`.
 already uses `/mcp`. `github` in `mcp_config.ts` is stdio vendor,
 not a self-loop.
 
+Cycle 92: **`mcp:inspector` is SSE against a dead path.**
+`package.json` L21 `--transport sse` + `/mcp/server`. Live
+initialize is POST `/mcp`. GET `/mcp` SSE needs `mcp-session-id`
+(L512–515) or 400. Q-001 is Streamable HTTP at `/mcp`. Do not
+HTTP-split to make the inspector work.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

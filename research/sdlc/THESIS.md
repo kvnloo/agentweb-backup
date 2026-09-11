@@ -121,6 +121,7 @@ Cycle 88: OMP 0.85.1 unpublished experimental client/server.
 Cycle 89: Hermes MCP parallel is opt-in (default false).
 Cycle 90: self-MCP skip is file-config only; DB path can loopback.
 Cycle 91: live HTTP face is `/mcp`; `/mcp/server` is stale.
+Cycle 92: inspector is SSE against that dead path; GET `/mcp` needs a session.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

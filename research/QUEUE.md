@@ -154,4 +154,6 @@ Cycle 90: file-config still skips `"agentweb-tools"`; DB
 `mcp_servers` does not. Park A-018. A-006 stays discarded.
 Cycle 91: live MCP face is `/mcp`; `/mcp/server` is stale
 inspector + AGENT_API L129. Q-001 runbook already matches.
+Cycle 92: inspector is `--transport sse` against that dead
+path; GET `/mcp` without session is 400. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
