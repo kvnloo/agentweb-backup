@@ -339,6 +339,10 @@ Immutable deploys, not `InstanceRefreshEnabled`. Only
 Cycle 116: `06-log-retention.config` names `systemd-journald`,
 not the Node unit. `web.stdout.log` is a log file. Sunday
 stop-timeout is live-AWS-only. Do not copy agent-engine 30s.
+Cycle 117: `runDrain` never stops nginx (`server.ts` L404–440).
+`nginx.service` is named in `dev.md` L1934; `websocket.conf` L6
+hardcodes `127.0.0.1:8080`. mcpFetch skips nginx. Sunday
+nginx-vs-Node stop order is live-AWS-only.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

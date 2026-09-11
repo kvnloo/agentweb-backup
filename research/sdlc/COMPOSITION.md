@@ -449,6 +449,12 @@ Cycle 116: **journald is not the Node unit.**
 `.platform` has no `hooks/`. `web.stdout.log` is a log file
 (CLAUDE.md L544). Sunday `TimeoutStopSec` is live-AWS-only.
 
+Cycle 117: **`runDrain` never stops nginx.**
+`dev.md` L1934 `nginx.service`. `websocket.conf` L6
+`proxy_pass 127.0.0.1:8080`. mcpFetch skips nginx
+(`httpClient.ts` L94–96). `server.ts` L404–440 `server.close` only.
+Sunday nginx-vs-Node stop order is live-AWS-only.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

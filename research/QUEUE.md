@@ -210,4 +210,5 @@ Cycle 115: Sunday SIGTERM is OS/cgroup, not the hook. A-006 stays
 discarded.
 Cycle 116: journald drop-in is not the Node unit. A-006 stays
 discarded.
+Cycle 117: `runDrain` never stops nginx. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

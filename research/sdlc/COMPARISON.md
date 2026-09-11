@@ -294,3 +294,5 @@ reverted. Do not copy that as A-006.
   does not keep it alive. 900s is not Sunday. Not A-006.
 - Cycle 116: journald drop-in is not the Node unit. Sunday
   `TimeoutStopSec` is live-AWS-only. Not A-006.
+- Cycle 117: `runDrain` never stops nginx. Stop order is
+  live-AWS-only. Not a fifth `listen()`.

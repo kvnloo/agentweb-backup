@@ -178,6 +178,8 @@ Immutable command Timeout, not recycle.
 Cycle 116: `06-log-retention.config` names `systemd-journald`.
 `web.stdout.log` is a log file. Sunday stop-timeout is
 live-AWS-only. Do not copy agent-engine’s 30s.
+Cycle 117: `runDrain` never stops `nginx.service`. Hermes inbound
+needs nginx; mcpFetch does not. Stop order is live-AWS-only.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

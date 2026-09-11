@@ -185,6 +185,8 @@ Product READY unchanged.
 Cycle 116: log-retention names `systemd-journald`, not the Node
 unit. Sunday `TimeoutStopSec` is live-AWS-only. Product READY
 unchanged.
+Cycle 117: `runDrain` never stops nginx. Stop order is
+live-AWS-only. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
