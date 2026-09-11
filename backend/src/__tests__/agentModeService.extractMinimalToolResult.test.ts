@@ -101,6 +101,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         status: 'deployed',
         buildStatus: 'success',
         deployedUrl: 'https://example.agentwebforms.com/pilot',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -121,6 +122,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         deployedUrl: 'https://example.agentwebforms.com/pilot',
         name: 'Cold Outreach',
         leadListId: 'list-9',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -135,6 +137,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(minimalResult).toEqual({
         buildStatus: 'success',
         previewUrl: 'https://preview.example.com',
+        launchReadiness: { ready: true, reasons: [] },
+      });
+    });
+
+    // ENG-1868: a failed smoke test must survive minimization — this is the exact ledger
+    // evidence the truthful-reporting reconciler needs to append a launch-readiness caveat.
+    it('surfaces launchReadiness.ready = false when the smoke test failed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        smokeTestResult: { ok: false, leadCaptured: false, checkedAt: '2026-09-11T00:00:00Z' },
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['Post-deploy smoke test failed'],
+      });
+    });
+
+    it('surfaces launchReadiness.ready = false when tracking was not installed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        trackingInstalled: false,
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['No conversion tracking (GTM) installed'],
       });
     });
   });
