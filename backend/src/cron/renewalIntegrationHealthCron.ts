@@ -150,8 +150,8 @@ export async function evaluateRenewalIntegrationHealth(user: any): Promise<Renew
 /**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
  * and flag paid-ads customers, whose plan actually permits ad integration,
- * whose ad integration is missing or expired. Resilient: a failure sending
- * one user's alert is logged and never aborts the rest of the run.
+ * whose ad integration is missing or expired. Resilient: a failure evaluating
+ * or alerting for one user is logged and never aborts the rest of the run.
  */
 export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegrationHealthSummary> {
   const summary: RenewalIntegrationHealthSummary = {
