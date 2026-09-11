@@ -13890,14 +13890,28 @@ export const agentModeController = {
               console.error('AgentMode: Failed to save first-attempt-failure telemetry record', sessionId, saveErr);
             }
 
-            // Restart the worker before retrying — the current worker may be unresponsive
-            try {
-              await generateMarketingResponseWorkerService.restartWorker();
-            } catch (restartErr) {
-              console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+            // Restart the worker before retrying — but ONLY if it's actually unresponsive.
+            // This worker process is a SHARED singleton serving every concurrent session.
+            // restartWorker() SIGKILLs it, and the exit handler's failAllPendingRequests()
+            // rejects EVERY other session's in-flight turn on that same worker, not just
+            // this one — so an unconditional restart here for what was often just a
+            // transient, single-session failure (a rate limit, a bad tool call, anything
+            // unrelated to the worker process itself) took down every concurrent user's
+            // turn for one unrelated hiccup. Ping first via the existing health check;
+            // only restart when the worker genuinely doesn't answer — the doc comment on
+            // restartWorker() already says it's "for when the worker is detected as
+            // unresponsive", this just actually detects that instead of assuming it.
+            const workerHealthy = await generateMarketingResponseWorkerService.isWorkerHealthy().catch(() => false);
+            if (!workerHealthy) {
+              try {
+                await generateMarketingResponseWorkerService.restartWorker();
+              } catch (restartErr) {
+                console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            } else {
+              console.log(`AgentMode: Worker responded to health check — skipping restart for session ${sessionId}, retrying directly`);
             }
-
-            await new Promise(resolve => setTimeout(resolve, 3000));
 
             let retryErrCaught: any = null;
             try {

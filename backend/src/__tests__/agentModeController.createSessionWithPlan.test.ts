@@ -1126,6 +1126,53 @@ describe('AgentModeController - createSessionWithPlan', () => {
       errorSpy.mockRestore();
     }, 10000);
 
+    // The blast-radius bug: restartWorker() SIGKILLs a worker process SHARED by every
+    // concurrent session, and its exit handler rejects every OTHER session's in-flight
+    // turn too — not just this one. Restarting unconditionally on any single session's
+    // transient failure (a rate limit, a bad tool call, anything unrelated to the worker
+    // process itself) took down every concurrent user for one unrelated hiccup. Fixed:
+    // ping the worker first: only restart when it's genuinely unresponsive.
+    it('does NOT restart the worker when it responds healthy — a single session\'s transient failure must not affect concurrent sessions', async () => {
+      mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const { generateMarketingResponseWorkerService } = jest.requireMock('../services/generateMarketingResponseWorkerService');
+      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValue(true);
+
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // No restart delay to wait out this time — should settle quickly.
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      expect(generateMarketingResponseWorkerService.isWorkerHealthy).toHaveBeenCalled();
+      expect(generateMarketingResponseWorkerService.restartWorker).not.toHaveBeenCalled();
+
+      (console.warn as jest.Mock).mockRestore();
+      (console.error as jest.Mock).mockRestore();
+    });
+
+    it('DOES restart the worker when it fails to respond — the genuinely-unresponsive case is unchanged', async () => {
+      mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const { generateMarketingResponseWorkerService } = jest.requireMock('../services/generateMarketingResponseWorkerService');
+      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValue(false);
+
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(req, res);
+
+      await new Promise(resolve => setTimeout(resolve, 4000));
+
+      expect(generateMarketingResponseWorkerService.isWorkerHealthy).toHaveBeenCalled();
+      expect(generateMarketingResponseWorkerService.restartWorker).toHaveBeenCalled();
+
+      (console.warn as jest.Mock).mockRestore();
+      (console.error as jest.Mock).mockRestore();
+    }, 10000);
+
     it('should handle missing req.body gracefully', async () => {
       // Create request without body property
       const req = {
