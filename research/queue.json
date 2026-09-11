@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "updated_at": "2026-09-11T17:35:00Z",
+  "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
+  "items": [
+    {
+      "id": "Q-001",
+      "title": "Make Emma-via-Hermes a real operator path",
+      "status": "keep",
+      "leverage": 5,
+      "product": 4,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 34,
+      "why": "ENG-1869 shipped native OAuth; remaining friction is client-side PTY+callback paste. Kevin is a Hermes contributor. Unblocks external Emma without schema.",
+      "files": [
+        "backend/docs/HERMES_MCP_OAUTH.md",
+        "backend/src/mcp/oauth/oauthRoutes.ts",
+        "backend/docs/AGENT_API.md"
+      ],
+      "first_slice": "Docs + a tiny Hermes-side runbook/skill; optional non-schema callback helper. Do not Slack-bridge PKCE on the server.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-002",
+      "title": "Eval-informed image model routing (no new table)",
+      "status": "triage",
+      "leverage": 5,
+      "product": 5,
+      "mergeability": 3,
+      "evidence": 4,
+      "collision": 1,
+      "score": 31,
+      "why": "Matt's creative_image queue + onboarding like-rates exist; getImageGenerationFallbackModel is a static list. DesignArena/mcp-bench-router is Kevin's live arena experiment.",
+      "files": [
+        "backend/src/services/agentModeService.ts",
+        "backend/src/services/humanEvalService.ts",
+        "backend/src/services/imagePromptQualityService.ts",
+        "backend/src/services/adImageVariantRatingService.ts"
+      ],
+      "first_slice": "Read existing eval items and like-rates; propose a pure function that reorders fallbackOrder. Cycle 4 must prove no new GSI is required.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-003",
+      "title": "DesignArena adapter for Emma design/image tasks",
+      "status": "keep",
+      "leverage": 5,
+      "product": 4,
+      "mergeability": 4,
+      "evidence": 3,
+      "collision": 1,
+      "score": 30,
+      "why": "mcp-bench-router already picks DesignArena #1 via OpenRouter. AgentWeb image path is not OpenRouter. Adapter can inform default model id, not replace providers.",
+      "files": [
+        "backend/src/services/imageGeneration.ts",
+        "backend/src/routes/image-models.ts"
+      ],
+      "first_slice": "Read-only fetch of DesignArena leaderboard → map to SUPPORTED_MODELS aliases. Fail open to current default.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-004",
+      "title": "MCP tools/list curation for external agents",
+      "status": "triage",
+      "leverage": 4,
+      "product": 3,
+      "mergeability": 5,
+      "evidence": 4,
+      "collision": 0,
+      "score": 30,
+      "why": "Hermes/DesignArena clients drown in 60+ tools. Registry already has internal/internalOnly. Curation is flags + tests.",
+      "files": [
+        "backend/src/mcp/server/registry.ts",
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/emma/tools.ts"
+      ],
+      "first_slice": "Inventory tools/list as externalMcp=true; mark publish/side-effect tools internalOnly if not already.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-005",
+      "title": "Multi-variant generate_image (n=3) like onboarding",
+      "status": "park",
+      "leverage": 3,
+      "product": 2,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 1,
+      "score": 22,
+      "why": "emma/tools.ts generate_image description already tells the model to emit N parallel calls in one turn. An n= parameter is convenience, not a gap. Revisit only if telemetry shows the model ignores the instruction.",
+      "files": [
+        "backend/src/emma/tools.ts",
+        "backend/src/services/onboardingAdImageService.ts"
+      ],
+      "first_slice": "Optional variants param; meter each success independently; keep category required.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-006",
+      "title": "Hide deprecated edit_landing_page_file; fix OpenRouter doc drift",
+      "status": "keep",
+      "leverage": 2,
+      "product": 4,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 27,
+      "why": "edit_landing_page_file is still registered and executable (apiTools.ts ~L1769) despite DEPRECATED copy. coding_agent is the real path. OpenRouter gateway doc still lists coding agent as Bedrock/Vertex. Collision: do not touch callLLM retry (#2862).",
+      "files": [
+        "backend/docs/OPENROUTER_GATEWAY.md",
+        "backend/src/services/codingAgentService.ts",
+        "backend/src/emma/tools.ts"
+      ],
+      "first_slice": "Doc fix + test that landing edits go through coding_agent. Collision: #2563 dead transports, #2862 429 retry.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-007",
+      "title": "Remotion compositions beyond intro/outro",
+      "status": "triage",
+      "leverage": 4,
+      "product": 3,
+      "mergeability": 4,
+      "evidence": 3,
+      "collision": 1,
+      "score": 27,
+      "why": "hyperframes/open-design/MoneyPrinterTurbo overlap. Remotion is the only graph-like post node today. Safe because it does not touch Veo/Seedance providers.",
+      "files": [
+        "remotion-lambda/src/compositions/BrandedVideo.tsx",
+        "backend/src/services/remotionService.ts"
+      ],
+      "first_slice": "Second composition (lower-third / product plate) behind compose_video. Metering unchanged.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-008",
+      "title": "Evaluation workspace as creative (not Meta) harness",
+      "status": "park",
+      "leverage": 4,
+      "product": 3,
+      "mergeability": 2,
+      "evidence": 4,
+      "collision": 2,
+      "score": 22,
+      "why": "ENG-1870 just merged. Isolated eval_* users + generationBudget map to Kerdoios-like allotment. Expanding beyond Meta simulation needs product intent.",
+      "files": [
+        "backend/docs/EVALUATION_WORKSPACES.md",
+        "backend/src/services/evaluationService.ts"
+      ],
+      "first_slice": "Park until Q-002 routing exists; then a pairwise image eval inside the existing Evaluations table.",
+      "harsha_db": "maybe — prefer existing Evaluations table"
+    },
+    {
+      "id": "Q-009",
+      "title": "Optional ComfyUI backend behind generate_image",
+      "status": "park",
+      "leverage": 5,
+      "product": 3,
+      "mergeability": 1,
+      "evidence": 2,
+      "collision": 1,
+      "score": 21,
+      "why": "Real unique leverage but ops-heavy (GPU, workflow JSON, brand-logo invariant, metering). Do not lead with this.",
+      "files": [
+        "backend/src/services/imageGeneration.ts"
+      ],
+      "first_slice": "Spike: one frozen workflow, fail-open, same S3+meter path. Needs an ops owner.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-010",
+      "title": "Strangler: extract callLLM + system prompt from agentModeService",
+      "status": "park",
+      "leverage": 2,
+      "product": 4,
+      "mergeability": 2,
+      "evidence": 5,
+      "collision": 3,
+      "score": 19,
+      "why": "Right long-term, wrong first PR. Monolith is Harsha/Argusoft gravity. Characterization suite exists. Do after a unique wedge ships.",
+      "files": [
+        "backend/src/services/agentModeService.ts",
+        "backend/docs/AGENTMODE_MIGRATION.md",
+        "backend/src/services/agentMode/"
+      ],
+      "first_slice": "One seam per PR. Not a rewrite.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-011",
+      "title": "Local Hermes proxy for WhatsApp/WeChat (WIP 2026-04)",
+      "status": "park",
+      "leverage": 4,
+      "product": 3,
+      "mergeability": 1,
+      "evidence": 3,
+      "collision": 5,
+      "score": 16,
+      "why": "WIP.md already scoped Hermes gateway. Open PR #2271 is WhatsApp Cloud API. Collision is fatal until that PR lands or dies.",
+      "files": [
+        "WIP.md",
+        "local-agent-relay/"
+      ],
+      "first_slice": "Wait on #2271. Do not add agentType field until then (schema-ish).",
+      "harsha_db": "agentType on AW-TaskExecutions is optional but still data-plane adjacent"
+    },
+    {
+      "id": "Q-012",
+      "title": "Port Kerdoios into AgentWeb usage accounting",
+      "status": "discard",
+      "leverage": 5,
+      "product": 1,
+      "mergeability": 1,
+      "evidence": 5,
+      "collision": 5,
+      "score": 12,
+      "why": "Usage runway, cost tiers, dominance, and metering already exist. Duplicate. Steal the BYOK-zero-price lesson only.",
+      "files": [
+        "backend/src/routes/subscription.ts",
+        "backend/docs/OPENROUTER_GATEWAY.md"
+      ],
+      "first_slice": "DISCARD. Optional: a comment/test that OpenRouter BYOK cost 0 still meters via price book.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-013",
+      "title": "Rewrite agentModeService.ts",
+      "status": "discard",
+      "leverage": 1,
+      "product": 3,
+      "mergeability": 0,
+      "evidence": 5,
+      "collision": 5,
+      "score": 8,
+      "why": "40k-line gravity well. Strangler exists. A rewrite cannot merge.",
+      "files": [
+        "backend/src/services/agentModeService.ts"
+      ],
+      "first_slice": "Never as a queue item for implementation.",
+      "harsha_db": false
+    }
+  ]
+}
