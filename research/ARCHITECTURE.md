@@ -230,6 +230,9 @@ the in-process composition bus.
 Cycle 34: A-002 oracle is **20** `loops/core` files (35 specifiers, two
 `../index` escapes). Q-014 drops `internal` at L2077 and edits
 `mcp.apiTools.test.ts` L91 — not an `emma_generate_image` wrapper.
+Cycle 35: `loops/index.ts` is Hermes `registry.py` (only `./core/types`).
+`app.ts` L118–120 is the composition root. MCP `registry.ts` already
+imports `evaluationPolicy`.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

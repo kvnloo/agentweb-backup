@@ -42,10 +42,11 @@ that self-client. Hop diagram: `COMPOSITION.md`.
 2. **`loops/core`** — no `services/` / `db.ts` imports; AWS/Slack via
    `ports.ts` (`LoopPorts` L143–150: s3, dynamo, bedrock, slack, clock,
    logger — cycle 33). Wired at `productionLoopPorts()` in
-   `loops/adapters/awsAdapters.ts` L219–227. That is in-process
-   composition, not HTTP. Core **does** import `loops/index` (registry)
-   from `orchestrator.ts` / `instanceRunner.ts`. CI does **not** enforce
-   the host-forbid rule. Folder map: `MODULE_MAP.md`.
+   `loops/adapters/awsAdapters.ts` L219–227. `loops/index.ts` is Hermes
+   `registry.py`: only import is `./core/types` (cycle 35). Instances
+   register from `app.ts` L118–120, not from a registry scan. Core **does**
+   import `loops/index` from `orchestrator.ts` / `instanceRunner.ts`.
+   CI does **not** enforce the host-forbid rule. Folder map: `MODULE_MAP.md`.
 3. **MCP** — the external composition bus (Hermes, Cursor, Claude).
    ENG-982 already extracted `workflowTools.ts` (5 mcpFetch tools).
    `evaluationTools.ts` is a *different* hop: in-process services + dual

@@ -52,12 +52,15 @@ README: zero host imports. **True for `services/` / `db.ts`.** Core
 *does* import `loops/index.ts` (registry) from `orchestrator.ts` and
 `instanceRunner.ts` — documented as deliberate. CI should forbid
 `loops/core/**` → `services|emma|db`, and **allow** `core → ../index`.
+Cycle 35: `loops/index.ts` itself may only import `./core/types`.
+`app.ts` L118–120 is the composition root (explicit instance register).
 
 ## MCP files (Hermes analog)
 
 | File | Role |
 |---|---|
-| `registry.ts` | Hermes `tools/registry.py` |
+| `loops/index.ts` | **Hermes `registry.py` analog** (types only; cycle 35) |
+| `mcp/server/registry.ts` | **Not** that analog — imports `evaluationPolicy` L1 |
 | `apiTools.ts` | **85** `register()` calls, 3.6k lines, section comments already name packages |
 | `workflowTools.ts` | ENG-982: **5** mcpFetch tools, zero service imports. **A-007 template.** |
 | `evaluationTools.ts` | 1 tool; **direct** `evaluationStore` / `evaluationService`; dual-registers onto `emmaToolRegistry` (L62). **A-007 anti-template** (cycle 32). |

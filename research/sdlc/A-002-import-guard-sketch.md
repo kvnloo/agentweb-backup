@@ -38,6 +38,13 @@ the file, or as a substring on the raw specifier):
 - `from './ports'`, `./types`, `./orchestrator`, etc.
 - type-only imports of ports
 
+**Second file (cycle 35): `loops/index.ts`.** Only allowed specifier:
+`./core/types` (L20–28). This is Hermes `registry.py` (no tool/instance
+imports). Fail if anyone adds `import './instances/…'` (auto-discover;
+cycle 28). Do **not** walk `mcp/server/registry.ts` with this rule —
+it already imports `evaluationPolicy` (L1). Composition root is
+`app.ts` L118–120 (explicit instance register), not a scan.
+
 **Not in scope for the first PR:** `loops/instances/**` (those *may*
 import `services/db` — `onboarding/index.ts` L35 `userDb`;
 `ai-eval-funnel/rcaEnricher.ts` L25 imports `agentModeService` and L227
@@ -91,6 +98,7 @@ That file is outside `core/`.
   `loops/core`
 - Does not fail on today’s tree (cycle 34: 20 files, 35 specifiers, two
   `../index` escapes; no `services/` imports in `loops/core`)
+- `loops/index.ts` only imports `./core/types` (cycle 35)
 - Does not touch `agentModeService.ts`
 
 Collision cycle 31 (20 open PRs): still **no** open PR on `loops/core`,

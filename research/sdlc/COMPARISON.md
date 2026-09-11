@@ -28,7 +28,7 @@ incomplete; the monolith is still the default place to add features.
 
 ```
 Hermes:     CLI / gateway / ACP  ──► AIAgent ──► registry ──► tools/*.py
-                                     (one process)               MCP as client
+                                     (one process; registry.py has no tool imports)
 
 OMP:        coding-agent CLI    ──► pi-agent-core ──► pi-ai ──► pi-catalog
             (package.json this cycle: ai does **not** depend on agent-core)
@@ -38,9 +38,9 @@ AgentWeb:   customer-portal (other repo)
             backend EB        ─┼─► one Node process: 40k-line loop + 60 tools
             agent-engine VM    ─┤   MCP server is a *face* that loopbacks
             remotion-lambda    ─┘   http://localhost → emmaApi → generateImage
-            (cycle 25 COMPOSITION.md). Agent-engine (GCP) polls Dynamo then
-            JWT-posts usage back (cycle 27) — extract for Playwright, not
-            for image gen. Creative leaf still matches OMP.
+            loops/index.ts      ──► ./core/types only (cycle 35; Hermes registry)
+            app.ts L118–120     ──► instances register (explicit, not discover)
+            mcp/server/registry ──► already imports evaluationPolicy (not loops-clean)
 ```
 
 ## OMP workspace DAG (live 2026-09-11T19:17Z `earendil-works/pi` **0.85.1**)

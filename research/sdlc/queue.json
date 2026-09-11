@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:30:00Z",
+  "updated_at": "2026-09-11T19:32:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -36,10 +36,11 @@
       "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts. Cycle 31: #2563 appends remnant string checks to sdkConstructionGuard.test.ts; AST walker L41–68 unchanged. Sibling file, do not append.",
       "files": [
         "backend/src/loops/core/ports.ts",
+        "backend/src/loops/index.ts",
         "backend/src/__tests__/sdkConstructionGuard.test.ts",
         "research/sdlc/A-002-import-guard-sketch.md"
       ],
-      "first_slice": "When coding unlocked: NEW sibling loopsCoreImportGuard.test.ts (do not append to sdkConstructionGuard.test.ts while #2563 is open). Copy findDirectProviderSdkImports visit() L41–68, not the remnant not.toContain pattern. AST-walk loops/core/** (20 prod files, 35 specifiers — cycle 34). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index. Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService) or mcp/server (httpClient.ts L63 imports db). Optional second test: agentMode/core ↛ agentModeService.ts only.",
+      "first_slice": "When coding unlocked: NEW sibling loopsCoreImportGuard.test.ts (do not append to sdkConstructionGuard.test.ts while #2563 is open). Copy findDirectProviderSdkImports visit() L41–68, not the remnant not.toContain pattern. AST-walk loops/core/** (20 prod files, 35 specifiers — cycle 34). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index. Also walk loops/index.ts: only allowed import is ./core/types (cycle 35; Hermes registry.py). Do not add instance auto-discover there (app.ts L118–120 is the composition root). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService) or mcp/server (httpClient.ts L63 imports db; registry.ts already imports evaluationPolicy). Optional second test: agentMode/core ↛ agentModeService.ts only.",
       "harsha_db": false
     },
     {

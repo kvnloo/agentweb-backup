@@ -102,6 +102,11 @@ Cycle 34: `httpClient.ts` L63 `lookupUser` → `await import('../../services/db'
 A-007 `tools/infrastructure.ts` still mcpFetchs through that client.
 File split ≠ `loops/core` package. Do not forbid db in `mcp/server`.
 
+Cycle 35: in-process composition root is `app.ts` L118–120 (explicit
+instance `register*`), not `loops/index.ts` (Hermes registry: types only).
+`mcp/server/registry.ts` L1 already imports `evaluationPolicy` — do not
+demand loops-index purity of the MCP registry.
+
 ## Two MCP hop styles (cycle 32)
 
 `mcpServerCore.ts` L26–30 already composes **three** in-process modules

@@ -23,20 +23,19 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 34: A-002 oracle is **20** `loops/core` files (not 18); 35
-specifiers and two `../index` escapes unchanged. Q-014 is drop
-`internal` at L2077 + `mcp.apiTools.test.ts` L91 — **not** an
-`emma_generate_image` wrapper. `httpClient.ts` L63 still imports `db`.
-A-006 stays discard.
+Cycle 35: `loops/index.ts` is Hermes `registry.py` (only `./core/types`).
+Composition root is `app.ts` L118–120, not auto-discover.
+`mcp/server/registry.ts` already imports `evaluationPolicy`. A-006 stays
+discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
 1. **A-002** — AST import guard on `loops/core` only. **New**
    `loopsCoreImportGuard.test.ts` — do not append to
    `sdkConstructionGuard.test.ts` (#2563). Copy `visit()` L41–68.
-   Allow exactly `orchestrator` / `instanceRunner` → `../index`. Do
-   **not** copy forbid-all-services onto `agentMode/core`
-   (`toolDispatch` imports the gateway).
+   Allow exactly `orchestrator` / `instanceRunner` → `../index`. Also
+   walk `loops/index.ts` (only `./core/types`). Do **not** copy
+   forbid-all-services onto `agentMode/core` or `mcp/server`.
 2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
