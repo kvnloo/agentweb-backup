@@ -39,6 +39,14 @@ agentModeService.generateImage  L28857
 imageService.generateImage  (meter L5 + C2PA L575–578 + CRITICAL LOGO L477–484)
 ```
 
+Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
+the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
+`emmaApi.ts` L16–21. `POST /generate-image` is `metered`
+(`emmaTokenBudget.ts` L58). In-app chat checks `checkTokenUsage` in
+`chatbot.ts` L156. Media auto-continuation had to copy it again
+(`agentModeController.ts` L1327–1334) after bypassing
+`generateSessionResponse`. A fifth process would need a fourth copy.
+
 In-app Emma does **not** use MCP for this tool (cycle 26):
 
 ```

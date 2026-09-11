@@ -24,9 +24,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 39: MCP `generate_image` is a thinner HTTP adapter (`emmaApi.ts`
-L181 `confirm=undefined`; no `session_id` in body). Q-014 stays ready
-(text-to-image list). A-011 parks unification. A-006 stays discard.
+Cycle 40: monthly quota is **above** `generateImage` (controllers /
+`emmaTokenBudget.ts` L58 / auto-continuation L1327). A fifth process
+would skip or re-copy that gate. A-006 stays discard. Q-014 lists a
+face that is already `metered`.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -246,6 +246,10 @@ AST, not npm workspaces.
 Cycle 39: MCP schema is a thinner HTTP adapter (no `confirm` /
 `metrics_verified`; `emmaApi.ts` L181). Q-014 stays list-only. A-011
 parks schema unification.
+Cycle 40: monthly quota is not in `generateImage`. MCP hop skipped the
+controller (`emmaTokenBudget.ts` L4–10); `POST /generate-image` is
+`metered` (L58). Auto-continuation copied `checkTokenUsage` again
+(L1327–1334). A-006 stays discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

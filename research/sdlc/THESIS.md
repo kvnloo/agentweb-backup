@@ -93,7 +93,9 @@ Order is process, not a rewrite:
    A fifth service for images/video would split the **leaf**
    (`imageGeneration.ts`: meter, C2PA L575–578, CRITICAL LOGO L477–484)
    from policy (category / HITL / persisted logo) and miss blog/thumbs/
-   video/onboarding callers (cycle 36). Forbidden.
+   video/onboarding callers (cycle 36). It would also skip monthly quota:
+   that gate lives in controllers / `emmaTokenBudget.ts`, not in
+   `generateImage` (cycle 40; MCP hop already skipped it once). Forbidden.
 5. **Agent context map.** Draft: `research/sdlc/MODULE_MAP.md`. A short
    `backend/src/AGENTS.md` (module index, max file size, “do not edit X”)
    beats another 40k-line CLAUDE dump. LinkedIn’s 2026 MCP playbook is

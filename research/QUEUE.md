@@ -71,4 +71,4 @@ None of these needs a database change.
 Kevin asked to research breaking the repo into nanoservices and
 comparing Hermes / Oh My Pi. **Do not HTTP-split Emma.** See
 `sdlc/THESIS.md`. Track queue: `sdlc/QUEUE.md`. First SDLC coding
-(after unlock, not instead of Q-014): A-002 then A-005.
+(after unlock, not instead of Q-014): A-002 then A-007 then A-008.
