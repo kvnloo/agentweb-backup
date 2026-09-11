@@ -813,6 +813,20 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
     if (!name || call?.error === undefined || call?.error === null) return;
     const err = call.error instanceof Error ? call.error : new Error(String(call.error));
     if (classifyToolErrorClass(err) !== 'tool_unavailable') return;
+    /*
+     * The INSTALLER is never itself the missing capability (ENG-1795). This notice exists to
+     * say "the tool you were expecting output from did not run"; `install_skills` did run, and
+     * refused — naming it here tells the user a tool was unavailable when what actually
+     * happened is that it worked and reported a reason.
+     *
+     * Load-bearing, though no longer for install_skills' OWN refusals — those now classify
+     * `skill_install_refused` and never reach this filter. Four other install_skills failures
+     * still classify `tool_unavailable`, because the classifier matches the bare tool name
+     * inside the message: a gateway policy block, the repeated-failure breaker, an excludeTools
+     * removal, and a timeout. Any of them would otherwise name install_skills in a banner as a
+     * capability that "did not run".
+     */
+    if (name === 'install_skills') return;
     // Ran successfully at some point in the turn — the capability is present.
     if (succeeded.has(name)) return;
     // Never tried to obtain it: doing without a speculative tool is not a missing capability.

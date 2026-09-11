@@ -79,7 +79,41 @@ const CONFIG_RE =
  * @param errorMessage the tool's error message (may be '', undefined)
  */
 export function classifyToolFailureType(errorClass?: string, errorMessage?: string): ToolFailureType {
+  /*
+   * ENG-1795. Deliberately NOT `model_uninstalled_tool` ("not a tool bug; fix the catalog, not
+   * the tool"). The `unavailable` bucket IS a catalog bug — an entitled bundle whose tool pool
+   * emptied out, the ENG-1237 production defect — so routing it to a non-dispatchable type
+   * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
+   * visible, which is where it was under the old single-message behaviour.
+   */
+
   const cls = (errorClass || '').toLowerCase();
+
+  if (cls === 'skill_install_refused') {
+    /*
+     * Two buckets share this class, and they are opposite kinds of event.
+     *
+     *   forbidden   — `__admin_tools__` refused to a non-admin. A ROLE boundary working
+     *                 exactly as designed. Nothing to investigate; proposing a "robustness
+     *                 fix" for the install_skills handler here is pure triage noise.
+     *   unavailable — an entitled bundle whose tool pool emptied out. That IS the ENG-1237
+     *                 catalog defect, and it must stay in the investigate set.
+     *
+     * Distinguished by message rather than by a second error class, because both real callers
+     * (`runRecorder.ts`, `backfillFailureTypes.ts`) already pass errorMessage — so this needs
+     * no new routing, guidance text or consumer trace.
+     *
+     * A MIXED refusal, carrying both an admin id and an entitled-but-empty one, stays `bug`:
+     * the unavailable half is a genuine defect, and under-investigating is the expensive
+     * direction. Absent or unreadable message likewise falls through to `bug`.
+     */
+    // `||`, not `??`: matches `cls` above, and coerces a non-string (0/false/NaN) that a
+    // historical DynamoDB row can hand `backfillFailureTypes.ts` — `?? ''` leaves those
+    // intact and `.toLowerCase()` then throws, aborting the whole backfill scan.
+    const m = (errorMessage || '').toLowerCase();
+    const rolesOnly = m.includes('requires admin access') && !m.includes('permitted to use it');
+    return rolesOnly ? 'by_design' : 'bug';
+  }
   const msg = errorMessage || '';
 
   // 1. Model called a tool that isn't installed. Message-driven: pre-classifier

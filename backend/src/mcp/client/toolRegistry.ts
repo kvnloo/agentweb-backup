@@ -1,3 +1,4 @@
+import { enforceEvaluationTool } from '../../services/evaluationPolicy';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
@@ -42,6 +43,7 @@ export class ToolRegistry {
   }
 
   async execute(toolName: string, args: any, context: ToolContext): Promise<any> {
+    await enforceEvaluationTool(context?.userId, toolName);
     const tool = this.getTool(toolName);
     if (!tool) {
       throw new Error(`Unknown tool: ${toolName}`);

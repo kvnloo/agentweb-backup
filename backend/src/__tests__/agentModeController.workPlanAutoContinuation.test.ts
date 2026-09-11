@@ -249,6 +249,49 @@ describe('AgentModeController - automatic work-plan continuation (ENG-1684/ENG-1
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
   });
 
+  it('ENG-1495: the live-delivered continuation message carries the real persisted messageIndex, not just the content', async () => {
+    // The default beforeEach mocks addMessagesToSession to resolve undefined (most tests
+    // here don't care about the return value) -- override it for this test with a
+    // realistic persisted-session shape so messageIndex genuinely flows through
+    // generateSessionResponse's own stamping into the socket emit.
+    mockChatbotDb.addMessagesToSession.mockResolvedValue({
+      ...baseSession(completedWorkPlan),
+      messages: [
+        {
+          role: 'assistant',
+          content: 'Report generated.',
+          timestamp: '2026-09-02T09:12:01.000Z',
+          metadata: { timestamp: '2026-09-02T09:12:01.000Z' },
+          messageIndex: 17,
+        },
+      ],
+    } as any);
+
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse('Steps 1-5 are done. Step 6 (HTML report) was interrupted.', [failedToolCall()]),
+      )
+      .mockImplementationOnce(async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(baseSession(completedWorkPlan) as any);
+        return workerResponse('Report generated.', []);
+      });
+
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+
+    expect(mockIoEmit).toHaveBeenCalledWith(
+      'session-message-appended',
+      expect.objectContaining({
+        sessionId: mockSessionId,
+        message: expect.objectContaining({
+          content: 'Report generated.',
+          messageIndex: 17,
+        }),
+      }),
+    );
+  });
+
   it('does not auto-continue when a tool call this turn actually succeeded', async () => {
     mockWorkerService.runInWorker.mockResolvedValueOnce(
       workerResponse('Working on it.', [{ id: 'tc-1', name: 'read_market_strategy', result: { success: true } }]),

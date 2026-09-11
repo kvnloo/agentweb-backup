@@ -90,6 +90,60 @@ export class SettingsService {
     }
   }
 
+  async getSettings(settingNames: string[]): Promise<Setting[]> {
+    const settings: Setting[] = [];
+    const uniqueNames = [...new Set(settingNames.filter(name => typeof name === 'string' && name.length > 0))];
+
+    const chunks: string[][] = [];
+    for (let index = 0; index < uniqueNames.length; index += 100) {
+      chunks.push(uniqueNames.slice(index, index + 100));
+    }
+
+    const results = await Promise.all(chunks.map(async names => {
+      try {
+        const items: Setting[] = [];
+        let keys = names.map(settingName => ({ settingName }));
+
+        for (let attempt = 0; keys.length > 0 && attempt < 4; attempt += 1) {
+          if (attempt > 0) {
+            await new Promise(resolve => setTimeout(resolve, 25 * (2 ** (attempt - 1))));
+          }
+
+          const result = await dynamodb.batchGet({
+            RequestItems: {
+              [this.tableName]: {
+                Keys: keys,
+                ProjectionExpression: 'settingName, settingValue',
+              },
+            },
+          }).promise();
+          const responseItems = result.Responses?.[this.tableName];
+          if (Array.isArray(responseItems)) {
+            items.push(...responseItems.filter(
+              (item): item is Setting =>
+                typeof item?.settingName === 'string' && typeof item?.settingValue === 'string',
+            ));
+          }
+
+          const unprocessedKeys = result.UnprocessedKeys?.[this.tableName]?.Keys;
+          keys = Array.isArray(unprocessedKeys)
+            ? unprocessedKeys.filter(
+                (key): key is { settingName: string } => typeof key?.settingName === 'string',
+              )
+            : [];
+        }
+
+        return items;
+      } catch (error) {
+        console.error('Error batch getting settings:', error);
+        return [];
+      }
+    }));
+
+    for (const items of results) settings.push(...items);
+    return settings;
+  }
+
   async setSetting(settingName: string, settingValue: string, description?: string, updatedBy: string = 'system', ttl?: number): Promise<Setting> {
     try {
       if (ttl !== undefined && !Number.isFinite(ttl)) {

@@ -1,3 +1,4 @@
+import { isEvaluationUser } from './services/evaluationPolicy';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -125,6 +126,8 @@ io.use(async (socket, next) => {
         delegateAccess?: unknown;
         _svc?: boolean;
       };
+
+      if (isEvaluationUser(decoded.userId) || isEvaluationUser((decoded.delegateAccess as any)?.targetUserId) || isEvaluationUser((decoded.delegateAccess as any)?.adminUserId)) return next(new Error('Authentication error'));
 
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are
@@ -664,6 +667,53 @@ createTestAccount().then(async () => {
         }, msUntilNextRun);
       } catch (error) {
         console.error('[ActivationCron] Failed to initialize:', error);
+      }
+
+      // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
+      // Three landing pages sat unreachable while every record read healthy, one of them
+      // unreported for months, because nothing ever asked whether the site loads.
+      try {
+        const { runDomainReachabilitySweep, REACHABILITY_INTERVAL_MS } =
+          await import('./cron/domainReachabilityCron');
+
+        /*
+         * DAILY at a fixed UTC time, not hourly-from-boot.
+         *
+         * Hourly meant we made an unsolicited HTTPS request to every customer's domain 24
+         * times a day. That is traffic they did not ask for, against their origin, and a WAF
+         * or bot-protection layer is entitled to start refusing it — at which point we would
+         * confidently report a working site as unreachable. Daily is enough: these are static
+         * landing pages, and the failure this watches for (a certificate that can never be
+         * issued) does not come and go.
+         *
+         * Fixed clock time rather than boot+offset, matching every other cron here. Under
+         * boot-relative scheduling the schedule reshuffles on every deploy, so "hourly" really
+         * meant "whenever this instance happened to start, then every hour after that" — which
+         * is neither predictable nor reproducible when reading the timestamps back.
+         */
+        const nowForReach = new Date();
+        const nextReachRun = new Date(nowForReach);
+        nextReachRun.setUTCHours(6, 15, 0, 0);
+        if (nextReachRun <= nowForReach) {
+          nextReachRun.setUTCDate(nextReachRun.getUTCDate() + 1);
+        }
+        const msUntilReach = nextReachRun.getTime() - nowForReach.getTime();
+
+        console.log(
+          `[DomainReachability] Initialized — first sweep at 06:15 UTC (in ${Math.round(msUntilReach / 60000)} min), then daily`,
+        );
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+            .catch(e => console.error('[DomainReachability] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+              .catch(e => console.error('[DomainReachability] Error:', e));
+          }, REACHABILITY_INTERVAL_MS);
+        }, msUntilReach);
+      } catch (error) {
+        console.error('[DomainReachability] Failed to initialize:', error);
       }
 
 

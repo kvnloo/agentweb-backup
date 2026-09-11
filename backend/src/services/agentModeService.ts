@@ -1,3 +1,4 @@
+import { enforceEvaluationTool } from './evaluationPolicy';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
@@ -155,16 +156,47 @@ import {
   applyOpenRouterCacheBreakpoints,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
+  type GatewayReasoningConfig,
+  resolveGatewayReasoningEffort,
 } from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+/*
+ * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
+ * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
+ * `invalid_args` instead of `subscription_blocked`, so it is a contract between the two
+ * files, not decoration — change it in both or in neither.
+ */
+export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+/*
+ * The skill exists and the account is entitled to it, but nothing is installable behind it
+ * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
+ *
+ * Routed to `skill_install_refused`, a class that exists for this case: its guidance defers to
+ * this message for the reason and adds only the verdict — do not retry, do not substitute.
+ * `empty_result` is actively harmful here ("the call succeeded … try a different source",
+ * beneath a refusal forbidding exactly that) and `tool_unavailable` is false and circular
+ * ("this tool is not available", "install via install_skills" — on an install_skills failure).
+ *
+ * NOT visibility-filtered skills (those never reach this bucket — `getPublishedSkills` drops
+ * `pending_review`, so they land in `unresolved`), and NOT the admin bundle (its own
+ * `forbidden` bucket).
+ */
+export const SKILL_UNAVAILABLE_MARKER = "These skills are currently unavailable to install";
+/*
+ * Appended to EVERY refusal, full or partial. The Phoenix session (delegated a1a6345a) showed
+ * a model answering a refused tool with an unrelated tool's output presented as that tool's
+ * result; this sentence is the direct countermeasure, so it must not be scoped to one branch.
+ */
+const SKILL_NO_SUBSTITUTION =
+  " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
 // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -920,7 +952,7 @@ function pdfPageRender(pageData: any): Promise<string> {
 }
 
 // Type for LLM model configuration
-interface LLMModelConfig {
+interface LLMModelConfig extends GatewayReasoningConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
   /**
@@ -1833,6 +1865,7 @@ export class AgentModeService {
         // Import the registry and the tools definitions (for side effects)
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
+        await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
         await import('../emma/meetingActionRouter');
@@ -2636,11 +2669,9 @@ export class AgentModeService {
     // Transport: OpenRouter BYOK → our own Azure resource
     // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
     // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
-    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
-    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
-    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
-    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
-    // with Sol on the same path.
+    // day: response provider "Azure", usage.is_byok true, and an exact
+    // upstream inference cost. AgentMode meters that upstream value for BYOK
+    // calls so OpenRouter's long-context pricing overrides remain accurate.
     // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
     // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
     // Deliberately NO `family`: Astra and Sol are distinct product lines;
@@ -2669,7 +2700,8 @@ export class AgentModeService {
     // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
     // `tier` is the no-price fallback only; the picker derives ultra_premium
     // live from MODEL_PRICING.
-    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
+    // ENG-1788: OpenRouter reasoning.supported_efforts, verified in the issue 2026-09-05.
+    'openrouter/openai/gpt-6-astra': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -3056,6 +3088,12 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
+    const reasoningEffort = resolveGatewayReasoningEffort(
+      this.llmModels[model], taskClass,
+      (fallbackModels ?? []).map(id => this.llmModels[this.normalizeModelId(id)]),
+    );
+    if (reasoningEffort !== undefined) params.reasoning = { effort: reasoningEffort };
+
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
@@ -3112,6 +3150,7 @@ export class AgentModeService {
         console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
           provider: resolvedMetadata.provider,
           is_byok: resolvedMetadata.is_byok,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
         });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
@@ -3132,15 +3171,24 @@ export class AgentModeService {
               cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               cacheWriteByTtl: usage.cache_creation_by_ttl,
               costUsdOverride:
-                usage.is_byok !== true && typeof usage.cost === 'number'
-                  ? usage.cost
-                  : undefined,
+                usage.is_byok === true
+                  ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                    Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                    usage.cost_details.upstream_inference_cost > 0
+                    ? usage.cost_details.upstream_inference_cost
+                    : undefined
+                  : typeof usage.cost === 'number'
+                    ? usage.cost
+                    : undefined,
             });
           }
         } catch {
           // Metering must never break an LLM call.
         }
-        return res;
+        // Keep default responses untouched; annotate only the effort actually sent.
+        return reasoningEffort !== undefined && res.usage
+          ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+          : res;
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
@@ -4377,6 +4425,8 @@ export class AgentModeService {
         const responseUsage = response.usage;
         if (responseUsage) {
           responseMessage.usage = {
+            ...(responseUsage.reasoning_effort !== undefined
+              ? { reasoning_effort: responseUsage.reasoning_effort } : {}),
             prompt_tokens: responseUsage.prompt_tokens || 0,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
@@ -6521,6 +6571,181 @@ export class AgentModeService {
     return skills;
   }
 
+  /*
+   * ENG-1795. A rejected skill id has two causes that are NOT interchangeable to the
+   * person on the other end of the chat:
+   *
+   *   unentitled — the skill exists and is published, but this account's allowedSkills
+   *                does not unlock it. "Not on your plan" is TRUE, and sales can fix it.
+   *   unresolved — no such skill id exists: retired, renamed, a typo, a virtual bundle
+   *                with nothing in it, or an id the model invented. "Not on your plan"
+   *                is FALSE. Support can fix it; sales cannot.
+   *
+   * Both used to return the single subscription message, which did not merely misreport
+   * the cause — it INSTRUCTED the model to state the plan limitation to the customer as
+   * fact. That is how a lookup failure reaches a paying customer as a billing statement
+   * and sends them to the one team that cannot help them.
+   */
+  private async classifySkillRejections(
+    rejectedSkillIds: string[],
+    userId: string
+  ): Promise<{ unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] }> {
+    /*
+     * Partitioned BEFORE the catalog read, because this decision needs no catalog: it is a
+     * static id comparison. Left below the try/catch, a catalog failure dropped
+     * `__admin_tools__` into the `unavailable` fallback — which asserts "this account is
+     * permitted to use it" and "support can look into it", the two false claims the forbidden
+     * bucket exists to remove. A lookup failure must not silently undo a decision that never
+     * depended on the lookup.
+     */
+    const adminRejected = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
+    const classifiable = rejectedSkillIds.filter((id) => id !== ADMIN_SKILL_VIRTUAL_ID);
+
+    /*
+     * `forbidden` asserts a ROLE RESTRICTION — permanent, nothing support can grant, and
+     * classified `by_design` so triage ignores it. That is only true if the caller genuinely is
+     * not an admin, so it is only claimed when we can CONFIRM that.
+     *
+     * The reason this needs confirming: `getSkillsForDisplay` adds the admin bundle inside a
+     * `try { getUserById } catch { }` that swallows a lookup failure. When DynamoDB blips, a
+     * real admin's request is rejected exactly like a non-admin's — and asserting a role
+     * restriction there tells them "not a temporary fault" when it is precisely that, while
+     * `by_design` hides the outage from triage. Unconfirmed cases go to `unavailable` instead,
+     * whose wording ("unavailable right now… support can look into it") is true either way and
+     * whose `bug` failure type keeps a real fault visible.
+     */
+    let forbidden: string[] = [];
+    const adminUnconfirmed: string[] = [];
+    if (adminRejected.length > 0) {
+      try {
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        if (user?.isAdmin === true) {
+          // An admin whose bundle was still refused: not a role boundary, so do not claim one.
+          adminUnconfirmed.push(...adminRejected);
+        } else {
+          forbidden = adminRejected;
+        }
+      } catch (err) {
+        console.warn('[installSkills] admin check failed while classifying a refusal:', err);
+        adminUnconfirmed.push(...adminRejected);
+      }
+    }
+
+    let allowedIds: string[];
+    let existingIds: Set<string>;
+    try {
+      /*
+       * `getAllowedSkills` directly, NOT `loadAuthorizedSkillCatalog` — the latter returns
+       * `allowedIds` verbatim from this same call, and the catalog half of its work would be
+       * discarded here. Building it costs `resolveUserSkillAccess` (getUserById + getOrgById),
+       * `getOrgMembers`, and one UNCACHED OwnerIndex query per org member — an N+1 on the
+       * refusal path for a value that is thrown away. `getPublishedSkills` is TTL-cached, so
+       * that half is genuinely cheap.
+       */
+      const [allowed, published] = await Promise.all([
+        getAllowedSkills(userId),
+        skillService.getPublishedSkills(),
+      ]);
+      allowedIds = allowed;
+      existingIds = new Set(published.map(s => s.skillId));
+      // The virtual bundles are real ids with no catalog row; entitlement still governs them.
+      existingIds.add(OTHER_SKILLS_VIRTUAL_ID);
+      existingIds.add(ADMIN_SKILL_VIRTUAL_ID);
+    } catch (err) {
+      /*
+       * We could not read the catalog, so we cannot prove a skill is absent — and an
+       * unproven absence must not be reported as an entitlement failure. Fail into the
+       * branch that makes no claim about the customer's plan.
+       */
+      console.warn('[installSkills] skill catalog lookup failed while classifying a refusal:', err);
+      /*
+       * We could not read the catalog, so we cannot prove WHY an id was rejected. The one
+       * thing we must not do is assert the customer's plan is at fault, so this falls to the
+       * non-billing branch. Note the honest limitation: `unavailable`'s wording claims the
+       * account IS permitted, which is unproven here — accepted as the lesser error, since
+       * over-claiming entitlement misroutes nobody, while under-claiming it bills them.
+       */
+      return {
+        unentitled: [],
+        unavailable: [...classifiable, ...adminUnconfirmed],
+        unresolved: [],
+        forbidden,
+      };
+    }
+
+    const isWildcard = allowedIds.includes('*');
+    const allowedSet = new Set(allowedIds);
+    const unentitled: string[] = [];
+    const unavailable: string[] = [];
+    const unresolved: string[] = [];
+    for (const id of classifiable) {
+      if (!existingIds.has(id)) { unresolved.push(id); continue; }
+      if (!isWildcard && !allowedSet.has(id)) { unentitled.push(id); continue; }
+      /*
+       * Exists AND granted, yet absent from this user's catalog: `__other_skills__` whose
+       * unassociated-tool pool is currently empty. This is the ENG-1237 production repro
+       * (harsha@agentweb.pro) — an unpublished org-shared skill claimed the last remaining
+       * tools, the bundle vanished from the catalog, and the refusal surfaced as "not
+       * available with your current subscription".
+       *
+       * NOT visibility-filtered skills, despite the obvious guess: `getPublishedSkills`
+       * already drops `pending_review`, so such an id never reaches `existingIds` and lands
+       * in `unresolved` instead. That is the better outcome anyway — it confirms nothing
+       * about another owner's draft.
+       */
+      unavailable.push(id);
+    }
+    return { unentitled, unavailable: [...unavailable, ...adminUnconfirmed], unresolved, forbidden };
+  }
+
+  /*
+   * Prose for a set of rejected ids, shared by the full-refusal and PARTIAL-install paths.
+   *
+   * The partial path is why this is extracted. It returns `success: true` (something did
+   * install), so `toolResultError` yields null and no classifier ever runs — the prose IS what
+   * the model reads, unmediated. It used to append a flat
+   * "N skill(s) were not available with your subscription", which reproduced the exact false
+   * billing claim this ticket exists to remove, on a path the split never touched.
+   */
+  private describeRejections(buckets: {
+    unentitled: string[];
+    unavailable: string[];
+    unresolved: string[];
+    forbidden: string[];
+  }): string[] {
+    const parts: string[] = [];
+    if (buckets.unentitled.length > 0) {
+      parts.push(
+        `The requested skills are not available with your current subscription: ${buckets.unentitled.join(', ')}.`
+        + " Tell the user plainly that this capability is not on their plan."
+      );
+    }
+    if (buckets.unresolved.length > 0) {
+      parts.push(
+        `${SKILL_UNRESOLVED_MARKER}: ${buckets.unresolved.join(', ')}.`
+        + " This is an ID problem, not a billing one — do NOT tell the user this capability is missing from their subscription."
+        + " Re-read the available skills list and retry with an exact ID from it."
+      );
+    }
+    if (buckets.unavailable.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.unavailable.join(', ')}.`
+        + " The ID is correct and this account is permitted to use it, so retrying the same ID will not help,"
+        + " and this is NOT a billing limitation — do NOT tell the user it is missing from their subscription."
+        + " Say the capability is unavailable right now and that support can look into it."
+      );
+    }
+    if (buckets.forbidden.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.forbidden.join(', ')}.`
+        + " This requires admin access — a role restriction, not a billing limit and not a temporary fault."
+        + " Do NOT suggest upgrading a plan and do NOT suggest contacting support about it."
+      );
+    }
+    return parts;
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
@@ -6555,6 +6780,8 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
+          const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+          const { unentitled, unavailable, unresolved, forbidden } = buckets;
           /*
            * `success: false` matters as much as the text: the success path returns
            * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
@@ -6562,11 +6789,14 @@ export class AgentModeService {
            * that is how a model ends up substituting another tool's output and presenting it
            * as the gated tool's result.
            */
+          const parts = this.describeRejections(buckets);
           return {
             success: false,
-            message: "The requested skills are not available with your current subscription."
-              + " Tell the user plainly that this capability is not on their plan."
-              + " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.",
+            message: parts.join(' ') + SKILL_NO_SUBSTITUTION,
+            ...(unentitled.length > 0 ? { unentitledSkillIds: unentitled } : {}),
+            ...(unavailable.length > 0 ? { unavailableSkillIds: unavailable } : {}),
+            ...(unresolved.length > 0 ? { unresolvedSkillIds: unresolved } : {}),
+            ...(forbidden.length > 0 ? { forbiddenSkillIds: forbidden } : {}),
           };
         }
         return { success: false, message: "No valid skills found for the provided IDs." };
@@ -6579,7 +6809,31 @@ export class AgentModeService {
       };
 
       if (rejectedSkillIds.length > 0) {
-        result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        /*
+         * ENG-1795. This path returns `success: true` — something DID install — so
+         * `toolResultError` yields null and no classifier ever runs. That makes this prose the
+         * only thing the model reads about the failure, unmediated by any error class.
+         *
+         * It used to be a flat "N skill(s) were not available with your subscription",
+         * asserted over every rejected id regardless of cause. So a hallucinated id reached a
+         * paying customer as a billing statement whenever at least one OTHER skill installed
+         * — the ticket's own premise, surviving on the path the original split never touched.
+         * `message` is in extractMinimalToolResult's allowlist, so it persisted into the
+         * ledger too.
+         */
+        const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        /*
+         * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
+         * the dispatcher's downgrade attaches an error class whose retryability line carries
+         * its own stop signal. Here `success: true` means no class is ever assigned, so this
+         * sentence is the only thing standing between "the one skill the gated tool needed was
+         * the one refused" and the model presenting another tool's output as that tool's result.
+         */
+        result.message += ' ' + this.describeRejections(partialBuckets).join(' ') + SKILL_NO_SUBSTITUTION;
+        if (partialBuckets.unentitled.length > 0) result.unentitledSkillIds = partialBuckets.unentitled;
+        if (partialBuckets.unavailable.length > 0) result.unavailableSkillIds = partialBuckets.unavailable;
+        if (partialBuckets.unresolved.length > 0) result.unresolvedSkillIds = partialBuckets.unresolved;
+        if (partialBuckets.forbidden.length > 0) result.forbiddenSkillIds = partialBuckets.forbidden;
         /*
          * The refusal has to be a FIELD, not just prose appended to `message`.
          *
@@ -6956,6 +7210,26 @@ export class AgentModeService {
       return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
+    // ENG-1720: a `send-invite` that de-duplicates returns
+    // `{ success: true, alreadyInvited: true }` — "Skipped to avoid a duplicate,
+    // no invite quota was used". Nothing is delivered, the pacer's daily volume
+    // does not move, and no ledger row is written.
+    //
+    // Without this branch that outcome falls into the `{}` default above, and the
+    // stored ledger entry becomes indistinguishable from a real delivery: the
+    // requirement verdict reads `{}`, `toolCallSucceeded` finds no error and no
+    // `success: false`, and counts it as a send. Observed in production twice —
+    // a run that contacted nobody stored `status: success`, `passed: true`,
+    // `{ actual: 2, required: 1 }`, `functionCallMisses: []`.
+    //
+    // The predicate that consumes this (`isDeliveredSend`) cannot work on data
+    // that was erased before it was stored, so the flag has to survive the
+    // minimizer. `success` rides along for the same reason the branch above keeps
+    // it — a bare marker with no outcome is not enough to score on.
+    if (toolName === 'linkedin_outreach' && result?.alreadyInvited === true) {
+      return { success: result?.success, alreadyInvited: true };
+    }
+
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
     // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
     // unenrichable one and (b) pair previews to executes per list. The large `samples`
@@ -7327,6 +7601,26 @@ export class AgentModeService {
         // install fail this turn" (buildUnavailableCapabilityNotice, synthesisResidue.ts).
         ...(Array.isArray(a.rejectedToolNames) && a.rejectedToolNames.length > 0
           ? { rejectedToolNames: a.rejectedToolNames }
+          : {}),
+        /*
+         * ENG-1795: WHY each id was refused, not just that it was. Carried for the same reason
+         * `rejectedSkillIds` is — a ledger-only reader cannot re-derive it, and the causes are
+         * not interchangeable: "your plan excludes this" is actionable by sales, "no such id"
+         * by the model retrying, and the other two by neither. Without these, anything reading
+         * the ledger can only ask "did an install fail", which is the coarse question that let
+         * a lookup failure be reported as a billing limit in the first place.
+         */
+        ...(Array.isArray(a.unentitledSkillIds) && a.unentitledSkillIds.length > 0
+          ? { unentitledSkillIds: a.unentitledSkillIds }
+          : {}),
+        ...(Array.isArray(a.unavailableSkillIds) && a.unavailableSkillIds.length > 0
+          ? { unavailableSkillIds: a.unavailableSkillIds }
+          : {}),
+        ...(Array.isArray(a.unresolvedSkillIds) && a.unresolvedSkillIds.length > 0
+          ? { unresolvedSkillIds: a.unresolvedSkillIds }
+          : {}),
+        ...(Array.isArray(a.forbiddenSkillIds) && a.forbiddenSkillIds.length > 0
+          ? { forbiddenSkillIds: a.forbiddenSkillIds }
           : {}),
       };
     }
@@ -8602,6 +8896,7 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    await enforceEvaluationTool(userId, toolName, extraContext);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({

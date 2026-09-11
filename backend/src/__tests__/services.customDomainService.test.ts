@@ -55,6 +55,9 @@ import {
   getDomain,
   verifyDomain,
   generateSubdomain,
+  setPageSubdomain,
+  MAX_SUBDOMAIN_LABEL_LENGTH,
+  SUBDOMAIN_BASE,
   CustomDomainRecord,
 } from "../services/customDomainService";
 
@@ -79,10 +82,139 @@ describe("customDomainService", () => {
       expect(result).toMatch(/^page-/);
     });
 
-    it("should truncate long names", () => {
-      const longName = "a".repeat(100);
-      const result = generateSubdomain(longName);
-      expect(result.length).toBeLessThanOrEqual(63);
+    // ENG-1839. This previously asserted `<= 63` (the DNS label limit), which is not the
+    // binding constraint: the cert covers `<label>.<SUBDOMAIN_BASE>`, so a 63-char label
+    // yields an 81-char FQDN that has been observed to fail issuance. The failure is silent —
+    // DNS resolves and the record reads "deployed" while the TLS handshake is closed.
+    // Assert the FQDN, so a regression to 63 fails here.
+    it("truncates long names so the resulting FQDN can be certificated", () => {
+      const result = generateSubdomain("a".repeat(100));
+      expect(result.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${result}.${SUBDOMAIN_BASE}`.length).toBeLessThanOrEqual(64);
+    });
+
+    it("derives the ceiling from SUBDOMAIN_BASE rather than hardcoding it", () => {
+      expect(MAX_SUBDOMAIN_LABEL_LENGTH).toBe(64 - 1 - SUBDOMAIN_BASE.length);
+    });
+
+    it("does not leave a trailing hyphen when truncation lands on one", () => {
+      // The slug must be chosen so the cut ACTUALLY lands on a hyphen at the current ceiling,
+      // otherwise this passes with or without the strip and pins nothing. "a-b-a-b-…" has
+      // period 2, so an odd ceiling (46 - 1 = index 45) cuts on a separator.
+      const slug = "a b ".repeat(40).trim();
+      expect(slug.replace(/ /g, "-").slice(0, MAX_SUBDOMAIN_LABEL_LENGTH)).toMatch(/-$/);
+
+      const result = generateSubdomain(slug);
+      expect(result).not.toMatch(/-$/);
+      expect(result).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
+    });
+  });
+
+  describe("subdomain length enforcement (ENG-1839)", () => {
+    const overLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH + 1);
+
+    it("rejects a label whose FQDN would exceed the safe ceiling", async () => {
+      await expect(
+        addSubdomain("user-1", "prj_test", overLimit)
+      ).rejects.toThrow(/failed SSL certificate issuance/i);
+    });
+
+    it("accepts a label exactly at the limit", async () => {
+      const atLimit = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${atLimit}.${SUBDOMAIN_BASE}`.length).toBe(64);
+
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+      const record = await addSubdomain("user-1", "prj_test", atLimit);
+      expect(record.domain).toBe(`${atLimit}.${SUBDOMAIN_BASE}`);
+    });
+
+    it("rejects the two labels that shipped broken", async () => {
+      // Both live pages that could never get a cert. 59-char labels -> 77-char FQDNs.
+      for (const label of [
+        "create-a-high-converting-mobile-first-emergency-home-servic",
+        "build-a-single-page-pricing-focused-landing-page-called-pro",
+      ]) {
+        await expect(addSubdomain("user-1", "prj_test", label)).rejects.toThrow(
+          /failed SSL certificate issuance/i
+        );
+      }
+    });
+
+    it("reports a bad charset as a charset problem, not a length problem", async () => {
+      await expect(
+        addSubdomain("user-1", "prj_test", "My Very Long Brand Name With Spaces".repeat(3))
+      ).rejects.toThrow(/lowercase letters, numbers, and hyphens/i);
+    });
+
+    it("validates against the customer's own domain, not SUBDOMAIN_BASE", async () => {
+      // setPageSubdomain issues under `mainDomain`. A prefix legal for a short customer
+      // domain must not be rejected by the (longer) managed-base ceiling, and one that
+      // overflows a long customer domain must be caught even though it fits that ceiling.
+      const prefix = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH + 4); // > managed ceiling
+      expect(`${prefix}.acme.io`.length).toBeLessThanOrEqual(64);
+
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+      const ok = await setPageSubdomain("user-1", "prj_test", prefix, "acme.io");
+      expect(ok.fullDomain).toBe(`${prefix}.acme.io`);
+
+      const longBase = "pages.internationalfacilitiesmanagement.co.uk";
+      const fits = "commercial-hvac-maintenance-quote"; // under the managed ceiling
+      expect(fits.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(`${fits}.${longBase}`.length).toBeGreaterThan(64);
+      await expect(
+        setPageSubdomain("user-1", "prj_test", fits, longBase)
+      ).rejects.toThrow(/failed SSL certificate issuance/i);
+    });
+
+    it("reuses the existing row when the same host is added again", async () => {
+      // A retried repair run, or a re-assignment after a partial failure, re-adds the same
+      // host. Writing a second row makes `bestByOwnerProject` tie-breaking and
+      // getProjectSubdomain's `find` arbitrary — whichever duplicate wins is luck.
+      // addCustomDomain already reuses; addSubdomain did not.
+      const host = `reused.${SUBDOMAIN_BASE}`;
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-row-id",
+                userId: "user-1",
+                domain: host,
+                type: "subdomain",
+                status: "active",
+                vercelProjectId: "prj_test",
+                createdAt: "2020-01-01T00:00:00Z",
+                updatedAt: "2020-01-01T00:00:00Z",
+                consecutiveFailures: 2,
+                reachabilityStatus: "unreachable",
+              },
+            ],
+          }),
+      });
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+
+      const rec = await addSubdomain("user-1", "prj_test", "reused");
+
+      expect(rec.id).toBe("existing-row-id");
+      expect(rec.createdAt).toBe("2020-01-01T00:00:00Z"); // not reset
+      // Reachability is the sweep's to own — a re-add must not blank a known-bad verdict.
+      expect(rec.consecutiveFailures).toBe(2);
+      expect(rec.reachabilityStatus).toBe("unreachable");
+    });
+
+    it("keeps the suffix intact when a collision forces a retry", async () => {
+      const near = "a".repeat(MAX_SUBDOMAIN_LABEL_LENGTH);
+      mockAxiosPost.mockRejectedValueOnce({ response: { status: 409 } });
+      mockAxiosGet.mockRejectedValueOnce(new Error("not on this project"));
+      mockAxiosPost.mockResolvedValueOnce({ data: {} });
+
+      const record = await addSubdomain("user-1", "prj_test", near);
+      const label = record.domain.replace(`.${SUBDOMAIN_BASE}`, "");
+
+      // The 4-char suffix must survive truncation, and the result must still be legal.
+      expect(label).toMatch(/-[0-9a-f]{4}$/);
+      expect(label.length).toBeLessThanOrEqual(MAX_SUBDOMAIN_LABEL_LENGTH);
+      expect(label).toMatch(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/);
     });
   });
 
@@ -225,6 +357,41 @@ describe("customDomainService", () => {
         expect.stringContaining("/projects/proj-id/domains/landing.example.com"),
         expect.any(Object)
       );
+    });
+
+    it("carries reachability forward on a re-add instead of erasing it", async () => {
+      // addCustomDomain is a full-item put, so omitting these ERASES them: a customer
+      // re-adding an already-confirmed-unreachable domain would clear the warning and reset
+      // the counter to zero. addSubdomain was taught this by an earlier fix; its sibling was
+      // missed, and no test caught it — this bug class has been found by review twice and by
+      // tests never.
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              {
+                id: "existing-custom-id",
+                userId: "user-123",
+                domain: "landing.example.com",
+                type: "custom",
+                status: "active",
+                vercelProjectId: "proj-id",
+                createdAt: "2020-01-01T00:00:00Z",
+                updatedAt: "2020-01-01T00:00:00Z",
+                reachabilityStatus: "unreachable",
+                reachabilityError: "The domain does not resolve in DNS.",
+                consecutiveFailures: 4,
+              },
+            ],
+          }),
+      });
+      mockAxiosPost.mockResolvedValueOnce({ data: { name: "landing.example.com", verified: false } });
+
+      const rec = await addCustomDomain("user-123", "proj-id", "landing.example.com");
+
+      expect(rec.reachabilityStatus).toBe("unreachable");
+      expect(rec.reachabilityError).toMatch(/does not resolve/i);
+      expect(rec.consecutiveFailures).toBe(4);
     });
 
     it("should reuse the existing DynamoDB record id on a re-add (no duplicate)", async () => {
