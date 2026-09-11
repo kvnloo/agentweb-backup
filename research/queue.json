@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:51:00Z",
+  "updated_at": "2026-09-11T18:31:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -52,7 +52,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 38,
-      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134. Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt).",
+      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11T17:28Z and re-fetch 18:30Z: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134 (logo #40). Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt).",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/agentModeService.ts",

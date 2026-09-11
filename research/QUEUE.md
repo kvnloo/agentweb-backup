@@ -3,8 +3,11 @@
 Source of truth: `queue.json`. Protocol score is research leverage.
 **Implementation order** (first PRs when unlocked): Q-001, Q-014, Q-003.
 Cycle 8 promoted Q-003. Cycle 9 promoted Q-006 / Q-015. Cycle 11 promoted
-Q-004. Cycle 12 parked Q-002 (offline parser only). It did not un-ready
-Q-001 / Q-014 / Q-003.
+Q-004. Cycle 12 parked Q-002 (offline parser only). Cycle 16 (18:30Z)
+re-fetched DesignArena: intersection ranks identical to the cycle-8
+table (`gpt-image-2` image #3 / logo #1; default still image #22 /
+logo #40). No open PR on `apiTools.ts` or `imageGeneration.ts`. It did
+not un-ready Q-001 / Q-014 / Q-003.
 
 **Do not implement yet.** `coding_unlocked: false`. `briefing_ready: true`.
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.

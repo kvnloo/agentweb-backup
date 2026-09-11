@@ -78,6 +78,8 @@ Known live programs (bootstrap):
 - Open PR: autonomous report work plan — #2871
 - Open PR: dead AgentMode transports — #2563
 - Open PR: renewal-health alert — #2875
+- Open PR: landing-page publish Tests gate — #2846 (`landingPageGeneration.ts` only; not first-slice)
+- Open PR: dependabot GitHub Actions — #2856 (workflows only)
 
 ## Adjacent-work mapping rule
 

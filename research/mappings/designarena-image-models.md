@@ -3,6 +3,8 @@
 Snapshot: **2026-09-11T17:28Z** via POST
 `https://www.designarena.ai/api/leaderboard`
 `{"arenaType":"models","category":"<cat>"}`.
+Cycle 16 re-fetch **2026-09-11T18:30:15Z** (image) / **18:30:16Z** (logo):
+AgentWeb intersection ranks and elo **unchanged**.
 
 Refresh ~2h on DesignArena. Do not treat this file as a live feed.
 
