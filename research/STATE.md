@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 96
+cycles_completed: 97
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 97
+next_cycle: 98
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 96: immutable deploy already overlaps two instances.
-  Cycle 97: cheapest remaining. Candidate: ALB vs server.close
-  during that overlap. Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 97: drain 503s scheduled chats only; /health and /mcp stay
+  open. Cycle 98: cheapest remaining. Candidate: untracked /mcp
+  CallTools during the four-way wait, then server.close kills
+  loopback. Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
+  A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

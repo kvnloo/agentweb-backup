@@ -113,6 +113,10 @@ Product READY unchanged.
 Cycle 96: Immutable + weekly refresh already overlap two instances
 (`rolling.config` L3, `asgLifecycleGuard.ts` L4–9). `socialPosts.ts`
 MinSize=MaxSize=1 is not in `.ebextensions`. Product READY unchanged.
+Cycle 97: drain 503s only `/run-scheduled-chats`
+(`agentModeController.ts` L13032). `/health` stays 200 (`app.ts`
+L551–553). `backend/src/mcp/` has zero `isCronEnabled`. Product
+READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

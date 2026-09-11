@@ -117,6 +117,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 94: shutdown is local-only; ENG-114 store outlives SIGTERM.
   Cycle 95: MCP_SESSION_STORE unset in tree; default memory.
   Cycle 96: immutable deploy already overlaps two instances.
+  Cycle 97: drain 503s scheduled chats; /health and /mcp stay open.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

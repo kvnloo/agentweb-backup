@@ -126,6 +126,8 @@ Cycle 93: SIGTERM closes inbound MCP before `runDrain` waits.
 Cycle 94: that close does not evict ENG-114; only `DELETE /mcp` does.
 Cycle 95: `MCP_SESSION_STORE` unset in git; default memory.
 Cycle 96: Immutable deploys already overlap two backends.
+Cycle 97: drain 503s scheduled chats only; `/health` and `/mcp`
+stay open until unawaited `server.close`.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

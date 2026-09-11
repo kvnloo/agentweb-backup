@@ -246,6 +246,11 @@ Cycle 96: `DeploymentPolicy: Immutable` and weekly instance refresh
 already overlap two backends (`asgLifecycleGuard.ts` L4–9).
 `socialPosts.ts` MinSize=MaxSize=1 is not in this tree. Hermes
 404-reinits across that window (cycle 95 memory default).
+Cycle 97: drain 503s only `POST /run-scheduled-chats`
+(`agentModeController.ts` L13032). `/health` stays 200 (`app.ts`
+L551–553). `backend/src/mcp/` has zero `isCronEnabled`. The new
+instance is already serving (`IgnoreHealthCheck: false`) when
+unawaited `server.close` runs on the old one.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

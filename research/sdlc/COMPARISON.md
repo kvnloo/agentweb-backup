@@ -238,3 +238,6 @@ reverted. Do not copy that as A-006.
 - Cycle 96: Immutable + weekly refresh already overlap two instances.
   `socialPosts.ts` MinSize=MaxSize=1 is not in `.ebextensions`.
   A fifth `listen()` is a third process in that window.
+- Cycle 97: drain 503s `/run-scheduled-chats` only. `/health` stays
+  200. MCP has no `isCronEnabled`. Hermes has no 503 hop; Q-001
+  404-reinits. Do not HTTP-split to get a drain admission.

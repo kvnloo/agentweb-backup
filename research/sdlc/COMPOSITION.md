@@ -338,6 +338,13 @@ Cycle 96: **immutable deploy already overlaps two instances.**
 Guard L4–9 is 3m19s overlap. `socialPosts.ts` L16–21 MinSize=MaxSize=1
 is not in this tree. Default memory 404s Hermes across that window.
 
+Cycle 97: **drain 503s scheduled chats, not `/mcp`.**
+`IgnoreHealthCheck: false` (rolling.config L4) waits for the new
+instance before removing the old. `disableCron()` 503s
+`runScheduledChats` L13032. `app.ts` L547–553 `/` and `/health`
+stay 200. Zero `isCronEnabled` under `backend/src/mcp/`.
+`server.close` (L440, not awaited) is after that wait.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
