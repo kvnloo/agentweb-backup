@@ -198,4 +198,6 @@ Cycle 109: enhanced-health probe is deploy-verify (ENG-878), not
 drain. A-006 stays discarded.
 Cycle 110: weekly refresh overlaps without `eb-deploy.sh`. A-006
 stays discarded.
+Cycle 111: Sunday + Immutable do not stack a third backend. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -160,6 +160,8 @@ Cycle 109: `underlying_health_verdict` is a GitHub Actions probe
 bless the dying instance. Do not HTTP-split to host it.
 Cycle 110: Sunday recycle overlaps without that probe. A-019 is
 weekly, not only on merge. Do not disable `InstanceRefreshEnabled`.
+Cycle 111: Sunday + Immutable serialize or fail the GitHub deploy
+(`Must be Ready`). Not a three-process mesh.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -131,6 +131,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 108: ALB health cannot stop Hermes during drain.
   Cycle 109: enhanced-health probe is deploy-verify, not drain.
   Cycle 110: weekly refresh overlaps without the deploy-verify probe.
+  Cycle 111: Sunday recycle and Immutable do not stack a third backend.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

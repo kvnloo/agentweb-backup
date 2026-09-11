@@ -314,6 +314,11 @@ Cycle 110: weekly refresh (`05-instance-recycling.config` L8–13,
 does not start it (`deploy.yml` L199–204). Same ASG hook, no
 ENG-878 probe. A-019’s window is weekly. Do not disable
 `InstanceRefreshEnabled`.
+Cycle 111: Sunday recycle and Immutable **do not stack** a third
+`listen()`. `update-environment` Must be Ready (`eb-deploy.sh`
+L668–680). Wait 1200s then fail. ENG-1127 is a 31s ASG join abort,
+not a third fleet. Do not HTTP-split to survive a stack this tree
+already refuses.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -166,6 +166,9 @@ stale Red. Product READY unchanged.
 Cycle 110: weekly refresh (`Sun:10:00`, `InstanceRefreshEnabled`)
 overlaps without `eb-deploy.sh`. A-019’s window is weekly, not
 only on merge. Product READY unchanged.
+Cycle 111: Sunday recycle and Immutable do **not** stack a third
+backend. Must be Ready; wait 1200s or fail. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

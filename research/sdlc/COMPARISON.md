@@ -282,3 +282,5 @@ reverted. Do not copy that as A-006.
   `listen()`.
 - Cycle 110: weekly `InstanceRefreshEnabled` overlaps without
   `eb-deploy.sh`. Same ASG hook, no ENG-878 probe. Not A-006.
+- Cycle 111: Sunday + Immutable do not stack. Must be Ready;
+  wait 1200s or fail. Hermes/OMP: one process. Not A-006.

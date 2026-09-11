@@ -417,6 +417,10 @@ Cycle 110: **weekly refresh overlaps without that probe.**
 starts it, GitHub Actions does not. Same ASG hook, no
 `underlying_health_verdict`.
 
+Cycle 111: **Sunday + Immutable do not stack a third listen().**
+`eb-deploy.sh` L668–680 Must be Ready. Wait 1200s (`deploy.yml`
+L211) then fail. ENG-1127 abort is 31s ASG join, not a third fleet.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

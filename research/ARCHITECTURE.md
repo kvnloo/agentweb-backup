@@ -448,6 +448,8 @@ Cycle 109: enhanced-health probe is deploy-verify, not drain.
 A-006 discarded.
 Cycle 110: weekly refresh overlaps without the deploy probe.
 A-006 discarded.
+Cycle 111: Sunday + Immutable do not stack a third backend.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
