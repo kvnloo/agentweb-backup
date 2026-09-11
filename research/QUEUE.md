@@ -159,4 +159,6 @@ path; GET `/mcp` without session is 400. A-006 stays discarded.
 Cycle 93: `mcpShutdown` runs on SIGTERM **before** `runDrain`
 (`mcpServer.ts` L269–270 vs `server.ts` L474–475). A-006 stays
 discarded.
+Cycle 94: `mcpShutdown` does not evict ENG-114; only `DELETE /mcp`
+does. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -229,3 +229,6 @@ reverted. Do not copy that as A-006.
 - Cycle 93: two SIGTERM listeners. `mcpShutdown` closes inbound
   CallTool first; `runDrain` waits second. ASG still drains before
   SIGTERM. Do not HTTP-split to get one handler. OMP still 0.85.1.
+- Cycle 94: shutdown does not `sessionStore.delete`. Hermes session
+  ids rehydrate on the next instance (ENG-114). A fifth `listen()`
+  is another local Map plus the same Dynamo mirror.

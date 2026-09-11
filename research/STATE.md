@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 93
+cycles_completed: 94
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 94
+next_cycle: 95
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 93: mcpShutdown races runDrain on SIGTERM (closes first).
-  Cycle 94: cheapest remaining. Candidate: shutdownAllSessions
-  only clears the local sessions Map, not ENG-114 store.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 94: mcpShutdown is local-only; ENG-114 store outlives SIGTERM.
+  Cycle 95: cheapest remaining. Candidate: sessionStore.set is
+  void/best-effort. Do not un-ready Q-001 / Q-014 / Q-003.
+  Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

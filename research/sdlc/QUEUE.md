@@ -105,7 +105,8 @@ Streamable HTTP POST `/mcp`; GET `/mcp` without session is 400.
 Product READY unchanged. Cycle 93: `mcpShutdown` still unused by
 `runDrain`; on SIGTERM it runs **first** (`mcpServer.ts` L269–270
 before `server.ts` L474–475) and `transport.close()`s inbound CallTool.
-OMP still 0.85.1.
+OMP still 0.85.1. Cycle 94: that closer does not `sessionStore.delete`;
+only client `DELETE /mcp` evicts ENG-114. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -321,6 +321,12 @@ Cycle 93: **`mcpShutdown` races `runDrain` on SIGTERM.**
 drains before SIGTERM (cycle 68). Inspector cannot open GET;
 Hermes can (`MCP_DISCOVERY.md` L15). OMP still 0.85.1.
 
+Cycle 94: **`mcpShutdown` is local-only.** L245–257 and
+`onclose` L382–387 never call `sessionStore.delete`. Only
+`DELETE /mcp` L565/L583 does (ENG-114 AC #3). Dynamo rows
+outlive SIGTERM so the next instance rehydrates. Do not evict
+the store on drain. Do not HTTP-split session metadata.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

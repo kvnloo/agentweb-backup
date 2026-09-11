@@ -235,6 +235,10 @@ Cycle 93: `mcpShutdown` is still unused by `runDrain`, but SIGTERM
 closes inbound MCP **first** (`mcpServer.ts` L269–270 registered
 via `app.ts` L204). Wrap CallTool after #2; then call `mcpShutdown`
 after the wait. Do not treat GET SSE as dead — Hermes can open it.
+Cycle 94: `mcpShutdown` / stale cleanup never `sessionStore.delete`.
+Only client `DELETE /mcp` evicts the ENG-114 mirror. Dynamo
+sessions rehydrate on the next instance. Do not HTTP-split that
+metadata; do not delete it on drain.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
