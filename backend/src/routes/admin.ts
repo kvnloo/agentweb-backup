@@ -837,12 +837,14 @@ router.get("/users", async (req, res) => {
       }
     }
 
-    // Fetch replay settings in one paginated table traversal instead of one
-    // point read per user. Preserve the old per-setting best-effort behavior.
-    const allSettings = await settingsService.getAllSettings().catch(() => []);
+    // Fetch only replay settings for these users in bounded BatchGet chunks.
+    // Preserve the old per-setting best-effort behavior.
+    const replaySettings = await settingsService.getSettings(
+      sanitized.map((user: any) => `replay_sessions_${user.userId}`),
+    ).catch(() => []);
     const replayByUserId = new Map<string, string>();
-    if (Array.isArray(allSettings)) {
-      for (const setting of allSettings) {
+    if (Array.isArray(replaySettings)) {
+      for (const setting of replaySettings) {
         if (typeof setting?.settingName !== "string" ||
             !setting.settingName.startsWith("replay_sessions_") ||
             typeof setting.settingValue !== "string") {
