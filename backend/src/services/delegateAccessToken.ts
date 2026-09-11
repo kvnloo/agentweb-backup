@@ -1,3 +1,4 @@
+import { isEvaluationUser, EvaluationDenied } from './evaluationPolicy';
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../config/jwt';
 
@@ -21,6 +22,7 @@ export function mintDelegateToken(
   targetUser: any,
   expiresIn: jwt.SignOptions['expiresIn'],
 ): string {
+  if (isEvaluationUser(adminUser.userId) || isEvaluationUser(targetUser?.userId)) throw new EvaluationDenied();
   const payload = {
     userId: targetUser.userId, // This will be the active user in the token
     email: targetUser.email,

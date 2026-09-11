@@ -1,3 +1,4 @@
+import { isEvaluationUser } from './services/evaluationPolicy';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -125,6 +126,8 @@ io.use(async (socket, next) => {
         delegateAccess?: unknown;
         _svc?: boolean;
       };
+
+      if (isEvaluationUser(decoded.userId) || isEvaluationUser((decoded.delegateAccess as any)?.targetUserId) || isEvaluationUser((decoded.delegateAccess as any)?.adminUserId)) return next(new Error('Authentication error'));
 
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are

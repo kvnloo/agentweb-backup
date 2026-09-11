@@ -1,3 +1,4 @@
+import { isEvaluationUser, requireActiveEvaluation } from '../../services/evaluationPolicy';
 /**
  * MCP OAuth 2.1 Service
  *
@@ -248,11 +249,11 @@ export class McpOAuthService {
     }).promise();
 
     const record = result.Item as OAuthAuthorizationCode | undefined;
-    if (!record) return null;
+    if (!record || typeof record.userId !== 'string' || !record.userId) return null;
     if (record.used) return null;
 
     const nowSec = Math.floor(Date.now() / 1000);
-    if (record.expiresAt <= nowSec) return null;
+    if (!Number.isFinite(record.expiresAt) || record.expiresAt <= nowSec) return null;
 
     // Mark as used (single-use)
     await dynamodb.update({
@@ -268,6 +269,7 @@ export class McpOAuthService {
   // ─── Token Pair ────────────────────────────────────────────────────────
 
   async createTokenPair(params: CreateTokenPairParams): Promise<TokenPairResponse> {
+    if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     const accessToken = crypto.randomBytes(48).toString('hex');
     const refreshToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(accessToken).digest('hex');
@@ -291,6 +293,7 @@ export class McpOAuthService {
       Item: record,
     }).promise();
 
+    if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     return {
       accessToken,
       refreshToken,
@@ -311,11 +314,14 @@ export class McpOAuthService {
     }).promise();
 
     const record = result.Item as OAuthTokenRecord | undefined;
-    if (!record) return null;
+    if (!record || typeof record.userId !== 'string' || !record.userId) return null;
     if (record.revoked) return null;
+    if (isEvaluationUser(record.userId)) {
+      try { await requireActiveEvaluation(record.userId); } catch { return null; }
+    }
 
     const nowSec = Math.floor(Date.now() / 1000);
-    if (record.expiresAt <= nowSec) return null;
+    if (!Number.isFinite(record.expiresAt) || record.expiresAt <= nowSec) return null;
 
     return record;
   }
@@ -333,13 +339,17 @@ export class McpOAuthService {
       ExpressionAttributeValues: { ':hash': refreshTokenHash },
     }).promise();
 
-    if (!result.Items || result.Items.length === 0) return null;
+    if (!Array.isArray(result.Items) || result.Items.length === 0) return null;
 
     const record = result.Items[0] as OAuthTokenRecord;
+    if (!record || typeof record.userId !== 'string' || !record.userId) return null;
     if (record.revoked) return null;
+    if (isEvaluationUser(record.userId)) {
+      try { await requireActiveEvaluation(record.userId); } catch { return null; }
+    }
 
     const nowSec = Math.floor(Date.now() / 1000);
-    if (record.refreshExpiresAt <= nowSec) return null;
+    if (!Number.isFinite(record.refreshExpiresAt) || record.refreshExpiresAt <= nowSec) return null;
 
     // Revoke the old token pair
     await dynamodb.update({
