@@ -197,3 +197,6 @@ submodule of the leaf package (A-008, not A-006).
   write `extraCostUsage` (CRM enrichment does). Three counters;
   MCP images move only observe-only `$`. Do not HTTP-split to
   inherit a dead gate.
+- Cycle 85: default image is $0.134 in `llmPricing.ts`; Hermes
+  omitting `image_model` hits that. OMP keeps prices in `pi-ai`.
+  Do not HTTP-split the book. Q-003 is the cheaper-model mapper.

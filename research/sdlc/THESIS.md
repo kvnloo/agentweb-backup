@@ -110,7 +110,8 @@ Cycle 82: the leaf writes `$` with zero tokens
 HTTP mints a `streamId` per POST (`webStandardStreamableHttp.ts`
 v1.25.2 L678); AgentWeb adds no mutex. Cycle 84:
 `checkExtraCostUsage` is tests-only; images do not write
-`extraCostUsage`. The listed face is a
+`extraCostUsage`. Cycle 85: default image is $0.134
+(`llmPricing.ts` L301); `gpt-image-2` is $0.04. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

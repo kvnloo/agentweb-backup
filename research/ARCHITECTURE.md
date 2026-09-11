@@ -392,6 +392,8 @@ Cycle 83: SDK `streamId` per POST; OAuth 60/min is not in-flight;
 rehydrate is one transport per request. A-006 discarded.
 Cycle 84: `checkExtraCostUsage` tests-only; images do not write
 `extraCostUsage`. A-006 discarded.
+Cycle 85: default image $0.134; `gpt-image-2` $0.04; cost caps
+are Dynamo. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

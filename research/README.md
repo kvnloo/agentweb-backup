@@ -203,6 +203,10 @@ to get a lock.
 Cycle 84: `checkExtraCostUsage` has zero production callers.
 Images do not write `extraCostUsage` (CRM enrichment does).
 Do not wire that dead API onto Q-014.
+Cycle 85: omitting MCP `image_model` hits leaf default
+`gemini-3-pro-image-preview` at **$0.134**. `gpt-image-2` is
+$0.04 (Q-003). Cost caps are Dynamo; in-repo Free fallback is
+unlimited. Do not HTTP-split the price book.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

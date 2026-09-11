@@ -140,4 +140,6 @@ Cycle 83: MCP CallTool is not serialized (SDK streamId per POST;
 rate limiter is count/min). A-006 stays discarded.
 Cycle 84: `checkExtraCostUsage` is tests-only; images do not
 write `extraCostUsage`. A-006 stays discarded.
+Cycle 85: default image is $0.134; Q-003 is $0.04. Cost caps are
+Dynamo. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

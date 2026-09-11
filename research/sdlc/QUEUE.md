@@ -87,7 +87,9 @@ the cost dimension. Cycle 83: CallTool is not serialized
 (SDK `streamId` per POST; rate limiter is count/min; rehydrate
 is one transport per in-flight request). Cycle 84:
 `checkExtraCostUsage` is tests-only; images do not write
-`extraCostUsage` (CRM enrichment does). Product READY unchanged.
+`extraCostUsage` (CRM enrichment does). Cycle 85: default
+image is $0.134 (`gemini-3-pro-image-preview`); `gpt-image-2`
+is $0.04; cost caps are Dynamo not git. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

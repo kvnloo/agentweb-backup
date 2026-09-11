@@ -260,6 +260,15 @@ enrichment only (`crmEnrichmentService.ts` L1958). Images write
 `tokenUsage.totalCost` (cycle 82), not `extraCostUsage`. Do not
 wire that API onto Q-014.
 
+Cycle 85: **default image is $0.134.** MCP `image_model` is
+optional (`apiTools.ts` L2090). Unset → Dynamo
+`agent_mode_image_api_default_model` or leaf
+`gemini-3-pro-image-preview` (`imageGeneration.ts` L492–494) at
+`IMAGE_GENERATION_PRICING_USD` L301. `gpt-image-2` is $0.04
+(Q-003). Cost caps are admin Dynamo; `FREE_TIER_FALLBACK` is
+unlimited. A fifth process copies the book or bills $0
+(`isPerGenerationPriced`).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

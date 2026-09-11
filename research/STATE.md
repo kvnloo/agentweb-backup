@@ -7,18 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 84
+cycles_completed: 85
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 85
+next_cycle: 86
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 84: checkExtraCostUsage is tests-only; images do not
-  write extraCostUsage (CRM enrichment does). Cycle 85: cheapest
-  remaining. Candidate: imageGenerationCostUsd vs token
-  allowances (blast radius if cost gated). Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
-  passes, unsubscribe agentweb-research-cycle.
+  Cycle 85: default image is $0.134; gpt-image-2 is $0.04;
+  cost caps are Dynamo. Cycle 86: cheapest remaining. Candidate:
+  generate-video is the same metered emmaApi face (Q-016 parked).
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```
