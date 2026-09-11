@@ -23,10 +23,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 35: `loops/index.ts` is Hermes `registry.py` (only `./core/types`).
-Composition root is `app.ts` L118–120, not auto-discover.
-`mcp/server/registry.ts` already imports `evaluationPolicy`. A-006 stays
-discard.
+Cycle 36: C2PA default-on and CRITICAL LOGO live in `imageGeneration.ts`
+(L575–578, L477–484), not in `generateImage`. Policy owns category /
+HITL / persisted logo. A-006 stays discard (HTTP in front of emmaApi
+still misses leaf callers).
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

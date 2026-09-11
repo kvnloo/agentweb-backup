@@ -40,7 +40,7 @@ is the inverted layer vs OMP `pi-utils` (A-009).
 
 | Folder | Contents | Extract as process? |
 |---|---|---|
-| `services/creative/` | `imageGeneration`, `videoGeneration`, `remotionService`, `voiceoverService`, `onboardingAdImageService`, `workPlanThumbnailService` | **No.** Keep meter + C2PA + logo in-process. First slice: `git mv` + re-export from old path. |
+| `services/creative/` | `imageGeneration`, `videoGeneration`, `remotionService`, `voiceoverService`, `onboardingAdImageService`, `workPlanThumbnailService` | **No.** Meter + C2PA + CRITICAL LOGO already live in the leaf (`imageGeneration.ts` L5 / L575–578 / L477–484). Policy (category / HITL / persisted logo) stays in `agentModeService`. First slice: `git mv` + path shim. |
 | `services/money/` | `usageRecorderService`, stripe helpers | **No.** 20 prod importers; moving is path churn for billing tests. |
 | `services/agent/` | later, after strangler | **No.** |
 | `services/gtm/` | meta, ads, hubspot, crm enrichment | **Do not pick up** (contractor PRs). |

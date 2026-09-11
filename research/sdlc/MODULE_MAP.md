@@ -44,7 +44,7 @@ move the Content section in A-007’s first slice.
 | MCP list / hide / generate_image | `mcp/server/apiTools.ts` L1996–2146 (infrastructure island) + `registry.ts` | `emma/tools.ts` while #2832 is open; do not open Content L1381 |
 | Loop termination / dispatch | `services/agentMode/core/*` | Adding to `agentModeService.ts` unless net-negative |
 | Closed-loop policy | `loops/core` + `loops/instances/<id>` | `agentModeService.ts` |
-| Billing / C2PA / logo | stop | `usageRecorderService`, `imageGeneration.ts` logo path |
+| Billing / C2PA / logo | stop | leaf: `imageGeneration.ts` L575–578 / L477–484; policy: `generateImage` persisted logo |
 
 ## `loops/core` boundary (A-002 nuance)
 

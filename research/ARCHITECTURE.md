@@ -233,6 +233,9 @@ Cycle 34: A-002 oracle is **20** `loops/core` files (35 specifiers, two
 Cycle 35: `loops/index.ts` is Hermes `registry.py` (only `./core/types`).
 `app.ts` L118–120 is the composition root. MCP `registry.ts` already
 imports `evaluationPolicy`.
+Cycle 36: C2PA default-on (`imageGeneration.ts` L575–578) and CRITICAL
+LOGO (L477–484) are **leaf** invariants; policy owns category / HITL /
+persisted logo. A-006 stays discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

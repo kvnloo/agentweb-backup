@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 35
+cycles_completed: 36
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 36
+next_cycle: 37
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 35: loops/index.ts is Hermes registry.py; app.ts is the composition
-  root. Cycle 36: collision-only unless a cheaper mapping exists. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 36: C2PA and CRITICAL LOGO live in the imageGeneration leaf, not
+  generateImage. Cycle 37: collision-only unless a cheaper mapping exists.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
+  passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

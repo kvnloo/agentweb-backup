@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:32:00Z",
+  "updated_at": "2026-09-11T19:35:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -151,7 +151,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. mcpClientService skips isInternal agentweb-tools as circular. A fifth process is a hop after that policy method. Splits meter/C2PA/logo. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. mcpClientService skips isInternal agentweb-tools as circular. Cycle 36: meter/C2PA/CRITICAL LOGO live in imageGeneration.ts (L5, L575–578, L477–484), not in generateImage. Policy owns category/HITL/persisted-logo. A fifth process is a hop after policy and still misses leaf callers. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",

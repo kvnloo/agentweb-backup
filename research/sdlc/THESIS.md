@@ -88,8 +88,10 @@ Order is process, not a rewrite:
    open `agentModeService.ts` PRs shrink.
 4. **Keep deploy units at four.** Agent-engine already extracted the
    Playwright workload and still JWT-calls `/api/internal/usage` (cycle 27).
-   A fifth service for images/video would split `meterUserUsage` / C2PA /
-   `logoImage` — forbidden invariants.
+   A fifth service for images/video would split the **leaf**
+   (`imageGeneration.ts`: meter, C2PA L575–578, CRITICAL LOGO L477–484)
+   from policy (category / HITL / persisted logo) and miss blog/thumbs/
+   video/onboarding callers (cycle 36). Forbidden.
 5. **Agent context map.** Draft: `research/sdlc/MODULE_MAP.md`. A short
    `backend/src/AGENTS.md` (module index, max file size, “do not edit X”)
    beats another 40k-line CLAUDE dump. LinkedIn’s 2026 MCP playbook is

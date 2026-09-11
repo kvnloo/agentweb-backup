@@ -5,7 +5,9 @@ Cycle 25. How AgentWeb *already* composes, vs a nanoservice mesh.
 Hermes uses MCP as a **client** to other servers. AgentWeb’s MCP is a
 **server** whose tools `mcpFetch` themselves on loopback. That is the
 external composition bus. A fifth process would add a hop *after* the
-policy object that owns metering, C2PA, and `logoImage`.
+policy method (category / HITL / persisted logo) **and** miss leaf
+callers that already hit `imageService.generateImage` (meter + C2PA
+default-on + CRITICAL LOGO live in that leaf — cycle 36).
 
 ## `generate_image` (the Q-014 / A-006 / A-008 specimen)
 
@@ -34,7 +36,7 @@ agentModeService.generateImage  L28857
     await import('./imageGeneration')            L28950  (cycle-break; A-008 re-export keeps this)
     │
     ▼
-imageService.generateImage  (meter + C2PA inside the leaf / recorder)
+imageService.generateImage  (meter L5 + C2PA L575–578 + CRITICAL LOGO L477–484)
 ```
 
 In-app Emma does **not** use MCP for this tool (cycle 26):
@@ -55,8 +57,10 @@ table plus MCP *outbound*.
 Cycle 30: **leaf callers skip the policy method** and still must stay
 in-process with the meter: `controllers/blog.ts` L648,
 `workPlanThumbnailService.ts` L98, `videoGeneration.ts` L875,
-`onboardingAdImageService.ts`. An HTTP mesh in front of `emmaApi` would
-not see them. A-008 re-export does.
+`onboardingAdImageService.ts` L494 (`logoImage` into the leaf). An HTTP
+mesh in front of `emmaApi` would not see them. C2PA default-on and
+CRITICAL LOGO already run in `imageGeneration.ts` for those callers
+(cycle 36). A-008 re-export does.
 
 `emmaApi.ts` has **59** `getAgentModeService()` calls. The REST surface
 already looks like logical nanoservices; almost every route funnels into
@@ -135,7 +139,7 @@ Q-014 is flipping L2077, not a new process.
 | Q-014 list on MCP | No | No (flag on `apiTools.ts` L2077) |
 | A-007 `tools/infrastructure.ts` | No | No (still mcpFetch) |
 | A-008 `git mv` + `export *` | No | No (`emmaApi` never imported the leaf; `agentModeService` L28950 keeps resolving) |
-| **A-006 HTTP image process** | **Yes** — after L28857 or instead of it | Would split category / HITL / logo / budget |
+| **A-006 HTTP image process** | **Yes** — after L28857 or instead of it | Would split category / HITL / persisted-logo from the leaf (C2PA + meter + CRITICAL LOGO already there) |
 
 A-008 is a **path shim**, not `services/swarm/index.ts` (cycle 33: that
 barrel has zero prod importers). After `git mv`, `services/imageGeneration.ts`
