@@ -482,6 +482,7 @@ import {
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
+import { getLandingPageLaunchReadiness } from '../utils/landingPageLaunchReadiness';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -7667,6 +7668,16 @@ export class AgentModeService {
     // URL) from a failed/in-flight one. Without this the default `{}` below strips the
     // deployedUrl, and a final message that falsely claims the deploy "timed out" would
     // have no ledger evidence to reconcile against.
+    //
+    // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
+    // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
+    // neither visible from status/buildStatus alone. Compute launchReadiness here (not
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so every one of
+    // these tools' ledger entries carries the SAME derived verdict regardless of which
+    // fields happen to be present on that particular tool's raw result shape — harmless
+    // when the underlying signal isn't populated yet (e.g. smokeTestResult is fire-and-
+    // forget after deploy, so it's genuinely absent mid-generation; ready:true is the
+    // correct default until the smoke test has actually had a chance to run).
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
@@ -7692,6 +7703,7 @@ export class AgentModeService {
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.id !== undefined ? { id: a.id } : {}),
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+        launchReadiness: a.launchReadiness ?? getLandingPageLaunchReadiness(a),
       };
     }
 
