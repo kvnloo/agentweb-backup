@@ -13890,14 +13890,44 @@ export const agentModeController = {
               console.error('AgentMode: Failed to save first-attempt-failure telemetry record', sessionId, saveErr);
             }
 
-            // Restart the worker before retrying — the current worker may be unresponsive
-            try {
-              await generateMarketingResponseWorkerService.restartWorker();
-            } catch (restartErr) {
-              console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+            // Restart the worker before retrying — but ONLY if it's actually unresponsive.
+            // This worker process is a SHARED singleton serving every concurrent session.
+            // restartWorker() SIGKILLs it, and the exit handler's failAllPendingRequests()
+            // rejects EVERY other session's in-flight turn on that same worker, not just
+            // this one — so an unconditional restart here for what was often just a
+            // transient, single-session failure (a rate limit, a bad tool call, anything
+            // unrelated to the worker process itself) took down every concurrent user's
+            // turn for one unrelated hiccup. Ping first via the existing health check;
+            // only restart when the worker genuinely doesn't answer — the doc comment on
+            // restartWorker() already says it's "for when the worker is detected as
+            // unresponsive", this just actually detects that instead of assuming it.
+            //
+            // Known accepted gap: isWorkerHealthy() is pure IPC liveness (ping/pong), not
+            // application-state health — a worker whose event loop answers fine but whose
+            // OWN internal state is corrupted (e.g. a botched mid-session tool re-registration)
+            // will report healthy and never get restarted via this path. That trades away an
+            // accidental self-heal for that class of bug in exchange for not collaterally
+            // killing every other session on every transient, worker-unrelated failure — the
+            // right tradeoff here, since a real app-state health signal doesn't exist yet.
+            const workerHealthy = await generateMarketingResponseWorkerService.isWorkerHealthy().catch(() => false);
+            if (!workerHealthy) {
+              try {
+                await generateMarketingResponseWorkerService.restartWorker();
+              } catch (restartErr) {
+                console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            } else {
+              // Review: restartWorker() already awaits the new worker's 'ready' signal, so
+              // the old 3s sleep was never really "letting the worker boot" — it was doing
+              // double duty as generic backoff for the transient failure itself (e.g. a
+              // rate limit that hasn't cleared yet). Dropping it to 0 on this branch made a
+              // rate-limit-class failure LESS likely to succeed on retry than before this
+              // fix — working against the point of retrying at all. Keep a short backoff
+              // here too, just not the full 3s this path no longer needs for worker-boot.
+              console.log(`AgentMode: Worker responded to health check — skipping restart for session ${sessionId}, retrying shortly`);
+              await new Promise(resolve => setTimeout(resolve, 1000));
             }
-
-            await new Promise(resolve => setTimeout(resolve, 3000));
 
             let retryErrCaught: any = null;
             try {
