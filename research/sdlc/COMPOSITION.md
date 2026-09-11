@@ -128,8 +128,10 @@ Q-014 is flipping L2077, not a new process.
 | A-008 `git mv` + `export *` | No | No (`emmaApi` never imported the leaf; `agentModeService` L28950 keeps resolving) |
 | **A-006 HTTP image process** | **Yes** — after L28857 or instead of it | Would split category / HITL / logo / budget |
 
-A-008 re-export pattern already in-tree: `services/swarm/index.ts`
-(`export * from './…'`). Do **not** rewrite `emmaApi.ts` in that PR.
+A-008 is a **path shim**, not `services/swarm/index.ts` (cycle 33: that
+barrel has zero prod importers). After `git mv`, `services/imageGeneration.ts`
+is `export * from './creative/imageGeneration'`. Closest analog:
+`socialPlatformService.ts` L8. **Do not** rewrite `emmaApi.ts`.
 
 ## Hermes / OMP vs this hop
 

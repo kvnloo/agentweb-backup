@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:24:00Z",
+  "updated_at": "2026-09-11T19:27:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -107,14 +107,16 @@
       "evidence": 5,
       "collision": 1,
       "score": 26,
-      "why": "Cycle 19–20. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports — same arrow as OMP pi-ai ↛ pi-agent-core. usageRecorder stays shared. Re-export old path so Q-003 can keep importing services/imageGeneration.",
+      "why": "Cycle 19–20. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports — same arrow as OMP pi-ai ↛ pi-agent-core. usageRecorder stays shared. Cycle 33: swarm/index.ts is an unused folder barrel, not a path shim. Compat file at old specifier (socialPlatformService.ts L8 analog, thinner). Q-003 can keep importing services/imageGeneration.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/videoGeneration.ts",
         "backend/src/services/remotionService.ts",
+        "backend/src/services/socialPlatformService.ts",
+        "backend/src/services/swarm/index.ts",
         "research/sdlc/SERVICES_DAG.md"
       ],
-      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from './creative/imageGeneration' at the old path (same pattern as services/swarm/index.ts). emmaApi.ts does not import the leaf — do not edit it. agentModeService L28950 dynamic import keeps resolving. Boundary test: creative/** ↛ agentModeService. Do not extract HTTP. Do not move db.ts.",
+      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/imageGeneration.ts; leave services/imageGeneration.ts as export * from './creative/imageGeneration' (path shim). Do not copy services/swarm/index.ts (zero prod importers). Do not copy socialPlatformService's registry — only the stay-at-old-path part (L8). emmaApi.ts does not import the leaf — do not edit it. agentModeService L28950 dynamic import keeps resolving. Boundary test: creative/** ↛ agentModeService. Do not extract HTTP. Do not move db.ts.",
       "harsha_db": false
     },
     {

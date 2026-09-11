@@ -23,11 +23,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 32: MCP already has **two hop styles**. Copy `workflowTools.ts`
-(5 mcpFetch) for A-007; do **not** copy `evaluationTools.ts` (in-process
-services + `emmaToolRegistry` dual-register L62). `registry.ts` L22–40
-already names image gen as `internal` hide-only. Expanded collision
-filter still only #2563. A-006 stays discard.
+Cycle 33: A-008 path shim is **not** `swarm/index.ts` (zero prod
+importers). Closest analog `socialPlatformService.ts` L8. `LoopPorts`
+(6 interfaces) is already the in-process composition bus. Expanded
+collision still only #2563. A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -40,7 +39,9 @@ filter still only #2563. A-006 stays discard.
 2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
-3. **A-008** — `services/creative/` with re-export + `creative ↛ agentModeService` test.
+3. **A-008** — `git mv` + **path shim** at `services/imageGeneration.ts`
+   (`export * from './creative/imageGeneration'`). Not `swarm/index.ts`.
+   Boundary test `creative ↛ agentModeService`.
 4. **A-005** — only after the `agentModeService.ts` PR pile shrinks.
 
 Never A-006. Never a Kubernetes slice of Emma as a first architecture PR.

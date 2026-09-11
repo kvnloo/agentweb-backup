@@ -79,4 +79,6 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
   (`A-007-split-map.md`). `loops/adapters/awsAdapters.ts` is the host
   package; do not import it from `core/`.
 - `loops/core/ports.ts` is closer to OMP `pi-agent-core` than
-  `agentModeService.ts` is. Promote that pattern; don’t invent K8s.
+  `agentModeService.ts` is. `LoopPorts` (L143–150) is six injected
+  interfaces wired at `productionLoopPorts()` — that is how nanoservices
+  already compose here. Promote that pattern; don’t invent K8s.

@@ -57,11 +57,16 @@ is the inverted layer vs OMP `pi-utils` (A-009).
 ## First move when coding (after A-002 / A-007, not instead of Q-014)
 
 1. `services/creative/imageGeneration.ts`
-2. `export * from './creative/imageGeneration'` in the old path (same
-   pattern as `services/swarm/index.ts`) so the five prod importers and
+2. After `git mv`, leave a **compat shim** at the old path
+   `services/imageGeneration.ts`: `export * from './creative/imageGeneration'`.
+   That is **not** `services/swarm/index.ts` (folder barrel; **zero**
+   prod importers — tests import siblings). Closer analog:
+   `socialPlatformService.ts` L8 keeps the old specifier while types live
+   under `./adapters/`. A-008 shim is thinner (no registry object).
    `agentModeService.generateImage`’s `await import('./imageGeneration')`
-   (L28950) keep compiling. **Do not edit `emmaApi.ts`** — the route
-   never imported the leaf (cycle 25).
+   (L28950) keeps compiling. **Do not edit `emmaApi.ts`** — the route
+   never imported the leaf (cycle 25). Do not require importers to switch
+   to `services/creative`.
 3. Boundary test: `creative/**` must not import `agentModeService` or
    `db.ts`. **Already true for `imageGeneration.ts` today** (imports:
    `secretsManager`, `s3Utils`, `llmClients`, `usageRecorderService`,

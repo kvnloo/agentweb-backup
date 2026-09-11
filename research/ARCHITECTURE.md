@@ -224,6 +224,9 @@ sibling file, does not append. `apiTools.ts` / `imageGeneration.ts` /
 `loops/core` still have no open PR.
 Cycle 32: A-007 copies `workflowTools.ts` (mcpFetch); do not copy
 `evaluationTools.ts` (in-process services + emma dual-register).
+Cycle 33: A-008 is a **path shim** at `services/imageGeneration.ts`, not
+`swarm/index.ts` (zero prod importers). `LoopPorts` (6 interfaces) is
+the in-process composition bus.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

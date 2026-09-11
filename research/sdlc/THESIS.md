@@ -40,9 +40,12 @@ that self-client. Hop diagram: `COMPOSITION.md`.
    (termination) and 3/dispatch (`core/toolDispatch.ts`) extracted.
    `executeAgentStep` is still a skeleton that throws.
 2. **`loops/core`** — no `services/` / `db.ts` imports; AWS/Slack via
-   `ports.ts`. It **does** import `loops/index` (registry) from
-   `orchestrator.ts` / `instanceRunner.ts`. CI does **not** enforce the
-   host-forbid rule. Folder map: `MODULE_MAP.md`.
+   `ports.ts` (`LoopPorts` L143–150: s3, dynamo, bedrock, slack, clock,
+   logger — cycle 33). Wired at `productionLoopPorts()` in
+   `loops/adapters/awsAdapters.ts` L219–227. That is in-process
+   composition, not HTTP. Core **does** import `loops/index` (registry)
+   from `orchestrator.ts` / `instanceRunner.ts`. CI does **not** enforce
+   the host-forbid rule. Folder map: `MODULE_MAP.md`.
 3. **MCP** — the external composition bus (Hermes, Cursor, Claude).
    ENG-982 already extracted `workflowTools.ts` (5 mcpFetch tools).
    `evaluationTools.ts` is a *different* hop: in-process services + dual
