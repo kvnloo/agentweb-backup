@@ -332,6 +332,8 @@ const PROVIDER_LABELS: Record<string, string> = {
   apollo: "Apollo",
   "enrich.so": "enrich.so",
   remotion: "Remotion Lambda",
+  elevenlabs: "ElevenLabs",
+  "2captcha": "2captcha",
 };
 
 /** An unknown key falls through unchanged — a new vendor is listed by its raw

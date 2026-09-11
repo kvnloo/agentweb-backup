@@ -399,7 +399,9 @@ describe('usageAnalyticsService', () => {
       expect(agg.availableProviders).toEqual([
         'all',
         'llm',
+        '2captcha',
         'apollo',
+        'elevenlabs',
         'enrich.so',
         'google_cse',
         'remotion',
@@ -489,7 +491,8 @@ describe('usageAnalyticsService', () => {
       // The registry entries are still offered — this narrows what the WINDOW
       // contributes, not what the registry guarantees.
       expect(agg.availableProviders).toEqual([
-        'all', 'llm', 'apollo', 'enrich.so', 'google_cse', 'remotion', 'twitter', 'v0', 'you.com',
+        'all', 'llm', '2captcha', 'apollo', 'elevenlabs', 'enrich.so', 'google_cse',
+        'remotion', 'twitter', 'v0', 'you.com',
       ]);
     });
 
@@ -807,7 +810,9 @@ describe('usageAnalyticsService', () => {
         availableProviders: [
           'all',
           'llm',
+          '2captcha',
           'apollo',
+          'elevenlabs',
           'enrich.so',
           'google_cse',
           'remotion',
