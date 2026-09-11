@@ -201,6 +201,9 @@ guidance) is: **packages + ports in one process**, MCP as the *external*
 bus, extract a fifth process only for scale or isolation. A HTTP
 nanoservice per Emma tool would split billing/C2PA/logo and fight MCP.
 
-In-tree gold standard: `backend/src/loops/core` (ports, zero host
-imports). Incomplete strangler: `agentMode/core` (`executeAgentStep`
-still throws). Full map: `research/sdlc/THESIS.md`.
+In-tree gold standard: `backend/src/loops/core` (ports; no `services/`
+imports; may import `loops/index` registry). Incomplete strangler:
+`agentMode/core` (`executeAgentStep` still throws). MCP already started
+the Hermes split (`workflowTools.ts`); `apiTools.ts` is 85 tools in one
+file (A-007). Folder map: `research/sdlc/MODULE_MAP.md`. Full thesis:
+`research/sdlc/THESIS.md`.

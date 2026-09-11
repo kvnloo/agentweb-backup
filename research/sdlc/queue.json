@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T18:45:00Z",
+  "updated_at": "2026-09-11T18:50:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
-  "implementation_order_when_unlocked": ["A-002", "A-005"],
+  "implementation_order_when_unlocked": ["A-002", "A-007", "A-005"],
   "items": [
     {
       "id": "A-001",
@@ -38,7 +38,7 @@
         "backend/src/loops/core/ports.ts",
         "backend/package.json"
       ],
-      "first_slice": "When coding unlocked: a unit test or dependency-cruiser rule that loops/core/** cannot import services/, emma/, or db.ts. Then copy the rule onto agentMode/core.",
+      "first_slice": "When coding unlocked: a unit test or dependency-cruiser rule that loops/core/** cannot import services/, emma/, or db.ts. Allow core → loops/index (orchestrator/instanceRunner already do; documented). Then copy the host-forbid rule onto agentMode/core.",
       "harsha_db": false
     },
     {
@@ -81,19 +81,39 @@
     {
       "id": "A-005",
       "title": "File-size + migration-scorecard ratchet in CI",
-      "status": "keep",
+      "status": "park",
       "leverage": 3,
       "product": 3,
-      "mergeability": 4,
+      "mergeability": 3,
       "evidence": 5,
-      "collision": 2,
-      "score": 25,
-      "why": "June scorecard still says 23,895 lines; disk is 40,571. Without a ratchet, strangler is theatre. A warning on agentModeService.ts line count (fail if a PR increases it without a core/ extraction) is the SDLC analog of OMP package boundaries.",
+      "collision": 3,
+      "score": 23,
+      "why": "June scorecard still says 23,895 lines; disk is 40,571. Cycle 18: seven open PRs touch agentModeService.ts (#2871 #2861 #2832 #2563 #2060 #1584 #1076). A LOC ratchet would fail them. Park until that set shrinks.",
       "files": [
         "backend/docs/AGENTMODE_MIGRATION.md",
         ".github/workflows/tests.yml"
       ],
-      "first_slice": "When coding unlocked: a script that prints agentModeService.ts LOC and fails if the PR grows it unless services/agentMode/core also grows. Update the markdown scorecard in the same PR. Collision: any live agentModeService PR (#2861, #2871, #2832).",
+      "first_slice": "PARK. After the agentModeService.ts PR set shrinks: LOC script + update AGENTMODE_MIGRATION.md scorecard in the same change.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-007",
+      "title": "Split apiTools.ts into mcp/server/tools/* along existing section headers",
+      "status": "ready",
+      "leverage": 4,
+      "product": 2,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 31,
+      "why": "Hermes one-file-per-tool without touching emma/tools.ts (#2832). 85 registers, 20+ section headers, ENG-982 already split workflowTools.ts. No open PR on apiTools.ts. Keep apiTools.ts as the barrel emma/tools.ts L7240 and tests import. Q-014 then edits tools/content.ts only.",
+      "files": [
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/mcpServerCore.ts",
+        "backend/src/mcp/server/workflowTools.ts",
+        "research/sdlc/MODULE_MAP.md"
+      ],
+      "first_slice": "When coding unlocked, after or with Q-014: move one section (content: generate_image/send_email) to mcp/server/tools/content.ts, barrel-import from apiTools.ts, mcp.apiTools.test.ts still green. Do not edit emma/tools.ts.",
       "harsha_db": false
     },
     {

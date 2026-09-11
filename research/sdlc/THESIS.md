@@ -36,10 +36,14 @@ metering, C2PA, and logo rules live in-process on purpose.
    Target loop: `model → parse → typed registry → terminate`. Seams 1
    (termination) and 3/dispatch (`core/toolDispatch.ts`) extracted.
    `executeAgentStep` is still a skeleton that throws.
-2. **`loops/core`** — claims **zero imports from the host**; all AWS/Slack
-   via `ports.ts`. This is the in-repo gold standard. CI does **not**
-   enforce it.
+2. **`loops/core`** — no `services/` / `db.ts` imports; AWS/Slack via
+   `ports.ts`. It **does** import `loops/index` (registry) from
+   `orchestrator.ts` / `instanceRunner.ts`. CI does **not** enforce the
+   host-forbid rule. Folder map: `MODULE_MAP.md`.
 3. **MCP** — the external composition bus (Hermes, Cursor, Claude).
+   ENG-982 already extracted `workflowTools.ts`. `apiTools.ts` still
+   has 85 registers; splitting along its section headers is the
+   Hermes `tools/*.py` move that does **not** wait on #2832 (A-007).
 4. **Coding agent** — already a sub-agent process in `codingAgentService.ts`,
    not a new deploy.
 
@@ -65,13 +69,16 @@ Order is process, not a rewrite:
    June baseline — the ratchet is not running.
 2. **Enforce the one good boundary.** CI check: `loops/core` must not
    import host services (A-002). Then the same rule for `agentMode/core`.
-3. **One-tool-per-file** only on files we already own for MCP hygiene
-   (`apiTools.ts`), never `emma/tools.ts` while #2832 is open (A-004).
+3. **One-tool-per-file on MCP first (A-007).** Split `apiTools.ts` along
+   existing section headers; keep the barrel. Never `emma/tools.ts`
+   while #2832 is open (A-004). A-005 (LOC ratchet) waits until seven
+   open `agentModeService.ts` PRs shrink.
 4. **Keep deploy units at four.** A fifth service for images/video would
    split `meterUserUsage` / C2PA / `logoImage` — forbidden invariants.
-5. **Agent context map.** A short `backend/src/AGENTS.md` (module
-   index, max file size, “do not edit X”) beats another 40k-line CLAUDE
-   dump. LinkedIn’s 2026 MCP playbook is curated context, not every tool.
+5. **Agent context map.** Draft: `research/sdlc/MODULE_MAP.md`. A short
+   `backend/src/AGENTS.md` (module index, max file size, “do not edit X”)
+   beats another 40k-line CLAUDE dump. LinkedIn’s 2026 MCP playbook is
+   curated context, not every tool.
 
 ## Harsha gates
 
