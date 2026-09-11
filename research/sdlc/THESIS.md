@@ -71,7 +71,9 @@ L88–120 has no `cronJobRegistry.track`). `mcpShutdown` is unused
 by `runDrain`. Cycle 70: local Map (`mcpServer.ts` L307–315) and
 `rehydrateAndServe` (L441) share that CallTool; wrap it once.
 Rehydrate is finite HTTP (`mcpSessionRehydration.ts` L15–18);
-mcpFetch still needs a new loopback. The listed face is a
+mcpFetch still needs a new loopback. Cycle 71: AgentWebPro is
+empty on that wrap set (`mcpServerCore.ts` / `cronJobRegistry.ts`
+/ `mcpServer.ts`). Do not start it instead of Q-014. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

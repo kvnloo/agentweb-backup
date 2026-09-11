@@ -350,6 +350,10 @@ Q-014 stays ready. A-006 discarded.
 Cycle 70: local `/mcp` (L307–315) vs `rehydrateAndServe` (L441)
 share `CallTool`. Wrap once (`cronJobRegistry.ts` L1–9 names the
 gap). A-006 discarded.
+Cycle 71: 20 AgentWebPro PRs. CallTool-wrap files **empty**.
+`emma/tools.ts` still #2832 #1076 #689. `app.ts` #2271 #1814.
+`crm.ts` #1544 #1790. `agentModeService.ts` #2871 #2861 #2563
+#2060 #1584. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

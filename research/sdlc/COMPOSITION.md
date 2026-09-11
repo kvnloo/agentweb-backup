@@ -155,6 +155,12 @@ JSON (`mcpSessionRehydration.ts` L15–18 / L115–118). Both execute
 the same untracked `CallTool`. `cronJobRegistry.ts` L1–9 already
 describes this job. Wrap `CallTool`, not only rehydrate.
 
+Cycle 71: **wrap files empty on AgentWebPro.** 20 PRs. Zero on
+`mcpServerCore.ts` / `mcpServer.ts` / `mcpSessionRehydration.ts` /
+`cronJobRegistry.ts` / `asgLifecycleGuard.ts` / `server.ts`.
+kvnloo#2 / #3 MERGEABLE. Do not land the wrap on this research
+branch. Do not start it instead of Q-014.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

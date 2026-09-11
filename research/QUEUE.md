@@ -102,4 +102,6 @@ MCP `CallTool`. Q-014 `generate_image` is that hop. Copy
 discarded.
 Cycle 70: local MCP Map vs `rehydrateAndServe` share `CallTool`.
 Wrap that once (`cronJobRegistry.ts` L1–9). A-006 stays discarded.
+Cycle 71: AgentWebPro empty on CallTool-wrap files. Do not start
+that wrap instead of Q-014. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -148,3 +148,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 70: two inbound MCP faces (local Map vs ENG-114 rehydrate)
   share `CallTool`. Wrap that once. Node `server.close()` is not
   the waiter for inner mcpFetch.
+- Cycle 71: AgentWebPro empty on `mcpServerCore.ts` /
+  `cronJobRegistry.ts` / `mcpServer.ts` / `asgLifecycleGuard.ts`.
+  Wrap is mergeable after #2, not instead of Q-014.

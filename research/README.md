@@ -141,7 +141,8 @@ process, inbound MCP `CallTool` is not in the four-way wait list
 (`chatbotTurn`); MCP was not. Do not HTTP-split to “fix” drain.
 Cycle 70: local `/mcp` reuse vs ENG-114 rehydrate are two faces of
 the same untracked `CallTool`. Wrap `mcpServerCore`, not a fifth
-process.
+process. Cycle 71: that wrap set is empty on AgentWebPro (20 PRs).
+Do not compete on `emma/tools.ts` / `app.ts` / `crm.ts`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
