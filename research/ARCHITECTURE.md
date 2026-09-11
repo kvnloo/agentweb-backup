@@ -458,6 +458,7 @@ Cycle 114: guard still drains without a hook; ASG does not wait.
 A-006 discarded.
 Cycle 115: Sunday SIGTERM is OS/cgroup, not the hook. A-006
 discarded.
+Cycle 116: journald is not the Node unit. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

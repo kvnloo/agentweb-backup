@@ -336,6 +336,9 @@ Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201), not the hook.
 `.platform` is nginx. The 900s `rolling.config` Timeout is
 Immutable deploys, not `InstanceRefreshEnabled`. Only
 `TimeoutStopSec` in git is agent-engine 30s.
+Cycle 116: `06-log-retention.config` names `systemd-journald`,
+not the Node unit. `web.stdout.log` is a log file. Sunday
+stop-timeout is live-AWS-only. Do not copy agent-engine 30s.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

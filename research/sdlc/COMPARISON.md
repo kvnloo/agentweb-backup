@@ -292,3 +292,5 @@ reverted. Do not copy that as A-006.
   wait. Two IMDS `Terminated` reads. Not a fifth `listen()`.
 - Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201). This tree
   does not keep it alive. 900s is not Sunday. Not A-006.
+- Cycle 116: journald drop-in is not the Node unit. Sunday
+  `TimeoutStopSec` is live-AWS-only. Not A-006.

@@ -182,6 +182,9 @@ unchanged.
 Cycle 115: Sunday still gets OS SIGTERM; this tree does not keep
 it alive. 900s is Immutable command Timeout, not recycle.
 Product READY unchanged.
+Cycle 116: log-retention names `systemd-journald`, not the Node
+unit. Sunday `TimeoutStopSec` is live-AWS-only. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

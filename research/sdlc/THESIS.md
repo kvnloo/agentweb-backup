@@ -175,6 +175,9 @@ not park. A-019 fires only if drain starts (`disableCron` first).
 Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201). This tree
 does not ship a backend `TimeoutStopSec`. The 900s comment is
 Immutable command Timeout, not recycle.
+Cycle 116: `06-log-retention.config` names `systemd-journald`.
+`web.stdout.log` is a log file. Sunday stop-timeout is
+live-AWS-only. Do not copy agent-engine’s 30s.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

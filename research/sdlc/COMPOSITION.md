@@ -444,6 +444,11 @@ Only `TimeoutStopSec` in repo is agent-engine 30s.
 `rolling.config` L7 900s is Immutable command Timeout, not
 `InstanceRefreshEnabled`.
 
+Cycle 116: **journald is not the Node unit.**
+`06-log-retention.config` L42–43 `systemctl restart systemd-journald`.
+`.platform` has no `hooks/`. `web.stdout.log` is a log file
+(CLAUDE.md L544). Sunday `TimeoutStopSec` is live-AWS-only.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
