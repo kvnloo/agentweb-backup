@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:36:00Z",
+  "updated_at": "2026-09-11T20:38:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -130,7 +130,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 29,
-      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template for mcpFetch + exported name list — NOT for identity. Cycle 54: workflowTools.ts L37 imports adminClientScope; L248 emma_get_account_status uses resolveClientScopedContext. The five infrastructure tools are all ctx() (L2015/2044/2068/2098/2141). Do not copy that import into infrastructure.ts. Cycle 48: kvnloo#2 owns apiTools.ts — wait for merge.",
+      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template for mcpFetch + exported name list — NOT for identity. Cycle 54: do not copy L37 adminClientScope. Cycle 57: attach via apiTools barrel / mcpServerCore L26, not app.ts (#2271 owns the Express route table). Cycle 48: kvnloo#2 owns apiTools.ts — wait for merge.",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/mcpServerCore.ts",
@@ -318,7 +318,7 @@
       "evidence": 5,
       "collision": 4,
       "score": 16,
-      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
+      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. Cycle 57: #2271 also edits slackChannelAdapter.ts, app.ts, and db.ts (Harsha). Do not start at WhatsApp/messaging-channels either. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
       "files": [
         "backend/src/services/emmaEmailService.ts",
         "backend/src/services/revisionService.ts",
@@ -327,7 +327,7 @@
         "backend/src/controllers/agentModeController.ts",
         "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK. Do not start at routes/slack.ts (#2393). After #2393, email/eval can implement conversation/channelPort. Do not lift generateSessionResponse instead of Q-014. Do not add HTTP. #1076 touches chatbotService.",
+      "first_slice": "PARK. Do not start at routes/slack.ts (#2393) or whatsappWebhook / messagingChannels / slackChannelAdapter (#2271). After #2393, email/eval can implement conversation/channelPort. Do not lift generateSessionResponse instead of Q-014. Do not add HTTP. #1076 touches chatbotService.",
       "harsha_db": false
     }
   ]

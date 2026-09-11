@@ -149,6 +149,9 @@ File split ≠ `loops/core` package. Do not forbid db in `mcp/server`.
 
 Cycle 35: in-process composition root is `app.ts` L118–120 (explicit
 instance `register*`), not `loops/index.ts` (Hermes registry: types only).
+Cycle 57: that root also does `setupMcpServer` L204 and `setupMcpOAuth`
+L343. **#2271** +7 on the Express route table (WhatsApp). A-007 still
+attaches at `mcpServerCore.ts` L26, not `app.ts`.
 `mcp/server/registry.ts` L1 already imports `evaluationPolicy` — do not
 demand loops-index purity of the MCP registry.
 

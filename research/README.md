@@ -89,7 +89,9 @@ Cycle 54: A-007 copies `workflowTools` **shape**, not its
 Cycle 55: remotion-lambda is the isolate; `imageGeneration.ts` is already
 the host adapter (vendor HTTP). Do not copy the Lambda process onto images.
 Cycle 56: MCP client/server folders are already acyclic (OMP DAG). Park
-A-016 until A-002. Do not HTTP-split them.
+A-016 until A-002. Do not HTTP-split them. Cycle 57: **#2271** owns
+`app.ts` route table; A-007 still attaches at `mcpServerCore` not `app.ts`.
+Never compete with #2271 / #2862 / #2861.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
@@ -110,9 +112,9 @@ and **no** `dependency-cruiser`.
 `agentModeService.ts` pile: **#2871 #2861 #2832 #2563 #2060 #1584 #1076**.
 Slack: **#2393**. Never #2862 / #2271 / #2861. `#1076` also touches
 `chatbotService.ts`. `#2861` is promoting `convert_to_pdf` to foundation
-— do not piggyback `generate_image`. Cycle 52: AgentWebPro still empty on
-`apiTools.ts` / `httpClient.ts` / `imageGeneration.ts` / `loops/core`
-(this fork #2 / #3 own those). #2875 (renewal-health) is unrelated.
+— do not piggyback `generate_image`. Cycle 57: still empty on
+`apiTools.ts` / `loops/core`. **#2271** owns `app.ts` (+7 WhatsApp) plus
+`slackChannelAdapter.ts` and `db.ts`. A-007 does not touch `app.ts`.
 
 ---
 

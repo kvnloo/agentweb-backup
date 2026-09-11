@@ -110,3 +110,5 @@ submodule of the leaf package (A-008, not A-006).
   process onto images.
 - Cycle 56: `mcp/client` ↛ `mcp/server` (prod). Shared
   `anonymousToolAccess.ts`. Do not HTTP-split; park A-016 until A-002.
+- Cycle 57: `app.ts` is the composition root. #2271 owns its route table.
+  A-007 attaches at `mcpServerCore`, not `app.ts`.

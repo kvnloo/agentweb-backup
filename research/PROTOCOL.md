@@ -73,7 +73,7 @@ Known live programs (bootstrap):
 - Usage runway / billing ledger
 - Open PR: OpenRouter 429 retry (`toolErrorClassifier.ts`, not callLLM body) — #2862
 - Open PR: X post ranking scores (`emma/tools.ts`) — #2832 — do not edit that file for Q-004
-- Open PR: WhatsApp Cloud API — #2271
+- Open PR: WhatsApp Cloud API — #2271 (`app.ts` +7, `slackChannelAdapter.ts`, `db.ts`). Do not add `app.use` in a competing PR. A-013 not WhatsApp.
 - Open PR: convert_to_pdf foundation tool — #2861
 - Open PR: Slack conversation channel port — #2393 (ENG-272). Architecture
   A-013 must not start at `routes/slack.ts`.

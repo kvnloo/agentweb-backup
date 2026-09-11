@@ -29,9 +29,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 56: `mcp/client` ↛ `mcp/server` (and reverse) already. Park A-016
-until A-002 (#3) merges. Do not HTTP-split that DAG. A-007 waits on
-kvnloo#2. A-006 stays discard. Product READY unchanged.
+Cycle 57: AgentWebPro still empty on `apiTools.ts` / `loops/core`.
+**#2271** owns `app.ts` (+7 WhatsApp routes) + `slackChannelAdapter.ts` +
+`db.ts`. A-007 attaches at `mcpServerCore` not `app.ts`. A-013 also
+not WhatsApp. A-016 parked. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

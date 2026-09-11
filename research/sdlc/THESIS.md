@@ -45,7 +45,10 @@ tool cannot skip `lookupUser` via ENG-1596 (`ctx()` has no
 as `pi-ai` sideEffects (`images.js`). Cycle 55: remotion-lambda is the
 isolate; identity stays in `remotionService` — same as `imageGeneration.ts`
 already calling vendor HTTP. Cycle 56: `mcp/client` ↛ `mcp/server`
-already (OMP DAG); park A-016 until A-002. The listed face is a
+already (OMP DAG); park A-016 until A-002. Cycle 57: `app.ts` is the
+composition root (`setupMcpServer` L204, loop `register*` L475–491);
+#2271 owns its route table — A-007 still attaches at `mcpServerCore`.
+The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
