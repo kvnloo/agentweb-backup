@@ -206,6 +206,9 @@ Cycle 125: hung ENG-836 still does not block merge; live ceiling
 is 12. Product READY unchanged.
 Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress turns
 it into the cancelled PASS. Product READY unchanged.
+Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
+adds Backend build to GitHub required contexts. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

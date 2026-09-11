@@ -375,6 +375,12 @@ Cycle 126: **in-flight ENG-836 is PENDING** (script L726).
 Separate concurrency groups; Backend cannot keep ENG-836 in
 the evidence set. Required context is only `Detect changed
 projects` (script L871).
+Cycle 127: **ENG-1373 is still an unlanded comment**
+(`merge-evidence.sh` L875, `dev.md` L157). Nothing in git adds
+`Backend build` or ENG-836 to GitHub required contexts.
+`BACKEND_JOBS` is script-local (L160). Dependabot yml L20 is
+also a comment. Auto-merge waits on the required set only
+(`tasks/lessons.md` L237).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

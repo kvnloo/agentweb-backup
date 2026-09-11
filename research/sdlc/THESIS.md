@@ -202,6 +202,9 @@ Cycle 125: 5-minute string is the #2491 receipt; live ceiling is
 Cycle 126: in-flight ENG-836 is PENDING (script L726). Separate
 concurrency groups; Backend does not keep ENG-836 in the
 evidence set. Do not add A-021.
+Cycle 127: ENG-1373 is still an unlanded comment
+(`merge-evidence.sh` L875, `dev.md` L157). Nothing in git adds
+Backend build to GitHub required contexts. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

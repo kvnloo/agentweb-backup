@@ -509,6 +509,13 @@ Backend and conflict use different concurrency groups
 (`tests.yml` L73–75 vs L249–251). Required context is only
 `Detect changed projects` (script L871–874).
 
+Cycle 127: **ENG-1373 is still an unlanded comment.**
+`merge-evidence.sh` L875 and `dev.md` L157 are present tense.
+No script updates `required_status_checks`. `BACKEND_JOBS`
+(L160) is script-local. Dependabot yml L20 is also a comment.
+Auto-merge waits on the required set only
+(`tasks/lessons.md` L237).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

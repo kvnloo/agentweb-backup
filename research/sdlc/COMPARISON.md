@@ -314,3 +314,5 @@ reverted. Do not copy that as A-006.
   ENG-836 still PASSes merge-evidence. Not A-006.
 - Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress turns
   it into cancelled PASS. Separate concurrency groups. Not A-006.
+- Cycle 127: ENG-1373 is still an unlanded comment. Nothing in
+  git adds Backend build to GitHub required contexts. Not A-006.

@@ -228,4 +228,7 @@ Cycle 125: hung ENG-836 still does not block merge; live ceiling
 is 12. A-006 stays discarded.
 Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress is
 the cancelled PASS. A-006 stays discarded.
+Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
+adds Backend build to GitHub required contexts. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.
