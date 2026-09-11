@@ -128,16 +128,20 @@ export class McpOAuthService {
   // ─── Client Registration ────────────────────────────────────────────────
 
   async registerClient(params: RegisterClientParams): Promise<RegisterClientResult> {
-    if (!params.clientName || params.clientName.trim() === '') {
+    if (typeof params.clientName !== 'string' || params.clientName.trim() === '') {
       throw new Error('Client name is required');
     }
-    if (!params.redirectUris || params.redirectUris.length === 0) {
+    if (!Array.isArray(params.redirectUris) || params.redirectUris.length === 0) {
       throw new Error('At least one redirect URI is required');
     }
 
     // Validate redirect URIs
     for (const uri of params.redirectUris) {
+      if (typeof uri !== 'string') throw new Error('Redirect URIs must be strings');
       const parsed = new URL(uri);
+      if (uri.includes('#') || parsed.username || parsed.password) {
+        throw new Error('Redirect URIs must not contain fragments or credentials');
+      }
       const isLoopback =
         parsed.hostname === 'localhost' ||
         parsed.hostname === '127.0.0.1' ||
@@ -254,13 +258,20 @@ export class McpOAuthService {
     const nowSec = Math.floor(Date.now() / 1000);
     if (record.expiresAt <= nowSec) return null;
 
-    // Mark as used (single-use)
-    await dynamodb.update({
-      TableName: this.codesTable,
-      Key: { code },
-      UpdateExpression: 'SET used = :used',
-      ExpressionAttributeValues: { ':used': true },
-    }).promise();
+    // The read alone cannot enforce single use: callback paste and the listener
+    // can race. DynamoDB must elect one redeemer, including at the TTL boundary.
+    try {
+      await dynamodb.update({
+        TableName: this.codesTable,
+        Key: { code },
+        UpdateExpression: 'SET used = :used',
+        ConditionExpression: 'used = :unused AND expiresAt > :now',
+        ExpressionAttributeValues: { ':used': true, ':unused': false, ':now': Math.floor(Date.now() / 1000) },
+      }).promise();
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ConditionalCheckFailedException') return null;
+      throw error;
+    }
 
     return record;
   }

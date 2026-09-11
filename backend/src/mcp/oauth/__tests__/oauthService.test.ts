@@ -482,3 +482,31 @@ describe('McpOAuthService', () => {
     });
   });
 });
+
+describe('Hermes one-time code and registration invariants (ENG-1869)', () => {
+  const service = new McpOAuthService();
+  beforeEach(() => jest.clearAllMocks());
+  it('allows only one concurrent code redemption even when both reads see unused', async () => {
+    const record = { code: 'race-code', used: false, expiresAt: Math.floor(Date.now() / 1000) + 600 };
+    mockGet.mockReturnValue({ promise: async () => ({ Item: { ...record } }) });
+    let used = false;
+    mockUpdate.mockImplementation(params => ({ promise: async () => {
+      if (params.ConditionExpression && used) {
+        throw Object.assign(new Error('Conditional failure'), { code: 'ConditionalCheckFailedException' });
+      }
+      used = true;
+      return {};
+    } }));
+    const results = await Promise.all([service.consumeAuthorizationCode('race-code'), service.consumeAuthorizationCode('race-code')]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+  it.each(['https://example.com/callback#fragment', 'http://user:password@127.0.0.1:49152/callback'])('rejects unsafe registered redirect %s', async redirect => {
+    await expect(service.registerClient({ clientName: 'Hermes Agent', redirectUris: [redirect] })).rejects.toThrow();
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+  it('rejects a wrong-type redirect element instead of coercing it into a URL', async () => {
+    await expect(service.registerClient({ clientName: 'Hermes Agent',
+      redirectUris: [{ toString: () => 'https://example.com/callback' } as any] })).rejects.toThrow();
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+});
