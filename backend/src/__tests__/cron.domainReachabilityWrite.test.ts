@@ -42,6 +42,17 @@ jest.mock("../services/domainReachabilityService", () => ({
     .UNREACHABLE_CONFIRMATIONS,
 }));
 
+// Reconciliation (ENG-1839 follow-up) is covered in its own file
+// (cron.domainReachabilityReconcile.test.ts) — this test file is about the WRITE path only, and
+// every DOMAIN fixture below is a managed agentwebforms.com subdomain, which reconciliation
+// always skips regardless of registration state. Stubbed only so importing customDomainService
+// (which instantiates AWS.SecretsManager at module load) does not throw against this file's
+// narrower aws-sdk mock.
+jest.mock("../services/customDomainService", () => ({
+  addCustomDomain: jest.fn(),
+  SUBDOMAIN_BASE: "agentwebforms.com",
+}));
+
 import { runDomainReachabilitySweep } from "../cron/domainReachabilityCron";
 import { UNREACHABLE_CONFIRMATIONS } from "../services/domainReachabilityService";
 
