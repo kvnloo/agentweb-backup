@@ -1,23 +1,29 @@
 # Feature queue
 
-Source of truth: `queue.json`. Ranked by protocol score. Frozen at cycle 7 (`briefing_ready`).
+Source of truth: `queue.json`. Protocol score is research leverage.
+**Implementation order** (first PRs when unlocked): Q-001, Q-014, Q-003.
+Cycle 8 promoted Q-003 to ready after a live DesignArena snapshot; it did
+not un-ready Q-001 / Q-014.
 
 **Do not implement yet.** `coding_unlocked: false`. `briefing_ready: true`.
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
+Mapping: `mappings/designarena-image-models.md`.
 
 ## How Kevin can help (thesis)
 
-Hermes operator + MCP creative discovery first. Local logged-in browser is
-ENG-381 (relay is dead). DesignArena for model routing. Do not port Kerdoios.
-Do not rewrite Agent Mode. Do not compete with WhatsApp Cloud API #2271.
+Hermes operator + MCP creative discovery first. Then a fail-open
+DesignArena → `SUPPORTED_MODELS` mapper (not mcp-bench-router's OpenRouter
+chat map). Local logged-in browser is ENG-381 (relay is dead; ownership
+unconfirmed). Do not port Kerdoios. Do not rewrite Agent Mode. Do not
+compete with WhatsApp Cloud API #2271.
 
-## Ranked
+## Ranked (by score)
 
 | Rank | ID | Score | Status | Title |
 |---|---|---|---|---|
-| 1 | Q-001 | 34 | **ready** | Emma-via-Hermes operator path — `briefs/Q-001-hermes-oauth.md` |
-| 2 | Q-014 | 34 | **ready** | Expose generate_image on MCP tools/list — `briefs/Q-014-generate-image-mcp.md` |
-| 3 | Q-003 | 31 | keep | DesignArena adapter for Emma design/image tasks |
+| 1 | Q-003 | 38 | **ready** | DesignArena adapter — `briefs/Q-003-designarena-adapter.md` |
+| 2 | Q-001 | 34 | **ready** | Emma-via-Hermes operator path — `briefs/Q-001-hermes-oauth.md` |
+| 3 | Q-014 | 34 | **ready** | Expose generate_image on MCP tools/list — `briefs/Q-014-generate-image-mcp.md` |
 | 4 | Q-002 | 29 | triage | Eval-informed image routing (parse outputSummary; not a live router) |
 | 5 | Q-006 | 27 | keep | Hide edit_landing_page_file; stop recommending missing coding_agent on MCP |
 | 6 | Q-015 | 27 | keep | Hide admin MCP tools from non-admin tools/list |
@@ -43,5 +49,9 @@ Do not rewrite Agent Mode. Do not compete with WhatsApp Cloud API #2271.
 
 ## First coding (when unlocked)
 
-Q-001 (docs/Hermes skill) and Q-014 (list generate_image, keep metering) in
-parallel. Neither needs a database change.
+1. **Q-001** — Hermes OAuth runbook / skill (no customer blast radius).
+2. **Q-014** — list `generate_image` on MCP (metering unchanged).
+3. **Q-003** — fail-open DesignArena mapper; Matt before flipping the
+   production default to `gpt-image-2`.
+
+None of these needs a database change.

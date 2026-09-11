@@ -39,6 +39,11 @@ are ready to implement.
 
 ## How Kevin should use this
 
-Until the loop marks `briefing_ready`, treat `QUEUE.md` as a draft. After the
-multi-hour pass, the agent will teach the architecture and propose a first
-implementation slice you can do together.
+`briefing_ready` is **true**. Read `ARCHITECTURE.md` then `HOW_TO_HELP.md`.
+`coding_unlocked` is still false until you ask to code. READY briefs:
+
+- `briefs/Q-001-hermes-oauth.md`
+- `briefs/Q-014-generate-image-mcp.md`
+- `briefs/Q-003-designarena-adapter.md` (third in implementation order)
+
+The loop may keep refining until `stop_after` (20:15 UTC).

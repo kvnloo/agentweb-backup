@@ -1,7 +1,8 @@
 # AgentWeb architecture — teach-in for Kevin
 
-Status: **cycle 6 teach-in.** Evidence from cycles 000–005. This is the map
-to read before we write product code.
+Status: **cycle 6 teach-in**, refined in cycle 8 (DesignArena mapping).
+Evidence from cycles 000–008. This is the map to read before we write
+product code.
 
 ## 1. What you forked
 
@@ -112,11 +113,18 @@ generate_image → imageGeneration.ts
   → enqueueAutoHumanEval (Matt, Slack)
 ```
 
-Failover is a **static list** and skips explicit model / edits / logo.
-Human-eval stores **no `imageModel` field** (only `Model:` in
-`outputSummary`). Onboarding like-rates score *prompts*, not providers.
+Failover is a **static list** (`gpt-image-2` already first) and skips
+explicit model / edits / logo. Human-eval stores **no `imageModel` field**
+(only `Model:` in `outputSummary`). Onboarding like-rates score *prompts*,
+not providers.
+
 **DesignArena (Q-003) is the live router; Matt's queue is taste, not a
-picker.**
+picker.** Cycle 8 proved `mcp-bench-router` cannot pick Emma providers
+(OpenRouter chat map). The `image` leaderboard *does* share IDs:
+`gpt-image-2` is #3 and $0.04; the hardcoded default
+`gemini-3-pro-image-preview` is #22 and $0.134. Map with fail-open; do not
+flip the production default until Matt says so. See
+`mappings/designarena-image-models.md`.
 
 Video: Seedance (Higgsfield MCP) → Veo; Remotion `BrandedVideo` for brand
 overlays. That is the only graph-like node today (Q-007 / Comfy later).
@@ -155,16 +163,19 @@ and a single meter point on success.
 
 ## 10. How you help (queue)
 
-READY, no schema:
+READY, no schema. **Code in this order**, not by raw score:
 
 1. **Q-001** — Hermes login runbook / skill (`briefs/Q-001-hermes-oauth.md`)
 2. **Q-014** — list `generate_image` on MCP (`briefs/Q-014-generate-image-mcp.md`)
+3. **Q-003** — DesignArena → `SUPPORTED_MODELS` (`briefs/Q-003-designarena-adapter.md`)
+   Score is highest (38) because the arena evidence is now live, but a
+   default flip has customer blast radius. Matt before production.
 
-Next KEEP: **Q-003** DesignArena → default image model; **Q-006** hide
-deprecated full-file edit; **Q-015** hide admin tools from `tools/list`.
+Next KEEP: **Q-006** hide deprecated full-file edit; **Q-015** hide admin
+tools from `tools/list`.
 
 Parked: Comfy backend, Agent Mode strangler, ENG-381 until Harsha says it's
-yours.
+yours (ownership not visible from this clone or from Linear `0ism`).
 
 Customer-portal code is **not in this clone**. Anything you want to see in
 the app UI needs the other repo.

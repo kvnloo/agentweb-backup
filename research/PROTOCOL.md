@@ -75,6 +75,8 @@ Known live programs (bootstrap):
 - Open PR: WhatsApp Cloud API — #2271
 - Open PR: convert_to_pdf foundation tool — #2861
 - Open PR: autonomous report work plan — #2871
+- Open PR: dead AgentMode transports — #2563
+- Open PR: renewal-health alert — #2875
 
 ## Adjacent-work mapping rule
 

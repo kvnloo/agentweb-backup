@@ -1,7 +1,8 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:50:00Z",
+  "updated_at": "2026-09-11T17:29:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
+  "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
     {
       "id": "Q-001",
@@ -45,19 +46,21 @@
     {
       "id": "Q-003",
       "title": "DesignArena adapter for Emma design/image tasks",
-      "status": "keep",
+      "status": "ready",
       "leverage": 5,
       "product": 4,
       "mergeability": 4,
-      "evidence": 4,
+      "evidence": 5,
       "collision": 1,
-      "score": 31,
-      "why": "mcp-bench-router already picks DesignArena #1 via OpenRouter. AgentWeb image path is not OpenRouter. Adapter can inform default model id, not replace providers.",
+      "score": 38,
+      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134. Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt).",
       "files": [
         "backend/src/services/imageGeneration.ts",
-        "backend/src/routes/image-models.ts"
+        "backend/src/services/agentModeService.ts",
+        "backend/src/utils/llmPricing.ts",
+        "research/mappings/designarena-image-models.md"
       ],
-      "first_slice": "Read-only fetch of DesignArena leaderboard → map to SUPPORTED_MODELS aliases. Fail open to current default.",
+      "first_slice": "See research/briefs/Q-003-designarena-adapter.md. Pure map + 2h cache + fail open. Do not add gpt-image-2.5 or Riverflow. Do not flip hardcoded default until Matt.",
       "harsha_db": false
     },
     {

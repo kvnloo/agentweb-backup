@@ -17,7 +17,7 @@ routing/eval, and external-agent (Hermes/MCP) operation*.
 | Repo / project | What it is | AgentWeb overlap |
 |---|---|---|
 | `kvnloo/kerdoios` | Hermes plugin: allot scarce compute, don't treat LiteLLM $0 as free | AgentWeb **already has** usage runway, cost tiers, quality scores, dominance hiding. Porting Kerdoios would duplicate. Learn from its "never treat zero-price as free" rule when reading OpenRouter BYOK (gateway reports $0). |
-| `kvnloo/mcp-bench-router` | MCP that routes design tasks to **DesignArena**'s current #1 via OpenRouter | AgentWeb image models are a **static list** + hardcoded failover. This is the LM-arena-class experiment. Highest creative-routing leverage. |
+| `kvnloo/mcp-bench-router` | MCP that routes **code/design** (HTML/UI) to DesignArena's #1 via OpenRouter | `STATIC_MAP` is chat-model IDs. Emma images are Azure/Gemini/Runway, **not** OpenRouter. Reuse the *leaderboard fetch* (`category=image\|logo`), not `query_design_model`. Cycle 8 snapshot: already-supported `gpt-image-2` is arena #3 / $0.04; hardcoded default `gemini-3-pro-image-preview` is #22 / $0.134. |
 | `kvnloo/ComfyUI` | Fork of Comfy-Org/ComfyUI, tracking upstream | AgentWeb image gen is one-shot prompt→provider. No graph, ControlNet, LoRA, or reusable workflows. Optional backend, not a rewrite. |
 | `kvnloo/hermes-agent` (+ `hermes-keel`, `hermes-talk`, Linear Hermes HITL) | Deep Hermes contributor | AgentWeb just shipped **Hermes native OAuth** for Emma MCP (`backend/docs/HERMES_MCP_OAUTH.md`). Operator UX is still PTY+paste. Kevin can make Emma-via-Hermes actually usable. |
 | `kvnloo/frontier-kb` | Cross-harness research (OMP/Hermes/Codex/Claude/Cursor/Pi) | Agent-mode loops already emit reliability events. Read-only harness export, not a runtime swap. |
@@ -30,11 +30,18 @@ routing/eval, and external-agent (Hermes/MCP) operation*.
 
 No repo named `lmarena` under `kvnloo`. The live arena-shaped work is:
 
-1. **DesignArena** via `mcp-bench-router` (crowdsourced design-model leaderboard, refresh ~2h).
-2. AgentWeb's own **hand-snapshotted Artificial Analysis** quality scores on the *text* model picker (`agentModeService` `qualityScore` / ENG-1786).
-3. **Human eval** for images: Slack queue to Matt (`humanEvalService`), plus onboarding swipe ratings. Preference is captured; **it does not route models**.
+1. **DesignArena** via `mcp-bench-router` — crowdsourced leaderboard, refresh
+   ~2h. The published MCP routes *website/UI code* through OpenRouter. The
+   **image / logo / graphicdesign** categories overlap AgentWeb
+   `SUPPORTED_MODELS` by exact `modelId` (see
+   `research/mappings/designarena-image-models.md`). That intersection is Q-003.
+2. AgentWeb's own **hand-snapshotted Artificial Analysis** quality scores on the
+   *text* model picker (`agentModeService` `qualityScore` / ENG-1786).
+3. **Human eval** for images: Slack queue to Matt (`humanEvalService`), plus
+   onboarding swipe ratings. Preference is captured; **it does not route
+   models** (no `imageModel` attribute; `listCandidates` is a scan).
 
-That is the gap: arena *signals* exist; a *router* does not.
+Gap: arena *signals* exist for images; Emma still hardcodes the default.
 
 ## AgentWeb in one paragraph
 
