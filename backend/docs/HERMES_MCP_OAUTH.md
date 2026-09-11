@@ -18,7 +18,7 @@ A server change cannot connect Slack messages to that running process.
 ## Native flow from a Slack-operated terminal
 
 1. Keep a persistent terminal/PTY session open on the Hermes host and run:
-   `hermes mcp add emma --url https://api.agentweb.pro/mcp --auth oauth`.
+   `hermes mcp add emma --url https://api.agentweb.pro/mcp --auth oauth --connect-timeout 315`.
    If already configured for OAuth, use `hermes mcp login emma` instead.
 2. Relay its authorization URL to the user. Keep the same process and stdin
    alive while the user signs in and approves in their browser.
@@ -31,7 +31,9 @@ A server change cannot connect Slack messages to that running process.
    caches tokens, and discovers tools. Complete any CLI tool-selection prompt.
    Reload/restart gateway MCP discovery if it was already running.
 
-The native callback wait defaults to 300 seconds. If expired, start a fresh
+The add command otherwise has a 30-second connection timeout; the explicit
+315-second timeout above covers the native 300-second callback wait. Login
+already applies that timeout floor. If expired, start a fresh
 login. Never paste an access token, refresh token, or password into chat. Treat
 callback URLs as short-lived credentials; do not put them into logs or issues.
 
