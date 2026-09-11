@@ -338,3 +338,5 @@ reverted. Do not copy that as A-006.
   (customerPortalPages.ts), one GET. Not A-006.
 - Cycle 138: growth-chat is a sixth origin; callLLM stays in
   this process. Not A-006.
+- Cycle 139: Growth Genius is a fifth in-process catalog
+  (inline search_knowledge_base + Emma KB). Not A-006.

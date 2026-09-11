@@ -254,4 +254,7 @@ Cycle 137: the other repo’s IA is a typed list in this backend,
 not an HTTP nanoservice. A-006 stays discarded.
 Cycle 138: `growth-chat/` is a sixth origin; the loop already
 shares `callLLM` in this process. A-006 stays discarded.
+Cycle 139: Growth Genius is a fifth in-process catalog
+(inline `search_knowledge_base` + Emma KB). A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

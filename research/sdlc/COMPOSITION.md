@@ -571,6 +571,11 @@ here.** Gitignored L122; Actions grep empty.
 `growthGeniusService.ts` L1 / L85 → `agentModeService.callLLM`.
 A-006 would cut the gateway this product already shares.
 
+Cycle 139: **Growth Genius is a fifth in-process catalog.**
+Inline `search_knowledge_base` (L129–150) → Emma
+`searchPlatformKnowledgeBase` (`chatbotService.ts` L4711).
+Two god-objects, one turn, no HTTP.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

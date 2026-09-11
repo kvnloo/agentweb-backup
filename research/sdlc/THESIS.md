@@ -234,6 +234,9 @@ add A-021.
 Cycle 138: `growth-chat/` is a sixth origin; Growth Genius
 already calls `agentModeService.callLLM` (L85). Do not add
 A-021.
+Cycle 139: Growth Genius inlines `search_knowledge_base` and
+executes Emma’s KB helper. Fifth catalog, still in-process.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -427,13 +427,17 @@ Cycle 138: **`growth-chat/` is a sixth origin; `callLLM` stays
 here.** Gitignored L122; Actions grep empty. README L2214
 points at `growth-genius-chat`. `growthGeniusService.ts` L1 /
 L85 imports `agentModeService.callLLM`.
+Cycle 139: **Growth Genius is a fifth in-process catalog.**
+Inline `search_knowledge_base` (`growthGeniusService.ts`
+L129–150) executes Emma’s `searchPlatformKnowledgeBase`
+(`chatbotService.ts` L4711). Two god-objects, one turn, no HTTP.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
 | Practice | Hermes / OMP | AgentWeb |
 |---|---|---|
 | Agent loop | One process, packages | 40,571-line `agentModeService.ts` |
-| Tool catalog | One registry / `tools/list` | Four in-process registries + three availability policies |
+| Tool catalog | One registry / `tools/list` | Four registries + Growth Genius inline `search_knowledge_base` (cycle 139) + three availability policies |
 | MCP | **Client** to other servers | **Server** for Hermes *and* client to vendors; self `"agentweb-tools"` skipped on file config; DB path can still loopback (cycle 90) |
 | Extract | MCP outbound; OMP packages | Fork for health checks; DAG inverted (`services/` import `controllers/`) |
 
