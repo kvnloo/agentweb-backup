@@ -152,6 +152,9 @@ HTTP-split to get a second close.
 Cycle 107: refused upstream is nginx **502 now**; the 600s is
 the SSE **504**. Three classifier classes for one close(). Do not
 HTTP-split to unify them.
+Cycle 108: ALB health cannot stop Hermes during drain. `/health`
+must stay 200 until close (ENG-1189). A-019 is the gate, not a
+health threshold.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

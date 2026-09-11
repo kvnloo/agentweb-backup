@@ -128,6 +128,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 105: send_message POST is not retried after server.close.
   Cycle 106: inbound /mcp and loopback mcpFetch are different sockets.
   Cycle 107: close() is nginx 502 now, not the 600s 504.
+  Cycle 108: ALB health cannot stop Hermes during drain.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

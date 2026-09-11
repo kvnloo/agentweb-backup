@@ -401,6 +401,12 @@ Zero `error_page` / `proxy_next_upstream`. Refused listen → 502.
 SSE already connected → 504 at read timeout. Classifier splits
 them (`toolErrorClassifier.ts` L84 vs L87).
 
+Cycle 108: **ALB health cannot stop Hermes during drain.**
+Zero `HealthCheckPath` in the repo. `healthEndpoint.test.ts` L51–75
+pins always-200, no drain case. Failing `/health` during the wait
+would yank the instance while mcpFetch still needs PORT.
+`asgLifecycleGuard.ts` L262–288 then deregisters.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

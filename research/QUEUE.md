@@ -192,4 +192,6 @@ Cycle 106: inbound `/mcp` and loopback are different sockets.
 `closeIdleConnections` unused. A-006 stays discarded.
 Cycle 107: close() is nginx 502 now, not the 600s 504.
 Classifier splits 502 / 504 / ECONNREFUSED. A-006 stays discarded.
+Cycle 108: ALB health cannot stop Hermes during drain. `/health`
+always 200 until close (ENG-1189). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -274,3 +274,6 @@ reverted. Do not copy that as A-006.
 - Cycle 107: close() is nginx 502 immediately; 600s is 504 on
   an already-connected SSE. Classifier: 502 `upstream_5xx`, 504
   `timeout`, loopback `network`. Not A-006.
+- Cycle 108: ALB health cannot stop Hermes during drain. Zero
+  `HealthCheckPath`. Always-200 `/health` is ENG-1189’s
+  load-balancer face. Not a health nanoservice.

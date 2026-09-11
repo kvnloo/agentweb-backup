@@ -442,6 +442,8 @@ Cycle 106: inbound `/mcp` and loopback are different sockets;
 `closeIdleConnections` unused. A-006 discarded.
 Cycle 107: close() is nginx 502 now, not the 600s 504. A-006
 discarded.
+Cycle 108: ALB health cannot stop Hermes during drain; `/health`
+must stay 200 until close. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

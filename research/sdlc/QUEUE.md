@@ -155,6 +155,11 @@ Cycle 107: close() is nginx **502 now**, not the 600s 504.
 `proxy_connect_timeout 600s` does not wait on ECONNREFUSED.
 Classifier: 502 `upstream_5xx`, 504 `timeout`, loopback
 `network`. Product READY unchanged.
+Cycle 108: ALB health cannot stop Hermes during drain. Zero
+`HealthCheckPath` in git. `/health` stays 200 until close
+because mcpFetch needs the listen (ENG-1189). Hook
+`CompleteLifecycleAction` then deregisters. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -300,6 +300,11 @@ refused listen. SSE already connected still 504s at
 `proxy_read_timeout`. Classifier: 502 `upstream_5xx`, 504
 `timeout`, loopback `network`. Do not add `error_page`. Do not
 HTTP-split to unify the three.
+Cycle 108: ALB health **cannot** stop Hermes during drain. Zero
+`HealthCheckPath` in git. `/health` stays 200 until close because
+mcpFetch needs the listen (ENG-1189). Hook
+`CompleteLifecycleAction` then deregisters (600s). Do not 503
+`/health` during the wait. A-019 refuse is the gate.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
