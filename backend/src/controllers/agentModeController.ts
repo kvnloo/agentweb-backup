@@ -1,3 +1,4 @@
+import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
 import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
@@ -5424,6 +5425,10 @@ export async function runScheduledChat(
   // the contact never went out.
   sendPressExhausted?: boolean;
 }> {
+  if (isEvaluationUser(userId) || isEvaluationUser(schedule?.userId)) {
+    await (await import('../services/evaluationStore')).evaluationStore.discardJob(isEvaluationUser(schedule?.userId) ? schedule.userId : userId, schedule?.scheduleId);
+    throw new EvaluationDenied();
+  }
   const now = new Date();
   let sessionId: string = '';
   // ENG-1118: set when the run parks on a user question. A park resumes into the SAME

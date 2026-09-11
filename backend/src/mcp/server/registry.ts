@@ -1,3 +1,4 @@
+import { enforceEvaluationTool } from '../../services/evaluationPolicy';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
@@ -103,6 +104,7 @@ export class McpToolRegistry {
   }
 
   async execute(name: string, args: any, context?: any) {
+    await enforceEvaluationTool(context?.userId, name);
     const handler = this.tools.get(name);
     if (!handler) {
       throw new Error(`Tool ${name} not found`);

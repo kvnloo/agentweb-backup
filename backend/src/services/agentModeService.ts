@@ -1,3 +1,4 @@
+import { enforceEvaluationTool } from './evaluationPolicy';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
@@ -155,6 +156,8 @@ import {
   applyOpenRouterCacheBreakpoints,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
+  type GatewayReasoningConfig,
+  resolveGatewayReasoningEffort,
 } from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
@@ -193,7 +196,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -949,7 +952,7 @@ function pdfPageRender(pageData: any): Promise<string> {
 }
 
 // Type for LLM model configuration
-interface LLMModelConfig {
+interface LLMModelConfig extends GatewayReasoningConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
   /**
@@ -1862,6 +1865,7 @@ export class AgentModeService {
         // Import the registry and the tools definitions (for side effects)
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
+        await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
         await import('../emma/meetingActionRouter');
@@ -2665,11 +2669,9 @@ export class AgentModeService {
     // Transport: OpenRouter BYOK → our own Azure resource
     // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
     // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
-    // day: response provider "Azure", usage.is_byok true, upstream cost exactly
-    // Azure's $10/$50 list rate — which is what llmPricing.ts bills, because
-    // the OpenRouter usage.cost override is skipped for BYOK calls. First call
-    // on the fresh deployment took ~67s (cold start); steady state ~2s, on par
-    // with Sol on the same path.
+    // day: response provider "Azure", usage.is_byok true, and an exact
+    // upstream inference cost. AgentMode meters that upstream value for BYOK
+    // calls so OpenRouter's long-context pricing overrides remain accurate.
     // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
     // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
     // Deliberately NO `family`: Astra and Sol are distinct product lines;
@@ -2698,7 +2700,8 @@ export class AgentModeService {
     // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
     // `tier` is the no-price fallback only; the picker derives ultra_premium
     // live from MODEL_PRICING.
-    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
+    // ENG-1788: OpenRouter reasoning.supported_efforts, verified in the issue 2026-09-05.
+    'openrouter/openai/gpt-6-astra': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -3085,6 +3088,12 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
+    const reasoningEffort = resolveGatewayReasoningEffort(
+      this.llmModels[model], taskClass,
+      (fallbackModels ?? []).map(id => this.llmModels[this.normalizeModelId(id)]),
+    );
+    if (reasoningEffort !== undefined) params.reasoning = { effort: reasoningEffort };
+
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
@@ -3141,6 +3150,7 @@ export class AgentModeService {
         console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
           provider: resolvedMetadata.provider,
           is_byok: resolvedMetadata.is_byok,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
         });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
@@ -3161,15 +3171,24 @@ export class AgentModeService {
               cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               cacheWriteByTtl: usage.cache_creation_by_ttl,
               costUsdOverride:
-                usage.is_byok !== true && typeof usage.cost === 'number'
-                  ? usage.cost
-                  : undefined,
+                usage.is_byok === true
+                  ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                    Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                    usage.cost_details.upstream_inference_cost > 0
+                    ? usage.cost_details.upstream_inference_cost
+                    : undefined
+                  : typeof usage.cost === 'number'
+                    ? usage.cost
+                    : undefined,
             });
           }
         } catch {
           // Metering must never break an LLM call.
         }
-        return res;
+        // Keep default responses untouched; annotate only the effort actually sent.
+        return reasoningEffort !== undefined && res.usage
+          ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+          : res;
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
@@ -4406,6 +4425,8 @@ export class AgentModeService {
         const responseUsage = response.usage;
         if (responseUsage) {
           responseMessage.usage = {
+            ...(responseUsage.reasoning_effort !== undefined
+              ? { reasoning_effort: responseUsage.reasoning_effort } : {}),
             prompt_tokens: responseUsage.prompt_tokens || 0,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
@@ -7189,6 +7210,26 @@ export class AgentModeService {
       return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
+    // ENG-1720: a `send-invite` that de-duplicates returns
+    // `{ success: true, alreadyInvited: true }` — "Skipped to avoid a duplicate,
+    // no invite quota was used". Nothing is delivered, the pacer's daily volume
+    // does not move, and no ledger row is written.
+    //
+    // Without this branch that outcome falls into the `{}` default above, and the
+    // stored ledger entry becomes indistinguishable from a real delivery: the
+    // requirement verdict reads `{}`, `toolCallSucceeded` finds no error and no
+    // `success: false`, and counts it as a send. Observed in production twice —
+    // a run that contacted nobody stored `status: success`, `passed: true`,
+    // `{ actual: 2, required: 1 }`, `functionCallMisses: []`.
+    //
+    // The predicate that consumes this (`isDeliveredSend`) cannot work on data
+    // that was erased before it was stored, so the flag has to survive the
+    // minimizer. `success` rides along for the same reason the branch above keeps
+    // it — a bare marker with no outcome is not enough to score on.
+    if (toolName === 'linkedin_outreach' && result?.alreadyInvited === true) {
+      return { success: result?.success, alreadyInvited: true };
+    }
+
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
     // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
     // unenrichable one and (b) pair previews to executes per list. The large `samples`
@@ -8855,6 +8896,7 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    await enforceEvaluationTool(userId, toolName, extraContext);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({

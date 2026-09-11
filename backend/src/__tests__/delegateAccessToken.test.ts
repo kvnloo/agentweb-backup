@@ -28,6 +28,11 @@ describe('mintDelegateToken', () => {
     sessionVersion: 5,
   };
 
+  it('ENG-1870 never mints delegated credentials to or from an evaluation identity', () => {
+    expect(() => mintDelegateToken(adminUser, { ...targetUser, userId: 'eval_test' }, 300)).toThrow();
+    expect(() => mintDelegateToken({ ...adminUser, userId: 'eval_test' }, targetUser, 300)).toThrow();
+  });
+
   it('mints a token whose active identity is the TARGET, not the admin', () => {
     const token = mintDelegateToken(adminUser, targetUser, 300);
     const decoded = jwt.verify(token, 'test-secret') as any;
