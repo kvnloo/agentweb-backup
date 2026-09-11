@@ -44,6 +44,14 @@ function isApproved(value: unknown): boolean {
   return value === true || value === 'true';
 }
 
+// Express query/form parsers can produce arrays or objects for repeated/nested
+// parameters. Reject those before URL construction, hashing, or database calls.
+function hasOnlyStringParams(params: Record<string, unknown>, keys: string[]): boolean {
+  return keys.every(key => params[key] === undefined || typeof params[key] === 'string');
+}
+
+const authorizationParams = ['client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method'];
+
 export function setupMcpOAuth(app: express.Express) {
   // ─── Well-Known Metadata (RFC 8414) ─────────────────────────────────────
 
@@ -124,6 +132,9 @@ export function setupMcpOAuth(app: express.Express) {
   // ─── Authorization Endpoint ─────────────────────────────────────────────
 
   app.get('/oauth/authorize', async (req: Request, res: Response) => {
+    if (!hasOnlyStringParams(req.query, ['response_type', ...authorizationParams])) {
+      return res.status(400).json({ error: 'invalid_request' });
+    }
     const {
       response_type,
       client_id,
@@ -218,6 +229,9 @@ export function setupMcpOAuth(app: express.Express) {
   // the Authorization header OR from a `jwt` field on the form body.
 
   app.post('/oauth/authorize/decision', authFromBodyOrHeader, async (req: Request, res: Response) => {
+    if (!hasOnlyStringParams(req.body, authorizationParams)) {
+      return res.status(400).json({ error: 'invalid_request' });
+    }
     const {
       client_id,
       redirect_uri,
@@ -228,6 +242,15 @@ export function setupMcpOAuth(app: express.Express) {
       approved,
     } = req.body;
 
+    // Validate on denial too: an authenticated form must not be an open redirect.
+    if (!client_id || !redirect_uri) {
+      return res.status(400).json({ error: 'Invalid client_id or redirect_uri' });
+    }
+    const client = await mcpOAuthService.getClient(client_id);
+    if (!client || !client.redirectUris.includes(redirect_uri)) {
+      return res.status(400).json({ error: 'Invalid client_id or redirect_uri' });
+    }
+
     if (!isApproved(approved)) {
       const errorUrl = new URL(redirect_uri);
       errorUrl.searchParams.set('error', 'access_denied');
@@ -235,10 +258,8 @@ export function setupMcpOAuth(app: express.Express) {
       return res.redirect(302, errorUrl.toString());
     }
 
-    // Validate client and redirect_uri
-    const client = await mcpOAuthService.getClient(client_id);
-    if (!client || !client.redirectUris.includes(redirect_uri)) {
-      return res.status(400).json({ error: 'Invalid client_id or redirect_uri' });
+    if (!code_challenge || (code_challenge_method && code_challenge_method !== 'S256')) {
+      return res.status(400).json({ error: 'invalid_request' });
     }
 
     const userId = (req as any).user.userId;
@@ -272,6 +293,10 @@ export function setupMcpOAuth(app: express.Express) {
 
     res.setHeader('Cache-Control', 'no-store');
 
+    if (!hasOnlyStringParams(req.body, ['grant_type', 'code', 'redirect_uri', 'client_id', 'client_secret', 'code_verifier', 'refresh_token'])) {
+      return res.status(400).json({ error: 'invalid_request' });
+    }
+
     if (grant_type === 'authorization_code') {
       return handleAuthorizationCodeGrant(req, res);
     } else if (grant_type === 'refresh_token') {
@@ -289,6 +314,11 @@ export function setupMcpOAuth(app: express.Express) {
 async function handleAuthorizationCodeGrant(req: Request, res: Response) {
   const { code, redirect_uri, client_id, code_verifier } = req.body;
 
+  const effectiveClientId = client_id || extractClientIdFromAuth(req);
+  if (!code || !redirect_uri || !effectiveClientId) {
+    return res.status(400).json({ error: 'invalid_request' });
+  }
+
   // Consume the authorization code (single-use)
   const codeRecord = await mcpOAuthService.consumeAuthorizationCode(code);
   if (!codeRecord) {
@@ -296,18 +326,20 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
   }
 
   // Validate client_id matches
-  const effectiveClientId = client_id || extractClientIdFromAuth(req);
-  if (effectiveClientId && codeRecord.clientId !== effectiveClientId) {
+  if (codeRecord.clientId !== effectiveClientId) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
   }
 
   // Validate redirect_uri matches
-  if (redirect_uri && codeRecord.redirectUri !== redirect_uri) {
+  if (codeRecord.redirectUri !== redirect_uri) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
   }
 
   // Validate client auth if confidential
   const client = await mcpOAuthService.getClient(codeRecord.clientId);
+  if (!client) {
+    return res.status(401).json({ error: 'invalid_client' });
+  }
   if (client && client.clientSecretHash) {
     const secret = extractClientSecret(req);
     if (!secret || !mcpOAuthService.validateClientSecret(secret, client.clientSecretHash)) {
