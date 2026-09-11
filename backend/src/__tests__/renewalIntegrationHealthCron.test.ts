@@ -318,7 +318,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
       expect(call.context.customerOutcome).toBe('stated goal: paid_ads');
     });
 
-    it('falls back to stated interests when there is no goal field', async () => {
+    it('falls back to Emma help interests when there is no matching goal field', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
         user({ userId: 'interest-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
       ]);
@@ -326,7 +326,71 @@ describe('runRenewalIntegrationHealthCheck', () => {
       await runRenewalIntegrationHealthCheck();
 
       const call = mockSendAlert.mock.calls[0][0];
-      expect(call.context.customerOutcome).toBe('stated interests: paid_ads');
+      expect(call.context.customerOutcome).toBe('stated interest: paid_ads (Emma help interests)');
+    });
+
+    /**
+     * Fresh-eyes review of the original version of this PR found a real bug here:
+     * it reported the first TRUTHY field on the user record ("stated goal: seo"),
+     * not the field that actually satisfied `hasPaidAdsIntent`. A stale/unrelated
+     * `goal` (free text, not enum-validated) would then read as the reason the
+     * customer was flagged for a paid-ads integration alert -- internally
+     * contradictory and exactly the misleading-alert failure mode this whole PR
+     * exists to prevent. This is the regression guard for that fix.
+     */
+    it('reports the signal that actually triggered the flag, not an unrelated stale goal', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({
+          userId: 'stale-goal-user',
+          goal: 'seo', // truthy, but NOT 'paid_ads' -- must not be reported as the reason
+          emmaHelpInterests: ['paid_ads'], // this is the real trigger
+          connected_accounts: [],
+        }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.customerOutcome).toBe('stated interest: paid_ads (Emma help interests)');
+      expect(call.context.customerOutcome).not.toContain('seo');
+    });
+
+    it('reports an onboarding-event trigger when neither goal nor interests matched', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({
+          userId: 'onboarding-event-user',
+          goal: undefined,
+          emmaHelpInterests: ['brand'], // present, but does not contain 'paid_ads'
+          onboardingEvents: [{ event: 'goal_selected', ts: '', data: { goal: 'paid_ads' } }],
+          connected_accounts: [],
+        }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.customerOutcome).toBe('paid_ads goal selected during onboarding');
+    });
+
+    it('picks the most recent expiry across multiple connected ad accounts', async () => {
+      const olderExpiry = NOW - 10 * DAY_MS;
+      const newerExpiry = NOW - 2 * DAY_MS;
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({
+          userId: 'multi-account-user',
+          connected_accounts: [
+            adAccount({ platform: 'meta', expiresAt: olderExpiry }),
+            adAccount({ platform: 'google_ads', expiresAt: newerExpiry }),
+          ],
+        }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.lastAdAccountSignal).toBe(
+        `most recent ad account token expired ${new Date(newerExpiry).toISOString()}`,
+      );
     });
 
     it('says "no ad platform account on record" when the account was never connected', async () => {

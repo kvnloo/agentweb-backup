@@ -84,13 +84,32 @@ function hasHealthyAdIntegration(user: any): boolean {
   return accounts.some((acc) => isAdAccount(acc) && acc.config && isTokenNotExpired(acc));
 }
 
+/** Which of the three independent paid-ads-intent signals actually matched, if any. */
+type PaidAdsIntentReason = 'goal' | 'emma_help_interests' | 'onboarding_event' | null;
+
+/**
+ * Single source of truth for "did this user express paid-ads intent, and how."
+ * `hasPaidAdsIntent` and `describeCustomerOutcome` both derive from this instead
+ * of each independently re-deciding: the two used to check similar-but-not-
+ * identical conditions (`describeCustomerOutcome` reported the first TRUTHY field
+ * in priority order, not the field that actually matched 'paid_ads'), which could
+ * report a stale, unrelated `goal` value as the reason even when the real trigger
+ * was `emmaHelpInterests` or an onboarding event -- an internally-contradictory,
+ * misleading alert, exactly what ENG-1541's alert-enrichment work exists to
+ * prevent. One function, two callers, cannot drift apart again.
+ */
+function paidAdsIntentReason(user: any): PaidAdsIntentReason {
+  if (user?.goal === 'paid_ads') return 'goal';
+  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.includes('paid_ads')) return 'emma_help_interests';
+  if (Array.isArray(user?.onboardingEvents) && user.onboardingEvents.some(
+    (event: any) => event?.event === 'goal_selected' && event?.data?.goal === 'paid_ads',
+  )) return 'onboarding_event';
+  return null;
+}
+
 /** A user needs an ad connection only after explicitly choosing paid ads. */
 function hasPaidAdsIntent(user: any): boolean {
-  if (user?.goal === 'paid_ads') return true;
-  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.includes('paid_ads')) return true;
-  return Array.isArray(user?.onboardingEvents) && user.onboardingEvents.some(
-    (event: any) => event?.event === 'goal_selected' && event?.data?.goal === 'paid_ads',
-  );
+  return paidAdsIntentReason(user) !== null;
 }
 
 /**
@@ -112,14 +131,25 @@ async function hasAdIntegrationEntitlement(userId: string): Promise<boolean> {
 
 /**
  * ENG-1541: what the customer is actually trying to achieve, for the alert body.
- * Only ever describes what's on record -- never infers or guesses.
+ * Reports whichever signal actually satisfied `hasPaidAdsIntent` (via
+ * `paidAdsIntentReason`), not just the first truthy field on the user record --
+ * a stale, unrelated `goal` (free text, not enum-validated -- see routes/brandBuild.ts)
+ * must never be reported as the reason when the real trigger was a different signal.
+ * The `null` branch is structurally unreachable when called from the `would_flag`
+ * path (that path requires `hasPaidAdsIntent` to already be true), kept only so this
+ * stays a total function if that invariant is ever broken elsewhere.
  */
 function describeCustomerOutcome(user: any): string {
-  if (user?.goal) return `stated goal: ${user.goal}`;
-  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.length > 0) {
-    return `stated interests: ${user.emmaHelpInterests.join(', ')}`;
+  switch (paidAdsIntentReason(user)) {
+    case 'goal':
+      return 'stated goal: paid_ads';
+    case 'emma_help_interests':
+      return 'stated interest: paid_ads (Emma help interests)';
+    case 'onboarding_event':
+      return 'paid_ads goal selected during onboarding';
+    case null:
+      return 'no stated goal on record (flagged via onboarding event history)';
   }
-  return 'no stated goal on record (flagged via onboarding event history)';
 }
 
 /**
@@ -227,19 +257,23 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
     if (evaluation.decision !== 'would_flag') continue;
 
     summary.flagged++;
-    // ENG-1541 Build item 4: state customer outcome, capability, last known signal,
-    // next actor, and confidence explicitly, rather than leaving the oncall reader to
-    // infer them from a single sentence.
-    const customerOutcome = describeCustomerOutcome(user);
-    const lastAdAccountSignal = describeLastAdAccountSignal(user);
-    const nextActor = 'Customer — reconnect the ad platform account in Settings > Connected Accounts';
-    // Deliberately not a fabricated score: this decision is a deterministic check, not
-    // a model guess, so "confidence" means stating exactly what was and wasn't verified
-    // this run, not inventing a number for something never measured.
-    const confidence =
-      'plan entitlement and current connection state independently verified this run; ' +
-      'paid-ads intent is user-declared and not independently re-confirmed';
     try {
+      // ENG-1541 Build item 4: state customer outcome, capability, last known signal,
+      // next actor, and confidence explicitly, rather than leaving the oncall reader to
+      // infer them from a single sentence. Built inside this try, not before it: these
+      // are pure functions that cannot throw today, but that's an implicit property of
+      // their current implementations, not a structural guarantee -- same reasoning as
+      // the evaluation-isolation fix above. A failure constructing the alert content is
+      // still a failure to alert, correctly counted as `alertFailed` either way.
+      const customerOutcome = describeCustomerOutcome(user);
+      const lastAdAccountSignal = describeLastAdAccountSignal(user);
+      const nextActor = 'Customer — reconnect the ad platform account in Settings > Connected Accounts';
+      // Deliberately not a fabricated score: this decision is a deterministic check, not
+      // a model guess, so "confidence" means stating exactly what was and wasn't verified
+      // this run, not inventing a number for something never measured.
+      const confidence =
+        'plan entitlement and current connection state independently verified this run; ' +
+        'paid-ads intent is user-declared and not independently re-confirmed';
       await sendAgentModeOncallAlert({
         subject: `Renewal at risk: ${user.email || user.userId} has no healthy ad integration`,
         message:
