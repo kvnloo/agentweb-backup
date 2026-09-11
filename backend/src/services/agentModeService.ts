@@ -6315,6 +6315,12 @@ export class AgentModeService {
     // happened to be on the `images` page — Emma returned "describe_image not
     // available" and had to ask the user to type out what was on screen (ENG-260).
     'describe_image',
+    // PDF export. Force-merged for the same reason as read_file_content/
+    // describe_image: the prod `foundation_tools` AW-Settings override omits
+    // DEFAULT-only additions, so without this convert_to_pdf falls back to
+    // the __other_skills__ catch-all pool and can be refused as "currently
+    // unavailable to install" even on a fully-entitled account (ENG-1867).
+    'convert_to_pdf',
     // Meeting Intelligence (Fathom). Force-merged because the prod
     // `foundation_tools` AW-Settings override predates these tools and omits
     // them — without force-merging, loadFoundationTools strips them in prod so
