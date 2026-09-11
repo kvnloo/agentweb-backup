@@ -482,6 +482,7 @@ import {
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
+import { getLandingPageLaunchReadiness } from '../utils/landingPageLaunchReadiness';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -6378,12 +6379,22 @@ export class AgentModeService {
     const allTools = this.toolRegistry.getAllTools();
 
     // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // emmaToolRegistry (the module-level singleton) is independently confirmed to
-    // contain both publish_landing_page_changes and get_landing_page_preview_url
-    // (throwaway script, 210 tools). registerTools() copies from that singleton into
-    // THIS instance's own this.toolRegistry at boot — never independently verified
-    // that the copy is complete on a real running server. This log settles it.
+    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
+    // across 5 calls within a single 6-second window of ONE user turn, all bearing
+    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
+    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
+    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
+    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
+    // this.toolRegistry is somehow being read as empty intermittently (no code path
+    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
+    // pure/synchronous, and registerTools() is called exactly once in this file), or
+    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
+    // restart/still draining, a new one still initializing) and both happen to log
+    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
+    // across all lines confirms (a); differing pids confirms (b).
     console.log('[ENG-1852-DIAG]', JSON.stringify({
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
       allToolsCount: allTools.length,
       hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
       hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
@@ -7682,6 +7693,22 @@ export class AgentModeService {
     // URL) from a failed/in-flight one. Without this the default `{}` below strips the
     // deployedUrl, and a final message that falsely claims the deploy "timed out" would
     // have no ledger evidence to reconcile against.
+    //
+    // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
+    // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
+    // neither visible from status/buildStatus alone. Compute launchReadiness here (not
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so each of these
+    // tools' ledger entries carries a derived verdict from whatever signals its OWN raw
+    // result shape actually has — harmless when the underlying signal isn't populated yet
+    // (e.g. smokeTestResult is fire-and-forget after deploy, so it's genuinely absent
+    // mid-generation; ready:true is the correct default until the smoke test has actually
+    // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
+    // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
+    // trackingInstalled at all, so its verdict is structurally always ready:true regardless
+    // of the real page's state. Low-impact (a draft-branch preview URL, not the production
+    // deployedUrl/customDomainUrl) and NOT recovered by landingDeploymentReport.ts's merge
+    // step either — the preview URL and the production URL are different strings, so they
+    // never share a dedup key. Accept the gap: previews are explicitly not the launch URL.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
@@ -7707,6 +7734,7 @@ export class AgentModeService {
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.id !== undefined ? { id: a.id } : {}),
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+        launchReadiness: a.launchReadiness ?? getLandingPageLaunchReadiness(a),
       };
     }
 
