@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 47
+cycles_completed: 48
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 48
+next_cycle: 49
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 47: three catalogs for generate_image (MCP internal flag,
-  chatbot pageToolMap, Agent Mode foundation/skills). A-014 parked.
-  Cycle 48: collision-only unless a cheaper mapping exists. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
-  passes, unsubscribe agentweb-research-cycle.
+  Cycle 48: MCP ListTools is getToolDefinitions with no skill gate.
+  Fork PRs #2 (Q-014+Q-004) and #3 (A-002) are in flight. Cycle 49:
+  collision-only unless a cheaper mapping exists. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes,
+  unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

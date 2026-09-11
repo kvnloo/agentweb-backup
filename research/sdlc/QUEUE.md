@@ -13,7 +13,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | Rank | ID | Score | Status | Title |
 |---|---|---|---|---|
 | 1 | A-001 | 32 | **ready** | Modular monolith thesis (this folder) |
-| 2 | A-007 | 31 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` |
+| 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
@@ -27,10 +27,11 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 47: three **catalogs** for `generate_image` (MCP `internal`,
-chatbot `pageToolMap` L5211, Agent Mode foundation/skills —
-`describe_image` is foundation, generation is not). A-014 parked.
-A-006 stays discard. Product READY unchanged.
+Cycle 48: MCP `ListTools` is `getToolDefinitions()` with **no skill
+gate** (`mcpServerCore.ts` L7–8 / L76–83). Q-014’s flag **is** Hermes
+`tools/list`. Fork PRs #2 (Q-014+Q-004) and #3 (A-002) are in flight;
+do not start A-007 until #2 merges. A-006 stays discard. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

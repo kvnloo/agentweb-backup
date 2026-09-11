@@ -191,6 +191,14 @@ Q-014 flips the MCP row only. A-014 parks copying the other two
 catalogs onto that list. A-006 would have to pick one policy or
 reimplement all three.
 
+Cycle 48: the live Hermes handler is **not** a fourth catalog.
+`mcpServerCore.ts` L76–83 `ListToolsRequestSchema` returns
+`getToolDefinitions()` and says “ALL clients now see all tools (no
+skill-gating).” Header L7–8: “No skill-gating for external clients.”
+Q-014’s `internal` drop is therefore the whole MCP catalog change.
+Fork [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2) owns that
+flag; do not open a second listing PR.
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

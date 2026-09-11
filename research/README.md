@@ -5,7 +5,9 @@ deploy units. The pain is a 40k-line god object, not missing Kubernetes.
 Hermes and Oh My Pi win on **in-process packages and one tool catalog**,
 not on a tool-per-HTTP mesh.
 
-Coding is unlocked. First product PRs: **Q-014 + Q-004**. Q-001 is Kevin
+Coding is unlocked. First product PRs are **in flight**:
+[Q-014 + Q-004](https://github.com/kvnloo/agentweb/pull/2),
+[A-002](https://github.com/kvnloo/agentweb/pull/3). Q-001 is Kevin
 Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
 
 ---
@@ -16,7 +18,7 @@ Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
 
 | Order | ID | Do this | Do not |
 |---|---|---|---|
-| 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. |
+| 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. **In flight: [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).** MCP `ListTools` is `getToolDefinitions()` with no skill gate (`mcpServerCore.ts` L76–83). | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. |
 | 1b | **Q-004** | Same PR or before: `internal` + `internalOnly` on MCP `post_on_account` only | Edit `emma/tools.ts` (#2832). Unlist `manage_*` (ENG-983). |
 | 2 | **Q-001** | Kevin OAuth smoke on `HERMES_MCP_OAUTH.md` (315s PTY). Parent already refreshes OAuth (`server.ts` L586). | Rewrite the in-repo runbook unless smoke finds a lie. |
 | 3 | **Q-003** | Fail-open DesignArena → `SUPPORTED_MODELS`. Live: `gpt-image-2` image **#3 / $0.04**, logo **#1**. Hardcoded default `gemini-3-pro-image-preview` is image **#22 / $0.134**, logo **#40**. | Flip prod default without Matt. Add Riverflow / `gpt-image-2.5` in the first slice. |
@@ -28,7 +30,7 @@ None of the first slices needs a Dynamo table.
 
 | Order | ID | Do this | Do not |
 |---|---|---|---|
-| 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts` | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
+| 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts`. **In flight: [kvnloo#3](https://github.com/kvnloo/agentweb/pull/3).** | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
 | 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
 
