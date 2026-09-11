@@ -208,6 +208,15 @@ handler. `generate_image` has no `requiresUserAccount` in `apiTools.ts`;
 ENG-822 is not the spend door. Do not add the name to `ANONYMOUS_TOOLS`
 (A-015). A fifth HTTP image process would need a copy of this allowlist.
 
+Cycle 50: **if CallTool leaked past that allowlist, the hop still dies
+in-process.** `mcpFetch` L169 `lookupUser` (`httpClient.ts` L57–66)
+throws `User not found: anon_*` before `generateSelfCallToken`. No POST
+to `emmaApi`. ENG-822 (`registry.ts` L136) does not fire — the tool has
+no `requiresUserAccount` — so the visitor would see the database error
+ENG-822 was written to hide, not a picture. That is UX, not spend.
+Do not treat `requireEmmaTokenBudget` as the third fail on this path
+(the request never arrives).
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

@@ -35,7 +35,9 @@ Q-014 lists `generate_image` for *external* Hermes; it does not re-enable
 that self-client. `ListTools` is `getToolDefinitions()` with **no skill
 gate** (`mcpServerCore.ts` L76–83, cycle 48). Anonymous discovery
 (cycle 49) may **list** that tool when the ENG-984 flag is on;
-`ANONYMOUS_TOOLS` is empty so they cannot **run** it. The listed face is a
+`ANONYMOUS_TOOLS` is empty so they cannot **run** it. Cycle 50: a leaked
+`CallTool` still dies at `mcpFetch` `lookupUser` (`httpClient.ts` L57–66)
+before a self-call JWT. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

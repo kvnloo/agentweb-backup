@@ -28,10 +28,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 49: when `MCP_ANONYMOUS_DISCOVERY=true`, anonymous `tools/list`
-includes Q-014’s listed `generate_image`; `ANONYMOUS_TOOLS` is **empty**
-so they cannot run it (`anonymousTransport.ts` L41–58). A-015 parked.
-A-007 waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
+Cycle 50: A-015 leak still cannot spend — `mcpFetch` `lookupUser` throws
+before a JWT (`httpClient.ts` L57–66 / L169). ENG-822 does not fire.
+A-015 stays park. A-007 waits on kvnloo#2. A-006 stays discard.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -73,7 +73,12 @@ become clients of a fifth hop.
 When `MCP_ANONYMOUS_DISCOVERY=true` (default **off**), anonymous
 `tools/list` will include listed `generate_image`. `ANONYMOUS_TOOLS`
 is empty — look but not run (`anonymousTransport.ts`). Do not add
-`generate_image` to that set (A-015).
+`generate_image` to that set (A-015). If that allowlist leaked,
+`mcpFetch` `lookupUser` still throws `User not found` **before** minting
+a self-call JWT (`httpClient.ts` L57–66 / L169) — no leaf, no vendor.
+ENG-822 does not rewrite that error (`generate_image` has no
+`requiresUserAccount`). Copying `emmaApi` “because it is metered” is
+not the same door (cycle 51).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

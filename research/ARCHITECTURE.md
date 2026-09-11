@@ -281,6 +281,9 @@ A-006 discarded.
 Cycle 49: anonymous `tools/list` (flag default off) can see Q-014’s
 tool; `ANONYMOUS_TOOLS` is empty so they cannot run it. A-015 parked.
 A-006 discarded.
+Cycle 50: leaked CallTool still dies at `mcpFetch` `lookupUser`
+(`httpClient.ts` L57–66 / L169) before a JWT. ENG-822 does not fire.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -56,6 +56,11 @@ anonymous `tools/list` will already include the listed tool; execute
 is blocked at the transport. Authenticated Hermes (Q-001) still
 meters `POST /api/emma/generate-image`.
 
+Cycle 50: do **not** add `requiresUserAccount` on MCP `generate_image`
+as part of this listing PR. A leaked CallTool already dies at
+`lookupUser` (`httpClient.ts` L57–66) before spend. ENG-822 on this
+tool would only change the error string, not the product.
+
 Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
 The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
 or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as
