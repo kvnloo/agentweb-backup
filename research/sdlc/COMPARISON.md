@@ -300,3 +300,5 @@ reverted. Do not copy that as A-006.
   Only git `proxy_pass` is `/socket.io/`. Not A-006.
 - Cycle 119: cannot name platform nginx.conf (`app.ts` L152–155).
   Docs default upstream 5000. Hermes/OMP: no proxy file. Not A-006.
+- Cycle 120: git never chooses 3001/8080/5000. Zero
+  `application:environment` in `.ebextensions`. Not A-006.

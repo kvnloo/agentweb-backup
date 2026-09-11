@@ -351,6 +351,10 @@ general proxy location is not in this repo. No
 `.platform/nginx/nginx.conf`. AWS docs (`dev.md` L6235) default
 upstream is **5000**, a third number. Hermes `/mcp` filename and
 port are live-AWS-only.
+Cycle 120: git **never chooses** among 3001 / 8080 / 5000. Zero
+`application:environment` in `.ebextensions`. That namespace is
+test fixtures only (`eb-config-conflict.test.sh` L304).
+`websocket.conf` hardcodes 8080 and does not read `$PORT`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

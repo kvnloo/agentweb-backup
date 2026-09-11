@@ -191,6 +191,9 @@ Cycle 118: `PORT=8080` is not in git. `.env.example` is 3001.
 Only git `proxy_pass` is `/socket.io/`. Product READY unchanged.
 Cycle 119: cannot name platform nginx.conf (`app.ts` L152–155).
 Docs default upstream 5000. Product READY unchanged.
+Cycle 120: git never chooses among 3001 / 8080 / 5000. Zero
+`application:environment` in `.ebextensions`. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

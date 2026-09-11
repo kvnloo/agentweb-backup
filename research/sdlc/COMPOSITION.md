@@ -468,6 +468,13 @@ default upstream **5000**. `trustProxy.test.ts` L9–10 is a live
 access log, not a conf path. `/mcp` `proxy_pass` filename and port
 are live-AWS-only. 600s timeout is in git (`agent-mode-timeout.conf`).
 
+Cycle 120: **git never chooses among 3001 / 8080 / 5000.**
+Zero `aws:elasticbeanstalk:application:environment` in
+`.ebextensions`. Fixtures only (`eb-config-conflict.test.sh`
+L304). `websocket.conf` L6 hardcodes 8080; Node fallback is 3001
+(`server.ts` L55). Platform injects `PORT`; `/socket.io/` does not
+read it.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

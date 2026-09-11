@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 119
+cycles_completed: 120
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 120
+next_cycle: 121
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 119: cannot name platform nginx.conf. Cycle 120: cheapest
-  remaining. Candidate: AWS docs default upstream 5000 vs
-  websocket.conf 8080 vs Node 3001 — any in-tree platform
-  string? Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
-  A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 120: git never chooses 3001/8080/5000. Cycle 121:
+  cheapest remaining. Candidate: would a /mcp location pin
+  8080, and does ENG-836 treat that as instance config?
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```
