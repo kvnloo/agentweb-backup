@@ -67,8 +67,9 @@ files; wrap after #2, not instead of Q-014. Cycle 72: local GET
 not instead of it. Cycle 73: `server.close()` is not awaited
 before `CompleteLifecycleAction` (`asgLifecycleGuard.ts` L262–273).
 Cycle 74: `workerShutdownGuards.ts` (ENG-201) is why the existing
-fork survives SIGTERM; a fifth `listen()` would not. Product READY
-unchanged.
+fork survives SIGTERM; a fifth `listen()` would not. Cycle 75:
+`RecordLifecycleActionHeartbeat` is unused; 900s is CONTINUE
+fallback (`eb-deploy.sh` L612). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

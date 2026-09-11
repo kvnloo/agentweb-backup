@@ -161,3 +161,7 @@ submodule of the leaf package (A-008, not A-006).
   can drain then SIGKILL. A fifth `listen()` gets the cgroup
   SIGTERM with Node’s default handler (ENG-201). Hermes: one
   process, no sibling to ignore.
+- Cycle 75: `RecordLifecycleActionHeartbeat` is never invoked.
+  Three 900s knobs (ASG hook, EB rolling Timeout, comment in
+  `runDrain`) are dead-man's switches stacked above a 10 min
+  ceiling. A fifth `listen()` is in none of them.

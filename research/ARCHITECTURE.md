@@ -364,6 +364,9 @@ Cycle 74: `workerShutdownGuards.ts` L1–18 / worker L9–13 ignore
 SIGTERM (ENG-201). Parent `kill('SIGKILL')` L379–384 after
 `pendingRequests`. A fifth `listen()` is not that child. A-006
 discarded.
+Cycle 75: `RecordLifecycleActionHeartbeat` never called. Hook
+`--heartbeat-timeout 900` (`eb-deploy.sh` L612) + rolling.config
+`Timeout: 900` sit above `DRAIN_CEILING_MS` 10 min. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

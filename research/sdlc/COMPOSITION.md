@@ -182,6 +182,17 @@ scheduled runs. Parent waits `pendingRequests` then SIGKILL
 `generate_image` is parent MCP, not this child. A-006 as HTTP
 would die on the signal the worker was taught to ignore.
 
+Cycle 75: **the ASG hook never heartbeats.**
+`RecordLifecycleActionHeartbeat` appears only in
+`asgLifecycleGuard.ts` L26. `eb-deploy.sh` L608–613 installs
+`--heartbeat-timeout 900 --default-result CONTINUE`. Drain is
+capped at 10 min (`shutdownConstants.ts` L8) so it finishes
+inside; force-exit 13 min (`server.ts` L377–382); EB rolling
+Timeout 15 min (`.ebextensions/rolling.config` L5–7). Awaiting
+GET SSE without `mcpShutdown` is cut by force-exit, still inside
+the hook. A-006 as a long image process would need a hook *and*
+the API this process does not call.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -155,6 +155,11 @@ Cycle 74: the existing fork is protected by
 ENG-201). A fifth image process would receive the cgroup SIGTERM
 and die — the failure that file exists to prevent. Q-014 is
 parent MCP, not the worker.
+Cycle 75: `RecordLifecycleActionHeartbeat` is IAM-only
+(`asgLifecycleGuard.ts` L26). The 900s ASG hook and EB rolling
+`Timeout: 900` (`.ebextensions/rolling.config` L5–7) are stacked
+above a 10 min drain ceiling. A fifth process is in none of those
+clocks.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

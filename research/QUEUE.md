@@ -113,4 +113,7 @@ anyway. A-006 stays discarded.
 Cycle 74: `workerShutdownGuards.ts` ignores SIGTERM (ENG-201);
 parent SIGKILLs after drain. A fifth `listen()` gets default
 SIGTERM. A-006 stays discarded.
+Cycle 75: `RecordLifecycleActionHeartbeat` is never called;
+`--heartbeat-timeout 900` is CONTINUE fallback (`eb-deploy.sh`
+L612). `DRAIN_CEILING_MS` 10 min fits inside. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -94,7 +94,8 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   `CallTool` once for local + rehydrate faces. Cycle 73: even this
   process's `server.close()` is not in the await the hook waits on.
   Cycle 74: `workerShutdownGuards.ts` (ENG-201) is the in-tree
-  rejection of “just add a process.”
+  rejection of “just add a process.” Cycle 75: the 900s ASG hook
+  is never heartbeated from TypeScript.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

@@ -80,7 +80,12 @@ SSE is why `mcpShutdown` must follow the CallTool wait. Cycle 73:
 awaited; the ASG hook (`asgLifecycleGuard.ts` L262–273) completes
 on drain resolve anyway. Cycle 74: the compute fork ignores
 SIGTERM (`workerShutdownGuards.ts` L1–18 / ENG-201); a fifth
-`listen()` would not. The listed face is a
+`listen()` would not. Cycle 75: `RecordLifecycleActionHeartbeat`
+is never called (`asgLifecycleGuard.ts` L26 comment only);
+`--heartbeat-timeout 900` (`eb-deploy.sh` L608–613) is CONTINUE
+fallback. `DRAIN_CEILING_MS` 10 min (`shutdownConstants.ts` L8)
+fits inside EB rolling `Timeout: 900` (`.ebextensions/rolling.config`
+L5–7). The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
