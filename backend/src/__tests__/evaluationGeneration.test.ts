@@ -64,10 +64,24 @@ describe('ENG-1870 approved-material-only generation and bounded spend', () => {
   });
   it('stores a high-entropy generated creative within the private artifact size limit', async () => {
     const image = await sharp(randomBytes(1024 * 1024 * 3), { raw: { width: 1024, height: 1024, channels: 3 } }).png().toBuffer();
-    generateContent.mockResolvedValueOnce({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: image.toString('base64') } }] } }] });
+    generateContent.mockResolvedValueOnce({
+      usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, thoughtsTokenCount: 10 },
+      candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: image.toString('base64') } }] } }],
+    });
     await runEvaluation('eval_test', { action: 'generate_creative', prompt: 'Create an evaluation image' });
     expect((evaluationStore.saveArtifact as jest.Mock).mock.calls[0][1].length).toBeLessThanOrEqual(240000);
-    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'eval_test', feature: 'evaluation', costUsdOverride: expect.any(Number) }));
-    expect((recordUsage as jest.Mock).mock.calls[0][0].costUsdOverride).toBe(0.0672);
+    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'eval_test', feature: 'evaluation', inputTokens: 100, outputTokens: 30,
+      costUsdOverride: 0.06734,
+    }));
+  });
+  it.each([
+    { response: { usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 0, thoughtsTokenCount: 5 }, candidates: [] }, expected: 0.000115 },
+    { response: { usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 10, thoughtsTokenCount: 5 }, candidates: [{ content: { parts: [{ text: 'No image generated' }] } }] }, expected: 0.000145 },
+  ])('records token spend without an image charge for rejected creative responses', async ({ response, expected }) => {
+    generateContent.mockResolvedValueOnce(response);
+    await expect(runEvaluation('eval_test', { action: 'generate_creative', prompt: 'Create an evaluation image' })).rejects.toThrow();
+    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ costUsdOverride: expected }));
+    expect(evaluationStore.saveArtifact).not.toHaveBeenCalled();
   });
 });

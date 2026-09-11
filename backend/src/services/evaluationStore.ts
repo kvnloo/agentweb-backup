@@ -38,9 +38,9 @@ export class EvaluationStore {
     return (result.Item as EvaluationRecord) || null;
   }
 
-  private audit(userId: string, actor: string, action: string) {
+  private audit(userId: string, actor: string, action: string, details: Record<string, unknown> = {}) {
     return { Put: { TableName: this.table, Item: {
-      evaluationKey: `evaluation/${userId}/audit/${randomUUID()}`, userId, actor, action, at: new Date().toISOString(),
+      evaluationKey: `evaluation/${userId}/audit/${randomUUID()}`, userId, actor, action, at: new Date().toISOString(), ...details,
     }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } };
   }
 
@@ -120,7 +120,9 @@ export class EvaluationStore {
   async revoke(actor: string, userId: string) {
     const record = await this.get(userId);
     if (!record || record.userId !== userId || typeof record.email !== 'string') throw new EvaluationDenied();
-    const audit = this.audit(userId, actor, 'revoke');
+    const audit = this.audit(userId, actor, 'revoke', { cleanupStatus: 'pending' });
+    // This marker is committed with the deny state, so incomplete cleanup remains
+    // durable even when both cleanup and the best-effort failure audit write fail.
     const writes: AWS.DynamoDB.DocumentClient.TransactWriteItemList = [
       { Update: { TableName: this.table, Key: this.key(userId),
         UpdateExpression: 'SET #status = :revoked', ConditionExpression: 'userId = :user',

@@ -91,6 +91,8 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email } }) });
     scan.mockImplementationOnce(() => ({ promise: async () => { throw new Error('synthetic unavailable'); } }));
     await expect(store.revoke('admin', 'eval_test')).rejects.toThrow();
+    const initialRevoke = transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item.action === 'revoke');
+    expect(initialRevoke.Put.Item.cleanupStatus).toBe('pending');
     expect(transactWrite.mock.calls.some(([params]) => params.TransactItems.some((w: any) => w.Put?.Item.action === 'revocation-cleanup-failed'))).toBe(true);
   });
 
