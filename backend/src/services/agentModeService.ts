@@ -7680,9 +7680,10 @@ export class AgentModeService {
     // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
     // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
     // trackingInstalled at all, so its verdict is structurally always ready:true regardless
-    // of the real page's state. Low-impact (a draft-branch preview, not the production URL)
-    // but real — landingDeploymentReport.ts's merge step is what actually recovers accuracy
-    // once a later get_deployment_status call for the SAME url reports the real verdict.
+    // of the real page's state. Low-impact (a draft-branch preview URL, not the production
+    // deployedUrl/customDomainUrl) and NOT recovered by landingDeploymentReport.ts's merge
+    // step either — the preview URL and the production URL are different strings, so they
+    // never share a dedup key. Accept the gap: previews are explicitly not the launch URL.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
