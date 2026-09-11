@@ -395,6 +395,12 @@ zero callers. Hermes → nginx `:80`; mcpFetch `localhost:${PORT}`
 bypasses nginx (`httpClient.ts` L94–96). `.platform/nginx` has
 zero `keepalive`. GET `/mcp` SSE is not idle (L525–528).
 
+Cycle 107: **close() is nginx 502 now, not the 600s 504.**
+`agent-mode-timeout.conf` L5–7 sets both connect and read to 600s.
+Zero `error_page` / `proxy_next_upstream`. Refused listen → 502.
+SSE already connected → 504 at read timeout. Classifier splits
+them (`toolErrorClassifier.ts` L84 vs L87).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

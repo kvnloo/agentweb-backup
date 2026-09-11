@@ -294,6 +294,12 @@ and unused. Hermes hits nginx; mcpFetch is `localhost:${PORT}`
 and bypasses nginx. GET `/mcp` SSE is not idle. Do not add a
 close API from this cycle; A-019 refuse at `disableCron` is the
 gate. Do not HTTP-split `/mcp`.
+Cycle 107: after close, new Hermes `/mcp` is nginx **502 now**,
+not a 600s 504. `proxy_connect_timeout 600s` does not wait on
+refused listen. SSE already connected still 504s at
+`proxy_read_timeout`. Classifier: 502 `upstream_5xx`, 504
+`timeout`, loopback `network`. Do not add `error_page`. Do not
+HTTP-split to unify the three.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

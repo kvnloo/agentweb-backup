@@ -271,3 +271,6 @@ reverted. Do not copy that as A-006.
   sockets. `closeIdleConnections` is typed and unused. Hermes
   fails at nginx; the wrap is only if CallTool already
   `execute()`d. Not a fifth `listen()`.
+- Cycle 107: close() is nginx 502 immediately; 600s is 504 on
+  an already-connected SSE. Classifier: 502 `upstream_5xx`, 504
+  `timeout`, loopback `network`. Not A-006.

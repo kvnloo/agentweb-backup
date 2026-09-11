@@ -149,6 +149,9 @@ the new instance is a different process.
 Cycle 106: inbound `/mcp` (nginx) and loopback mcpFetch (`PORT`)
 are different sockets. `closeIdleConnections` unused. Do not
 HTTP-split to get a second close.
+Cycle 107: refused upstream is nginx **502 now**; the 600s is
+the SSE **504**. Three classifier classes for one close(). Do not
+HTTP-split to unify them.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

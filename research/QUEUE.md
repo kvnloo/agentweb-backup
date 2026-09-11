@@ -190,4 +190,6 @@ Cycle 105: that POST is not retried after `server.close`
 into a closed listener. A-006 stays discarded.
 Cycle 106: inbound `/mcp` and loopback are different sockets.
 `closeIdleConnections` unused. A-006 stays discarded.
+Cycle 107: close() is nginx 502 now, not the 600s 504.
+Classifier splits 502 / 504 / ECONNREFUSED. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -151,6 +151,10 @@ Cycle 106: inbound `/mcp` and loopback mcpFetch are different
 sockets. `closeIdleConnections` is typed (`http.d.ts` L420–425)
 and unused. Hermes hits nginx; mcpFetch is `localhost:${PORT}`.
 Product READY unchanged.
+Cycle 107: close() is nginx **502 now**, not the 600s 504.
+`proxy_connect_timeout 600s` does not wait on ECONNREFUSED.
+Classifier: 502 `upstream_5xx`, 504 `timeout`, loopback
+`network`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
