@@ -486,6 +486,12 @@ Cycle 122: **detect-changes skips drafts.** `tests.yml` L16–18
 (L244–246). A draft `/mcp` PR never runs ENG-836. Pass still
 refuses deployability (script L232–233; test L200–201).
 
+Cycle 123: **re-draft is `NO_EVIDENCE`.** `merge-evidence.sh`
+L262–267 exits 3 on `pr_draft`. Missing `converted_to_draft`
+(`tests.yml` L5) does not let a `/mcp` PR merge. `gh pr checks`
+can still look green (L14–25). Discriminator is
+`Detect changed projects` (L147).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

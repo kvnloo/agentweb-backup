@@ -7,18 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 122
+cycles_completed: 123
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 123
+next_cycle: 124
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 122: detect-changes skips drafts; ENG-836 never sees a
-  draft /mcp PR. Cycle 123: cheapest remaining. Candidate:
-  ready_for_review vs converted_to_draft — does last ready run
-  remain evidence? Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 123: re-draft is NO_EVIDENCE; gh pr checks can still look
+  green. Cycle 124: cheapest remaining. Candidate: would ENG-836
+  path-filter skip be misread as draft? Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006. If stop_after passes,
+  unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

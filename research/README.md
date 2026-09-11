@@ -361,6 +361,9 @@ it alone (test L188–192) and forbids it next to `timeout.config`
 Cycle 122: **detect-changes skips drafts** (`tests.yml` L18).
 The conflict job never runs on a draft `/mcp` PR. A pass still
 refuses deployability (test L200–201).
+Cycle 123: **re-draft is `NO_EVIDENCE`** (`merge-evidence.sh`
+L264). Missing `converted_to_draft` does not let a `/mcp` PR
+merge. `gh pr checks` can still look green (L14–25).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

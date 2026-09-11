@@ -193,6 +193,8 @@ Cycle 121: a `/mcp` location is instance-only. ENG-836 allows it
 alone and forbids it next to ALB `.ebextensions`. Do not add A-021.
 Cycle 122: detect-changes skips drafts (`tests.yml` L18). Cycle
 121’s draft-run claim is wrong; instance-only classification holds.
+Cycle 123: re-draft is `NO_EVIDENCE` (`merge-evidence.sh` L264).
+`gh pr checks` can still look green. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
