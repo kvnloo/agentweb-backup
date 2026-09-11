@@ -415,6 +415,10 @@ Cycle 135: **agent-engine is a deploy unit with no GitHub
 build job.** Grep of `.github/workflows/` is empty. Test L1199
 PASSes `agent-engine/web_agent.py` as `NON_BACKEND`. Remotion
 got ENG-1377; the Python worker did not.
+Cycle 136: **customer-portal is a fifth repo (gitignored).**
+`.gitignore` L121–124. No directory in this tree. `tests.yml`
+/ `deploy.yml` grep empty. Test L1044–1047 path is synthetic.
+CLAUDE.md L155 (“in this repo”) is stale vs L894.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

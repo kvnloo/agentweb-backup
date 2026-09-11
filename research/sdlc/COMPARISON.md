@@ -332,3 +332,5 @@ reverted. Do not copy that as A-006.
   requires Backend build only. Not A-006.
 - Cycle 135: agent-engine is a deploy unit with no GitHub build
   job. Not A-006.
+- Cycle 136: customer-portal is a fifth repo (gitignored), not
+  a fifth process. Not A-006.

@@ -248,4 +248,6 @@ Cycle 134: a `tests.yml` PR schedules six jobs; merge-evidence
 requires `Backend build` only. A-006 stays discarded.
 Cycle 135: agent-engine is a deploy unit with no GitHub build
 job. A-006 stays discarded.
+Cycle 136: customer-portal is a fifth repo (gitignored), not a
+fifth process. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

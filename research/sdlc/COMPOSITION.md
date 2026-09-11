@@ -556,6 +556,11 @@ build job.** Grep of `.github/workflows/` is empty. Test L1199
 PASSes `agent-engine/web_agent.py` as `NON_BACKEND`. Remotion
 got ENG-1377; the Python worker did not.
 
+Cycle 136: **customer-portal is a fifth repo (gitignored).**
+`.gitignore` L121–124. No directory. `tests.yml` / `deploy.yml`
+grep empty. Test L1044–1047 path is synthetic. CLAUDE.md L155
+is stale vs L894.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
