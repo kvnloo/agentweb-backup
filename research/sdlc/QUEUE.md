@@ -189,6 +189,8 @@ Cycle 117: `runDrain` never stops nginx. Stop order is
 live-AWS-only. Product READY unchanged.
 Cycle 118: `PORT=8080` is not in git. `.env.example` is 3001.
 Only git `proxy_pass` is `/socket.io/`. Product READY unchanged.
+Cycle 119: cannot name platform nginx.conf (`app.ts` L152–155).
+Docs default upstream 5000. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

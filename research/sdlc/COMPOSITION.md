@@ -460,6 +460,14 @@ Cycle 118: **`PORT=8080` is not in git.**
 (`mcp.httpClient.test.ts` L27 / L239). Only git `proxy_pass` is
 `/socket.io/`. `/mcp` is unvendored platform nginx.conf.
 
+Cycle 119: **cannot name that nginx.conf.** `app.ts` L152–155
+(ENG-493) says the general proxy location is not in this repo.
+Zero `.platform/nginx/nginx.conf`. `dev.md` L6235 AWS docs:
+extend dirs we already use; override path we do not ship;
+default upstream **5000**. `trustProxy.test.ts` L9–10 is a live
+access log, not a conf path. `/mcp` `proxy_pass` filename and port
+are live-AWS-only. 600s timeout is in git (`agent-mode-timeout.conf`).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

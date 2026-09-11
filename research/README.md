@@ -346,6 +346,11 @@ nginx-vs-Node stop order is live-AWS-only.
 Cycle 118: `PORT=8080` is **not** in git. `.env.example` L1 is
 `PORT=3001`. Tests pin mcpFetch to 3001. Only git `proxy_pass` is
 `/socket.io/`. Hermes `/mcp` is unvendored platform nginx.conf.
+Cycle 119: **cannot name** that file. `app.ts` L152–155 says the
+general proxy location is not in this repo. No
+`.platform/nginx/nginx.conf`. AWS docs (`dev.md` L6235) default
+upstream is **5000**, a third number. Hermes `/mcp` filename and
+port are live-AWS-only.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

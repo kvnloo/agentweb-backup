@@ -183,6 +183,9 @@ needs nginx; mcpFetch does not. Stop order is live-AWS-only.
 Cycle 118: `PORT=8080` is not in git. `.env.example` L1 is 3001.
 Only git `proxy_pass` is `/socket.io/` → 8080. `/mcp` is
 unvendored.
+Cycle 119: cannot name the platform nginx.conf. `app.ts` L152–155
+is the in-repo admission. Docs default upstream is 5000. Filename
+and port are live-AWS-only.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
