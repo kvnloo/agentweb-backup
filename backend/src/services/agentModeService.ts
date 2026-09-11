@@ -23342,6 +23342,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (isBookkeepingTool(toolName)) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
     }
+    // ENG-1855: install_skills refusing the __other_skills__ bundle (which gates
+    // publish_landing_page_changes, among other unassociated tools) reaches the
+    // model ONLY as this generic wrapper — installSkills returns success:false,
+    // so it never throws, and this is the sole place that failure is described
+    // (see toolDispatch.ts's success-with-encoded-error downgrade). A real
+    // incident showed the model filling that silence with a fabricated manual
+    // workaround ("navigate to Landing Pages and click Publish") for a button
+    // that does not exist anywhere in the product. Don't assert no workaround
+    // exists for every tool this bundle could gate — just forbid inventing one.
+    if (toolName === 'install_skills' && safeMessage.includes(OTHER_SKILLS_VIRTUAL_ID)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The tool this would have unlocked is temporarily unavailable. Do NOT invent a manual UI workaround (a button, a page, a settings toggle) unless you have concrete, verified confirmation one exists — guessing one into existence sends the user on a search that may never succeed. Tell them plainly that this is temporarily unavailable and to check back or retry.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
