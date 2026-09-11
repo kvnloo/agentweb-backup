@@ -136,12 +136,16 @@ describe("SpendLedgerBody", () => {
     // A reservation is never folded into settled spend.
     expect(screen.getByTestId("spend-ledger-settled")).toHaveTextContent("$0.0100");
     expect(screen.getByTestId("spend-ledger-inflight")).toHaveTextContent("$0.0900");
-    expect(screen.getByTestId("spend-ledger-allowance")).toHaveTextContent("$200.00");
     // And it is itemised, because a pause has to be explained against it.
     expect(within(screen.getByTestId("spend-ledger-inflight-table")).getByText("v0")).toBeInTheDocument();
   });
 
-  it("states why an account is paused, from the same events it reports (AC3)", () => {
+  // SUPERSEDES "states why an account is paused, from the same events it
+  // reports (AC3)". ENG-1874: `explainPause` compares committed spend against
+  // the usable allowance, and those have different bases — the ledger holds
+  // vendor spend only, the allowance covers LLM too. A pause claim built on
+  // that is wrong, not merely weak, so it is withheld rather than shown.
+  it("withholds the pause explanation while the ledger cannot substantiate it (ENG-1874)", () => {
     render(
       <SpendLedgerBody
         data={payload({
@@ -159,21 +163,36 @@ describe("SpendLedgerBody", () => {
       />,
     );
 
-    expect(screen.getByTestId("spend-ledger-pause")).toHaveTextContent("reached the cap");
-    // Overspend replaces "remaining" rather than showing a floored $0.00, which
-    // would read as "exactly at the limit".
-    expect(screen.getByText("Overspent")).toBeInTheDocument();
-    expect(screen.getByTestId("spend-ledger-remaining")).toHaveTextContent("$10.00");
+    expect(screen.queryByTestId("spend-ledger-pause")).not.toBeInTheDocument();
+    expect(screen.queryByText(/reached the cap/)).not.toBeInTheDocument();
+    // The spend itself is still reported — only the comparison is withheld.
+    expect(screen.getByTestId("spend-ledger-settled")).toBeInTheDocument();
   });
 
-  it("distinguishes an uncapped tier from a zero allowance (AC4)", () => {
-    render(<SpendLedgerBody data={payload({ projection: projection({ unlimited: true }) })} />);
-    expect(screen.getByTestId("spend-ledger-allowance")).toHaveTextContent("Uncapped");
-    expect(screen.getByTestId("spend-ledger-remaining")).toHaveTextContent("—");
-    expect(screen.getByText(/not applicable/)).toBeInTheDocument();
+  it("shows no allowance, remaining or percentage figure at all (ENG-1874 AC1)", () => {
+    render(<SpendLedgerBody data={payload()} />);
+
+    // The comparison is invalid regardless of the tier, so nothing conditional
+    // survives here — not "Uncapped", not a floored $0.00, not a percentage.
+    expect(screen.queryByTestId("spend-ledger-allowance")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("spend-ledger-remaining")).not.toBeInTheDocument();
+    expect(screen.queryByText(/of allowance committed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Usable allowance/)).not.toBeInTheDocument();
   });
 
-  it("itemises adjustments rather than netting them into the allowance (AC4)", () => {
+  it("states why those figures are absent, rather than leaving a hole (ENG-1874)", () => {
+    render(<SpendLedgerBody data={payload()} />);
+
+    const note = screen.getByTestId("spend-ledger-basis-note");
+    expect(note).toHaveTextContent("vendor spend only");
+    // Naming the reason matters: an unexplained omission reads as a bug, and
+    // the next reader would try to restore the comparison.
+    expect(note).toHaveTextContent("withheld");
+  });
+
+  it("withholds allowance adjustments along with the allowance (ENG-1874)", () => {
+    // An adjustment shown next to no balance invites the reader to
+    // reconstruct the comparison this change exists to remove.
     render(
       <SpendLedgerBody
         data={payload({
@@ -185,11 +204,8 @@ describe("SpendLedgerBody", () => {
         })}
       />,
     );
-    const adj = screen.getByTestId("spend-ledger-adjustments");
-    expect(within(adj).getByText("Purchased credits")).toBeInTheDocument();
-    expect(within(adj).getByText("$50.00")).toBeInTheDocument();
-    // A reversal keeps its sign — netting it away would hide that it happened.
-    expect(within(adj).getByText("-$5.00")).toBeInTheDocument();
+    expect(screen.queryByTestId("spend-ledger-adjustments")).not.toBeInTheDocument();
+    expect(screen.queryByText("Purchased credits")).not.toBeInTheDocument();
   });
 
   it("hides the adjustments block entirely when there are none", () => {
