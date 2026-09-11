@@ -52,9 +52,11 @@ withdrawn; the replacement compatibility test captured **RED 1 failed / 72
 passed**, then passed after preserving omission support. Supplied redirect
 URIs still require exact matching; registered consent redirects and PKCE remain
 mandatory. See [OAuth 2.1 §10.2](https://www.ietf.org/ietf-ftp/internet-drafts/draft-ietf-oauth-v2-1-16.html#section-10.2).
-Four additional exact-binding regressions bring the final OAuth/MCP run to
-**119 passed across 4 suites**. Native fixture: **1 passed**. Production build and
-full typecheck passed on Atem. The native fixture also passes unchanged base
+Four additional exact-binding regressions and two code-preservation tests bring the final OAuth/MCP run to
+**121 passed across 4 suites**. Native fixture: **1 passed**. Production build and
+full typecheck passed on Atem. The final two binding tests captured RED
+(2 failed / 31 passed) before moving client/redirect validation ahead of code
+consumption and into the conditional update. The native fixture also passes unchanged base
 `745c4549b`: this is security hardening and a headless usage diagnosis, not evidence
 of a newly repaired server interoperability failure. The existing neighboring
 MCP suites emit a timer-teardown warning; the native fixture exits cleanly.

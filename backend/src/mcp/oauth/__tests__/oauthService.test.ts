@@ -510,3 +510,18 @@ describe('Hermes one-time code and registration invariants (ENG-1869)', () => {
     expect(mockPut).not.toHaveBeenCalled();
   });
 });
+
+describe('Rejected callback bindings do not consume the code', () => {
+  it.each([
+    ['other-client', 'http://127.0.0.1:49152/callback'],
+    ['hermes', 'http://127.0.0.1:49153/callback'],
+  ])('preserves the code for client %s / redirect %s', async (clientId, redirectUri) => {
+    jest.clearAllMocks();
+    mockGet.mockReturnValue({ promise: async () => ({ Item: { code: 'bound-code', used: false,
+      clientId: 'hermes', redirectUri: 'http://127.0.0.1:49152/callback', expiresAt: Math.floor(Date.now() / 1000) + 600 } }) });
+    const service = new McpOAuthService();
+    const result = await service.consumeAuthorizationCode('bound-code', clientId, redirectUri);
+    expect(result).toBeNull();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+});

@@ -320,7 +320,7 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
   }
 
   // Consume the authorization code (single-use)
-  const codeRecord = await mcpOAuthService.consumeAuthorizationCode(code);
+  const codeRecord = await mcpOAuthService.consumeAuthorizationCode(code, effectiveClientId, redirect_uri);
   if (!codeRecord) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
   }
