@@ -93,4 +93,7 @@ claim. A-006 stays discarded.
 Cycle 67: MCP ENG-114 (`mcpSessionRehydration.ts` L3–8) — no sticky
 routing; share Dynamo metadata, rehydrate in-process. Not a fifth
 `listen()`. A-006 stays discarded.
+Cycle 68: ENG-764 ASG hook (`asgLifecycleGuard.ts`) is why drain
+runs before the instance dies. A fifth `listen()` is not parked in
+`Terminating:Wait`. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

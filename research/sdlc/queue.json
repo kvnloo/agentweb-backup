@@ -153,7 +153,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown waits on worker/cron/turns BEFORE server.close() because mcpFetch is this PORT. Cycle 64–65: SSE Maps are parent-heap only. Cycle 66: keyedMutex + tryClaimSessionGeneration are in-memory (per-instance). Cycle 67: the actual scale-out template is ENG-114 (mcpSessionRehydration.ts L3–8: no sticky routing; Dynamo metadata; rehydrate in-process). A fifth listen() is not that pattern. Hermes: one process. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown waits on worker/cron/turns BEFORE server.close() because mcpFetch is this PORT. Cycle 64–65: SSE Maps are parent-heap only. Cycle 66: keyedMutex + tryClaimSessionGeneration are in-memory (per-instance). Cycle 67: the actual scale-out template is ENG-114 (mcpSessionRehydration.ts L3–8: no sticky routing; Dynamo metadata; rehydrate in-process). Cycle 68: ASG terminates before drain (asgLifecycleGuard.ts L4–16); hook agentweb-drain-before-terminate is installed by eb-deploy.sh (ENG-818), not .ebextensions, and calls this process's drainForShutdown (server.ts L572–574). A fifth listen() is a second process the hook does not park. Hermes: one process. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -170,6 +170,8 @@
         "backend/src/controllers/agentModeController.ts",
         "backend/src/mcp/server/mcpSessionRehydration.ts",
         "backend/src/mcp/server/mcpSessionStore.ts",
+        "backend/src/services/asgLifecycleGuard.ts",
+        ".github/scripts/eb-deploy.sh",
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",

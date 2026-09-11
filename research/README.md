@@ -130,7 +130,11 @@ Cycle 67: that claim is **per-instance**. MCP ENG-114 already
 handles “no sticky routing” by Dynamo metadata + in-process
 rehydrate (`mcpSessionRehydration.ts` L3–8 / `mcpSessionStore.ts`
 L7–19). Do not HTTP-split images to copy that. Do not copy the
-MCP session table onto generate locks (Harsha).
+MCP session table onto generate locks (Harsha). Cycle 68: even
+that in-process work is killed on deploy unless `asgLifecycleGuard`
+parks the ASG (`asgLifecycleGuard.ts` L4–16 / `server.ts` L572–574).
+A fifth image process would need its own hook + `eb-deploy.sh`
+install (ENG-818: not `.ebextensions`).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

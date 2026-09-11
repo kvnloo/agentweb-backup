@@ -7,16 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 67
+cycles_completed: 68
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 68
+next_cycle: 69
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 67: ENG-114 — no sticky routing; scale-out is Dynamo metadata
-  + in-process rehydrate, not a fifth listen(). Cycle 68: cheapest
-  remaining mapping. Do not un-ready Q-001 / Q-014 / Q-003. Do not
-  revive A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 68: ASG terminates before drain unless asgLifecycleGuard
+  (ENG-764) parks Terminating:Wait. A fifth listen() needs its own
+  hook. Cycle 69: cheapest remaining mapping. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes,
+  unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

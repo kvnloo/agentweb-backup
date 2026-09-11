@@ -134,6 +134,12 @@ process-local cooldown and a Dynamo fallback *if* ASG scales.
 DR investigation L112 lists MaxSize=4 — in-tree disagreement; the
 pattern is not a fifth `listen()`.
 
+Cycle 68: **the ASG does not wait on drain.** `asgLifecycleGuard.ts`
+L4–16 (session `d7e4863c`): SIGTERM + ALB 600s still lost a 5.4 min
+run. Hook `agentweb-drain-before-terminate` + `drainForShutdown`
+(`server.ts` L361–370 / L572–574). `.ebextensions` cannot install the
+hook (ENG-818). A-006 would reproduce that kill.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

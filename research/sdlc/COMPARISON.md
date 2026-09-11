@@ -137,3 +137,6 @@ submodule of the leaf package (A-008, not A-006).
   A fifth process would race the claim. Do not Redis-ify the lock.
 - Cycle 67: ENG-114 — no sticky routing. Scale-out is Dynamo metadata
   + in-process rehydrate, not HTTP-per-tool.
+- Cycle 68: ASG does not wait on SIGTERM drain (`asgLifecycleGuard.ts`
+  L4–16, session `d7e4863c`). Hook + `drainForShutdown` are this
+  `listen()`. Hermes/OMP: one process, no ASG hook.

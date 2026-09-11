@@ -87,7 +87,8 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
 
 ## What this is not
 
-- Not A-006 (HTTP image service).
+- Not A-006 (HTTP image service). Cycle 68: a fifth process would
+  also miss the ASG termination hook (`asgLifecycleGuard.ts`).
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

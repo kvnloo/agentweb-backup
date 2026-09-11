@@ -53,8 +53,11 @@ L936–956) is an in-memory Set. Cycle 67: MCP ENG-114 — no sticky
 routing; scale-out is Dynamo metadata + in-process rehydrate
 (`mcpSessionRehydration.ts` L3–8), not a fifth `listen()`.
 `socialPosts.ts` L16–21 says MinSize=MaxSize=1; DR doc L112 says
-MaxSize=4 — do not treat either as live AWS. A-006 stays discard.
-Product READY unchanged.
+MaxSize=4 — do not treat either as live AWS. Cycle 68: ASG
+terminates before drain (`asgLifecycleGuard.ts` L4–16); the hook
+calls **this** `drainForShutdown` (`server.ts` L572–574). A fifth
+`listen()` is not in that hook. A-006 stays discard. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

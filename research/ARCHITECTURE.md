@@ -339,6 +339,10 @@ Set. A-006 discarded.
 Cycle 67: MCP ENG-114 — no sticky routing; Dynamo metadata +
 in-process rehydrate (`mcpSessionRehydration.ts` L3–8). A-006
 discarded.
+Cycle 68: ASG terminates before drain (`asgLifecycleGuard.ts`
+L4–16). Hook `agentweb-drain-before-terminate` + `server.ts`
+L572–574. Install is `eb-deploy.sh`, not `.ebextensions`
+(ENG-818). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

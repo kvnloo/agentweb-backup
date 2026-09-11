@@ -61,7 +61,11 @@ shape; child worker never imports `sseProgress`). Cycle 66:
 `keyedMutex.ts` L12–15 — one session, one process;
 `tryClaimSessionGeneration` is an in-memory Set. Cycle 67: MCP
 ENG-114 is the scale-out template (Dynamo metadata, in-process
-rehydrate, no sticky routing) — not a fifth `listen()`. The listed face is a
+rehydrate, no sticky routing) — not a fifth `listen()`. Cycle 68:
+ASG kill is faster than drain (`asgLifecycleGuard.ts` L4–16);
+hook `agentweb-drain-before-terminate` parks **this** process
+(`server.ts` L572–574). `.ebextensions` cannot install it (ENG-818).
+The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
