@@ -168,3 +168,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 76: inbound MCP is on the global nginx/ALB 600s path.
   Socket.IO is the 3600s exception. Hermes SSE idle > 10 min
   dies at the proxy even if Node never times out.
+- Cycle 77: mcpFetch default abort is 5 min; `generate_image` does
+  not override. v0 tools pass 25 min on the same hop instead of
+  extracting a process. Hermes: one execute() timeout.

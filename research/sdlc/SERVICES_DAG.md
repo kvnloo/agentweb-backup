@@ -96,7 +96,8 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 74: `workerShutdownGuards.ts` (ENG-201) is the in-tree
   rejection of “just add a process.” Cycle 75: the 900s ASG hook
   is never heartbeated from TypeScript. Cycle 76: `/mcp` is on
-  the 600s nginx/ALB path; only `/socket.io/` is 3600s.
+  the 600s nginx/ALB path; only `/socket.io/` is 3600s. Cycle 77:
+  `generate_image` mcpFetch default abort is 5 min, not 10.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

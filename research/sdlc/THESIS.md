@@ -89,7 +89,10 @@ L5–7). Cycle 76: GET `/mcp` is nginx/ALB **600s**
 (`.platform/nginx/conf.d/agent-mode-timeout.conf` L5–7, no
 location; `.ebextensions/timeout.config` L5–6), not Socket.IO’s
 3600s (`websocket.conf` L5–16). Node `setTimeout(0)` does not
-beat the proxy. The listed face is a
+beat the proxy. Cycle 77: Q-014 `generate_image` mcpFetch uses
+the **5 min** default abort (`httpClient.ts` L205); it does not
+pass `timeoutMs` (`apiTools.ts` L2096–2108). Landing-page tools
+already override to 25 min in-process. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

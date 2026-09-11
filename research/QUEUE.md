@@ -118,4 +118,7 @@ Cycle 75: `RecordLifecycleActionHeartbeat` is never called;
 L612). `DRAIN_CEILING_MS` 10 min fits inside. A-006 stays discarded.
 Cycle 76: nginx/ALB 600s on `/mcp`; Socket.IO 3600s. Node
 `setTimeout(0)` does not beat the proxy. A-006 stays discarded.
+Cycle 77: `generate_image` mcpFetch aborts at 5 min default
+(`httpClient.ts` L205). v0 already raises `timeoutMs` in-process.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

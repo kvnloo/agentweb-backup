@@ -71,7 +71,8 @@ fork survives SIGTERM; a fifth `listen()` would not. Cycle 75:
 `RecordLifecycleActionHeartbeat` is unused; 900s is CONTINUE
 fallback (`eb-deploy.sh` L612). Cycle 76: GET `/mcp` is nginx/ALB
 600s (`agent-mode-timeout.conf`), not `/socket.io/` 3600s.
-Product READY unchanged.
+Cycle 77: `generate_image` mcpFetch default abort is 5 min
+(`httpClient.ts` L205); no `timeoutMs`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

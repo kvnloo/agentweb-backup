@@ -164,6 +164,10 @@ Cycle 76: GET `/mcp` is the global nginx 600s path
 (`.platform/nginx/conf.d/agent-mode-timeout.conf` L5–7), not
 `/socket.io/` 3600s. ALB IdleTimeout 600. DeregistrationDelay is
 the deploy script (ENG-823), same pattern as the ASG hook.
+Cycle 77: Q-014’s inner mcpFetch aborts at 5 min
+(`httpClient.ts` L205) unless `timeoutMs` is set. `generate_image`
+does not set it. Do not HTTP-split to get a longer clock; v0
+already overrides `timeoutMs` on this hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

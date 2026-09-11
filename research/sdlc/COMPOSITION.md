@@ -201,6 +201,12 @@ DeregistrationDelay is `ensure_deregistration_delay()` (ENG-823),
 not `.ebextensions`. A-006 would copy three deploy artifacts and
 still miss the Socket.IO exception.
 
+Cycle 77: **inner hop is 5 min, not 10.** `httpClient.ts` L204–206
+`timeoutMs ?? 5 * 60 * 1000`. `generate_image` (`apiTools.ts`
+L2096–2108) does not override. Landing-page tools pass
+`timeoutMs: 25 * 60 * 1000` (L1543) — already longer than nginx,
+still mcpFetch to this PORT. A-006 would sit behind that abort.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

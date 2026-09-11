@@ -7,14 +7,14 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 76
+cycles_completed: 77
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 77
+next_cycle: 78
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 76: GET /mcp is nginx/ALB 600s, not Socket.IO 3600s.
-  Node setTimeout(0) does not beat the proxy. Cycle 77: cheapest
+  Cycle 77: generate_image mcpFetch default abort is 5 min
+  (httpClient.ts L205), tighter than nginx 10. Cycle 78: cheapest
   remaining mapping. Do not un-ready Q-001 / Q-014 / Q-003. Do
   not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
