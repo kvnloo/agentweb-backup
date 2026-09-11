@@ -294,6 +294,9 @@ Cycle 52: AgentWebPro still empty on `apiTools.ts` / `httpClient.ts` /
 Cycle 53: MCP `generate_image` is `ctx(context)` (`apiTools.ts`
 L2096–2098); `toolHelpers.ts` L10–22 drops `overrideToken`. ENG-1596
 cannot skip `lookupUser` on this tool. A-007 keeps `ctx()`. A-006 discarded.
+Cycle 54: `workflowTools.ts` L37/L248 is mixed-identity; do not copy that
+import into `infrastructure.ts`. OMP 0.85.1 images stay in `pi-ai`.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

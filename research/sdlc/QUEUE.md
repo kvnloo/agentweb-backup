@@ -28,9 +28,11 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 53: MCP `generate_image` uses `ctx()` — no `overrideToken`, so
-ENG-1596 cannot skip `lookupUser`. A-007 must keep `ctx()`. A-015 stays
-park. A-007 waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
+Cycle 54: A-007 copies ENG-982 **shape** (mcpFetch + name list), not
+`workflowTools.ts` L37 `adminClientScope` (`emma_get_account_status` is
+the mixed-identity tool). Five infrastructure tools are all `ctx()`.
+OMP 0.85.1 still has images inside `pi-ai`. A-015 stays park. A-007
+waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

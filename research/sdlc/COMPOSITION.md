@@ -233,6 +233,12 @@ Execute is `ctx(context)` (`apiTools.ts` L2096–2098). `ctx()`
 tools, not this one. Chatbot/ishare `$2` is a **different face**
 (`executeTool` in-process). A-007 `infrastructure.ts` must keep `ctx()`.
 
+Cycle 54: **do not copy `workflowTools.ts` L37 into that file.**
+`emma_get_account_status` (L248) is the mixed-identity tool. The five
+infrastructure tools (`apiTools.ts` L2015 / L2044 / L2068 / L2098 /
+L2141) are all `ctx()`. OMP `@earendil-works/pi-ai` 0.85.1 still
+registers images in-process (`sideEffects` `images.js`).
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

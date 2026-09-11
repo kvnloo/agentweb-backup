@@ -54,9 +54,11 @@ unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
 | `pi-ai` | pi-telemetry; **no** agent-core | **agent-core** |
 | `pi-agent-core` | **pi-ai**, chord, pi-telemetry | coding-agent |
 
-Cycle 20 catalog/utils/wire names may have folded into this publish; the
-AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
-`pi-agent-core` ≈ `agentModeService.ts`.
+Live `earendil-works/pi` `@earendil-works/pi-ai` **0.85.1** (cycle 54
+reconfirm). Arrow unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
+`sideEffects` include `./dist/images.js` and
+`./providers/images/register-builtins.js` — images are an in-process
+submodule of the leaf package (A-008, not A-006).
 
 ## Agentic SDLC practices
 
@@ -98,3 +100,6 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
 - Cycle 48–49: AgentWeb `ListTools` has no skill gate. Lazy auth
   (ENG-984) may list to strangers; `ANONYMOUS_TOOLS` is empty so they
   cannot run. Hermes OAuth (Q-001) is still the execute path.
+- Cycle 54: ENG-982 `workflowTools.ts` is mixed-identity (`adminClientScope`
+  for `emma_get_account_status`). A-007 copies mcpFetch shape, not that
+  import. OMP 0.85.1 still registers images inside `pi-ai`.

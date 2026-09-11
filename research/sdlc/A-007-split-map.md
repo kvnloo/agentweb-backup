@@ -15,13 +15,16 @@ the in-tree proof of a *section* extract: `workflowTools.ts` (ENG-982,
 and would fight `mcp.apiTools.test.ts` (imports the barrel, not each tool).
 
 First slice = one sibling file of mcpFetch-only tools, barrel from
-`apiTools.ts`. Copy **`workflowTools.ts`** (5 mcpFetch registers,
+`apiTools.ts`. Copy **`workflowTools.ts` shape** (5 mcpFetch registers,
 `WORKFLOW_TOOL_NAMES` export, zero service imports). Do **not** copy
 **`evaluationTools.ts`**: that file imports `evaluationStore` /
 `evaluationPolicy` / `evaluationService` (L1–5) and dual-registers the
 same handler onto `emmaToolRegistry` (L62). That hop skips REST.
 Applying it to `generate_image` would skip `emmaApi` policy (A-006).
-One-file-per-tool later, after the barrel exists.
+Cycle 54: also do **not** copy `workflowTools.ts` L37
+`adminClientScope` — that import exists for `emma_get_account_status`
+(L248). The five infrastructure tools are all `ctx()`. One-file-per-tool
+later, after the barrel exists.
 
 Cycle 28: Hermes `discover_builtin_tools()` AST-scans `tools/*.py`.
 Do **not** add that in the first A-007 PR. Keep the ENG-982 explicit
@@ -94,10 +97,9 @@ Acceptance: `mcp.apiTools.test.ts` still green **after** Q-014 drops
 `generate_image` from the L91 `internalTools` list (cycle 34). Until
 that flag flip, L91 still expects it hidden. `generate_image` still
 registered once; no new `mcp → agentModeService` edge in the new file.
-Keep `ctx(context)` on `generate_image` (cycle 53). Do **not** copy
-`resolveClientScopedContext` from `list_tasks` — that ENG-1596
-`overrideToken` path is admin list/manage only and is the only in-tree
-skip of `lookupUser`.
+Keep `ctx(context)` on **all five** infrastructure tools (cycle 53–54).
+Do **not** copy `resolveClientScopedContext` from `workflowTools.ts`
+(`emma_get_account_status` L248) or from `list_tasks`.
 
 ## Later section files (not the first PR)
 

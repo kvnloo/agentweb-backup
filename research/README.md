@@ -84,6 +84,8 @@ ChatSessions cap (`tokenUsageService.ts` L293–305) and `_svc` JWTs skip
 fire-and-forget and drops `no_user` (cycle 51). Cycle 53: MCP
 `generate_image` uses `ctx()` and cannot take the ENG-1596
 `overrideToken` skip; chatbot/ishare `$2` is a different face.
+Cycle 54: A-007 copies `workflowTools` **shape**, not its
+`adminClientScope` import. OMP 0.85.1 still keeps images in `pi-ai`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

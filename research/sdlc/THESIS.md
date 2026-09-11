@@ -40,7 +40,9 @@ gate** (`mcpServerCore.ts` L76–83, cycle 48). Anonymous discovery
 before a self-call JWT. Cycle 51: do not treat `requireEmmaTokenBudget`
 as a substitute — it allow-lists `anon_*` (ENG-1163). Cycle 53: this
 tool cannot skip `lookupUser` via ENG-1596 (`ctx()` has no
-`overrideToken`). The listed face is a
+`overrideToken`). Cycle 54: A-007 copies ENG-982 mcpFetch shape, not
+`workflowTools.ts` L37 `adminClientScope`. OMP 0.85.1 still has images
+as `pi-ai` sideEffects (`images.js`). The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

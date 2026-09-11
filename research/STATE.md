@@ -7,18 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 53
+cycles_completed: 54
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 54
+next_cycle: 55
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 53: MCP generate_image uses ctx() (no overrideToken); ENG-1596
-  cannot skip lookupUser on this tool. A-007 must keep ctx() not
-  resolveClientScopedContext. Cycle 54: cheapest remaining mapping or
-  collision if AgentWebPro lands on apiTools.ts. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 54: A-007 copies workflowTools mcpFetch shape, not its
+  adminClientScope import (emma_get_account_status L248). Five
+  infrastructure tools are all ctx(). OMP 0.85.1 still in-process
+  images inside pi-ai. Cycle 55: cheapest remaining mapping or collision.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```
