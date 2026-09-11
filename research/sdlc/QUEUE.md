@@ -26,9 +26,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 45: MCP **server** is parent-only (`app.ts` L204). Worker is a
-second `AgentModeService` + outbound MCP clients. Chatbot stays
-in-process on the parent (`server.ts` L288). A-006 stays discard.
+Cycle 46: parent is **I/O** (HTTP / Socket.IO / cron / MCP server);
+worker is **compute** (`generateMarketingResponse`). Chatbot still
+`executeTool` on the parent (`chatbotService.ts` L5461). A-006 stays
+discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

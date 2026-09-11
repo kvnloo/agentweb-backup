@@ -39,7 +39,7 @@ agentModeService.generateImage  L28857
 imageService.generateImage  (meter L5 + C2PA L575–578 + CRITICAL LOGO L477–484)
 ```
 
-**Parent vs worker (cycle 44–45).** MCP’s hop above runs in the **EB
+**Parent vs worker (cycle 44–46).** MCP’s hop above runs in the **EB
 parent** (Express + `app.ts` L204 `setupMcpServer`). In-app Emma Agent
 Mode does **not** take that hop:
 `generateSessionResponse` L8256 `runInWorker` →
@@ -53,6 +53,18 @@ process, 4GB heap, IPC for `publishAuthorizationOverride` /
 and `emmaApi`. Worker has no MCP HTTP server. `IS_MCP_SERVER` skip at
 `initialize()` L1593 is unused in-repo — both processes load vendor MCP
 clients. Do not add HTTP in front of this fork.
+
+Cycle 46: the fork is already **hexagonal I/O vs compute**, not a
+nanoservice. Parent owns HTTP / Socket.IO / cron
+(`shouldBootstrapBackgroundJobs` `server.ts` L563; `instanceState.ts`
+L10–11 in-memory) and MCP HTTP. Worker has no `listen(` and no cron
+bootstrap. Worker L115–119 `socketEmit` IPC because it has no Socket.IO;
+parent L181–189 `require('../server'); io.to(room).emit(...)`. The
+hexagon **leaks**: Emma chatbot stays on the parent (`server.ts`
+L288–291) and `chatbotService.ts` L5461 `executeTool` — so `generateImage`
+already has **three** faces (parent MCP, parent chatbot, worker chat).
+Hermes keeps sockets and the loop in one process. Do not HTTP-split
+`generateImage`.
 
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
@@ -160,6 +172,10 @@ apiTools.ts L2096–2107    ──► mcpFetch POST /api/emma/generate-image
 Q-014 lists the second row. A-006 would add a third hop after it.
 `backend/package.json`: no `workspaces`, no dependency-cruiser.
 
+Cycle 46: there is a **third execute on the parent** that is neither
+row: Emma chatbot `chatbotService.ts` L5461 `executeTool` (in-process,
+no fork, no mcpFetch). Three faces, one policy method, two OS processes.
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:
@@ -204,7 +220,7 @@ Q-014 is flipping L2077, not a new process.
 | Q-014 list on MCP | No | No (flag on `apiTools.ts` L2077) |
 | A-007 `tools/infrastructure.ts` | No | No (still mcpFetch) |
 | A-008 `git mv` + `export *` | No | No (`emmaApi` never imported the leaf; `agentModeService` L28950 keeps resolving) |
-| **A-006 HTTP image process** | **Yes** — after L28857 or instead of it | Would split category / HITL / persisted-logo from the leaf (C2PA + meter + CRITICAL LOGO already there) |
+| **A-006 HTTP image process** | **Yes** — after L28857 or instead of it | Would split category / HITL / persisted-logo from the leaf (C2PA + meter + CRITICAL LOGO already there). Cycle 46: would also be called from parent chatbot + worker chat |
 
 A-008 is a **path shim**, not `services/swarm/index.ts` (cycle 33: that
 barrel has zero prod importers). After `git mv`, `services/imageGeneration.ts`
@@ -218,8 +234,9 @@ is `export * from './creative/imageGeneration'`. Closest analog:
 - AgentWeb already paid for an HTTP composition layer (`mcpFetch`) **and
   still** lands in `agentModeService`. Cycle 44: the **chat** path
   additionally `fork`s a child that constructs another `AgentModeService`.
-  Copying Hermes’ MCP-as-client or exploding that loopback into Kubernetes
-  does not shrink the 40k file.
+  Cycle 46: that fork is I/O vs compute; chatbot still `executeTool` on
+  the parent. Copying Hermes’ MCP-as-client or exploding that loopback into
+  Kubernetes does not shrink the 40k file.
 - Cycle 41: the loop also **imports a controller**
   (`agentModeService.ts` L29894 → `controllers/blog.ts`). Cycle 42: five
   more service files do the same (`emmaEmailService.ts` L5 is a **static**

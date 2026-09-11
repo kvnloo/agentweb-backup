@@ -19,7 +19,7 @@ the chat loop is the same idea with more latency and a billing footgun.
 |---|---|---|
 | **Logical** | One operation, one contract, one test surface | Partial: `loops/core` ports, `agentMode/core/*` seams, MCP tool handlers |
 | **Package** | Import boundary an agent can hold in context | Missing: `backend/package.json` has no `workspaces` and no dependency-cruiser (cycle 38). Folders + A-002 AST guard first; do not extract npm workspaces instead of Q-014 |
-| **Process / deploy** | Independently shipped runtime | Already: backend EB **plus a `child_process.fork` worker that still `new AgentModeService()`** (cycle 44–45: MCP *server* stays on the parent; worker is outbound MCP *clients* + chat loop), partner-portal EB, agent-engine GCP, remotion-lambda. The fork is event-loop isolation, not a package boundary |
+| **Process / deploy** | Independently shipped runtime | Already: backend EB **plus a `child_process.fork` worker that still `new AgentModeService()`** (cycle 44–46: parent = I/O — HTTP, Socket.IO, cron, MCP *server*; worker = compute — `generateMarketingResponse`; chatbot still `executeTool` on the parent). partner-portal EB, agent-engine GCP, remotion-lambda. The fork is event-loop isolation, not a package boundary |
 
 2026 writing that uses “nanoservice” (e.g. telemetryagent.dev) is
 explicit that this is **first a logical architecture**, compatible with
@@ -96,7 +96,10 @@ Order is process, not a rewrite:
    from policy (category / HITL / persisted logo) and miss blog/thumbs/
    video/onboarding callers (cycle 36). It would also skip monthly quota
    (cycle 40) and pile onto the existing `fork` worker that already loads
-   `AgentModeService` (cycle 44). Forbidden.
+   `AgentModeService` (cycle 44). Cycle 46: `generateImage` is already
+   called from parent MCP, parent chatbot (`chatbotService.ts` L5461),
+   and worker chat — a fifth HTTP process would be a client of both OS
+   processes. Forbidden.
 5. **Agent context map.** Draft: `research/sdlc/MODULE_MAP.md`. A short
    `backend/src/AGENTS.md` (module index, max file size, “do not edit X”)
    beats another 40k-line CLAUDE dump. LinkedIn’s 2026 MCP playbook is

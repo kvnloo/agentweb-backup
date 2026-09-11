@@ -14,6 +14,14 @@ Not in `backend/src` yet — research-only. Cycle 18. LOC is production
 
 Customer UI is **another GitHub repo**.
 
+Cycle 46: the backend EB box is **two OS processes**, not a fifth deploy
+unit. Do not HTTP-split either of them.
+
+| Process | Role | Must not become |
+|---|---|---|
+| Parent (`server.ts`) | I/O: Express, Socket.IO, cron (`instanceState.ts` in-memory), MCP HTTP server, OAuth refresh, Emma chatbot `executeTool` | An image nanoservice |
+| Worker (`generateMarketingResponseWorker.ts`) | Compute: `generateMarketingResponse`; `socketEmit` IPC back to parent | A second MCP HTTP server |
+
 ## `backend/src` folders (logical packages)
 
 | Folder | Prod LOC | Files | Allowed to import | Must not become a process |

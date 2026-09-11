@@ -35,12 +35,13 @@ OMP:        coding-agent CLI    ──► pi-agent-core ──► pi-ai ──�
 
 AgentWeb:   customer-portal (other repo)
             partner-portal EB  ─┐
-            backend EB        ─┼─► one Node process: 40k-line loop + 60 tools
-            agent-engine VM    ─┤   MCP server is a *face* that loopbacks
-            remotion-lambda    ─┘   http://localhost → emmaApi → generateImage
+            backend EB        ─┼─► parent I/O (HTTP, Socket.IO, cron, MCP server)
+            agent-engine VM    ─┤   + fork worker compute (same 40k class)
+            remotion-lambda    ─┘   MCP loopback: localhost → emmaApi → generateImage
             loops/index.ts      ──► ./core/types only (cycle 35; Hermes registry)
             app.ts L118–120     ──► instances register (explicit, not discover)
             mcp/server/registry ──► already imports evaluationPolicy (not loops-clean)
+            chatbot on parent   ──► still executeTool (cycle 46; hexagon leaks)
 ```
 
 ## OMP workspace DAG (live 2026-09-11T19:17Z `earendil-works/pi` **0.85.1**)
@@ -86,3 +87,7 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
   AgentWeb already has two (Emma camelCase + HITL vs MCP snake_case
   HTTP adapter). That is composition drift, not a reason to add a
   fifth process. Q-014 lists the adapter; A-011 parks unifying it.
+- Cycle 46: Hermes keeps sockets and the loop in one process. AgentWeb
+  already split parent **I/O** from worker **compute**, then left Emma
+  chatbot `executeTool` on the parent. Do not HTTP-split `generateImage`
+  (three faces: parent MCP, parent chatbot, worker chat).

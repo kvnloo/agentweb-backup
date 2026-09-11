@@ -264,6 +264,11 @@ MCP listing stays on the parent. Do not add HTTP on top of the fork.
 Cycle 45: parent singleton (`server.ts` L6 / L594) still serves MCP
 server + chatbot-without-fork; worker has no `setupMcpServer`. Q-014 is
 parent `tools/list`. A-006 discarded.
+Cycle 46: parent is I/O (cron `server.ts` L563, in-memory
+`instanceState.ts` L10–11, Socket.IO); worker is compute
+(`generateMarketingResponse`). Chatbot still `executeTool` on parent
+(`chatbotService.ts` L5461). `generateImage` has three faces. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
