@@ -241,3 +241,6 @@ reverted. Do not copy that as A-006.
 - Cycle 97: drain 503s `/run-scheduled-chats` only. `/health` stays
   200. MCP has no `isCronEnabled`. Hermes has no 503 hop; Q-001
   404-reinits. Do not HTTP-split to get a drain admission.
+- Cycle 98: `cronJobRegistry.drain()` is live (`inFlight.size`).
+  `track()` has no `draining` flag; the worker does. Wrap CallTool
+  after #2 must copy that pair, not `track()` alone.

@@ -128,6 +128,8 @@ Cycle 95: `MCP_SESSION_STORE` unset in git; default memory.
 Cycle 96: Immutable deploys already overlap two backends.
 Cycle 97: drain 503s scheduled chats only; `/health` and `/mcp`
 stay open until unawaited `server.close`.
+Cycle 98: `cronJobRegistry.drain()` is live; `track()` has no
+gate. Worker already refuses new `runInWorker`.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

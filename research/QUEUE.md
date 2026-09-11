@@ -168,4 +168,7 @@ Cycle 96: Immutable deploy already overlaps two instances;
 discarded.
 Cycle 97: drain 503s scheduled chats only; `/health` and `/mcp`
 stay open until unawaited `server.close`. A-006 stays discarded.
+Cycle 98: `cronJobRegistry.drain()` is live; `track()` has no gate.
+Wrap CallTool after #2 must copy worker `draining`. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

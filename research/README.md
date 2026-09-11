@@ -251,6 +251,11 @@ Cycle 97: drain 503s only `POST /run-scheduled-chats`
 L551–553). `backend/src/mcp/` has zero `isCronEnabled`. The new
 instance is already serving (`IgnoreHealthCheck: false`) when
 unawaited `server.close` runs on the old one.
+Cycle 98: `cronJobRegistry.drain()` is a live `while (size > 0)`
+(`cronJobRegistry.ts` L68). `track()` has no `draining` flag.
+The worker already refuses new `runInWorker` (L443). Wrap
+CallTool after #2 must copy that pair, or Hermes POSTs during
+overlap hold the 10 min ceiling.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

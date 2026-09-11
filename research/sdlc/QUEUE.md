@@ -117,6 +117,10 @@ Cycle 97: drain 503s only `/run-scheduled-chats`
 (`agentModeController.ts` L13032). `/health` stays 200 (`app.ts`
 L551–553). `backend/src/mcp/` has zero `isCronEnabled`. Product
 READY unchanged.
+Cycle 98: `cronJobRegistry.drain()` is a live `while (size > 0)`
+(L68); `track()` has no `draining` flag. Worker already refuses
+new `runInWorker` (L443). Wrap CallTool after #2 must copy that
+pair. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

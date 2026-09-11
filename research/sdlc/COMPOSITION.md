@@ -345,6 +345,12 @@ instance before removing the old. `disableCron()` 503s
 stay 200. Zero `isCronEnabled` under `backend/src/mcp/`.
 `server.close` (L440, not awaited) is after that wait.
 
+Cycle 98: **`drain()` is live; `track()` has no gate.**
+`cronJobRegistry.ts` L68 waits on `inFlight.size`, not a snapshot.
+Worker L363/L443 already refuses new work. `mcp/server/` still
+has zero `cronJobRegistry` imports. Wrap CallTool after #2 must
+copy the worker pair, or Hermes POSTs extend the 10 min ceiling.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
