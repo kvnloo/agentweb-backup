@@ -102,6 +102,15 @@ emit to `user:`. `gtmPlan.ts` L12–13 is the documented load-time
 dodge; it is still the listen module. A-017 `getIo()` replaces it.
 Do not start that replacement at `agentModeController.ts`.
 
+Cycle 64: **SSE is not Socket.IO.** Worker L107–119 sends
+`type:'progress'` and `type:'socketEmit'` on separate IPC. Parent
+progress path is `sseProgress.emitProgress(sessionId)` (controller
+L8284) → `text/event-stream` L7791. `RunEmitter` L3449
+`new RunEmitter(id, () => {}, onProgress)` — typed `emit()` unused;
+only `emitLegacy`. `crm.ts` L3245 local `emitProgress` is Socket.IO
+and must not be confused with `sseProgress`. A-017 does not absorb
+the SSE Maps.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

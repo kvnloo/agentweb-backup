@@ -38,8 +38,11 @@ codingAgent L1828 emits `sessionId` with no join. A-017 is a
 passthrough. Cycle 63: ten dynamic `await import('../server')` sites
 (gtmPlan L1495, admin L4749, durableLanding L237, agentModeController
 **seven**) plus the three cycle-59 requires. A-017 first slice still
-the two `require`s, not the 15k controller. A-006 stays discard.
-Product READY unchanged.
+the two `require`s, not the 15k controller. Cycle 64: worker IPC
+already splits `'progress'` (SSE / `sseProgress.ts`) from
+`'socketEmit'` (A-017). `RunEmitter` typed sink is `() => {}`
+(`agentModeService.ts` L3449); only `emitLegacy` is live. A-017 is
+Socket.IO only. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

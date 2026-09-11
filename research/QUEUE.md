@@ -83,5 +83,7 @@ AgentWebPro still empty on Q-014/A-002/A-017 first-slice files;
 (do not unify socket.id / sessionId). Cycle 63: ten dynamic
 `import('../server')` sites (GTM/admin/durableLanding + seven in
 `agentModeController.ts`); A-017 first slice still the two `require`s.
+Cycle 64: SSE (`sseProgress.ts`) is a different bus from Socket.IO;
+`RunEmitter` typed sink is a no-op (`agentModeService.ts` L3449).
 A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

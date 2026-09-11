@@ -46,8 +46,11 @@ partner-portal (admin, here)  ─┼─► Express API  :3001
 `agentModeController` (session lock, timeouts, scheduled-chat policy) →
 `generateMarketingResponseWorkerService` (fork) →
 `agentModeService.generateMarketingResponse` (LLM ↔ tools). Progress is
-**SSE** via `RunEmitter`. Socket.IO is the Emma *sidebar* and some fanout —
-the README picture is stale.
+**SSE** via `utils/sseProgress.ts` (legacy `onProgress` /
+`RunEmitter.emitLegacy`). The typed `RunEmitter` sink is a no-op
+(`agentModeService.ts` L3449; cycle 64). Socket.IO is the Emma
+*sidebar* and some fanout (`user:` / `socket.id`) — not the Agent Mode
+progress bus. The README picture is stale.
 
 Gravity wells (do not "split the file" as a first PR):
 
@@ -324,6 +327,9 @@ A-017 is a passthrough. A-006 discarded.
 Cycle 63: ten dynamic `await import('../server')` (gtmPlan L1495,
 admin L4749, durableLanding L237, seven in agentModeController).
 A-017 first slice is still the two `require`s. A-006 discarded.
+Cycle 64: SSE (`sseProgress.ts`) ≠ Socket.IO. Worker IPC
+`type:'progress'` vs `type:'socketEmit'`. `RunEmitter` typed sink is
+a no-op. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

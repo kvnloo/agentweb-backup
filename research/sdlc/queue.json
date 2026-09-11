@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:56:00Z",
+  "updated_at": "2026-09-11T20:58:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -355,9 +355,11 @@
         "backend/src/services/fathomLinearPortRegistry.ts",
         "backend/src/services/chatSocketHandler.ts",
         "backend/src/loops/core/ports.ts",
+        "backend/src/utils/sseProgress.ts",
+        "backend/src/services/agentMode/streamEvents.ts",
         "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62: user:${userId} is the only socket.join; CRM uses socket.id; codingAgent emits sessionId with no join). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo() (Fathom getFathomLinearPort analog). Do not edit crm.ts (7815 lines; #1544 and #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice (14,929 lines; A-005 pile). Later adopters: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM. Do not edit app.ts (#2271 + #1814).",
+      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo(). Do not absorb sseProgress / RunEmitter (cycle 64: worker already splits type:progress vs type:socketEmit; RunEmitter typed sink is a no-op at agentModeService L3449). Do not edit crm.ts (#1544 #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice. Later: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM/SSE. Do not edit app.ts (#2271 + #1814).",
       "harsha_db": false
     }
   ]

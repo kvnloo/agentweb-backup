@@ -110,7 +110,12 @@ the listen module. Same at admin L4749, durableLanding L237, and
 **seven** `agentModeController` sites (`session-message-appended` to
 `user:`). Partner-portal `GTMPlans.tsx` L292–300 listens with no
 client join — server L186 is enough. A-017 first slice stays the two
-`require`s, not the 15k controller.
+`require`s, not the 15k controller. Cycle 64: Agent Mode progress is
+**SSE** (`sseProgress.ts` L43, controller L8282–8284 / L7791), not
+Socket.IO. Worker IPC already has two types (`progress` vs
+`socketEmit`). `RunEmitter` (`streamEvents.ts`) typed sink is empty
+(`agentModeService.ts` L3449); only `emitLegacy` runs. Do not absorb
+SSE into A-017. Do not HTTP-split either bus.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
