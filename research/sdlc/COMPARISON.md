@@ -1,7 +1,7 @@
 # Code-quality comparison for agentic development
 
-Snapshot: 2026-09-11T18:45Z. Hermes and OMP via public GitHub trees;
-AgentWeb from this clone.
+Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **18:58Z**. Hermes and OMP
+via public GitHub; AgentWeb from this clone.
 
 ## Size (what an agent must hold)
 
@@ -30,15 +30,31 @@ incomplete; the monolith is still the default place to add features.
 Hermes:     CLI / gateway / ACP  ──► AIAgent ──► registry ──► tools/*.py
                                      (one process)               MCP as client
 
-OMP:        coding-agent CLI    ──► pi-agent-core ──► pi-ai / natives
-            (monorepo packages; some Rust; not 60 HTTP services)
+OMP:        coding-agent CLI    ──► pi-agent-core ──► pi-ai ──► pi-catalog
+            (package.json this cycle: ai does **not** depend on agent-core)
 
 AgentWeb:   customer-portal (other repo)
             partner-portal EB  ─┐
             backend EB        ─┼─► one Node process: 40k-line loop + 60 tools
             agent-engine VM    ─┤   MCP server is a *face* on that process
             remotion-lambda    ─┘
+            creative leaf already matches OMP: loop → imageGeneration,
+            never reverse. Folder-move (A-008) keeps that arrow.
 ```
+
+## OMP workspace DAG (2026-09-11 `package.json`)
+
+| Package | Depends on `@oh-my-pi/*` | Must not depend on |
+|---|---|---|
+| `pi-catalog` | omptype, pi-utils | agent-core, coding-agent |
+| `pi-ai` | catalog, natives, utils, wire, omptype | **agent-core** |
+| `pi-agent-core` | **pi-ai**, catalog, natives, utils, wire, snapcompact | coding-agent |
+| `pi-coding-agent` | agent-core, pi-ai, tui, mnemopi, … | — |
+
+AgentWeb mapping: `pi-ai` ≈ `imageGeneration.ts` + `llmClients.ts`;
+`pi-agent-core` ≈ `agentModeService.ts`. The image arrow already matches.
+The mismatch is `utils/llmClients.ts` importing `services/usageRecorderService`
+(OMP `pi-utils` would not depend on the app). That is A-009, parked.
 
 ## Agentic SDLC practices
 

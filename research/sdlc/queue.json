@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T18:55:00Z",
+  "updated_at": "2026-09-11T18:58:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -106,14 +106,14 @@
       "evidence": 5,
       "collision": 1,
       "score": 26,
-      "why": "Cycle 19. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports. usageRecorder stays shared. Not a new deploy unit. Re-export old path so Q-003 can keep importing services/imageGeneration.",
+      "why": "Cycle 19–20. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports — same arrow as OMP pi-ai ↛ pi-agent-core. usageRecorder stays shared. Re-export old path so Q-003 can keep importing services/imageGeneration.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/videoGeneration.ts",
         "backend/src/services/remotionService.ts",
         "research/sdlc/SERVICES_DAG.md"
       ],
-      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from the old path. Do not extract HTTP. Do not move db.ts.",
+      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from the old path. Add a grep/depcruise test: creative/** must not import agentModeService (OMP package.json edge). Do not extract HTTP. Do not move db.ts.",
       "harsha_db": false
     },
     {
@@ -152,6 +152,25 @@
         "backend/src/mcp/server/apiTools.ts"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-009",
+      "title": "Do not invert utils/llmClients vs usageRecorder to copy OMP pi-utils",
+      "status": "park",
+      "leverage": 2,
+      "product": 2,
+      "mergeability": 2,
+      "evidence": 5,
+      "collision": 3,
+      "score": 15,
+      "why": "Cycle 20. OMP pi-utils does not depend on the app. AgentWeb utils/llmClients.ts and llmService.ts import services/usageRecorderService. Moving the meter into utils would fight the one-charge invariant and billing tests. Leave the hub in services/. Not a nanoservice.",
+      "files": [
+        "backend/src/utils/llmClients.ts",
+        "backend/src/utils/llmService.ts",
+        "backend/src/services/usageRecorderService.ts"
+      ],
+      "first_slice": "PARK. Optional later: a money package that both utils and creative may import. Do not do this instead of Q-014.",
       "harsha_db": false
     }
   ]

@@ -31,8 +31,10 @@ routes / controllers / mcpFetch
 ```
 
 Creative files today **do not import** `agentModeService` (grep clean).
-`videoGeneration.ts` imports `imageGeneration` + `remotionService` +
-`meterUserUsage` only. That is already a leaf package.
+That is the same arrow as OMP `pi-ai ↛ pi-agent-core` (cycle 20
+`package.json`). `videoGeneration.ts` also imports `mcpClientService`
+(leave that leak). `utils/llmClients.ts` importing `usageRecorderService`
+is the inverted layer vs OMP `pi-utils` (A-009).
 
 ## Proposed folders (logical nanoservices)
 
