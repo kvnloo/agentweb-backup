@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:00:00Z",
+  "updated_at": "2026-09-11T19:04:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -114,7 +114,7 @@
         "backend/src/services/remotionService.ts",
         "research/sdlc/SERVICES_DAG.md"
       ],
-      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from the old path. Add a grep/depcruise test: creative/** must not import agentModeService (OMP package.json edge). Do not extract HTTP. Do not move db.ts.",
+      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/ and export * from './creative/imageGeneration' at the old path (same pattern as services/swarm/index.ts). emmaApi.ts does not import the leaf — do not edit it. agentModeService L28950 dynamic import keeps resolving. Boundary test: creative/** ↛ agentModeService. Do not extract HTTP. Do not move db.ts.",
       "harsha_db": false
     },
     {
@@ -147,10 +147,13 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Duplicates MCP. Splits meterUserUsage, C2PA, logoImage. Extra deploy unit with no ownership team. Microsoft + 2026 nanoservice writing: logical modules first; extract only for scale/isolation. Image/video are not independently scaled today.",
+      "why": "Cycle 25: MCP generate_image already mcpFetchs localhost /api/emma/generate-image into agentModeService.generateImage (category/HITL/logo) then dynamic-imports imageGeneration. A fifth process is a hop after that policy method. Splits meter/C2PA/logo. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
-        "backend/src/mcp/server/apiTools.ts"
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/httpClient.ts",
+        "backend/src/routes/emmaApi.ts",
+        "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
       "harsha_db": false

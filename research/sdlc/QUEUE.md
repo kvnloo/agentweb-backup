@@ -6,7 +6,7 @@ Product implementation order is still Q-001 → Q-014 → Q-003.
 
 Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 `MODULE_MAP.md`. Services DAG: `SERVICES_DAG.md`. A-007 map:
-`A-007-split-map.md`.
+`A-007-split-map.md`. Hops: `COMPOSITION.md`.
 
 ## Ranked (architecture track)
 
@@ -22,9 +22,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 20: OMP `pi-ai` does not depend on `pi-agent-core`. AgentWeb
-`imageGeneration` already matches that arrow. A-008 stays ready.
-A-009 parked (utils importing the meter).
+Cycle 25: MCP `generate_image` already loopbacks into
+`agentModeService.generateImage` (`COMPOSITION.md`). A-006 stays
+discard. A-008 still does not edit `emmaApi.ts`.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

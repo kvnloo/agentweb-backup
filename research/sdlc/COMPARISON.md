@@ -36,10 +36,10 @@ OMP:        coding-agent CLI    ──► pi-agent-core ──► pi-ai ──�
 AgentWeb:   customer-portal (other repo)
             partner-portal EB  ─┐
             backend EB        ─┼─► one Node process: 40k-line loop + 60 tools
-            agent-engine VM    ─┤   MCP server is a *face* on that process
-            remotion-lambda    ─┘
-            creative leaf already matches OMP: loop → imageGeneration,
-            never reverse. Folder-move (A-008) keeps that arrow.
+            agent-engine VM    ─┤   MCP server is a *face* that loopbacks
+            remotion-lambda    ─┘   http://localhost → emmaApi → generateImage
+            (cycle 25 COMPOSITION.md). Creative leaf still matches OMP:
+            loop → imageGeneration, never reverse. A-008 keeps that arrow.
 ```
 
 ## OMP workspace DAG (2026-09-11 `package.json`)

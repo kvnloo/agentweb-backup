@@ -206,6 +206,8 @@ imports; may import `loops/index` registry). Incomplete strangler:
 `agentMode/core` (`executeAgentStep` still throws). MCP already started
 the Hermes split (`workflowTools.ts`); `apiTools.ts` is 85 tools in one
 file. Cycle 24: do not put Q-014 in a `content.ts` extract — Content
-already imports `agentModeService`. Map: `research/sdlc/A-007-split-map.md`.
+already imports `agentModeService`. Cycle 25: that MCP tool already
+loopbacks `http://localhost` into `generateImage` (`COMPOSITION.md`).
+Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

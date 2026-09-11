@@ -27,8 +27,11 @@ recommends the same: start modular-monolith, extract when scale or
 ownership forces it.
 
 A 60-tool HTTP mesh would recreate MCP poorly: `apiTools.ts` already
-wraps `/api/emma/*`. Extra hops do not make `generate_image` safer;
-metering, C2PA, and logo rules live in-process on purpose.
+`mcpFetch`s `http://localhost:${PORT}/api/emma/*` (`httpClient.ts` L94–97).
+`generate_image` then lands in `agentModeService.generateImage` (L28857)
+before `imageGeneration` (L28950). Extra hops do not make that safer;
+metering, C2PA, and logo rules live on that method on purpose. Hop
+diagram: `COMPOSITION.md`.
 
 ## What already exists (do not rebuild)
 
