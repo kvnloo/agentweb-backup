@@ -14,9 +14,10 @@
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
- *   scope_refused | publisher_refused
+ *   scope_refused | publisher_refused | skill_install_refused
  *
- * The three trailing classes were added 2026-06-14 after a 7-day production
+ * `skill_install_refused` was added by ENG-1795; see its routing below for why no existing
+ * class fit. The three classes before it were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
  * 283 real failures with the prior patterns still left 63% in the generic
  * `Error` fallback (dev.md target was <20%). The real residual clusters were:
@@ -81,6 +82,53 @@ function classFromStatus(status: number): string | null {
 
 function classFromMessage(message: string): string | null {
   const m = message.toLowerCase();
+
+  /*
+   * ENG-1795 — install_skills refusals, matched FIRST and deliberately so.
+   *
+   * These sentences are ours, emitted verbatim by installSkills, so their presence is
+   * definitive and nothing later can describe the failure better. Order matters twice over:
+   *
+   *   1. The refusal interpolates the REJECTED SKILL IDS, which on the `unresolved` path are
+   *      strings a model invented. An id like "UTM Audit 404 Report" or "ads 403 manager" would
+   *      otherwise be caught by the embedded-status and bare-substring patterns below and
+   *      classified `not_found` / `auth` / `upstream_5xx` — the last of which is RETRYABLE, so
+   *      a permanent refusal would advertise itself as worth retrying. Matching our own marker
+   *      first makes the classification independent of whatever the model put in the id.
+   *
+   *   2. A mixed refusal carries several of these sentences at once. Unknown ids are the
+   *      actionable half — the model can retry with a correct id — so they win, and the
+   *      subscription sentence must not pull the whole message under a billing verdict. That
+   *      conflation is the entire bug this ticket exists to remove.
+   *
+   * `skill_install_refused` exists because no pre-existing class fit. `empty_result` says "the
+   * call succeeded but returned nothing … try a different source" — appending that beneath a
+   * refusal whose own text forbids substitution is precisely how ENG-1625 produced a fabricated
+   * audit table. `tool_unavailable` was tried next and is also wrong: its guidance opens with
+   * "this tool is not available in this session" (install_skills ran) and tells the model to
+   * "install the required skill via install_skills" (the call that just refused), and its
+   * failure type drops the bucket out of the investigate set.
+   */
+  if (/could not resolve these skill ids to any known skill/.test(m)) return 'invalid_args';
+  if (/these skills are currently unavailable to install/.test(m)) return 'skill_install_refused';
+  /*
+   * The entitlement sentence needs the same protection, and for the same reason: a published
+   * skillId beginning with a "500"/"404"/"403"-shaped token would otherwise be caught by the
+   * embedded-status regex below and classified `upstream_5xx` / `not_found` / `auth`.
+   * `upstream_5xx` is RETRYABLE, appending "Wait briefly, then retry ONCE" beneath a permanent
+   * billing refusal.
+   *
+   * ANCHORED to our own full sentence, unlike the generic phrasing kept at its original
+   * position further down. "not available with your current subscription" is ordinary vendor
+   * English, not a string we own — matching it here would promote it above the read-bounded and
+   * ad-account guards that this file deliberately orders for truthfulness, and would reclassify
+   * a vendor 403 ("...status code 403: this feature is not available with your current
+   * subscription") from `auth` to `subscription_blocked`, telling the model to say the
+   * capability is off the user's plan instead of to reconnect the account.
+   */
+  if (/the requested skills are not available with your current subscription/.test(m)) {
+    return 'subscription_blocked';
+  }
 
   // Hard quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
   // current quota, please check your plan and billing details") is a
@@ -157,17 +205,6 @@ function classFromMessage(message: string): string | null {
   // user has not enabled; a config gap, not a failure of the tool itself.
   if (/is not available\. you must install the required skill|install_skills/.test(m)) return 'tool_unavailable';
 
-  /*
-   * install_skills refusals — the skill exists but the user's plan does not include it.
-   *
-   * Checked HERE, above the generic branches, because the refusal text is deliberately written
-   * to forbid substitution ("Do NOT substitute a different tool's output..."). Left unclassified
-   * it fell through to the legacy `Error` class, whose DEFAULT_NEXT_STEP ends "...use a different
-   * tool", so the retryability line appended by the dispatcher instructed the model to do the
-   * exact thing the refusal forbids. That contradiction is how a gated tool's absence turns into
-   * a fabricated result (ENG-1625: a "UTM Tagging Audit Summary — PASS, 6/6 tagged" produced by
-   * a tool that never ran). Both strings below are ours, emitted by installSkills.
-   */
 
   /*
    * An ad-account scope refusal. Unclassified it fell to the legacy `Error` class, whose default
@@ -201,6 +238,10 @@ function classFromMessage(message: string): string | null {
   if (/is not available in the selected ad account/.test(m)) return 'upstream_5xx';
   if (/could not verify the requested .* against the selected ad account/.test(m)) return 'upstream_5xx';
 
+  // Generic vendor phrasing, kept exactly where it has always been — BELOW the embedded-status
+  // and ad-account guards, so a "403 ... not available with your current subscription" still
+  // classifies `auth`. Our own refusal is anchored and matched at the top of this function
+  // instead; the two are deliberately separate (ENG-1795).
   if (/not available with your current subscription|capability is not on their plan/.test(m)) return 'subscription_blocked';
   // Bad skill ids from the model — an argument problem, not a plan problem.
   if (/no valid skills found/.test(m)) return 'invalid_args';

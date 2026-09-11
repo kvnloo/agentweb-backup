@@ -259,6 +259,9 @@ export function endChatSpan(
     span.setAttribute(ATTR_GEN_AI_REQUEST_MODEL, info.model);
     span.setAttribute(ATTR_GEN_AI_PROVIDER_NAME, info.provider ?? providerForModel(info.model));
     const usage = info.response?.usage;
+    if (typeof usage?.reasoning_effort === 'string') {
+      span.setAttribute('agentweb.reasoning_effort', usage.reasoning_effort);
+    }
     if (usage?.prompt_tokens != null) span.setAttribute(ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.prompt_tokens);
     if (usage?.completion_tokens != null) span.setAttribute(ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.completion_tokens);
     const finishReasons = (info.response?.choices ?? [])

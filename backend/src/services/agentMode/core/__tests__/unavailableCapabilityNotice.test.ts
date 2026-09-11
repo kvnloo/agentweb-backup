@@ -164,7 +164,7 @@ describe('buildUnavailableCapabilityNotice', () => {
         name: 'install_skills',
         result: {
           success: true,
-          message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+          message: 'Successfully installed 1 skill(s). Could not resolve these skill IDs to any known skill: no-such-id. This is an ID problem, not a billing one.',
           installedSkills: ['Some Other Skill'],
           rejectedSkillIds: ['utm-audit'],
         },
@@ -222,7 +222,7 @@ describe('buildUnavailableCapabilityNotice', () => {
         name: 'install_skills',
         result: {
           success: true,
-          message: 'Successfully installed 1 skill(s). 1 skill(s) were not available with your subscription.',
+          message: 'Successfully installed 1 skill(s). Could not resolve these skill IDs to any known skill: no-such-id. This is an ID problem, not a billing one.',
           installedSkills: ['Brand Guidelines'],
           rejectedSkillIds: ['utm-audit'],
           rejectedToolNames: ['audit_ad_utm_coverage'],
@@ -232,5 +232,72 @@ describe('buildUnavailableCapabilityNotice', () => {
 
     expect(notice).toContain('audit_ad_utm_coverage');
     expect(notice).not.toContain('read_brand_guidelines');
+  });
+});
+
+/*
+ * ENG-1795. Every case in this file uses the SUBSCRIPTION refusal as the install_skills error,
+ * which classifies `subscription_blocked` — the one refusal shape this notice's filter ignores.
+ * So when ENG-1795 retargeted the "unavailable" refusal to `tool_unavailable` (chosen for its
+ * model-facing text, which forbids substitution), install_skills began matching the filter and
+ * the whole suite stayed green while a false banner shipped.
+ */
+describe('buildUnavailableCapabilityNotice — the installer is never the missing capability', () => {
+  const UNAVAILABLE_REFUSAL =
+    'These skills are currently unavailable to install: __other_skills__. The ID is correct and '
+    + 'this account is permitted to use it, so retrying the same ID will not help.';
+  const FORBIDDEN_REFUSAL =
+    'These skills are currently unavailable to install: __admin_tools__. This requires admin '
+    + 'access — a role restriction, not a billing limit and not a temporary fault.';
+
+  /*
+   * These four are the ones that keep the guard load-bearing. install_skills' OWN refusals now
+   * classify `skill_install_refused` and never reach this filter — but a gateway policy block,
+   * the repeated-failure breaker, an excludeTools removal and a timeout all still classify
+   * `tool_unavailable`, because the classifier matches the bare tool name inside the message.
+   * Without the guard, any of them names install_skills in a banner as a capability that "did
+   * not run".
+   */
+  it.each([
+    ['gateway policy block', 'Tool "install_skills" is blocked by policy for this session.'],
+    ['repeated-failure breaker', 'install_skills exceeded its repeated-failure budget for this run.'],
+    ['excludeTools removal', 'Tool "install_skills" is not available in this context.'],
+    ['gateway policy', 'install_skills was blocked by Agent Tool Gateway policy: session limit.'],
+    ['timeout', 'install_skills timed out after 30000ms'],
+  ])('does not announce install_skills itself as unavailable (%s)', (_label, err) => {
+    expect(buildUnavailableCapabilityNotice([{ name: 'install_skills', error: err }])).toBeNull();
+  });
+
+  /*
+   * These two no longer exercise the guard: since ENG-1795 gave install refusals their own
+   * class, they classify `skill_install_refused` and are filtered out before it. Kept because
+   * the OUTCOME is the contract — an install refusal must never produce this banner — and they
+   * would catch a future re-route back to `tool_unavailable`. They document the outcome, not
+   * the mechanism; the four cases above are what pin the guard itself.
+   */
+  it.each([
+    ['unavailable', UNAVAILABLE_REFUSAL],
+    ['forbidden', FORBIDDEN_REFUSAL],
+  ])('an install refusal never produces the banner (%s)', (_label, refusal) => {
+    /*
+     * install_skills DID run — it ran and refused, with a reason. Naming it here tells the user
+     * a tool was unavailable when the truth is the opposite, and prepends that claim above an
+     * answer that may be entirely correct.
+     */
+    expect(buildUnavailableCapabilityNotice([{ name: 'install_skills', error: refusal }])).toBeNull();
+  });
+
+  it('still announces the genuinely gated tool alongside an install refusal', () => {
+    // The guard must be surgical: suppressing install_skills must not suppress the tool the
+    // model was actually denied, which is the entire point of the notice.
+    const notice = buildUnavailableCapabilityNotice([
+      { name: 'install_skills', error: UNAVAILABLE_REFUSAL },
+      {
+        name: 'audit_ad_utm_coverage',
+        error: 'Tool "audit_ad_utm_coverage" is not available. You must install the required skill first using install_skills.',
+      },
+    ]);
+    expect(notice).toContain('audit_ad_utm_coverage');
+    expect(notice).not.toContain('install_skills`');
   });
 });

@@ -26,6 +26,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+import { METERED_VENDOR_PROVIDERS } from '../services/usageAnalyticsService';
+
 const SRC_ROOT = path.join(__dirname, '..');
 
 /** A distinctive, low-false-positive marker for a paid vendor's egress call. */
@@ -404,6 +406,47 @@ function loadRealRepoFiles(): Map<string, string> {
   return files;
 }
 
+/**
+ * Provider keys passed to `recordVendorUsage` as a shared constant rather than
+ * a string literal. Resolved by name so the registry check below still sees
+ * them.
+ *
+ * Kept as an explicit alias map, not a looser regex: a NEW constant-valued
+ * provider then fails the registry check loudly and gets an entry here, which
+ * is the behaviour we want. A regex broad enough to guess would instead
+ * silently "resolve" the wrong thing.
+ */
+const PROVIDER_CONSTANT_ALIASES: Record<string, string> = {
+  TWITTER_PROVIDER: 'twitter', // services/twitterService.ts (ENG-664)
+};
+
+/** Lines of a `recordVendorUsage({ ... })` call to scan for its provider key. */
+const CALL_WINDOW_LINES = 15;
+
+/**
+ * Every provider key the repo actually meters, read from the `provider:` field
+ * of each `recordVendorUsage` call.
+ *
+ * Scoped to a window after each call site rather than the whole file, because
+ * the search providers carry an unrelated `provider: this.name` on their own
+ * result objects — a file-wide scan would report `this` as a vendor.
+ */
+function meteredProviderKeysInRepo(files: ReadonlyMap<string, string>): string[] {
+  const found = new Set<string>();
+  for (const content of files.values()) {
+    const lines = content.split('\n');
+    lines.forEach((line, i) => {
+      if (!/recordVendorUsage\s*\(/.test(line)) return;
+      const window = lines.slice(i, i + CALL_WINDOW_LINES).join('\n');
+      for (const m of window.matchAll(/provider:\s*(?:(['"])([^'"]+)\1|([A-Z][A-Z0-9_]*))/g)) {
+        const key = m[2] ?? PROVIDER_CONSTANT_ALIASES[m[3]!];
+        if (key) found.add(key);
+      }
+    });
+  }
+  return [...found].sort();
+}
+
 describe('helper-indirected metering (ENG-1797)', () => {
   const SIGS: VendorSignature[] = [{ vendor: 'FakeVendor', re: /fake-vendor\.example\.com/ }];
 
@@ -530,5 +573,22 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
       'ElevenLabs (services/voiceoverService.ts) — ENG-698',
       'Placid (controllers/tasks.ts) — ENG-698',
     ]);
+  });
+
+  /**
+   * ENG-1837. The admin provider picker offers METERED_VENDOR_PROVIDERS, so
+   * that list has to mean "has a live adapter" and not "was true when someone
+   * last edited it".
+   *
+   * Both directions are failures, and they fail differently:
+   *  - a key in the registry with no adapter → a dropdown option that can only
+   *    ever render empty, which reads as "this vendor costs nothing";
+   *  - an adapter missing from the registry → a metered vendor that is absent
+   *    from the picker until it happens to have spend in the selected window.
+   */
+  it('METERED_VENDOR_PROVIDERS matches the providers actually metered in the repo (ENG-1837)', () => {
+    expect(meteredProviderKeysInRepo(loadRealRepoFiles())).toEqual(
+      [...METERED_VENDOR_PROVIDERS].sort()
+    );
   });
 });

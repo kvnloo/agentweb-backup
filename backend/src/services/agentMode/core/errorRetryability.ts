@@ -14,7 +14,7 @@
  *
  *   rate_limit / timeout / network / upstream_5xx / truncated_response → transient → retryable
  *   auth / upstream_rejected / invalid_args (schema reject) / tool_unavailable /
- *   invalid_output / policy_blocked / subscription_blocked
+ *   invalid_output / policy_blocked / subscription_blocked / skill_install_refused
  *                                                  → terminal  → NOT retryable
  *   anything else (legacy/unknown classes)         → conservative: NOT retryable
  *                                                    as an identical call
@@ -65,6 +65,8 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'invalid_output',
   'policy_blocked',
   'subscription_blocked',
+  // ENG-1795: a refused install repeats identically on retry, same as its siblings here.
+  'skill_install_refused',
   'scope_refused',
   // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
   // "an identical retry is known-pointless".
@@ -96,6 +98,19 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   upstream_rejected: 'the provider deliberately refused this action (business rule). Do NOT retry the same call — explain the refusal to the user and follow its guidance.',
   invalid_args: 'the arguments were invalid. Do NOT repeat the identical call — fix the arguments to exactly match the tool schema first, then retry with the corrected arguments.',
   tool_unavailable: 'this tool is not available in this session. Do NOT retry it — install the required skill via install_skills, or tell the user the capability is not enabled. Do NOT present another tool\'s output as this tool\'s result.',
+  /*
+   * install_skills itself refusing — NOT a missing tool (ENG-1795).
+   *
+   * `tool_unavailable` was the closest existing class and its tail sentence is right, but its
+   * head is false here and its remedy is circular: install_skills DID run, and telling the
+   * model to "install the required skill via install_skills" points it at the very call that
+   * just refused. It also contradicted the refusal's own prose, which for an admin-only bundle
+   * says explicitly not to suggest support or an upgrade.
+   *
+   * The refusal text already carries the specific, accurate reason — which of four causes, and
+   * which ids. This line's only job is the verdict: stop, and do not fake it with another tool.
+   */
+  skill_install_refused: 'the install was refused and the message above says why. Do NOT retry it — the same call will be refused again. Relay that reason to the user as written, and do NOT substitute another tool\'s output for the tool that needed the skill.',
   scope_refused: 'the requested object is not in the selected ad account. Do NOT retry it, and do NOT fall back to an account-wide or unscoped list — widening the read is precisely what this refusal prevents. Select the ad account that owns the object, or tell the user it is not available in the one they are using.',
   read_bounded: 'the read stopped at a fixed scope or time bound and will stop in the same place every time, so retrying the identical call cannot help — and it is NOT evidence that anything is absent; never report an item as missing based on it. Narrow the scope instead: a specific sub-folder, campaign or ad set, or ask the user for a direct link.',
   read_incomplete: 'the read did not finish, so it is NOT evidence that anything is absent — never report an item as missing based on this result. If it was throttled or failed transiently, wait briefly and retry ONCE; if it stopped at a scope or budget bound, narrow the scope (a specific folder, campaign or ad set, or ask the user for a direct link) rather than repeating the identical call.',

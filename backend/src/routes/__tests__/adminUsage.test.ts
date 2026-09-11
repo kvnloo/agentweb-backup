@@ -28,6 +28,18 @@ jest.mock('../../services/usageAnalyticsService', () => ({
   getUserXBreakdown: jest.fn(),
 }));
 
+// The spend-breakdown route (ENG-1250 §7) has no route-level coverage: the read
+// model is unit-tested as pure functions, but the route's COMPOSITION -- billing
+// resolution, guards, and stitching breakdown+allowance+projection+pause into one
+// payload -- was asserted nowhere. Only the true boundaries are mocked below;
+// spendReadModel and spendProjection run for real, so these exercise the
+// composition rather than a restatement of it.
+jest.mock('../../services/spendEventDb', () => ({ listSpendEvents: jest.fn() }));
+jest.mock('../../services/tokenUsageService', () => ({ resolveBillingUserId: jest.fn() }));
+jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
+jest.mock('../../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
+jest.mock('../../services/llmUsageCreditService', () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
+
 import adminUsageRoutes from '../adminUsage';
 import { authenticateToken } from '../../middleware/auth';
 import {
@@ -35,11 +47,39 @@ import {
   getUsageComparison,
   getUserXBreakdown,
 } from '../../services/usageAnalyticsService';
+import { listSpendEvents } from '../../services/spendEventDb';
+import { resolveBillingUserId } from '../../services/tokenUsageService';
+import { userDb } from '../../services/db';
+import { getSubscriptionTypeConfig } from '../../services/subscriptionService';
+import { getLlmUsageCreditAdjustment } from '../../services/llmUsageCreditService';
 
 const mockByModelDay = getUserUsageByModelDay as jest.Mock;
 const mockComparison = getUsageComparison as jest.Mock;
 const mockXBreakdown = getUserXBreakdown as jest.Mock;
 const mockAuth = authenticateToken as unknown as jest.Mock;
+const mockListSpendEvents = listSpendEvents as jest.Mock;
+const mockResolveBilling = resolveBillingUserId as jest.Mock;
+const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
+const mockCreditAdjustment = getLlmUsageCreditAdjustment as jest.Mock;
+
+/** A settled spend event, overridable per test. */
+const spendEvent = (over: Record<string, unknown> = {}) => ({
+  billingUserId: 'owner-1',
+  eventId: `evt-${Math.random().toString(36).slice(2)}`,
+  occurredAt: '2026-09-04T10:00:00.000Z',
+  billingMonth: '2026-09',
+  actingUserId: 'member-1',
+  provider: 'apollo',
+  operation: 'email_reveal',
+  feature: 'lead-finder',
+  unit: 'reveal',
+  quantity: 1,
+  costMicroUsd: 49_500,
+  costSource: 'allocated' as const,
+  lifecycle: 'settled' as const,
+  ...over,
+});
 
 let app: express.Application;
 
@@ -53,6 +93,184 @@ describe('admin usage routes', () => {
     app = express();
     app.use(express.json());
     app.use('/api/admin', adminUsageRoutes);
+  });
+
+  describe('GET /api/admin/users/:billingUserId/spend/breakdown', () => {
+    beforeEach(() => {
+      mockResolveBilling.mockImplementation(async (id: string) => id);
+      mockGetUserById.mockResolvedValue({ userId: 'owner-1', subscriptionType: 'Pro' });
+      // A Pro tier with a $200 hard cap, so the projection has something real to
+      // measure against. `null` here would make the account UNLIMITED, which
+      // silently makes every pause assertion vacuous.
+      mockTierConfig.mockResolvedValue({
+        llmUsagePolicy: { hardCostThresholdMicroUsd: 200_000_000 },
+      });
+      // resolveAllowanceInputs reads three fields off this unconditionally — a
+      // bare null is not a valid "no credits" value.
+      mockCreditAdjustment.mockReturnValue({
+        purchasedMicroUsd: 0,
+        adminGrantedMicroUsd: 0,
+        migrationOffsetMicroUsd: 0,
+      });
+      mockListSpendEvents.mockResolvedValue([]);
+    });
+
+    it('400s on a malformed month, before reading the ledger', async () => {
+      for (const month of ['', '2026-13', '2026-00', 'nope']) {
+        const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month });
+        expect(res.status).toBe(400);
+      }
+      expect(mockListSpendEvents).not.toHaveBeenCalled();
+    });
+
+    it('400s on an identifier that is not a plausible id', async () => {
+      const res = await request(app)
+        .get('/api/admin/users/not%20an%20id/spend/breakdown')
+        .query({ month: '2026-09' });
+      expect(res.status).toBe(400);
+      expect(mockListSpendEvents).not.toHaveBeenCalled();
+    });
+
+    it('403s for a non-admin', async () => {
+      mockAuth.mockImplementation((req: any, _res: any, next: any) => {
+        req.user = { userId: 'u-1', isAdmin: false };
+        next();
+      });
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+      expect(res.status).toBe(403);
+    });
+
+    // The trap this route's parameter name invites: spend events are partitioned
+    // by billing root, so a member id matches nothing and returns a complete,
+    // well-formed, EMPTY breakdown -- "this account spent nothing" about an
+    // account that spent plenty. The admin cost tables are keyed by acting user,
+    // so a member id arrives here routinely (ENG-1838).
+    it('resolves an org member to the billing root before reading the ledger', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([spendEvent()]);
+
+      const res = await request(app)
+        .get('/api/admin/users/member-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.status).toBe(200);
+      expect(mockResolveBilling).toHaveBeenCalledWith('member-1');
+      expect(mockListSpendEvents).toHaveBeenCalledWith('owner-1', '2026-09-01', '2026-09-31');
+      // Both ids are reported, so the UI can say whose ledger this is.
+      expect(res.body.billingUserId).toBe('owner-1');
+      expect(res.body.requestedUserId).toBe('member-1');
+      expect(res.body.settledMicroUsd).toBe(49_500);
+    });
+
+    it('is a no-op for a billing root', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([spendEvent()]);
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.body.billingUserId).toBe('owner-1');
+      expect(res.body.requestedUserId).toBe('owner-1');
+    });
+
+    it('composes breakdown, allowance, projection and pause into one payload', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([
+        spendEvent({ provider: 'apollo', costMicroUsd: 40_000 }),
+        spendEvent({ provider: 'twitter', operation: 'post', costMicroUsd: 15_000 }),
+      ]);
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(
+        expect.objectContaining({
+          billingUserId: 'owner-1',
+          billingMonth: '2026-09',
+          settledMicroUsd: 55_000,
+          eventCount: 2,
+          allowance: expect.any(Object),
+          projection: expect.objectContaining({ settledMicroUsd: 55_000 }),
+          pause: expect.objectContaining({ paused: expect.any(Boolean) }),
+        }),
+      );
+      expect(res.body.byProvider.map((s: any) => s.key).sort()).toEqual(['apollo', 'twitter']);
+    });
+
+    // AC2: committed money must never read as spent money.
+    it('reports a reservation separately from settled spend', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([
+        spendEvent({ costMicroUsd: 10_000, lifecycle: 'settled' }),
+        spendEvent({ eventId: 'evt-r', costMicroUsd: 90_000, lifecycle: 'reserved' }),
+      ]);
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.body.settledMicroUsd).toBe(10_000);
+      expect(res.body.inFlightMicroUsd).toBe(90_000);
+      expect(res.body.inFlight).toHaveLength(1);
+      expect(res.body.inFlight[0].eventId).toBe('evt-r');
+    });
+
+    // AC6: a slice that silently drops rows makes the parts sum to less than the
+    // whole, and the gap looks like missing spend rather than missing metadata.
+    it('buckets a missing dimension explicitly instead of dropping the event', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([
+        spendEvent({ costMicroUsd: 20_000, feature: undefined }),
+      ]);
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.body.byFeature).toHaveLength(1);
+      expect(res.body.byFeature[0].key).toBe('(unattributed)');
+      expect(res.body.byFeature[0].settledMicroUsd).toBe(20_000);
+      // bySession has no session on this event either -- same rule.
+      expect(res.body.bySession[0].key).toBe('(unattributed)');
+    });
+
+    // AC5: absence must be stated, not rendered as a zero-dollar month.
+    it('returns an explicit empty breakdown for a month with no events', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([]);
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(
+        expect.objectContaining({
+          settledMicroUsd: 0,
+          eventCount: 0,
+          daily: [],
+          byProvider: [],
+          inFlight: [],
+        }),
+      );
+    });
+
+    it('500s when the ledger read throws', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockRejectedValue(new Error('dynamo down'));
+
+      const res = await request(app)
+        .get('/api/admin/users/owner-1/spend/breakdown')
+        .query({ month: '2026-09' });
+
+      expect(res.status).toBe(500);
+      expect(res.body.error).toMatch(/Failed to build spend breakdown/i);
+    });
   });
 
   describe('GET /api/admin/users/:userId/usage/by-model-day', () => {

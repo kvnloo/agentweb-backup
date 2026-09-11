@@ -53,6 +53,35 @@ export const GATEWAY_TASK_CLASSES = [
 
 export type GatewayTaskClass = typeof GATEWAY_TASK_CLASSES[number];
 
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/** Mechanism only: task policy is deliberately unconfigured (ENG-1788). */
+export const GATEWAY_REASONING_EFFORT_OVERRIDES: Partial<Record<GatewayTaskClass, ReasoningEffort>> = {};
+
+export interface GatewayReasoningConfig {
+  reasoningEffort?: ReasoningEffort;
+  /** Snapshot of the OpenRouter model record's reasoning.supported_efforts. */
+  supportedReasoningEfforts?: readonly ReasoningEffort[];
+}
+
+/** Fail closed on missing/malformed capability metadata, including fallback targets. */
+export function resolveGatewayReasoningEffort(
+  config: GatewayReasoningConfig,
+  taskClass?: GatewayTaskClass,
+  fallbacks: readonly GatewayReasoningConfig[] = [],
+): ReasoningEffort | undefined {
+  const effort = (taskClass ? GATEWAY_REASONING_EFFORT_OVERRIDES[taskClass] : undefined)
+    ?? config.reasoningEffort;
+  const validEfforts: readonly string[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  if (typeof effort !== 'string' || !validEfforts.includes(effort)) return undefined;
+  return [config, ...fallbacks].every(({ supportedReasoningEfforts: supported }) =>
+    Array.isArray(supported)
+      && supported.every(value => typeof value === 'string' && validEfforts.includes(value))
+      && supported.includes(effort),
+  ) ? effort : undefined;
+}
+
+
 export interface GatewayUsage {
   inputTokens: number;
   outputTokens: number;

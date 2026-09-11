@@ -108,7 +108,7 @@ interface ToolStats {
  *   model_uninstalled_tool — the model called a tool it does not have; registry/prompt
  * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
  */
-const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
+export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
 
 /**
  * A one-line action for a secondary cohort (ENG-820 review round 7).

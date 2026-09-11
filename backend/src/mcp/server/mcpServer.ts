@@ -285,6 +285,14 @@ export function setupMcpServer(
     });
   };
 
+  // Local transports retain their original execution identity. Bind every reuse
+  // to that identity before dispatch, just as the durable rehydration path does.
+  const ownsLocalSession = (req: Request, owner: SessionEntry): boolean => {
+    if (owner.isInternal) return (req as any)._mcpIsInternal === true;
+    if (owner.agentUserId?.startsWith('anon_')) return (req as any)._mcpAuthMethod === 'anonymous';
+    return !!owner.agentUserId && owner.agentUserId === (req as any)._agentApiUserId;
+  };
+
   // POST handler - handles all JSON-RPC messages including initialization
   // Note: express.json() is added here because MCP routes are mounted before global body parser
   app.post("/mcp", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
@@ -297,6 +305,10 @@ export function setupMcpServer(
       let transport: StreamableHTTPServerTransport;
 
       if (sessionId && sessions.has(sessionId)) {
+        if (!ownsLocalSession(req, sessions.get(sessionId)!)) {
+          res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found. Please reinitialize.' }, id: null });
+          return;
+        }
         // Reuse existing transport for established session
         transport = sessions.get(sessionId)!.transport;
         touchSession(sessionId);
@@ -501,7 +513,7 @@ export function setupMcpServer(
       res.status(400).send('Missing session ID');
       return;
     }
-    if (!sessions.has(sessionId)) {
+    if (!sessions.has(sessionId) || !ownsLocalSession(req, sessions.get(sessionId)!)) {
       // Session expired/unknown — return 404 so MCP SDK client auto-reinitializes.
       res.status(404).send('Session not found. Please reinitialize.');
       return;
