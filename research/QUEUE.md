@@ -90,4 +90,7 @@ clears them on child death); chatbot is per-socket `message`, not
 SSE. Cycle 66: `keyedMutex.ts` L12–15 + `activeSessionGenerations`
 Set — one session, one process. A fifth `listen()` would race that
 claim. A-006 stays discarded.
+Cycle 67: MCP ENG-114 (`mcpSessionRehydration.ts` L3–8) — no sticky
+routing; share Dynamo metadata, rehydrate in-process. Not a fifth
+`listen()`. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

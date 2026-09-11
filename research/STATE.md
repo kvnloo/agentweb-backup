@@ -7,17 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 66
+cycles_completed: 67
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 67
+next_cycle: 68
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 66: keyedMutex.ts L12-15 — different processes never write the
-  same session. tryClaimSessionGeneration is an in-memory Set. Cycle
-  67: cheapest remaining mapping. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 67: ENG-114 — no sticky routing; scale-out is Dynamo metadata
+  + in-process rehydrate, not a fifth listen(). Cycle 68: cheapest
+  remaining mapping. Do not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

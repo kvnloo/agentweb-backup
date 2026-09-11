@@ -126,6 +126,11 @@ progress. Cycle 66: concurrency is the same shape.
 `keyedMutex.ts` L12–15 states different processes never write the
 same session; `tryClaimSessionGeneration` L936–956 is an in-memory
 Set. Do not extract `generateImage` out from under that claim.
+Cycle 67: that claim is **per-instance**. MCP ENG-114 already
+handles “no sticky routing” by Dynamo metadata + in-process
+rehydrate (`mcpSessionRehydration.ts` L3–8 / `mcpSessionStore.ts`
+L7–19). Do not HTTP-split images to copy that. Do not copy the
+MCP session table onto generate locks (Harsha).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

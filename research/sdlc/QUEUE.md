@@ -49,8 +49,12 @@ as `instanceState.ts` L10–11 (no Redis). Chatbot is a third fanout
 (`chatSocketHandler.ts` L94 `socket.emit('message')`). Cycle 66:
 `keyedMutex.ts` L12–15 — different processes never write the same
 session. `tryClaimSessionGeneration` (`agentModeController.ts`
-L936–956) is an in-memory Set. A-006 stays discard. Product READY
-unchanged.
+L936–956) is an in-memory Set. Cycle 67: MCP ENG-114 — no sticky
+routing; scale-out is Dynamo metadata + in-process rehydrate
+(`mcpSessionRehydration.ts` L3–8), not a fifth `listen()`.
+`socialPosts.ts` L16–21 says MinSize=MaxSize=1; DR doc L112 says
+MaxSize=4 — do not treat either as live AWS. A-006 stays discard.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

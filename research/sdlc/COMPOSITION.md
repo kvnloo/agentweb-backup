@@ -126,6 +126,14 @@ is a `Set`. `tryClaimSessionGeneration` is synchronous check-and-set.
 A-006 as a fifth process would race that Set. A-017 does not touch
 it. `cronJobRegistry.inFlight` is the drain-side Map (ENG-1189).
 
+Cycle 67: **scale-out is ENG-114, not A-006.**
+`mcpSessionRehydration.ts` L3–8: multi-instance, no sticky routing;
+live transports cannot be shared; rehydrate in-process from
+Dynamo metadata. `socialPosts.ts` L16–21 still documents a
+process-local cooldown and a Dynamo fallback *if* ASG scales.
+DR investigation L112 lists MaxSize=4 — in-tree disagreement; the
+pattern is not a fifth `listen()`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -135,3 +135,5 @@ submodule of the leaf package (A-008, not A-006).
   `instanceState` — no Redis). Chatbot is per-socket `'message'`.
 - Cycle 66: `keyedMutex.ts` L12–15 + `activeSessionGenerations` Set.
   A fifth process would race the claim. Do not Redis-ify the lock.
+- Cycle 67: ENG-114 — no sticky routing. Scale-out is Dynamo metadata
+  + in-process rehydrate, not HTTP-per-tool.
