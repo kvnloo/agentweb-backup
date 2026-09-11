@@ -31893,6 +31893,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-1877: variable values come from campaign names, CRM data, and other
+      // caller-supplied strings — none of it trusted HTML. The LLM is instructed below
+      // to copy values through verbatim ("EXACT REPLACEMENT"), so an unescaped `<script>`
+      // or `<img onerror=...>` in a value reaches the rendered report unchanged. Escaping
+      // here (not on the LLM's output afterward) is the only point where "this came from
+      // a value" and "this is the template's own static markup" are still distinguishable
+      // — post-hoc sanitizing final_html can't tell the two apart.
+      const { escapeHtml } = await import('../utils/markdownHtmlReport');
+      const escapedVariableValuesObj = Object.fromEntries(
+        Object.entries(variableValuesObj).map(([key, value]) => [key, escapeHtml(String(value))])
+      );
+      const escapedArrayVariableValuesObj = Object.fromEntries(
+        Object.entries(arrayVariableValuesObj).map(([key, values]) => [
+          key,
+          (values as string[]).map((value) => escapeHtml(String(value))),
+        ])
+      );
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -31903,10 +31921,10 @@ TEMPLATE SUBJECT:
 ${template.subject}
 
 VARIABLE VALUES:
-${JSON.stringify(variableValuesObj, null, 2)}
+${JSON.stringify(escapedVariableValuesObj, null, 2)}
 
 ARRAY VARIABLE VALUES:
-${JSON.stringify(arrayVariableValuesObj, null, 2)}
+${JSON.stringify(escapedArrayVariableValuesObj, null, 2)}
 
 CRITICAL INSTRUCTIONS:
 1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template

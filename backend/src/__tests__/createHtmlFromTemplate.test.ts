@@ -174,6 +174,64 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(agentModeService.callLLM).toHaveBeenCalled();
     });
 
+    // ENG-1877: variable values (campaign names, CRM data) are not trusted HTML, but the
+    // LLM is instructed to copy them through verbatim — so an unescaped value reaches the
+    // rendered report unchanged. Asserts on the actual PROMPT sent to callLLM, since that's
+    // where escaping has to happen (post-hoc sanitizing the LLM's output can't tell a
+    // value's markup apart from the template's own static markup).
+    it('should HTML-escape scalar variable values before building the substitution prompt', async () => {
+      const maliciousTitle = '<script>alert(1)</script> & "Sale" <b>Bold</b>';
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('<script>alert(1)</script>');
+      expect(promptContent).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(promptContent).toContain('&amp;');
+      expect(promptContent).toContain('&quot;Sale&quot;');
+      expect(promptContent).toContain('&lt;b&gt;Bold&lt;/b&gt;');
+    });
+
+    it('should HTML-escape array variable values before building the substitution prompt', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items'],
+        html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const maliciousItem = '<img src=x onerror=alert(1)>';
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [maliciousItem] },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('<img src=x onerror=alert(1)>');
+      expect(promptContent).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    });
+
     it('should validate that all required variables are provided', async () => {
       const result = await (agentModeService as any).createHtmlFromTemplate(
         agentModeService.default_model,
