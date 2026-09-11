@@ -189,6 +189,12 @@ on month, not remaining allowance. `spendChargingService`
 reservation exists; admission is Harsha and unused here. Two
 parallel Hermes `CallTool`s can both pass. A fifth process
 copies the GET. Do not wire a reservation onto Q-014.
+Cycle 82: that GET is the **token** dimension by default.
+The leaf meters `$` with 0 tokens (`imageGeneration.ts` L551–563).
+`ENFORCE_COST_CAP` is observe-only unless flipped or a versioned
+policy enforces cost. `spendChargingService` has zero production
+callers. Q-014 still lists into `metered` middleware; do not flip
+billing to “fix” A-006.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -237,6 +237,14 @@ and unused by this leaf. Two parallel Hermes `CallTool`s can
 both pass. A fifth `listen()` copies the GET. Do not wire
 ENG-1250 onto Q-014.
 
+Cycle 82: **image spend misses the default token gate.**
+`meterUserUsage` from the leaf uses `costUsdOverride` with
+`inputTokens: 0` / `outputTokens: 0` (`imageGeneration.ts`
+L551–563). `checkTokenUsage` gates tokens unless
+`ENFORCE_COST_CAP` or a versioned policy enforces cost
+(`tokenUsageService.ts` L342–396). `spendChargingService` has
+zero production imports. Do not flip the flag; do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

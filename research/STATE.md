@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 81
+cycles_completed: 82
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 82
+next_cycle: 83
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 81: MCP quota is check-then-act (GET then next(); charge
-  after vendor, fire-and-forget). Cycle 82: cheapest remaining
-  mapping. Candidate: Agent Mode/chatbot faces share this GET
-  (still no reserveSpend). Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes, unsubscribe
+  Cycle 82: image meter writes $ with 0 tokens; default hard gate
+  is tokens. Cycle 80 brake is the cost dimension. Cycle 83:
+  cheapest remaining. Candidate: mcpServerCore CallTool has no
+  per-user mutex. Do not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

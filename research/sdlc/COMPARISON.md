@@ -186,3 +186,7 @@ submodule of the leaf package (A-008, not A-006).
   Hermes bounds parallel tools in the loop; AgentWeb MCP is a
   server that admits N Express POSTs. Do not HTTP-split to
   “atomize” a GET. Do not wire ENG-1250 admission (Harsha).
+- Cycle 82: image meter is `$` / 0 tokens. Default hard gate is
+  tokens. Hermes loop still bounds spend; AgentWeb’s token cap
+  does not, unless cost enforcement is on. Do not flip
+  `ENFORCE_COST_CAP` from a research timer.

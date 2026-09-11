@@ -386,6 +386,8 @@ Cycle 81: that quota is `checkTokenUsage` then `next()`
 (`emmaTokenBudget.ts` L171–196). Charge is `void meterUserUsage`
 after vendor success; ADD does not refuse overshoot.
 `reserveSpend` unused on this path. A-006 discarded.
+Cycle 82: image `meterUserUsage` is `costUsdOverride` with 0
+tokens. Default gate is tokens. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

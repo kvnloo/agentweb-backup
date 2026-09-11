@@ -133,4 +133,7 @@ A-006 stays discarded.
 Cycle 81: `requireEmmaTokenBudget` is check-then-act; increment
 is after vendor success and does not condition on remaining
 quota. Do not wire ENG-1250 admission. A-006 stays discarded.
+Cycle 82: image spend does not increment `totalTokens`; default
+hard gate is tokens. Do not flip `ENFORCE_COST_CAP`. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -80,7 +80,10 @@ is the brake. Cycle 81: that brake is `checkTokenUsage` then
 `next()` (`emmaTokenBudget.ts` L171–196); increment is AFTER
 vendor success (`meterUserUsage` void) and ADD does not refuse
 overshoot. `reserveSpend` is unused on this path (ENG-1250
-admission is Harsha). Product READY unchanged.
+admission is Harsha). Cycle 82: image meter writes `$` with 0
+tokens (`imageGeneration.ts` L551–563); default hard gate is
+tokens (`tokenUsageService.ts` L342–396). Cycle 80 brake is
+the cost dimension. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
