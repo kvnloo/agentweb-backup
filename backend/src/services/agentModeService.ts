@@ -6378,12 +6378,22 @@ export class AgentModeService {
     const allTools = this.toolRegistry.getAllTools();
 
     // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // emmaToolRegistry (the module-level singleton) is independently confirmed to
-    // contain both publish_landing_page_changes and get_landing_page_preview_url
-    // (throwaway script, 210 tools). registerTools() copies from that singleton into
-    // THIS instance's own this.toolRegistry at boot — never independently verified
-    // that the copy is complete on a real running server. This log settles it.
+    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
+    // across 5 calls within a single 6-second window of ONE user turn, all bearing
+    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
+    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
+    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
+    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
+    // this.toolRegistry is somehow being read as empty intermittently (no code path
+    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
+    // pure/synchronous, and registerTools() is called exactly once in this file), or
+    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
+    // restart/still draining, a new one still initializing) and both happen to log
+    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
+    // across all lines confirms (a); differing pids confirms (b).
     console.log('[ENG-1852-DIAG]', JSON.stringify({
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
       allToolsCount: allTools.length,
       hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
       hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
