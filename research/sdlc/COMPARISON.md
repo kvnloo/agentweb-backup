@@ -277,3 +277,6 @@ reverted. Do not copy that as A-006.
 - Cycle 108: ALB health cannot stop Hermes during drain. Zero
   `HealthCheckPath`. Always-200 `/health` is ENG-1189’s
   load-balancer face. Not a health nanoservice.
+- Cycle 109: enhanced-health probe is deploy-verify (ENG-878).
+  Zero process callers. `LAGGING` is post-terminate. Not a fifth
+  `listen()`.

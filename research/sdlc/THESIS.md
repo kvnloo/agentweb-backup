@@ -155,6 +155,9 @@ HTTP-split to unify them.
 Cycle 108: ALB health cannot stop Hermes during drain. `/health`
 must stay 200 until close (ENG-1189). A-019 is the gate, not a
 health threshold.
+Cycle 109: `underlying_health_verdict` is a GitHub Actions probe
+(ENG-878), not runtime drain. Copying it into the process would
+bless the dying instance. Do not HTTP-split to host it.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -305,6 +305,10 @@ Cycle 108: ALB health **cannot** stop Hermes during drain. Zero
 mcpFetch needs the listen (ENG-1189). Hook
 `CompleteLifecycleAction` then deregisters (600s). Do not 503
 `/health` during the wait. A-019 refuse is the gate.
+Cycle 109: `underlying_health_verdict` (`eb-deploy.sh` L270–375)
+is **deploy-verify**, not drain. Zero `backend/src` callers.
+`LAGGING` is stale Red after the old instance is already gone.
+Do not call it from `runDrain`. Do not HTTP-split to host it.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

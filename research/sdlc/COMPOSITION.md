@@ -407,6 +407,11 @@ pins always-200, no drain case. Failing `/health` during the wait
 would yank the instance while mcpFetch still needs PORT.
 `asgLifecycleGuard.ts` L262–288 then deregisters.
 
+Cycle 109: **enhanced-health probe is deploy-verify, not drain.**
+`eb-deploy.sh` L270–375 / L745–748. Zero `backend/src` callers.
+`LAGGING` is new-instance-already-Ok after the old is gone.
+Dry-run cannot change deploy exit (`deploy.yml` L213).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

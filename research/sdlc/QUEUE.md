@@ -160,6 +160,9 @@ Cycle 108: ALB health cannot stop Hermes during drain. Zero
 because mcpFetch needs the listen (ENG-1189). Hook
 `CompleteLifecycleAction` then deregisters. Product READY
 unchanged.
+Cycle 109: `underlying_health_verdict` is deploy-verify (ENG-878),
+not drain. Zero `backend/src` callers. `LAGGING` is post-terminate
+stale Red. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
