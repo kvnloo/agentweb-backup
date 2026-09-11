@@ -202,3 +202,6 @@ submodule of the leaf package (A-008, not A-006).
   Do not HTTP-split the book. Q-003 is the cheaper-model mapper.
 - Cycle 86: video is the same meter, Emma-catalog only. MCP grep
   empty. Do not HTTP-split video to “prepare” Q-016.
+- Cycle 87: 20 AgentWebPro PRs still miss `apiTools.ts` /
+  `llmPricing.ts` / `loops/core`. Hermes does not wait on a
+  god-object pile to list a tool. Do not HTTP-split for collision.

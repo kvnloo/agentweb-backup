@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 86
+cycles_completed: 87
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 87
+next_cycle: 88
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 86: generate_video is the same $ / 0-token meter; MCP
-  does not list it (Q-016 parked). Cycle 87: cheapest remaining.
-  Candidate: AgentWebPro collision refresh on apiTools.ts /
-  loops/core. Do not un-ready Q-001 / Q-014 / Q-003. Do not
-  revive A-006. If stop_after passes, unsubscribe
+  Cycle 87: AgentWebPro still empty on apiTools / loops/core /
+  meter files (llmPricing, emmaTokenBudget, imageGeneration).
+  Cycle 88: cheapest remaining. Candidate: OMP DAG reconfirm
+  (last pin 0.85.1 cycle 54). Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

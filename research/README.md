@@ -210,6 +210,10 @@ unlimited. Do not HTTP-split the price book.
 Cycle 86: `generate_video` uses the same `$` / 0-token meter
 (`videoGeneration.ts` L1098–1106) and is **not** on MCP. Q-016
 is list-like-Q-014 at 12–39× image price. Do not delay Q-014.
+Cycle 87: AgentWebPro (20 PRs) still empty on `apiTools.ts`,
+`loops/core`, and the cycle 81–86 meter files. `#2875` is
+cron. `#2862` still `toolErrorClassifier.ts`. Land Q-014 on
+the empty file; do not HTTP-split to dodge collision.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
@@ -235,6 +239,10 @@ Slack: **#2393**. Never #2862 / #2271 / #2861. `#1076` also touches
 `slackChannelAdapter.ts` and `db.ts`. Cycle 61: **#1814** also edits
 `app.ts` (HubSpot `crmSync`). A-007 does not touch `app.ts`.
 `crm.ts` is **#1544 + #1790** — A-017 first slice is not that file.
+Cycle 87: **#2875** is `renewalIntegrationHealthCron.ts` (not MCP).
+`#2862` still `toolErrorClassifier.ts`. Meter/price files
+(`llmPricing.ts`, `emmaTokenBudget.ts`, `imageGeneration.ts`)
+empty. `agentModeService.ts` also **#2832 #1076**.
 
 ---
 

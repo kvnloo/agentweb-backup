@@ -276,6 +276,12 @@ tokens + `costUsdOverride`. `POST /generate-video` is already
 zero `generate_video`. Q-016 is list-like-Q-014 at 12–39× image
 price. Do not HTTP-split; do not delay Q-014.
 
+Cycle 87: **AgentWebPro still empty on Q-014 / meter / wrap.**
+20 PRs. `#2875` is renewal-health cron. `#2862` still
+`toolErrorClassifier.ts`. Zero on `apiTools.ts`, `loops/core`,
+`llmPricing.ts`, `emmaTokenBudget.ts`, `imageGeneration.ts`.
+Do not wait; do not HTTP-split to dodge collision.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

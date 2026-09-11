@@ -113,6 +113,7 @@ v1.25.2 L678); AgentWeb adds no mutex. Cycle 84:
 `extraCostUsage`. Cycle 85: default image is $0.134
 (`llmPricing.ts` L301); `gpt-image-2` is $0.04. Cycle 86:
 video uses the same `$` / 0-token meter and is not on MCP.
+Cycle 87: AgentWebPro empty on those files plus `apiTools.ts`.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
