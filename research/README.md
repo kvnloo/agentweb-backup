@@ -160,6 +160,10 @@ Cycle 75: `RecordLifecycleActionHeartbeat` is IAM-only
 `Timeout: 900` (`.ebextensions/rolling.config` L5–7) are stacked
 above a 10 min drain ceiling. A fifth process is in none of those
 clocks.
+Cycle 76: GET `/mcp` is the global nginx 600s path
+(`.platform/nginx/conf.d/agent-mode-timeout.conf` L5–7), not
+`/socket.io/` 3600s. ALB IdleTimeout 600. DeregistrationDelay is
+the deploy script (ENG-823), same pattern as the ASG hook.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

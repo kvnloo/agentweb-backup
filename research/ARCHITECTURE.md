@@ -367,6 +367,9 @@ discarded.
 Cycle 75: `RecordLifecycleActionHeartbeat` never called. Hook
 `--heartbeat-timeout 900` (`eb-deploy.sh` L612) + rolling.config
 `Timeout: 900` sit above `DRAIN_CEILING_MS` 10 min. A-006 discarded.
+Cycle 76: nginx `agent-mode-timeout.conf` L5–7 is global 600s;
+`/socket.io/` is 3600s; ALB IdleTimeout 600; DeregistrationDelay is
+`eb-deploy.sh` not `.ebextensions` (ENG-823). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

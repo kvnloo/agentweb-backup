@@ -193,6 +193,14 @@ GET SSE without `mcpShutdown` is cut by force-exit, still inside
 the hook. A-006 as a long image process would need a hook *and*
 the API this process does not call.
 
+Cycle 76: **Node timeout 0 loses to nginx/ALB 600s.**
+`agent-mode-timeout.conf` L5–7 is global (no `location`).
+`websocket.conf` L5–16 gives `/socket.io/` 3600s. GET `/mcp` is
+not that path. ALB `IdleTimeout: 600` (`timeout.config` L5–6).
+DeregistrationDelay is `ensure_deregistration_delay()` (ENG-823),
+not `.ebextensions`. A-006 would copy three deploy artifacts and
+still miss the Socket.IO exception.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

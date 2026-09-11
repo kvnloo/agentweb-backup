@@ -165,3 +165,6 @@ submodule of the leaf package (A-008, not A-006).
   Three 900s knobs (ASG hook, EB rolling Timeout, comment in
   `runDrain`) are dead-man's switches stacked above a 10 min
   ceiling. A fifth `listen()` is in none of them.
+- Cycle 76: inbound MCP is on the global nginx/ALB 600s path.
+  Socket.IO is the 3600s exception. Hermes SSE idle > 10 min
+  dies at the proxy even if Node never times out.

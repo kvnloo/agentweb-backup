@@ -116,4 +116,6 @@ SIGTERM. A-006 stays discarded.
 Cycle 75: `RecordLifecycleActionHeartbeat` is never called;
 `--heartbeat-timeout 900` is CONTINUE fallback (`eb-deploy.sh`
 L612). `DRAIN_CEILING_MS` 10 min fits inside. A-006 stays discarded.
+Cycle 76: nginx/ALB 600s on `/mcp`; Socket.IO 3600s. Node
+`setTimeout(0)` does not beat the proxy. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
