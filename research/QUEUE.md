@@ -148,4 +148,6 @@ Cycle 87: AgentWebPro empty on Q-014 / meter / wrap files.
 A-006 stays discarded.
 Cycle 88: OMP 0.85.1 unpublished experimental client/server.
 A-006 stays discarded.
+Cycle 89: Hermes still MCP client; parallel opt-in default
+false. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

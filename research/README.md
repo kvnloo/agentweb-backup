@@ -217,6 +217,10 @@ the empty file; do not HTTP-split to dodge collision.
 Cycle 88: Oh My Pi still **0.85.1**. They unpublished 0.85.0’s
 experimental client/server. Images stay in `pi-ai`. Cutting-edge
 is in-process packages; MCP is AgentWeb’s *external* bus (Q-014).
+Cycle 89: Hermes `mcp_tool.py` is still a **client**. Parallel
+`CallTool` is `supports_parallel_tool_calls` (default false).
+The Emma OAuth runbook does not set it. Q-014 lists; do not add
+a server mutex; do not rewrite Q-001.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

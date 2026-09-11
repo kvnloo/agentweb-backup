@@ -287,6 +287,13 @@ Cycle 88: **OMP 0.85.1 unpublished a server split.**
 devDependency. Images stay in `pi-ai` `sideEffects`. A-006 is
 the shape they rolled back.
 
+Cycle 89: **Hermes is still an MCP client.**
+`discover_builtin_tools` skips `mcp_tool.py`.
+`mcp_tool_server_run.py` is remote `MCPServerTask` lifecycle.
+Parallel is opt-in (`supports_parallel_tool_calls`, default
+false). `HERMES_MCP_OAUTH.md` does not set it. Q-014 lists;
+Hermes serializes unless Kevin opts in.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -115,6 +115,7 @@ v1.25.2 L678); AgentWeb adds no mutex. Cycle 84:
 video uses the same `$` / 0-token meter and is not on MCP.
 Cycle 87: AgentWebPro empty on those files plus `apiTools.ts`.
 Cycle 88: OMP 0.85.1 unpublished experimental client/server.
+Cycle 89: Hermes MCP parallel is opt-in (default false).
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

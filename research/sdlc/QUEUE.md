@@ -94,7 +94,8 @@ is $0.04; cost caps are Dynamo not git. Cycle 86: `generate_video` is the same
 `apiTools.ts` / `loops/core` / meter files (`llmPricing.ts`,
 `emmaTokenBudget.ts`, `imageGeneration.ts`). Cycle 88: OMP
 still 0.85.1; they unpublished experimental client/server.
-Product READY unchanged.
+Cycle 89: Hermes is still MCP client-only; parallel is opt-in
+(default false). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

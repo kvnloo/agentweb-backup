@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 88
+cycles_completed: 89
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 89
+next_cycle: 90
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 88: OMP still 0.85.1; 0.85.1 undid publishing
-  experimental client/server. Cycle 89: cheapest remaining.
-  Candidate: Hermes mcp_tool.py still client-only. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 89: Hermes is still MCP client-only; parallel CallTool
+  is opt-in (default false). Cycle 90: cheapest remaining.
+  Candidate: mcpClientService still skips self agentweb-tools.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

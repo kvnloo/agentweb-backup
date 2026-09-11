@@ -76,7 +76,7 @@ reverted. Do not copy that as A-006.
 | Eval / bench on tools | OMP “benchmaxxed” edits; metaharness package | `loops/` framework; human eval for images (not a router) |
 | Module boundary in CI | package graph / AST `discover_builtin_tools` | **No** (A-002 sketch only) |
 | Skills as files | `skills/` + optional-skills | Skills in system prompt + DB `foundation_tools` |
-| MCP | Client (`mcp_tool.py` skipped by discover) | Server for Hermes **and** client to vendors; self `"agentweb-tools"` **skipped** (`mcpClientService.ts` L420–432) |
+| MCP | Client (`mcp_tool.py` skipped by discover; `supports_parallel_tool_calls` default **false**, cycle 89) | Server for Hermes **and** client to vendors; self `"agentweb-tools"` **skipped** (`mcpClientService.ts` L420–432) |
 
 ## Implications (not a port)
 
@@ -213,3 +213,7 @@ reverted. Do not copy that as A-006.
 - Cycle 88: OMP 0.85.1 unpublished experimental client/server.
   Cutting-edge this month is in-process SDK + stdio, not a fifth
   `listen()`.
+- Cycle 89: Hermes `mcp_tool.py` is still a client loader.
+  `mcp_tool_server_run.py` is remote-session lifecycle. Parallel
+  MCP is `supports_parallel_tool_calls` default false. Do not
+  HTTP-split to get a mutex Hermes already owns on the client.
