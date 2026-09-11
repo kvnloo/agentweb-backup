@@ -26,9 +26,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 43: loop root is `runVerifiedChat` L5019 / `runScheduledChat`
-L5362 / `generateSessionResponse` L7908. **#2393** owns Slack
-`conversation/channelPort`. A-013 collision 4. A-006 stays discard.
+Cycle 44: Emma chat already `fork`s `generateMarketingResponseWorker.ts`
+(same `AgentModeService`). MCP `generate_image` hits the **parent**.
+A-006 stays discard. Q-014 lists the parent face.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

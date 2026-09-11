@@ -39,6 +39,16 @@ agentModeService.generateImage  L28857
 imageService.generateImage  (meter L5 + C2PA L575–578 + CRITICAL LOGO L477–484)
 ```
 
+**Parent vs worker (cycle 44).** MCP’s hop above runs in the **EB
+parent** (Express). In-app Emma does **not** take that hop: 
+`generateSessionResponse` L8256 `runInWorker` →
+`child_process.fork` (`generateMarketingResponseWorkerService.ts` L98)
+→ `workers/generateMarketingResponseWorker.ts` L16 `new AgentModeService()`
+then L123 `generateMarketingResponse`. Same 40k class, second OS
+process, 4GB heap, IPC for `publishAuthorizationOverride` /
+`approvedRevisionImageSources`. Health checks stay on the parent
+(L8254). Do not add HTTP in front of this fork.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
@@ -201,8 +211,10 @@ is `export * from './creative/imageGeneration'`. Closest analog:
 - Hermes tools run in-process next to `run_agent.py`; MCP is outbound.
 - OMP `pi-ai` is an in-process package; no localhost self-call.
 - AgentWeb already paid for an HTTP composition layer (`mcpFetch`) **and
-  still** lands in `agentModeService`. Copying Hermes’ MCP-as-client or
-  exploding that loopback into Kubernetes does not shrink the 40k file.
+  still** lands in `agentModeService`. Cycle 44: the **chat** path
+  additionally `fork`s a child that constructs another `AgentModeService`.
+  Copying Hermes’ MCP-as-client or exploding that loopback into Kubernetes
+  does not shrink the 40k file.
 - Cycle 41: the loop also **imports a controller**
   (`agentModeService.ts` L29894 → `controllers/blog.ts`). Cycle 42: five
   more service files do the same (`emmaEmailService.ts` L5 is a **static**
