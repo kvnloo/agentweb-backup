@@ -218,4 +218,6 @@ Cycle 120: git never chooses among 3001 / 8080 / 5000. A-006
 stays discarded.
 Cycle 121: a `/mcp` location is instance-only; ENG-836 allows it
 alone. Do not add A-021. A-006 stays discarded.
+Cycle 122: detect-changes skips drafts; ENG-836 never sees a
+draft `/mcp` PR. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -304,3 +304,5 @@ reverted. Do not copy that as A-006.
   `application:environment` in `.ebextensions`. Not A-006.
 - Cycle 121: a `/mcp` location is instance-only. ENG-836 allows
   it alone, forbids it with ALB `.ebextensions`. Not A-006.
+- Cycle 122: detect-changes skips drafts (`tests.yml` L18).
+  ENG-836 never sees a draft `/mcp` PR. Pass ≠ deployable.

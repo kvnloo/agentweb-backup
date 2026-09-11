@@ -358,6 +358,9 @@ test fixtures only (`eb-config-conflict.test.sh` L304).
 Cycle 121: a `/mcp` location is **instance-only**. ENG-836 allows
 it alone (test L188–192) and forbids it next to `timeout.config`
 (L124–130). `eb-deploy.sh` is not classified. Do not add A-021.
+Cycle 122: **detect-changes skips drafts** (`tests.yml` L18).
+The conflict job never runs on a draft `/mcp` PR. A pass still
+refuses deployability (test L200–201).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

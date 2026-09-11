@@ -481,6 +481,11 @@ instance. Test L188–192 instance-only **passes**. L124–130 +
 `timeout.config` is `EB_CONFIG_CONFLICT`. `eb-deploy.sh` is not
 classified (L196–197). Do not add A-021.
 
+Cycle 122: **detect-changes skips drafts.** `tests.yml` L16–18
+`draft == false` on the parent job. Conflict job `needs` it
+(L244–246). A draft `/mcp` PR never runs ENG-836. Pass still
+refuses deployability (script L232–233; test L200–201).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

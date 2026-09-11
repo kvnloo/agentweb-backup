@@ -196,6 +196,8 @@ Cycle 120: git never chooses among 3001 / 8080 / 5000. Zero
 unchanged.
 Cycle 121: a `/mcp` location is instance-only. ENG-836 allows it
 alone. Do not add A-021. Product READY unchanged.
+Cycle 122: detect-changes skips drafts. ENG-836 never sees a
+draft `/mcp` PR. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
