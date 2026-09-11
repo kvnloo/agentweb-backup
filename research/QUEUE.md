@@ -226,4 +226,6 @@ Cycle 124: ENG-836 skip is not draft; conflict job is not the
 discriminator. A-006 stays discarded.
 Cycle 125: hung ENG-836 still does not block merge; live ceiling
 is 12. A-006 stays discarded.
+Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress is
+the cancelled PASS. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

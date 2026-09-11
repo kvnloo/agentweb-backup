@@ -312,3 +312,5 @@ reverted. Do not copy that as A-006.
   filter. Conflict job is not `BACKEND_JOBS`. Not A-006.
 - Cycle 125: 5-minute comment is #2491; live ceiling is 12. Hung
   ENG-836 still PASSes merge-evidence. Not A-006.
+- Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress turns
+  it into cancelled PASS. Separate concurrency groups. Not A-006.

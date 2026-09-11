@@ -371,6 +371,10 @@ job timeout/cancel is outside the evidence set (L586–591).
 Cycle 125: **5-minute string is the #2491 receipt.** Live
 `timeout-minutes: 12` (`tests.yml` L248). Hung ENG-836 is
 `cancelled` (test L860–877 PASS). Failure still blocks.
+Cycle 126: **in-flight ENG-836 is PENDING** (script L726).
+Separate concurrency groups; Backend cannot keep ENG-836 in
+the evidence set. Required context is only `Detect changed
+projects` (script L871).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

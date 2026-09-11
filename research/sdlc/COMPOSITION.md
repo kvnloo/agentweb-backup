@@ -503,6 +503,12 @@ ceiling is 12 (`tests.yml` L248). `bad` excludes `cancelled`
 (script L596). Test L860–877: hung conflict job is PASS.
 `fetch-depth: 0` (L255) vs detect-changes `fetch-depth: 1` (L34).
 
+Cycle 126: **in-flight ENG-836 is PENDING.** `n_pending` is
+every incomplete check-run (script L726–728; test L318–322).
+Backend and conflict use different concurrency groups
+(`tests.yml` L73–75 vs L249–251). Required context is only
+`Detect changed projects` (script L871–874).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 125
+cycles_completed: 126
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 126
+next_cycle: 127
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 125: 5-minute string is #2491 receipt; live ceiling is 12;
-  hung ENG-836 still does not block merge. Cycle 126: cheapest
-  remaining. Candidate: cancel-in-progress on the conflict job
-  vs Backend build concurrency — same cancelled PASS?
+  Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress turns
+  it into the cancelled PASS. Cycle 127: cheapest remaining.
+  Candidate: required set is only Detect changed projects — is
+  ENG-1373 still open in this tree?
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

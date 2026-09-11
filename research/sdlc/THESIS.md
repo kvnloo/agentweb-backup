@@ -199,6 +199,9 @@ Cycle 124: ENG-836 skip is not draft. Discriminator has no path
 filter. `BACKEND_JOBS` is only `Backend build`. Do not add A-021.
 Cycle 125: 5-minute string is the #2491 receipt; live ceiling is
 12. Hung ENG-836 still PASSes. Do not add A-021.
+Cycle 126: in-flight ENG-836 is PENDING (script L726). Separate
+concurrency groups; Backend does not keep ENG-836 in the
+evidence set. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
