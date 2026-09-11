@@ -96,7 +96,11 @@ only `socket.join` (`user:${userId}`). CRM `io.to(socketId)` uses the
 implicit socket-id room. `codingAgentService.ts` L1828 emits
 `sessionId` and nothing joins it. `toolDispatch.ts` L1198 already
 emits `user:` on dispatch ports, not LoopPorts. A-017 does not unify
-these.
+these. Cycle 63: gtmPlan L1495 / admin L4749 / durableLanding L237 /
+agentModeController (seven sites) `await import('../server')` then
+emit to `user:`. `gtmPlan.ts` L12–13 is the documented load-time
+dodge; it is still the listen module. A-017 `getIo()` replaces it.
+Do not start that replacement at `agentModeController.ts`.
 
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at

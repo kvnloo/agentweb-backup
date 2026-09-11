@@ -35,7 +35,11 @@ Cycle 61: AgentWebPro still empty on `apiTools.ts` / `loops/core` /
 **#1544 + #1790**. `app.ts` is **#2271 + #1814**. Cycle 62: only
 `server.ts` L186 `socket.join(\`user:${userId}\`)`; CRM uses `socket.id`;
 codingAgent L1828 emits `sessionId` with no join. A-017 is a
-passthrough. A-006 stays discard. Product READY unchanged.
+passthrough. Cycle 63: ten dynamic `await import('../server')` sites
+(gtmPlan L1495, admin L4749, durableLanding L237, agentModeController
+**seven**) plus the three cycle-59 requires. A-017 first slice still
+the two `require`s, not the 15k controller. A-006 stays discard.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

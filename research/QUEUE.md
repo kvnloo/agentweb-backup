@@ -80,5 +80,8 @@ A-017 copies Fathom get/register, not LoopPorts. Cycle 61:
 AgentWebPro still empty on Q-014/A-002/A-017 first-slice files;
 `crm.ts` is #1544+#1790; `app.ts` is #2271+#1814. Cycle 62: only
 `server.ts` L186 joins `user:`; A-017 is a string-room passthrough
-(do not unify socket.id / sessionId). A-006 stays discarded.
+(do not unify socket.id / sessionId). Cycle 63: ten dynamic
+`import('../server')` sites (GTM/admin/durableLanding + seven in
+`agentModeController.ts`); A-017 first slice still the two `require`s.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

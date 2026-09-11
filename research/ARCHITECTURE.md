@@ -321,6 +321,9 @@ still empty. `crm.ts` #1544+#1790. `app.ts` #2271+#1814.
 Cycle 62: only `server.ts` L186 `socket.join(\`user:${userId}\`)`. CRM
 uses `socket.id`; codingAgent L1828 emits `sessionId` with no join.
 A-017 is a passthrough. A-006 discarded.
+Cycle 63: ten dynamic `await import('../server')` (gtmPlan L1495,
+admin L4749, durableLanding L237, seven in agentModeController).
+A-017 first slice is still the two `require`s. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

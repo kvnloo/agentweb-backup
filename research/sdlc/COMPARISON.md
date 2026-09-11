@@ -126,3 +126,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 62: one `socket.join` (`server.ts` L186 `user:`). CRM uses
   `socket.id`; codingAgent emits `sessionId` with no join. A-017 is a
   passthrough, not a room enum.
+- Cycle 63: `gtmPlan.ts` L12–13 / L1495 documents dynamic
+  `import('../server')`. Ten such sites plus cycle-59 requires.
+  Partner-portal GTMPlans listens with no client join.

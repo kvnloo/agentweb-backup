@@ -52,7 +52,9 @@ Cycle 58: `server.ts` drain (ENG-1189) is why mcpFetch must share this
 `listen()`. Cycle 59: `app.ts` → `crm.ts` L24 → `server.ts` already
 cycles; `registerIo` exists but `MinimalIo` cannot emit — park A-017
 (expand emit, do not HTTP-split CRM). Cycle 60: copy
-`getFathomLinearPort`, not `LoopPorts` (L143–150). The listed face is a
+`getFathomLinearPort`, not `LoopPorts` (L143–150). Cycle 63: dynamic
+`import('../server')` is the rest of the leak (`gtmPlan.ts` L12–13 /
+L1495). The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

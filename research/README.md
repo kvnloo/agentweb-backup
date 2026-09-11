@@ -104,6 +104,13 @@ already extracted the right direction (`server.ts` L18 imports the
 handler). Cycle 62: the only `socket.join` is `server.ts` L186
 (`user:${userId}`). CRM emits to `socket.id`; codingAgent L1828 emits
 `sessionId` with no join. A-017 is a passthrough, not a room enum.
+Cycle 63: `gtmPlan.ts` L12–13 already documents dynamic
+`import('../server')` to dodge the static cycle; L1495 still loads
+the listen module. Same at admin L4749, durableLanding L237, and
+**seven** `agentModeController` sites (`session-message-appended` to
+`user:`). Partner-portal `GTMPlans.tsx` L292–300 listens with no
+client join — server L186 is enough. A-017 first slice stays the two
+`require`s, not the 15k controller.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

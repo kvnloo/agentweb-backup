@@ -71,7 +71,9 @@ controllers:
 add Socket.IO to `LoopPorts` (cycle 60: copy `getFathomLinearPort`,
 `fathomWebhook.ts` L39). `#1790` still touches `crm.ts`. Cycle 62:
 only `server.ts` L186 joins `user:`; CRM `socket.id`; codingAgent
-`sessionId` with no join. A-017 does not unify rooms.
+`sessionId` with no join. A-017 does not unify rooms. Cycle 63: dynamic `import('../server')`
+in gtmPlan / admin / durableLanding / agentModeController (seven)
+is the rest of the leak. Do not start A-017 at the 15k controller.
 
 ## Proposed folders (logical nanoservices)
 

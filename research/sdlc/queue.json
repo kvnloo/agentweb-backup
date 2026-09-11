@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:55:00Z",
+  "updated_at": "2026-09-11T20:56:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -341,19 +341,23 @@
       "evidence": 5,
       "collision": 2,
       "score": 19,
-      "why": "Cycle 59–62. server.ts L2 imports app; crm.ts L24 imports io from server — ENG-1286 (instanceState.ts L24–30). registerIo already exists; MinimalIo is only in(room).fetchSockets so worker L184 and crmEnrichmentService L67 still require('../server') for to(room).emit. Cycle 60: the complete analog is fathomLinearPortRegistry (server.ts L44 register, fathomWebhook.ts L39 get). Cycle 62: only socket.join is server.ts L186 user:${userId}; CRM uses socket.id; codingAgent L1828 emits sessionId with no join — A-017 is a string passthrough, not a room enum. LoopPorts L143–150 has no Socket.IO. Cycle 61: AgentWebPro empty on sessionSockets / crmEnrichmentService / worker; crm.ts is #1544+#1790; app.ts is #2271+#1814. A-013 family (listen module, not controllers). Not A-006.",
+      "why": "Cycle 59–63. server.ts L2 imports app; crm.ts L24 imports io from server — ENG-1286. registerIo exists; MinimalIo cannot emit so worker L184 and crmEnrichmentService L67 require('../server'). Cycle 63: ten more await import('../server') sites — gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237, agentModeController.ts L1201/1302/1381/1419/1585/1695/1732 — documented at gtmPlan.ts L12–13 as a load-time dodge. Cycle 60: Fathom get/register analog. Cycle 62: only socket.join is server.ts L186 user:; CRM socket.id; codingAgent sessionId with no join. Cycle 61: AgentWebPro empty on sessionSockets / worker / crmEnrichment; crm.ts #1544+#1790; app.ts #2271+#1814. A-013 family. Not A-006. Do not start at agentModeController (14,929 lines).",
       "files": [
         "backend/src/services/sessionSockets.ts",
         "backend/src/services/generateMarketingResponseWorkerService.ts",
         "backend/src/services/crmEnrichmentService.ts",
         "backend/src/routes/crm.ts",
+        "backend/src/routes/gtmPlan.ts",
+        "backend/src/routes/admin.ts",
+        "backend/src/controllers/agentModeController.ts",
+        "backend/src/services/durableLandingService.ts",
         "backend/src/utils/instanceState.ts",
         "backend/src/services/fathomLinearPortRegistry.ts",
         "backend/src/services/chatSocketHandler.ts",
         "backend/src/loops/core/ports.ts",
         "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62: user:${userId} is the only socket.join; CRM uses socket.id; codingAgent emits sessionId with no join). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo() (Fathom getFathomLinearPort analog). Do not edit crm.ts (7815 lines; #1544 and #1790). Do not add Socket.IO to LoopPorts (ports.ts L143–150; A-002). Do not unify the three room conventions. Do not HTTP-split CRM. Do not start at Slack/WhatsApp (A-013). Do not edit app.ts (#2271 + #1814).",
+      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62: user:${userId} is the only socket.join; CRM uses socket.id; codingAgent emits sessionId with no join). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo() (Fathom getFathomLinearPort analog). Do not edit crm.ts (7815 lines; #1544 and #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice (14,929 lines; A-005 pile). Later adopters: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM. Do not edit app.ts (#2271 + #1814).",
       "harsha_db": false
     }
   ]
