@@ -489,7 +489,8 @@
         ".github/workflows/deploy.yml",
         "backend/src/services/asgLifecycleGuard.ts",
         "backend/.ebextensions/rolling.config",
-        "backend/.ebextensions/05-instance-recycling.config"
+        "backend/.ebextensions/05-instance-recycling.config",
+        "backend/.ebextensions/06-log-retention.config"
       ],
       "first_slice": "PARK until after Q-014, not instead. After verify_deployment succeeds, call ensure_termination_lifecycle_hook again so AutoScalingGroups[0] is the surviving Immutable ASG. Change the ENG-764 test from exactly one put to: one before update-environment AND one after verify. Do not add .ebextensions/07-termination-lifecycle.config (ENG-818). Do not disable InstanceRefreshEnabled. Do not HTTP-split.",
       "harsha_db": false
