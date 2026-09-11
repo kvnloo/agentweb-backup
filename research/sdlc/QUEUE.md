@@ -220,6 +220,8 @@ Cycle 131: merge-evidence has no `PARTNER_JOBS`; a partner-only
 PR PASSes with Partner skipped. Product READY unchanged.
 Cycle 132: no `WORKFLOW_JOBS`; editing `merge-evidence.sh` PASSes
 with CI script tests skipped. Product READY unchanged.
+Cycle 133: ENG-1377 relay and remotion builds are unnamed in
+merge-evidence. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -541,6 +541,11 @@ Cycle 132: **no `WORKFLOW_JOBS`.** Test L1196–1198: editing
 That job runs `merge-evidence.test.sh` (`tests.yml` L142).
 The gate does not require the job that tests the gate.
 
+Cycle 133: **ENG-1377 relay and remotion builds are unnamed**
+in merge-evidence. Zero mentions in the gate or its tests.
+Not in `NON_BACKEND`. Failure FAILs (`n_bad`); skip/cancel
+does not.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

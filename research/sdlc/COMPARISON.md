@@ -326,3 +326,5 @@ reverted. Do not copy that as A-006.
   PASSes with Partner skipped. Not A-006.
 - Cycle 132: no WORKFLOW_JOBS; editing merge-evidence.sh PASSes
   with CI script tests skipped. Not A-006.
+- Cycle 133: ENG-1377 relay and remotion builds are unnamed in
+  merge-evidence. Not A-006.

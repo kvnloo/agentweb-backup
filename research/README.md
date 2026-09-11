@@ -403,6 +403,10 @@ Cycle 132: **no `WORKFLOW_JOBS`.** Test L1196–1198: editing
 `merge-evidence.sh` PASSes with `CI script tests` skipped.
 That job runs `merge-evidence.test.sh` (`tests.yml` L142).
 Name-exists invariant does not list it (test L1498).
+Cycle 133: **ENG-1377 relay and remotion builds are unnamed**
+in merge-evidence. Zero mentions of those jobs or paths in
+the gate or its tests. Not in `NON_BACKEND`. Failure still
+FAILs (`n_bad`). Skip/cancel does not.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

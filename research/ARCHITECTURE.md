@@ -490,6 +490,8 @@ Cycle 131: merge-evidence has no `PARTNER_JOBS`; a partner-only
 PR PASSes with Partner skipped. A-006 discarded.
 Cycle 132: no `WORKFLOW_JOBS`; editing `merge-evidence.sh`
 PASSes with CI script tests skipped. A-006 discarded.
+Cycle 133: ENG-1377 relay and remotion builds are unnamed in
+merge-evidence. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
