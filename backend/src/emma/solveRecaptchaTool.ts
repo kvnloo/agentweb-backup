@@ -7,6 +7,9 @@ import { get2CaptchaApiKey } from '../utils/secretsManager';
 // bound it explicitly so a hung MCP call can't block the whole captcha solve.
 const SITE_KEY_PROBE_TIMEOUT_MS = 8000;
 
+import { recordVendorUsage } from '../services/usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -40,11 +43,55 @@ function extractMcpText(result: any): string {
   return String(result);
 }
 
+/**
+ * Record one 2captcha solve against the requesting user (ENG-1878, split from
+ * ENG-698).
+ *
+ * Called from exactly two places inside `submit2CaptchaTask`, and which two is
+ * the whole judgement call. 2captcha's stated policy is that you pay only for
+ * solved captchas, so the three failure shapes are not equivalent:
+ *
+ *   - submission rejected (`status !== 1`) — never accepted, never billed, not recorded;
+ *   - `ERROR_CAPTCHA_UNSOLVABLE` and friends while polling — 2captcha documents
+ *     these as free, not recorded;
+ *   - our own 3-minute poll deadline — the task WAS accepted and may have been
+ *     solved and charged after we stopped waiting. Recorded, because AC3 asks
+ *     for failures the vendor still billed, and silence here would understate.
+ *
+ * Recording the timeout makes 2captcha's allocated total an UPPER BOUND, in the
+ * same way X's already is. It is never a measured charge.
+ *
+ * Fire-and-forget: metering must never cost the caller its solve (AC5).
+ */
+function record2CaptchaSolve(userId: string | undefined, outcome: 'solved' | 'timeout'): void {
+  // try/catch for the same reason as the ElevenLabs meter: computeAllocatedCost
+  // throws on an unpriced unit by design (ENG-703 AC2), and AC5 forbids a
+  // metering failure costing the caller its solve. Loud in the log, not to the user.
+  try {
+    void recordVendorUsage({
+      userId,
+      provider: '2captcha',
+      operation: 'solve',
+      feature: `captcha:${outcome}`,
+      unit: 'solve',
+      quantity: 1,
+      costSource: 'allocated',
+      costUsd: computeAllocatedCost('2captcha', 'solve', 1),
+    });
+  } catch (error) {
+    console.error(
+      '[solveCaptcha] failed to meter 2captcha usage (solve still returned):',
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
 /** Submit a task to 2captcha and poll until solved. Returns the solution token. */
 async function submit2CaptchaTask(
   apiKey: string,
   params: Record<string, string>,
-  initialWaitMs: number
+  initialWaitMs: number,
+  userId: string | undefined
 ): Promise<string> {
   const submitUrl = new URL('https://2captcha.com/in.php');
   submitUrl.searchParams.set('key', apiKey);
@@ -73,14 +120,30 @@ async function submit2CaptchaTask(
   while (Date.now() < deadline) {
     const pollRes = await fetch(resultUrl.toString());
     const pollJson = await pollRes.json() as { status: number; request: string };
-    if (pollJson.status === 1) return pollJson.request;
+    if (pollJson.status === 1) {
+      record2CaptchaSolve(userId, 'solved');
+      return pollJson.request;
+    }
     if (pollJson.request !== 'CAPCHA_NOT_READY') {
       throw new Error(`2captcha error: ${pollJson.request}`);
     }
     await new Promise(r => setTimeout(r, 5000));
   }
+  // Accepted by the vendor, outcome unknown to us — see record2CaptchaSolve.
+  record2CaptchaSolve(userId, 'timeout');
   throw new Error('2captcha timed out — CAPTCHA not solved within 3 minutes');
 }
+
+/**
+ * Test seam for `submit2CaptchaTask` (ENG-1878).
+ *
+ * The helper is module-private on purpose — all five call sites funnel through
+ * it, which is what makes it the right metering chokepoint — but the billing
+ * semantics it encodes (which failures the vendor charges for) are the part
+ * most worth asserting, and they are unreachable from the exported tool without
+ * standing up an entire MCP browser session.
+ */
+export const __test_submit2CaptchaTask = submit2CaptchaTask;
 
 /** Inject a token into the page for a given CAPTCHA type and fire any registered callbacks. */
 function buildInjectCode(captchaType: string, token: string): string {
@@ -351,7 +414,7 @@ emmaToolRegistry.register({
           googlekey: resolvedSiteKey,
           pageurl: page_url,
           ...(invisible ? { invisible: '1' } : {})
-        }, 15000);
+        }, 15000, userId);
         break;
 
       case 'recaptcha_v3':
@@ -362,7 +425,7 @@ emmaToolRegistry.register({
           pageurl: page_url,
           action,
           min_score: String(min_score)
-        }, 20000);
+        }, 20000, userId);
         // v3: return token for Emma to inject — no standard injection target
         return {
           success: true,
@@ -376,7 +439,7 @@ emmaToolRegistry.register({
           method: 'hcaptcha',
           sitekey: resolvedSiteKey,
           pageurl: page_url
-        }, 15000);
+        }, 15000, userId);
         break;
 
       case 'turnstile':
@@ -384,7 +447,7 @@ emmaToolRegistry.register({
           method: 'turnstile',
           sitekey: resolvedSiteKey,
           pageurl: page_url
-        }, 10000);
+        }, 10000, userId);
         break;
 
       case 'funcaptcha':
@@ -392,7 +455,7 @@ emmaToolRegistry.register({
           method: 'funcaptcha',
           publickey: resolvedSiteKey,
           pageurl: page_url
-        }, 30000);
+        }, 30000, userId);
         break;
 
       default:

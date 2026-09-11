@@ -421,7 +421,15 @@ describe("UsageCostByUserTab rendering", () => {
 
     // Default is "all". A figure that silently omits ElevenLabs, 2captcha and
     // Placid would read as the vendor envelope being comfortably met.
-    expect(screen.getByTestId("undercount-caveat")).toHaveTextContent("undercount");
+    const caveat = screen.getByTestId("undercount-caveat");
+    expect(caveat).toHaveTextContent("undercount");
+    // Names only what is genuinely unmetered. ENG-1878 metered ElevenLabs and
+    // 2captcha; leaving them here would tell an admin their usage is absent
+    // when it is present — a worse error than the undercount being disclosed
+    // (CodeRabbit, PR #2864).
+    expect(caveat).toHaveTextContent("Placid");
+    expect(caveat).not.toHaveTextContent("ElevenLabs");
+    expect(caveat).not.toHaveTextContent("2captcha");
 
     await selectProvider("X (Twitter)");
     await waitFor(() => expect(screen.queryByTestId("undercount-caveat")).not.toBeInTheDocument());

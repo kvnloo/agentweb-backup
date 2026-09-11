@@ -6378,6 +6378,21 @@ export class AgentModeService {
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
+    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
+    // emmaToolRegistry (the module-level singleton) is independently confirmed to
+    // contain both publish_landing_page_changes and get_landing_page_preview_url
+    // (throwaway script, 210 tools). registerTools() copies from that singleton into
+    // THIS instance's own this.toolRegistry at boot — never independently verified
+    // that the copy is complete on a real running server. This log settles it.
+    console.log('[ENG-1852-DIAG]', JSON.stringify({
+      allToolsCount: allTools.length,
+      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
+      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
+      associatedToolNamesCount: associatedToolNames.size,
+      excludedToolsCount: excludedTools.size,
+      publishedSkillsCount: publishedSkills.length,
+    }));
+
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
