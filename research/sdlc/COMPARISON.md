@@ -53,7 +53,9 @@ AgentWeb:   customer-portal (other repo)
 
 AgentWeb mapping: `pi-ai` ≈ `imageGeneration.ts` + `llmClients.ts`;
 `pi-agent-core` ≈ `agentModeService.ts`. The image arrow already matches.
-The mismatch is `utils/llmClients.ts` importing `services/usageRecorderService`
+`pi-coding-agent` ≉ a subprocess here: `codingAgentService.ts` is
+in-process and imports the god object (cycle 26 / A-010). The other
+mismatch is `utils/llmClients.ts` importing `usageRecorderService`
 (OMP `pi-utils` would not depend on the app). That is A-009, parked.
 
 ## Agentic SDLC practices

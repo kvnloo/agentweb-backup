@@ -208,6 +208,8 @@ the Hermes split (`workflowTools.ts`); `apiTools.ts` is 85 tools in one
 file. Cycle 24: do not put Q-014 in a `content.ts` extract — Content
 already imports `agentModeService`. Cycle 25: that MCP tool already
 loopbacks `http://localhost` into `generateImage` (`COMPOSITION.md`).
+Cycle 26: in-app path is `toolDispatch` → `executeTool` (no HTTP);
+`codingAgentService.ts` is not a subprocess.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

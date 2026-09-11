@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:04:00Z",
+  "updated_at": "2026-09-11T19:07:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -175,6 +175,24 @@
         "backend/src/services/usageRecorderService.ts"
       ],
       "first_slice": "PARK. Optional later: a money package that both utils and creative may import. Do not do this instead of Q-014.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-010",
+      "title": "Stop codingAgentService importing agentModeService (use context.llmModel)",
+      "status": "park",
+      "leverage": 3,
+      "product": 1,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 1,
+      "score": 23,
+      "why": "Cycle 26. THESIS called it a subprocess; it is 2387 lines in-process. L13 imports the 40k file for getCodingAgentDefaultModel (L2176) while emma/tools.ts L7582 already passes llmModel. OMP pi-coding-agent is a package on agent-core, not a god-object import. Not a fifth deploy unit.",
+      "files": [
+        "backend/src/services/codingAgentService.ts",
+        "backend/src/emma/tools.ts"
+      ],
+      "first_slice": "PARK until after Q-014 / A-002 / A-007. Then: prefer context.llmModel || DEFAULT_CODING_AGENT_MODEL, delete the agentModeService import. Tests spy getCodingAgentDefaultModel — update those spies. Do not edit emma/tools.ts while #2832 is open. Do not spawn a process.",
       "harsha_db": false
     }
   ]

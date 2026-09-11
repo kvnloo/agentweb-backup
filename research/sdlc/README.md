@@ -13,7 +13,7 @@ This is a **parallel track** to the product queue (`QUEUE.md`). It does
 | `COMPARISON.md` | Hermes / OMP / AgentWeb, with file-level numbers |
 | `queue.json` + `QUEUE.md` | A-items (architecture), not product ranks |
 | `A-007-split-map.md` | Section → file map; first slice is infrastructure.ts |
-| `COMPOSITION.md` | MCP → localhost emmaApi → agentModeService hops |
+| `COMPOSITION.md` | MCP loopback + in-app toolDispatch hops; coding agent |
 | `../cycles/017-*.md` | First architecture cycle receipt |
 
 Product work when unlocked is still Q-014. This track answers “how the

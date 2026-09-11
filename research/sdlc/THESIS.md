@@ -47,8 +47,10 @@ diagram: `COMPOSITION.md`.
    ENG-982 already extracted `workflowTools.ts`. `apiTools.ts` still
    has 85 registers; splitting along its section headers is the
    Hermes `tools/*.py` move that does **not** wait on #2832 (A-007).
-4. **Coding agent** — already a sub-agent process in `codingAgentService.ts`,
-   not a new deploy.
+4. **Coding agent** — `codingAgentService.ts` is an **in-process**
+   sub-loop (2,387 lines, no `spawn`/`fork`), not a deploy unit. It
+   imports `agentModeService` for one settings read (A-010 park). OMP
+   `pi-coding-agent` is a package; do not copy that into a fifth process.
 
 ## Cutting-edge vs this tree
 

@@ -17,14 +17,14 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
+| — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-003 | 16 | park | Wire `executeAgentStep` (Harsha / Q-010) |
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 25: MCP `generate_image` already loopbacks into
-`agentModeService.generateImage` (`COMPOSITION.md`). A-006 stays
-discard. A-008 still does not edit `emmaApi.ts`.
+Cycle 26: coding agent is in-process (A-010 park). MCP vs in-app
+`generate_image` are two faces of `executeTool`. A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

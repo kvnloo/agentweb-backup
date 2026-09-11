@@ -37,13 +37,32 @@ agentModeService.generateImage  L28857
 imageService.generateImage  (meter + C2PA inside the leaf / recorder)
 ```
 
-In-app Emma does **not** use MCP for this tool. It hits the same
-`generateImage` method from the 40k switch / `toolDispatch`. Two faces,
-one policy method.
+In-app Emma does **not** use MCP for this tool (cycle 26):
+
+```
+toolDispatch.ts L930–936
+    ports.executeAgentToolThroughGateway
+    execute: () => ports.executePreparedAgentTool(...)
+    ▼
+agentModeService.executePreparedAgentTool  L8773
+    ▼
+this.executeTool(...)  L8804   ← same generateImage policy, no HTTP
+```
+
+Two inbound faces, one policy method. Hermes has one in-process tool
+table plus MCP *outbound*.
 
 `emmaApi.ts` has **59** `getAgentModeService()` calls. The REST surface
 already looks like logical nanoservices; almost every route funnels into
 the god object. `/email` is a rare exception (`emailProviderService`).
+
+## Coding agent (cycle 26)
+
+`codingAgentService.ts` (2,387 lines) is **not** a subprocess. It
+`mcpFetch`es landing-page files (loopback) and imports `agentModeService`
+only to ignore `context.llmModel` (already set at `emma/tools.ts` L7582)
+in favor of `getCodingAgentDefaultModel()`. A-010: drop that import; do
+not extract a fifth deploy unit.
 
 ## What this means
 
