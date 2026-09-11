@@ -412,6 +412,11 @@ Cycle 109: **enhanced-health probe is deploy-verify, not drain.**
 `LAGGING` is new-instance-already-Ok after the old is gone.
 Dry-run cannot change deploy exit (`deploy.yml` L213).
 
+Cycle 110: **weekly refresh overlaps without that probe.**
+`05-instance-recycling.config` L8–13. `deploy.yml` L199–204: EB
+starts it, GitHub Actions does not. Same ASG hook, no
+`underlying_health_verdict`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -309,6 +309,11 @@ Cycle 109: `underlying_health_verdict` (`eb-deploy.sh` L270–375)
 is **deploy-verify**, not drain. Zero `backend/src` callers.
 `LAGGING` is stale Red after the old instance is already gone.
 Do not call it from `runDrain`. Do not HTTP-split to host it.
+Cycle 110: weekly refresh (`05-instance-recycling.config` L8–13,
+`Sun:10:00`) overlaps **without** `eb-deploy.sh`. GitHub Actions
+does not start it (`deploy.yml` L199–204). Same ASG hook, no
+ENG-878 probe. A-019’s window is weekly. Do not disable
+`InstanceRefreshEnabled`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

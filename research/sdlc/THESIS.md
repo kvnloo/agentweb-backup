@@ -158,6 +158,8 @@ health threshold.
 Cycle 109: `underlying_health_verdict` is a GitHub Actions probe
 (ENG-878), not runtime drain. Copying it into the process would
 bless the dying instance. Do not HTTP-split to host it.
+Cycle 110: Sunday recycle overlaps without that probe. A-019 is
+weekly, not only on merge. Do not disable `InstanceRefreshEnabled`.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -446,6 +446,8 @@ Cycle 108: ALB health cannot stop Hermes during drain; `/health`
 must stay 200 until close. A-006 discarded.
 Cycle 109: enhanced-health probe is deploy-verify, not drain.
 A-006 discarded.
+Cycle 110: weekly refresh overlaps without the deploy probe.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

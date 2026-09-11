@@ -280,3 +280,5 @@ reverted. Do not copy that as A-006.
 - Cycle 109: enhanced-health probe is deploy-verify (ENG-878).
   Zero process callers. `LAGGING` is post-terminate. Not a fifth
   `listen()`.
+- Cycle 110: weekly `InstanceRefreshEnabled` overlaps without
+  `eb-deploy.sh`. Same ASG hook, no ENG-878 probe. Not A-006.
