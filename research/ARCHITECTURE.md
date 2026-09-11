@@ -216,6 +216,8 @@ Cycle 28: `awsAdapters.ts` is the host; do not copy Hermes
 `discover_builtin_tools` into A-007.
 Cycle 29: `mcp_config` `"agentweb-tools"` self-MCP is skipped as circular
 (`mcpClientService.ts` L420–432).
+Cycle 30: leaf callers skip `generateImage`; OMP is `@earendil-works/pi-ai`
+0.85.1 (arrow unchanged).
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

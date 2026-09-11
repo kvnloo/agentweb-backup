@@ -52,6 +52,12 @@ this.executeTool(...)  L8804   ← same generateImage policy, no HTTP
 Two inbound faces, one policy method. Hermes has one in-process tool
 table plus MCP *outbound*.
 
+Cycle 30: **leaf callers skip the policy method** and still must stay
+in-process with the meter: `controllers/blog.ts` L648,
+`workPlanThumbnailService.ts` L98, `videoGeneration.ts` L875,
+`onboardingAdImageService.ts`. An HTTP mesh in front of `emmaApi` would
+not see them. A-008 re-export does.
+
 `emmaApi.ts` has **59** `getAgentModeService()` calls. The REST surface
 already looks like logical nanoservices; almost every route funnels into
 the god object. `/email` is a rare exception (`emailProviderService`).

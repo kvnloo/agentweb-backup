@@ -1,7 +1,7 @@
 # Code-quality comparison for agentic development
 
-Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **18:58Z**. Hermes and OMP
-via public GitHub; AgentWeb from this clone.
+Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **19:17Z** (cycle 30). Hermes
+and OMP via public GitHub; AgentWeb from this clone.
 
 ## Size (what an agent must hold)
 
@@ -15,7 +15,7 @@ via public GitHub; AgentWeb from this clone.
 | `executeAgentStep` | skeleton **throws** | `core/agentStep.ts` L48–55 |
 | Hermes largest Python | ~392 KB `plugins/platforms/telegram/adapter.py` | Still big, but **plugins**, not the loop |
 | Hermes `tools/` | many files, self-register | Documented acyclic import: registry ← tools ← model_tools |
-| OMP `@oh-my-pi/pi-agent-core` etc. | bun **packages/** | `packages/agent`, `ai`, `catalog`, `coding-agent`, `tui`, `natives` (Rust), `wire` |
+| OMP `@earendil-works/pi-ai` etc. | bun **packages/** | `pi-ai`, `pi-agent-core`, `pi-coding-agent` (scope renamed from `@oh-my-pi`, cycle 30) |
 | OMP largest TS | `packages/coding-agent/src/session/agent-session.ts` **445 KB** | They also have god files; they **contain** them in a package |
 | OMP README claim | ~80k lines Rust core | `crates/pi-builtins`, `pi-shell` |
 
@@ -43,21 +43,19 @@ AgentWeb:   customer-portal (other repo)
             for image gen. Creative leaf still matches OMP.
 ```
 
-## OMP workspace DAG (2026-09-11 `package.json`)
+## OMP workspace DAG (live 2026-09-11T19:17Z `earendil-works/pi` **0.85.1**)
 
-| Package | Depends on `@oh-my-pi/*` | Must not depend on |
+Cycle 20 used `@oh-my-pi/*`. npm scope is now `@earendil-works/*`. Arrow
+unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
+
+| Package | Depends on `@earendil-works/*` (0.85.1) | Must not depend on |
 |---|---|---|
-| `pi-catalog` | omptype, pi-utils | agent-core, coding-agent |
-| `pi-ai` | catalog, natives, utils, wire, omptype | **agent-core** |
-| `pi-agent-core` | **pi-ai**, catalog, natives, utils, wire, snapcompact | coding-agent |
-| `pi-coding-agent` | agent-core, pi-ai, tui, mnemopi, … | — |
+| `pi-ai` | pi-telemetry; **no** agent-core | **agent-core** |
+| `pi-agent-core` | **pi-ai**, chord, pi-telemetry | coding-agent |
 
-AgentWeb mapping: `pi-ai` ≈ `imageGeneration.ts` + `llmClients.ts`;
-`pi-agent-core` ≈ `agentModeService.ts`. The image arrow already matches.
-`pi-coding-agent` ≉ a subprocess here: `codingAgentService.ts` is
-in-process and imports the god object (cycle 26 / A-010). The other
-mismatch is `utils/llmClients.ts` importing `usageRecorderService`
-(OMP `pi-utils` would not depend on the app). That is A-009, parked.
+Cycle 20 catalog/utils/wire names may have folded into this publish; the
+AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
+`pi-agent-core` ≈ `agentModeService.ts`.
 
 ## Agentic SDLC practices
 
