@@ -433,6 +433,11 @@ L654–655; test L1066–1091 exactly one). `main()` after verify only
 `ensure_deregistration_delay` (L895–897). Sunday
 `InstanceRefreshEnabled` never re-puts. Park A-020.
 
+Cycle 114: **guard still drains without a hook; ASG does not wait.**
+Two IMDS `Terminated` reads (`asgLifecycleGuard.ts` L232–296;
+test L267–283). `disableCron` is first in `runDrain` (`server.ts`
+L387). 3m19s is two-instance overlap, not `Terminating:Wait`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

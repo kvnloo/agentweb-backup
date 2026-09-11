@@ -454,6 +454,8 @@ Cycle 112: 3×1200s settle is not a wait; `fail()` exits attempt 1.
 A-006 discarded.
 Cycle 113: last deploy’s hook dies with the Immutable ASG. Park
 A-020. A-006 discarded.
+Cycle 114: guard still drains without a hook; ASG does not wait.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

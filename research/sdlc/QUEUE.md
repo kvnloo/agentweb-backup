@@ -176,6 +176,9 @@ budget 2700s caps retries. Product READY unchanged.
 Cycle 113: last deploy’s hook dies with the Immutable ASG.
 Sunday recycle is not that hook. Park **A-020**. Product READY
 unchanged.
+Cycle 114: guard still drains without a hook; ASG does not wait.
+Two IMDS `Terminated` reads; `disableCron` first. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

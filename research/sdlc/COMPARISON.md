@@ -288,3 +288,5 @@ reverted. Do not copy that as A-006.
   attempt 1; 2700s total caps retries. Not a 3600s third clock.
 - Cycle 113: last deploy’s hook dies with the Immutable ASG.
   Sunday recycle is not that hook. Park A-020. Not A-006.
+- Cycle 114: guard still drains without a hook; ASG does not
+  wait. Two IMDS `Terminated` reads. Not a fifth `listen()`.

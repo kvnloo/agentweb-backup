@@ -329,6 +329,9 @@ L1066–1091 exactly one). After swap the serving group is unhooked.
 Sunday `InstanceRefreshEnabled` never calls `eb-deploy.sh`. Park
 **A-020** (second put after verify). Do not restore `.ebextensions`
 hook (ENG-818).
+Cycle 114: guard still drains without a hook; ASG does not wait.
+Two IMDS `Terminated` reads then `disableCron`. 3m19s is overlap,
+not park. A-019 fires only if drain starts.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
