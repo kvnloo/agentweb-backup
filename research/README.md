@@ -419,6 +419,10 @@ Cycle 136: **customer-portal is a fifth repo (gitignored).**
 `.gitignore` L121–124. No directory in this tree. `tests.yml`
 / `deploy.yml` grep empty. Test L1044–1047 path is synthetic.
 CLAUDE.md L155 (“in this repo”) is stale vs L894.
+Cycle 137: **the other repo’s IA is a typed list in this
+backend.** `customerPortalPages.ts` L28–124;
+`GET /customer-portal-pages` (`subscription.ts` L322–325).
+Policy is the constant; HTTP is the other origin. Not A-006.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

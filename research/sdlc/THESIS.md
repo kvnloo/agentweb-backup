@@ -228,6 +228,9 @@ job. Remotion got ENG-1377; the Python worker did not. Do not
 add A-021.
 Cycle 136: customer-portal is a fifth repo (gitignored), not a
 fifth process. CLAUDE.md L155 is stale. Do not add A-021.
+Cycle 137: `customerPortalPages.ts` is the other repo’s IA as
+an in-process list plus one GET. Not a fifth `listen()`. Do not
+add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

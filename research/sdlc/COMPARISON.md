@@ -334,3 +334,5 @@ reverted. Do not copy that as A-006.
   job. Not A-006.
 - Cycle 136: customer-portal is a fifth repo (gitignored), not
   a fifth process. Not A-006.
+- Cycle 137: other repo IA is a typed list in this backend
+  (customerPortalPages.ts), one GET. Not A-006.

@@ -561,6 +561,11 @@ Cycle 136: **customer-portal is a fifth repo (gitignored).**
 grep empty. Test L1044–1047 path is synthetic. CLAUDE.md L155
 is stale vs L894.
 
+Cycle 137: **the other repo’s IA is a typed list in this
+backend.** `customerPortalPages.ts` L28–124;
+`GET /customer-portal-pages` (`subscription.ts` L322–325).
+Policy is the constant; HTTP is the other origin. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

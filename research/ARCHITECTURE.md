@@ -498,6 +498,8 @@ Cycle 135: agent-engine is a deploy unit with no GitHub build
 job. A-006 discarded.
 Cycle 136: customer-portal is a fifth repo (gitignored), not a
 fifth process. A-006 discarded.
+Cycle 137: the other repo’s IA is a typed list in this backend,
+not an HTTP nanoservice. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
