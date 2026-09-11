@@ -12046,8 +12046,22 @@ export const agentModeController = {
         }
       });
 
-      // At least one email notification is always required for scheduled chats
-      if (effectiveEmailNotifications.length === 0) {
+      // ENG-1836: require an address only where this schedule actually HAD one.
+      //
+      // The blanket check assumed every schedule carries a notification address,
+      // which stopped being true when ENG-1723 began auto-creating outreach
+      // schedules with `emailNotifications: []`. The customer never asked for that
+      // schedule, so the first thing many will do is edit it — narrow the ICP,
+      // rename it, change the cadence — and every one of those edits returned a
+      // 400 until they also supplied an address they never chose to give, for
+      // notifications they never requested.
+      //
+      // The invariant is still enforced where it held: clearing the last address
+      // off a schedule that has one is still refused. Only a schedule that never
+      // had one is allowed to stay that way.
+      const hadEmailNotifications =
+        normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
+      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
