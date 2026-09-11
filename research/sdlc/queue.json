@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:41:00Z",
+  "updated_at": "2026-09-11T20:52:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -319,7 +319,7 @@
       "evidence": 5,
       "collision": 4,
       "score": 16,
-      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. Cycle 57: #2271 also edits slackChannelAdapter.ts, app.ts, and db.ts (Harsha). Do not start at WhatsApp/messaging-channels either. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
+      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. Cycle 57: #2271 also edits slackChannelAdapter.ts, app.ts, and db.ts (Harsha). Do not start at WhatsApp/messaging-channels either. Cycle 59 sibling A-017 is the listen-module leak (crm/server), not controllers. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
       "files": [
         "backend/src/services/emmaEmailService.ts",
         "backend/src/services/revisionService.ts",
@@ -329,6 +329,31 @@
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "PARK. Do not start at routes/slack.ts (#2393) or whatsappWebhook / messagingChannels / slackChannelAdapter (#2271). After #2393, email/eval can implement conversation/channelPort. Do not lift generateSessionResponse instead of Q-014. Do not add HTTP. #1076 touches chatbotService.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-017",
+      "title": "Stop CRM/worker importing server.ts; expand sessionSockets IoPort with emit",
+      "status": "park",
+      "leverage": 2,
+      "product": 2,
+      "mergeability": 3,
+      "evidence": 5,
+      "collision": 2,
+      "score": 19,
+      "why": "Cycle 59–61. server.ts L2 imports app; crm.ts L24 imports io from server — ENG-1286 (instanceState.ts L24–30). registerIo already exists; MinimalIo is only in(room).fetchSockets so worker L184 and crmEnrichmentService L67 still require('../server') for to(room).emit. Cycle 60: the complete analog is fathomLinearPortRegistry (server.ts L44 register, fathomWebhook.ts L39 get) — sessionSockets has register and no getIo(). chatSocketHandler.ts L17–20 already extracted the right direction. LoopPorts L143–150 has no Socket.IO; adding it punches A-002. Cycle 61: AgentWebPro empty on sessionSockets / crmEnrichmentService / worker; crm.ts is #1544+#1790; app.ts is #2271+#1814. Hermes packages do not import the CLI for sockets. A-013 family (listen module, not controllers). Not A-006.",
+      "files": [
+        "backend/src/services/sessionSockets.ts",
+        "backend/src/services/generateMarketingResponseWorkerService.ts",
+        "backend/src/services/crmEnrichmentService.ts",
+        "backend/src/routes/crm.ts",
+        "backend/src/utils/instanceState.ts",
+        "backend/src/services/fathomLinearPortRegistry.ts",
+        "backend/src/services/chatSocketHandler.ts",
+        "backend/src/loops/core/ports.ts",
+        "research/sdlc/COMPOSITION.md"
+      ],
+      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit. Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo() (Fathom getFathomLinearPort analog). Do not edit crm.ts (7815 lines; #1544 and #1790). Do not add Socket.IO to LoopPorts (ports.ts L143–150; A-002). Do not HTTP-split CRM. Do not start at Slack/WhatsApp (A-013). Do not edit app.ts (#2271 + #1814).",
       "harsha_db": false
     }
   ]

@@ -72,6 +72,25 @@ Cycle 58: **drain is the listen() proof.** `drainForShutdown`
 (ENG-1189). A fifth image `listen()` is not in that drain. `server.ts`
 L41–44 `registerFathomLinearPort` is an in-process port at this root.
 
+Cycle 59: **the two roots already import each other.** `server.ts` L2
+imports `app`; `app.ts` L40/L405 mounts `crm.ts`, which L24
+`import { io } from '../server'`. That is ENG-1286
+(`instanceState.ts` L24–30). `registerIo` (`sessionSockets.ts` L9–12 /
+`server.ts` L113) was the break; `MinimalIo` is only
+`in(room).fetchSockets`, so `generateMarketingResponseWorkerService.ts`
+L184 and `crmEnrichmentService.ts` L67 still `require('../server')`
+for `to(room).emit`. A-017 expands that port. Not a fifth listen().
+
+Cycle 60: **copy Fathom, not LoopPorts.** `fathomWebhook.ts` L39
+`getFathomLinearPort()` never imports `server.ts`. `sessionSockets`
+has `registerIo` and no `getIo()`. `chatSocketHandler.ts` L17–20 is
+listen-module → handler (ENG-1222). `LoopPorts` L143–150 has no
+Socket.IO; adding it would punch A-002.
+
+Cycle 61: AgentWebPro still empty on `sessionSockets` / worker /
+`crmEnrichmentService`. `crm.ts` is #1544+#1790. `app.ts` is
+#2271+#1814 — A-007 still not `app.ts`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

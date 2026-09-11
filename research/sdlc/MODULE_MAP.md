@@ -62,6 +62,8 @@ README: zero host imports. **True for `services/` / `db.ts`.** Core
 `loops/core/**` → `services|emma|db`, and **allow** `core → ../index`.
 Cycle 35: `loops/index.ts` itself may only import `./core/types`.
 `app.ts` L118–120 is the composition root (explicit instance register).
+Cycle 61: **#2271 and #1814** both edit `app.ts` — A-007 still attaches
+at `mcpServerCore`.
 
 ## MCP files (Hermes analog)
 

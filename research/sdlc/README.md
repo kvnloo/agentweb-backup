@@ -7,7 +7,7 @@ compare to cutting-edge strategies; improve the SDLC to get there.
 This is a **parallel track** to the product queue (`QUEUE.md`). It does
 **not** un-ready Q-001 / Q-014 / Q-003. `coding_unlocked` is **true**
 (Kevin asked for real PRs; product work is on `#2` / `#3`, not this
-research branch).
+research branch). Cycle 59 parked A-017 (CRM/worker → `server.ts`).
 
 | Artifact | Role |
 |---|---|

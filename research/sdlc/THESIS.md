@@ -49,7 +49,10 @@ already (OMP DAG); park A-016 until A-002. Cycle 57: `app.ts` is the
 composition root (`setupMcpServer` L204, loop `register*` L475–491);
 #2271 owns its route table — A-007 still attaches at `mcpServerCore`.
 Cycle 58: `server.ts` drain (ENG-1189) is why mcpFetch must share this
-`listen()`. The listed face is a
+`listen()`. Cycle 59: `app.ts` → `crm.ts` L24 → `server.ts` already
+cycles; `registerIo` exists but `MinimalIo` cannot emit — park A-017
+(expand emit, do not HTTP-split CRM). Cycle 60: copy
+`getFathomLinearPort`, not `LoopPorts` (L143–150). The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
@@ -88,7 +91,7 @@ Hop diagram: `COMPOSITION.md`.
 | One file per tool | `tools/*.py` self-register | 31 tools, split packages | `emma/tools.ts` 9.8k lines; `apiTools.ts` 3.6k |
 | Typed tool registry | `tools/registry.py` | package `agent` | **Four** in-process tables (cycle 37): `mcpToolRegistry`, `emmaToolRegistry` (3-line `emma/registry.ts`), vendor MCP client, per-session `this.toolRegistry`. Monolith copies Emma tools at L1891 |
 | Characterization / eval | ~25k pytest files claimed | edit benchmarks, metaharness | Characterization harness exists; god file still grows (24k → **40.5k** since Jun) |
-| Boundary linter | import chain documented | workspace packages | **None**. Cycle 42: at least six `services/` files import `controllers/` (A-013) |
+| Boundary linter | import chain documented | workspace packages | **None**. Cycle 42: at least six `services/` files import `controllers/` (A-013). Cycle 59: CRM/worker import the listen module (`server.ts`); park A-017 |
 | Network extract | MCP *clients* to other servers | browser-relay, collab-web as packages | MCP *server*; don’t invert it |
 
 ## SDLC to get there (when coding is unlocked)

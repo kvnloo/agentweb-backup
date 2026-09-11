@@ -22,6 +22,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
+| — | A-017 | 19 | park | Stop CRM/worker importing `server.ts`; expand sessionSockets emit |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
 | — | A-003 | 16 | park | Wire `executeAgentStep` (Harsha / Q-010) |
@@ -29,9 +30,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 58: `server.ts` drain (ENG-1189 L404–413) proves mcpFetch is
-loopback to **this** `listen()`. A-006 would need a second drain. A-007
-still not `app.ts` / `server.ts`. A-006 stays discard. Product READY unchanged.
+Cycle 61: AgentWebPro still empty on `apiTools.ts` / `loops/core` /
+`sessionSockets.ts` / worker / `crmEnrichmentService`. `crm.ts` is
+**#1544 + #1790**. `app.ts` is **#2271 + #1814**. A-017 first slice
+stays off `crm.ts`. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -74,5 +74,9 @@ image execute cannot skip `lookupUser` via ENG-1596. Cycle 54: A-007
 copies workflowTools **shape**, not admin identity. Cycle 55: remotion
 isolate vs image host adapter. Cycle 56: MCP client/server already
 acyclic; A-016 parked. Cycle 57: #2271 owns `app.ts`; A-007 does not
-touch it. Cycle 58: ENG-1189 drain is the listen() proof. A-006 stays discarded.
+touch it. Cycle 58: ENG-1189 drain is the listen() proof. Cycle 59:
+`crm.ts` L24 imports `server.ts` (ENG-1286); park A-017. Cycle 60:
+A-017 copies Fathom get/register, not LoopPorts. Cycle 61:
+AgentWebPro still empty on Q-014/A-002/A-017 first-slice files;
+`crm.ts` is #1544+#1790; `app.ts` is #2271+#1814. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -40,7 +40,9 @@ Q-014.
 
 Nanoservice mesh of Emma: **no**. Modular monolith + existing four
 deploy units: **yes**. Map: `research/sdlc/THESIS.md`. SDLC first
-slices after unlock (not instead of Q-014): A-002, A-005.
+slices after unlock (not instead of Q-014): A-002, A-007, A-008.
+Do not edit `crm.ts` / `server.ts` as architecture first slices (A-017
+parked; ENG-1286).
 
 ## If we only do one product thing
 

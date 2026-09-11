@@ -43,6 +43,7 @@ AgentWeb:   customer-portal (other repo)
             mcp/server/registry ──► already imports evaluationPolicy (not loops-clean)
             mcp/client ↛ mcp/server (cycle 56; OMP DAG already true)
             chatbot on parent   ──► still executeTool (cycle 46; hexagon leaks)
+            app.ts → crm.ts L24 ──► server.ts (cycle 59; IoPort too small)
 ```
 
 ## OMP workspace DAG (live 2026-09-11T19:17Z `earendil-works/pi` **0.85.1**)
@@ -114,3 +115,11 @@ submodule of the leaf package (A-008, not A-006).
   A-007 attaches at `mcpServerCore`, not `app.ts`.
 - Cycle 58: `server.ts` drain (ENG-1189 L404–413) waits on in-flight
   mcpFetch before `server.close()`. Hermes: one process, no second listen().
+- Cycle 59: `crm.ts` L24 / worker L184 / `crmEnrichmentService` L67
+  import `server.ts` despite `registerIo`. Hermes packages do not import
+  the CLI for sockets. Park A-017 (expand `MinimalIo`, not HTTP).
+- Cycle 60: A-017 is `getFathomLinearPort` (`fathomWebhook.ts` L39),
+  not `LoopPorts`. `chatSocketHandler` already extracted from `server.ts`
+  (ENG-1222 L17–20). Do not put live rooms on the loop package.
+- Cycle 61: AgentWebPro still empty on `apiTools.ts` / `loops/core` /
+  `sessionSockets.ts`. `app.ts` is now #2271 **and** #1814.

@@ -57,6 +57,20 @@ Cycle 42 — full prod inventory (`services/` → `controllers/`):
 `revisionService.ts` L11–16 is the in-app `confirm=true` revision
 path (Matt / Slack). Not MCP. A-013 parks the family. Do not HTTP-split.
 
+Cycle 59 — prod importers of the **listen module** (`server.ts`), not
+controllers:
+
+| File | Import | Why |
+|---|---|---|
+| `routes/crm.ts` L24 | `import { io } from '../server'` | `app.ts` → CRM → `listen()` (ENG-1286). 7,815 lines; four `io.to().emit` |
+| `crmEnrichmentService.ts` L67 | `require('../server')` | `getIO()` for `defaultSocketEmit` |
+| `generateMarketingResponseWorkerService.ts` L184 | `require('../server')` | parent `socketEmit` IPC |
+
+`sessionSockets.ts` already injects `io` for password-change
+`fetchSockets`. A-017 expands that port with `to(room).emit`. Do not
+add Socket.IO to `LoopPorts` (cycle 60: copy `getFathomLinearPort`,
+`fathomWebhook.ts` L39). `#1790` still touches `crm.ts`.
+
 ## Proposed folders (logical nanoservices)
 
 | Folder | Contents | Extract as process? |

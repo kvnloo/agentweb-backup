@@ -34,7 +34,7 @@ None of the first slices needs a Dynamo table.
 | 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
 
-**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`).
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts).
 
 ---
 
@@ -94,6 +94,14 @@ A-016 until A-002. Do not HTTP-split them. Cycle 57: **#2271** owns
 Never compete with #2271 / #2862 / #2861.
 Cycle 58: `server.ts` drain (ENG-1189) proves mcpFetch is loopback to this
 `listen()`. A fifth image process would need a copy of that drain.
+Cycle 59: `app.ts` → `crm.ts` L24 → `server.ts` already cycles. `registerIo`
+exists; `MinimalIo` is password-change `fetchSockets` only, so worker
+L184 and `crmEnrichmentService` L67 still `require('../server')`. Park
+A-017 (expand emit; do not HTTP-split CRM; do not edit 7,815-line
+`crm.ts` while #1790 is open). Cycle 60: that expand is
+`getFathomLinearPort` (`fathomWebhook.ts` L39), not `LoopPorts`
+(`ports.ts` L143–150). `chatSocketHandler.ts` L17–20 already extracted
+the right direction (`server.ts` L18 imports the handler).
 
 ### 4. Hermes / Oh My Pi vs this tree
 
@@ -116,7 +124,9 @@ Slack: **#2393**. Never #2862 / #2271 / #2861. `#1076` also touches
 `chatbotService.ts`. `#2861` is promoting `convert_to_pdf` to foundation
 — do not piggyback `generate_image`. Cycle 57: still empty on
 `apiTools.ts` / `loops/core`. **#2271** owns `app.ts` (+7 WhatsApp) plus
-`slackChannelAdapter.ts` and `db.ts`. A-007 does not touch `app.ts`.
+`slackChannelAdapter.ts` and `db.ts`. Cycle 61: **#1814** also edits
+`app.ts` (HubSpot `crmSync`). A-007 does not touch `app.ts`.
+`crm.ts` is **#1544 + #1790** — A-017 first slice is not that file.
 
 ---
 

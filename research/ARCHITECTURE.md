@@ -308,6 +308,16 @@ the composition root. **#2271** +7 WhatsApp routes on that file. A-007
 does not touch `app.ts`. A-006 discarded.
 Cycle 58: `drainForShutdown` (`server.ts` L404–413) waits before
 `server.close()` because mcpFetch is this PORT. A-006 discarded.
+Cycle 59: `crm.ts` L24 imports `io` from `server.ts` (ENG-1286
+`instanceState.ts` L24–30). `registerIo` exists; `MinimalIo` cannot
+`emit`. Worker L184 and `crmEnrichmentService` L67 `require('../server')`.
+Park A-017. A-006 discarded.
+Cycle 60: A-017 copies `fathomLinearPortRegistry` (register at
+`server.ts` L44, get at `fathomWebhook.ts` L39). `chatSocketHandler`
+L17–20 is the correct extract. Do not add `io` to `LoopPorts`.
+A-006 discarded.
+Cycle 61: 20 AgentWebPro PRs. Q-014 / A-002 / A-017 first-slice files
+still empty. `crm.ts` #1544+#1790. `app.ts` #2271+#1814.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
