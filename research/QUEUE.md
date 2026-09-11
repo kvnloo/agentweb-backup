@@ -78,5 +78,7 @@ touch it. Cycle 58: ENG-1189 drain is the listen() proof. Cycle 59:
 `crm.ts` L24 imports `server.ts` (ENG-1286); park A-017. Cycle 60:
 A-017 copies Fathom get/register, not LoopPorts. Cycle 61:
 AgentWebPro still empty on Q-014/A-002/A-017 first-slice files;
-`crm.ts` is #1544+#1790; `app.ts` is #2271+#1814. A-006 stays discarded.
+`crm.ts` is #1544+#1790; `app.ts` is #2271+#1814. Cycle 62: only
+`server.ts` L186 joins `user:`; A-017 is a string-room passthrough
+(do not unify socket.id / sessionId). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

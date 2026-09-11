@@ -99,9 +99,11 @@ exists; `MinimalIo` is password-change `fetchSockets` only, so worker
 L184 and `crmEnrichmentService` L67 still `require('../server')`. Park
 A-017 (expand emit; do not HTTP-split CRM; do not edit 7,815-line
 `crm.ts` while #1790 is open). Cycle 60: that expand is
-`getFathomLinearPort` (`fathomWebhook.ts` L39), not `LoopPorts`
-(`ports.ts` L143–150). `chatSocketHandler.ts` L17–20 already extracted
-the right direction (`server.ts` L18 imports the handler).
+`getFathomLinearPort`, not `LoopPorts`. `chatSocketHandler.ts` L17–20
+already extracted the right direction (`server.ts` L18 imports the
+handler). Cycle 62: the only `socket.join` is `server.ts` L186
+(`user:${userId}`). CRM emits to `socket.id`; codingAgent L1828 emits
+`sessionId` with no join. A-017 is a passthrough, not a room enum.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -32,8 +32,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 
 Cycle 61: AgentWebPro still empty on `apiTools.ts` / `loops/core` /
 `sessionSockets.ts` / worker / `crmEnrichmentService`. `crm.ts` is
-**#1544 + #1790**. `app.ts` is **#2271 + #1814**. A-017 first slice
-stays off `crm.ts`. A-006 stays discard. Product READY unchanged.
+**#1544 + #1790**. `app.ts` is **#2271 + #1814**. Cycle 62: only
+`server.ts` L186 `socket.join(\`user:${userId}\`)`; CRM uses `socket.id`;
+codingAgent L1828 emits `sessionId` with no join. A-017 is a
+passthrough. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

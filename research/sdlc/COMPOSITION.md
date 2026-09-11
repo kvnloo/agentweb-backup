@@ -91,6 +91,13 @@ Cycle 61: AgentWebPro still empty on `sessionSockets` / worker /
 `crmEnrichmentService`. `crm.ts` is #1544+#1790. `app.ts` is
 #2271+#1814 — A-007 still not `app.ts`.
 
+Cycle 62: **three room strings, one join.** `server.ts` L186 is the
+only `socket.join` (`user:${userId}`). CRM `io.to(socketId)` uses the
+implicit socket-id room. `codingAgentService.ts` L1828 emits
+`sessionId` and nothing joins it. `toolDispatch.ts` L1198 already
+emits `user:` on dispatch ports, not LoopPorts. A-017 does not unify
+these.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

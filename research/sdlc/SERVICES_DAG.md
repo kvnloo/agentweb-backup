@@ -69,7 +69,9 @@ controllers:
 `sessionSockets.ts` already injects `io` for password-change
 `fetchSockets`. A-017 expands that port with `to(room).emit`. Do not
 add Socket.IO to `LoopPorts` (cycle 60: copy `getFathomLinearPort`,
-`fathomWebhook.ts` L39). `#1790` still touches `crm.ts`.
+`fathomWebhook.ts` L39). `#1790` still touches `crm.ts`. Cycle 62:
+only `server.ts` L186 joins `user:`; CRM `socket.id`; codingAgent
+`sessionId` with no join. A-017 does not unify rooms.
 
 ## Proposed folders (logical nanoservices)
 

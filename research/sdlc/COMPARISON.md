@@ -123,3 +123,6 @@ submodule of the leaf package (A-008, not A-006).
   (ENG-1222 L17–20). Do not put live rooms on the loop package.
 - Cycle 61: AgentWebPro still empty on `apiTools.ts` / `loops/core` /
   `sessionSockets.ts`. `app.ts` is now #2271 **and** #1814.
+- Cycle 62: one `socket.join` (`server.ts` L186 `user:`). CRM uses
+  `socket.id`; codingAgent emits `sessionId` with no join. A-017 is a
+  passthrough, not a room enum.
