@@ -286,3 +286,5 @@ reverted. Do not copy that as A-006.
   wait 1200s or fail. Hermes/OMP: one process. Not A-006.
 - Cycle 112: 3×1200s settle is not a wait. `fail()` exits
   attempt 1; 2700s total caps retries. Not a 3600s third clock.
+- Cycle 113: last deploy’s hook dies with the Immutable ASG.
+  Sunday recycle is not that hook. Park A-020. Not A-006.

@@ -34,7 +34,7 @@ None of the first slices needs a Dynamo table.
 | 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
 
-**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`). **A-019** — refuse new `track()` **and** `tryClaim` while draining (one `instanceState` bit; do not edit `slack.ts`).
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`). **A-019** — refuse new `track()` **and** `tryClaim` while draining (one `instanceState` bit; do not edit `slack.ts`). **A-020** — second `put-lifecycle-hook` after Immutable verify (surviving ASG; do not `.ebextensions`).
 
 ---
 
@@ -323,6 +323,12 @@ Cycle 112: 3×1200s settle is **not** a wait. Never-Ready
 `fail()`s attempt 1 (`eb-deploy.sh` L639–640 / L155–158). The
 2700s total budget caps retries (`deploy.yml` L187; test
 L518–534). Recycle overlap continues without CI adding a listen().
+Cycle 113: last deploy’s hook dies with the Immutable ASG.
+`put-lifecycle-hook` is before `update-environment` (test
+L1066–1091 exactly one). After swap the serving group is unhooked.
+Sunday `InstanceRefreshEnabled` never calls `eb-deploy.sh`. Park
+**A-020** (second put after verify). Do not restore `.ebextensions`
+hook (ENG-818).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

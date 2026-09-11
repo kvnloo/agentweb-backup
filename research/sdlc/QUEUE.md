@@ -23,6 +23,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
 | — | A-018 | 28 | park | Copy isInternal skip onto DB MCP load path (not a fifth listen) |
+| — | A-020 | 29 | park | Second `put-lifecycle-hook` after Immutable verify |
 | — | A-019 | 27 | park | Refuse new `track()` **and** `tryClaim` while draining |
 | — | A-017 | 19 | park | Stop CRM/worker importing `server.ts`; expand sessionSockets emit |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
@@ -172,6 +173,9 @@ unchanged.
 Cycle 112: 3×1200s settle is **not** a wait. Never-Ready
 `fail()`s attempt 1 (`eb-deploy.sh` L639–640 / L155–158). Total
 budget 2700s caps retries. Product READY unchanged.
+Cycle 113: last deploy’s hook dies with the Immutable ASG.
+Sunday recycle is not that hook. Park **A-020**. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

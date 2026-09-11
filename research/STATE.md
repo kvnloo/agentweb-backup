@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 112
+cycles_completed: 113
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 113
+next_cycle: 114
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 112: 3×1200s is not a wait; settle fail() exits attempt 1.
-  Cycle 113: cheapest remaining. Candidate: settle fail() is
-  before ensure_termination_lifecycle_hook. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
-  passes, unsubscribe agentweb-research-cycle.
+  Cycle 113: last deploy's hook dies with the Immutable ASG.
+  Parked A-020. Cycle 114: cheapest remaining. Candidate: without
+  the hook, does startAsgTerminationGuard still drain before
+  SIGKILL? Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
+  A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

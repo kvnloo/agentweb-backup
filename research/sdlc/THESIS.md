@@ -165,6 +165,10 @@ Cycle 111: Sunday + Immutable serialize or fail the GitHub deploy
 Cycle 112: 3×1200s is not a wait. Settle expiry `fail()`s
 (`exit 1`); the 2700s total budget caps retries. Not a
 3600s third clock.
+Cycle 113: last deploy’s hook is on the ASG Immutable then
+discards. Sunday recycle is rolling on the surviving group
+with no hook. Park A-020 (second put after verify). Not
+`.ebextensions` (ENG-818).
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

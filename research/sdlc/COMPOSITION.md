@@ -427,6 +427,12 @@ Cycle 112: **3×1200s settle is not a wait.**
 `EB_TOTAL_TIMEOUT_SECONDS` 2700 (`deploy.yml` L187) is the
 absolute cap (`capped_deadline` L201–209). Test L518–534.
 
+Cycle 113: **last deploy’s hook dies with the Immutable ASG.**
+`put-lifecycle-hook` is before `update-environment` (`eb-deploy.sh`
+L654–655; test L1066–1091 exactly one). `main()` after verify only
+`ensure_deregistration_delay` (L895–897). Sunday
+`InstanceRefreshEnabled` never re-puts. Park A-020.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

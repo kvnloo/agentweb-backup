@@ -202,4 +202,6 @@ Cycle 111: Sunday + Immutable do not stack a third backend. A-006
 stays discarded.
 Cycle 112: 3×1200s settle is not a wait; `fail()` exits attempt 1.
 A-006 stays discarded.
+Cycle 113: last deploy’s hook dies with the Immutable ASG. Park
+A-020. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
