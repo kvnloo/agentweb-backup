@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 export const evaluationPage = Router();
 evaluationPage.get('/', (_req, res) => {
   const nonce = randomBytes(16).toString('base64');
-  res.set({ 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` }).type('html').send(`<!doctype html>
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` }).type('html').send(`<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Evaluation workspace</title>
 <style nonce="${nonce}">body{font:16px system-ui;max-width:850px;margin:40px auto;padding:0 20px;color:#18252e}input,textarea,button{font:inherit;padding:10px;margin:8px 0}textarea{box-sizing:border-box;width:100%;min-height:150px}button{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}label{display:block}img{max-width:100%}[hidden]{display:none}</style>
 <h1>Evaluation workspace</h1><p>Query the approved case, build simulated campaigns, and develop creatives with Emma. Simulation complete — not sent to Meta. No delivery or spend occurs.</p>
@@ -24,20 +24,26 @@ evaluationPage.get('/', (_req, res) => {
 <label>Upload an artifact (up to 240 KB)<input id="upload" type="file"></label><h2>Evaluation artifacts</h2><div id="artifacts"></div></main>
 <section id="reviewWorkspace" hidden><button id="reviewLogout">Sign out</button><h2>Review an evaluation</h2><label>Evaluation user ID <input id="reviewUserId" autocomplete="off"></label><button id="review">Inspect simulation and audit</button><pre id="reviewResult"></pre><div id="reviewArtifacts"></div></section>
 <script nonce="${nonce}">
-let token = ''; let previewUrl = ''; const el = id => document.getElementById(id);
+let token = ''; let session = 0; let previewUrl = ''; const el = id => document.getElementById(id);
 const status = text => { el('status').textContent = text; };
-function logout() { token = ''; if(previewUrl) URL.revokeObjectURL(previewUrl); previewUrl = ''; el('login').hidden = false; el('workspace').hidden = true; el('reviewWorkspace').hidden = true; for(const id of ['materials','answer','artifacts','simulationResult','reviewResult','reviewArtifacts']) el(id).textContent = ''; el('prompt').value = ''; el('simulationId').value = ''; el('reviewUserId').value = ''; el('preview').hidden = true; }
+function scrubFragment() { history.replaceState(null, '', location.pathname + location.search); }
+function logout() { token = ''; session++; try { scrubFragment(); } catch {} if(previewUrl) URL.revokeObjectURL(previewUrl); previewUrl = ''; el('login').hidden = false; el('workspace').hidden = true; el('reviewWorkspace').hidden = true; for(const id of ['materials','answer','artifacts','simulationResult','reviewResult','reviewArtifacts']) el(id).textContent = ''; el('prompt').value = ''; el('simulationId').value = ''; el('reviewUserId').value = ''; el('preview').hidden = true; }
 async function api(path, body, blob) {
-  const response = await fetch(path, {method:body ? 'POST':'GET',cache:'no-store',headers:{'Content-Type':'application/json',...(token ? {Authorization:'Bearer '+token}:{})},...(body ? {body:JSON.stringify(body)}:{})});
+  const currentSession = session;
+  const response = await fetch(path, {referrerPolicy:'no-referrer',method:body ? 'POST':'GET',cache:'no-store',headers:{'Content-Type':'application/json',...(token ? {Authorization:'Bearer '+token}:{})},...(body ? {body:JSON.stringify(body)}:{})});
+  if(currentSession !== session) throw new Error('Request denied or unavailable.');
   if(!response.ok) { if(response.status === 401) logout(); throw new Error('Request denied or unavailable.'); }
-  return blob ? response.blob() : response.json();
+  const data = await (blob ? response.blob() : response.json());
+  if(currentSession !== session) throw new Error('Request denied or unavailable.');
+  return data;
 }
-async function refresh() {
-  const data = await api('/api/evaluation'); el('budget').textContent = 'Generation calls remaining: '+data.remaining;
+async function refresh(verifyCandidate = false) {
+  const data = await api('/api/evaluation');
+  if(!data || typeof data !== 'object' || (verifyCandidate && (typeof data.userId !== 'string' || !data.userId.startsWith('eval_') || data.status !== 'active'))) throw new Error('Request denied or unavailable.'); el('budget').textContent = 'Generation calls remaining: '+data.remaining;
   el('materials').textContent = (Array.isArray(data.materials) ? data.materials.filter(m=>m && typeof m.title==='string' && typeof m.text==='string') : []).map(m => m.title+'\\n'+m.text).join('\\n\\n'); el('artifacts').textContent = '';
   for(const item of (Array.isArray(data.artifacts) ? data.artifacts.filter(a=>a && typeof a.artifactId==='string' && typeof a.mime==='string') : [])) { const button = document.createElement('button'); button.textContent = 'Download '+item.artifactId; button.onclick = async () => {try{const blob = await api('/api/evaluation/artifacts/'+encodeURIComponent(item.artifactId),null,true);const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=item.artifactId+(item.mime==='image/jpeg'?'.jpg':item.mime==='text/plain'?'.txt':'.bin');link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(e){status(e.message);}};el('artifacts').append(button,document.createElement('br')); }
 }
-el('login').onsubmit = async event => { event.preventDefault(); const password=el('password').value; el('password').value=''; try{const data=await api('/api/auth/login',{email:el('email').value,password});token=data.token;if(typeof data.user?.userId!=='string')throw new Error('Request denied or unavailable.');if(data.user.userId.startsWith('eval_')){await refresh();el('workspace').hidden=false;}else{el('reviewWorkspace').hidden=false;}el('login').hidden=true;status('Signed in.');}catch(e){logout();status(e.message);} };
+el('login').onsubmit = async event => { event.preventDefault(); logout(); const password=el('password').value; el('password').value=''; try{const data=await api('/api/auth/login',{email:el('email').value,password});token=data.token;if(typeof data.user?.userId!=='string')throw new Error('Request denied or unavailable.');if(data.user.userId.startsWith('eval_')){await refresh();el('workspace').hidden=false;}else{el('reviewWorkspace').hidden=false;}el('login').hidden=true;status('Signed in.');}catch(e){logout();status(e.message);} };
 async function generate(action) { el('analyze').disabled=el('creative').disabled=true; status('Emma is working…');try{const data=await api('/api/evaluation',{action,prompt:el('prompt').value});el('answer').textContent=data.text || '';if(data.mime!=='image/jpeg'){if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl='';el('preview').removeAttribute('src');el('preview').hidden=true;}if(data.mime==='image/jpeg'){const blob=await api('/api/evaluation/artifacts/'+encodeURIComponent(data.artifactId),null,true);if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(blob);el('preview').src=previewUrl;el('preview').hidden=false;}await refresh();status('Artifact saved.');}catch(e){status(e.message);}finally{el('analyze').disabled=el('creative').disabled=false;}}
 el('analyze').onclick=()=>generate('analyze');el('creative').onclick=()=>generate('generate_creative');el('logout').onclick=logout;
 el('simulate').onclick=async()=>{el('simulate').disabled=true;try{
@@ -58,5 +64,18 @@ el('review').onclick=async()=>{try{
   }
 }catch(e){status(e.message);}};
 el('upload').onchange=async()=>{try{const file=el('upload').files[0];if(!file)return;if(file.size>240000)throw new Error('Artifact exceeds 240 KB.');const bytes=new Uint8Array(await file.arrayBuffer());let raw='';for(const byte of bytes)raw+=String.fromCharCode(byte);await api('/api/evaluation',{action:'upload_artifact',base64:btoa(raw)});await refresh();status('Artifact uploaded.');}catch(e){status(e.message);}finally{el('upload').value='';}};
+// Fragments never reach the HTTP server. Scrub synchronously before any request,
+// then verify candidate access using the same revocation boundary as every action.
+(async () => {
+  if(!location.hash) return;
+  try {
+    let incoming = new URLSearchParams(location.hash.slice(1)).get('token');
+    scrubFragment();
+    if(!incoming) throw new Error('Request denied or unavailable.');
+    token = incoming; incoming = '';
+    await refresh(true);
+    el('workspace').hidden = false; el('login').hidden = true; status('Signed in.');
+  } catch { logout(); status('Request denied or unavailable.'); }
+})();
 </script></html>`);
 });
