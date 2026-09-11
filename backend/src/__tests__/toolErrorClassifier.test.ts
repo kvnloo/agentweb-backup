@@ -58,6 +58,32 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
   });
 
+  // A real OpenAI-SDK APIError (thrown by every OpenRouter call, including a
+  // BYOK upstream that's run out of quota) carries a numeric `.status`, unlike
+  // the plain-message `err()` errors above. classFromStatus(429) must not win
+  // by default over the quota_exceeded message check, or ENG-1661's
+  // OpenRouter retry loop (keyed on 'rate_limit') would blindly retry a
+  // permanent billing stop that can never succeed.
+  it('prefers quota_exceeded over rate_limit for a status-429 error with quota-exhaustion text', () => {
+    const quotaErrorWithStatus = Object.assign(
+      new Error('429 You exceeded your current quota, please check your plan and billing details.'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(quotaErrorWithStatus)).toBe('quota_exceeded');
+
+    // The real ENG-1661 incident shape ("Provider returned error") must stay
+    // rate_limit/retryable even with a numeric .status present.
+    const genuineRateLimitWithStatus = Object.assign(
+      new Error('429 Provider returned error'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(genuineRateLimitWithStatus)).toBe('rate_limit');
+
+    // Sibling statuses are unaffected by the 429-specific message check.
+    const paymentRequiredWithStatus = Object.assign(new Error('402 insufficient credits'), { status: 402 });
+    expect(classifyToolErrorClass(paymentRequiredWithStatus)).toBe('payment_required');
+  });
+
   it('classifies argument validation — the LinkedIn outreach cluster', () => {
     expect(classifyToolErrorClass(err('Invitation message is too long (224 characters). Max is 200.'))).toBe('invalid_args');
     expect(classifyToolErrorClass(err('Invalid parameters'))).toBe('invalid_args');
