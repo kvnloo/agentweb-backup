@@ -167,6 +167,13 @@ must run **after** the CallTool wait, before `server.close()`.
 Calling it during `generate_image` aborts the mcpFetch. A-006
 would own a third GET with no closer.
 
+Cycle 73: **close is not in the await the hook waits on.**
+`server.ts` L440–455 fire-and-forget; `asgLifecycleGuard.ts`
+L262–273 `await onTerminating()` then `completeAction`.
+`gracefulShutdown.test.ts` L223–230 pins source *order*, not join.
+`agentModeService.shutdown()` (L1729) closes vendor MCP clients, not
+inbound SSE. Promisify close after `mcpShutdown`, still in-process.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -64,7 +64,9 @@ server. Copy `chatbotTurn`, do not revive A-006. Cycle 70: wrap
 wrap only the ENG-114 face. Cycle 71: AgentWebPro empty on those
 files; wrap after #2, not instead of Q-014. Cycle 72: local GET
 `/mcp` SSE hangs `server.close()`; `mcpShutdown` after the wait,
-not instead of it. Product READY unchanged.
+not instead of it. Cycle 73: `server.close()` is not awaited
+before `CompleteLifecycleAction` (`asgLifecycleGuard.ts` L262–273).
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -357,6 +357,9 @@ Cycle 71: 20 AgentWebPro PRs. CallTool-wrap files **empty**.
 Cycle 72: GET `/mcp` L508–531 `setTimeout(0)` SSE. Rehydrate has
 no GET. Ordered: track CallTool, then `mcpShutdown`, then
 `server.close()`. A-006 discarded.
+Cycle 73: `server.close` / `io.close` L440–455 are callbacks, not
+awaits. Guard L262–273 completes the hook when drain resolves.
+`agentModeService.shutdown()` is MCP *client*. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

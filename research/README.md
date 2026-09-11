@@ -146,6 +146,10 @@ Do not compete on `emma/tools.ts` / `app.ts` / `crm.ts`.
 Cycle 72: GET `/mcp` keep-alive SSE (`mcpServer.ts` L508–531) is
 why `mcpShutdown` follows the wait. Rehydrate has no SSE. Do not
 HTTP-split the stream.
+Cycle 73: even after that order, `server.close()` is not joined
+(`server.ts` L440–446). The ASG hook (`asgLifecycleGuard.ts`
+L262–273) treats drain resolve as “instance may terminate.” Do not
+HTTP-split to get a second close() to forget to await.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

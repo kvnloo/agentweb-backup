@@ -75,7 +75,10 @@ mcpFetch still needs a new loopback. Cycle 71: AgentWebPro is
 empty on that wrap set (`mcpServerCore.ts` / `cronJobRegistry.ts`
 / `mcpServer.ts`). Do not start it instead of Q-014. Cycle 72:
 local GET `/mcp` (`mcpServer.ts` L508–531) disables timeouts; that
-SSE is why `mcpShutdown` must follow the CallTool wait. The listed face is a
+SSE is why `mcpShutdown` must follow the CallTool wait. Cycle 73:
+`server.close()` / `io.close()` (`server.ts` L440–455) are not
+awaited; the ASG hook (`asgLifecycleGuard.ts` L262–273) completes
+on drain resolve anyway. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

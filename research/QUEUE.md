@@ -107,4 +107,7 @@ that wrap instead of Q-014. A-006 stays discarded.
 Cycle 72: local GET `/mcp` (`mcpServer.ts` L508–531) is timeout-0
 SSE. Ordered drain: track CallTool, then `mcpShutdown`, then
 `server.close()`. A-006 stays discarded.
+Cycle 73: `server.close` / `io.close` are not awaited
+(`server.ts` L440–455). The ASG hook completes on drain resolve
+anyway. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

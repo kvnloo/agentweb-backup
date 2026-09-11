@@ -154,3 +154,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 72: local GET `/mcp` SSE (`mcpServer.ts` L508–531) hangs
   `server.close()`. Ordered drain: wait CallTool, then
   `mcpShutdown`, then close. Hermes has no inbound SSE.
+- Cycle 73: `server.close((err) => …)` is not a Promise. The ASG
+  hook awaits drain then `CompleteLifecycleAction`. Source-pinned
+  ENG-1189 tests order, not join. Hermes exit *is* close.

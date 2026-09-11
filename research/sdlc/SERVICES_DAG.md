@@ -91,7 +91,8 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   also miss the ASG termination hook (`asgLifecycleGuard.ts`).
   Cycle 69: inbound MCP `CallTool` is already off `runDrain`'s
   wait list; a fifth listen would not join it. Cycle 70: wrap
-  `CallTool` once for local + rehydrate faces.
+  `CallTool` once for local + rehydrate faces. Cycle 73: even this
+  process's `server.close()` is not in the await the hook waits on.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test
