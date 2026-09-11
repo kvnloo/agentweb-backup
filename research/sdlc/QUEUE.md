@@ -27,7 +27,8 @@ A-009 parked (utils importing the meter).
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
-1. **A-002** — prove `loops/core` cannot import `services/` / `db.ts`.
+1. **A-002** — AST import guard on `loops/core` (copy
+   `sdkConstructionGuard.test.ts`; sketch in `A-002-import-guard-sketch.md`).
 2. **A-007** — barrel-split `apiTools.ts`.
 3. **A-008** — `services/creative/` with re-export + `creative ↛ agentModeService` test.
 4. **A-005** — only after the `agentModeService.ts` PR pile shrinks.

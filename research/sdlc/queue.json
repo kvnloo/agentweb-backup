@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T18:58:00Z",
+  "updated_at": "2026-09-11T19:00:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -36,9 +36,10 @@
       "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts.",
       "files": [
         "backend/src/loops/core/ports.ts",
-        "backend/package.json"
+        "backend/src/__tests__/sdkConstructionGuard.test.ts",
+        "research/sdlc/A-002-import-guard-sketch.md"
       ],
-      "first_slice": "When coding unlocked: a unit test or dependency-cruiser rule that loops/core/** cannot import services/, emma/, or db.ts. Allow core → loops/index (orchestrator/instanceRunner already do; documented). Then copy the host-forbid rule onto agentMode/core.",
+      "first_slice": "When coding unlocked: sibling of sdkConstructionGuard.test.ts that AST-walks loops/core/**, forbids services/emma/db, allows ../index. Do not add dependency-cruiser. See A-002-import-guard-sketch.md. Then copy onto imageGeneration.ts (A-008) / agentMode/core.",
       "harsha_db": false
     },
     {
