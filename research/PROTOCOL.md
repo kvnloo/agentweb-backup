@@ -71,7 +71,8 @@ Known live programs (bootstrap):
 - Evaluation workspaces (ENG-1870, just merged)
 - Hermes MCP OAuth (ENG-1869)
 - Usage runway / billing ledger
-- Open PR: OpenRouter 429 retry (`callLLM`) — #2862
+- Open PR: OpenRouter 429 retry (`toolErrorClassifier.ts`, not callLLM body) — #2862
+- Open PR: X post ranking scores (`emma/tools.ts`) — #2832 — do not edit that file for Q-004
 - Open PR: WhatsApp Cloud API — #2271
 - Open PR: convert_to_pdf foundation tool — #2861
 - Open PR: autonomous report work plan — #2871

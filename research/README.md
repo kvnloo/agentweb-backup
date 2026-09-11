@@ -45,7 +45,7 @@ are ready to implement.
 - `briefs/Q-001-hermes-oauth.md`
 - `briefs/Q-014-generate-image-mcp.md`
 - `briefs/Q-003-designarena-adapter.md` (third in implementation order)
-- `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` (MCP hygiene)
+- `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` / `briefs/Q-004-post-on-account-internalOnly.md` (MCP hygiene; land Q-004 with Q-014)
 
 Mapping: `mappings/designarena-image-models.md`,
 `mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy).

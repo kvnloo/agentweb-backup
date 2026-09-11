@@ -177,9 +177,9 @@ READY, no schema. **Code in this order**, not by raw score:
    Score is highest (38) because the arena evidence is now live, but a
    default flip has customer blast radius. Matt before production.
 
-Hygiene READY (after the first three): **Q-006** hide deprecated
-full-file edit; **Q-015** hide always-admin tools. KEEP: **Q-004**
-`post_on_account` `internalOnly` only.
+Hygiene READY (after the first three): **Q-004** hide MCP
+`post_on_account` (land with Q-014); **Q-006** hide deprecated full-file
+edit; **Q-015** hide always-admin tools.
 
 Parked: Comfy backend (Q-009), extra Remotion compositions (Q-007 —
 intro/outro already ship), MCP video (Q-016, after Q-014), Agent Mode

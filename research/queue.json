@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:37:00Z",
+  "updated_at": "2026-09-11T17:39:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -66,19 +66,20 @@
     {
       "id": "Q-004",
       "title": "Mark post_on_account internalOnly for external MCP",
-      "status": "keep",
+      "status": "ready",
       "leverage": 3,
       "product": 4,
-      "mergeability": 4,
+      "mergeability": 5,
       "evidence": 5,
-      "collision": 3,
-      "score": 24,
-      "why": "Customer social publish is outbound (ENG-827 withdraw exists). freeze_user_account moved to Q-015 (admin, not outbound). Do NOT unlist manage_* (ENG-983).",
+      "collision": 1,
+      "score": 32,
+      "why": "MCP post_on_account is listed outbound; in-app uses post_on_connected_account (emma/tools.ts). Blog already internalOnly. freeze is Q-015. Land with/before Q-014. Do not edit emma/tools.ts (#2832).",
       "files": [
+        "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/registry.ts",
-        "backend/src/mcp/server/apiTools.ts"
+        "backend/src/__tests__/security.mcpServer.test.ts"
       ],
-      "first_slice": "internal + internalOnly on post_on_account only. Tests: hidden from getToolDefinitions and refused for externalMcp. Leave manage_* listed until ENG-983.",
+      "first_slice": "See research/briefs/Q-004-post-on-account-internalOnly.md. internal+internalOnly on post_on_account only.",
       "harsha_db": false
     },
     {

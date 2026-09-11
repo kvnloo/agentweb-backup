@@ -2,8 +2,8 @@
 
 Source of truth: `queue.json`. Protocol score is research leverage.
 **Implementation order** (first PRs when unlocked): Q-001, Q-014, Q-003.
-Cycle 8 promoted Q-003 after a live DesignArena snapshot. Cycle 9 promoted
-Q-006 / Q-015 (MCP hide-list). It did not un-ready Q-001 / Q-014 / Q-003.
+Cycle 8 promoted Q-003. Cycle 9 promoted Q-006 / Q-015. Cycle 11 promoted
+Q-004 (`post_on_account`). It did not un-ready Q-001 / Q-014 / Q-003.
 
 **Do not implement yet.** `coding_unlocked: false`. `briefing_ready: true`.
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
@@ -24,10 +24,10 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 | 1 | Q-003 | 38 | **ready** | DesignArena adapter — `briefs/Q-003-designarena-adapter.md` |
 | 2 | Q-001 | 34 | **ready** | Emma-via-Hermes operator path — `briefs/Q-001-hermes-oauth.md` |
 | 3 | Q-014 | 34 | **ready** | Expose generate_image on MCP tools/list — `briefs/Q-014-generate-image-mcp.md` |
-| 4 | Q-002 | 29 | triage | Eval-informed image routing (parse outputSummary; not a live router) |
-| 5 | Q-006 | 27 | **ready** | Hide edit_landing_page_file — `briefs/Q-006-hide-edit-landing-page.md` |
-| 6 | Q-015 | 27 | **ready** | Hide admin MCP tools — `briefs/Q-015-hide-admin-mcp-tools.md` |
-| 7 | Q-004 | 24 | keep | internalOnly on post_on_account only (freeze moved to Q-015; not ENG-983) |
+| 4 | Q-004 | 32 | **ready** | post_on_account internalOnly — `briefs/Q-004-post-on-account-internalOnly.md` |
+| 5 | Q-002 | 29 | triage | Eval-informed image routing (parse outputSummary; not a live router) |
+| 6 | Q-006 | 27 | **ready** | Hide edit_landing_page_file — `briefs/Q-006-hide-edit-landing-page.md` |
+| 7 | Q-015 | 27 | **ready** | Hide admin MCP tools — `briefs/Q-015-hide-admin-mcp-tools.md` |
 
 ## Parked
 
@@ -54,7 +54,8 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 2. **Q-014** — list `generate_image` on MCP (metering unchanged).
 3. **Q-003** — fail-open DesignArena mapper; Matt before flipping the
    production default to `gpt-image-2`.
-4. **Q-006 / Q-015** — MCP hygiene (deprecated landing edit; admin names).
-   Can parallel after Q-014 so the listing tests do not fight.
+4. **Q-006 / Q-015 / Q-004** — MCP hygiene. Land **Q-004 with or before
+   Q-014** so listing `generate_image` does not leave live social publish
+   in the same `tools/list`.
 
 None of these needs a database change.
