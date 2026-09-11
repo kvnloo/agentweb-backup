@@ -127,4 +127,7 @@ discarded.
 Cycle 79: `emmaApi` generate-image has no abort listener; leaf
 meters after success even if MCP already aborted. A-006 stays
 discarded.
+Cycle 80: MCP `POST /generate-image` is not under
+`tryClaimSessionGeneration`. Do not copy that Set onto Q-014.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

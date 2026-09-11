@@ -177,6 +177,11 @@ Cycle 79: that 5 min abort does not cancel `generateImage`
 (`emmaApi.ts` L174–187) and does not skip the leaf meter
 (L546–562). Do not HTTP-split to get a cancel protocol; do not
 touch billing.
+Cycle 80: that orphan leaf is also **unclaimed**.
+`tryClaimSessionGeneration` is Agent Mode only. MCP generate_image
+has quota (`requireEmmaTokenBudget`), not the session Set.
+Q-014 lists the tool; it does not add a lock. Do not HTTP-split
+to get one.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

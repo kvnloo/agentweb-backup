@@ -97,7 +97,10 @@ already override to 25 min in-process. Cycle 78: the leaf is
 is a stricter face, not the vendor cap. Cycle 79: that 5 min
 abort does **not** cancel the leaf (`emmaApi.ts` L174–187 has
 no close listener; `generateImage` has no AbortSignal); meter
-still runs after success (`imageGeneration.ts` L546–562). The listed face is a
+still runs after success (`imageGeneration.ts` L546–562). Cycle 80:
+MCP `POST /generate-image` never calls `tryClaimSessionGeneration`
+(`emmaApi.ts` L174–182 vs `agentModeController.ts` L951). Quota is
+the brake. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

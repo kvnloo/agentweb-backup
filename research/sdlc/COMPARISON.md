@@ -177,3 +177,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 79: aborting mcpFetch does not stop `generateImage` or skip
   the leaf meter. Hermes execute() abort is the same promise.
   Do not add a hop whose cancel story does not exist.
+- Cycle 80: `tryClaimSessionGeneration` is Agent Mode only.
+  MCP generate_image is unclaimed. Hermes loop is the concurrency
+  bound. Do not copy the Set onto emmaApi; do not HTTP-split.

@@ -218,6 +218,13 @@ Cycle 79: **abort ≠ cancel.** `emmaApi.ts` L174–187 has no
 vendor promise. Meter L546–562 still fires. A-006 would need a
 distributed cancel this tree does not have. Align `timeoutMs`.
 
+Cycle 80: **MCP is outside the session claim.**
+`tryClaimSessionGeneration` lives only in `agentModeController`.
+`keyedMutex.ts` L12–15 assumes that claim; prod uses are
+`chatbotService.ts` L1078 / L1134. `emmaApi.ts` L174–182 has
+quota, not a claim. Cycle 66’s “A-006 would race the Set” does
+not apply to this face — there is no Set. Still do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
