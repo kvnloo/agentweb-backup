@@ -1,8 +1,9 @@
 # AgentWeb architecture — teach-in for Kevin
 
-Status: **cycle 6 teach-in**, refined in cycle 8 (DesignArena mapping).
-Evidence from cycles 000–008. This is the map to read before we write
-product code.
+Findings and priorities first: [`README.md`](README.md).
+
+Status: **cycle 6 teach-in**, refined through cycle 47. This is the map
+behind the artifact.
 
 ## 1. What you forked
 

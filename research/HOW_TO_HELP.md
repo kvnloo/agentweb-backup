@@ -9,7 +9,7 @@ Kevin asked to start real PRs. Implementation order, not score.
 Q-003 scores higher because the arena snapshot is live; it still waits
 until Matt is ok with a default flip.
 
-## First slices (when you unlock)
+## First slices
 
 Implementation order, not score. Q-003 scores higher because the arena
 snapshot is live; it still waits until Matt is ok with a default flip.
