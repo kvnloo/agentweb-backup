@@ -24,6 +24,7 @@ python3 - "$evidence" <<'PY'
 import json, sys
 table = json.load(open(sys.argv[1]))['Table']
 assert table['KeySchema'] == [{'AttributeName': 'evaluationKey', 'KeyType': 'HASH'}], 'Unexpected key schema'
+assert table['AttributeDefinitions'] == [{'AttributeName': 'evaluationKey', 'AttributeType': 'S'}], 'Unexpected key type'
 assert table['BillingModeSummary']['BillingMode'] == 'PAY_PER_REQUEST', 'Unexpected billing mode'
 assert table.get('DeletionProtectionEnabled') is True, 'Deletion protection is required'
 assert table.get('SSEDescription', {}).get('Status') == 'ENABLED', 'Encryption is required'

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 const mockGet = jest.fn();
 const mockQuery = jest.fn();
 const mockWrite = jest.fn(() => ({ promise: async () => ({}) }));
@@ -11,7 +12,7 @@ describe('ENG-1870 revoked evaluation credentials', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'revoked' });
-    const credential = { userId: 'eval_test', status: 'active', revoked: false, keyId: 'test', expiresAt: Math.floor(Date.now() / 1000) + 600, refreshExpiresAt: Math.floor(Date.now() / 1000) + 3600 };
+    const credential = { tokenHash: crypto.createHash('sha256').update('synthetic-access').digest('hex'), refreshTokenHash: crypto.createHash('sha256').update('synthetic-refresh').digest('hex'), clientId: 'synthetic-client', scope: 'mcp', userId: 'eval_test', status: 'active', revoked: false, keyId: 'test', expiresAt: Math.floor(Date.now() / 1000) + 600, refreshExpiresAt: Math.floor(Date.now() / 1000) + 3600 };
     mockGet.mockReturnValue({ promise: async () => ({ Item: credential }) });
     mockQuery.mockReturnValue({ promise: async () => ({ Items: [{ ...credential, expiresAt: undefined }] }) });
   });
@@ -21,9 +22,11 @@ describe('ENG-1870 revoked evaluation credentials', () => {
   });
   it('rejects an OAuth access token even when its own row is not revoked', async () => {
     expect(await new McpOAuthService().validateAccessToken('synthetic-access')).toBeNull();
+    expect(evaluationStore.get).toHaveBeenCalledWith('eval_test');
   });
   it('cannot refresh a revoked evaluation into a new session', async () => {
-    expect(await new McpOAuthService().refreshTokens('synthetic-refresh')).toBeNull();
+    expect(await new McpOAuthService().refreshTokens('synthetic-refresh', 'synthetic-client')).toBeNull();
+    expect(evaluationStore.get).toHaveBeenCalledWith('eval_test');
     expect(mockWrite).not.toHaveBeenCalled();
   });
   it('cannot mint a new API key after revocation', async () => {

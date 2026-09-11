@@ -125,6 +125,21 @@ describe('setupMcpServer durable session store wiring', () => {
     process.env = originalEnv;
   });
 
+  it.each(['post', 'get', 'delete'] as const)('ENG-1870: evaluation cannot use another local session via %s', async method => {
+    const store = makeSpyStore();
+    const app = makeApp(store);
+    (isInitializeRequest as unknown as jest.Mock).mockReturnValue(true);
+    await request(app).post('/mcp').set('Authorization', `Bearer ${INTERNAL_TOKEN}`)
+      .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    (isInitializeRequest as unknown as jest.Mock).mockReturnValue(false);
+    (agentApiKeyService.validateKey as jest.Mock).mockResolvedValue({ userId: 'eval_isolation', keyId: 'synthetic' });
+    const res = await request(app)[method]('/mcp').set('Authorization', 'Bearer aw_synthetic')
+      .set('mcp-session-id', 'test-session-id').send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'send_email' }, id: 2 });
+    expect(res.status).toBe(method === 'delete' ? 204 : 404);
+    expect(store.delete).not.toHaveBeenCalled();
+  });
+
   it('persists session metadata to the store on initialize', async () => {
     const store = makeSpyStore();
     const app = makeApp(store);
