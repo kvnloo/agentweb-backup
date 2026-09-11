@@ -80,6 +80,18 @@ architecture edits there.
 in-process from `remotionService.ts` via `@remotion/lambda` — not a
 second Emma mesh.
 
+## MCP client + server (cycle 29)
+
+Hermes: MCP **client** to other servers; tools stay in-process.
+
+AgentWeb: MCP **server** (`mcp/server`, loopback `mcpFetch`) *and* MCP
+**client** (`mcp/client/mcpClientService.ts`) to GitHub/Playwright/Higgsfield.
+`mcp_config.ts` L3–10 still names `"agentweb-tools"` → `http://localhost/mcp`.
+`initialize()` L420–432 **skips `isInternal`** so Emma does not MCP-call
+herself. That skip is the in-tree rejection of A-006. Vendor MCP
+(`excludeFromAgent`, Higgsfield) stays; do not invent a fifth process for
+image gen.
+
 
 ## What this means
 

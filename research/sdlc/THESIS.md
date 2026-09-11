@@ -27,11 +27,11 @@ recommends the same: start modular-monolith, extract when scale or
 ownership forces it.
 
 A 60-tool HTTP mesh would recreate MCP poorly: `apiTools.ts` already
-`mcpFetch`s `http://localhost:${PORT}/api/emma/*` (`httpClient.ts` L94–97).
-`generate_image` then lands in `agentModeService.generateImage` (L28857)
-before `imageGeneration` (L28950). Extra hops do not make that safer;
-metering, C2PA, and logo rules live on that method on purpose. Hop
-diagram: `COMPOSITION.md`.
+`mcpFetch`s `http://localhost:${PORT}/api/emma/*`. The MCP *client* even
+had a self-server `"agentweb-tools"` (`mcp_config.ts` L3–10) and
+**skips it** (`mcpClientService.ts` L420–432) as a circular dependency.
+Q-014 lists `generate_image` for *external* Hermes; it does not re-enable
+that self-client. Hop diagram: `COMPOSITION.md`.
 
 ## What already exists (do not rebuild)
 

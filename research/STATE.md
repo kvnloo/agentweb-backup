@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 28
+cycles_completed: 29
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 29
+next_cycle: 30
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 28: awsAdapters is the host package; rcaEnricher.callLLM is why
-  A-002 is core-only; do not copy Hermes discover_builtin_tools. Cycle
-  29: collision-only. Do not un-ready Q-001 / Q-014 / Q-003. Do not
-  revive A-006. If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 29: agentweb-tools self-MCP is skipped as circular. Collision
+  still empty. Cycle 30: collision-only. Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

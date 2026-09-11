@@ -23,9 +23,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 28: `loops/adapters/awsAdapters.ts` is the host package.
-`rcaEnricher.ts` `callLLM` is why A-002 walks `core/` only. Hermes
-`discover_builtin_tools` is **not** the first A-007 PR.
+Cycle 29: `"agentweb-tools"` → localhost `/mcp` is still in
+`mcp_config.ts` but `initialize()` skips `isInternal` as circular.
+A-006 stays discard. Hermes is client-only; AgentWeb is both.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

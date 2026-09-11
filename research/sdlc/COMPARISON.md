@@ -68,7 +68,7 @@ mismatch is `utils/llmClients.ts` importing `usageRecorderService`
 | Eval / bench on tools | OMP “benchmaxxed” edits; metaharness package | `loops/` framework; human eval for images (not a router) |
 | Module boundary in CI | package graph / AST `discover_builtin_tools` | **No** (A-002 sketch only) |
 | Skills as files | `skills/` + optional-skills | Skills in system prompt + DB `foundation_tools` |
-| MCP | Client (`mcp_tool.py` skipped by discover) | Server; **manual** `mcpServerCore.ts` L26–30 imports |
+| MCP | Client (`mcp_tool.py` skipped by discover) | Server for Hermes **and** client to vendors; self `"agentweb-tools"` **skipped** (`mcpClientService.ts` L420–432) |
 
 ## Implications (not a port)
 

@@ -214,6 +214,8 @@ Cycle 27: agent-engine still JWT-calls `/api/internal/usage`; A-002
 oracle is 18 `loops/core` files / two `../index` escapes.
 Cycle 28: `awsAdapters.ts` is the host; do not copy Hermes
 `discover_builtin_tools` into A-007.
+Cycle 29: `mcp_config` `"agentweb-tools"` self-MCP is skipped as circular
+(`mcpClientService.ts` L420–432).
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
