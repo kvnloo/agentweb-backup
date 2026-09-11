@@ -65,7 +65,7 @@ that self-client. Hop diagram: `COMPOSITION.md`.
 | One process for the agent loop | Yes | Yes (`pi-agent-core` package) | Yes, but 40.5k-line file |
 | Package / folder graph | `agent/`, `tools/`, `gateway/`, plugins | bun workspaces: `pi-agent-core`, `pi-ai`, `pi-catalog`, … | Three *repos-in-folder* (backend / partner / engine) + one backend blob |
 | One file per tool | `tools/*.py` self-register | 31 tools, split packages | `emma/tools.ts` 9.8k lines; `apiTools.ts` 3.6k |
-| Typed tool registry | `tools/registry.py` | package `agent` | Interface in `core/types.ts`; monolith still implements it |
+| Typed tool registry | `tools/registry.py` | package `agent` | **Four** in-process tables (cycle 37): `mcpToolRegistry`, `emmaToolRegistry` (3-line `emma/registry.ts`), vendor MCP client, per-session `this.toolRegistry`. Monolith copies Emma tools at L1891 |
 | Characterization / eval | ~25k pytest files claimed | edit benchmarks, metaharness | Characterization harness exists; god file still grows (24k → **40.5k** since Jun) |
 | Boundary linter | import chain documented | workspace packages | **None** |
 | Network extract | MCP *clients* to other servers | browser-relay, collab-web as packages | MCP *server*; don’t invert it |

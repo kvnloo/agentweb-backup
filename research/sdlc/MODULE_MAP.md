@@ -60,7 +60,8 @@ Cycle 35: `loops/index.ts` itself may only import `./core/types`.
 | File | Role |
 |---|---|
 | `loops/index.ts` | **Hermes `registry.py` analog** (types only; cycle 35) |
-| `mcp/server/registry.ts` | **Not** that analog — imports `evaluationPolicy` L1 |
+| `emma/registry.ts` | **3 lines** — `new McpToolRegistry()` (cycle 37). In-app catalog is a second instance of the MCP class, not a process |
+| `mcp/server/registry.ts` | **Not** that analog — imports `evaluationPolicy` L1. `ListToolsRequestSchema` in `mcpServerCore.ts` L81–83 |
 | `apiTools.ts` | **85** `register()` calls, 3.6k lines, section comments already name packages |
 | `workflowTools.ts` | ENG-982: **5** mcpFetch tools, zero service imports. **A-007 template.** |
 | `evaluationTools.ts` | 1 tool; **direct** `evaluationStore` / `evaluationService`; dual-registers onto `emmaToolRegistry` (L62). **A-007 anti-template** (cycle 32). |

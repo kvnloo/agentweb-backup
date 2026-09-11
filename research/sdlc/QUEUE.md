@@ -23,10 +23,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 36: C2PA default-on and CRITICAL LOGO live in `imageGeneration.ts`
-(L575–578, L477–484), not in `generateImage`. Policy owns category /
-HITL / persisted logo. A-006 stays discard (HTTP in front of emmaApi
-still misses leaf callers).
+Cycle 37: four in-process registries (`emma/registry.ts` is 3 lines).
+Q-014 is `ListToolsRequestSchema` L81–83, not an Emma dual-register.
+A-005 pile still 7 PRs; scorecard 23,895 vs disk 40,571. A-006 stays
+discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

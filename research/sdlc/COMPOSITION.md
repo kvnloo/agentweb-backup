@@ -111,6 +111,22 @@ instance `register*`), not `loops/index.ts` (Hermes registry: types only).
 `mcp/server/registry.ts` L1 already imports `evaluationPolicy` — do not
 demand loops-index purity of the MCP registry.
 
+## Four in-process registries (cycle 37)
+
+Hermes: one `registry.py`. AgentWeb already composes four tables without
+HTTP:
+
+```
+mcpToolRegistry        ← apiTools / workflowTools / evaluationTools
+emmaToolRegistry        ← emma/tools.ts (3-line emma/registry.ts)
+mcpClientService tools  ← vendor MCP (Hermes-shaped client)
+this.toolRegistry       ← copies both (L1827 vendor, L1891 Emma)
+```
+
+`ListToolsRequestSchema` (`mcpServerCore.ts` L81–83) is Q-014’s face.
+Do not dual-register `generate_image` like `evaluation_workspace` (L62).
+
+
 ## Two MCP hop styles (cycle 32)
 
 `mcpServerCore.ts` L26–30 already composes **three** in-process modules

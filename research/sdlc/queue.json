@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:35:00Z",
+  "updated_at": "2026-09-11T19:37:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -90,7 +90,7 @@
       "evidence": 5,
       "collision": 3,
       "score": 23,
-      "why": "June scorecard still says 23,895 lines; disk is 40,571. Cycle 18: seven open PRs touch agentModeService.ts (#2871 #2861 #2832 #2563 #2060 #1584 #1076). A LOC ratchet would fail them. Park until that set shrinks.",
+      "why": "June scorecard still says 23,895 lines; disk is 40,571 (cycle 37 re-count). toolDispatch.ts is 1,409 vs scorecard 522. Seven open PRs still touch agentModeService.ts (#2871 #2861 #2832 #2563 #2060 #1584 #1076). A LOC ratchet would fail them. Park until that set shrinks.",
       "files": [
         "backend/docs/AGENTMODE_MIGRATION.md",
         ".github/workflows/tests.yml"
