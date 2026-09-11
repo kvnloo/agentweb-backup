@@ -1,64 +1,112 @@
-# AgentWeb research loop
+# AgentWeb research artifact
 
-Living research system for this fork (`kvnloo/agentweb`, parent `AgentWebPro/agentweb`).
-It does **not** ship product code. It scans the tree, maps Kevin's adjacent work,
-and keeps a ranked feature queue that gets re-triaged every cycle until we
-are ready to implement.
+**Do not explode Emma into HTTP nanoservices.** AgentWeb already has four
+deploy units. The pain is a 40k-line god object, not missing Kubernetes.
+Hermes and Oh My Pi win on **in-process packages and one tool catalog**,
+not on a tool-per-HTTP mesh.
 
-## What this is
+Coding is unlocked. First product PRs: **Q-014 + Q-004**. Q-001 is Kevin
+Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
 
-| Artifact | Role |
+---
+
+## Priorities (implementation order, not score)
+
+### Product
+
+| Order | ID | Do this | Do not |
+|---|---|---|---|
+| 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. |
+| 1b | **Q-004** | Same PR or before: `internal` + `internalOnly` on MCP `post_on_account` only | Edit `emma/tools.ts` (#2832). Unlist `manage_*` (ENG-983). |
+| 2 | **Q-001** | Kevin OAuth smoke on `HERMES_MCP_OAUTH.md` (315s PTY). Parent already refreshes OAuth (`server.ts` L586). | Rewrite the in-repo runbook unless smoke finds a lie. |
+| 3 | **Q-003** | Fail-open DesignArena → `SUPPORTED_MODELS`. Live: `gpt-image-2` image **#3 / $0.04**, logo **#1**. Hardcoded default `gemini-3-pro-image-preview` is image **#22 / $0.134**, logo **#40**. | Flip prod default without Matt. Add Riverflow / `gpt-image-2.5` in the first slice. |
+| hygiene | Q-006 / Q-015 | Hide `edit_landing_page_file` and admin MCP tools | — |
+
+None of the first slices needs a Dynamo table.
+
+### Architecture (after or beside Q-014, not instead)
+
+| Order | ID | Do this | Do not |
+|---|---|---|---|
+| 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts` | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
+| 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
+| 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
+
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`).
+
+---
+
+## Findings (cycles 17–47)
+
+### 1. Four deploy units already exist
+
+Backend EB, partner-portal EB, agent-engine GCP VM, remotion-lambda.
+A fifth process for images would split **policy** (`generateImage`:
+category / HITL / persisted logo) from the **leaf** (`imageGeneration.ts`:
+meter, C2PA default-on, CRITICAL LOGO) and miss blog / thumbs / video /
+onboarding callers.
+
+### 2. The EB box already forked — that is I/O vs compute, not a package
+
+| Process | Role |
 |---|---|
-| `PROTOCOL.md` | Scoring, KEEP/DISCARD, collision rules, what not to touch |
-| `CONTEXT.md` | Kevin's other repos/experiments mapped onto AgentWeb |
-| `ARCHITECTURE.md` | Living architecture brief (filled over cycles, then used to teach) |
-| `QUEUE.md` | Human-readable ranked queue |
-| `queue.json` | Machine-readable queue (source of truth for ranks) |
-| `STATE.md` | Current cycle, next focus, stop conditions |
-| `cycles/` | Dated analysis receipts |
-| `briefs/` | Deeper implementation sketches for READY items |
+| Parent | HTTP, Socket.IO, in-memory cron, MCP **server**, OAuth refresh, Emma chatbot |
+| Worker | `new AgentModeService()` then `generateMarketingResponse`. No Socket.IO (`socketEmit` IPC). |
 
-## Operating rules
+Same 40k class on both sides. Hermes keeps sockets **and** the loop in one
+process. Oh My Pi stays in-process packages (`pi-ai` ↛ `pi-agent-core`).
 
-1. **Research first.** No product implementation until `STATE.md` says `coding_unlocked: true` and a queue item is `READY`.
-2. **Re-rank every cycle.** New evidence can promote, demote, or DISCARD.
-3. **One wedge.** Prefer work only Kevin is uniquely positioned to do. Do not compete with the Argusoft contractors on CRM/Meta/billing plumbing.
-4. **No database/data-plane proposals** without an explicit Harsha gate note. AgentWeb merge rules treat schema as a hard stop.
-5. **Collision check.** Open PRs on `AgentWebPro/agentweb` beat a duplicate idea.
+### 3. `generate_image` is one name, three faces, three catalogs
 
-## Cycle procedure (for the timer agent)
+| Face | Process | How it runs | Who sees it |
+|---|---|---|---|
+| MCP (Q-014) | Parent | `mcpFetch` → `/api/emma/generate-image` → policy | Hidden by `internal: true` until Q-014. No page, no skill. |
+| Emma chatbot | Parent | `executeTool` in-process (no fork) | Injected on the `images` page only |
+| Agent Mode | Worker | emma registry → `generateImage` | Skill / `__other_skills__`. **Not** foundation (`describe_image` is). |
 
-1. Read `STATE.md`, `PROTOCOL.md`, `queue.json`.
-2. Pick the next `focus` subsystem (or continue a parked deep-dive).
-3. Gather evidence from code, docs, open PRs, and adjacent repos.
-4. Write `cycles/NNN-<slug>.md`.
-5. Update `queue.json` then regenerate the top of `QUEUE.md`.
-6. Update `ARCHITECTURE.md` only where the cycle actually taught something.
-7. Commit, push, update the PR.
-8. If UTC now > `stop_after`, unsubscribe `agentweb-research-cycle`.
-   Do not unset `briefing_ready`. Do not set `coding_unlocked` unless
-   Kevin asked to code. Initialization is already complete
-   (`STATE.md` `initialization_complete`).
+MCP schema is thinner (no `confirm`). Quota is per-face, not in
+`generateImage`. Do not HTTP-split this method — both OS processes would
+become clients of a fifth hop.
 
-## How Kevin should use this
+### 4. Hermes / Oh My Pi vs this tree
 
-`briefing_ready` is **true**. Read `ARCHITECTURE.md` then `HOW_TO_HELP.md`.
-`coding_unlocked` is still false until you ask to code. READY briefs:
+| Practice | Hermes / OMP | AgentWeb |
+|---|---|---|
+| Agent loop | One process, packages | 40,571-line `agentModeService.ts` |
+| Tool catalog | One registry / `tools/list` | Four in-process registries + three availability policies |
+| MCP | **Client** to other servers | **Server** for Hermes *and* client to vendors; self `"agentweb-tools"` skipped |
+| Extract | MCP outbound; OMP packages | Fork for health checks; DAG inverted (`services/` import `controllers/`) |
 
-- `briefs/Q-001-hermes-oauth.md`
-- `briefs/Q-014-generate-image-mcp.md`
-- `briefs/Q-003-designarena-adapter.md` (third in implementation order)
-- `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` / `briefs/Q-004-post-on-account-internalOnly.md` (MCP hygiene; land Q-004 with Q-014)
+Cutting-edge 2026 (Microsoft modular-monolith first): folders + AST
+guards, then extract. `backend/package.json` has **no** `workspaces`
+and **no** `dependency-cruiser`.
 
-Mapping: `mappings/designarena-image-models.md`,
-`mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy),
-`mappings/eval-output-summary.md` (Q-002 parser, not a live router).
+### 5. What not to compete with (AgentWebPro)
 
-The loop may keep refining until `stop_after` (see `STATE.md`;
-extended 2026-09-11 for the architecture/SDLC track).
+`emma/tools.ts`: **#2832 #1076 #689**. `sdkConstructionGuard.test.ts`: **#2563**.
+`agentModeService.ts` pile: **#2871 #2861 #2832 #2563 #2060 #1584 #1076**.
+Slack: **#2393**. Never #2862 / #2271 / #2861. `#1076` also touches
+`chatbotService.ts`. `#2861` is promoting `convert_to_pdf` to foundation
+— do not piggyback `generate_image`.
 
-## Architecture / SDLC track
+---
 
-Kevin asked to research nanoservice splits vs Hermes / Oh My Pi.
-Read `sdlc/THESIS.md` then `sdlc/COMPARISON.md`. Product READY items
-are unchanged. HTTP-per-tool is discarded (A-006).
+## Invariants
+
+Billing meter / `llmPricing`. C2PA default-on in the **leaf**. Brand
+`logoImage` / CRITICAL LOGO in the **leaf**. No Dynamo schema without
+Harsha. No `localStorage.getItem("token")`. End-user UI only in
+**customer-portal**.
+
+## Read next
+
+| If you want | Open |
+|---|---|
+| Teach-in | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| Product queue + briefs | [`QUEUE.md`](QUEUE.md), [`briefs/`](briefs/) |
+| Architecture thesis | [`sdlc/THESIS.md`](sdlc/THESIS.md) |
+| Hop diagram | [`sdlc/COMPOSITION.md`](sdlc/COMPOSITION.md) |
+| Hermes / OMP comparison | [`sdlc/COMPARISON.md`](sdlc/COMPARISON.md) |
+| Cycle receipts | [`cycles/`](cycles/) |
+
+Rollback: delete `research/`.

@@ -2,7 +2,7 @@
 
 Source of truth: `research/sdlc/queue.json`. **Not** the product queue.
 Product implementation order is still Q-001 → Q-014 → Q-003.
-`coding_unlocked: false`.
+`coding_unlocked: true`.
 
 Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 `MODULE_MAP.md`. Services DAG: `SERVICES_DAG.md`. A-007 map:

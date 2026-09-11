@@ -1,12 +1,13 @@
 # How we help together
 
-Read `ARCHITECTURE.md` first, then `QUEUE.md`.
+Read [`README.md`](README.md) first (findings + priorities), then
+`ARCHITECTURE.md` and `QUEUE.md`.
 
-## Mode until you say "code"
+## Coding is unlocked
 
-Research loop keeps re-ranking until `stop_after` (20:15 UTC) or you say
-start. `coding_unlocked` is still false. READY briefs exist so the first PRs
-are specified, not invented at the keyboard.
+Kevin asked to start real PRs. Implementation order, not score.
+Q-003 scores higher because the arena snapshot is live; it still waits
+until Matt is ok with a default flip.
 
 ## First slices (when you unlock)
 

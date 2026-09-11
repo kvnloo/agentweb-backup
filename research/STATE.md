@@ -4,7 +4,7 @@
 started_at: 2026-09-11T17:03:00Z
 owner: cursor-cloud bc-658f6e8c-e6a2-4e2e-99d4-8bee7362c95b
 branch: cursor/research-loop-c95b
-coding_unlocked: false
+coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
 cycles_completed: 47
