@@ -322,3 +322,5 @@ reverted. Do not copy that as A-006.
   Dependabot REQUIRED only bites when the job runs. Not A-006.
 - Cycle 130: naming Backend build as required cannot reproduce
   merge-evidence section 7. Not A-006.
+- Cycle 131: merge-evidence has no PARTNER_JOBS; partner-only
+  PASSes with Partner skipped. Not A-006.

@@ -216,6 +216,8 @@ Dependabot’s REQUIRED comment only bites when the job runs.
 Product READY unchanged.
 Cycle 130: naming `Backend build` as required cannot reproduce
 merge-evidence section 7. Product READY unchanged.
+Cycle 131: merge-evidence has no `PARTNER_JOBS`; a partner-only
+PR PASSes with Partner skipped. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

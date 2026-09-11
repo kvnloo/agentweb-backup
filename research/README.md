@@ -395,6 +395,10 @@ Cycle 130: **naming `Backend build` as required cannot
 reproduce merge-evidence section 7.** Every `tests.yml` job
 except Detect changed projects is a job-level path skip
 (L70). GitHub required checks are names, not path-conditional.
+Cycle 131: **no `PARTNER_JOBS`.** Test L1047: partner-only diff
+PASSes with Partner skipped. Fixtures still say `Partner portal
+tests`; live job is `Partner portal build` (`tests.yml` L92).
+Failure still FAILs (`n_bad`). Skip/cancel does not.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

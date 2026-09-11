@@ -486,6 +486,8 @@ Dependabot’s REQUIRED comment only bites when the job runs.
 A-006 discarded.
 Cycle 130: naming `Backend build` as required cannot reproduce
 merge-evidence section 7. A-006 discarded.
+Cycle 131: merge-evidence has no `PARTNER_JOBS`; a partner-only
+PR PASSes with Partner skipped. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -7,16 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 130
+cycles_completed: 131
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 131
+next_cycle: 132
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 130: naming Backend build as required cannot reproduce
-  merge-evidence section 7. Cycle 131: cheapest remaining.
-  Candidate: merge-evidence has no PARTNER_JOBS — cancelled /
-  skipped Partner portal build is the same hole as ENG-836.
+  Cycle 131: merge-evidence has no PARTNER_JOBS; a partner-only PR
+  PASSes with Partner skipped. Cycle 132: cheapest remaining.
+  Candidate: same hole for CI script tests — editing
+  merge-evidence.sh PASSes with CI script tests skipped
+  (test L1196-1198). No WORKFLOW_JOBS.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

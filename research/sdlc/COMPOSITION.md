@@ -531,6 +531,11 @@ merge-evidence section 7.** Every `tests.yml` job except Detect
 changed projects is a job-level path skip (`tests.yml` L70).
 GitHub required checks are names, not path-conditional.
 
+Cycle 131: **no `PARTNER_JOBS`.** Test L1047: partner-only diff
+PASSes with Partner skipped. Fixtures still say `Partner portal
+tests`; live job is `Partner portal build`. Failure FAILs
+(`n_bad`); skip/cancel does not.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
