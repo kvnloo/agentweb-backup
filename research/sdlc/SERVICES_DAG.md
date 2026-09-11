@@ -123,6 +123,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 100: Slack/email ack-then-track; park A-019 (registry gate).
   Cycle 101: /generate uses the session Set, not track().
   Cycle 102: auto-continuation re-fills the Set after release.
+  Cycle 103: emma_get_session GET starts billed continuation.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

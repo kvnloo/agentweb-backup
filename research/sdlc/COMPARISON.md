@@ -257,3 +257,6 @@ reverted. Do not copy that as A-006.
 - Cycle 102: media/work-plan auto-continuation `setImmediate`s
   after lock release and `tryClaim`s again. Live drain sees
   1→0→1. Not an image nanoservice.
+- Cycle 103: `emma_get_session` is listed, not internal, and
+  GETs a handler the comment calls a “passive READ” that starts
+  billed generation. Hermes poll during overlap. Not A-006.

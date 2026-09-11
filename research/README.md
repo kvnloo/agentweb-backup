@@ -272,6 +272,11 @@ Cycle 102: auto-continuation `setImmediate`s after that lock
 releases (L9406–9409) and `tryClaim`s again (L1350). The live
 Set goes 1→0→1. `disableCron` does not cancel `setImmediate`.
 Do not HTTP-split `generate_image` to isolate this scheduler.
+Cycle 103: listed MCP `emma_get_session` (`apiTools.ts` L274–288,
+not `internal`) mcpFetchs `GET /session/:id`. The handler
+comment says “passive READ” then `setImmediate`s a continuation.
+Hermes polling during overlap starts billed generation on this
+PORT. Do not hide the tool; A-019 `tryClaim` refuse is the gate.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -373,6 +373,11 @@ Cycle 102: **auto-continuation re-fills the Set.**
 `tryClaim` L1350, chain L1468. `getSession` L8730 GET backstop.
 `disableCron` does not cancel `setImmediate`.
 
+Cycle 103: **`emma_get_session` is a GET that is not a read.**
+`apiTools.ts` L274–288, listed (`mcp.apiTools.test.ts` L71).
+mcpFetch GET `/session/:id` → `setImmediate` continuation.
+Hermes during overlap starts Q-014’s leaf on this PORT.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -138,6 +138,8 @@ Cycle 101: `/generate` uses `tryClaim` / the session Set, not
 `track()`. A-019 must close both.
 Cycle 102: auto-continuation re-fills that Set after release.
 `tryClaim` refuse is required, not optional.
+Cycle 103: listed MCP `emma_get_session` mcpFetchs the GET that
+starts that continuation. Do not HTTP-split the leaf.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

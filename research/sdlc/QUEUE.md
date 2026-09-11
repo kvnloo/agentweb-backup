@@ -135,6 +135,10 @@ covers that Set too. Product READY unchanged.
 Cycle 102: auto-continuation `setImmediate` after lock release
 (L9406–9409) then `tryClaim` L1350. Re-fills the live Set.
 Product READY unchanged.
+Cycle 103: listed `emma_get_session` mcpFetchs that GET
+(`apiTools.ts` L286, not `internal`). Hermes poll can start
+billed continuation on the dying instance. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
