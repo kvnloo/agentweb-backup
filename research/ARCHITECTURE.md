@@ -465,6 +465,8 @@ Cycle 119: cannot name platform nginx.conf (`app.ts` L152–155).
 A-006 discarded.
 Cycle 120: git never chooses among 3001 / 8080 / 5000. A-006
 discarded.
+Cycle 121: a `/mcp` location is instance-only; ENG-836 allows it
+alone. Do not add A-021. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

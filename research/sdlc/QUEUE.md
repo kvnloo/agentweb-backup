@@ -194,6 +194,8 @@ Docs default upstream 5000. Product READY unchanged.
 Cycle 120: git never chooses among 3001 / 8080 / 5000. Zero
 `application:environment` in `.ebextensions`. Product READY
 unchanged.
+Cycle 121: a `/mcp` location is instance-only. ENG-836 allows it
+alone. Do not add A-021. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

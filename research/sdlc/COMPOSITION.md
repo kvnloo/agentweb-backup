@@ -475,6 +475,12 @@ L304). `websocket.conf` L6 hardcodes 8080; Node fallback is 3001
 (`server.ts` L55). Platform injects `PORT`; `/socket.io/` does not
 read it.
 
+Cycle 121: **a `/mcp` location is instance-only.**
+`eb-config-conflict.sh` L190–193 every `*.platform/*` is
+instance. Test L188–192 instance-only **passes**. L124–130 +
+`timeout.config` is `EB_CONFIG_CONFLICT`. `eb-deploy.sh` is not
+classified (L196–197). Do not add A-021.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

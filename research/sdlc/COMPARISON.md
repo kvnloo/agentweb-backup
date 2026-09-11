@@ -302,3 +302,5 @@ reverted. Do not copy that as A-006.
   Docs default upstream 5000. Hermes/OMP: no proxy file. Not A-006.
 - Cycle 120: git never chooses 3001/8080/5000. Zero
   `application:environment` in `.ebextensions`. Not A-006.
+- Cycle 121: a `/mcp` location is instance-only. ENG-836 allows
+  it alone, forbids it with ALB `.ebextensions`. Not A-006.

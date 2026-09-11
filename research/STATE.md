@@ -7,15 +7,15 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 120
+cycles_completed: 121
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 121
+next_cycle: 122
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 120: git never chooses 3001/8080/5000. Cycle 121:
-  cheapest remaining. Candidate: would a /mcp location pin
-  8080, and does ENG-836 treat that as instance config?
+  Cycle 121: /mcp location is instance-only; ENG-836 allows it
+  alone. Cycle 122: cheapest remaining. Candidate: conflict job
+  has no draft skip; pass still refuses deployability?
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

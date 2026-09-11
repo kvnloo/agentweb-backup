@@ -189,6 +189,8 @@ and port are live-AWS-only.
 Cycle 120: git never chooses among 3001 / 8080 / 5000. Zero
 `application:environment` in `.ebextensions`. `websocket.conf`
 hardcodes 8080 and does not read `$PORT`.
+Cycle 121: a `/mcp` location is instance-only. ENG-836 allows it
+alone and forbids it next to ALB `.ebextensions`. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

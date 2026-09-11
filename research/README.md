@@ -355,6 +355,9 @@ Cycle 120: git **never chooses** among 3001 / 8080 / 5000. Zero
 `application:environment` in `.ebextensions`. That namespace is
 test fixtures only (`eb-config-conflict.test.sh` L304).
 `websocket.conf` hardcodes 8080 and does not read `$PORT`.
+Cycle 121: a `/mcp` location is **instance-only**. ENG-836 allows
+it alone (test L188–192) and forbids it next to `timeout.config`
+(L124–130). `eb-deploy.sh` is not classified. Do not add A-021.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
