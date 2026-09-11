@@ -40,6 +40,7 @@ jest.mock("../services/db", () => ({
 jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: jest.fn().mockResolvedValue(null),
+    getSettings: jest.fn().mockResolvedValue([]),
     setSetting: jest.fn().mockResolvedValue(undefined),
   },
 }));
