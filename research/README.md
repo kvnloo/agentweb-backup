@@ -122,7 +122,10 @@ them; parent `clearTerminalProgress` L322 on worker death. Chatbot
 is `chatSocketHandler.ts` L94 `socket.emit('message')` — a third
 fanout, still this process. MCP `text/event-stream` Accept
 (`mcpSessionRehydration.ts` L40) is Streamable HTTP, not Agent Mode
-progress.
+progress. Cycle 66: concurrency is the same shape.
+`keyedMutex.ts` L12–15 states different processes never write the
+same session; `tryClaimSessionGeneration` L936–956 is an in-memory
+Set. Do not extract `generateImage` out from under that claim.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T21:00:00Z",
+  "updated_at": "2026-09-11T21:02:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -153,7 +153,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown (server.ts L404–413 ENG-1189) waits on worker/cron/turns BEFORE server.close() because mcpFetch is loopback to this PORT. Cycle 64–65: SSE Maps (sseProgress.ts) are parent-heap only — child worker never imports them; a fifth listen() cannot see progress without Redis (instanceState.ts L10–11 already refused Redis for cron). Hermes: one process. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown (server.ts L404–413 ENG-1189) waits on worker/cron/turns BEFORE server.close() because mcpFetch is loopback to this PORT. Cycle 64–65: SSE Maps are parent-heap only. Cycle 66: keyedMutex.ts L12–15 — different processes never write the same session; tryClaimSessionGeneration (agentModeController.ts L936–956) is an in-memory Set. A fifth listen() would race that claim. Hermes: one process. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -166,6 +166,8 @@
         "backend/src/services/tokenUsageService.ts",
         "backend/src/server.ts",
         "backend/src/services/remotionService.ts",
+        "backend/src/utils/keyedMutex.ts",
+        "backend/src/controllers/agentModeController.ts",
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",

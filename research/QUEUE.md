@@ -87,5 +87,7 @@ Cycle 64: SSE (`sseProgress.ts`) is a different bus from Socket.IO;
 `RunEmitter` typed sink is a no-op (`agentModeService.ts` L3449).
 Cycle 65: `sseProgress` Maps are parent-local (`workerService` L322
 clears them on child death); chatbot is per-socket `message`, not
-SSE. A-006 stays discarded.
+SSE. Cycle 66: `keyedMutex.ts` L12–15 + `activeSessionGenerations`
+Set — one session, one process. A fifth `listen()` would race that
+claim. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

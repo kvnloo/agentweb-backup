@@ -46,8 +46,11 @@ Socket.IO only. Cycle 65: `sseProgress` Maps live on the **parent**
 (`workerService.ts` L8 / L322 `clearTerminalProgress` on child death).
 Child worker has zero `sseProgress` imports. Same in-memory family
 as `instanceState.ts` L10–11 (no Redis). Chatbot is a third fanout
-(`chatSocketHandler.ts` L94 `socket.emit('message')`). A-006 stays
-discard. Product READY unchanged.
+(`chatSocketHandler.ts` L94 `socket.emit('message')`). Cycle 66:
+`keyedMutex.ts` L12–15 — different processes never write the same
+session. `tryClaimSessionGeneration` (`agentModeController.ts`
+L936–956) is an in-memory Set. A-006 stays discard. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

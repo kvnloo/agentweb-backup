@@ -119,6 +119,13 @@ fix). `instanceState.ts` L10–11 already refused Redis for cron.
 MCP rehydration L40 `text/event-stream` is MCP protocol, not this
 SSE. Do not introduce Redis. Do not HTTP-split.
 
+Cycle 66: **the lock is the composition boundary.**
+`keyedMutex.ts` L12–15: different processes never write the same
+session. `activeSessionGenerations` (`agentModeController.ts` L936)
+is a `Set`. `tryClaimSessionGeneration` is synchronous check-and-set.
+A-006 as a fifth process would race that Set. A-017 does not touch
+it. `cronJobRegistry.inFlight` is the drain-side Map (ENG-1189).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

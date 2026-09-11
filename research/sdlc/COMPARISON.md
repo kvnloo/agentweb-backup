@@ -133,3 +133,5 @@ submodule of the leaf package (A-008, not A-006).
   Socket.IO (`type:'socketEmit'`). `RunEmitter` typed sink is a no-op.
 - Cycle 65: `sseProgress` Maps are parent-heap only (same as
   `instanceState` — no Redis). Chatbot is per-socket `'message'`.
+- Cycle 66: `keyedMutex.ts` L12–15 + `activeSessionGenerations` Set.
+  A fifth process would race the claim. Do not Redis-ify the lock.

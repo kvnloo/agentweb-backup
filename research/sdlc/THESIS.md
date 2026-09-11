@@ -57,7 +57,9 @@ cycles; `registerIo` exists but `MinimalIo` cannot emit — park A-017
 L1495). Cycle 64: SSE (`sseProgress.ts`) is a second in-process bus;
 `RunEmitter` typed sink is empty (`agentModeService.ts` L3449). Cycle 65:
 those Maps are parent-heap only (`instanceState.ts` L10–11 same
-shape; child worker never imports `sseProgress`). The listed face is a
+shape; child worker never imports `sseProgress`). Cycle 66:
+`keyedMutex.ts` L12–15 — one session, one process;
+`tryClaimSessionGeneration` is an in-memory Set. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
