@@ -85,5 +85,7 @@ AgentWebPro still empty on Q-014/A-002/A-017 first-slice files;
 `agentModeController.ts`); A-017 first slice still the two `require`s.
 Cycle 64: SSE (`sseProgress.ts`) is a different bus from Socket.IO;
 `RunEmitter` typed sink is a no-op (`agentModeService.ts` L3449).
-A-006 stays discarded.
+Cycle 65: `sseProgress` Maps are parent-local (`workerService` L322
+clears them on child death); chatbot is per-socket `message`, not
+SSE. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

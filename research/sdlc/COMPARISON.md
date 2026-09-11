@@ -131,3 +131,5 @@ submodule of the leaf package (A-008, not A-006).
   Partner-portal GTMPlans listens with no client join.
 - Cycle 64: worker IPC already splits SSE (`type:'progress'`) from
   Socket.IO (`type:'socketEmit'`). `RunEmitter` typed sink is a no-op.
+- Cycle 65: `sseProgress` Maps are parent-heap only (same as
+  `instanceState` — no Redis). Chatbot is per-socket `'message'`.

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:58:00Z",
+  "updated_at": "2026-09-11T21:00:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -153,7 +153,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown (server.ts L404–413 ENG-1189) waits on worker/cron/turns BEFORE server.close() because mcpFetch is loopback to this PORT. A fifth listen() is not in that drain. Hermes: one process. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown (server.ts L404–413 ENG-1189) waits on worker/cron/turns BEFORE server.close() because mcpFetch is loopback to this PORT. Cycle 64–65: SSE Maps (sseProgress.ts) are parent-heap only — child worker never imports them; a fifth listen() cannot see progress without Redis (instanceState.ts L10–11 already refused Redis for cron). Hermes: one process. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -359,7 +359,7 @@
         "backend/src/services/agentMode/streamEvents.ts",
         "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo(). Do not absorb sseProgress / RunEmitter (cycle 64: worker already splits type:progress vs type:socketEmit; RunEmitter typed sink is a no-op at agentModeService L3449). Do not edit crm.ts (#1544 #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice. Later: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM/SSE. Do not edit app.ts (#2271 + #1814).",
+      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo(). Do not absorb sseProgress / RunEmitter (cycle 64–65: worker IPC type:progress vs type:socketEmit; Maps are parent-local — child worker never imports sseProgress; clearTerminalProgress L322 on death). Do not introduce Redis. Do not edit crm.ts (#1544 #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice. Later: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM/SSE. Do not edit app.ts (#2271 + #1814).",
       "harsha_db": false
     }
   ]

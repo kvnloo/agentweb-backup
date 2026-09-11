@@ -111,6 +111,14 @@ only `emitLegacy`. `crm.ts` L3245 local `emitProgress` is Socket.IO
 and must not be confused with `sseProgress`. A-017 does not absorb
 the SSE Maps.
 
+Cycle 65: **Maps stay on the parent heap.** Child worker has zero
+`sseProgress` imports. `generateMarketingResponseWorkerService.ts` L8 /
+L322 `clearTerminalProgress` on child death (zombie-"Thinking…"
+fix). `instanceState.ts` L10–11 already refused Redis for cron.
+`chatSocketHandler.ts` L94 is a third fanout (this socket, `'message'`).
+MCP rehydration L40 `text/event-stream` is MCP protocol, not this
+SSE. Do not introduce Redis. Do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -7,15 +7,15 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 64
+cycles_completed: 65
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 65
+next_cycle: 66
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 64: worker already splits SSE (type:progress) from Socket.IO
-  (type:socketEmit). RunEmitter typed sink is a no-op. A-017 Socket.IO
-  only. Cycle 65: cheapest remaining mapping. Do not un-ready Q-001 /
+  Cycle 65: sseProgress Maps are parent-instance-local (same as
+  instanceState). Child worker never imports them. A-017 Socket.IO
+  only. Cycle 66: cheapest remaining mapping. Do not un-ready Q-001 /
   Q-014 / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle

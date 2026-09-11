@@ -42,7 +42,12 @@ the two `require`s, not the 15k controller. Cycle 64: worker IPC
 already splits `'progress'` (SSE / `sseProgress.ts`) from
 `'socketEmit'` (A-017). `RunEmitter` typed sink is `() => {}`
 (`agentModeService.ts` L3449); only `emitLegacy` is live. A-017 is
-Socket.IO only. A-006 stays discard. Product READY unchanged.
+Socket.IO only. Cycle 65: `sseProgress` Maps live on the **parent**
+(`workerService.ts` L8 / L322 `clearTerminalProgress` on child death).
+Child worker has zero `sseProgress` imports. Same in-memory family
+as `instanceState.ts` L10–11 (no Redis). Chatbot is a third fanout
+(`chatSocketHandler.ts` L94 `socket.emit('message')`). A-006 stays
+discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

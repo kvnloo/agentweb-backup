@@ -330,6 +330,9 @@ A-017 first slice is still the two `require`s. A-006 discarded.
 Cycle 64: SSE (`sseProgress.ts`) ≠ Socket.IO. Worker IPC
 `type:'progress'` vs `type:'socketEmit'`. `RunEmitter` typed sink is
 a no-op. A-006 discarded.
+Cycle 65: `sseProgress` Maps are parent-local (`workerService` L322).
+Child worker never imports them. Chatbot is per-socket `message`
+(`chatSocketHandler.ts` L94). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

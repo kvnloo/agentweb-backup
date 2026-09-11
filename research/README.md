@@ -115,7 +115,14 @@ client join — server L186 is enough. A-017 first slice stays the two
 Socket.IO. Worker IPC already has two types (`progress` vs
 `socketEmit`). `RunEmitter` (`streamEvents.ts`) typed sink is empty
 (`agentModeService.ts` L3449); only `emitLegacy` runs. Do not absorb
-SSE into A-017. Do not HTTP-split either bus.
+SSE into A-017. Do not HTTP-split either bus. Cycle 65: those SSE
+Maps are parent-instance-local (`sseProgress.ts` L10–14;
+`instanceState.ts` L10–11 same shape). Child worker never imports
+them; parent `clearTerminalProgress` L322 on worker death. Chatbot
+is `chatSocketHandler.ts` L94 `socket.emit('message')` — a third
+fanout, still this process. MCP `text/event-stream` Accept
+(`mcpSessionRehydration.ts` L40) is Streamable HTTP, not Agent Mode
+progress.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
