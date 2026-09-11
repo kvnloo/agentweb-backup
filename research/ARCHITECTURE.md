@@ -239,6 +239,10 @@ persisted logo. A-006 stays discarded.
 Cycle 37: four in-process registries (`emma/registry.ts` is 3 lines).
 Q-014 is `mcpServerCore.ts` L81–83 `getToolDefinitions()`, not an Emma
 dual-register. A-005 pile still 7 PRs (40,571 vs scorecard 23,895).
+Cycle 38: two `generate_image` executes (Emma `emma/tools.ts` L5055
+direct vs MCP `apiTools.ts` L2096 mcpFetch). `backend/package.json` has
+neither `workspaces` nor `dependency-cruiser`. First slice is folders +
+AST, not npm workspaces.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

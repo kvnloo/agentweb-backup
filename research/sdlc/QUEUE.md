@@ -23,10 +23,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 37: four in-process registries (`emma/registry.ts` is 3 lines).
-Q-014 is `ListToolsRequestSchema` L81–83, not an Emma dual-register.
-A-005 pile still 7 PRs; scorecard 23,895 vs disk 40,571. A-006 stays
-discard.
+Cycle 38: Emma `generate_image` execute is in-process policy
+(`emma/tools.ts` L5055); MCP execute is already mcpFetch (L2096).
+Q-014 lists the MCP face. `backend/package.json` has no workspaces.
+A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

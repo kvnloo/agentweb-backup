@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:37:00Z",
+  "updated_at": "2026-09-11T19:39:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -172,7 +172,7 @@
       "evidence": 5,
       "collision": 3,
       "score": 15,
-      "why": "Cycle 20. OMP pi-utils does not depend on the app. AgentWeb utils/llmClients.ts and llmService.ts import services/usageRecorderService. Moving the meter into utils would fight the one-charge invariant and billing tests. Leave the hub in services/. Not a nanoservice.",
+      "why": "Cycle 20. OMP pi-ai does not depend on agent-core. AgentWeb utils/llmClients.ts L33 and llmService.ts import services/usageRecorderService. Moving the meter into utils would fight the one-charge invariant and billing tests. Leave the hub in services/. Not a nanoservice.",
       "files": [
         "backend/src/utils/llmClients.ts",
         "backend/src/utils/llmService.ts",

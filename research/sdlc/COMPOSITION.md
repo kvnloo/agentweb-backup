@@ -126,6 +126,18 @@ this.toolRegistry       ← copies both (L1827 vendor, L1891 Emma)
 `ListToolsRequestSchema` (`mcpServerCore.ts` L81–83) is Q-014’s face.
 Do not dual-register `generate_image` like `evaluation_workspace` (L62).
 
+## Two `generate_image` executes (cycle 38)
+
+```
+emma/tools.ts L5055–5075  ──► agentModeService.generateImage  (policy, in-process)
+apiTools.ts L2096–2107    ──► mcpFetch POST /api/emma/generate-image
+                              ──► same generateImage (already the HTTP face)
+```
+
+Q-014 lists the second row. A-006 would add a third hop after it.
+`backend/package.json`: no `workspaces`, no dependency-cruiser.
+
+
 
 ## Two MCP hop styles (cycle 32)
 
