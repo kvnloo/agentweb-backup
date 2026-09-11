@@ -134,6 +134,8 @@ Cycle 99: `chatbotTurn` already extends that live drain; wrap
 CallTool after #2 must copy the worker pair.
 Cycle 100: Slack/email ack HTTP then `track()`. Park A-019 —
 one registry gate, not a Slack nanoservice.
+Cycle 101: `/generate` uses `tryClaim` / the session Set, not
+`track()`. A-019 must close both.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

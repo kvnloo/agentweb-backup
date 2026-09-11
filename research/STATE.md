@@ -7,17 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 100
+cycles_completed: 101
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 101
+next_cycle: 102
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 100: Slack/email ack HTTP then track(); parked A-019.
-  Cycle 101: cheapest remaining. Candidate: verifiedGenerateTurn
-  / tryClaim on HTTP /generate during drain. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
-  passes, unsubscribe agentweb-research-cycle.
+  Cycle 101: /generate uses the session Set, not track().
+  A-019 first slice now covers tryClaim too. Cycle 102:
+  cheapest remaining. Candidate: media auto-continuation
+  tryClaim during drain. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

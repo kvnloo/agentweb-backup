@@ -176,4 +176,7 @@ L301, no `isCronEnabled`). A-006 stays discarded.
 Cycle 100: Slack/email ack HTTP then `track()`. Park A-019 (one
 `track()` gate). Do not edit `slack.ts` (#2393). A-006 stays
 discarded.
+Cycle 101: `/generate` uses `tryClaim` into the session Set, not
+`track()`. A-019 first slice now covers both waiters. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

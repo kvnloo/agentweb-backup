@@ -250,3 +250,7 @@ reverted. Do not copy that as A-006.
 - Cycle 100: Slack/email ack 200 then `track()`. HTTP is already
   gone; `server.close` does not abort. Park A-019: flag on
   `track()`, not `slack.ts` (#2393). Hermes: one process.
+- Cycle 101: `/generate` never `track()`s. Second live waiter is
+  `activeSessionGenerations`. A-019 first slice: `instanceState`
+  bit consulted by `track()` and `tryClaim`. Not a `/generate`
+  nanoservice.

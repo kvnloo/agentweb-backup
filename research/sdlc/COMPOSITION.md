@@ -363,6 +363,11 @@ L468 `res.status(200)` then `slackAgentTurn` L249. Resend
 `server.close` does not abort after-ack work. Park A-019: one
 `draining` flag on `track()`. Do not edit `slack.ts` (#2393).
 
+Cycle 101: **`/generate` is the Set, not `track()`.**
+`generateResponse` L8817 / L9016. `verifiedGenerateTurn` L14194
+is the only `track()` in the controller. `drainActiveSessionGenerations`
+is a second live waiter. A-019 must close `tryClaim` too.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
