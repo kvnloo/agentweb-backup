@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:45:00Z",
+  "updated_at": "2026-09-11T17:50:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "items": [
     {
       "id": "Q-001",
       "title": "Make Emma-via-Hermes a real operator path",
-      "status": "keep",
+      "status": "ready",
       "leverage": 5,
       "product": 4,
       "mergeability": 5,
@@ -19,7 +19,7 @@
         "backend/src/mcp/oauth/oauthRoutes.ts",
         "backend/docs/AGENT_API.md"
       ],
-      "first_slice": "Docs + a tiny Hermes-side runbook/skill; optional non-schema callback helper. Do not Slack-bridge PKCE on the server. After OAuth works, Hermes still will not see generate_image until Q-014.",
+      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. Docs + Hermes-side skill. After OAuth, Hermes still will not see generate_image until Q-014.",
       "harsha_db": false
     },
     {
@@ -190,21 +190,22 @@
     },
     {
       "id": "Q-011",
-      "title": "Local Hermes proxy for WhatsApp/WeChat (WIP 2026-04)",
+      "title": "Hermes as ENG-381 local-agent successor (logged-in browser)",
       "status": "park",
-      "leverage": 4,
-      "product": 3,
+      "leverage": 5,
+      "product": 4,
       "mergeability": 1,
-      "evidence": 3,
-      "collision": 5,
-      "score": 16,
-      "why": "WIP.md already scoped Hermes gateway. Open PR #2271 is WhatsApp Cloud API. Collision is fatal until that PR lands or dies.",
+      "evidence": 5,
+      "collision": 4,
+      "score": 26,
+      "why": "local-agent-relay is dead (ENG-383). Playwright MCP is headless+isolated; agent-engine is cloud browser-use. Logged-in WhatsApp/LinkedIn needs a local persistent browser. Official replacement is ENG-381. Do not compete with WhatsApp Cloud API #2271. Don't revive ngrok/Codex.",
       "files": [
-        "WIP.md",
-        "local-agent-relay/"
+        "backend/src/emma/localAgentTools.ts",
+        "local-agent-relay/",
+        "backend/src/mcp/client/mcpClientService.ts"
       ],
-      "first_slice": "Wait on #2271. Do not add agentType field until then (schema-ish).",
-      "harsha_db": "agentType on AW-TaskExecutions is optional but still data-plane adjacent"
+      "first_slice": "Confirm ENG-381 ownership with Harsha. If open, Hermes+Tailscale instead of ngrok. No new Dynamo agentType.",
+      "harsha_db": false
     },
     {
       "id": "Q-012",
@@ -244,7 +245,7 @@
     {
       "id": "Q-014",
       "title": "Expose generate_image on external MCP tools/list",
-      "status": "keep",
+      "status": "ready",
       "leverage": 5,
       "product": 4,
       "mergeability": 4,

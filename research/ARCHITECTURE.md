@@ -1,6 +1,6 @@
 # Architecture brief (living)
 
-Status: **cycle 4**. Deepens every cycle. Full teach-in after `briefing_ready`.
+Status: **cycle 5**. Deepens every cycle. Full teach-in after `briefing_ready`.
 
 ## What AgentWeb actually is
 
@@ -19,8 +19,10 @@ partner-portal (this repo, admin) ─┼─► backend Express API + Socket.IO
                                    │       ├─ MCP /oauth + /mcp  (external agents, Hermes)
                                    │       └─ DynamoDB + S3
                                    │
-                                   └─ agent-engine (Python, Playwright/browser-use)
-                                      polls AW-TaskExecutions for classic web tasks
+                                   ├─ Playwright MCP (@playwright/mcp 0.0.70)
+                                   │    headless + isolated per Agent Mode session
+                                   └─ agent-engine (Python, browser-use)
+                                      polls AW-TaskExecutions (max 3 concurrent)
 ```
 
 | Runtime | When it runs | LLM path |
@@ -82,9 +84,17 @@ do not duplicate it. `edit_landing_page_file` is still listed and deprecated.
 - Evaluation workspaces are isolated `eval_*` users with a connector-free Meta simulator.
 - Database/schema is a Harsha gate.
 
+## Browsers (cycle 5)
+
+Agent Mode Playwright MCP is **not** the agent-engine. The MCP client injects
+`--headless --isolated`, so it cannot hold WhatsApp Web. Cookie persistence
+(`AW-BrowserCookies`) exists for Emma; agent-engine has a separate S3
+`CookieSync`. `local-agent-relay` (Codex + ngrok) was retired ENG-383;
+replacement is ENG-381 — the Hermes-shaped local logged-in browser.
+
 ## What this brief still owes Kevin (later cycles)
 
-- Work plans vs skills decision rule (already in README) with a real example
+- Work plans vs skills decision rule with a real example
 - How scheduled chats differ from interactive (controller policy)
-- agent-engine cookie sync and why WhatsApp/WeChat still fail
 - Customer-portal surfaces we cannot see from this repo
+- Full teach-in prose (cycle 6)

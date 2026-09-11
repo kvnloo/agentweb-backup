@@ -6,16 +6,15 @@ owner: cursor-cloud bc-658f6e8c-e6a2-4e2e-99d4-8bee7362c95b
 branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: false
-cycles_completed: 4
+cycles_completed: 5
 target_cycles: 7
 stop_after: 2026-09-11T20:15:00Z
-next_cycle: 5
-focus: agent-engine-vs-agent-mode
+next_cycle: 6
+focus: architecture-teach-in
 next_focus_hint: |
-  Cycle 5: agent-engine vs Agent Mode — where browser-use still matters;
-  cookie sync; why WhatsApp/WeChat fail; relation to #2271.
-  Cycle 6: synthesize ARCHITECTURE.md teach-in + promote 1–2 READY briefs
-  (Q-001 and Q-014 or Q-015).
+  Cycle 6: rewrite ARCHITECTURE.md as a teach-in Kevin can read (three
+  runtimes, two tool registries, three browser stacks, money/models).
+  Q-001 and Q-014 already have READY briefs.
   Cycle 7: freeze queue, set briefing_ready true, stop timer.
 timer_name: agentweb-research-cycle
 ```
