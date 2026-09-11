@@ -220,3 +220,6 @@ reverted. Do not copy that as A-006.
 - Cycle 90: AgentWeb’s self-MCP skip is file-config only. Dynamo
   `mcp_servers` + admin localhost URL still connect. Copy the
   filter (A-018 park); do not HTTP-split to “close the loop”.
+- Cycle 91: live face is `/mcp` (`mcpServer.ts` + OAuth metadata).
+  `/mcp/server` is inspector + AGENT_API L129 drift. Q-001 runbook
+  already matches. Do not HTTP-split a renamed URL.

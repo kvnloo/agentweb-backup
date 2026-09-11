@@ -225,6 +225,9 @@ Cycle 90: self `"agentweb-tools"` skip is **file-config only**
 (`mcpClientService.ts` L420–432). Dynamo `mcp_servers` has no
 `isInternal` filter; admin localhost URLs connect. Park A-018;
 do not HTTP-split; do not delay Q-014.
+Cycle 91: live MCP face is **`/mcp`** (`mcpServer.ts` L298).
+`package.json` `mcp:inspector` and `AGENT_API.md` L129 still say
+`/mcp/server`. Q-001 runbook already uses `/mcp`. Do not rewrite it.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

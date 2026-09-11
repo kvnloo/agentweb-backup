@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 90
+cycles_completed: 91
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 91
+next_cycle: 92
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 90: self-MCP skip is file-config only; A-018 parked.
-  Cycle 91: cheapest remaining. Candidate: getSessionClient
-  still reachable with agentweb-tools if serverConfigs is stuffed.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 91: live MCP face is /mcp; /mcp/server is stale.
+  Cycle 92: cheapest remaining. Candidate: mcp:inspector SSE vs
+  Streamable HTTP POST /mcp. Do not un-ready Q-001 / Q-014 / Q-003.
+  Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

@@ -98,7 +98,9 @@ still 0.85.1; they unpublished experimental client/server.
 Cycle 89: Hermes is still MCP client-only; parallel is opt-in
 (default false). Cycle 90: file-config still skips
 `"agentweb-tools"`; the Dynamo `mcp_servers` path does not.
-Park A-018. Product READY unchanged.
+Park A-018. Cycle 91: live HTTP face is `/mcp` only;
+`/mcp/server` is stale inspector + AGENT_API L129. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

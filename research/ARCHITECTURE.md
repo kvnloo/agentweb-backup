@@ -407,6 +407,9 @@ Cycle 90: file-config still skips `"agentweb-tools"`
 (`mcpClientService.ts` L420–432); Dynamo `mcp_servers` L435–450
 does not. Admin `isValidUrl` allows localhost. Park A-018.
 A-006 discarded.
+Cycle 91: live face `/mcp` (`mcpServer.ts` L298); `/mcp/server`
+is stale inspector + AGENT_API L129. Q-001 runbook is correct.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

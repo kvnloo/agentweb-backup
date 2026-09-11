@@ -302,6 +302,12 @@ Admin localhost URLs connect (`mcpServers.ts` L87–90);
 Discover L443–465 is a third `listTools` with no skip.
 Park A-018. Do not HTTP-split.
 
+Cycle 91: **live MCP face is `/mcp`.** `mcpServer.ts` L298/509/535
+and OAuth metadata (`oauthRoutes.ts` L81) have no `/mcp/server`.
+`mcp:inspector` and `AGENT_API.md` L129 are stale. Q-001 runbook
+already uses `/mcp`. `github` in `mcp_config.ts` is stdio vendor,
+not a self-loop.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
