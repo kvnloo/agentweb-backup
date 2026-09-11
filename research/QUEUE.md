@@ -121,4 +121,7 @@ Cycle 76: nginx/ALB 600s on `/mcp`; Socket.IO 3600s. Node
 Cycle 77: `generate_image` mcpFetch aborts at 5 min default
 (`httpClient.ts` L205). v0 already raises `timeoutMs` in-process.
 A-006 stays discarded.
+Cycle 78: leaf `IMAGE_GENERATION_TIMEOUT_MS` is 8 min (ENG-510);
+MCP mcpFetch is 5. Align `timeoutMs` after Q-014. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

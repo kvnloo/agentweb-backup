@@ -207,6 +207,12 @@ L2096–2108) does not override. Landing-page tools pass
 `timeoutMs: 25 * 60 * 1000` (L1543) — already longer than nginx,
 still mcpFetch to this PORT. A-006 would sit behind that abort.
 
+Cycle 78: **leaf is 8 min; MCP is 5.** `IMAGE_GENERATION_TIMEOUT_MS`
+(`imageGeneration.ts` L69–79) stays under the 10 min turn
+(ENG-510). `withTimeout` L537–542. MCP never passes `timeoutMs`,
+so Hermes loses 3 min of allowed vendor time. Align on this PORT
+after #2; do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

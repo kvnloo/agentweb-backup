@@ -168,6 +168,11 @@ Cycle 77: Q-014’s inner mcpFetch aborts at 5 min
 (`httpClient.ts` L205) unless `timeoutMs` is set. `generate_image`
 does not set it. Do not HTTP-split to get a longer clock; v0
 already overrides `timeoutMs` on this hop.
+Cycle 78: the leaf allows 8 min (`imageGeneration.ts` L69–79
+ENG-510) so a hung provider leaves 2 min under the 10 min turn.
+MCP’s 5 min abort is stricter than that leaf. Align `timeoutMs`
+on mcpFetch after listing; do not extract a process to get the
+8 min.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

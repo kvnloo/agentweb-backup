@@ -373,6 +373,10 @@ Cycle 76: nginx `agent-mode-timeout.conf` L5–7 is global 600s;
 Cycle 77: `httpClient.ts` L205 default 5 min; `generate_image`
 L2096–2108 has no `timeoutMs`. v0 L1543 passes 25 min in-process.
 A-006 discarded.
+Cycle 78: `imageGeneration.ts` L69–79 default 8 min (ENG-510);
+must stay under `GENERATION_TIMEOUT_MS` 10 min
+(`agentModeController.ts` L1100–1101). MCP 5 min is stricter.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

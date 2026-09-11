@@ -171,3 +171,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 77: mcpFetch default abort is 5 min; `generate_image` does
   not override. v0 tools pass 25 min on the same hop instead of
   extracting a process. Hermes: one execute() timeout.
+- Cycle 78: leaf `IMAGE_GENERATION_TIMEOUT_MS` is 8 min (ENG-510,
+  below the 10 min turn). MCP abort is 5. Two clocks on one leaf.
+  Align `timeoutMs`; do not add a process.

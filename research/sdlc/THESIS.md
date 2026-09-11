@@ -92,7 +92,9 @@ location; `.ebextensions/timeout.config` L5–6), not Socket.IO’s
 beat the proxy. Cycle 77: Q-014 `generate_image` mcpFetch uses
 the **5 min** default abort (`httpClient.ts` L205); it does not
 pass `timeoutMs` (`apiTools.ts` L2096–2108). Landing-page tools
-already override to 25 min in-process. The listed face is a
+already override to 25 min in-process. Cycle 78: the leaf is
+**8 min** (`imageGeneration.ts` L69–79 ENG-510), so MCP’s 5 min
+is a stricter face, not the vendor cap. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

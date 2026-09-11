@@ -98,6 +98,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   is never heartbeated from TypeScript. Cycle 76: `/mcp` is on
   the 600s nginx/ALB path; only `/socket.io/` is 3600s. Cycle 77:
   `generate_image` mcpFetch default abort is 5 min, not 10.
+  Cycle 78: leaf withTimeout is 8 min (ENG-510); MCP is 5.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test
