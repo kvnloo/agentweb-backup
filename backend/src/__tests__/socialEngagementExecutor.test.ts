@@ -1,3 +1,5 @@
+jest.mock('../services/evaluationStore', () => ({ evaluationStore: { discardJob: jest.fn().mockResolvedValue(undefined) } }));
+import { evaluationStore } from '../services/evaluationStore';
 // ─── Mock all external dependencies ─────────────────────────────────────────
 
 jest.mock('../services/db', () => ({
@@ -175,6 +177,14 @@ describe('SocialEngagementExecutor', () => {
   // ─── processQueue ───────────────────────────────────────────────────────────
 
   describe('processQueue', () => {
+    it('ENG-1870 never claims or executes evaluation-owned jobs', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction({ userId: 'eval_test' })]);
+      const run = executor.processQueue(); await jest.runAllTimersAsync(); await run;
+      expect(evaluationStore.discardJob).toHaveBeenCalledWith('eval_test', 'sched-1');
+      expect(mockScheduleDb.claimAction).not.toHaveBeenCalled();
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+    });
     it('should do nothing when no actions are due', async () => {
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([]);
 

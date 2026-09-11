@@ -1,3 +1,4 @@
+import { isEvaluationUser, requireActiveEvaluation } from '../../services/evaluationPolicy';
 /**
  * MCP OAuth 2.1 Service
  *
@@ -263,7 +264,7 @@ export class McpOAuthService {
 
     const record = result.Item as OAuthAuthorizationCode | undefined;
     if (!record || record.used !== false || record.code !== code ||
-        typeof record.clientId !== 'string' || typeof record.userId !== 'string' ||
+        typeof record.clientId !== 'string' || (typeof record.userId !== 'string' || !record.userId) ||
         typeof record.scope !== 'string' || typeof record.redirectUri !== 'string' ||
         !Number.isFinite(record.expiresAt)) return null;
 
@@ -311,8 +312,10 @@ export class McpOAuthService {
   // ─── Token Pair ────────────────────────────────────────────────────────
 
   async createTokenPair(params: CreateTokenPairParams): Promise<TokenPairResponse> {
+    if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     const { record, response } = this.newTokenPair(params);
     await dynamodb.put({ TableName: this.tokensTable, Item: record }).promise();
+    if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     return response;
   }
 
@@ -362,8 +365,11 @@ export class McpOAuthService {
 
     const record = result.Item as OAuthTokenRecord | undefined;
     if (!record || record.revoked !== false || record.tokenHash !== tokenHash ||
-        typeof record.clientId !== 'string' || typeof record.userId !== 'string' || typeof record.scope !== 'string') return null;
+        typeof record.clientId !== 'string' || (typeof record.userId !== 'string' || !record.userId) || typeof record.scope !== 'string') return null;
 
+    if (isEvaluationUser(record.userId)) {
+      try { await requireActiveEvaluation(record.userId); } catch { return null; }
+    }
     const nowSec = Math.floor(Date.now() / 1000);
     const accessExpiry = record.familyId === undefined ? record.expiresAt : record.accessExpiresAt;
     if (typeof accessExpiry !== 'number' || !Number.isFinite(accessExpiry) || accessExpiry <= nowSec) return null;
@@ -434,9 +440,12 @@ export class McpOAuthService {
     const record = await this.tokenRecord(result.Items[0].tokenHash);
     const now = Math.floor(Date.now() / 1000);
     if (!record || record.refreshTokenHash !== refreshTokenHash || record.clientId !== clientId ||
-        typeof record.userId !== 'string' || typeof record.scope !== 'string' ||
+        (typeof record.userId !== 'string' || !record.userId) || typeof record.scope !== 'string' ||
         typeof record.revoked !== 'boolean' || !Number.isFinite(record.refreshExpiresAt) ||
         record.refreshExpiresAt <= now) return null;
+    if (isEvaluationUser(record.userId)) {
+      try { await requireActiveEvaluation(record.userId); } catch { return null; }
+    }
     if (record.revoked) {
       await this.revokeFamily(record);
       return null;
@@ -480,6 +489,9 @@ export class McpOAuthService {
       const reasons = (error as { CancellationReasons?: { Code?: string }[] }).CancellationReasons;
       if (Array.isArray(reasons) && reasons.some(reason => reason?.Code === 'ConditionalCheckFailed')) return null;
       throw error;
+    }
+    if (isEvaluationUser(record.userId)) {
+      try { await requireActiveEvaluation(record.userId); } catch { return null; }
     }
     return response;
   }

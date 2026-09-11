@@ -1630,6 +1630,9 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getAdminToolNames', () => {
+    it('ENG-1870 makes the evaluation lifecycle available to Emma administrators', () => {
+      expect(agentModeService.getAdminToolNames()).toContain('evaluation_workspace');
+    });
     it('does not expose manage_user_guide (ENG-163: legacy Notion write tool removed)', () => {
       // The admin tool registry (ADMIN_SKILL_TOOL_NAMES) must no longer carry the
       // retired manage_user_guide Notion write tool.
