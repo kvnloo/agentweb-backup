@@ -46,6 +46,22 @@ describe('AgentMode core loop — characterization snapshots', () => {
     installStandardMockDeps();
   });
 
+  it.each([undefined, 'high'])('ENG-1788: run message usage preserves served effort %s', async (effort) => {
+    const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
+      ...(effort ? { reasoning_effort: effort } : {}) };
+    jest.spyOn(service, 'callLLM').mockResolvedValue({
+      choices: [{ message: { role: 'assistant', content: 'Hello!', tool_calls: null }, finish_reason: 'stop' }],
+      usage,
+    } as any);
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+    const result = await service.generateMarketingResponse('Say hello.', [], 'test-user', service.default_model, 'test-session');
+    const message = result.responseMessages.find((entry: any) => entry.role === 'assistant');
+    expect(result.content).toBe('Hello!');
+    expect(message?.usage).toEqual(expect.objectContaining({ prompt_tokens: 10, completion_tokens: 5 }));
+    if (effort) expect(message?.usage).toHaveProperty('reasoning_effort', effort);
+    else expect(message?.usage).not.toHaveProperty('reasoning_effort');
+  });
+
   it('(a) happy path — one tool-call iteration then a final text response', async () => {
     const snapshot = await runScenario(service, {
       message: 'Pull my brand info and summarize it.',
