@@ -23,13 +23,15 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 26: coding agent is in-process (A-010 park). MCP vs in-app
-`generate_image` are two faces of `executeTool`. A-006 stays discard.
+Cycle 27: agent-engine (the real extract) still JWT-posts usage and
+revisions to `BACKEND_URL`. A-006 stays discard. A-002 oracle: 18
+`loops/core` files, two `../index` escapes.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
 1. **A-002** — AST import guard on `loops/core` only (copy
-   `sdkConstructionGuard.test.ts`). Do **not** copy forbid-all-services
+   `sdkConstructionGuard.test.ts`). Allow exactly `orchestrator` /
+   `instanceRunner` → `../index`. Do **not** copy forbid-all-services
    onto `agentMode/core` (`toolDispatch` imports the gateway).
 2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section

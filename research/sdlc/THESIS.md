@@ -80,8 +80,10 @@ Order is process, not a rewrite:
    the Content section). Keep the barrel. Never `emma/tools.ts`
    while #2832 is open (A-004). A-005 (LOC ratchet) waits until seven
    open `agentModeService.ts` PRs shrink.
-4. **Keep deploy units at four.** A fifth service for images/video would
-   split `meterUserUsage` / C2PA / `logoImage` — forbidden invariants.
+4. **Keep deploy units at four.** Agent-engine already extracted the
+   Playwright workload and still JWT-calls `/api/internal/usage` (cycle 27).
+   A fifth service for images/video would split `meterUserUsage` / C2PA /
+   `logoImage` — forbidden invariants.
 5. **Agent context map.** Draft: `research/sdlc/MODULE_MAP.md`. A short
    `backend/src/AGENTS.md` (module index, max file size, “do not edit X”)
    beats another 40k-line CLAUDE dump. LinkedIn’s 2026 MCP playbook is

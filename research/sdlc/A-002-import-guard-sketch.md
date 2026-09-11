@@ -10,6 +10,18 @@ dynamic `import()` string literals).
 
 Walk every `.ts` file under `backend/src/loops/core/` except `__tests__`.
 
+Cycle 27 oracle (2026-09-11T19:10Z): **18** prod files, **35** import
+specifiers. **Escapes from `loops/core/`:** only
+
+| File | Line | Specifier |
+|---|---|---|
+| `orchestrator.ts` | 27 | `../index` |
+| `instanceRunner.ts` | 22 | `../index` |
+
+Zero `services/` / `emma/` / `db`. A first PR that fails on any *new*
+escape (or on those two disappearing without a comment) is the ratchet.
+`instanceRunner.ts` L8–11 documents `../index` as deliberate.
+
 **Forbidden** module specifiers (after resolving relative paths against
 the file, or as a substring on the raw specifier):
 

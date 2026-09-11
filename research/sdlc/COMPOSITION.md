@@ -64,6 +64,23 @@ only to ignore `context.llmModel` (already set at `emma/tools.ts` L7582)
 in favor of `getCodingAgentDefaultModel()`. A-010: drop that import; do
 not extract a fifth deploy unit.
 
+## Fourth deploy unit: agent-engine (cycle 27)
+
+This is the Microsoft “extract when isolation forces it” case:
+Playwright + conda cannot share the Node/EB process. Work arrives via
+Dynamo (`get_pending_executions`, `StatusStartTimeIndex`, status
+`pending` — `task_monitor.py` L253–274). Metering and revisions do **not**
+stay in Python: `create_jwt_token` (`task_utils.py` L84) + `requests.post`
+to `BACKEND_URL` (`usage_reporter.py` L258 `/api/internal/usage`;
+`task_monitor.py` L129 revision). Same JWT self-call as MCP `mcpFetch`,
+cross-process. `#361` is an open engine PR (browser-use); do not land
+architecture edits there.
+
+`remotion-lambda` is the other extract (GPU/time-bounded render), invoked
+in-process from `remotionService.ts` via `@remotion/lambda` — not a
+second Emma mesh.
+
+
 ## What this means
 
 | Move | Extra hop? | Touches policy? |

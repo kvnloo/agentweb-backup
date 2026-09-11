@@ -38,8 +38,9 @@ AgentWeb:   customer-portal (other repo)
             backend EB        ─┼─► one Node process: 40k-line loop + 60 tools
             agent-engine VM    ─┤   MCP server is a *face* that loopbacks
             remotion-lambda    ─┘   http://localhost → emmaApi → generateImage
-            (cycle 25 COMPOSITION.md). Creative leaf still matches OMP:
-            loop → imageGeneration, never reverse. A-008 keeps that arrow.
+            (cycle 25 COMPOSITION.md). Agent-engine (GCP) polls Dynamo then
+            JWT-posts usage back (cycle 27) — extract for Playwright, not
+            for image gen. Creative leaf still matches OMP.
 ```
 
 ## OMP workspace DAG (2026-09-11 `package.json`)

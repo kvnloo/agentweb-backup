@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:07:00Z",
+  "updated_at": "2026-09-11T19:10:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -39,7 +39,7 @@
         "backend/src/__tests__/sdkConstructionGuard.test.ts",
         "research/sdlc/A-002-import-guard-sketch.md"
       ],
-      "first_slice": "When coding unlocked: sibling of sdkConstructionGuard.test.ts that AST-walks loops/core/**, forbids services/emma/db, allows ../index. Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService). Optional second test: agentMode/core ↛ agentModeService.ts only.",
+      "first_slice": "When coding unlocked: sibling of sdkConstructionGuard.test.ts that AST-walks loops/core/** (18 prod files). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index (cycle 27 oracle). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService). Optional second test: agentMode/core ↛ agentModeService.ts only.",
       "harsha_db": false
     },
     {

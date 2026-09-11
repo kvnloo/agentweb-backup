@@ -210,6 +210,8 @@ already imports `agentModeService`. Cycle 25: that MCP tool already
 loopbacks `http://localhost` into `generateImage` (`COMPOSITION.md`).
 Cycle 26: in-app path is `toolDispatch` → `executeTool` (no HTTP);
 `codingAgentService.ts` is not a subprocess.
+Cycle 27: agent-engine still JWT-calls `/api/internal/usage`; A-002
+oracle is 18 `loops/core` files / two `../index` escapes.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
