@@ -8,11 +8,13 @@
 // ── Mocks (must come before import) ─────────────────────────────────────────
 const mockGetSetting = jest.fn();
 const mockSetSetting = jest.fn();
+const mockSetSettingIfValueMatches = jest.fn();
 
 jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: mockGetSetting,
     setSetting:  mockSetSetting,
+    setSettingIfValueMatches: mockSetSettingIfValueMatches,
   },
 }));
 
@@ -42,6 +44,7 @@ const BASE_TPL: HtmlTemplate = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockSetSetting.mockResolvedValue({});
+  mockSetSettingIfValueMatches.mockResolvedValue(undefined);
 });
 
 // ── getTemplatesByOwner ───────────────────────────────────────────────────────
@@ -284,5 +287,175 @@ describe("getPublicTemplates", () => {
     expect(result).toHaveLength(1);
     expect(result[0].template_id).toBe("pub-1");
     expect(mockGetSetting).toHaveBeenCalledWith("templates_public");
+  });
+});
+
+// ── upsertPublicTemplate (ENG-1552) ─────────────────────────────────────────
+// The only writer of templates_public anywhere in this codebase — createTemplate
+// above only ever targets USER_KEY. Callers (seed scripts) supply their own
+// STABLE template_id rather than relying on a fresh uuid, so re-running a seed
+// is idempotent instead of accumulating duplicate public rows.
+describe("upsertPublicTemplate", () => {
+  const PUB_TPL = {
+    template_id: "eng1552-fixed-id",
+    template_name: "multi_campaign_performance_report",
+    type: ["landing_page"] as ("email" | "landing_page")[],
+    subject: "Report",
+    html_content: "<p>{{report_title}}</p>",
+    variables: ["report_title"],
+    arrayVariables: [],
+  };
+
+  it("creates a new row on an empty templates_public table", async () => {
+    mockGetSetting.mockResolvedValue(null);
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+    );
+
+    expect(created).toBe(true);
+    expect(template.template_id).toBe("eng1552-fixed-id");
+    expect(template.created_at).toBeTruthy();
+    expect(template.updated_at).toBeTruthy();
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      "templates_public",
+      expect.any(String),
+      "User templates",
+      "system",
+    );
+    const written = JSON.parse(mockSetSetting.mock.calls[0][1]);
+    expect(written).toHaveLength(1);
+    expect(written[0].template_id).toBe("eng1552-fixed-id");
+  });
+
+  it("with onlyIfAbsent:true, skips the write entirely when the id already exists", async () => {
+    const existing = { ...PUB_TPL, created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" };
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([existing]),
+    });
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+      { onlyIfAbsent: true },
+    );
+
+    expect(created).toBe(false);
+    expect(template.updated_at).toBe("2026-01-01T00:00:00.000Z");
+    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(mockSetSettingIfValueMatches).not.toHaveBeenCalled();
+  });
+
+  it("without onlyIfAbsent, overwrites the existing row in place via a CONDITIONED write, not duplicating it", async () => {
+    const existing = { ...PUB_TPL, html_content: "<p>OLD</p>", created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-01T00:00:00.000Z" };
+    const rawExisting = JSON.stringify([existing]);
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: rawExisting,
+    });
+
+    const { template, created } = await htmlTemplateService.upsertPublicTemplate(
+      PUB_TPL,
+      "system",
+    );
+
+    expect(created).toBe(false);
+    expect(template.html_content).toBe(PUB_TPL.html_content);
+    expect(template.created_at).toBe("2026-01-01T00:00:00.000Z");
+    // A row that already exists goes through the CONDITIONED write, never the plain one —
+    // an existing row is exactly the case a lost update could silently clobber.
+    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(1);
+    const [key, newValue, expectedValue] = mockSetSettingIfValueMatches.mock.calls[0];
+    expect(key).toBe("templates_public");
+    expect(expectedValue).toBe(rawExisting); // conditioned on the EXACT raw value just read
+    const written = JSON.parse(newValue);
+    expect(written).toHaveLength(1);
+    expect(written[0].html_content).toBe(PUB_TPL.html_content);
+  });
+
+  it("retries with a fresh read when the conditioned write loses a race, instead of failing or clobbering", async () => {
+    const stale = JSON.stringify([{ ...PUB_TPL, html_content: "<p>STALE</p>" }]);
+    const fresh = JSON.stringify([{ ...PUB_TPL, html_content: "<p>FRESH FROM ANOTHER WRITER</p>" }]);
+    mockGetSetting
+      .mockResolvedValueOnce({ settingName: "templates_public", settingValue: stale })
+      .mockResolvedValueOnce({ settingName: "templates_public", settingValue: fresh });
+    const conditionFailed: any = new Error("conflict");
+    conditionFailed.code = "ConditionalCheckFailedException";
+    mockSetSettingIfValueMatches
+      .mockRejectedValueOnce(conditionFailed)
+      .mockResolvedValueOnce(undefined);
+
+    const { created } = await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
+
+    expect(created).toBe(false);
+    expect(mockGetSetting).toHaveBeenCalledTimes(2);
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(2);
+    // The SECOND attempt must condition on the FRESH value it re-read, not the stale one.
+    expect(mockSetSettingIfValueMatches.mock.calls[1][2]).toBe(fresh);
+  });
+
+  it("does not swallow a real error as a lost race", async () => {
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([{ ...PUB_TPL, html_content: "<p>OLD</p>" }]),
+    });
+    mockSetSettingIfValueMatches.mockRejectedValue(new Error("dynamo down"));
+
+    await expect(htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system")).rejects.toThrow("dynamo down");
+  });
+
+  // Review findings, both closed: (1) sustained contention was correct by hand-trace but
+  // undertested — this pins the actual bound; (2) an existing row with an empty-string
+  // settingValue (distinct from a genuinely absent row) must still go through the
+  // conditioned write, not the unconditioned bootstrap path.
+  it("throws a clear bounded error after exhausting all retry attempts under sustained contention", async () => {
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: JSON.stringify([{ ...PUB_TPL, html_content: "<p>OLD</p>" }]),
+    });
+    const conditionFailed: any = new Error("conflict");
+    conditionFailed.code = "ConditionalCheckFailedException";
+    mockSetSettingIfValueMatches.mockRejectedValue(conditionFailed);
+
+    await expect(htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system")).rejects.toThrow(
+      /exceeded 5 attempts/,
+    );
+    // Bounded, not runaway: exactly 5 reads and 5 conditioned write attempts, never more.
+    expect(mockGetSetting).toHaveBeenCalledTimes(5);
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(5);
+  });
+
+  it("an existing row with an empty-string settingValue still goes through the CONDITIONED write, not the unconditioned bootstrap path", async () => {
+    mockGetSetting.mockResolvedValue({
+      settingName: "templates_public",
+      settingValue: "", // row EXISTS, but its value is falsy — distinct from row being absent
+    });
+
+    const { created } = await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
+
+    expect(created).toBe(true); // parses to [] either way, so this is a create
+    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(mockSetSettingIfValueMatches).toHaveBeenCalledTimes(1);
+    expect(mockSetSettingIfValueMatches.mock.calls[0][2]).toBe(""); // conditioned on the exact empty string read
+  });
+
+  it("never writes to a per-user key — only templates_public", async () => {
+    mockGetSetting.mockResolvedValue(null);
+    await htmlTemplateService.upsertPublicTemplate(PUB_TPL, "system");
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      "templates_public",
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+    );
+    expect(mockSetSetting).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^templates_(?!public)/),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
   });
 });

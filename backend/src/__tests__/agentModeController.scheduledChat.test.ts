@@ -3687,13 +3687,19 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         });
       });
 
-      it('should reject updating schedule without email notifications (no variables)', async () => {
+      // ENG-1836: retargeted. These asserted that an empty list is refused when the
+      // STORED list is also empty — an invariant that stopped holding when ENG-1723
+      // began auto-creating schedules with `emailNotifications: []`. Under that
+      // fixture a customer could never edit the schedule the system made for them.
+      // The protection that still applies, and what these now cover, is that you
+      // cannot CLEAR the last address off a schedule that has one.
+      it('should reject clearing the last email notification from a schedule that has one', async () => {
         mockScheduleDb.getScheduleById.mockResolvedValue({
           scheduleId: mockScheduleId,
           userId: mockUserId,
           status: 'active',
           nextRunTime: '2025-01-15T09:00:00.000Z',
-          emailNotifications: [],
+          emailNotifications: ['existing@example.com'],
         } as any);
 
         const mockReq = {
@@ -3720,13 +3726,52 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         });
       });
 
-      it('should reject updating schedule without email notifications (with variables)', async () => {
+      // ENG-1836: the case this ticket is about. An outreach schedule auto-created at
+      // onboarding ships with `emailNotifications: []` — the customer never asked for
+      // it and never supplied an address. Editing it (narrowing the ICP, renaming,
+      // changing cadence) returned 400 until they handed over an address for
+      // notifications they never requested. A schedule that never had one stays
+      // editable and stays without one.
+      it('allows editing an auto-created schedule that has no email notifications', async () => {
         mockScheduleDb.getScheduleById.mockResolvedValue({
           scheduleId: mockScheduleId,
           userId: mockUserId,
           status: 'active',
           nextRunTime: '2025-01-15T09:00:00.000Z',
           emailNotifications: [],
+          autoCreatedFromTemplateId: 'eng1609-linkedin-outreach-agent',
+        } as any);
+        mockScheduleDb.updateSchedule.mockResolvedValue({} as any);
+
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Renamed by the customer',
+            startingMessage: 'Run today outreach cycle',
+            scheduleFrequency: 'daily',
+            // Deliberately omitted — the customer is not supplying an address.
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).not.toHaveBeenCalledWith(400);
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+      });
+
+      it('should reject clearing the last email notification (with variables)', async () => {
+        mockScheduleDb.getScheduleById.mockResolvedValue({
+          scheduleId: mockScheduleId,
+          userId: mockUserId,
+          status: 'active',
+          nextRunTime: '2025-01-15T09:00:00.000Z',
+          emailNotifications: ['existing@example.com'],
         } as any);
 
         const mockReq = {

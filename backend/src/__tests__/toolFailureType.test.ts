@@ -38,6 +38,14 @@ describe('classifyToolFailureType', () => {
         classifyToolFailureType('Error', 'Task rejected: local agent may only be used for web browsing and data extraction'),
       ).toBe('by_design');
     });
+    // ENG-1844: the brand-logo gate correctly refusing to generate an invented-logo
+    // page is the tool working as designed, not a bug — must not inflate the 'bug'
+    // reliability count for a defect-free gate.
+    it('classifies missing_brand_logo errorClass', () => {
+      expect(
+        classifyToolFailureType('missing_brand_logo', 'API error (422): No brand logo is saved in Brand Guidelines.'),
+      ).toBe('by_design');
+    });
     it('classifies the local agent deprecation stub error (ENG-383) — retired-by-design, not a bug', () => {
       expect(
         classifyToolFailureType(
