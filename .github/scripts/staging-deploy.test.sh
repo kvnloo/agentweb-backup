@@ -44,6 +44,7 @@ class StagingContract(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', step('Checkout deploy controls'))
         self.assertIn('bash .github/scripts/eb-deploy.sh', step('Deploy and verify'))
         self.assertIn('working-directory: source/backend', step('Build and package'))
+        self.assertIn("node-version: '22'", step('Setup Node.js'))
         for name in ('Build and package', 'Transfer deployment package'):
             self.assertIn('${{ steps.version.outputs.version_label }}', step(name))
         for name in ('Upload deployment package', 'Deploy and verify', 'Confirm staging Ready and Green'):
