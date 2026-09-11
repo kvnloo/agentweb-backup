@@ -146,6 +146,9 @@ not. One process, two clocks.
 Cycle 105: that POST is not retried after `server.close`. GET
 `emma_get_session` retries 3× into a closed listener. Hermes on
 the new instance is a different process.
+Cycle 106: inbound `/mcp` (nginx) and loopback mcpFetch (`PORT`)
+are different sockets. `closeIdleConnections` unused. Do not
+HTTP-split to get a second close.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -267,3 +267,7 @@ reverted. Do not copy that as A-006.
   L116–118). GET `emma_get_session` retries 3× after close and
   still fails. Hermes on the new instance never sees the old
   `isError`. Not A-006.
+- Cycle 106: inbound `/mcp` and loopback mcpFetch are different
+  sockets. `closeIdleConnections` is typed and unused. Hermes
+  fails at nginx; the wrap is only if CallTool already
+  `execute()`d. Not a fifth `listen()`.

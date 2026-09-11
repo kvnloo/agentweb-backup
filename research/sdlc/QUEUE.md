@@ -147,6 +147,10 @@ Cycle 105: that POST is not retried on `fetch failed`
 retries 3× into a closed listener and still fails (`server.ts`
 L411–413). Hermes on the new instance never sees the old
 `isError`. Product READY unchanged.
+Cycle 106: inbound `/mcp` and loopback mcpFetch are different
+sockets. `closeIdleConnections` is typed (`http.d.ts` L420–425)
+and unused. Hermes hits nginx; mcpFetch is `localhost:${PORT}`.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

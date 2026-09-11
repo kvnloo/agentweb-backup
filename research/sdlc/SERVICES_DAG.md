@@ -126,6 +126,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 103: emma_get_session GET starts billed continuation.
   Cycle 104: emma_send_message 5 min hop around /generate.
   Cycle 105: send_message POST is not retried after server.close.
+  Cycle 106: inbound /mcp and loopback mcpFetch are different sockets.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

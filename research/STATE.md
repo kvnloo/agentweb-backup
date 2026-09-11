@@ -7,15 +7,15 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 105
+cycles_completed: 106
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 106
+next_cycle: 107
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 105: emma_send_message POST is not retried after server.close.
-  Cycle 106: cheapest remaining. Candidate: inbound /mcp keep-alive
-  after close still delivers CallTool. Do not un-ready Q-001 /
+  Cycle 106: inbound /mcp and loopback mcpFetch are different sockets.
+  Cycle 107: cheapest remaining. Candidate: nginx status when
+  upstream :8080 is closed (502 vs 504). Do not un-ready Q-001 /
   Q-014 / Q-003. Do not revive A-006. If stop_after passes,
   unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

@@ -288,6 +288,12 @@ GET `emma_get_session` retries 3× into `server.close` and still
 fails (L411–413). Hermes already on the new instance never sees
 the old session’s `isError`. Do not add POST retry (duplicate
 risk). Do not HTTP-split the hop.
+Cycle 106: inbound `/mcp` and loopback mcpFetch are **different
+sockets**. `closeIdleConnections` is typed (`http.d.ts` L420–425)
+and unused. Hermes hits nginx; mcpFetch is `localhost:${PORT}`
+and bypasses nginx. GET `/mcp` SSE is not idle. Do not add a
+close API from this cycle; A-019 refuse at `disableCron` is the
+gate. Do not HTTP-split `/mcp`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

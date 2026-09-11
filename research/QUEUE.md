@@ -188,4 +188,6 @@ Cycle 104: `emma_send_message` 5 min mcpFetch around `/generate`
 Cycle 105: that POST is not retried after `server.close`
 (`httpClient.ts` L116–118). GET `emma_get_session` retries 3×
 into a closed listener. A-006 stays discarded.
+Cycle 106: inbound `/mcp` and loopback are different sockets.
+`closeIdleConnections` unused. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

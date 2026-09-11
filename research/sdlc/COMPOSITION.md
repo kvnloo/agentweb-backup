@@ -389,6 +389,12 @@ GET/PUT retry 3× (`httpClient.ts` L116–118); POST is one fetch
 << 10 min drain. Wrapped `isError` stays on the old session.
 Hermes on the new instance never reads it.
 
+Cycle 106: **inbound `/mcp` and loopback are different sockets.**
+`closeIdleConnections` typed at `@types/node/http.d.ts` L415–425,
+zero callers. Hermes → nginx `:80`; mcpFetch `localhost:${PORT}`
+bypasses nginx (`httpClient.ts` L94–96). `.platform/nginx` has
+zero `keepalive`. GET `/mcp` SSE is not idle (L525–528).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
