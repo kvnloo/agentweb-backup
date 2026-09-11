@@ -398,6 +398,8 @@ Cycle 86: video same `$` / 0-token meter; not on MCP. Q-016
 parked. A-006 discarded.
 Cycle 87: AgentWebPro empty on `apiTools.ts` / meter files /
 wrap set. `#2875` is cron. A-006 discarded.
+Cycle 88: OMP 0.85.1 unpublished experimental client/server.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

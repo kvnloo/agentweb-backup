@@ -92,7 +92,9 @@ image is $0.134 (`gemini-3-pro-image-preview`); `gpt-image-2`
 is $0.04; cost caps are Dynamo not git. Cycle 86: `generate_video` is the same
 `$` / 0-token meter; MCP does not list it. Q-016 stays parked. Cycle 87: AgentWebPro still empty on
 `apiTools.ts` / `loops/core` / meter files (`llmPricing.ts`,
-`emmaTokenBudget.ts`, `imageGeneration.ts`). Product READY unchanged.
+`emmaTokenBudget.ts`, `imageGeneration.ts`). Cycle 88: OMP
+still 0.85.1; they unpublished experimental client/server.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

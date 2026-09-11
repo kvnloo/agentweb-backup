@@ -146,4 +146,6 @@ Cycle 86: `generate_video` is not on MCP; same meter as images
 at 12–39×. Q-016 stays parked. A-006 stays discarded.
 Cycle 87: AgentWebPro empty on Q-014 / meter / wrap files.
 A-006 stays discarded.
+Cycle 88: OMP 0.85.1 unpublished experimental client/server.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

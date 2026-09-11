@@ -108,6 +108,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 85: default image is $0.134; gpt-image-2 is $0.04.
   Cycle 86: video same meter, not on MCP (Q-016 parked).
   Cycle 87: AgentWebPro empty on apiTools / meter / wrap files.
+  Cycle 88: OMP 0.85.1 unpublished experimental client/server.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

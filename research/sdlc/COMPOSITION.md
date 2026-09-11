@@ -282,6 +282,11 @@ Cycle 87: **AgentWebPro still empty on Q-014 / meter / wrap.**
 `llmPricing.ts`, `emmaTokenBudget.ts`, `imageGeneration.ts`.
 Do not wait; do not HTTP-split to dodge collision.
 
+Cycle 88: **OMP 0.85.1 unpublished a server split.**
+`pi-coding-agent` `./client` is source-only; `pi-server` is a
+devDependency. Images stay in `pi-ai` `sideEffects`. A-006 is
+the shape they rolled back.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

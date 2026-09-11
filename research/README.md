@@ -214,6 +214,9 @@ Cycle 87: AgentWebPro (20 PRs) still empty on `apiTools.ts`,
 `loops/core`, and the cycle 81–86 meter files. `#2875` is
 cron. `#2862` still `toolErrorClassifier.ts`. Land Q-014 on
 the empty file; do not HTTP-split to dodge collision.
+Cycle 88: Oh My Pi still **0.85.1**. They unpublished 0.85.0’s
+experimental client/server. Images stay in `pi-ai`. Cutting-edge
+is in-process packages; MCP is AgentWeb’s *external* bus (Q-014).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

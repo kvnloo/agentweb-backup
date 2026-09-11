@@ -46,7 +46,7 @@ AgentWeb:   customer-portal (other repo)
             app.ts → crm.ts L24 ──► server.ts (cycle 59; IoPort too small)
 ```
 
-## OMP workspace DAG (live 2026-09-11T19:17Z `earendil-works/pi` **0.85.1**)
+## OMP workspace DAG (live 2026-09-11T21:48Z `earendil-works/pi` **0.85.1**)
 
 Cycle 20 used `@oh-my-pi/*`. npm scope is now `@earendil-works/*`. Arrow
 unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
@@ -55,12 +55,17 @@ unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
 |---|---|---|
 | `pi-ai` | pi-telemetry; **no** agent-core | **agent-core** |
 | `pi-agent-core` | **pi-ai**, chord, pi-telemetry | coding-agent |
+| `pi-coding-agent` | agent-core, pi-ai, tui, chord | — |
 
-Live `earendil-works/pi` `@earendil-works/pi-ai` **0.85.1** (cycle 54
-reconfirm). Arrow unchanged: `pi-ai` does **not** depend on `pi-agent-core`.
-`sideEffects` include `./dist/images.js` and
+Live `earendil-works/pi` `@earendil-works/pi-ai` **0.85.1** (cycle 88
+reconfirm; released 2026-09-05). Arrow unchanged: `pi-ai` does **not**
+depend on `pi-agent-core`. `sideEffects` include `./dist/images.js` and
 `./providers/images/register-builtins.js` — images are an in-process
-submodule of the leaf package (A-008, not A-006).
+submodule of the leaf package (A-008, not A-006). Cycle 88: 0.85.1
+**unpublished** experimental `./client` / `./experimental/plugin`
+(`source`-only exports; `pi-server` / `pi-client` are
+devDependencies). They tried shipping a server split in 0.85.0 and
+reverted. Do not copy that as A-006.
 
 ## Agentic SDLC practices
 
@@ -205,3 +210,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 87: 20 AgentWebPro PRs still miss `apiTools.ts` /
   `llmPricing.ts` / `loops/core`. Hermes does not wait on a
   god-object pile to list a tool. Do not HTTP-split for collision.
+- Cycle 88: OMP 0.85.1 unpublished experimental client/server.
+  Cutting-edge this month is in-process SDK + stdio, not a fifth
+  `listen()`.
