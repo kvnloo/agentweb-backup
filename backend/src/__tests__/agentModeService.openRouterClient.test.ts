@@ -1008,3 +1008,117 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 });
+
+
+describe('ENG-1788: opt-in reasoning effort', () => {
+  const contract = require('../utils/openRouterGatewayContract');
+  const { endChatSpan } = require('../observability/tracing');
+  const model = 'openrouter/openai/gpt-6-astra';
+  const messages = [{ role: 'user', content: 'Hello' }];
+  let service: AgentModeService;
+  let row: any;
+  let create: jest.Mock;
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    row = (service as any).llmModels[model];
+    create = jest.fn().mockResolvedValue({
+      id: 'completion-effort', model: 'openai/gpt-6-astra',
+      choices: [], usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+  });
+
+  afterEach(() => {
+    if (contract.GATEWAY_REASONING_EFFORT_OVERRIDES) {
+      for (const key of Object.keys(contract.GATEWAY_REASONING_EFFORT_OVERRIDES)) {
+        delete contract.GATEWAY_REASONING_EFFORT_OVERRIDES[key];
+      }
+    }
+    jest.restoreAllMocks();
+  });
+
+  it('characterizes the unset request byte-for-byte and preserves the response', async () => {
+    const result = await service.callLLM(model, messages);
+    expect(JSON.stringify(create.mock.calls[0][0])).toBe(
+      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"allow_fallbacks":true,"require_parameters":true},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
+    );
+    expect(result).toEqual({
+      id: 'completion-effort', model: 'openai/gpt-6-astra',
+      choices: [], usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    expect(Object.values((service as any).llmModels).every((config: any) => config.reasoningEffort === undefined)).toBe(true);
+  });
+
+  it('starts with an empty task-class override map', () => {
+    expect(contract.GATEWAY_REASONING_EFFORT_OVERRIDES).toEqual({});
+  });
+
+  it('sends the registry effort for a model with verified supported_efforts', async () => {
+    row.reasoningEffort = 'high';
+    await service.callLLM(model, messages);
+    expect(create.mock.calls[0][0].reasoning).toEqual({ effort: 'high' });
+  });
+
+  it('task-class override wins and does not leak into another class', async () => {
+    row.reasoningEffort = 'medium';
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.scheduled_background = 'high';
+    await service.callLLM(model, messages, { taskClass: 'scheduled_background' });
+    await service.callLLM(model, messages, { taskClass: 'interactive_chat' });
+    expect(create.mock.calls.map(([params]) => params.reasoning)).toEqual([
+      { effort: 'high' }, { effort: 'medium' },
+    ]);
+  });
+
+  it('allows a task override without a registry default', async () => {
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.mcp_api = 'low';
+    await service.callLLM(model, messages, { taskClass: 'mcp_api' });
+    expect(create.mock.calls[0][0].reasoning).toEqual({ effort: 'low' });
+  });
+
+  it.each([undefined, [], 'high', [null, 'high'], [42], ['low']])(
+    'omits reasoning for absent, malformed, or incompatible supported_efforts: %j', async (supported) => {
+      row.reasoningEffort = 'high';
+      row.supportedReasoningEfforts = supported;
+      await service.callLLM(model, messages);
+      expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+    },
+  );
+
+  it('does not let an override bypass the capability guard', async () => {
+    delete row.supportedReasoningEfforts;
+    contract.GATEWAY_REASONING_EFFORT_OVERRIDES.interactive_chat = 'high';
+    await service.callLLM(model, messages, { taskClass: 'interactive_chat' });
+    expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+  });
+
+  it('omits reasoning if a fallback model cannot accept the effort', async () => {
+    row.reasoningEffort = 'high';
+    await service.callLLM(model, messages, { fallbackModels: ['openrouter/z-ai/glm-5.2'] });
+    expect(create.mock.calls[0][0]).not.toHaveProperty('reasoning');
+  });
+
+  it('records effective effort in usage, the success log, and the run chat span', async () => {
+    row.reasoningEffort = 'high';
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const result = await service.callLLM(model, messages);
+    expect(result.usage).toEqual({ prompt_tokens: 10, completion_tokens: 2, reasoning_effort: 'high' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('OpenRouter call succeeded'),
+      expect.objectContaining({ reasoningEffort: 'high' }));
+    const span = { setAttribute: jest.fn(), setStatus: jest.fn(), end: jest.fn() };
+    endChatSpan(span, { model, response: result });
+    expect(span.setAttribute).toHaveBeenCalledWith('agentweb.reasoning_effort', 'high');
+  });
+
+  it('does not label an unsupported or unset effort as served', async () => {
+    row.reasoningEffort = 'high';
+    delete row.supportedReasoningEfforts;
+    const result = await service.callLLM(model, messages);
+    expect(result.usage).not.toHaveProperty('reasoning_effort');
+    const span = { setAttribute: jest.fn(), setStatus: jest.fn(), end: jest.fn() };
+    endChatSpan(span, { model, response: result });
+    expect(span.setAttribute).not.toHaveBeenCalledWith('agentweb.reasoning_effort', expect.anything());
+  });
+});

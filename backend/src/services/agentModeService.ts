@@ -156,6 +156,8 @@ import {
   applyOpenRouterCacheBreakpoints,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
+  type GatewayReasoningConfig,
+  resolveGatewayReasoningEffort,
 } from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
@@ -950,7 +952,7 @@ function pdfPageRender(pageData: any): Promise<string> {
 }
 
 // Type for LLM model configuration
-interface LLMModelConfig {
+interface LLMModelConfig extends GatewayReasoningConfig {
   client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
   supportsTemperature: boolean;
   /**
@@ -2698,7 +2700,8 @@ export class AgentModeService {
     // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
     // `tier` is the no-price fallback only; the picker derives ultra_premium
     // live from MODEL_PRICING.
-    'openrouter/openai/gpt-6-astra': { name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
+    // ENG-1788: OpenRouter reasoning.supported_efforts, verified in the issue 2026-09-05.
+    'openrouter/openai/gpt-6-astra': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -3085,6 +3088,12 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
+    const reasoningEffort = resolveGatewayReasoningEffort(
+      this.llmModels[model], taskClass,
+      (fallbackModels ?? []).map(id => this.llmModels[this.normalizeModelId(id)]),
+    );
+    if (reasoningEffort !== undefined) params.reasoning = { effort: reasoningEffort };
+
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
@@ -3141,6 +3150,7 @@ export class AgentModeService {
         console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
           provider: resolvedMetadata.provider,
           is_byok: resolvedMetadata.is_byok,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
         });
         // Fire-and-forget usage metering; it must never break an LLM call.
         try {
@@ -3175,7 +3185,10 @@ export class AgentModeService {
         } catch {
           // Metering must never break an LLM call.
         }
-        return res;
+        // Keep default responses untouched; annotate only the effort actually sent.
+        return reasoningEffort !== undefined && res.usage
+          ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+          : res;
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
@@ -4412,6 +4425,8 @@ export class AgentModeService {
         const responseUsage = response.usage;
         if (responseUsage) {
           responseMessage.usage = {
+            ...(responseUsage.reasoning_effort !== undefined
+              ? { reasoning_effort: responseUsage.reasoning_effort } : {}),
             prompt_tokens: responseUsage.prompt_tokens || 0,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
