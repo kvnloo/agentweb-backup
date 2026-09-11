@@ -245,7 +245,7 @@ export class McpOAuthService {
     return { code };
   }
 
-  async consumeAuthorizationCode(code: string): Promise<OAuthAuthorizationCode | null> {
+  async consumeAuthorizationCode(code: string, clientId?: string, redirectUri?: string): Promise<OAuthAuthorizationCode | null> {
     const result = await dynamodb.get({
       TableName: this.codesTable,
       Key: { code },
@@ -257,6 +257,21 @@ export class McpOAuthService {
 
     const nowSec = Math.floor(Date.now() / 1000);
     if (record.expiresAt <= nowSec) return null;
+    if (clientId !== undefined && record.clientId !== clientId) return null;
+    if (redirectUri !== undefined && record.redirectUri !== redirectUri) return null;
+
+    const conditions = ['used = :unused', 'expiresAt > :now'];
+    const values: Record<string, string | number | boolean> = {
+      ':used': true, ':unused': false, ':now': Math.floor(Date.now() / 1000),
+    };
+    if (clientId !== undefined) {
+      conditions.push('clientId = :clientId');
+      values[':clientId'] = clientId;
+    }
+    if (redirectUri !== undefined) {
+      conditions.push('redirectUri = :redirectUri');
+      values[':redirectUri'] = redirectUri;
+    }
 
     // The read alone cannot enforce single use: callback paste and the listener
     // can race. DynamoDB must elect one redeemer, including at the TTL boundary.
@@ -265,8 +280,8 @@ export class McpOAuthService {
         TableName: this.codesTable,
         Key: { code },
         UpdateExpression: 'SET used = :used',
-        ConditionExpression: 'used = :unused AND expiresAt > :now',
-        ExpressionAttributeValues: { ':used': true, ':unused': false, ':now': Math.floor(Date.now() / 1000) },
+        ConditionExpression: conditions.join(' AND '),
+        ExpressionAttributeValues: values,
       }).promise();
     } catch (error) {
       if ((error as { code?: string }).code === 'ConditionalCheckFailedException') return null;
