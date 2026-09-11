@@ -1,8 +1,9 @@
 # Feature queue
 
-Source of truth: `queue.json`. Ranked by protocol score. Updated 2026-09-11 cycle 5.
+Source of truth: `queue.json`. Ranked by protocol score. Frozen at cycle 7 (`briefing_ready`).
 
-**Do not implement yet.** `coding_unlocked: false`. Two items are **READY** with briefs.
+**Do not implement yet.** `coding_unlocked: false`. `briefing_ready: true`.
+Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
 
 ## How Kevin can help (thesis)
 

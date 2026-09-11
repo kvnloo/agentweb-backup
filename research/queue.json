@@ -258,7 +258,7 @@
         "backend/src/mcp/server/registry.ts",
         "backend/src/mcp/server/workflowTools.ts"
       ],
-      "first_slice": "Remove internal:true from generate_image (or add an emma_generate_image workflow tool). Tests: listed for external, still metered. Do not expose send_email.",
+      "first_slice": "See research/briefs/Q-014-generate-image-mcp.md. Remove internal:true or add emma_generate_image. Tests: listed for external, still metered. Do not expose send_email.",
       "harsha_db": false
     },
     {
