@@ -47,6 +47,7 @@ export interface RenewalIntegrationHealthSummary {
   scannedUsers: number;
   flagged: number;
   alertFailed: number;
+  evaluationFailed: number;
 }
 
 /**
@@ -157,6 +158,7 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
     scannedUsers: 0,
     flagged: 0,
     alertFailed: 0,
+    evaluationFailed: 0,
   };
 
   const now = Date.now();
@@ -177,7 +179,20 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   for (const user of users) {
     summary.scannedUsers++;
 
-    const evaluation = await evaluateRenewalIntegrationHealth(user);
+    // Isolated on purpose, symmetric to the alert-send try/catch below: today's
+    // helper functions all guard their inputs and cannot throw, but that is an
+    // implicit property of their current implementations, not a structural
+    // guarantee of this loop. Without this, a future regression in one of them
+    // would silently abort evaluation for every remaining user in the scan, not
+    // just the one with unexpected data.
+    let evaluation: RenewalIntegrationHealthEvaluation;
+    try {
+      evaluation = await evaluateRenewalIntegrationHealth(user);
+    } catch (error) {
+      summary.evaluationFailed++;
+      console.error(`${TAG} Failed to evaluate user ${user?.userId ?? 'unknown'}:`, error);
+      continue;
+    }
     if (evaluation.decision !== 'would_flag') continue;
 
     summary.flagged++;
@@ -203,7 +218,8 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   }
 
   console.log(
-    `${TAG} Run complete — scannedUsers=${summary.scannedUsers} flagged=${summary.flagged} alertFailed=${summary.alertFailed}`
+    `${TAG} Run complete — scannedUsers=${summary.scannedUsers} flagged=${summary.flagged} ` +
+    `alertFailed=${summary.alertFailed} evaluationFailed=${summary.evaluationFailed}`
   );
   return summary;
 }

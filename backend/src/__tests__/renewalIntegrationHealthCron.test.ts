@@ -158,6 +158,35 @@ describe('runRenewalIntegrationHealthCheck', () => {
   });
 
   /**
+   * Defense-in-depth: today's decision helpers all guard their own inputs and
+   * cannot throw, but that's an implicit property of their current
+   * implementations, not something this loop enforces structurally. Simulate a
+   * future regression by making the (mocked) entitlement lookup reject for one
+   * user, and prove the loop isolates it instead of aborting the whole scan.
+   */
+  it('continues scanning and flags other users when evaluating one user throws', async () => {
+    (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+      user({ userId: 'broken-user', connected_accounts: [] }),
+      user({ userId: 'fine-user', connected_accounts: [] }),
+    ]);
+    mockGetAllowedConnectedAccounts
+      .mockRejectedValueOnce(new Error('unexpected malformed user data'))
+      .mockResolvedValueOnce(UNRESTRICTED_CONNECTED_ACCOUNTS);
+
+    const summary = await runRenewalIntegrationHealthCheck();
+
+    expect(summary.scannedUsers).toBe(2);
+    expect(summary.evaluationFailed).toBe(1);
+    // The second user must still be reached and flagged -- the whole point of
+    // isolating the failure is that it doesn't take the rest of the scan with it.
+    expect(summary.flagged).toBe(1);
+    expect(mockSendAlert).toHaveBeenCalledTimes(1);
+    expect(mockSendAlert).toHaveBeenCalledWith(expect.objectContaining({
+      context: expect.objectContaining({ userId: 'fine-user' }),
+    }));
+  });
+
+  /**
    * Regression fixtures — ENG-1270. The old check assumed all renewal-imminent
    * customers use ads, which misclassified TransAmerica's LinkedIn-only plan.
    */
