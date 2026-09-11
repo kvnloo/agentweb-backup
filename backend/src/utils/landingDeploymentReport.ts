@@ -103,18 +103,47 @@ function successfulUrlFromEntry(entry: LandingLedgerEntry | null | undefined): D
   return null;
 }
 
+/**
+ * ENG-1868 review: merge two launchReadiness verdicts for the SAME url, never first-wins.
+ * `smokeTestResult` is fire-and-forget AFTER deploy — a `generate_landing_page` ledger
+ * entry earlier in the same run genuinely cannot know it yet, so it reports `ready: true`
+ * by default; a LATER `get_deployment_status` call for the same URL can then see the real
+ * (possibly failed) result. First-occurrence-wins dedup would keep the stale optimistic
+ * verdict and silently drop the real failure — reproducing the exact bug this module
+ * exists to fix. A `ready: false` from EITHER side always wins, regardless of order.
+ */
+function mergeLaunchReadiness(
+  a: DeployedLandingUrl['launchReadiness'],
+  b: DeployedLandingUrl['launchReadiness'],
+): DeployedLandingUrl['launchReadiness'] {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.ready && b.ready) return b; // both ready — prefer the later (fresher) observation
+  const reasons = new Set<string>([...(a.ready ? [] : a.reasons), ...(b.ready ? [] : b.reasons)]);
+  return { ready: false, reasons: Array.from(reasons) };
+}
+
 /** URLs of landing pages that genuinely deployed live this run, de-duplicated by URL. */
 export function collectSuccessfulLandingUrls(toolCalls: LandingLedgerEntry[] | null | undefined): DeployedLandingUrl[] {
   if (!Array.isArray(toolCalls)) return [];
   const out: DeployedLandingUrl[] = [];
-  const seen = new Set<string>();
+  const indexByKey = new Map<string, number>();
   for (const entry of toolCalls) {
     const hit = successfulUrlFromEntry(entry);
     if (!hit) continue;
     const key = hit.url.toLowerCase().replace(/\/+$/, '');
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(hit);
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx === undefined) {
+      indexByKey.set(key, out.length);
+      out.push(hit);
+      continue;
+    }
+    const existing = out[existingIdx];
+    out[existingIdx] = {
+      url: existing.url,
+      name: hit.name ?? existing.name,
+      launchReadiness: mergeLaunchReadiness(existing.launchReadiness, hit.launchReadiness),
+    };
   }
   return out;
 }

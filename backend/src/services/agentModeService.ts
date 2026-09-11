@@ -7672,12 +7672,17 @@ export class AgentModeService {
     // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
     // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
     // neither visible from status/buildStatus alone. Compute launchReadiness here (not
-    // just pass the raw smokeTestResult/trackingInstalled fields through) so every one of
-    // these tools' ledger entries carries the SAME derived verdict regardless of which
-    // fields happen to be present on that particular tool's raw result shape — harmless
-    // when the underlying signal isn't populated yet (e.g. smokeTestResult is fire-and-
-    // forget after deploy, so it's genuinely absent mid-generation; ready:true is the
-    // correct default until the smoke test has actually had a chance to run).
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so each of these
+    // tools' ledger entries carries a derived verdict from whatever signals its OWN raw
+    // result shape actually has — harmless when the underlying signal isn't populated yet
+    // (e.g. smokeTestResult is fire-and-forget after deploy, so it's genuinely absent
+    // mid-generation; ready:true is the correct default until the smoke test has actually
+    // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
+    // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
+    // trackingInstalled at all, so its verdict is structurally always ready:true regardless
+    // of the real page's state. Low-impact (a draft-branch preview, not the production URL)
+    // but real — landingDeploymentReport.ts's merge step is what actually recovers accuracy
+    // once a later get_deployment_status call for the SAME url reports the real verdict.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||

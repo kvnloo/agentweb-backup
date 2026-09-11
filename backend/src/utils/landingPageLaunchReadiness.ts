@@ -6,15 +6,20 @@
  * `status`/`buildStatus` alone, which is exactly how a launch-ready claim went out for a
  * page with `smokeTestResult: { ok: false }`.
  *
- * Deliberately excludes `metaTrackingInstalled` even though it lives right next to
- * `trackingInstalled` on the record: a customer with no Meta ad account connected NEVER
- * gets a pixel (`resolveMetaPixelForUser` resolving to nothing is a legitimate, deliberate
- * outcome per ENG-1141/ENG-449, not a defect), so flagging every such page as "not ready"
- * would be false-positive noise on the common case. The frontend's own existing Meta badge
- * (`LandingPages.tsx`) already encodes this — it only shows when the user has a connected
- * ad account at all. `trackingInstalled` (general GTM conversion tracking) has no such
- * caveat: it is expected on every page regardless of ad platform, matching its own existing
- * unconditional frontend badge.
+ * Deliberately excludes `metaTrackingInstalled` AND `googleAdsTrackingInstalled` even
+ * though both live right next to `trackingInstalled` on the record — both are opt-in
+ * signals, populated only when the caller explicitly requested that platform's tracking
+ * (the `meta_pixel_override` / `google_ads` params on generate_landing_page), unlike
+ * `trackingInstalled` (general GTM), which every page gets regardless of ad platform. A
+ * customer with no Meta ad account connected NEVER gets a pixel (`resolveMetaPixelForUser`
+ * resolving to nothing is a legitimate, deliberate outcome per ENG-1141/ENG-449, not a
+ * defect) — and the same reasoning applies to Google Ads tracking for a page that never
+ * requested it. Flagging either as "not ready" would be false-positive noise on the common
+ * case. The frontend's own existing Meta badge (`LandingPages.tsx`) already encodes this —
+ * it only shows when the user has a connected ad account at all. A separate gate (RULE 7.5
+ * in the campaign-launch tools) independently re-checks Google Ads tracking at the point it
+ * actually matters — launching a Google Ads campaign against this page — so excluding it
+ * here isn't a coverage gap, just the right layer for the check.
  *
  * Standalone, dependency-free module (not part of v0Service.ts, which is heavy at import
  * time — aws-sdk, axios): agentModeService.ts is required by most of the test suite
