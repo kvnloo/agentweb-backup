@@ -482,6 +482,7 @@ import {
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
+import { getLandingPageLaunchReadiness } from '../utils/landingPageLaunchReadiness';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -7682,6 +7683,22 @@ export class AgentModeService {
     // URL) from a failed/in-flight one. Without this the default `{}` below strips the
     // deployedUrl, and a final message that falsely claims the deploy "timed out" would
     // have no ledger evidence to reconcile against.
+    //
+    // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
+    // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
+    // neither visible from status/buildStatus alone. Compute launchReadiness here (not
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so each of these
+    // tools' ledger entries carries a derived verdict from whatever signals its OWN raw
+    // result shape actually has — harmless when the underlying signal isn't populated yet
+    // (e.g. smokeTestResult is fire-and-forget after deploy, so it's genuinely absent
+    // mid-generation; ready:true is the correct default until the smoke test has actually
+    // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
+    // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
+    // trackingInstalled at all, so its verdict is structurally always ready:true regardless
+    // of the real page's state. Low-impact (a draft-branch preview URL, not the production
+    // deployedUrl/customDomainUrl) and NOT recovered by landingDeploymentReport.ts's merge
+    // step either — the preview URL and the production URL are different strings, so they
+    // never share a dedup key. Accept the gap: previews are explicitly not the launch URL.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
@@ -7707,6 +7724,7 @@ export class AgentModeService {
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.id !== undefined ? { id: a.id } : {}),
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+        launchReadiness: a.launchReadiness ?? getLandingPageLaunchReadiness(a),
       };
     }
 
