@@ -482,6 +482,7 @@ import {
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
+import { getLandingPageLaunchReadiness } from '../utils/landingPageLaunchReadiness';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
@@ -6377,6 +6378,31 @@ export class AgentModeService {
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
+    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
+    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
+    // across 5 calls within a single 6-second window of ONE user turn, all bearing
+    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
+    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
+    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
+    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
+    // this.toolRegistry is somehow being read as empty intermittently (no code path
+    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
+    // pure/synchronous, and registerTools() is called exactly once in this file), or
+    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
+    // restart/still draining, a new one still initializing) and both happen to log
+    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
+    // across all lines confirms (a); differing pids confirms (b).
+    console.log('[ENG-1852-DIAG]', JSON.stringify({
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
+      allToolsCount: allTools.length,
+      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
+      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
+      associatedToolNamesCount: associatedToolNames.size,
+      excludedToolsCount: excludedTools.size,
+      publishedSkillsCount: publishedSkills.length,
+    }));
+
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
@@ -7667,6 +7693,22 @@ export class AgentModeService {
     // URL) from a failed/in-flight one. Without this the default `{}` below strips the
     // deployedUrl, and a final message that falsely claims the deploy "timed out" would
     // have no ledger evidence to reconcile against.
+    //
+    // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
+    // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
+    // neither visible from status/buildStatus alone. Compute launchReadiness here (not
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so each of these
+    // tools' ledger entries carries a derived verdict from whatever signals its OWN raw
+    // result shape actually has — harmless when the underlying signal isn't populated yet
+    // (e.g. smokeTestResult is fire-and-forget after deploy, so it's genuinely absent
+    // mid-generation; ready:true is the correct default until the smoke test has actually
+    // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
+    // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
+    // trackingInstalled at all, so its verdict is structurally always ready:true regardless
+    // of the real page's state. Low-impact (a draft-branch preview URL, not the production
+    // deployedUrl/customDomainUrl) and NOT recovered by landingDeploymentReport.ts's merge
+    // step either — the preview URL and the production URL are different strings, so they
+    // never share a dedup key. Accept the gap: previews are explicitly not the launch URL.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
@@ -7692,6 +7734,7 @@ export class AgentModeService {
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.id !== undefined ? { id: a.id } : {}),
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+        launchReadiness: a.launchReadiness ?? getLandingPageLaunchReadiness(a),
       };
     }
 
@@ -23266,9 +23309,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
+    //
+    // ENG-1844 review: this used to be a bare `.includes('Connection timeout')` /
+    // `.includes('service temporarily unavailable')` — loose enough that ANY future
+    // tool error whose message happened to contain either fragment would get this
+    // "external service unreachable" framing, regardless of tool or actual cause. That
+    // is the exact wrong-outage-framing bug class ENG-1844 exists to fix, just at a
+    // different, ungated trigger site. Both real origins (mcpClientService.ts) always
+    // emit the FULL phrase below — matching on that instead of the bare fragment keeps
+    // this scoped to genuine MCP-server connection failures.
     const isConnectionTimeout =
-      safeMessage.includes('Connection timeout') ||
-      safeMessage.includes('service temporarily unavailable');
+      safeMessage.includes('Connection timeout for ') ||
+      safeMessage.includes('service temporarily unavailable — retrying in');
     if (isConnectionTimeout) {
       return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
     }
@@ -23341,6 +23393,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // asked for: the failure is real and must be reported, it is just SCOPED to the note.
     if (isBookkeepingTool(toolName)) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
+    }
+    // ENG-1855: install_skills refusing the __other_skills__ bundle (which gates
+    // publish_landing_page_changes, among other unassociated tools) reaches the
+    // model ONLY as this generic wrapper — installSkills returns success:false,
+    // so it never throws, and this is the sole place that failure is described
+    // (see toolDispatch.ts's success-with-encoded-error downgrade). A real
+    // incident showed the model filling that silence with a fabricated manual
+    // workaround ("navigate to Landing Pages and click Publish") for a button
+    // that does not exist anywhere in the product. Don't assert no workaround
+    // exists for every tool this bundle could gate — just forbid inventing one.
+    if (toolName === 'install_skills' && safeMessage.includes(OTHER_SKILLS_VIRTUAL_ID)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The tool this would have unlocked is temporarily unavailable. Do NOT invent a manual UI workaround (a button, a page, a settings toggle) unless you have concrete, verified confirmation one exists — guessing one into existence sends the user on a search that may never succeed. Tell them plainly that this is temporarily unavailable and to check back or retry.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }

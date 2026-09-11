@@ -141,7 +141,14 @@ describe('executePreparedTools', () => {
       await executePreparedTools(input);
 
       const err = String(input.toolCallsLedger[0]?.error ?? '');
-      expect(err).toMatch(/unavailable on their plan/i);
+      // Was `/unavailable on their plan/i` -- ENG-1844 (de6002c8e, 2026-09-11) removed that
+      // guessed cause deliberately: this gate fires BEFORE install_skills ever runs, and
+      // install_skills refuses for four distinct reasons (billing, catalog gap, bad id, role),
+      // only one of which is billing (the exact bug ENG-1795 exists for). Asserting a specific
+      // guessed cause here pre-empts install_skills' own accurate, already-bucketed reason. The
+      // invariant this test protects is now "defer, don't guess," not "name the billing cause."
+      expect(err).toMatch(/do not guess or assume why/i);
+      expect(err).toMatch(/relay install_skills' own response message/i);
     });
 
     it('keeps the prefix that classifyToolErrorClass keys tool_unavailable off', async () => {

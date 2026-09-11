@@ -23,6 +23,23 @@ export function mintDelegateToken(
   expiresIn: jwt.SignOptions['expiresIn'],
 ): string {
   if (isEvaluationUser(adminUser.userId) || isEvaluationUser(targetUser?.userId)) throw new EvaluationDenied();
+  return signDelegateToken(adminUser, targetUser, expiresIn);
+}
+
+/** Access Portal only: a candidate session, never generic staff/tool delegation. */
+export function mintEvaluationDelegateToken(
+  adminUser: { userId: string; email: string },
+  targetUser: any,
+  expiresIn: jwt.SignOptions['expiresIn'],
+): string {
+  if (isEvaluationUser(adminUser.userId) || !isEvaluationUser(targetUser?.userId)) throw new EvaluationDenied();
+  return signDelegateToken(adminUser, targetUser, expiresIn, 'evaluation');
+}
+
+function signDelegateToken(
+  adminUser: { userId: string; email: string }, targetUser: any,
+  expiresIn: jwt.SignOptions['expiresIn'], scope?: 'evaluation',
+): string {
   const payload = {
     userId: targetUser.userId, // This will be the active user in the token
     email: targetUser.email,
@@ -31,6 +48,7 @@ export function mintDelegateToken(
     dte: targetUser.delegateTokenEpoch ?? 0,
     sv: targetUser.sessionVersion ?? 0,
     delegateAccess: {
+      ...(scope ? { scope } : {}),
       adminUserId: adminUser.userId,
       adminEmail: adminUser.email,
       targetUserId: targetUser.userId,

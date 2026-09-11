@@ -1472,6 +1472,82 @@ async function scheduleAutoMediaContinuation(
     });
 }
 
+// ENG-1819: LLM-judge check for whether the user's most recent REAL message explicitly
+// asked the assistant to stop / not do more work this turn, so auto-continuation can honor
+// it instead of firing anyway. Pure LLM classifier, no regex fast-path — unlike
+// scheduledTurnDefersToUser's opposite-direction check (where a false-negative just costs
+// one extra retry), a false-negative here means silently disobeying an explicit user
+// instruction, which is worse than the extra LLM call. A regex would also false-positive on
+// unrelated content that merely mentions "stop" non-instructionally. Fails SAFE: any
+// error/timeout returns `false` (do NOT suppress), preserving ENG-1684's original guarantee
+// that a stalled autocomplete plan always gets its continuation even if this classifier
+// itself is broken.
+//
+// Deliberately reads with EVENTUAL consistency (does not pass consistentRead: true to
+// getMostRecentRealUserMessage), same reasoning as the pre-fire recheck's plain
+// getChatSessionRecord read a few lines below in scheduleAutoWorkPlanContinuation: by the
+// time this runs, the "stop" message being looked for was written by THIS SAME request's
+// own earlier, already-completed turn-processing step, not a concurrent write racing this
+// read — several real async operations (the LLM call, tool execution, response persistence)
+// separate the write from this check, which is itself deferred another tick via
+// setImmediate. A stale read here would, worst case, cost one harmless extra continuation
+// round before self-correcting on the next round's fresh check — not a silent, permanent
+// failure to ever honor the stop.
+const STOP_REQUEST_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+const STOP_REQUEST_JUDGE_TIMEOUT_MS = 8000;
+const STOP_REQUEST_JUDGE_SYSTEM = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+Decide whether the user's message explicitly asks the assistant to STOP or to NOT do any more work right now — as opposed to a normal instruction, question, or request to continue/proceed.
+
+Answer "yes" when the message clearly asks to halt, pause, wait, not continue, or do no further work without being asked again — even if phrased casually ("that's enough for now", "hold off", "don't keep going").
+
+Answer "no" for everything else, including ordinary requests, questions, corrections, or instructions that do not ask the assistant to stop.
+
+Reply with ONLY one word: yes or no.`;
+
+async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> {
+  try {
+    const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+    if (!recent?.content) return false;
+    const llmPromise = agentModeService.callLLM(
+      STOP_REQUEST_JUDGE_MODEL,
+      [
+        { role: 'system', content: STOP_REQUEST_JUDGE_SYSTEM },
+        { role: 'user', content: recent.content.slice(0, 2500) },
+      ],
+      // ENG-1819 live-testing found gemini-3.1-flash-lite is a reasoning model (confirmed
+      // in this file's own llmModels registry) that can spend its whole completion budget on
+      // an internal reasoning trace before ever emitting "yes"/"no" -- a tight budget (the
+      // scheduledTurnDefersToUser precedent's max_completion_tokens: 3) came back
+      // finish_reason:"length" with content:null every time, which this function's own
+      // empty-string parse then (correctly, but unintentionally) treated as "no". 500 leaves
+      // headroom for a reasoning trace ahead of the one-word answer; cost scales with tokens
+      // actually generated, not this ceiling.
+      { temperature: 0, max_completion_tokens: 500, taskClass: 'scheduled_background' }
+    );
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
+    );
+    const res: any = await Promise.race([llmPromise, timeoutPromise]);
+    // ENG-1819: this is exactly the failure mode live-testing found at
+    // max_completion_tokens: 3 -- a truncated reasoning trace silently reads as "no". 500
+    // makes truncation unlikely, but isn't a guarantee; log loudly instead of letting a
+    // recurrence go unnoticed again.
+    if (res?.choices?.[0]?.finish_reason === 'length') {
+      console.warn(
+        `AgentMode: work-plan auto-continuation stop-request judge for session ${sessionId} was ` +
+        `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+        `this may be silently missing a real stop request.`
+      );
+    }
+    const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+    return raw.startsWith('yes');
+  } catch (err) {
+    console.error(`AgentMode: work-plan auto-continuation stop-request judge failed for session ${sessionId}:`, err);
+    return false; // fail-safe: never suppress a continuation on judge failure
+  }
+}
+
 /**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
  * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
@@ -1590,6 +1666,40 @@ async function scheduleAutoWorkPlanContinuation(
     (!currentSession?.workPlan?.autocomplete
       || !workPlanHasUnfinishedAutocompleteWork(currentSession.workPlan, currentSession.calledFunctions))
   ) {
+    autoContinuationSessions.delete(sessionId);
+    releaseSessionGeneration(sessionId);
+    return;
+  }
+
+  // ENG-1819: honor an explicit "stop" instruction instead of firing anyway. Re-evaluated
+  // fresh on every round (this function re-reads session state each time it's called), so a
+  // user who says "stop" mid-chain is caught on the very next round automatically. Checked
+  // only here, on the rare already-decided-to-continue path — not on every ordinary turn.
+  if (await userExplicitlyRequestedStop(sessionId)) {
+    console.log(
+      `AgentMode: work-plan auto-continuation for session ${sessionId} suppressed — user's ` +
+      `most recent message explicitly asked to stop.`
+    );
+    const stoppedMsg =
+      `⏸️ Got it — pausing here since you asked me to stop. This work plan is paused, not ` +
+      `abandoned; whenever you're ready, just say so and I'll pick up right where it left off.`;
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content: stoppedMsg,
+      timestamp: new Date().toISOString(),
+      metadata: { timestamp: new Date().toISOString(), kind: 'work-plan-auto-continuation-stopped' },
+    }).catch((persistErr) =>
+      console.error('AgentMode: failed to persist work-plan-auto-continuation-stopped message:', persistErr),
+    );
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: { role: 'assistant', content: stoppedMsg },
+      });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit work-plan-auto-continuation-stopped message for session ${sessionId}:`, emitErr);
+    }
     autoContinuationSessions.delete(sessionId);
     releaseSessionGeneration(sessionId);
     return;
@@ -11936,8 +12046,22 @@ export const agentModeController = {
         }
       });
 
-      // At least one email notification is always required for scheduled chats
-      if (effectiveEmailNotifications.length === 0) {
+      // ENG-1836: require an address only where this schedule actually HAD one.
+      //
+      // The blanket check assumed every schedule carries a notification address,
+      // which stopped being true when ENG-1723 began auto-creating outreach
+      // schedules with `emailNotifications: []`. The customer never asked for that
+      // schedule, so the first thing many will do is edit it — narrow the ICP,
+      // rename it, change the cadence — and every one of those edits returned a
+      // 400 until they also supplied an address they never chose to give, for
+      // notifications they never requested.
+      //
+      // The invariant is still enforced where it held: clearing the last address
+      // off a schedule that has one is still refused. Only a schedule that never
+      // had one is allowed to stay that way.
+      const hadEmailNotifications =
+        normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
+      if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
@@ -13766,14 +13890,44 @@ export const agentModeController = {
               console.error('AgentMode: Failed to save first-attempt-failure telemetry record', sessionId, saveErr);
             }
 
-            // Restart the worker before retrying — the current worker may be unresponsive
-            try {
-              await generateMarketingResponseWorkerService.restartWorker();
-            } catch (restartErr) {
-              console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+            // Restart the worker before retrying — but ONLY if it's actually unresponsive.
+            // This worker process is a SHARED singleton serving every concurrent session.
+            // restartWorker() SIGKILLs it, and the exit handler's failAllPendingRequests()
+            // rejects EVERY other session's in-flight turn on that same worker, not just
+            // this one — so an unconditional restart here for what was often just a
+            // transient, single-session failure (a rate limit, a bad tool call, anything
+            // unrelated to the worker process itself) took down every concurrent user's
+            // turn for one unrelated hiccup. Ping first via the existing health check;
+            // only restart when the worker genuinely doesn't answer — the doc comment on
+            // restartWorker() already says it's "for when the worker is detected as
+            // unresponsive", this just actually detects that instead of assuming it.
+            //
+            // Known accepted gap: isWorkerHealthy() is pure IPC liveness (ping/pong), not
+            // application-state health — a worker whose event loop answers fine but whose
+            // OWN internal state is corrupted (e.g. a botched mid-session tool re-registration)
+            // will report healthy and never get restarted via this path. That trades away an
+            // accidental self-heal for that class of bug in exchange for not collaterally
+            // killing every other session on every transient, worker-unrelated failure — the
+            // right tradeoff here, since a real app-state health signal doesn't exist yet.
+            const workerHealthy = await generateMarketingResponseWorkerService.isWorkerHealthy().catch(() => false);
+            if (!workerHealthy) {
+              try {
+                await generateMarketingResponseWorkerService.restartWorker();
+              } catch (restartErr) {
+                console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            } else {
+              // Review: restartWorker() already awaits the new worker's 'ready' signal, so
+              // the old 3s sleep was never really "letting the worker boot" — it was doing
+              // double duty as generic backoff for the transient failure itself (e.g. a
+              // rate limit that hasn't cleared yet). Dropping it to 0 on this branch made a
+              // rate-limit-class failure LESS likely to succeed on retry than before this
+              // fix — working against the point of retrying at all. Keep a short backoff
+              // here too, just not the full 3s this path no longer needs for worker-boot.
+              console.log(`AgentMode: Worker responded to health check — skipping restart for session ${sessionId}, retrying shortly`);
+              await new Promise(resolve => setTimeout(resolve, 1000));
             }
-
-            await new Promise(resolve => setTimeout(resolve, 3000));
 
             let retryErrCaught: any = null;
             try {
