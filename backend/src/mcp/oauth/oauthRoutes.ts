@@ -315,7 +315,7 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
   const { code, redirect_uri, client_id, code_verifier } = req.body;
 
   const effectiveClientId = client_id || extractClientIdFromAuth(req);
-  if (!code || !redirect_uri || !effectiveClientId) {
+  if (!code || !effectiveClientId) {
     return res.status(400).json({ error: 'invalid_request' });
   }
 
@@ -330,8 +330,9 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
   }
 
-  // Validate redirect_uri matches
-  if (codeRecord.redirectUri !== redirect_uri) {
+  // OAuth 2.1 omits this redundant parameter; PKCE still binds the code.
+  // When a client sends it (including Hermes), require an exact match.
+  if (redirect_uri !== undefined && codeRecord.redirectUri !== redirect_uri) {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
   }
 
