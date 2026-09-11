@@ -204,6 +204,6 @@ is `export * from './creative/imageGeneration'`. Closest analog:
   still** lands in `agentModeService`. Copying Hermes’ MCP-as-client or
   exploding that loopback into Kubernetes does not shrink the 40k file.
 - Cycle 41: the loop also **imports a controller**
-  (`agentModeService.ts` L29894 → `controllers/blog.ts`). Hermes/OMP
-  packages do not import their HTTP handlers. A-012 parks lifting
-  `generateBlogImage`; do not HTTP-split to hide the inversion.
+  (`agentModeService.ts` L29894 → `controllers/blog.ts`). Cycle 42: five
+  more service files do the same (`emmaEmailService.ts` L5 is a **static**
+  import of `generateSessionResponse`). A-013 parks the family.

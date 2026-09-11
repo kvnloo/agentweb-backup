@@ -69,7 +69,7 @@ in-app tool (cycle 39: no `confirm`, `emmaApi.ts` L181). Hop diagram:
 | One file per tool | `tools/*.py` self-register | 31 tools, split packages | `emma/tools.ts` 9.8k lines; `apiTools.ts` 3.6k |
 | Typed tool registry | `tools/registry.py` | package `agent` | **Four** in-process tables (cycle 37): `mcpToolRegistry`, `emmaToolRegistry` (3-line `emma/registry.ts`), vendor MCP client, per-session `this.toolRegistry`. Monolith copies Emma tools at L1891 |
 | Characterization / eval | ~25k pytest files claimed | edit benchmarks, metaharness | Characterization harness exists; god file still grows (24k → **40.5k** since Jun) |
-| Boundary linter | import chain documented | workspace packages | **None** |
+| Boundary linter | import chain documented | workspace packages | **None**. Cycle 42: at least six `services/` files import `controllers/` (A-013) |
 | Network extract | MCP *clients* to other servers | browser-relay, collab-web as packages | MCP *server*; don’t invert it |
 
 ## SDLC to get there (when coding is unlocked)

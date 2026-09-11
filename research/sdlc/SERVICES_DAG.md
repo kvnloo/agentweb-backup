@@ -43,6 +43,20 @@ CMS config helpers from the same controller. Intended DAG is
 controllers → services; actual is services → controllers. A-012
 parks lifting the helper. A-008 does not fix it.
 
+Cycle 42 — full prod inventory (`services/` → `controllers/`):
+
+| Service | Import |
+|---|---|
+| `agentModeService.ts` L29894, L29909 | `controllers/blog` (dynamic) |
+| `blogPublishers.ts` L2 | `controllers/blog` |
+| `emmaEmailService.ts` L5 | `agentModeController.generateSessionResponse` (static) + `agentModeService` L6 |
+| `revisionService.ts` L144 / L385 | `runVerifiedChat`; `controllers/tasks` |
+| `humanEvalActionService.ts` L30 | `runVerifiedChat` |
+| `chatbotService.ts` L7, L9, L10 | `release`, `docsController`, and **Express `Request`/`Response` types** |
+
+`revisionService.ts` L11–16 is the in-app `confirm=true` revision
+path (Matt / Slack). Not MCP. A-013 parks the family. Do not HTTP-split.
+
 ## Proposed folders (logical nanoservices)
 
 | Folder | Contents | Extract as process? |

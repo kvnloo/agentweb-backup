@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:50:00Z",
+  "updated_at": "2026-09-11T19:52:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -237,6 +237,27 @@
         "research/sdlc/SERVICES_DAG.md"
       ],
       "first_slice": "PARK until the agentModeService.ts PR pile shrinks. Then move generateBlogImage (and only the helpers the loop needs) out of controllers/blog.ts into services/creative or services/blog; point L29894 at the new module. Do not wrap it in HTTP. Do not do this instead of Q-014 / A-002 / A-007 / A-008. A-008 git mv of imageGeneration.ts does not remove the controller import.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-013",
+      "title": "Stop services importing HTTP controllers (inventory beyond blog)",
+      "status": "park",
+      "leverage": 4,
+      "product": 1,
+      "mergeability": 2,
+      "evidence": 5,
+      "collision": 3,
+      "score": 18,
+      "why": "Cycle 42. Cycle 41's blog import is one of six: emmaEmailService.ts L5 statically imports generateSessionResponse from agentModeController (14k) and also agentModeService; revisionService L144 and humanEvalActionService L30 dynamic-import runVerifiedChat; chatbotService L7-10 imports release/docsController and Express Request/Response. revisionService L11-16 is the confirm=true in-app revision path — do not copy onto Q-014/MCP. Hermes/OMP do not import HTTP handlers from packages. Not A-006.",
+      "files": [
+        "backend/src/services/emmaEmailService.ts",
+        "backend/src/services/revisionService.ts",
+        "backend/src/services/humanEvalActionService.ts",
+        "backend/src/services/chatbotService.ts",
+        "research/sdlc/SERVICES_DAG.md"
+      ],
+      "first_slice": "PARK. After A-012, lift runVerifiedChat/generateSessionResponse behind an application-service port so email/eval/revision do not import agentModeController. Do not do this instead of Q-014. Do not add HTTP. #1076 touches chatbotService — do not start there.",
       "harsha_db": false
     }
   ]
