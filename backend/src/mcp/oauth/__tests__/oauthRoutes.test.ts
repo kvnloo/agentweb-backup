@@ -727,12 +727,18 @@ describe('Hermes callback security boundaries (ENG-1869)', () => {
     await request(app).post('/oauth/authorize/decision').send({ ...decision, code_challenge_method: 'plain' }).expect(400);
     expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
   });
-  it.each(['client_id', 'redirect_uri'])('requires the original %s at token exchange', async field => {
+  it.each(['client_id'])('requires the original %s at token exchange', async field => {
     const body: Record<string, string> = { grant_type: 'authorization_code', code: 'one-time-code',
       client_id: 'hermes', redirect_uri: redirect, code_verifier: 'verifier' };
     delete body[field];
     await request(app).post('/oauth/token').type('form').send(body).expect(400);
     expect(mockCreateTokenPair).not.toHaveBeenCalled();
+  });
+  it('preserves OAuth 2.1 exchange without a redundant redirect_uri', async () => {
+    await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
+      code: 'one-time-code', client_id: 'hermes', code_verifier: 'verifier' }).expect(200);
+    expect(mockValidatePkce).toHaveBeenCalled();
+    expect(mockCreateTokenPair).toHaveBeenCalledWith(expect.objectContaining({ clientId: 'hermes' }));
   });
   it.each([
     { client_id: 'other-client' },
