@@ -301,6 +301,78 @@ describe('runRenewalIntegrationHealthCheck', () => {
   });
 
   /**
+   * ENG-1541 Build item 4: the alert must state customer outcome, capability,
+   * last known signal, next actor, and confidence explicitly, not leave the
+   * oncall reader to infer them.
+   */
+  describe('alert content is enriched (ENG-1541)', () => {
+    it('states the customer outcome from their stated goal', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'goal-user', goal: 'paid_ads', emmaHelpInterests: [], connected_accounts: [] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.message).toContain('Customer outcome: stated goal: paid_ads');
+      expect(call.context.customerOutcome).toBe('stated goal: paid_ads');
+    });
+
+    it('falls back to stated interests when there is no goal field', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'interest-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.customerOutcome).toBe('stated interests: paid_ads');
+    });
+
+    it('says "no ad platform account on record" when the account was never connected', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'never-connected-user', connected_accounts: [] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.lastAdAccountSignal).toBe('no ad platform account on record');
+      expect(call.message).toContain('Last known signal: no ad platform account on record');
+    });
+
+    it('states the most recent ad token expiry when one is on record', async () => {
+      const expiredAt = NOW - DAY_MS;
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'expired-user', connected_accounts: [adAccount({ expiresAt: expiredAt })] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.lastAdAccountSignal).toBe(
+        `most recent ad account token expired ${new Date(expiredAt).toISOString()}`,
+      );
+    });
+
+    it('always names the customer as next actor with a concrete instruction, and never fabricates a confidence score', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'next-actor-user', connected_accounts: [] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      const call = mockSendAlert.mock.calls[0][0];
+      expect(call.context.nextActor).toMatch(/^Customer/i);
+      expect(call.context.nextActor).toContain('Settings');
+      // No numeric/percentage score -- states what was verified, not a guess.
+      expect(call.context.confidence).not.toMatch(/%|\bscore\b/i);
+      expect(call.context.confidence).toContain('independently verified this run');
+      expect(call.context.capability).toBe('ad_platform_integration');
+    });
+  });
+
+  /**
    * ENG-1541 — the shared decision function the admin dry-run route calls.
    * Same four branches `runRenewalIntegrationHealthCheck`'s loop takes, tested
    * directly rather than only through the scan loop, since this is now the

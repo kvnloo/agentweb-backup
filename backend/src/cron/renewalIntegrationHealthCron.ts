@@ -111,6 +111,37 @@ async function hasAdIntegrationEntitlement(userId: string): Promise<boolean> {
 }
 
 /**
+ * ENG-1541: what the customer is actually trying to achieve, for the alert body.
+ * Only ever describes what's on record -- never infers or guesses.
+ */
+function describeCustomerOutcome(user: any): string {
+  if (user?.goal) return `stated goal: ${user.goal}`;
+  if (Array.isArray(user?.emmaHelpInterests) && user.emmaHelpInterests.length > 0) {
+    return `stated interests: ${user.emmaHelpInterests.join(', ')}`;
+  }
+  return 'no stated goal on record (flagged via onboarding event history)';
+}
+
+/**
+ * ENG-1541: the most recent ad-platform signal on record, for the alert body.
+ * Ad-platform configs (`BaseOAuthConfig`) only carry `token_expires_at` -- there is
+ * no dedicated "disconnected at" timestamp for these platforms (that field exists
+ * only on `LinkedInOutreachConfig`, a different platform). So this can only ever
+ * honestly say when a token expired, never claim the account was actively healthy
+ * up to that point -- and if no ad-platform entry exists at all, says so plainly
+ * rather than guessing at a date.
+ */
+function describeLastAdAccountSignal(user: any): string {
+  const raw = user?.connected_accounts;
+  const accounts: any[] = Array.isArray(raw) ? raw : [];
+  const expiries = accounts
+    .filter((acc) => isAdAccount(acc) && typeof acc?.config?.token_expires_at === 'number')
+    .map((acc) => acc.config.token_expires_at as number);
+  if (expiries.length === 0) return 'no ad platform account on record';
+  return `most recent ad account token expired ${new Date(Math.max(...expiries)).toISOString()}`;
+}
+
+/**
  * The single decision this whole cron makes, for one user. Shared by the real
  * scan loop below and by the read-only admin dry-run route (ENG-1541) so the
  * two can never diverge — the dry-run route proves exactly what the scan
@@ -196,19 +227,41 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
     if (evaluation.decision !== 'would_flag') continue;
 
     summary.flagged++;
+    // ENG-1541 Build item 4: state customer outcome, capability, last known signal,
+    // next actor, and confidence explicitly, rather than leaving the oncall reader to
+    // infer them from a single sentence.
+    const customerOutcome = describeCustomerOutcome(user);
+    const lastAdAccountSignal = describeLastAdAccountSignal(user);
+    const nextActor = 'Customer — reconnect the ad platform account in Settings > Connected Accounts';
+    // Deliberately not a fabricated score: this decision is a deterministic check, not
+    // a model guess, so "confidence" means stating exactly what was and wasn't verified
+    // this run, not inventing a number for something never measured.
+    const confidence =
+      'plan entitlement and current connection state independently verified this run; ' +
+      'paid-ads intent is user-declared and not independently re-confirmed';
     try {
       await sendAgentModeOncallAlert({
         subject: `Renewal at risk: ${user.email || user.userId} has no healthy ad integration`,
         message:
           `${user.email || user.userId} selected paid ads and renews on ${user.current_period_end}, but has no ` +
           `connected, non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). Check the account ` +
-          `before the charge fires.`,
+          `before the charge fires.\n\n` +
+          `Customer outcome: ${customerOutcome}\n` +
+          `Capability affected: ad platform integration (Meta / Google Ads / LinkedIn Ads)\n` +
+          `Last known signal: ${lastAdAccountSignal}\n` +
+          `Next actor: ${nextActor}\n` +
+          `Confidence: ${confidence}`,
         dedupeKey: `renewal-integration-health:${user.userId}`,
         dedupeWindowMs: DEDUPE_WINDOW_MS,
         context: {
           userId: user.userId,
           email: user.email,
           currentPeriodEnd: user.current_period_end,
+          customerOutcome,
+          capability: 'ad_platform_integration',
+          lastAdAccountSignal,
+          nextActor,
+          confidence,
         },
       });
     } catch (error) {
