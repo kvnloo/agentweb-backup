@@ -297,6 +297,9 @@ cannot skip `lookupUser` on this tool. A-007 keeps `ctx()`. A-006 discarded.
 Cycle 54: `workflowTools.ts` L37/L248 is mixed-identity; do not copy that
 import into `infrastructure.ts`. OMP 0.85.1 images stay in `pi-ai`.
 A-006 discarded.
+Cycle 55: `renderMediaOnLambda` L467 is the isolate; meter stays in
+`remotionService`. `imageGeneration.ts` already calls vendor HTTP.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -7,17 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 54
+cycles_completed: 55
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 55
+next_cycle: 56
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 54: A-007 copies workflowTools mcpFetch shape, not its
-  adminClientScope import (emma_get_account_status L248). Five
-  infrastructure tools are all ctx(). OMP 0.85.1 still in-process
-  images inside pi-ai. Cycle 55: cheapest remaining mapping or collision.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  Cycle 55: remotion-lambda is the isolate; identity/meter stay in
+  remotionService. imageGeneration.ts is already that adapter (vendor
+  HTTP, not our process). Cycle 56: cheapest remaining mapping or
+  collision. Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

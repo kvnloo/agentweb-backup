@@ -103,3 +103,7 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 54: ENG-982 `workflowTools.ts` is mixed-identity (`adminClientScope`
   for `emma_get_account_status`). A-007 copies mcpFetch shape, not that
   import. OMP 0.85.1 still registers images inside `pi-ai`.
+- Cycle 55: remotion-lambda is Chromium/ffmpeg isolation;
+  `recordVendorUsage` stays in `remotionService`. `imageGeneration.ts`
+  is already the host adapter (vendor HTTP). Do not copy the Lambda
+  process onto images.

@@ -121,9 +121,12 @@ to `BACKEND_URL` (`usage_reporter.py` L258 `/api/internal/usage`;
 cross-process. `#361` is an open engine PR (browser-use); do not land
 architecture edits there.
 
-`remotion-lambda` is the other extract (GPU/time-bounded render), invoked
-in-process from `remotionService.ts` via `@remotion/lambda` — not a
-second Emma mesh.
+`remotion-lambda` is the other extract (Chromium/ffmpeg), invoked
+in-process from `remotionService.ts` via `renderMediaOnLambda` L467 —
+not a second Emma mesh. Cycle 55: `recordVendorUsage` stays in that
+host adapter with `params.userId`. `LoopPorts` has no remotion.
+`imageGeneration.ts` is the same shape (vendor HTTP + in-process
+meter). Do not copy the **Lambda process** onto images.
 
 ## MCP client + server (cycle 29)
 

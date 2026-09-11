@@ -86,6 +86,8 @@ fire-and-forget and drops `no_user` (cycle 51). Cycle 53: MCP
 `overrideToken` skip; chatbot/ishare `$2` is a different face.
 Cycle 54: A-007 copies `workflowTools` **shape**, not its
 `adminClientScope` import. OMP 0.85.1 still keeps images in `pi-ai`.
+Cycle 55: remotion-lambda is the isolate; `imageGeneration.ts` is already
+the host adapter (vendor HTTP). Do not copy the Lambda process onto images.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

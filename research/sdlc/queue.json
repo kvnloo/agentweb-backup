@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:31:00Z",
+  "updated_at": "2026-09-11T20:34:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -153,7 +153,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–46: chat forks generateMarketingResponseWorker.ts (new AgentModeService); parent is I/O; worker is compute. Cycle 50: surviving MCP-hop spend door after an A-015 leak is lookupUser (httpClient.ts L57–66), not a fifth process. Cycle 51: copying requireEmmaTokenBudget is not that door — checkTokenUsage allow-lists anon_* ($2 vs ChatSessions, tokenUsageService.ts L293–305); _svc JWTs skip getUserById (auth.ts L155–167); leaf meter is void/no_user. Cycle 53: generate_image cannot take the ENG-1596 overrideToken skip (ctx() only; resolveClientScopedContext is admin list/manage). A sixth HTTP image process that skipped lookupUser would uncapped-spend. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 50–53: lookupUser is the MCP-hop spend door; Emma meter allow-lists anon_*; ctx() cannot skip via ENG-1596. Cycle 54: A-007 must not copy workflowTools adminClientScope. Cycle 55: remotion-lambda is the isolate (renderMediaOnLambda L467); recordVendorUsage stays in remotionService with params.userId. imageGeneration.ts is already that host adapter (vendor HTTP + meterUserUsage L551). Copying the Lambda process onto images adds AgentWeb HTTP in front of a leaf that already speaks vendor HTTP. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -164,6 +164,7 @@
         "backend/src/middleware/auth.ts",
         "backend/src/middleware/emmaTokenBudget.ts",
         "backend/src/services/tokenUsageService.ts",
+        "backend/src/services/remotionService.ts",
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
