@@ -49,6 +49,25 @@ export interface RenewalIntegrationHealthSummary {
   alertFailed: number;
 }
 
+/**
+ * Every branch `runRenewalIntegrationHealthCheck`'s per-user decision can take.
+ * `would_flag` is the only branch that leads to an alert in a real run —
+ * everything else is a reasoned skip.
+ */
+export type RenewalIntegrationHealthDecision =
+  | 'skipped_no_paid_ads_intent'
+  | 'skipped_healthy_integration'
+  | 'skipped_no_ad_entitlement'
+  | 'would_flag';
+
+export interface RenewalIntegrationHealthEvaluation {
+  decision: RenewalIntegrationHealthDecision;
+  hasPaidAdsIntent: boolean;
+  hasHealthyAdIntegration: boolean;
+  /** null when the entitlement check was short-circuited by an earlier skip. */
+  hasAdIntegrationEntitlement: boolean | null;
+}
+
 function isAdAccount(account: any): boolean {
   return !!account && AD_PLATFORMS.has(account.platform);
 }
@@ -91,6 +110,43 @@ async function hasAdIntegrationEntitlement(userId: string): Promise<boolean> {
 }
 
 /**
+ * The single decision this whole cron makes, for one user. Shared by the real
+ * scan loop below and by the read-only admin dry-run route (ENG-1541) so the
+ * two can never diverge — the dry-run route proves exactly what the scan
+ * would have decided, not a parallel reimplementation of the same logic.
+ * Read-only: makes no writes and sends no alert either way.
+ */
+export async function evaluateRenewalIntegrationHealth(user: any): Promise<RenewalIntegrationHealthEvaluation> {
+  const paidAdsIntent = hasPaidAdsIntent(user);
+  const healthyIntegration = hasHealthyAdIntegration(user);
+
+  if (!paidAdsIntent) {
+    return {
+      decision: 'skipped_no_paid_ads_intent',
+      hasPaidAdsIntent: paidAdsIntent,
+      hasHealthyAdIntegration: healthyIntegration,
+      hasAdIntegrationEntitlement: null,
+    };
+  }
+  if (healthyIntegration) {
+    return {
+      decision: 'skipped_healthy_integration',
+      hasPaidAdsIntent: paidAdsIntent,
+      hasHealthyAdIntegration: healthyIntegration,
+      hasAdIntegrationEntitlement: null,
+    };
+  }
+
+  const entitled = await hasAdIntegrationEntitlement(user.userId);
+  return {
+    decision: entitled ? 'would_flag' : 'skipped_no_ad_entitlement',
+    hasPaidAdsIntent: paidAdsIntent,
+    hasHealthyAdIntegration: healthyIntegration,
+    hasAdIntegrationEntitlement: entitled,
+  };
+}
+
+/**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
  * and flag paid-ads customers, whose plan actually permits ad integration,
  * whose ad integration is missing or expired. Resilient: a failure sending
@@ -121,8 +177,8 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   for (const user of users) {
     summary.scannedUsers++;
 
-    if (!hasPaidAdsIntent(user) || hasHealthyAdIntegration(user)) continue;
-    if (!(await hasAdIntegrationEntitlement(user.userId))) continue;
+    const evaluation = await evaluateRenewalIntegrationHealth(user);
+    if (evaluation.decision !== 'would_flag') continue;
 
     summary.flagged++;
     try {

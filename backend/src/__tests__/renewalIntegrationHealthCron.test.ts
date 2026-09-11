@@ -34,7 +34,7 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedConnectedAccounts: (...args: any[]) => mockGetAllowedConnectedAccounts(...args),
 }));
 
-import { runRenewalIntegrationHealthCheck } from '../cron/renewalIntegrationHealthCron';
+import { runRenewalIntegrationHealthCheck, evaluateRenewalIntegrationHealth } from '../cron/renewalIntegrationHealthCron';
 import { userDb } from '../services/db';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -191,6 +191,28 @@ describe('runRenewalIntegrationHealthCheck', () => {
         context: expect.objectContaining({ userId: 'paid-ads-user' }),
       }));
     });
+
+    // ENG-1270 AC3 named both ThinkingAI and TransAmerica as required regression
+    // fixtures; only TransAmerica ever got one. ThinkingAI's real pre-fix state
+    // (per the issue's own description): paid-ads customer, no Meta ad account
+    // connected, ~6 days from renewal.
+    it('flags the ThinkingAI-shaped account: paid-ads intent, no ad account connected, ~6 days from renewal', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({
+          userId: 'thinkingai-user',
+          current_period_end: periodEndInDays(6),
+          emmaHelpInterests: ['paid_ads'],
+          connected_accounts: [],
+        }),
+      ]);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.flagged).toBe(1);
+      expect(mockSendAlert).toHaveBeenCalledWith(expect.objectContaining({
+        context: expect.objectContaining({ userId: 'thinkingai-user' }),
+      }));
+    });
   });
 
   /**
@@ -242,6 +264,82 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
       expect(summary.flagged).toBe(1);
       expect(mockSendAlert).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * ENG-1541 — the shared decision function the admin dry-run route calls.
+   * Same four branches `runRenewalIntegrationHealthCheck`'s loop takes, tested
+   * directly rather than only through the scan loop, since this is now the
+   * function a production-proof caller depends on being correct in isolation.
+   */
+  describe('evaluateRenewalIntegrationHealth', () => {
+    it('skipped_no_paid_ads_intent: no paid-ads intent at all', async () => {
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ emmaHelpInterests: [], connected_accounts: [] }),
+      );
+      expect(evaluation).toEqual({
+        decision: 'skipped_no_paid_ads_intent',
+        hasPaidAdsIntent: false,
+        hasHealthyAdIntegration: false,
+        hasAdIntegrationEntitlement: null,
+      });
+      expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
+    });
+
+    it('skipped_healthy_integration: paid-ads intent, but already has a healthy connection', async () => {
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ connected_accounts: [adAccount({ expiresAt: NOW + 30 * DAY_MS })] }),
+      );
+      expect(evaluation).toEqual({
+        decision: 'skipped_healthy_integration',
+        hasPaidAdsIntent: true,
+        hasHealthyAdIntegration: true,
+        hasAdIntegrationEntitlement: null,
+      });
+      expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
+    });
+
+    it('skipped_no_ad_entitlement: paid-ads intent, unhealthy, but the plan excludes every ad platform (TFAConnect shape)', async () => {
+      mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['linkedin', 'gmail', 'calendly']);
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ userId: 'tfaconnect-user', connected_accounts: [] }),
+      );
+      expect(evaluation).toEqual({
+        decision: 'skipped_no_ad_entitlement',
+        hasPaidAdsIntent: true,
+        hasHealthyAdIntegration: false,
+        hasAdIntegrationEntitlement: false,
+      });
+      expect(mockGetAllowedConnectedAccounts).toHaveBeenCalledWith('tfaconnect-user');
+    });
+
+    it('would_flag: paid-ads intent, unhealthy, plan explicitly permits ad integration', async () => {
+      mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['meta', 'gmail']);
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ userId: 'entitled-user', connected_accounts: [] }),
+      );
+      expect(evaluation).toEqual({
+        decision: 'would_flag',
+        hasPaidAdsIntent: true,
+        hasHealthyAdIntegration: false,
+        hasAdIntegrationEntitlement: true,
+      });
+    });
+
+    it('would_flag: paid-ads intent, unhealthy, unrestricted plan (allowedConnectedAccounts undefined/["*"])', async () => {
+      mockGetAllowedConnectedAccounts.mockResolvedValueOnce(UNRESTRICTED_CONNECTED_ACCOUNTS);
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ userId: 'unrestricted-user', connected_accounts: [] }),
+      );
+      expect(evaluation.decision).toBe('would_flag');
+      expect(evaluation.hasAdIntegrationEntitlement).toBe(true);
+    });
+
+    it('never calls the real scan or sends an alert — pure decision, no side effects', async () => {
+      await evaluateRenewalIntegrationHealth(user({ connected_accounts: [] }));
+      expect(userDb.scanWithFilter).not.toHaveBeenCalled();
+      expect(mockSendAlert).not.toHaveBeenCalled();
     });
   });
 });
