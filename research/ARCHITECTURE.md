@@ -218,6 +218,10 @@ Cycle 29: `mcp_config` `"agentweb-tools"` self-MCP is skipped as circular
 (`mcpClientService.ts` L420–432).
 Cycle 30: leaf callers skip `generateImage`; OMP is `@earendil-works/pi-ai`
 0.85.1 (arrow unchanged).
+Cycle 31: **#2563** appends remnant `not.toContain` checks to
+`sdkConstructionGuard.test.ts`; A-002 copies walker L41–68 into a
+sibling file, does not append. `apiTools.ts` / `imageGeneration.ts` /
+`loops/core` still have no open PR.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 30
+cycles_completed: 31
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 31
+next_cycle: 32
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 30: blog/thumbs/video/onboarding hit imageService directly; OMP
-  npm is @earendil-works 0.85.1, arrow unchanged. Cycle 31: collision-
-  only. Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 31: #2563 edits sdkConstructionGuard.test.ts remnant checks; A-002
+  stays a sibling file. Cycle 32: collision-only. Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

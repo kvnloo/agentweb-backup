@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:17:00Z",
+  "updated_at": "2026-09-11T19:25:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -33,13 +33,13 @@
       "evidence": 5,
       "collision": 1,
       "score": 28,
-      "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts.",
+      "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts. Cycle 31: #2563 appends remnant string checks to sdkConstructionGuard.test.ts; AST walker L41–68 unchanged. Sibling file, do not append.",
       "files": [
         "backend/src/loops/core/ports.ts",
         "backend/src/__tests__/sdkConstructionGuard.test.ts",
         "research/sdlc/A-002-import-guard-sketch.md"
       ],
-      "first_slice": "When coding unlocked: sibling of sdkConstructionGuard.test.ts that AST-walks loops/core/** (18 prod files). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index (cycle 27 oracle). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService). Optional second test: agentMode/core ↛ agentModeService.ts only.",
+      "first_slice": "When coding unlocked: NEW sibling loopsCoreImportGuard.test.ts (do not append to sdkConstructionGuard.test.ts while #2563 is open). Copy findDirectProviderSdkImports visit() L41–68, not the remnant not.toContain pattern. AST-walk loops/core/** (18 prod files). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index (cycle 27 oracle). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService). Optional second test: agentMode/core ↛ agentModeService.ts only.",
       "harsha_db": false
     },
     {

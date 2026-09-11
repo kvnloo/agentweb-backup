@@ -92,7 +92,10 @@ That file is outside `core/`.
   imports in `loops/core`)
 - Does not touch `agentModeService.ts`
 
-Collision cycle 24: **no** open PR on `loops/core`, `apiTools.ts`,
-`imageGeneration.ts`, `agentMode/core`, or `brandLogo.ts` (20 open PRs
-on AgentWebPro/agentweb). A-007 first-slice map is `A-007-split-map.md`
-— not this guard.
+Collision cycle 31 (20 open PRs): still **no** open PR on `loops/core`,
+`apiTools.ts`, `imageGeneration.ts`, `agentMode/core`, or `brandLogo.ts`.
+**#2563** *does* edit `sdkConstructionGuard.test.ts` (+11 remnant
+`not.toContain` on `vertex_client*` / `convertContentToAnthropicBlocks`).
+It does **not** touch `findDirectProviderSdkImports` (L41–68). First
+slice stays a **sibling** file — do not append to that describe while
+#2563 is open. A-007 first-slice map is `A-007-split-map.md`.

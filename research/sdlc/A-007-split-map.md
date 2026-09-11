@@ -1,6 +1,8 @@
 # A-007 split map (research only — do not land this PR yet)
 
-`coding_unlocked` is false. Cycle 24. Collision on `apiTools.ts`: **empty**.
+`coding_unlocked` is false. Cycle 24. Collision on `apiTools.ts`: **empty**
+through cycle 31 (20 open PRs). Cycle 31: **#2563** touches
+`sdkConstructionGuard.test.ts` (A-002 copy source), not `apiTools.ts`.
 
 Cycle 18 listed section *line numbers*. This file names the **tools** and
 corrects the draft tree in `MODULE_MAP.md`.

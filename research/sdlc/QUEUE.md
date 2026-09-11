@@ -23,16 +23,19 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 30: blog/thumbs/video/onboarding call `imageService` directly
-(A-006 emmaApi-mesh would miss them). OMP live scope is
-`@earendil-works` 0.85.1; `pi-ai` still ↛ agent-core.
+Cycle 31: **#2563** owns `sdkConstructionGuard.test.ts` (+11 remnant
+`not.toContain`). A-002 still a sibling file (walker L41–68 unchanged).
+`apiTools.ts` / `imageGeneration.ts` / `loops/core` still empty. A-006
+stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
-1. **A-002** — AST import guard on `loops/core` only (copy
-   `sdkConstructionGuard.test.ts`). Allow exactly `orchestrator` /
-   `instanceRunner` → `../index`. Do **not** copy forbid-all-services
-   onto `agentMode/core` (`toolDispatch` imports the gateway).
+1. **A-002** — AST import guard on `loops/core` only. **New**
+   `loopsCoreImportGuard.test.ts` — do not append to
+   `sdkConstructionGuard.test.ts` (#2563). Copy `visit()` L41–68.
+   Allow exactly `orchestrator` / `instanceRunner` → `../index`. Do
+   **not** copy forbid-all-services onto `agentMode/core`
+   (`toolDispatch` imports the gateway).
 2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
