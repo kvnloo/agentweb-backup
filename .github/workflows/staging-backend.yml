@@ -20,16 +20,14 @@ env:
   AWS_REGION: us-west-2
 
 jobs:
-  backend-staging-deploy:
-    # Dispatch requires repository write access. Run the controls from main;
-    # the explicit input selects only the backend source, never the environment.
+  build:
+    # Build caller-selected source without an environment, secrets, or AWS credentials.
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 70
-    environment: staging
-    env:
-      EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_APPLICATION_NAME }}
-      EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_ENVIRONMENT_NAME }}
+    timeout-minutes: 25
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      version_label: ${{ steps.version.outputs.version_label }}
     steps:
       - name: Validate explicit ref
         env:
@@ -40,12 +38,6 @@ jobs:
             echo "::error::An explicit deployment ref or SHA is required."
             exit 1
           fi
-
-      - name: Checkout deploy controls
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
 
       - name: Checkout deployment source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,8 +71,40 @@ jobs:
           npm ci
           NODE_OPTIONS="--max-old-space-size=4096" npm run build
           cp ../test-env/user-data-dev-auto.sh dist/
+          for entry in .platform .ebextensions; do
+            [[ -d "$entry" ]] || { echo "::error::Missing bundle directory: ${entry}"; exit 1; }
+          done
           mkdir -p builds
           zip -r "builds/${VERSION_LABEL}.zip" dist docs package.json package-lock.json .env.example .platform .ebextensions
+
+      - name: Transfer deployment package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backend-staging-bundle
+          path: source/backend/builds/${{ steps.version.outputs.version_label }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-staging-deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    environment: staging
+    env:
+      EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}
+      EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}
+    steps:
+      - name: Checkout deploy controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download deployment package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: backend-staging-bundle
+          path: builds
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -91,18 +115,18 @@ jobs:
 
       - name: Upload deployment package
         env:
-          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+          VERSION_LABEL: ${{ needs.build.outputs.version_label }}
         run: |
           set -euo pipefail
-          aws s3 cp "source/backend/builds/${VERSION_LABEL}.zip" \
+          aws s3 cp "builds/${VERSION_LABEL}.zip" \
             "s3://elasticbeanstalk-${AWS_REGION}-992382574572/builds/${VERSION_LABEL}.zip"
 
       - name: Deploy and verify
         timeout-minutes: 50
         env:
-          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+          EB_VERSION_LABEL: ${{ needs.build.outputs.version_label }}
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
-          EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
+          EB_SOURCE_BUNDLE_S3_KEY: builds/${{ needs.build.outputs.version_label }}.zip
           EB_TOTAL_TIMEOUT_SECONDS: '2700'
           EB_SETTLE_TIMEOUT_SECONDS: '1200'
         run: bash .github/scripts/eb-deploy.sh
@@ -111,15 +135,22 @@ jobs:
       # additionally requires a literal Green rollup on the exact new version.
       - name: Confirm staging Ready and Green
         env:
-          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+          EB_VERSION_LABEL: ${{ needs.build.outputs.version_label }}
         run: |
           set -euo pipefail
-          STATE="$(aws elasticbeanstalk describe-environments \
-            --application-name "$EB_APPLICATION_NAME" \
-            --environment-names "$EB_ENVIRONMENT_NAME" \
-            --query 'Environments[0].[Status,Health,VersionLabel]' --output text)"
-          if [[ "$STATE" != "$(printf 'Ready\tGreen\t%s' "$EB_VERSION_LABEL")" ]]; then
-            echo "::error::Staging verification failed: ${STATE}"
-            exit 1
-          fi
+          EXPECTED="$(printf 'Ready\tGreen\t%s' "$EB_VERSION_LABEL")"
+          DEADLINE=$(( SECONDS + ${STAGING_GREEN_TIMEOUT_SECONDS:-600} ))
+          while :; do
+            STATE="$(aws elasticbeanstalk describe-environments \
+              --application-name "$EB_APPLICATION_NAME" \
+              --environment-names "$EB_ENVIRONMENT_NAME" \
+              --query 'Environments[0].[Status,Health,VersionLabel]' --output text)"
+            [[ "$STATE" == "$EXPECTED" ]] && break
+            if (( SECONDS >= DEADLINE )); then
+              echo "::error::Staging verification failed: ${STATE}"
+              exit 1
+            fi
+            echo "Waiting for Ready/Green on ${EB_VERSION_LABEL}; observed: ${STATE}"
+            sleep 20
+          done
           printf 'Verified staging %s: %s\n' "$EB_ENVIRONMENT_NAME" "$STATE" | tee -a "$GITHUB_STEP_SUMMARY"

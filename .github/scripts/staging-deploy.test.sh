@@ -35,7 +35,7 @@ class StagingContract(unittest.TestCase):
         self.assertEqual(re.findall(r'^    environment: (.+)$', workflow, re.M), ['staging'])
         self.assertNotIn('partner', workflow.lower())
         self.assertNotIn('environment: prod', workflow)
-        self.assertEqual(re.findall(r'^  ([\w-]+):\n', workflow.split('jobs:\n')[1], re.M), ['backend-staging-deploy'])
+        self.assertEqual(re.findall(r'^  ([\w-]+):\n', workflow.split('jobs:\n')[1], re.M), ['build', 'backend-staging-deploy'])
 
     def test_exact_checkout_and_trusted_deploy_script(self):
         self.assertIn('ref: ${{ inputs.ref }}', step('Checkout deployment source'))
@@ -44,20 +44,28 @@ class StagingContract(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', step('Checkout deploy controls'))
         self.assertIn('bash .github/scripts/eb-deploy.sh', step('Deploy and verify'))
         self.assertIn('working-directory: source/backend', step('Build and package'))
-        for name in ('Build and package', 'Upload deployment package', 'Deploy and verify', 'Confirm staging Ready and Green'):
+        for name in ('Build and package', 'Transfer deployment package'):
             self.assertIn('${{ steps.version.outputs.version_label }}', step(name))
-        self.assertIn('EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip', step('Deploy and verify'))
+        for name in ('Upload deployment package', 'Deploy and verify', 'Confirm staging Ready and Green'):
+            self.assertIn('${{ needs.build.outputs.version_label }}', step(name))
+        self.assertIn('EB_SOURCE_BUNDLE_S3_KEY: builds/${{ needs.build.outputs.version_label }}.zip', step('Deploy and verify'))
+        self.assertIn('needs: build', workflow)
+        self.assertIn('actions/upload-artifact@', step('Transfer deployment package'))
+        self.assertIn('actions/download-artifact@', step('Download deployment package'))
         self.assertNotIn('continue-on-error', workflow)
         self.assertIn('run: bash .github/scripts/eb-deploy.sh', step('Deploy and verify'))
 
     def test_serialization_and_credentials(self):
         self.assertIn('concurrency:\n  group: backend-staging-deploy\n  cancel-in-progress: false', workflow)
         self.assertIn('permissions:\n  contents: read', workflow)
-        for name in ('EB_BACKEND_APPLICATION_NAME', 'EB_BACKEND_ENVIRONMENT_NAME'):
+        for name in ('EB_BACKEND_STAGING_APPLICATION_NAME', 'EB_BACKEND_STAGING_ENVIRONMENT_NAME'):
             self.assertIn('${{ vars.' + name + ' }}', workflow)
+        self.assertNotIn('${{ vars.EB_BACKEND_APPLICATION_NAME }}', workflow)
+        self.assertNotIn('${{ vars.EB_BACKEND_ENVIRONMENT_NAME }}', workflow)
         for name in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'):
             self.assertIn('${{ secrets.' + name + ' }}', step('Configure AWS credentials'))
-        self.assertLess(workflow.index('name: Build and package'), workflow.index('name: Configure AWS credentials'))
+        self.assertNotIn('secrets.', workflow[:workflow.index('  backend-staging-deploy:')])
+        self.assertLess(workflow.index('name: Transfer deployment package'), workflow.index('  backend-staging-deploy:'))
 
     def test_empty_ref_cannot_fall_back_to_main(self):
         self.assertIn('DEPLOY_REF: ${{ inputs.ref }}', step('Validate explicit ref'))
@@ -92,7 +100,7 @@ class StagingContract(unittest.TestCase):
             aws = root / 'aws'
             aws.write_text('#!/bin/bash\nprintf "%s\\n" "$MOCK_STATE"\nexit "$MOCK_EXIT"\n')
             aws.chmod(0o755)
-            env = dict(os.environ, PATH=tmp + ':' + os.environ['PATH'], EB_APPLICATION_NAME='staging-app', EB_ENVIRONMENT_NAME='staging-env', EB_VERSION_LABEL='exact-version', GITHUB_STEP_SUMMARY=str(root / 'summary'))
+            env = dict(os.environ, PATH=tmp + ':' + os.environ['PATH'], EB_APPLICATION_NAME='staging-app', EB_ENVIRONMENT_NAME='staging-env', EB_VERSION_LABEL='exact-version', STAGING_GREEN_TIMEOUT_SECONDS='0', GITHUB_STEP_SUMMARY=str(root / 'summary'))
             for state, code, success in [('Ready\tGreen\texact-version', '0', True), ('Ready\tGreen\told-version', '0', False), ('Ready\tRed\texact-version', '0', False), ('Ready\tYellow\texact-version', '0', False), ('Updating\tGreen\texact-version', '0', False), ('None', '0', False), ('', '0', False), ('Ready\tGreen\texact-version', '255', False)]:
                 with self.subTest(state=state, code=code):
                     result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script('Confirm staging Ready and Green')], env=dict(env, MOCK_STATE=state, MOCK_EXIT=code), capture_output=True, text=True)
