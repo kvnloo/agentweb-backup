@@ -6169,6 +6169,16 @@ export class AgentModeService {
     // available" and Emma had to ask them to type out what was on screen (ENG-260).
     'describe_image',
 
+    // PDF export — converts a previously generated HTML file to a PDF. Same
+    // ENG-152/ENG-260 class of bug: this is a basic, universally-useful utility
+    // (there is even a plain HTTP export-pdf endpoint alongside it), not a
+    // gated capability, but it was left in the __other_skills__ catch-all pool.
+    // That pool's membership depends on which OTHER skills happen to be
+    // installed for a given subscription tier, so a fully-entitled account
+    // could still have install_skills(["__other_skills__"]) refused with
+    // "these skills are currently unavailable to install" (ENG-1867).
+    'convert_to_pdf',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
