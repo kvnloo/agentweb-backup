@@ -38,4 +38,37 @@ describe('SettingsService.getSettings', () => {
 
     await expect(resultPromise).resolves.toHaveLength(4);
   });
+
+  it('retries unprocessed keys and returns their settings', async () => {
+    mockBatchGet
+      .mockResolvedValueOnce({
+        Responses: { 'AW-Settings': [] },
+        UnprocessedKeys: {
+          'AW-Settings': {
+            Keys: [{ settingName: 'replay_sessions_user-1' }],
+            ProjectionExpression: 'settingName, settingValue',
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        Responses: {
+          'AW-Settings': [{
+            settingName: 'replay_sessions_user-1',
+            settingValue: 'https://replay.example/user-1',
+          }],
+        },
+      });
+
+    await expect(new SettingsService().getSettings([
+      'replay_sessions_user-1',
+    ])).resolves.toEqual([{
+      settingName: 'replay_sessions_user-1',
+      settingValue: 'https://replay.example/user-1',
+    }]);
+
+    expect(mockBatchGet).toHaveBeenCalledTimes(2);
+    expect(mockBatchGet.mock.calls[1][0].RequestItems['AW-Settings'].Keys).toEqual([
+      { settingName: 'replay_sessions_user-1' },
+    ]);
+  });
 });
