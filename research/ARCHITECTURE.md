@@ -300,6 +300,9 @@ A-006 discarded.
 Cycle 55: `renderMediaOnLambda` L467 is the isolate; meter stays in
 `remotionService`. `imageGeneration.ts` already calls vendor HTTP.
 A-006 discarded.
+Cycle 56: `mcp/client` ↛ `mcp/server` in prod (only test comments mention
+the other folder). Shared `anonymousToolAccess.ts`. A-016 parked.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

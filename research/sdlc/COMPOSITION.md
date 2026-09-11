@@ -136,7 +136,10 @@ AgentWeb: MCP **server** (`mcp/server`, loopback `mcpFetch`) *and* MCP
 **client** (`mcp/client/mcpClientService.ts`) to GitHub/Playwright/Higgsfield.
 `mcp_config.ts` L3–10 still names `"agentweb-tools"` → `http://localhost/mcp`.
 `initialize()` L420–432 **skips `isInternal`** so Emma does not MCP-call
-herself. That skip is the in-tree rejection of A-006. Vendor MCP
+herself. That skip is the in-tree rejection of A-006. Cycle 56: the
+folders already encode it — prod `mcp/client` ↛ `mcp/server` and reverse.
+Shared `mcp/anonymousToolAccess.ts` only (ENG-822). Do not HTTP-split
+that DAG; park A-016 until A-002. Vendor MCP
 (`excludeFromAgent`, Higgsfield) stays; do not invent a fifth process for
 image gen.
 

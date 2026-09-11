@@ -33,7 +33,7 @@ unit. Do not HTTP-split either of them.
 | `controllers/` | 26,852 | 20 | `services` | Same process as routes |
 | `utils/` | 23,312 | 133 | little | Shared lib |
 | `emma/` | 15,008 | 24 | `services`, `mcp/server` | In-app registry |
-| `mcp/` | 9,665 | 23 | `services` via REST (`mcpFetch`) | **External nanoservice bus** |
+| `mcp/` | 9,665 | 23 | `services` via REST (`mcpFetch`) | **External nanoservice bus**. Cycle 56: `client/` ↛ `server/` already |
 | `loops/` | 8,864 | 46 | adapters → AWS; **core via ports**; instances may import `db` / `callLLM` | Already a package |
 | `cron/` | 7,415 | 19 | `services`, `loops` | Same Node process |
 

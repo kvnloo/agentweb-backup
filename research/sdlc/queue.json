@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:34:00Z",
+  "updated_at": "2026-09-11T20:36:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -205,6 +205,27 @@
         "backend/src/emma/tools.ts"
       ],
       "first_slice": "PARK until after Q-014 / A-002 / A-007. Then: prefer context.llmModel || DEFAULT_CODING_AGENT_MODEL, delete the agentModeService import. Tests spy getCodingAgentDefaultModel — update those spies. Do not edit emma/tools.ts while #2832 is open. Do not spawn a process.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-016",
+      "title": "AST guard: mcp/client ↛ mcp/server and reverse (OMP DAG already true)",
+      "status": "park",
+      "leverage": 2,
+      "product": 2,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 2,
+      "score": 23,
+      "why": "Cycle 56. Prod mcp/client does not import mcp/server; reverse also empty. Shared parent anonymousToolAccess.ts is the ENG-822 leaf (OMP pi-telemetry). backend/package.json has no workspaces. HTTP-splitting these folders would recreate the cycle 29 self-MCP skip. Park until kvnloo#3 (A-002) merges — do not stack a second import-guard PR.",
+      "files": [
+        "backend/src/mcp/client/mcpClientService.ts",
+        "backend/src/mcp/client/toolRegistry.ts",
+        "backend/src/mcp/server/mcpServerCore.ts",
+        "backend/src/mcp/anonymousToolAccess.ts",
+        "research/sdlc/COMPARISON.md"
+      ],
+      "first_slice": "PARK until A-002 merges. Then sibling mcpFolderImportGuard.test.ts copying loopsCoreImportGuard visit(). Walk mcp/client/** (forbid mcp/server) and mcp/server/** (forbid mcp/client). Allow ../anonymousToolAccess. Do not forbid services/ on mcp/server (httpClient lookupUser, registry evaluationPolicy). Do not add dependency-cruiser. Do not do this instead of Q-014 / A-007.",
       "harsha_db": false
     },
     {

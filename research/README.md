@@ -88,6 +88,8 @@ Cycle 54: A-007 copies `workflowTools` **shape**, not its
 `adminClientScope` import. OMP 0.85.1 still keeps images in `pi-ai`.
 Cycle 55: remotion-lambda is the isolate; `imageGeneration.ts` is already
 the host adapter (vendor HTTP). Do not copy the Lambda process onto images.
+Cycle 56: MCP client/server folders are already acyclic (OMP DAG). Park
+A-016 until A-002. Do not HTTP-split them.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

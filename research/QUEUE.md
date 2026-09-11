@@ -72,5 +72,6 @@ cannot spend (`httpClient.ts` `lookupUser`). Cycle 51: copying the
 Emma meter is not that door (`anon_*` is allow-listed). Cycle 53: MCP
 image execute cannot skip `lookupUser` via ENG-1596. Cycle 54: A-007
 copies workflowTools **shape**, not admin identity. Cycle 55: remotion
-isolate vs image host adapter. A-006 stays discarded.
+isolate vs image host adapter. Cycle 56: MCP client/server already
+acyclic; A-016 parked. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

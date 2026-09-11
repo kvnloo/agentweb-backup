@@ -21,6 +21,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
+| — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
 | — | A-003 | 16 | park | Wire `executeAgentStep` (Harsha / Q-010) |
@@ -28,11 +29,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 55: remotion-lambda is the **isolate**; `recordVendorUsage` stays in
-`remotionService` (host). `imageGeneration.ts` is already that adapter
-(vendor HTTP). A-006 would copy the Lambda process, not the adapter.
-A-015 stays park. A-007 waits on kvnloo#2. A-006 stays discard.
-Product READY unchanged.
+Cycle 56: `mcp/client` ↛ `mcp/server` (and reverse) already. Park A-016
+until A-002 (#3) merges. Do not HTTP-split that DAG. A-007 waits on
+kvnloo#2. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

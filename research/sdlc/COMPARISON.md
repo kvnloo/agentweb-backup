@@ -41,6 +41,7 @@ AgentWeb:   customer-portal (other repo)
             loops/index.ts      ──► ./core/types only (cycle 35; Hermes registry)
             app.ts L118–120     ──► instances register (explicit, not discover)
             mcp/server/registry ──► already imports evaluationPolicy (not loops-clean)
+            mcp/client ↛ mcp/server (cycle 56; OMP DAG already true)
             chatbot on parent   ──► still executeTool (cycle 46; hexagon leaks)
 ```
 
@@ -107,3 +108,5 @@ submodule of the leaf package (A-008, not A-006).
   `recordVendorUsage` stays in `remotionService`. `imageGeneration.ts`
   is already the host adapter (vendor HTTP). Do not copy the Lambda
   process onto images.
+- Cycle 56: `mcp/client` ↛ `mcp/server` (prod). Shared
+  `anonymousToolAccess.ts`. Do not HTTP-split; park A-016 until A-002.
