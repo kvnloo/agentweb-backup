@@ -62,7 +62,9 @@ four named drains; inbound MCP `CallTool` is not one
 server. Copy `chatbotTurn`, do not revive A-006. Cycle 70: wrap
 `CallTool` once (covers local Map and `rehydrateAndServe`); do not
 wrap only the ENG-114 face. Cycle 71: AgentWebPro empty on those
-files; wrap after #2, not instead of Q-014. Product READY unchanged.
+files; wrap after #2, not instead of Q-014. Cycle 72: local GET
+`/mcp` SSE hangs `server.close()`; `mcpShutdown` after the wait,
+not instead of it. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

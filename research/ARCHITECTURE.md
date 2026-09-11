@@ -354,6 +354,9 @@ Cycle 71: 20 AgentWebPro PRs. CallTool-wrap files **empty**.
 `emma/tools.ts` still #2832 #1076 #689. `app.ts` #2271 #1814.
 `crm.ts` #1544 #1790. `agentModeService.ts` #2871 #2861 #2563
 #2060 #1584. A-006 discarded.
+Cycle 72: GET `/mcp` L508–531 `setTimeout(0)` SSE. Rehydrate has
+no GET. Ordered: track CallTool, then `mcpShutdown`, then
+`server.close()`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

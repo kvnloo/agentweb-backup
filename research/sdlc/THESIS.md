@@ -73,7 +73,9 @@ by `runDrain`. Cycle 70: local Map (`mcpServer.ts` L307–315) and
 Rehydrate is finite HTTP (`mcpSessionRehydration.ts` L15–18);
 mcpFetch still needs a new loopback. Cycle 71: AgentWebPro is
 empty on that wrap set (`mcpServerCore.ts` / `cronJobRegistry.ts`
-/ `mcpServer.ts`). Do not start it instead of Q-014. The listed face is a
+/ `mcpServer.ts`). Do not start it instead of Q-014. Cycle 72:
+local GET `/mcp` (`mcpServer.ts` L508–531) disables timeouts; that
+SSE is why `mcpShutdown` must follow the CallTool wait. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

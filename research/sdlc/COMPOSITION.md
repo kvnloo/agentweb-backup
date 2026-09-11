@@ -161,6 +161,12 @@ Cycle 71: **wrap files empty on AgentWebPro.** 20 PRs. Zero on
 kvnloo#2 / #3 MERGEABLE. Do not land the wrap on this research
 branch. Do not start it instead of Q-014.
 
+Cycle 72: **local GET `/mcp` is a keep-alive SSE.** L508–531
+disables timeouts. Rehydrate has no GET (L516 404). `mcpShutdown`
+must run **after** the CallTool wait, before `server.close()`.
+Calling it during `generate_image` aborts the mcpFetch. A-006
+would own a third GET with no closer.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

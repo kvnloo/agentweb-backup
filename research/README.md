@@ -143,6 +143,9 @@ Cycle 70: local `/mcp` reuse vs ENG-114 rehydrate are two faces of
 the same untracked `CallTool`. Wrap `mcpServerCore`, not a fifth
 process. Cycle 71: that wrap set is empty on AgentWebPro (20 PRs).
 Do not compete on `emma/tools.ts` / `app.ts` / `crm.ts`.
+Cycle 72: GET `/mcp` keep-alive SSE (`mcpServer.ts` L508–531) is
+why `mcpShutdown` follows the wait. Rehydrate has no SSE. Do not
+HTTP-split the stream.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

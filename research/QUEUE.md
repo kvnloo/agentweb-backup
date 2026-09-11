@@ -104,4 +104,7 @@ Cycle 70: local MCP Map vs `rehydrateAndServe` share `CallTool`.
 Wrap that once (`cronJobRegistry.ts` L1–9). A-006 stays discarded.
 Cycle 71: AgentWebPro empty on CallTool-wrap files. Do not start
 that wrap instead of Q-014. A-006 stays discarded.
+Cycle 72: local GET `/mcp` (`mcpServer.ts` L508–531) is timeout-0
+SSE. Ordered drain: track CallTool, then `mcpShutdown`, then
+`server.close()`. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

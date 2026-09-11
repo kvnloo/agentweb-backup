@@ -7,16 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 71
+cycles_completed: 72
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 72
+next_cycle: 73
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 71: AgentWebPro empty on CallTool-wrap files. Do not start
-  that wrap instead of Q-014. Cycle 72: cheapest remaining mapping.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 72: local GET /mcp SSE (timeout 0) hangs server.close();
+  mcpShutdown after CallTool wait, not instead. Cycle 73: cheapest
+  remaining mapping. Do not un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

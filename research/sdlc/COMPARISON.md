@@ -151,3 +151,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 71: AgentWebPro empty on `mcpServerCore.ts` /
   `cronJobRegistry.ts` / `mcpServer.ts` / `asgLifecycleGuard.ts`.
   Wrap is mergeable after #2, not instead of Q-014.
+- Cycle 72: local GET `/mcp` SSE (`mcpServer.ts` L508–531) hangs
+  `server.close()`. Ordered drain: wait CallTool, then
+  `mcpShutdown`, then close. Hermes has no inbound SSE.
