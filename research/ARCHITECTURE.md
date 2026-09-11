@@ -250,6 +250,8 @@ Cycle 40: monthly quota is not in `generateImage`. MCP hop skipped the
 controller (`emmaTokenBudget.ts` L4–10); `POST /generate-image` is
 `metered` (L58). Auto-continuation copied `checkTokenUsage` again
 (L1327–1334). A-006 stays discarded.
+Cycle 41: `agentModeService.ts` L29894 imports `controllers/blog`.
+A-012 parks lifting `generateBlogImage`. A-008 does not fix it.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

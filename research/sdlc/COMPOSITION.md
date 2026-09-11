@@ -203,3 +203,7 @@ is `export * from './creative/imageGeneration'`. Closest analog:
 - AgentWeb already paid for an HTTP composition layer (`mcpFetch`) **and
   still** lands in `agentModeService`. Copying Hermes’ MCP-as-client or
   exploding that loopback into Kubernetes does not shrink the 40k file.
+- Cycle 41: the loop also **imports a controller**
+  (`agentModeService.ts` L29894 → `controllers/blog.ts`). Hermes/OMP
+  packages do not import their HTTP handlers. A-012 parks lifting
+  `generateBlogImage`; do not HTTP-split to hide the inversion.

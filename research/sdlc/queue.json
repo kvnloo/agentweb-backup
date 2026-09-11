@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:48:00Z",
+  "updated_at": "2026-09-11T19:50:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -217,6 +217,26 @@
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "PARK. Q-014 stays drop internal L2077 + mcp.apiTools.test.ts L91. Do not add confirm/metrics_verified/session_id. Optional later after Q-001 Hermes smoke proves generation. Never write MCP session UUIDs into chatbotDb as Emma chats.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-012",
+      "title": "Stop agentModeService importing controllers/blog (lift generateBlogImage)",
+      "status": "park",
+      "leverage": 4,
+      "product": 1,
+      "mergeability": 2,
+      "evidence": 5,
+      "collision": 5,
+      "score": 14,
+      "why": "Cycle 41. SERVICES_DAG says controllers import services, never reverse. agentModeService.ts L29894 dynamically imports ../controllers/blog then L29962/L30001 call generateBlogImage (leaf at blog.ts L648). blogPublishers.ts L2 also imports that controller. Hermes registry.py / OMP pi-ai do not import HTTP handlers. Fix is an in-process lift, not A-006. Touches the 40k file (7 open PRs) so park with A-005.",
+      "files": [
+        "backend/src/services/agentModeService.ts",
+        "backend/src/controllers/blog.ts",
+        "backend/src/services/blogPublishers.ts",
+        "research/sdlc/SERVICES_DAG.md"
+      ],
+      "first_slice": "PARK until the agentModeService.ts PR pile shrinks. Then move generateBlogImage (and only the helpers the loop needs) out of controllers/blog.ts into services/creative or services/blog; point L29894 at the new module. Do not wrap it in HTTP. Do not do this instead of Q-014 / A-002 / A-007 / A-008. A-008 git mv of imageGeneration.ts does not remove the controller import.",
       "harsha_db": false
     }
   ]

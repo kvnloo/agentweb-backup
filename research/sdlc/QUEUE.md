@@ -22,12 +22,12 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-003 | 16 | park | Wire `executeAgentStep` (Harsha / Q-010) |
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
+| — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 40: monthly quota is **above** `generateImage` (controllers /
-`emmaTokenBudget.ts` L58 / auto-continuation L1327). A fifth process
-would skip or re-copy that gate. A-006 stays discard. Q-014 lists a
-face that is already `metered`.
+Cycle 41: `agentModeService.ts` L29894 imports `controllers/blog`
+(`generateBlogImage`). Intended SERVICES_DAG is inverted. A-012 parks
+the lift (touches the 40k file). A-006 stays discard. Q-014 unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

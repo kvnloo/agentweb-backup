@@ -36,6 +36,13 @@ That is the same arrow as OMP `pi-ai ↛ pi-agent-core` (cycle 20
 (leave that leak). `utils/llmClients.ts` importing `usageRecorderService`
 is the inverted layer vs OMP `pi-utils` (A-009).
 
+Cycle 41: the **reverse** arrow is already live. `agentModeService.ts`
+L29894 `await import('../controllers/blog')` then calls
+`generateBlogImage` (L29962 / L30001). `blogPublishers.ts` L2 imports
+CMS config helpers from the same controller. Intended DAG is
+controllers → services; actual is services → controllers. A-012
+parks lifting the helper. A-008 does not fix it.
+
 ## Proposed folders (logical nanoservices)
 
 | Folder | Contents | Extract as process? |
