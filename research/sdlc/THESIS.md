@@ -31,7 +31,9 @@ A 60-tool HTTP mesh would recreate MCP poorly: `apiTools.ts` already
 had a self-server `"agentweb-tools"` (`mcp_config.ts` L3–10) and
 **skips it** (`mcpClientService.ts` L420–432) as a circular dependency.
 Q-014 lists `generate_image` for *external* Hermes; it does not re-enable
-that self-client. Hop diagram: `COMPOSITION.md`.
+that self-client. The listed face is a **thinner** schema than Emma’s
+in-app tool (cycle 39: no `confirm`, `emmaApi.ts` L181). Hop diagram:
+`COMPOSITION.md`.
 
 ## What already exists (do not rebuild)
 

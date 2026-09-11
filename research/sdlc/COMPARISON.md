@@ -82,3 +82,7 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
   `agentModeService.ts` is. `LoopPorts` (L143–150) is six injected
   interfaces wired at `productionLoopPorts()` — that is how nanoservices
   already compose here. Promote that pattern; don’t invent K8s.
+- Cycle 39: Hermes would expose **one** `generate_image` schema.
+  AgentWeb already has two (Emma camelCase + HITL vs MCP snake_case
+  HTTP adapter). That is composition drift, not a reason to add a
+  fifth process. Q-014 lists the adapter; A-011 parks unifying it.

@@ -16,6 +16,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 31 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` |
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
+| — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
@@ -23,10 +24,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 38: Emma `generate_image` execute is in-process policy
-(`emma/tools.ts` L5055); MCP execute is already mcpFetch (L2096).
-Q-014 lists the MCP face. `backend/package.json` has no workspaces.
-A-006 stays discard.
+Cycle 39: MCP `generate_image` is a thinner HTTP adapter (`emmaApi.ts`
+L181 `confirm=undefined`; no `session_id` in body). Q-014 stays ready
+(text-to-image list). A-011 parks unification. A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

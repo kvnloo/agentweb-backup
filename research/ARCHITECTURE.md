@@ -243,6 +243,9 @@ Cycle 38: two `generate_image` executes (Emma `emma/tools.ts` L5055
 direct vs MCP `apiTools.ts` L2096 mcpFetch). `backend/package.json` has
 neither `workspaces` nor `dependency-cruiser`. First slice is folders +
 AST, not npm workspaces.
+Cycle 39: MCP schema is a thinner HTTP adapter (no `confirm` /
+`metrics_verified`; `emmaApi.ts` L181). Q-014 stays list-only. A-011
+parks schema unification.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

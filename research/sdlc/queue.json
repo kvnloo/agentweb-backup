@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:39:00Z",
+  "updated_at": "2026-09-11T19:45:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -197,6 +197,26 @@
         "backend/src/emma/tools.ts"
       ],
       "first_slice": "PARK until after Q-014 / A-002 / A-007. Then: prefer context.llmModel || DEFAULT_CODING_AGENT_MODEL, delete the agentModeService import. Tests spy getCodingAgentDefaultModel — update those spies. Do not edit emma/tools.ts while #2832 is open. Do not spawn a process.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-011",
+      "title": "Do not unify MCP vs Emma generate_image schemas inside Q-014",
+      "status": "park",
+      "leverage": 3,
+      "product": 2,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 0,
+      "score": 30,
+      "why": "Cycle 39. Emma schema (emma/tools.ts L4995) has confirm, metrics_verified, camelCase. MCP schema (apiTools.ts L2075) is snake_case and thinner. emmaApi.ts L181 hardcodes confirm=undefined so external MCP cannot self-approve edits. generate_image body omits session_id; route uses ''. Leaf meter/C2PA still run. Q-014 lists text-to-image. Unifying schemas is a later strangler of the HTTP adapter, not a nanoservice.",
+      "files": [
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/routes/emmaApi.ts",
+        "backend/src/emma/tools.ts",
+        "research/sdlc/COMPOSITION.md"
+      ],
+      "first_slice": "PARK. Q-014 stays drop internal L2077 + mcp.apiTools.test.ts L91. Do not add confirm/metrics_verified/session_id. Optional later after Q-001 Hermes smoke proves generation. Never write MCP session UUIDs into chatbotDb as Emma chats.",
       "harsha_db": false
     }
   ]

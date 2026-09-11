@@ -137,6 +137,20 @@ apiTools.ts L2096–2107    ──► mcpFetch POST /api/emma/generate-image
 Q-014 lists the second row. A-006 would add a third hop after it.
 `backend/package.json`: no `workspaces`, no dependency-cruiser.
 
+## MCP schema is thinner (cycle 39)
+
+Hermes one-handler-table vs AgentWeb’s HTTP adapter:
+
+| Contract | In-app Emma | MCP → `emmaApi` |
+|---|---|---|
+| Schema | `inputImages`, `imageModel`, `confirm`, `metrics_verified` (`emma/tools.ts` L4995–5052) | `input_images`, `image_model`; no confirm / metrics (`apiTools.ts` L2075–2094) |
+| `confirm` | passed through to policy | `emmaApi.ts` L181 **`undefined`** — edits always HITL-stop |
+| `sessionId` | Emma chat session | `ctx()` has it; `generate_image` body omits it; route uses `session_id \|\| ''` |
+
+Q-014 stays **ready** (list for text-to-image). A-011 parks schema
+unification / threading `confirm`. Do not revive A-006 to “fix” the
+thinner face.
+
 
 
 ## Two MCP hop styles (cycle 32)

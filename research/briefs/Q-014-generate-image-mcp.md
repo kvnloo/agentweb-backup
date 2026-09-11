@@ -41,6 +41,16 @@ Keep `you_search_*` / `google_search_web` internal in this slice.
 
 ComfyUI backend, DesignArena routing (Q-003), video, changing prices.
 
+Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
+The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
+or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as
+`undefined`. That is why external MCP cannot self-approve image *edits*.
+Text-to-image (no `input_images`) is the acceptance path. Do not put
+`session_id` on the body here — MCP session ids are not Emma chat
+sessions. After the flag drop, update the stale comment at
+`mcp.apiTools.test.ts` L405–406 (tool will be in `getToolDefinitions()`);
+keep L407–421 via `getTool()`.
+
 ## Collision
 
 ENG-983 unlists CRUD; this is additive. Don't touch `manage_*` listing.
