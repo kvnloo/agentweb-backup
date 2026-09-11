@@ -16,6 +16,10 @@ and would fight `mcp.apiTools.test.ts` (imports the barrel, not each tool).
 First slice = one sibling file of mcpFetch-only tools, barrel from
 `apiTools.ts`. One-file-per-tool later, after the barrel exists.
 
+Cycle 28: Hermes `discover_builtin_tools()` AST-scans `tools/*.py`.
+Do **not** add that in the first A-007 PR. Keep the ENG-982 explicit
+`import './workflowTools'` / `apiTools` list.
+
 ## Barrel contract (must keep)
 
 | Importer | Specifier |

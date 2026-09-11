@@ -66,9 +66,9 @@ mismatch is `utils/llmClients.ts` importing `usageRecorderService`
 | Documented target loop | Yes | `AGENTMODE_MIGRATION.md` — **stale scorecard** (24k vs 40k) |
 | Characterization tests | pytest volume | `backend/src/__tests__/agentMode/characterization/` exists |
 | Eval / bench on tools | OMP “benchmaxxed” edits; metaharness package | `loops/` framework; human eval for images (not a router) |
-| Module boundary in CI | package graph / documented import chain | **No** dependency-cruiser / eslint-plugin-boundaries |
+| Module boundary in CI | package graph / AST `discover_builtin_tools` | **No** (A-002 sketch only) |
 | Skills as files | `skills/` + optional-skills | Skills in system prompt + DB `foundation_tools` |
-| MCP | Client to many servers | Server wrapping the monolith |
+| MCP | Client (`mcp_tool.py` skipped by discover) | Server; **manual** `mcpServerCore.ts` L26–30 imports |
 
 ## Implications (not a port)
 
@@ -77,6 +77,8 @@ mismatch is `utils/llmClients.ts` importing `usageRecorderService`
 - Do copy: **package boundaries, registry import DAG, section-file MCP
   (ENG-982) then one-tool-per-file later, keep the loop in-process, MCP
   as the *external* nanoservice bus.** Do not copy Hermes’ 1-file-per-tool
-  as the *first* A-007 PR (`A-007-split-map.md`).
+  **or** `discover_builtin_tools` as the *first* A-007 PR
+  (`A-007-split-map.md`). `loops/adapters/awsAdapters.ts` is the host
+  package; do not import it from `core/`.
 - `loops/core/ports.ts` is closer to OMP `pi-agent-core` than
   `agentModeService.ts` is. Promote that pattern; don’t invent K8s.

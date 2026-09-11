@@ -38,8 +38,11 @@ the file, or as a substring on the raw specifier):
 - type-only imports of ports
 
 **Not in scope for the first PR:** `loops/instances/**` (those *may*
-import `services/db` — onboarding already does). `loops/adapters/`
-is the AWS host.
+import `services/db` — `onboarding/index.ts` L35 `userDb`;
+`ai-eval-funnel/rcaEnricher.ts` L25 imports `agentModeService` and L227
+calls `callLLM` — A-003 lane). `loops/adapters/awsAdapters.ts` is the
+AWS host (cycle 28): implements `ports.ts` with `aws-sdk`, **must not**
+be imported from `core/`. `loops/adapters/` is the AWS host.
 
 ## Why not dependency-cruiser
 

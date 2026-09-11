@@ -26,7 +26,7 @@ Customer UI is **another GitHub repo**.
 | `utils/` | 23,312 | 133 | little | Shared lib |
 | `emma/` | 15,008 | 24 | `services`, `mcp/server` | In-app registry |
 | `mcp/` | 9,665 | 23 | `services` via REST (`mcpFetch`) | **External nanoservice bus** |
-| `loops/` | 8,864 | 46 | adapters → AWS; **core via ports** | Already a package |
+| `loops/` | 8,864 | 46 | adapters → AWS; **core via ports**; instances may import `db` / `callLLM` | Already a package |
 | `cron/` | 7,415 | 19 | `services`, `loops` | Same Node process |
 
 Hottest edges: `routes → services` (398), `services → utils` (250),
