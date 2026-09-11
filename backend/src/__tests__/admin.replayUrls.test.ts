@@ -20,9 +20,11 @@ jest.mock('../services/resendService', () => ({
 jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
-    getSettings: jest.fn(),
     setSetting: jest.fn(),
-    getSettingsByPrefix: jest.fn(),
+    // ENG-1782 replaced the per-user getSetting loop this file's tests were written
+    // against with a single batched getSettings(names) call -- see each test's setup
+    // below, which configures getSettings (not getSetting) to match.
+    getSettings: jest.fn(),
   },
 }));
 
@@ -92,8 +94,8 @@ describe('GET /api/admin/users - replay URLs', () => {
           trackingUserId: 'user-1',
           lastTracked: '2026-02-17T00:00:00Z',
         }),
-      },
-    ] as any);
+      } as any,
+    ]);
 
     const res = await request(app)
       .get('/api/admin/users')
@@ -130,8 +132,8 @@ describe('GET /api/admin/users - replay URLs', () => {
       {
         settingName: 'replay_sessions_user-1',
         settingValue: 'not-valid-json',
-      },
-    ] as any);
+      } as any,
+    ]);
 
     const res = await request(app)
       .get('/api/admin/users')

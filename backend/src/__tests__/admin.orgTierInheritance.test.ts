@@ -35,8 +35,12 @@ jest.mock("../services/db", () => ({
 jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: jest.fn().mockResolvedValue(null),
-    getSettings: jest.fn().mockResolvedValue([]),
     setSetting: jest.fn().mockResolvedValue(undefined),
+    // ENG-1782 added a batched settingsService.getSettings() call to the admin-users
+    // route (replay-session lookup) after this mock was written -- the route wraps it
+    // in .catch(() => []), so an empty resolve here reproduces "no replay settings
+    // found" without needing per-test setup.
+    getSettings: jest.fn().mockResolvedValue([]),
   },
 }));
 

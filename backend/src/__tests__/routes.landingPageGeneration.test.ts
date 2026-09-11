@@ -1414,19 +1414,80 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     );
   });
 
-  it("keeps the gate when checks come from a GitHub App rather than Actions", async () => {
-    // actions/workflows enumerates GitHub ACTIONS only. A repo whose CI is a GitHub App
-    // reports total_count 0 while real checks exist — keying off that alone would skip a gate
-    // that was doing its job and merge an untested draft to a customer's live site. Requiring
-    // zero check runs as well is what closes that hole.
+  // ENG-1856. The `checkRuns.length === 0` requirement this test used to pin was itself the
+  // bug: Vercel's own GitHub integration auto-deploys and posts a check run for ANY PR on a
+  // connected project, unconditionally, and this route always opens a PR as its first step —
+  // so `checkRuns.length` was never actually 0 on a real publish attempt, the workflow-count
+  // check never ran, and the gate blocked every single publish forever. Confirmed live: zero
+  // of a random sample of generated repos ever had a merged publish PR since this gate shipped.
+  it("skips the gate when a non-Tests check exists but the repo genuinely has zero workflows", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
     mockAxios.get
       .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({
-        // An App reported a check, and it is not named "Tests".
-        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success" }] },
+        // Vercel's bot check — present on every real publish attempt, unrelated to test execution.
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 0 } }) // no Actions workflow can ever run
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://x.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // The workflow count is now consulted whenever no "Tests" check reported, regardless of
+    // what ELSE has reported — that's the whole fix.
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("still blocks a repo that genuinely has an Actions workflow but no Tests check yet", async () => {
+    // The workflow-count check itself must still fail closed for a repo that DOES have real
+    // CI configured — this is what keeps the gate meaningful, not merely satisfiable.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 1 } }); // a real Actions workflow exists
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("keeps the gate for a check from an app that is NOT the known-benign allowlist", async () => {
+    // This is the narrower protection ENG-1856 preserves: only a check identified as Vercel's
+    // own app is filtered out. Any OTHER app's check — a real CI tool, or anything unexpected —
+    // still counts toward checkRuns.length and keeps the gate, never even asking about
+    // workflows. Filtering everything unconditionally was the wrong fix; this pins the boundary.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success", app: { slug: "buildkite" } }] },
       });
     mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
 
@@ -1435,7 +1496,6 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .send({ branch: "draft/agentweb-preview" });
 
     expect(res.status).toBe(409);
-    // It must not even ask about workflows — a check reported, so the repo demonstrably has CI.
     expect(mockAxios.get).not.toHaveBeenCalledWith(
       expect.stringContaining("/actions/workflows"), expect.anything()
     );

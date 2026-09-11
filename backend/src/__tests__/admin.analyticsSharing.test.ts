@@ -40,8 +40,10 @@ jest.mock("../services/db", () => ({
 jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: jest.fn().mockResolvedValue(null),
-    getSettings: jest.fn().mockResolvedValue([]),
     setSetting: jest.fn().mockResolvedValue(undefined),
+    // ENG-1782: the comment above already described this intent, but the batch
+    // method itself was never actually stubbed -- getSetting alone doesn't cover it.
+    getSettings: jest.fn().mockResolvedValue([]),
   },
 }));
 
