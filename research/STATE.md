@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 14
+cycles_completed: 15
 target_cycles: 7
 stop_after: 2026-09-11T20:15:00Z
-next_cycle: 15
+next_cycle: 16
 focus: collision-refresh-until-stop_after
 next_focus_hint: |
-  CreateGoal (initialize research system + queue) is satisfied.
-  Timer may collision-refresh until 20:15 UTC. A cycle with no new
-  open PR on apiTools.ts / imageGeneration.ts should skip a queue
-  rewrite. If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 15: no open PR on apiTools.ts or imageGeneration.ts.
+  Repeat the file-filter collision check. Do not rewrite QUEUE.md
+  unless a new PR hits those paths. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 ```
 
