@@ -66,6 +66,12 @@ already has **three** faces (parent MCP, parent chatbot, worker chat).
 Hermes keeps sockets and the loop in one process. Do not HTTP-split
 `generateImage`.
 
+Cycle 58: **drain is the listen() proof.** `drainForShutdown`
+(`server.ts` L404–413) waits on worker + cron + interactive turns
+**before** `server.close()` because mcpFetch is loopback to this PORT
+(ENG-1189). A fifth image `listen()` is not in that drain. `server.ts`
+L41–44 `registerFathomLinearPort` is an in-process port at this root.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

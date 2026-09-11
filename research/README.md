@@ -92,6 +92,8 @@ Cycle 56: MCP client/server folders are already acyclic (OMP DAG). Park
 A-016 until A-002. Do not HTTP-split them. Cycle 57: **#2271** owns
 `app.ts` route table; A-007 still attaches at `mcpServerCore` not `app.ts`.
 Never compete with #2271 / #2862 / #2861.
+Cycle 58: `server.ts` drain (ENG-1189) proves mcpFetch is loopback to this
+`listen()`. A fifth image process would need a copy of that drain.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

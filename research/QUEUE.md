@@ -74,5 +74,5 @@ image execute cannot skip `lookupUser` via ENG-1596. Cycle 54: A-007
 copies workflowTools **shape**, not admin identity. Cycle 55: remotion
 isolate vs image host adapter. Cycle 56: MCP client/server already
 acyclic; A-016 parked. Cycle 57: #2271 owns `app.ts`; A-007 does not
-touch it. A-006 stays discarded.
+touch it. Cycle 58: ENG-1189 drain is the listen() proof. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

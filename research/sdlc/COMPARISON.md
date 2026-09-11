@@ -112,3 +112,5 @@ submodule of the leaf package (A-008, not A-006).
   `anonymousToolAccess.ts`. Do not HTTP-split; park A-016 until A-002.
 - Cycle 57: `app.ts` is the composition root. #2271 owns its route table.
   A-007 attaches at `mcpServerCore`, not `app.ts`.
+- Cycle 58: `server.ts` drain (ENG-1189 L404–413) waits on in-flight
+  mcpFetch before `server.close()`. Hermes: one process, no second listen().

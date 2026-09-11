@@ -48,7 +48,8 @@ already calling vendor HTTP. Cycle 56: `mcp/client` ↛ `mcp/server`
 already (OMP DAG); park A-016 until A-002. Cycle 57: `app.ts` is the
 composition root (`setupMcpServer` L204, loop `register*` L475–491);
 #2271 owns its route table — A-007 still attaches at `mcpServerCore`.
-The listed face is a
+Cycle 58: `server.ts` drain (ENG-1189) is why mcpFetch must share this
+`listen()`. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

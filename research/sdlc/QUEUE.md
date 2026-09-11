@@ -29,10 +29,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 57: AgentWebPro still empty on `apiTools.ts` / `loops/core`.
-**#2271** owns `app.ts` (+7 WhatsApp routes) + `slackChannelAdapter.ts` +
-`db.ts`. A-007 attaches at `mcpServerCore` not `app.ts`. A-013 also
-not WhatsApp. A-016 parked. A-006 stays discard. Product READY unchanged.
+Cycle 58: `server.ts` drain (ENG-1189 L404–413) proves mcpFetch is
+loopback to **this** `listen()`. A-006 would need a second drain. A-007
+still not `app.ts` / `server.ts`. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

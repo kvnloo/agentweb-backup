@@ -306,6 +306,8 @@ A-006 discarded.
 Cycle 57: `app.ts` L204 `setupMcpServer` + L475–491 loop registers are
 the composition root. **#2271** +7 WhatsApp routes on that file. A-007
 does not touch `app.ts`. A-006 discarded.
+Cycle 58: `drainForShutdown` (`server.ts` L404–413) waits before
+`server.close()` because mcpFetch is this PORT. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
