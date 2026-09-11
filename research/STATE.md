@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 114
+cycles_completed: 115
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 115
+next_cycle: 116
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 114: guard still drains without a hook; ASG does not wait.
-  Cycle 115: cheapest remaining. Candidate: EB/OS SIGTERM on
-  Sunday refresh without our hook. Do not un-ready Q-001 / Q-014
-  / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  Cycle 115: Sunday still gets OS SIGTERM; this tree does not
+  keep it alive. Cycle 116: cheapest remaining. Candidate: webapp
+  TimeoutStopSec is not in git. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

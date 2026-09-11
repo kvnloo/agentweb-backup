@@ -438,6 +438,12 @@ Two IMDS `Terminated` reads (`asgLifecycleGuard.ts` L232–296;
 test L267–283). `disableCron` is first in `runDrain` (`server.ts`
 L387). 3m19s is two-instance overlap, not `Terminating:Wait`.
 
+Cycle 115: **Sunday SIGTERM is OS/cgroup, not the hook.**
+`server.ts` L474–475 only listens. `.platform` is nginx.
+Only `TimeoutStopSec` in repo is agent-engine 30s.
+`rolling.config` L7 900s is Immutable command Timeout, not
+`InstanceRefreshEnabled`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

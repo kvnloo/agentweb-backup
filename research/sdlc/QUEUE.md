@@ -179,6 +179,9 @@ unchanged.
 Cycle 114: guard still drains without a hook; ASG does not wait.
 Two IMDS `Terminated` reads; `disableCron` first. Product READY
 unchanged.
+Cycle 115: Sunday still gets OS SIGTERM; this tree does not keep
+it alive. 900s is Immutable command Timeout, not recycle.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -332,6 +332,10 @@ hook (ENG-818).
 Cycle 114: guard still drains without a hook; ASG does not wait.
 Two IMDS `Terminated` reads then `disableCron`. 3m19s is overlap,
 not park. A-019 fires only if drain starts.
+Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201), not the hook.
+`.platform` is nginx. The 900s `rolling.config` Timeout is
+Immutable deploys, not `InstanceRefreshEnabled`. Only
+`TimeoutStopSec` in git is agent-engine 30s.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

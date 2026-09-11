@@ -290,3 +290,5 @@ reverted. Do not copy that as A-006.
   Sunday recycle is not that hook. Park A-020. Not A-006.
 - Cycle 114: guard still drains without a hook; ASG does not
   wait. Two IMDS `Terminated` reads. Not a fifth `listen()`.
+- Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201). This tree
+  does not keep it alive. 900s is not Sunday. Not A-006.

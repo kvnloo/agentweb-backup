@@ -206,4 +206,6 @@ Cycle 113: last deploy’s hook dies with the Immutable ASG. Park
 A-020. A-006 stays discarded.
 Cycle 114: guard still drains without a hook; ASG does not wait.
 A-006 stays discarded.
+Cycle 115: Sunday SIGTERM is OS/cgroup, not the hook. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

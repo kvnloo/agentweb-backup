@@ -172,6 +172,9 @@ with no hook. Park A-020 (second put after verify). Not
 Cycle 114: the guard still drains on two IMDS `Terminated`
 reads without a hook. ASG does not wait. 3m19s is overlap,
 not park. A-019 fires only if drain starts (`disableCron` first).
+Cycle 115: Sunday SIGTERM is OS/cgroup (ENG-201). This tree
+does not ship a backend `TimeoutStopSec`. The 900s comment is
+Immutable command Timeout, not recycle.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
