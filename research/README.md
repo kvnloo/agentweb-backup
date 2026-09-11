@@ -268,6 +268,10 @@ Cycle 101: `POST /generate` never `track()`s (`generateResponse`
 L8817). It `tryClaimSessionGeneration`s (L9016). A-019’s first
 slice is one `instanceState` bit on **both** `track()` and
 `tryClaim`, not a `/generate` HTTP service.
+Cycle 102: auto-continuation `setImmediate`s after that lock
+releases (L9406–9409) and `tryClaim`s again (L1350). The live
+Set goes 1→0→1. `disableCron` does not cancel `setImmediate`.
+Do not HTTP-split `generate_image` to isolate this scheduler.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

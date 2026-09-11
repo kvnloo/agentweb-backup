@@ -254,3 +254,6 @@ reverted. Do not copy that as A-006.
   `activeSessionGenerations`. A-019 first slice: `instanceState`
   bit consulted by `track()` and `tryClaim`. Not a `/generate`
   nanoservice.
+- Cycle 102: media/work-plan auto-continuation `setImmediate`s
+  after lock release and `tryClaim`s again. Live drain sees
+  1→0→1. Not an image nanoservice.

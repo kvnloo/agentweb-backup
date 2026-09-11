@@ -368,6 +368,11 @@ Cycle 101: **`/generate` is the Set, not `track()`.**
 is the only `track()` in the controller. `drainActiveSessionGenerations`
 is a second live waiter. A-019 must close `tryClaim` too.
 
+Cycle 102: **auto-continuation re-fills the Set.**
+`setImmediate` after `/generate` releases (L9406–9409).
+`tryClaim` L1350, chain L1468. `getSession` L8730 GET backstop.
+`disableCron` does not cancel `setImmediate`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -136,6 +136,8 @@ Cycle 100: Slack/email ack HTTP then `track()`. Park A-019 —
 one registry gate, not a Slack nanoservice.
 Cycle 101: `/generate` uses `tryClaim` / the session Set, not
 `track()`. A-019 must close both.
+Cycle 102: auto-continuation re-fills that Set after release.
+`tryClaim` refuse is required, not optional.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

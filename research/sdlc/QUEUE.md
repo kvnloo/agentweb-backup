@@ -132,6 +132,9 @@ L291). Park A-019: one gate on the registry, not `slack.ts`
 Cycle 101: `POST /generate` never `track()`s — `tryClaim`
 L9016 into `activeSessionGenerations`. A-019 first slice now
 covers that Set too. Product READY unchanged.
+Cycle 102: auto-continuation `setImmediate` after lock release
+(L9406–9409) then `tryClaim` L1350. Re-fills the live Set.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

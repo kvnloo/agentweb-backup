@@ -179,4 +179,6 @@ discarded.
 Cycle 101: `/generate` uses `tryClaim` into the session Set, not
 `track()`. A-019 first slice now covers both waiters. A-006 stays
 discarded.
+Cycle 102: auto-continuation re-fills the Set after release
+(`setImmediate` L9406, `tryClaim` L1350). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
