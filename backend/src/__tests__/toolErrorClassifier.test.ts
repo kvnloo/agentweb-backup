@@ -18,6 +18,7 @@
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { ToolOutputContractError } from '../utils/toolOutputContract';
+import { MISSING_BRAND_LOGO_ERROR } from '../services/agentMode/brandLogo';
 
 function err(message: string, name?: string): Error {
   const e = new Error(message);
@@ -448,7 +449,7 @@ describe('missing_brand_logo — brand-logo content gate (ENG-1844)', () => {
       new Error(
         'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again — landing pages are never generated with an invented or approximate logo.'
       ),
-      { code: 'missing_brand_logo' }
+      { code: MISSING_BRAND_LOGO_ERROR }
     );
     expect(classifyToolErrorClass(err)).toBe('missing_brand_logo');
   });

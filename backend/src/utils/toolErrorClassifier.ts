@@ -44,6 +44,14 @@
  * `.name`, else constructor name) so named custom errors lose nothing.
  */
 
+// ENG-1844 review: this module was previously import-free by convention. A single import
+// of a plain string constant (no transitive weight — brandLogo.ts lazy-loads everything
+// else) is worth the small deviation: the alternative was a second, independently-typed
+// copy of 'missing_brand_logo' in this file, which a future rename of the real constant
+// would silently desync from — classification would revert to the generic fallback with
+// every test still green, since the test would need the same independent literal too.
+import { MISSING_BRAND_LOGO_ERROR } from '../services/agentMode/brandLogo';
+
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolBudgetExceededError: 'repeated_failure',
   AgentToolPolicyBlockedError: 'policy_blocked',
@@ -320,15 +328,17 @@ export function classifyToolErrorClass(error: unknown): string {
       return 'rate_limit';
     }
 
-    // ENG-1844: the landing-page generate/duplicate routes' brand-logo gate
-    // (services/agentMode/brandLogo.ts's MISSING_BRAND_LOGO_ERROR = 'missing_brand_logo',
-    // inlined here rather than imported to keep this module import-free) reaches this
-    // point via httpClient.ts's self-call Error, which preserves the route's `error`
-    // code on `.code` specifically so it can be matched here instead of the human
-    // `message` text — that message embeds "(422)" with no preceding whitespace, which
-    // the embedded-status regex below does not match, so this was previously falling
-    // through to the generic unclassified 'Error' bucket and reporting as an outage.
-    if (stringCodeProp === 'missing_brand_logo') {
+    // ENG-1844: the landing-page generate/duplicate routes' brand-logo gate reaches this
+    // point via httpClient.ts's self-call Error, which preserves the route's `error` code
+    // on `.code` specifically so it can be matched here instead of the human `message`
+    // text — that message embeds "(422)" with no preceding whitespace, which the
+    // embedded-status regex below does not match, so this was previously falling through
+    // to the generic unclassified 'Error' bucket and reporting as an outage. Matched
+    // against the imported constant (the INPUT marker), not a second independent
+    // literal — the returned class name below stays its own literal on purpose: this
+    // taxonomy is a stable, independently-owned namespace (see file docblock), and
+    // renaming the trigger's source constant must not silently rename the class too.
+    if (stringCodeProp === MISSING_BRAND_LOGO_ERROR) {
       return 'missing_brand_logo';
     }
 
