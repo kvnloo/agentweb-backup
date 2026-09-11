@@ -21,6 +21,8 @@ import { meteredV0 } from "./v0Metering";
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
+import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+export { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -5435,10 +5437,17 @@ async function assignManagedSubdomain(
 export async function getDeploymentStatus(
   id: string,
   userId: string
-): Promise<{ status: string; buildStatus?: string; buildError?: string; deployedUrl?: string }> {
+): Promise<{
+  status: string;
+  buildStatus?: string;
+  buildError?: string;
+  deployedUrl?: string;
+  launchReadiness: { ready: boolean; reasons: string[] };
+}> {
   const record = await getLandingPage(id, userId);
   if (!record) throw new Error("Landing page not found");
-  if (!record.vercelProjectId) return { status: record.status };
+  const launchReadiness = getLandingPageLaunchReadiness(record);
+  if (!record.vercelProjectId) return { status: record.status, launchReadiness };
 
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}` };
@@ -5449,13 +5458,13 @@ export async function getDeploymentStatus(
   );
 
   const deployment = deploymentsRes.data?.deployments?.[0];
-  if (!deployment) return { status: record.status, buildStatus: "no_deployment" };
+  if (!deployment) return { status: record.status, buildStatus: "no_deployment", launchReadiness };
 
   const state = deployment.readyState || deployment.state;
 
   if (state === "ERROR" || state === "CANCELED") {
     const buildError = await getVercelBuildErrors(deployment.uid, vercelToken);
-    return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl };
+    return { status: record.status, buildStatus: "error", buildError, deployedUrl: record.deployedUrl, launchReadiness };
   }
 
   // Auto-heal: if Vercel shows the project is READY but our record says
@@ -5494,6 +5503,7 @@ export async function getDeploymentStatus(
         status: "deployed",
         buildStatus: "success",
         deployedUrl: record.deployedUrl,
+        launchReadiness,
       };
     }
     // Project is READY but this page's route is not live — do not heal.
@@ -5501,6 +5511,7 @@ export async function getDeploymentStatus(
       status: record.status,
       buildStatus: "route_not_live",
       deployedUrl: record.deployedUrl,
+      launchReadiness,
     };
   }
 
@@ -5508,6 +5519,7 @@ export async function getDeploymentStatus(
     status: record.status,
     buildStatus: state === "READY" ? "success" : state.toLowerCase(),
     deployedUrl: record.deployedUrl,
+    launchReadiness,
   };
 }
 
