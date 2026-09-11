@@ -35,7 +35,13 @@ Cloud API (#2271), ngrok revival of `local-agent-relay`, porting HyperFrames
 or MoneyPrinterTurbo into Remotion, listing `generate_video` on MCP before
 Q-014.
 
-## If we only do one thing
+## Architecture research (parallel)
+
+Nanoservice mesh of Emma: **no**. Modular monolith + existing four
+deploy units: **yes**. Map: `research/sdlc/THESIS.md`. SDLC first
+slices after unlock (not instead of Q-014): A-002, A-005.
+
+## If we only do one product thing
 
 **Q-014.** OAuth already exists; without listing `generate_image`, Hermes
 cannot participate in the creative stack your other repos are about.

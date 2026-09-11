@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "updated_at": "2026-09-11T18:45:00Z",
+  "track": "architecture-sdlc",
+  "scoring": "same PROTOCOL formula; these items are not product ranks",
+  "implementation_order_when_unlocked": ["A-002", "A-005"],
+  "items": [
+    {
+      "id": "A-001",
+      "title": "Architecture thesis: modular monolith, not HTTP nanoservices",
+      "status": "ready",
+      "leverage": 5,
+      "product": 2,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 0,
+      "score": 32,
+      "why": "Cycle 17. Deploy units already exist. Emma loop must stay in-process for metering/C2PA/logo. Cutting-edge 2026 agrees.",
+      "files": [
+        "research/sdlc/THESIS.md",
+        "backend/docs/AGENTMODE_MIGRATION.md"
+      ],
+      "first_slice": "Research only. Teach-in is THESIS.md. Do not open a services/ mesh PR.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-002",
+      "title": "CI import-boundary ratchet for loops/core (then agentMode/core)",
+      "status": "ready",
+      "leverage": 3,
+      "product": 3,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 28,
+      "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts.",
+      "files": [
+        "backend/src/loops/core/ports.ts",
+        "backend/package.json"
+      ],
+      "first_slice": "When coding unlocked: a unit test or dependency-cruiser rule that loops/core/** cannot import services/, emma/, or db.ts. Then copy the rule onto agentMode/core.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-003",
+      "title": "Continue Harsha strangler; wire executeAgentStep",
+      "status": "park",
+      "leverage": 2,
+      "product": 4,
+      "mergeability": 1,
+      "evidence": 5,
+      "collision": 5,
+      "score": 16,
+      "why": "Same as Q-010. AGENTMODE_MIGRATION.md owner is Harsha/swarm. executeAgentStep still throws. Monolith grew 24k→40.5k. Kevin should not pick this up as a nanoservice rewrite.",
+      "files": [
+        "backend/src/services/agentMode/core/agentStep.ts",
+        "backend/src/services/agentModeService.ts",
+        "backend/docs/AGENTMODE_MIGRATION.md"
+      ],
+      "first_slice": "PARK. Same lane as Q-010. If Harsha asks: one seam per PR, characterization unchanged.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-004",
+      "title": "One-file-per-tool split of emma/tools.ts (Hermes shape)",
+      "status": "park",
+      "leverage": 4,
+      "product": 2,
+      "mergeability": 2,
+      "evidence": 5,
+      "collision": 5,
+      "score": 19,
+      "why": "Hermes tools/*.py self-register. emma/tools.ts is 9780 lines. Open PR #2832 edits that file. Do not split it until #2832 merges. MCP apiTools.ts can be split later without touching emma.",
+      "files": [
+        "backend/src/emma/tools.ts",
+        "backend/src/mcp/server/apiTools.ts"
+      ],
+      "first_slice": "PARK until #2832. Then mechanical move + registry import DAG test.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-005",
+      "title": "File-size + migration-scorecard ratchet in CI",
+      "status": "keep",
+      "leverage": 3,
+      "product": 3,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 2,
+      "score": 25,
+      "why": "June scorecard still says 23,895 lines; disk is 40,571. Without a ratchet, strangler is theatre. A warning on agentModeService.ts line count (fail if a PR increases it without a core/ extraction) is the SDLC analog of OMP package boundaries.",
+      "files": [
+        "backend/docs/AGENTMODE_MIGRATION.md",
+        ".github/workflows/tests.yml"
+      ],
+      "first_slice": "When coding unlocked: a script that prints agentModeService.ts LOC and fails if the PR grows it unless services/agentMode/core also grows. Update the markdown scorecard in the same PR. Collision: any live agentModeService PR (#2861, #2871, #2832).",
+      "harsha_db": false
+    },
+    {
+      "id": "A-006",
+      "title": "HTTP nanoservice per Emma tool / extract imageGeneration process",
+      "status": "discard",
+      "leverage": 1,
+      "product": 2,
+      "mergeability": 0,
+      "evidence": 5,
+      "collision": 5,
+      "score": 6,
+      "why": "Duplicates MCP. Splits meterUserUsage, C2PA, logoImage. Extra deploy unit with no ownership team. Microsoft + 2026 nanoservice writing: logical modules first; extract only for scale/isolation. Image/video are not independently scaled today.",
+      "files": [
+        "backend/src/services/imageGeneration.ts",
+        "backend/src/mcp/server/apiTools.ts"
+      ],
+      "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
+      "harsha_db": false
+    }
+  ]
+}

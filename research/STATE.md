@@ -7,23 +7,24 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 16
+cycles_completed: 17
 target_cycles: 7
-stop_after: 2026-09-11T20:15:00Z
-next_cycle: 17
-focus: collision-refresh-until-stop_after
+stop_after: 2026-09-12T06:00:00Z
+next_cycle: 18
+focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 16: DesignArena 18:30Z ranks unchanged vs cycle 8.
-  No open PR on apiTools.ts or imageGeneration.ts (#2846 and
-  #2856 are extra vs cycle 15's method list; neither hits those
-  files). Repeat the file-filter collision check. Do not rewrite
-  QUEUE.md unless a new PR hits those paths. If stop_after
-  passes, unsubscribe agentweb-research-cycle and
-  agentweb-research-briefing.
+  Cycle 17 started the architecture track (research/sdlc/).
+  Cycle 18: module map for a backend/src/AGENTS.md; can apiTools.ts
+  split without #2832; collision on agentModeService.ts PRs.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not implement A-002/A-005
+  until coding_unlocked. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
+product_queue_frozen: true
 ```
 
 ## Stop conditions
 
 Timer may stop when now > `stop_after`. Do not unset `briefing_ready`.
 Do not set `coding_unlocked` unless Kevin asks to code.
+Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.

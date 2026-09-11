@@ -54,4 +54,11 @@ Mapping: `mappings/designarena-image-models.md`,
 `mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy),
 `mappings/eval-output-summary.md` (Q-002 parser, not a live router).
 
-The loop may keep refining until `stop_after` (20:15 UTC).
+The loop may keep refining until `stop_after` (see `STATE.md`;
+extended 2026-09-11 for the architecture/SDLC track).
+
+## Architecture / SDLC track
+
+Kevin asked to research nanoservice splits vs Hermes / Oh My Pi.
+Read `sdlc/THESIS.md` then `sdlc/COMPARISON.md`. Product READY items
+are unchanged. HTTP-per-tool is discarded (A-006).

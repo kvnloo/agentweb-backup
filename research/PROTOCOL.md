@@ -90,8 +90,16 @@ solved another way, **do not port it**. Either:
 - operator path (Hermes → Emma MCP), or
 - DISCARD (Kerdoios vs usage-runway: AgentWeb already meters and recommends cheaper models).
 
+## Parallel track (from 2026-09-11T18:45Z)
+
+Kevin asked for continuous research on **nanoservices / agentic SDLC**.
+That work lives in `research/sdlc/` and must not rewrite product ranks
+or un-ready Q-001 / Q-014 / Q-003. A-006 (HTTP-per-tool) is discard —
+same family as Q-013.
+
 ## Cycle quality bar
 
 A cycle that only restates `QUEUE.md` is a failed cycle. Each cycle must add
 at least one of: a file-level citation, a DISCARD, a rank change, a new item,
-or a parked item unblocked.
+or a parked item unblocked. Architecture-track cycles write `research/sdlc/`
+and `cycles/NNN-*.md`.

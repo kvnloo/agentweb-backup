@@ -189,3 +189,18 @@ strangler, ENG-381 until Harsha says it's yours.
 
 Customer-portal code is **not in this clone**. Anything you want to see in
 the app UI needs the other repo.
+
+## 11. Nanoservices vs modular monolith (cycle 17)
+
+You asked whether to break this repo into nanoservices. **Deploy-layer
+split already exists** (backend EB, partner-portal EB, agent-engine VM,
+remotion-lambda). The 40.5k-line loop is an *in-process* problem.
+
+Cutting-edge agentic SDLC (Hermes, Oh My Pi, Microsoft modular-monolith
+guidance) is: **packages + ports in one process**, MCP as the *external*
+bus, extract a fifth process only for scale or isolation. A HTTP
+nanoservice per Emma tool would split billing/C2PA/logo and fight MCP.
+
+In-tree gold standard: `backend/src/loops/core` (ports, zero host
+imports). Incomplete strangler: `agentMode/core` (`executeAgentStep`
+still throws). Full map: `research/sdlc/THESIS.md`.

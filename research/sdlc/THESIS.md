@@ -1,0 +1,81 @@
+# Thesis: nanoservices for AgentWeb
+
+## One sentence
+
+Do **not** explode Emma into a mesh of HTTP nanoservices. AgentWeb is
+already a **multi-runtime system** with a **god-object backend**. The
+cutting-edge move for *agentic* development is a **modular monolith**
+(Hermes / OMP shape): in-process packages with ports, one tool per file,
+a typed loop, and extract-to-network only where a deploy unit already
+exists.
+
+Q-013 (rewrite `agentModeService.ts`) stays **discard**. Network-splitting
+the chat loop is the same idea with more latency and a billing footgun.
+
+## What “nanoservice” should mean here
+
+| Layer | Meaning | AgentWeb today |
+|---|---|---|
+| **Logical** | One operation, one contract, one test surface | Partial: `loops/core` ports, `agentMode/core/*` seams, MCP tool handlers |
+| **Package** | Import boundary an agent can hold in context | Missing: one `backend/` npm package, no dependency-cruiser |
+| **Process / deploy** | Independently shipped runtime | Already: backend EB, partner-portal EB, agent-engine GCP, remotion-lambda |
+
+2026 writing that uses “nanoservice” (e.g. telemetryagent.dev) is
+explicit that this is **first a logical architecture**, compatible with
+a modular monolith. Microsoft’s multi-agent reference architecture
+recommends the same: start modular-monolith, extract when scale or
+ownership forces it.
+
+A 60-tool HTTP mesh would recreate MCP poorly: `apiTools.ts` already
+wraps `/api/emma/*`. Extra hops do not make `generate_image` safer;
+metering, C2PA, and logo rules live in-process on purpose.
+
+## What already exists (do not rebuild)
+
+1. **Strangler, chosen 2026-06-14** — `backend/docs/AGENTMODE_MIGRATION.md`.
+   Target loop: `model → parse → typed registry → terminate`. Seams 1
+   (termination) and 3/dispatch (`core/toolDispatch.ts`) extracted.
+   `executeAgentStep` is still a skeleton that throws.
+2. **`loops/core`** — claims **zero imports from the host**; all AWS/Slack
+   via `ports.ts`. This is the in-repo gold standard. CI does **not**
+   enforce it.
+3. **MCP** — the external composition bus (Hermes, Cursor, Claude).
+4. **Coding agent** — already a sub-agent process in `codingAgentService.ts`,
+   not a new deploy.
+
+## Cutting-edge vs this tree
+
+| Strategy | Hermes | Oh My Pi | AgentWeb |
+|---|---|---|---|
+| One process for the agent loop | Yes | Yes (`pi-agent-core` package) | Yes, but 40.5k-line file |
+| Package / folder graph | `agent/`, `tools/`, `gateway/`, plugins | bun workspaces: `pi-agent-core`, `pi-ai`, `pi-catalog`, … | Three *repos-in-folder* (backend / partner / engine) + one backend blob |
+| One file per tool | `tools/*.py` self-register | 31 tools, split packages | `emma/tools.ts` 9.8k lines; `apiTools.ts` 3.6k |
+| Typed tool registry | `tools/registry.py` | package `agent` | Interface in `core/types.ts`; monolith still implements it |
+| Characterization / eval | ~25k pytest files claimed | edit benchmarks, metaharness | Characterization harness exists; god file still grows (24k → **40.5k** since Jun) |
+| Boundary linter | import chain documented | workspace packages | **None** |
+| Network extract | MCP *clients* to other servers | browser-relay, collab-web as packages | MCP *server*; don’t invert it |
+
+## SDLC to get there (when coding is unlocked)
+
+Order is process, not a rewrite:
+
+1. **Ratchet, don’t rewrite.** New code in `agentMode/core/` or sibling
+   modules; net-negative-or-flat `agentModeService.ts` on loop PRs
+   (already the migration rule). Monolith grew +16k lines since the
+   June baseline — the ratchet is not running.
+2. **Enforce the one good boundary.** CI check: `loops/core` must not
+   import host services (A-002). Then the same rule for `agentMode/core`.
+3. **One-tool-per-file** only on files we already own for MCP hygiene
+   (`apiTools.ts`), never `emma/tools.ts` while #2832 is open (A-004).
+4. **Keep deploy units at four.** A fifth service for images/video would
+   split `meterUserUsage` / C2PA / `logoImage` — forbidden invariants.
+5. **Agent context map.** A short `backend/src/AGENTS.md` (module
+   index, max file size, “do not edit X”) beats another 40k-line CLAUDE
+   dump. LinkedIn’s 2026 MCP playbook is curated context, not every tool.
+
+## Harsha gates
+
+- Dynamo / `db.ts` (11.7k) is not a nanoservice candidate.
+- Billing meter stays one success-path.
+- Strangler PRs are his lane (Q-010 / A-003). Kevin’s unique help is
+  still Hermes operator + MCP listing, plus *researching* this map.

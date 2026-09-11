@@ -65,3 +65,10 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
    in the same `tools/list`.
 
 None of these needs a database change.
+
+## Architecture / SDLC (parallel; not product ranks)
+
+Kevin asked to research breaking the repo into nanoservices and
+comparing Hermes / Oh My Pi. **Do not HTTP-split Emma.** See
+`sdlc/THESIS.md`. Track queue: `sdlc/QUEUE.md`. First SDLC coding
+(after unlock, not instead of Q-014): A-002 then A-005.
