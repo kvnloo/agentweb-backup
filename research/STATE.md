@@ -7,17 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 134
+cycles_completed: 135
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 135
+next_cycle: 136
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 134: a tests.yml PR schedules six jobs; merge-evidence
-  requires Backend build only. Cycle 135: cheapest remaining.
-  Candidate: agent-engine is a deploy unit with no GitHub build
-  job — NON_BACKEND PASSes agent-engine/web_agent.py. Remotion
-  got ENG-1377; the Python worker did not.
+  Cycle 135: agent-engine is a deploy unit with no GitHub build
+  job. Cycle 136: cheapest remaining. Candidate: customer-portal
+  in this tree is NON_BACKEND and a separate GitHub repo — fifth
+  repo, not a fifth process on this box.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

@@ -551,6 +551,11 @@ merge-evidence requires `Backend build` only.** `tests.yml`
 is in backend / workflows / relay / remotion / ebconfig
 filters. Cancelled relay is the same cancelled PASS as ENG-836.
 
+Cycle 135: **agent-engine is a deploy unit with no GitHub
+build job.** Grep of `.github/workflows/` is empty. Test L1199
+PASSes `agent-engine/web_agent.py` as `NON_BACKEND`. Remotion
+got ENG-1377; the Python worker did not.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

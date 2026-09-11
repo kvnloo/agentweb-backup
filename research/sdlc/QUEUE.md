@@ -224,6 +224,8 @@ Cycle 133: ENG-1377 relay and remotion builds are unnamed in
 merge-evidence. Product READY unchanged.
 Cycle 134: a `tests.yml` PR schedules six jobs; merge-evidence
 requires `Backend build` only. Product READY unchanged.
+Cycle 135: agent-engine is a deploy unit with no GitHub build
+job. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
