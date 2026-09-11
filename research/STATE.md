@@ -7,17 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 85
+cycles_completed: 86
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 86
+next_cycle: 87
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 85: default image is $0.134; gpt-image-2 is $0.04;
-  cost caps are Dynamo. Cycle 86: cheapest remaining. Candidate:
-  generate-video is the same metered emmaApi face (Q-016 parked).
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 86: generate_video is the same $ / 0-token meter; MCP
+  does not list it (Q-016 parked). Cycle 87: cheapest remaining.
+  Candidate: AgentWebPro collision refresh on apiTools.ts /
+  loops/core. Do not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

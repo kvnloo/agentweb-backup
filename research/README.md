@@ -207,6 +207,9 @@ Cycle 85: omitting MCP `image_model` hits leaf default
 `gemini-3-pro-image-preview` at **$0.134**. `gpt-image-2` is
 $0.04 (Q-003). Cost caps are Dynamo; in-repo Free fallback is
 unlimited. Do not HTTP-split the price book.
+Cycle 86: `generate_video` uses the same `$` / 0-token meter
+(`videoGeneration.ts` L1098–1106) and is **not** on MCP. Q-016
+is list-like-Q-014 at 12–39× image price. Do not delay Q-014.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

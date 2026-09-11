@@ -89,7 +89,9 @@ is one transport per in-flight request). Cycle 84:
 `checkExtraCostUsage` is tests-only; images do not write
 `extraCostUsage` (CRM enrichment does). Cycle 85: default
 image is $0.134 (`gemini-3-pro-image-preview`); `gpt-image-2`
-is $0.04; cost caps are Dynamo not git. Product READY unchanged.
+is $0.04; cost caps are Dynamo not git. Cycle 86: `generate_video` is the same
+`$` / 0-token meter; MCP does not list it. Q-016 stays parked.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

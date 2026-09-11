@@ -269,6 +269,13 @@ optional (`apiTools.ts` L2090). Unset → Dynamo
 unlimited. A fifth process copies the book or bills $0
 (`isPerGenerationPriced`).
 
+Cycle 86: **video is the same meter, not on MCP.**
+`videoGeneration.ts` L1098–1106 is `void meterUserUsage` with 0
+tokens + `costUsdOverride`. `POST /generate-video` is already
+`metered` (`emmaTokenBudget.ts` L59). `backend/src/mcp/` has
+zero `generate_video`. Q-016 is list-like-Q-014 at 12–39× image
+price. Do not HTTP-split; do not delay Q-014.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

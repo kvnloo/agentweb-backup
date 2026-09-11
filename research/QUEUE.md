@@ -142,4 +142,6 @@ Cycle 84: `checkExtraCostUsage` is tests-only; images do not
 write `extraCostUsage`. A-006 stays discarded.
 Cycle 85: default image is $0.134; Q-003 is $0.04. Cost caps are
 Dynamo. A-006 stays discarded.
+Cycle 86: `generate_video` is not on MCP; same meter as images
+at 12–39×. Q-016 stays parked. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

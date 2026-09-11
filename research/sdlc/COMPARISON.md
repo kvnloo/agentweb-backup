@@ -200,3 +200,5 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 85: default image is $0.134 in `llmPricing.ts`; Hermes
   omitting `image_model` hits that. OMP keeps prices in `pi-ai`.
   Do not HTTP-split the book. Q-003 is the cheaper-model mapper.
+- Cycle 86: video is the same meter, Emma-catalog only. MCP grep
+  empty. Do not HTTP-split video to “prepare” Q-016.
