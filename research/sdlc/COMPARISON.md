@@ -95,3 +95,6 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
   `generate_image` (MCP `internal`, chatbot `images` page, Agent Mode
   skills — not foundation). Q-014 lists MCP; A-014 parks copying the
   other catalogs.
+- Cycle 48–49: AgentWeb `ListTools` has no skill gate. Lazy auth
+  (ENG-984) may list to strangers; `ANONYMOUS_TOOLS` is empty so they
+  cannot run. Hermes OAuth (Q-001) is still the execute path.

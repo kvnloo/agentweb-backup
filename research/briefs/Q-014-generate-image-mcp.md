@@ -50,6 +50,12 @@ no skill install step — Q-014 is `tools/list` for an authenticated MCP
 session. Do not add the name to `DEFAULT_FOUNDATION_TOOLS` (#2861 is
 that move for `convert_to_pdf`). Do not edit `chatbotService.ts` (#1076).
 
+Cycle 49: do **not** add `generate_image` to `ANONYMOUS_TOOLS`
+(`anonymousTransport.ts` L48–58). When `MCP_ANONYMOUS_DISCOVERY=true`,
+anonymous `tools/list` will already include the listed tool; execute
+is blocked at the transport. Authenticated Hermes (Q-001) still
+meters `POST /api/emma/generate-image`.
+
 Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
 The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
 or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as

@@ -18,7 +18,7 @@ Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
 
 | Order | ID | Do this | Do not |
 |---|---|---|---|
-| 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. **In flight: [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).** MCP `ListTools` is `getToolDefinitions()` with no skill gate (`mcpServerCore.ts` L76–83). | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. |
+| 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. **In flight: [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).** MCP `ListTools` is `getToolDefinitions()` with no skill gate (`mcpServerCore.ts` L76–83). | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. Add to `ANONYMOUS_TOOLS` (A-015). |
 | 1b | **Q-004** | Same PR or before: `internal` + `internalOnly` on MCP `post_on_account` only | Edit `emma/tools.ts` (#2832). Unlist `manage_*` (ENG-983). |
 | 2 | **Q-001** | Kevin OAuth smoke on `HERMES_MCP_OAUTH.md` (315s PTY). Parent already refreshes OAuth (`server.ts` L586). | Rewrite the in-repo runbook unless smoke finds a lie. |
 | 3 | **Q-003** | Fail-open DesignArena → `SUPPORTED_MODELS`. Live: `gpt-image-2` image **#3 / $0.04**, logo **#1**. Hardcoded default `gemini-3-pro-image-preview` is image **#22 / $0.134**, logo **#40**. | Flip prod default without Matt. Add Riverflow / `gpt-image-2.5` in the first slice. |
@@ -69,6 +69,11 @@ process. Oh My Pi stays in-process packages (`pi-ai` ↛ `pi-agent-core`).
 MCP schema is thinner (no `confirm`). Quota is per-face, not in
 `generateImage`. Do not HTTP-split this method — both OS processes would
 become clients of a fifth hop.
+
+When `MCP_ANONYMOUS_DISCOVERY=true` (default **off**), anonymous
+`tools/list` will include listed `generate_image`. `ANONYMOUS_TOOLS`
+is empty — look but not run (`anonymousTransport.ts`). Do not add
+`generate_image` to that set (A-015).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

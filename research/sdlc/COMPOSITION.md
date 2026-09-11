@@ -199,6 +199,15 @@ Q-014’s `internal` drop is therefore the whole MCP catalog change.
 Fork [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2) owns that
 flag; do not open a second listing PR.
 
+Cycle 49: **anonymous may list, cannot run.** When
+`MCP_ANONYMOUS_DISCOVERY=true` (`anonymousTransport.ts` L30–34, default
+OFF), `tools/list` is in `ANONYMOUS_METHODS` (L41–46).
+`ANONYMOUS_TOOLS` is an **empty Set** (L48–58) — Harsha 2026-08-08,
+demo tool not shipped. `mcpServer.ts` L61–65 wires that before any
+handler. `generate_image` has no `requiresUserAccount` in `apiTools.ts`;
+ENG-822 is not the spend door. Do not add the name to `ANONYMOUS_TOOLS`
+(A-015). A fifth HTTP image process would need a copy of this allowlist.
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:14:00Z",
+  "updated_at": "2026-09-11T20:17:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -239,6 +239,26 @@
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "PARK. Q-014 stays drop internal L2077 + test L91. Do not add generate_image to DEFAULT_FOUNDATION_TOOLS. Do not copy pageToolMap onto MCP. Do not edit chatbotService.ts (#1076).",
+      "harsha_db": false
+    },
+    {
+      "id": "A-015",
+      "title": "Do not add generate_image to ANONYMOUS_TOOLS (ENG-984 demo tool)",
+      "status": "park",
+      "leverage": 2,
+      "product": 4,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 31,
+      "why": "Cycle 49. anonymousTransport.ts: tools/list is anonymously permitted when MCP_ANONYMOUS_DISCOVERY=true (default OFF). ANONYMOUS_TOOLS is an empty Set — look but not run. generate_image has no requiresUserAccount in apiTools.ts; the transport allowlist is the spend door (comment L16–25 cites ENG-973). Q-014 listing will advertise the tool to anonymous tools/list when the flag is on; execute still 401s. Do not make generate_image the unshipped demo tool.",
+      "files": [
+        "backend/src/mcp/server/anonymousTransport.ts",
+        "backend/src/mcp/server/mcpServer.ts",
+        "backend/src/mcp/server/apiTools.ts",
+        "research/sdlc/COMPOSITION.md"
+      ],
+      "first_slice": "PARK. Q-014 does not touch ANONYMOUS_TOOLS or MCP_ANONYMOUS_DISCOVERY. Do not add requiresUserAccount as a substitute. Authenticated execute stays metered on /api/emma/generate-image.",
       "harsha_db": false
     },
     {

@@ -278,6 +278,9 @@ onto Hermes `tools/list`. A-006 discarded.
 Cycle 48: `ListTools` is `getToolDefinitions()` with no skill gate
 (`mcpServerCore.ts` L76–83). Fork #2 / #3 in flight. A-007 waits on #2.
 A-006 discarded.
+Cycle 49: anonymous `tools/list` (flag default off) can see Q-014’s
+tool; `ANONYMOUS_TOOLS` is empty so they cannot run it. A-015 parked.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

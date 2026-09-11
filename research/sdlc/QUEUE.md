@@ -16,6 +16,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
+| — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
@@ -27,11 +28,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 48: MCP `ListTools` is `getToolDefinitions()` with **no skill
-gate** (`mcpServerCore.ts` L7–8 / L76–83). Q-014’s flag **is** Hermes
-`tools/list`. Fork PRs #2 (Q-014+Q-004) and #3 (A-002) are in flight;
-do not start A-007 until #2 merges. A-006 stays discard. Product READY
-unchanged.
+Cycle 49: when `MCP_ANONYMOUS_DISCOVERY=true`, anonymous `tools/list`
+includes Q-014’s listed `generate_image`; `ANONYMOUS_TOOLS` is **empty**
+so they cannot run it (`anonymousTransport.ts` L41–58). A-015 parked.
+A-007 waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
