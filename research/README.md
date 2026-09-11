@@ -423,6 +423,10 @@ Cycle 137: **the other repo’s IA is a typed list in this
 backend.** `customerPortalPages.ts` L28–124;
 `GET /customer-portal-pages` (`subscription.ts` L322–325).
 Policy is the constant; HTTP is the other origin. Not A-006.
+Cycle 138: **`growth-chat/` is a sixth origin; `callLLM` stays
+here.** Gitignored L122; Actions grep empty. README L2214
+points at `growth-genius-chat`. `growthGeniusService.ts` L1 /
+L85 imports `agentModeService.callLLM`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

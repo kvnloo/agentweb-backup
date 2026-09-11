@@ -566,6 +566,11 @@ backend.** `customerPortalPages.ts` L28–124;
 `GET /customer-portal-pages` (`subscription.ts` L322–325).
 Policy is the constant; HTTP is the other origin. Not A-006.
 
+Cycle 138: **`growth-chat/` is a sixth origin; `callLLM` stays
+here.** Gitignored L122; Actions grep empty.
+`growthGeniusService.ts` L1 / L85 → `agentModeService.callLLM`.
+A-006 would cut the gateway this product already shares.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

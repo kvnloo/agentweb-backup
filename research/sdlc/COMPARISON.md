@@ -336,3 +336,5 @@ reverted. Do not copy that as A-006.
   a fifth process. Not A-006.
 - Cycle 137: other repo IA is a typed list in this backend
   (customerPortalPages.ts), one GET. Not A-006.
+- Cycle 138: growth-chat is a sixth origin; callLLM stays in
+  this process. Not A-006.

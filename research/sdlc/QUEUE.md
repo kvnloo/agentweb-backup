@@ -230,6 +230,8 @@ Cycle 136: customer-portal is a fifth repo (gitignored), not a
 fifth process. Product READY unchanged.
 Cycle 137: the other repo’s IA is a typed list in this backend,
 not an HTTP nanoservice. Product READY unchanged.
+Cycle 138: `growth-chat/` is a sixth origin; the loop already
+shares `callLLM` in this process. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

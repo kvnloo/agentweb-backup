@@ -500,6 +500,8 @@ Cycle 136: customer-portal is a fifth repo (gitignored), not a
 fifth process. A-006 discarded.
 Cycle 137: the other repo’s IA is a typed list in this backend,
 not an HTTP nanoservice. A-006 discarded.
+Cycle 138: `growth-chat/` is a sixth origin; the loop already
+shares `callLLM` in this process. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

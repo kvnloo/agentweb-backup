@@ -231,6 +231,9 @@ fifth process. CLAUDE.md L155 is stale. Do not add A-021.
 Cycle 137: `customerPortalPages.ts` is the other repo’s IA as
 an in-process list plus one GET. Not a fifth `listen()`. Do not
 add A-021.
+Cycle 138: `growth-chat/` is a sixth origin; Growth Genius
+already calls `agentModeService.callLLM` (L85). Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
