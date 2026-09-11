@@ -498,6 +498,11 @@ filter skips do not block PASS. `BACKEND_JOBS` is only
 `Backend build` (script L160). Conflict job `if: ebconfig`
 (`tests.yml` L246) cannot be the discriminator (script L74–76).
 
+Cycle 125: **5-minute string is the #2491 receipt.** Live
+ceiling is 12 (`tests.yml` L248). `bad` excludes `cancelled`
+(script L596). Test L860–877: hung conflict job is PASS.
+`fetch-depth: 0` (L255) vs detect-changes `fetch-depth: 1` (L34).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

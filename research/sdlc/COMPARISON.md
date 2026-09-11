@@ -310,3 +310,5 @@ reverted. Do not copy that as A-006.
   `gh pr checks` can still look green. Not A-006.
 - Cycle 124: ENG-836 skip is not draft. Discriminator has no path
   filter. Conflict job is not `BACKEND_JOBS`. Not A-006.
+- Cycle 125: 5-minute comment is #2491; live ceiling is 12. Hung
+  ENG-836 still PASSes merge-evidence. Not A-006.

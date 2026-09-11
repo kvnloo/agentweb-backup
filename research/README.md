@@ -368,6 +368,9 @@ Cycle 124: **ENG-836 skip is not draft.** Discriminator is
 `Detect changed projects` with no path filter (test L1426–1433).
 `BACKEND_JOBS` is only `Backend build` (script L160). Conflict
 job timeout/cancel is outside the evidence set (L586–591).
+Cycle 125: **5-minute string is the #2491 receipt.** Live
+`timeout-minutes: 12` (`tests.yml` L248). Hung ENG-836 is
+`cancelled` (test L860–877 PASS). Failure still blocks.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

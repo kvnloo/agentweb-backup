@@ -202,6 +202,8 @@ Cycle 123: re-draft is `NO_EVIDENCE` (`merge-evidence.sh` L264).
 Product READY unchanged.
 Cycle 124: ENG-836 skip is not draft; conflict job is not the
 discriminator. Product READY unchanged.
+Cycle 125: hung ENG-836 still does not block merge; live ceiling
+is 12. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
