@@ -195,7 +195,11 @@ describe('runRenewalIntegrationHealthCheck', () => {
     // ENG-1270 AC3 named both ThinkingAI and TransAmerica as required regression
     // fixtures; only TransAmerica ever got one. ThinkingAI's real pre-fix state
     // (per the issue's own description): paid-ads customer, no Meta ad account
-    // connected, ~6 days from renewal.
+    // connected, ~6 days from renewal. This shape is deliberately the same as
+    // the generic "flags a paid-ads customer with no ad account connected" test
+    // above — the point of a named fixture isn't new code coverage, it's that
+    // ThinkingAI's specific real incident stays protected by name even if that
+    // generic test is ever weakened or removed.
     it('flags the ThinkingAI-shaped account: paid-ads intent, no ad account connected, ~6 days from renewal', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
         user({
