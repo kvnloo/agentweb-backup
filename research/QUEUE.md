@@ -173,4 +173,7 @@ Wrap CallTool after #2 must copy worker `draining`. A-006 stays
 discarded.
 Cycle 99: `chatbotTurn` already extends that live drain (`server.ts`
 L301, no `isCronEnabled`). A-006 stays discarded.
+Cycle 100: Slack/email ack HTTP then `track()`. Park A-019 (one
+`track()` gate). Do not edit `slack.ts` (#2393). A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

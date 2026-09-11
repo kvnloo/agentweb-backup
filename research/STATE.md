@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 99
+cycles_completed: 100
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 100
+next_cycle: 101
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 99: chatbotTurn already extends live drain. Cycle 100:
-  cheapest remaining. Candidate: slackAgentTurn /
-  emmaEmailAgentTurn unguarded track(). Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 100: Slack/email ack HTTP then track(); parked A-019.
+  Cycle 101: cheapest remaining. Candidate: verifiedGenerateTurn
+  / tryClaim on HTTP /generate during drain. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
+  passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

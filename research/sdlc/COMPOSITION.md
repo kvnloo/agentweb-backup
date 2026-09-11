@@ -357,6 +357,12 @@ L286–301 tracks Socket.IO `'message'` with no `isCronEnabled`.
 the four-way wait. `/socket.io/` is 3600s. New Emma turns during
 drain keep `inFlight.size` > 0.
 
+Cycle 100: **Slack/email ack HTTP, then `track()`.** Slack events
+L468 `res.status(200)` then `slackAgentTurn` L249. Resend
+`webhooks.ts` L348 `void` then `emmaEmailAgentTurn` L291.
+`server.close` does not abort after-ack work. Park A-019: one
+`draining` flag on `track()`. Do not edit `slack.ts` (#2393).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

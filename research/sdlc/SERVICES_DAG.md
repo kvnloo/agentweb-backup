@@ -120,6 +120,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 97: drain 503s scheduled chats; /health and /mcp stay open.
   Cycle 98: drain() is live; track() has no gate (worker does).
   Cycle 99: chatbotTurn already extends live drain (wrap preview).
+  Cycle 100: Slack/email ack-then-track; park A-019 (registry gate).
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

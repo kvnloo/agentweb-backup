@@ -426,6 +426,8 @@ Cycle 98: `cronJobRegistry.drain()` is live; `track()` has no
 gate. Worker already refuses new work. A-006 discarded.
 Cycle 99: `chatbotTurn` already extends live drain; wrap preview
 is in-app Emma, not a fifth `listen()`. A-006 discarded.
+Cycle 100: Slack/email ack-then-track. Park A-019 (registry
+gate). Do not edit `slack.ts` (#2393). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -23,6 +23,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
 | — | A-018 | 28 | park | Copy isInternal skip onto DB MCP load path (not a fifth listen) |
+| — | A-019 | 27 | park | Refuse new `track()` while draining (copy worker.draining) |
 | — | A-017 | 19 | park | Stop CRM/worker importing `server.ts`; expand sessionSockets emit |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
@@ -124,6 +125,10 @@ pair. Product READY unchanged.
 Cycle 99: `chatbotTurn` already `track()`s Socket.IO `'message'`
 (`server.ts` L301) with no `isCronEnabled`. `io.close` is after
 the wait. Product READY unchanged.
+Cycle 100: Slack/email ack HTTP 200 then `track()` (`slack.ts`
+L468 then L249; `webhooks.ts` L348 then `emmaEmailAgentTurn`
+L291). Park A-019: one gate on the registry, not `slack.ts`
+(#2393). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

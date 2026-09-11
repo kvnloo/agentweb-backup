@@ -34,7 +34,7 @@ None of the first slices needs a Dynamo table.
 | 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
 
-**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`).
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`). **A-019** — refuse new `track()` while draining (copy worker `draining`; do not edit `slack.ts`).
 
 ---
 
@@ -260,6 +260,10 @@ Cycle 99: that wrap already exists for Emma chat.
 `cronJobRegistry.track('chatbotTurn', …)` (`server.ts` L301) has
 no `isCronEnabled`. `io.close` is after the four-way wait.
 `/socket.io/` is 3600s. Do not HTTP-split to get a draining flag.
+Cycle 100: Slack and Resend **ack HTTP 200** then `track()`
+(`slack.ts` L468 then L249; `webhooks.ts` L348 then
+`emmaEmailAgentTurn`). Park **A-019**: refuse new `track()` while
+draining. Do not edit `slack.ts` (#2393). Do not HTTP-split Slack.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
