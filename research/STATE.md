@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 51
+cycles_completed: 52
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 52
+next_cycle: 53
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 51: requireEmmaTokenBudget allow-lists anon_* ($2 vs
-  ChatSessions, not MCP). _svc JWTs skip getUserById. Leaf meter
-  is void / no_user. lookupUser remains the MCP-hop spend door.
-  Cycle 52: collision refresh. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  Cycle 52: AgentWebPro still empty on apiTools/httpClient/
+  anonymousTransport/emmaApi/tokenUsage/imageGeneration/loops/core.
+  Fork #2/#3 still own Q-014 and A-002. Cycle 53: cheapest remaining
+  mapping (not another QUEUE restatement). Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

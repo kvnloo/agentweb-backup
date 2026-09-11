@@ -102,7 +102,9 @@ and **no** `dependency-cruiser`.
 `agentModeService.ts` pile: **#2871 #2861 #2832 #2563 #2060 #1584 #1076**.
 Slack: **#2393**. Never #2862 / #2271 / #2861. `#1076` also touches
 `chatbotService.ts`. `#2861` is promoting `convert_to_pdf` to foundation
-— do not piggyback `generate_image`.
+— do not piggyback `generate_image`. Cycle 52: AgentWebPro still empty on
+`apiTools.ts` / `httpClient.ts` / `imageGeneration.ts` / `loops/core`
+(this fork #2 / #3 own those). #2875 (renewal-health) is unrelated.
 
 ---
 
