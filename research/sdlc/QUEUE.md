@@ -110,6 +110,9 @@ only client `DELETE /mcp` evicts ENG-114. Product READY unchanged.
 Cycle 95: this tree never sets `MCP_SESSION_STORE`; factory
 default is memory. Dynamo rehydrate is opt-in, not git-proven live.
 Product READY unchanged.
+Cycle 96: Immutable + weekly refresh already overlap two instances
+(`rolling.config` L3, `asgLifecycleGuard.ts` L4–9). `socialPosts.ts`
+MinSize=MaxSize=1 is not in `.ebextensions`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

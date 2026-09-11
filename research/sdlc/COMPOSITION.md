@@ -333,6 +333,11 @@ Factory default is memory (`mcpSessionStore.ts` L205–210).
 `AW-MCPSessions` exists in `create-tables.ts` L1816. Do not flip
 the env from Q-014. Live AWS console unverified.
 
+Cycle 96: **immutable deploy already overlaps two instances.**
+`rolling.config` L3 Immutable; recycle L13 `InstanceRefreshEnabled`.
+Guard L4–9 is 3m19s overlap. `socialPosts.ts` L16–21 MinSize=MaxSize=1
+is not in this tree. Default memory 404s Hermes across that window.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

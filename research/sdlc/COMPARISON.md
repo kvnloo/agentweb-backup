@@ -235,3 +235,6 @@ reverted. Do not copy that as A-006.
 - Cycle 95: this tree never sets `MCP_SESSION_STORE`. Default memory.
   Dynamo rehydrate is opt-in. Do not HTTP-split to survive deploys;
   Hermes already re-inits on 404.
+- Cycle 96: Immutable + weekly refresh already overlap two instances.
+  `socialPosts.ts` MinSize=MaxSize=1 is not in `.ebextensions`.
+  A fifth `listen()` is a third process in that window.

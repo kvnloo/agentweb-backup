@@ -242,6 +242,10 @@ metadata; do not delete it on drain.
 Cycle 95: this tree never sets `MCP_SESSION_STORE` (zero hits in
 `.env.example`, `.ebextensions/`, `.github/`). Default is memory.
 Do not treat Dynamo rehydrate as a production fact from git.
+Cycle 96: `DeploymentPolicy: Immutable` and weekly instance refresh
+already overlap two backends (`asgLifecycleGuard.ts` L4–9).
+`socialPosts.ts` MinSize=MaxSize=1 is not in this tree. Hermes
+404-reinits across that window (cycle 95 memory default).
 
 ### 4. Hermes / Oh My Pi vs this tree
 
