@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:25:00Z",
+  "updated_at": "2026-09-11T19:24:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -127,14 +127,15 @@
       "evidence": 5,
       "collision": 1,
       "score": 31,
-      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 already split workflowTools.ts (5 registers). No open PR on apiTools.ts. Keep the apiTools.ts barrel (emma/tools.ts L7240). Q-014 then edits tools/infrastructure.ts (or apiTools.ts if A-007 has not landed).",
+      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template (5 mcpFetch, no services). evaluationTools.ts is the anti-template (in-process services + emma dual-register L62). No open PR on apiTools.ts. Keep the apiTools.ts barrel. Q-014 then edits tools/infrastructure.ts (or apiTools.ts if A-007 has not landed).",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/mcpServerCore.ts",
         "backend/src/mcp/server/workflowTools.ts",
+        "backend/src/mcp/server/evaluationTools.ts",
         "research/sdlc/A-007-split-map.md"
       ],
-      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Barrel via import './tools/infrastructure' in apiTools.ts only (do not also import from mcpServerCore). Leave Content/blog and install_skills in apiTools.ts (dynamic agentModeService). mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
+      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Copy workflowTools.ts (mcpFetch + exported name list), not evaluationTools.ts. Barrel via import './tools/infrastructure' in apiTools.ts only (do not also import from mcpServerCore — that pattern is for workflowTools because it is not in the apiTools barrel). Keep send_email internal+internalOnly (L2113–2115). Leave Content/blog and install_skills in apiTools.ts. mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
       "harsha_db": false
     },
     {

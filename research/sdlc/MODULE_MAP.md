@@ -59,8 +59,8 @@ README: zero host imports. **True for `services/` / `db.ts`.** Core
 |---|---|
 | `registry.ts` | Hermes `tools/registry.py` |
 | `apiTools.ts` | **85** `register()` calls, 3.6k lines, section comments already name packages |
-| `workflowTools.ts` | ENG-982 already split `emma_*` jobs out |
-| `evaluationTools.ts` | 1 tool |
+| `workflowTools.ts` | ENG-982: **5** mcpFetch tools, zero service imports. **A-007 template.** |
+| `evaluationTools.ts` | 1 tool; **direct** `evaluationStore` / `evaluationService`; dual-registers onto `emmaToolRegistry` (L62). **A-007 anti-template** (cycle 32). |
 | `mcpServerCore.ts` | side-effect `import './apiTools'` etc. Stale comment: “All 30 tools” (85+5+1) |
 
 `emma/tools.ts` L7240 side-effect-imports `apiTools` to bridge scheduled-chat

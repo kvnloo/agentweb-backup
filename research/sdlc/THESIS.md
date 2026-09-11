@@ -44,9 +44,11 @@ that self-client. Hop diagram: `COMPOSITION.md`.
    `orchestrator.ts` / `instanceRunner.ts`. CI does **not** enforce the
    host-forbid rule. Folder map: `MODULE_MAP.md`.
 3. **MCP** — the external composition bus (Hermes, Cursor, Claude).
-   ENG-982 already extracted `workflowTools.ts`. `apiTools.ts` still
-   has 85 registers; splitting along its section headers is the
-   Hermes `tools/*.py` move that does **not** wait on #2832 (A-007).
+   ENG-982 already extracted `workflowTools.ts` (5 mcpFetch tools).
+   `evaluationTools.ts` is a *different* hop: in-process services + dual
+   `emmaToolRegistry` register (cycle 32). A-007 copies workflowTools,
+   not evaluationTools. `apiTools.ts` still has 85 registers; splitting
+   along its section headers does **not** wait on #2832.
 4. **Coding agent** — `codingAgentService.ts` is an **in-process**
    sub-loop (2,387 lines, no `spawn`/`fork`), not a deploy unit. It
    imports `agentModeService` for one settings read (A-010 park). OMP

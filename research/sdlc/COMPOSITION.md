@@ -98,6 +98,26 @@ herself. That skip is the in-tree rejection of A-006. Vendor MCP
 (`excludeFromAgent`, Higgsfield) stays; do not invent a fifth process for
 image gen.
 
+## Two MCP hop styles (cycle 32)
+
+`mcpServerCore.ts` L26–30 already composes **three** in-process modules
+(91 registers). They do not share a hop:
+
+```
+workflowTools.ts     ── mcpFetch ──► REST ──► services     (ENG-982; 5 tools)
+apiTools infrastructure island ── same hop ──► /api/emma/generate-image
+evaluationTools.ts   ── in-process ──► evaluationStore/Service
+                     + emmaToolRegistry.register(same handler) L62
+```
+
+A-007 `tools/infrastructure.ts` is the workflowTools hop (keep mcpFetch).
+evaluationTools is the OMP/Hermes in-process package *already used* for
+the eval sandbox. Do not reuse that hop for image gen.
+
+`registry.ts` L22–40: `internal` = hide from `tools/list`; image
+generation is named as a cost-driven example (ENG-973 meters the route).
+Q-014 is flipping L2077, not a new process.
+
 
 ## What this means
 

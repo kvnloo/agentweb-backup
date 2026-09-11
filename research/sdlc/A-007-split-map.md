@@ -1,8 +1,8 @@
 # A-007 split map (research only — do not land this PR yet)
 
 `coding_unlocked` is false. Cycle 24. Collision on `apiTools.ts`: **empty**
-through cycle 31 (20 open PRs). Cycle 31: **#2563** touches
-`sdkConstructionGuard.test.ts` (A-002 copy source), not `apiTools.ts`.
+through cycle 32 (20 open PRs; expanded filter still only #2563 on
+`sdkConstructionGuard.test.ts`).
 
 Cycle 18 listed section *line numbers*. This file names the **tools** and
 corrects the draft tree in `MODULE_MAP.md`.
@@ -16,7 +16,13 @@ the in-tree proof of a *section* extract: `workflowTools.ts` (ENG-982,
 and would fight `mcp.apiTools.test.ts` (imports the barrel, not each tool).
 
 First slice = one sibling file of mcpFetch-only tools, barrel from
-`apiTools.ts`. One-file-per-tool later, after the barrel exists.
+`apiTools.ts`. Copy **`workflowTools.ts`** (5 mcpFetch registers,
+`WORKFLOW_TOOL_NAMES` export, zero service imports). Do **not** copy
+**`evaluationTools.ts`**: that file imports `evaluationStore` /
+`evaluationPolicy` / `evaluationService` (L1–5) and dual-registers the
+same handler onto `emmaToolRegistry` (L62). That hop skips REST.
+Applying it to `generate_image` would skip `emmaApi` policy (A-006).
+One-file-per-tool later, after the barrel exists.
 
 Cycle 28: Hermes `discover_builtin_tools()` AST-scans `tools/*.py`.
 Do **not** add that in the first A-007 PR. Keep the ENG-982 explicit

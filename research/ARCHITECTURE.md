@@ -222,6 +222,8 @@ Cycle 31: **#2563** appends remnant `not.toContain` checks to
 `sdkConstructionGuard.test.ts`; A-002 copies walker L41–68 into a
 sibling file, does not append. `apiTools.ts` / `imageGeneration.ts` /
 `loops/core` still have no open PR.
+Cycle 32: A-007 copies `workflowTools.ts` (mcpFetch); do not copy
+`evaluationTools.ts` (in-process services + emma dual-register).
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

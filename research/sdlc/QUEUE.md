@@ -23,10 +23,11 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 31: **#2563** owns `sdkConstructionGuard.test.ts` (+11 remnant
-`not.toContain`). A-002 still a sibling file (walker L41–68 unchanged).
-`apiTools.ts` / `imageGeneration.ts` / `loops/core` still empty. A-006
-stays discard.
+Cycle 32: MCP already has **two hop styles**. Copy `workflowTools.ts`
+(5 mcpFetch) for A-007; do **not** copy `evaluationTools.ts` (in-process
+services + `emmaToolRegistry` dual-register L62). `registry.ts` L22–40
+already names image gen as `internal` hide-only. Expanded collision
+filter still only #2563. A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
