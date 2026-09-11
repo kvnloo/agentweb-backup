@@ -435,6 +435,30 @@ describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
   });
 });
 
+// ENG-1844: the landing-page generate/duplicate routes' brand-logo 422 reaches the model
+// as `API error (422): No brand logo is saved...` via httpClient.ts's self-call Error.
+// The embedded-status regex requires whitespace/start-of-string before the digits, but
+// "(422)" has "(" immediately before them, so it never matched — this fell all the way to
+// the generic unclassified fallback. httpClient.ts now preserves the route's own
+// `missing_brand_logo` marker on `.code` (separately from the human `.message`), so this
+// must classify by that STRING code, not by the numeric status at all.
+describe('missing_brand_logo — brand-logo content gate (ENG-1844)', () => {
+  it('classifies by the .code marker even though the message embeds "(422)" unmatchably', () => {
+    const err = Object.assign(
+      new Error(
+        'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again — landing pages are never generated with an invented or approximate logo.'
+      ),
+      { code: 'missing_brand_logo' }
+    );
+    expect(classifyToolErrorClass(err)).toBe('missing_brand_logo');
+  });
+
+  it('falls back to invalid_args for an ordinary 422 with no .code marker (no regression)', () => {
+    const err = Object.assign(new Error('API error (422): "prompt" is required'), { status: 422 });
+    expect(classifyToolErrorClass(err)).toBe('invalid_args');
+  });
+});
+
 // ENG-1162: a publisher (not an AgentWeb-connected account) refusing or failing to serve a
 // plain external fetch — read_file_content's own 401/403 marker, or a Chromium/Playwright
 // browser-navigation net-error — must not be swept into 'auth' ("reconnect the account" is

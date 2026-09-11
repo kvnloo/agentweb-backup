@@ -14,7 +14,7 @@
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
- *   scope_refused | publisher_refused | skill_install_refused
+ *   scope_refused | publisher_refused | skill_install_refused | missing_brand_logo
  *
  * `skill_install_refused` was added by ENG-1795; see its routing below for why no existing
  * class fit. The three classes before it were added 2026-06-14 after a 7-day production
@@ -318,6 +318,18 @@ export function classifyToolErrorClass(error: unknown): string {
     if (typeof stringCodeProp === 'string'
       && (stringCodeProp === 'ThrottlingException' || stringCodeProp === 'ProvisionedThroughputExceededException')) {
       return 'rate_limit';
+    }
+
+    // ENG-1844: the landing-page generate/duplicate routes' brand-logo gate
+    // (services/agentMode/brandLogo.ts's MISSING_BRAND_LOGO_ERROR = 'missing_brand_logo',
+    // inlined here rather than imported to keep this module import-free) reaches this
+    // point via httpClient.ts's self-call Error, which preserves the route's `error`
+    // code on `.code` specifically so it can be matched here instead of the human
+    // `message` text — that message embeds "(422)" with no preceding whitespace, which
+    // the embedded-status regex below does not match, so this was previously falling
+    // through to the generic unclassified 'Error' bucket and reporting as an outage.
+    if (stringCodeProp === 'missing_brand_logo') {
+      return 'missing_brand_logo';
     }
 
     let statusProp = (error as { status?: unknown }).status

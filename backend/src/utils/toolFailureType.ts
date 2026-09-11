@@ -130,8 +130,10 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   //    third-party site's own anti-bot/WAF block on our anonymous fetch — the
   //    tool executed correctly, an external party outside our control declined
   //    it, and there is no credential/config on our side that would fix it, so
-  //    it belongs here rather than 'config'. None of these are a tool bug.
-  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused') return 'by_design';
+  //    it belongs here rather than 'config'. 'missing_brand_logo' (ENG-1844) = the
+  //    generate/duplicate brand-logo gate correctly refused an invented-logo page —
+  //    the tool worked exactly as designed. None of these are a tool bug.
+  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused' || cls === 'missing_brand_logo') return 'by_design';
   if (BY_DESIGN_RE.test(msg)) return 'by_design';
 
   // 3. Arguments rejected by schema validation before execution.

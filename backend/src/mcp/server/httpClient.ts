@@ -228,7 +228,17 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
 
   if (!response.ok) {
     const message = typeof data === 'object' ? (data.message || data.error || JSON.stringify(data)) : data;
-    throw new Error(`API error (${response.status}): ${message}`);
+    const err = new Error(`API error (${response.status}): ${message}`);
+    // Routes sometimes emit BOTH a human `message` (which wins above, and is
+    // what a real UI would show) and a stable machine-readable `error` code —
+    // e.g. `missing_brand_logo`. That code is otherwise lost the moment
+    // `message` wins the `||` above. Preserve it separately so
+    // classifyToolErrorClass can key off the stable code instead of matching
+    // prose that was never meant to be a classification target (ENG-1844).
+    if (typeof data === 'object' && typeof data.error === 'string' && data.error !== message) {
+      (err as { code?: string }).code = data.error;
+    }
+    throw err;
   }
 
   return data;
