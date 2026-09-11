@@ -51,6 +51,19 @@ walker would fail today.
 The copied rule for core is narrower: **forbid only `agentModeService.ts`**
 (the 40.5k monolith). Allow gateway, `utils/`, `observability/`.
 
+**Prod outbound allowlist** (cycle 23, `agentMode/core/*.ts` excluding
+`__tests__`):
+
+| Specifier | File |
+|---|---|
+| `../../agentToolGatewayService` (type-only) | `toolDispatch.ts` L28 |
+| `utils/toolErrorClassifier`, `toolResultError`, `citations`, `toolResponseS3Ref` | `toolDispatch.ts` |
+| `observability/tracing`, `semconv` | `toolDispatch.ts` L39–41 (“NOT ports”; spans no-op without exporter) |
+| `utils/turnTimeBudget`, `toolErrorClassifier` | `synthesisResidue.ts` |
+| `crypto` | `geminiNativeClient.ts` |
+
+`executeAgentStep` still throws (`agentStep.ts` L48–55). A-003 still park.
+
 Do **not** walk all of `services/agentMode/` — `brandLogo.ts` L600–603
 `await import('../agentModeService')` is a deliberate cycle break.
 That file is outside `core/`.
