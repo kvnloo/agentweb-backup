@@ -546,6 +546,11 @@ in merge-evidence. Zero mentions in the gate or its tests.
 Not in `NON_BACKEND`. Failure FAILs (`n_bad`); skip/cancel
 does not.
 
+Cycle 134: **a `tests.yml` PR schedules six jobs;
+merge-evidence requires `Backend build` only.** `tests.yml`
+is in backend / workflows / relay / remotion / ebconfig
+filters. Cancelled relay is the same cancelled PASS as ENG-836.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

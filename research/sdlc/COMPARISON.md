@@ -328,3 +328,5 @@ reverted. Do not copy that as A-006.
   with CI script tests skipped. Not A-006.
 - Cycle 133: ENG-1377 relay and remotion builds are unnamed in
   merge-evidence. Not A-006.
+- Cycle 134: a tests.yml PR schedules six jobs; merge-evidence
+  requires Backend build only. Not A-006.

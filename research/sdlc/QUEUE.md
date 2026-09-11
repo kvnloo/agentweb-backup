@@ -222,6 +222,8 @@ Cycle 132: no `WORKFLOW_JOBS`; editing `merge-evidence.sh` PASSes
 with CI script tests skipped. Product READY unchanged.
 Cycle 133: ENG-1377 relay and remotion builds are unnamed in
 merge-evidence. Product READY unchanged.
+Cycle 134: a `tests.yml` PR schedules six jobs; merge-evidence
+requires `Backend build` only. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

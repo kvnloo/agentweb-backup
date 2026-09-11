@@ -407,6 +407,10 @@ Cycle 133: **ENG-1377 relay and remotion builds are unnamed**
 in merge-evidence. Zero mentions of those jobs or paths in
 the gate or its tests. Not in `NON_BACKEND`. Failure still
 FAILs (`n_bad`). Skip/cancel does not.
+Cycle 134: **a `tests.yml` PR schedules six jobs;
+merge-evidence requires `Backend build` only.** `tests.yml`
+is in backend / workflows / relay / remotion / ebconfig
+filters. Cancelled relay is the same cancelled PASS as ENG-836.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
