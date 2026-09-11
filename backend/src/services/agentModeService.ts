@@ -6377,6 +6377,21 @@ export class AgentModeService {
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
+    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
+    // emmaToolRegistry (the module-level singleton) is independently confirmed to
+    // contain both publish_landing_page_changes and get_landing_page_preview_url
+    // (throwaway script, 210 tools). registerTools() copies from that singleton into
+    // THIS instance's own this.toolRegistry at boot — never independently verified
+    // that the copy is complete on a real running server. This log settles it.
+    console.log('[ENG-1852-DIAG]', JSON.stringify({
+      allToolsCount: allTools.length,
+      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
+      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
+      associatedToolNamesCount: associatedToolNames.size,
+      excludedToolsCount: excludedTools.size,
+      publishedSkillsCount: publishedSkills.length,
+    }));
+
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
@@ -23266,9 +23281,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
+    //
+    // ENG-1844 review: this used to be a bare `.includes('Connection timeout')` /
+    // `.includes('service temporarily unavailable')` — loose enough that ANY future
+    // tool error whose message happened to contain either fragment would get this
+    // "external service unreachable" framing, regardless of tool or actual cause. That
+    // is the exact wrong-outage-framing bug class ENG-1844 exists to fix, just at a
+    // different, ungated trigger site. Both real origins (mcpClientService.ts) always
+    // emit the FULL phrase below — matching on that instead of the bare fragment keeps
+    // this scoped to genuine MCP-server connection failures.
     const isConnectionTimeout =
-      safeMessage.includes('Connection timeout') ||
-      safeMessage.includes('service temporarily unavailable');
+      safeMessage.includes('Connection timeout for ') ||
+      safeMessage.includes('service temporarily unavailable — retrying in');
     if (isConnectionTimeout) {
       return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
     }
