@@ -360,6 +360,10 @@ no GET. Ordered: track CallTool, then `mcpShutdown`, then
 Cycle 73: `server.close` / `io.close` L440–455 are callbacks, not
 awaits. Guard L262–273 completes the hook when drain resolves.
 `agentModeService.shutdown()` is MCP *client*. A-006 discarded.
+Cycle 74: `workerShutdownGuards.ts` L1–18 / worker L9–13 ignore
+SIGTERM (ENG-201). Parent `kill('SIGKILL')` L379–384 after
+`pendingRequests`. A fifth `listen()` is not that child. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

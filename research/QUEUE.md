@@ -110,4 +110,7 @@ SSE. Ordered drain: track CallTool, then `mcpShutdown`, then
 Cycle 73: `server.close` / `io.close` are not awaited
 (`server.ts` L440–455). The ASG hook completes on drain resolve
 anyway. A-006 stays discarded.
+Cycle 74: `workerShutdownGuards.ts` ignores SIGTERM (ENG-201);
+parent SIGKILLs after drain. A fifth `listen()` gets default
+SIGTERM. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

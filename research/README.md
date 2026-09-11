@@ -150,6 +150,11 @@ Cycle 73: even after that order, `server.close()` is not joined
 (`server.ts` L440–446). The ASG hook (`asgLifecycleGuard.ts`
 L262–273) treats drain resolve as “instance may terminate.” Do not
 HTTP-split to get a second close() to forget to await.
+Cycle 74: the existing fork is protected by
+`workerShutdownGuards.ts` (ignore SIGTERM, parent SIGKILL,
+ENG-201). A fifth image process would receive the cgroup SIGTERM
+and die — the failure that file exists to prevent. Q-014 is
+parent MCP, not the worker.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

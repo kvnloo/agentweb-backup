@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 73
+cycles_completed: 74
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 74
+next_cycle: 75
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 73: server.close()/io.close() are not awaited; ASG hook
-  completes while GET /mcp SSE may still be open. Cycle 74:
-  cheapest remaining mapping. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 74: workerShutdownGuards.ts ignores SIGTERM (ENG-201);
+  parent SIGKILLs after drain. A fifth listen() would die on the
+  OS signal. Cycle 75: cheapest remaining mapping. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
+  stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

@@ -157,3 +157,7 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 73: `server.close((err) => …)` is not a Promise. The ASG
   hook awaits drain then `CompleteLifecycleAction`. Source-pinned
   ENG-1189 tests order, not join. Hermes exit *is* close.
+- Cycle 74: `workerShutdownGuards.ts` ignores SIGTERM so the parent
+  can drain then SIGKILL. A fifth `listen()` gets the cgroup
+  SIGTERM with Node’s default handler (ENG-201). Hermes: one
+  process, no sibling to ignore.

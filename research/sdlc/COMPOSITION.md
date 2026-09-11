@@ -174,6 +174,14 @@ L262–273 `await onTerminating()` then `completeAction`.
 `agentModeService.shutdown()` (L1729) closes vendor MCP clients, not
 inbound SSE. Promisify close after `mcpShutdown`, still in-process.
 
+Cycle 74: **the fork ignores SIGTERM; a fifth listen() would not.**
+`workerShutdownGuards.ts` L1–18 (ENG-201): same cgroup, so the
+child gets SIGTERM with the parent. Default handling aborted
+scheduled runs. Parent waits `pendingRequests` then SIGKILL
+(`generateMarketingResponseWorkerService.ts` L379–384). Q-014
+`generate_image` is parent MCP, not this child. A-006 as HTTP
+would die on the signal the worker was taught to ignore.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

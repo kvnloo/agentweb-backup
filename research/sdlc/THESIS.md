@@ -78,7 +78,9 @@ local GET `/mcp` (`mcpServer.ts` L508–531) disables timeouts; that
 SSE is why `mcpShutdown` must follow the CallTool wait. Cycle 73:
 `server.close()` / `io.close()` (`server.ts` L440–455) are not
 awaited; the ASG hook (`asgLifecycleGuard.ts` L262–273) completes
-on drain resolve anyway. The listed face is a
+on drain resolve anyway. Cycle 74: the compute fork ignores
+SIGTERM (`workerShutdownGuards.ts` L1–18 / ENG-201); a fifth
+`listen()` would not. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

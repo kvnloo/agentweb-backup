@@ -66,7 +66,9 @@ files; wrap after #2, not instead of Q-014. Cycle 72: local GET
 `/mcp` SSE hangs `server.close()`; `mcpShutdown` after the wait,
 not instead of it. Cycle 73: `server.close()` is not awaited
 before `CompleteLifecycleAction` (`asgLifecycleGuard.ts` L262–273).
-Product READY unchanged.
+Cycle 74: `workerShutdownGuards.ts` (ENG-201) is why the existing
+fork survives SIGTERM; a fifth `listen()` would not. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
