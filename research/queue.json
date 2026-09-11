@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:41:00Z",
+  "updated_at": "2026-09-11T17:42:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -20,7 +20,7 @@
         "backend/src/mcp/oauth/oauthRoutes.ts",
         "backend/docs/AGENT_API.md"
       ],
-      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. Docs + Hermes-side skill. After OAuth, Hermes still will not see generate_image until Q-014.",
+      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. In-repo runbook already exists. Remaining: Kevin operator smoke + optional Hermes skill. After OAuth, Hermes still will not see generate_image until Q-014.",
       "harsha_db": false
     },
     {

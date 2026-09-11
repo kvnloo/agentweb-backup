@@ -15,7 +15,7 @@ snapshot is live; it still waits until Matt is ok with a default flip.
 
 | You | Agent |
 |---|---|
-| Hermes host: complete MCP OAuth against `api.agentweb.pro` using the Q-001 runbook; report where it still breaks | Tighten `HERMES_MCP_OAUTH.md`; optional Hermes skill in your hermes-agent tree |
+| Hermes host: complete MCP OAuth against `api.agentweb.pro` using the **existing** `HERMES_MCP_OAUTH.md` recipe (`--connect-timeout 315`); report where it still breaks | Optional Hermes skill in your hermes-agent tree. **Do not rewrite the in-repo runbook** unless the smoke finds a lie. |
 | Confirm product intent: should external agents *see* image gen? | Q-014: `emma_generate_image` workflow tool or un-hide `generate_image`; tests; leave `send_email` internalOnly |
 | Taste call: is `gpt-image-2` acceptable as Emma's unspecific default? (arena #3, 3× cheaper than today's Gemini Pro default) | Q-003: fail-open DesignArena mapper + fixture from `mappings/designarena-image-models.md`; no new provider |
 
