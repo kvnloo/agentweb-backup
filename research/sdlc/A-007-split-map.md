@@ -91,7 +91,9 @@ import './tools/infrastructure';
 // remaining register() calls
 ```
 
-Acceptance: `mcp.apiTools.test.ts` still green; `generate_image` still
+Acceptance: `mcp.apiTools.test.ts` still green **after** Q-014 drops
+`generate_image` from the L91 `internalTools` list (cycle 34). Until
+that flag flip, L91 still expects it hidden. `generate_image` still
 registered once; no new `mcp → agentModeService` edge in the new file.
 
 ## Later section files (not the first PR)

@@ -23,10 +23,11 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 33: A-008 path shim is **not** `swarm/index.ts` (zero prod
-importers). Closest analog `socialPlatformService.ts` L8. `LoopPorts`
-(6 interfaces) is already the in-process composition bus. Expanded
-collision still only #2563. A-006 stays discard.
+Cycle 34: A-002 oracle is **20** `loops/core` files (not 18); 35
+specifiers and two `../index` escapes unchanged. Q-014 is drop
+`internal` at L2077 + `mcp.apiTools.test.ts` L91 — **not** an
+`emma_generate_image` wrapper. `httpClient.ts` L63 still imports `db`.
+A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

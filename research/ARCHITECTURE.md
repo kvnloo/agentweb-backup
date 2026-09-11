@@ -227,6 +227,9 @@ Cycle 32: A-007 copies `workflowTools.ts` (mcpFetch); do not copy
 Cycle 33: A-008 is a **path shim** at `services/imageGeneration.ts`, not
 `swarm/index.ts` (zero prod importers). `LoopPorts` (6 interfaces) is
 the in-process composition bus.
+Cycle 34: A-002 oracle is **20** `loops/core` files (35 specifiers, two
+`../index` escapes). Q-014 drops `internal` at L2077 and edits
+`mcp.apiTools.test.ts` L91 — not an `emma_generate_image` wrapper.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -98,6 +98,10 @@ herself. That skip is the in-tree rejection of A-006. Vendor MCP
 (`excludeFromAgent`, Higgsfield) stays; do not invent a fifth process for
 image gen.
 
+Cycle 34: `httpClient.ts` L63 `lookupUser` → `await import('../../services/db')`.
+A-007 `tools/infrastructure.ts` still mcpFetchs through that client.
+File split ≠ `loops/core` package. Do not forbid db in `mcp/server`.
+
 ## Two MCP hop styles (cycle 32)
 
 `mcpServerCore.ts` L26–30 already composes **three** in-process modules

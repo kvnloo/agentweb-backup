@@ -10,8 +10,9 @@ dynamic `import()` string literals).
 
 Walk every `.ts` file under `backend/src/loops/core/` except `__tests__`.
 
-Cycle 27 oracle (2026-09-11T19:10Z): **18** prod files, **35** import
-specifiers. **Escapes from `loops/core/`:** only
+Cycle 34 oracle (2026-09-11T19:30Z): **20** prod files, **35** import
+specifiers (cycle 27 said 18 files; specifier count was already 35).
+**Escapes from `loops/core/`:** only
 
 | File | Line | Specifier |
 |---|---|---|
@@ -88,8 +89,8 @@ That file is outside `core/`.
 - New file e.g. `backend/src/__tests__/loopsCoreImportGuard.test.ts`
 - Fails if anyone adds `import { userDb } from '../../services/db'` in
   `loops/core`
-- Does not fail on today’s tree (cycle 18/20 greps: no `services/`
-  imports in `loops/core`)
+- Does not fail on today’s tree (cycle 34: 20 files, 35 specifiers, two
+  `../index` escapes; no `services/` imports in `loops/core`)
 - Does not touch `agentModeService.ts`
 
 Collision cycle 31 (20 open PRs): still **no** open PR on `loops/core`,

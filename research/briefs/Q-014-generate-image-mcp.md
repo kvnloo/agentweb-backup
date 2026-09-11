@@ -23,12 +23,19 @@ bypass the meter.
 
 ## First slice
 
-In `backend/src/mcp/server/apiTools.ts`, remove `internal: true` from
-`generate_image` **or** add `emma_generate_image` in `workflowTools.ts` (ENG-982
-style) and keep the granular tool internal.
+In `backend/src/mcp/server/apiTools.ts` (or `tools/infrastructure.ts` if
+A-007 has landed), **remove `internal: true`** from `generate_image`
+(L2077). Do **not** add `emma_generate_image` in `workflowTools.ts` as
+this PR — that wrapper would leave `generate_image` hidden and fail
+acceptance #1 (`registry.ts` L82–86 `getToolDefinitions` filters
+`!t.internal` only).
 
-Prefer the `emma_generate_image` workflow wrapper if we want a job-shaped name
-for Hermes without un-hiding the rest of the cost tools.
+Required test edit: `mcp.apiTools.test.ts` L91 — drop `generate_image`
+from `internalTools` so `externalNames` is allowed to contain it. Keep
+L407–421 category schema via `getTool()`. Leave `send_email` on the
+L91 list (`internalOnly`).
+
+Keep `you_search_*` / `google_search_web` internal in this slice.
 
 ## Out of scope
 
@@ -40,4 +47,5 @@ ENG-983 unlists CRUD; this is additive. Don't touch `manage_*` listing.
 
 ## Rollback
 
-Restore `internal: true` / drop the wrapper tool.
+Restore `internal: true` on `generate_image` and put the name back on
+`mcp.apiTools.test.ts` L91.
