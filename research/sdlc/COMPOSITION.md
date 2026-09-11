@@ -245,6 +245,14 @@ L551–563). `checkTokenUsage` gates tokens unless
 (`tokenUsageService.ts` L342–396). `spendChargingService` has
 zero production imports. Do not flip the flag; do not HTTP-split.
 
+Cycle 83: **CallTool is not serialized.** Local reuse
+(`mcpServer.ts` L312–313 / L492) fans overlapping POSTs into one
+SDK transport. SDK `handlePostRequest` (v1.25.2 L678) mints a
+`streamId` per POST and `onmessage`s with no queue. OAuth rate
+limit is 60/min (`mcpServer.ts` L142), not in-flight. Rehydrate
+(`mcpSessionRehydration.ts` L16–18) is one transport per in-flight
+request by design. A fifth `listen()` is not a serializer.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

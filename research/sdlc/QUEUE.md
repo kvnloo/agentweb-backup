@@ -83,7 +83,9 @@ overshoot. `reserveSpend` is unused on this path (ENG-1250
 admission is Harsha). Cycle 82: image meter writes `$` with 0
 tokens (`imageGeneration.ts` L551–563); default hard gate is
 tokens (`tokenUsageService.ts` L342–396). Cycle 80 brake is
-the cost dimension. Product READY unchanged.
+the cost dimension. Cycle 83: CallTool is not serialized
+(SDK `streamId` per POST; rate limiter is count/min; rehydrate
+is one transport per in-flight request). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

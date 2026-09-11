@@ -190,3 +190,6 @@ submodule of the leaf package (A-008, not A-006).
   tokens. Hermes loop still bounds spend; AgentWeb’s token cap
   does not, unless cost enforcement is on. Do not flip
   `ENFORCE_COST_CAP` from a research timer.
+- Cycle 83: MCP Streamable HTTP SDK fans out CallTool (new
+  `streamId` per POST). Hermes loop is the bound; AgentWeb server
+  is not. Do not HTTP-split to get a mutex the SDK does not have.

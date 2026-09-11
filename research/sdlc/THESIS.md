@@ -106,7 +106,9 @@ is after success and does not condition on remaining allowance.
 `reserveSpend` is unused here (ENG-1250 admission is Harsha).
 Cycle 82: the leaf writes `$` with zero tokens
 (`imageGeneration.ts` L551–563); default `allowed` is
-`tokenAllowed` (`tokenUsageService.ts` L342–396). The listed face is a
+`tokenAllowed` (`tokenUsageService.ts` L342–396). Cycle 83: MCP SDK Streamable
+HTTP mints a `streamId` per POST (`webStandardStreamableHttp.ts`
+v1.25.2 L678); AgentWeb adds no mutex. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

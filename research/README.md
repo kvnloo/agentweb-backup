@@ -195,6 +195,11 @@ The leaf meters `$` with 0 tokens (`imageGeneration.ts` L551–563).
 policy enforces cost. `spendChargingService` has zero production
 callers. Q-014 still lists into `metered` middleware; do not flip
 billing to “fix” A-006.
+Cycle 83: the MCP server does not serialize `CallTool`. SDK
+Streamable HTTP mints a `streamId` per POST; OAuth 60/min is a
+count window; ENG-114 rehydrate is one transport per in-flight
+request. Hermes’ loop is the concurrency bound. Do not HTTP-split
+to get a lock.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

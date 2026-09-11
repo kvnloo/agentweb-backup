@@ -1,9 +1,14 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T21:48:00Z",
+  "updated_at": "2026-09-11T21:50:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
-  "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
+  "implementation_order_when_unlocked": [
+    "A-002",
+    "A-007",
+    "A-008",
+    "A-005"
+  ],
   "items": [
     {
       "id": "A-001",
@@ -33,14 +38,14 @@
       "evidence": 5,
       "collision": 1,
       "score": 28,
-      "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts. Cycle 31: #2563 appends remnant string checks to sdkConstructionGuard.test.ts; AST walker L41–68 unchanged. Sibling file, do not append.",
+      "why": "loops/core already claims zero host imports via ports.ts. No dependency-cruiser in backend/package.json. Smallest SDLC PR that makes the gold standard true in CI. Does not touch agentModeService.ts. Cycle 31: #2563 appends remnant string checks to sdkConstructionGuard.test.ts; AST walker L41\u201368 unchanged. Sibling file, do not append.",
       "files": [
         "backend/src/loops/core/ports.ts",
         "backend/src/loops/index.ts",
         "backend/src/__tests__/sdkConstructionGuard.test.ts",
         "research/sdlc/A-002-import-guard-sketch.md"
       ],
-      "first_slice": "When coding unlocked: NEW sibling loopsCoreImportGuard.test.ts (do not append to sdkConstructionGuard.test.ts while #2563 is open). Copy findDirectProviderSdkImports visit() L41–68, not the remnant not.toContain pattern. AST-walk loops/core/** (20 prod files, 35 specifiers — cycle 34). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts → ../index. Also walk loops/index.ts: only allowed import is ./core/types (cycle 35; Hermes registry.py). Do not add instance auto-discover there (app.ts L118–120 is the composition root). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService) or mcp/server (httpClient.ts L63 imports db; registry.ts already imports evaluationPolicy). Optional second test: agentMode/core ↛ agentModeService.ts only.",
+      "first_slice": "When coding unlocked: NEW sibling loopsCoreImportGuard.test.ts (do not append to sdkConstructionGuard.test.ts while #2563 is open). Copy findDirectProviderSdkImports visit() L41\u201368, not the remnant not.toContain pattern. AST-walk loops/core/** (20 prod files, 35 specifiers \u2014 cycle 34). Forbid services/emma/db. Allow exactly two escapes: orchestrator.ts and instanceRunner.ts \u2192 ../index. Also walk loops/index.ts: only allowed import is ./core/types (cycle 35; Hermes registry.py). Do not add instance auto-discover there (app.ts L118\u2013120 is the composition root). Do not add dependency-cruiser. Do not copy the same forbid-all-services rule onto agentMode/core (toolDispatch imports agentToolGatewayService) or mcp/server (httpClient.ts L63 imports db; registry.ts already imports evaluationPolicy). Optional second test: agentMode/core \u219b agentModeService.ts only.",
       "harsha_db": false
     },
     {
@@ -53,7 +58,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 16,
-      "why": "Same as Q-010. AGENTMODE_MIGRATION.md owner is Harsha/swarm. executeAgentStep still throws. Monolith grew 24k→40.5k. Kevin should not pick this up as a nanoservice rewrite.",
+      "why": "Same as Q-010. AGENTMODE_MIGRATION.md owner is Harsha/swarm. executeAgentStep still throws. Monolith grew 24k\u219240.5k. Kevin should not pick this up as a nanoservice rewrite.",
       "files": [
         "backend/src/services/agentMode/core/agentStep.ts",
         "backend/src/services/agentModeService.ts",
@@ -108,7 +113,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 26,
-      "why": "Cycle 19–20. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports — same arrow as OMP pi-ai ↛ pi-agent-core. usageRecorder stays shared. Cycle 33: swarm/index.ts is an unused folder barrel, not a path shim. Compat file at old specifier (socialPlatformService.ts L8 analog, thinner). Q-003 can keep importing services/imageGeneration.",
+      "why": "Cycle 19\u201320. imageGeneration has 5 prod importers and zero db.ts / agentModeService imports \u2014 same arrow as OMP pi-ai \u219b pi-agent-core. usageRecorder stays shared. Cycle 33: swarm/index.ts is an unused folder barrel, not a path shim. Compat file at old specifier (socialPlatformService.ts L8 analog, thinner). Q-003 can keep importing services/imageGeneration.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/videoGeneration.ts",
@@ -117,7 +122,7 @@
         "backend/src/services/swarm/index.ts",
         "research/sdlc/SERVICES_DAG.md"
       ],
-      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/imageGeneration.ts; leave services/imageGeneration.ts as export * from './creative/imageGeneration' (path shim). Do not copy services/swarm/index.ts (zero prod importers). Do not copy socialPlatformService's registry — only the stay-at-old-path part (L8). emmaApi.ts does not import the leaf — do not edit it. agentModeService L28950 dynamic import keeps resolving. Boundary test: creative/** ↛ agentModeService. Do not extract HTTP. Do not move db.ts.",
+      "first_slice": "When coding unlocked, after A-007 / Q-014, not instead of Q-003: git mv imageGeneration.ts to services/creative/imageGeneration.ts; leave services/imageGeneration.ts as export * from './creative/imageGeneration' (path shim). Do not copy services/swarm/index.ts (zero prod importers). Do not copy socialPlatformService's registry \u2014 only the stay-at-old-path part (L8). emmaApi.ts does not import the leaf \u2014 do not edit it. agentModeService L28950 dynamic import keeps resolving. Boundary test: creative/** \u219b agentModeService. Do not extract HTTP. Do not move db.ts.",
       "harsha_db": false
     },
     {
@@ -130,7 +135,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 29,
-      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template for mcpFetch + exported name list — NOT for identity. Cycle 54: do not copy L37 adminClientScope. Cycle 57: attach via apiTools barrel / mcpServerCore L26, not app.ts (#2271 owns the Express route table). Cycle 48: kvnloo#2 owns apiTools.ts — wait for merge.",
+      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996\u20132146). ENG-982 workflowTools.ts is the template for mcpFetch + exported name list \u2014 NOT for identity. Cycle 54: do not copy L37 adminClientScope. Cycle 57: attach via apiTools barrel / mcpServerCore L26, not app.ts (#2271 owns the Express route table). Cycle 48: kvnloo#2 owns apiTools.ts \u2014 wait for merge.",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/mcpServerCore.ts",
@@ -140,7 +145,7 @@
         "backend/src/mcp/server/toolHelpers.ts",
         "research/sdlc/A-007-split-map.md"
       ],
-      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Copy workflowTools.ts shape (mcpFetch + exported name list), not evaluationTools.ts, and not workflowTools.ts L37 adminClientScope (cycle 54: that import exists only for emma_get_account_status). Barrel via import './tools/infrastructure' in apiTools.ts only. Keep send_email internal+internalOnly (L2113–2115). Keep all five on ctx(context). Leave Content/blog and install_skills in apiTools.ts. mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
+      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Copy workflowTools.ts shape (mcpFetch + exported name list), not evaluationTools.ts, and not workflowTools.ts L37 adminClientScope (cycle 54: that import exists only for emma_get_account_status). Barrel via import './tools/infrastructure' in apiTools.ts only. Keep send_email internal+internalOnly (L2113\u20132115). Keep all five on ctx(context). Leave Content/blog and install_skills in apiTools.ts. mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
       "harsha_db": false
     },
     {
@@ -153,7 +158,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50–53: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown waits on worker/cron/turns BEFORE server.close() because mcpFetch is this PORT. Cycle 64–65: SSE Maps are parent-heap only. Cycle 66: keyedMutex + tryClaimSessionGeneration are in-memory (per-instance). Cycle 67: the actual scale-out template is ENG-114 (mcpSessionRehydration.ts L3–8: no sticky routing; Dynamo metadata; rehydrate in-process). Cycle 68: ASG terminates before drain (asgLifecycleGuard.ts L4–16); hook agentweb-drain-before-terminate is installed by eb-deploy.sh (ENG-818), not .ebextensions, and calls this process's drainForShutdown (server.ts L572–574). Cycle 69: that drain's wait list is four named units (server.ts L397–420); inbound MCP CallTool (mcpServerCore.ts L88–120, Q-014 generate_image at apiTools.ts L2096–2108) is not tracked. mcpShutdown (mcpServer.ts L260–261) is unused by runDrain. Copy chatbotTurn (server.ts L288–301), do not HTTP-split. Cycle 70: local MCP Map (mcpServer.ts L307–315) and rehydrateAndServe (L441) share that CallTool; wrap it once (cronJobRegistry.ts L1–9). Rehydrate is finite HTTP (mcpSessionRehydration.ts L15–18); inner mcpFetch still needs a new loopback. Cycle 71: AgentWebPro empty on mcpServerCore.ts / mcpServer.ts / mcpSessionRehydration.ts / cronJobRegistry.ts / asgLifecycleGuard.ts / server.ts (20 PRs). Wrap after kvnloo#2, not instead of Q-014. Cycle 72: local GET /mcp (mcpServer.ts L508–531) is timeout-0 SSE; mcpShutdown must follow CallTool wait, then server.close(). Cycle 73: server.close/io.close (server.ts L440–455) are not awaited; asgLifecycleGuard.ts L262–273 completes the hook when drain resolves. Cycle 74: workerShutdownGuards.ts L1–18 ignores SIGTERM (ENG-201); parent SIGKILLs after pendingRequests (generateMarketingResponseWorkerService.ts L379–384). A fifth listen() gets default SIGTERM. Cycle 75: RecordLifecycleActionHeartbeat is never called (asgLifecycleGuard.ts L26 comment only); eb-deploy.sh L612 --heartbeat-timeout 900 and .ebextensions/rolling.config Timeout 900 sit above DRAIN_CEILING_MS 10 min (shutdownConstants.ts L8). Hermes: one process. See COMPOSITION.md. Cycle 76: nginx agent-mode-timeout.conf L5–7 is global 600s (GET /mcp); websocket.conf L5–16 is /socket.io/ 3600s; ALB IdleTimeout 600 (timeout.config L5–6); DeregistrationDelay is eb-deploy.sh ensure_deregistration_delay (ENG-823), not .ebextensions. Cycle 77: generate_image mcpFetch has no timeoutMs (apiTools.ts L2096–2108); httpClient.ts L205 defaults to 5 min, inside nginx 10. v0 tools pass timeoutMs 25 min on the same hop. Cycle 78: leaf IMAGE_GENERATION_TIMEOUT_MS is 8 min (imageGeneration.ts L69–79 ENG-510) under GENERATION_TIMEOUT_MS 10 min; MCP generate_image still uses 5 min mcpFetch default. Cycle 79: emmaApi.ts L174–187 has no abort listener; generateImage has no AbortSignal; meter imageGeneration.ts L546–562 still fires after success. A-006 cannot cancel. Cycle 80: emmaApi generate-image never calls tryClaimSessionGeneration (agentModeController.ts L951); keyedMutex is chatbot append only. Quota is the MCP brake. Cycle 81: requireEmmaTokenBudget is check-then-act (emmaTokenBudget.ts L171-196 checkTokenUsage GET then next); increment is AFTER vendor success via fire-and-forget meterUserUsage (usageRecorderService.ts L482-531; imageGeneration.ts L546-562). applyMonthlyChargeAtomic conditions on month, not remaining quota (db.ts L1878). spendChargingService.chargeForCall/reserveSpend unused by imageGeneration/emmaApi; ENG-1250 admission is Harsha (spendChargingService.ts L17-20). A fifth listen() duplicates the GET. Cycle 82: image meterUserUsage is costUsdOverride with 0 tokens (imageGeneration.ts L551-563); checkTokenUsage default allowed is tokenAllowed (tokenUsageService.ts L342-396). spendChargingService has zero production imports; dual-write is observe-only (spendLedgerDualWrite.ts L12-13). Hermes: one process. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 50\u201353: lookupUser is the MCP-hop spend door. Cycle 55: remotion-lambda is the isolate; imageGeneration.ts is already the host adapter. Cycle 58: drainForShutdown waits on worker/cron/turns BEFORE server.close() because mcpFetch is this PORT. Cycle 64\u201365: SSE Maps are parent-heap only. Cycle 66: keyedMutex + tryClaimSessionGeneration are in-memory (per-instance). Cycle 67: the actual scale-out template is ENG-114 (mcpSessionRehydration.ts L3\u20138: no sticky routing; Dynamo metadata; rehydrate in-process). Cycle 68: ASG terminates before drain (asgLifecycleGuard.ts L4\u201316); hook agentweb-drain-before-terminate is installed by eb-deploy.sh (ENG-818), not .ebextensions, and calls this process's drainForShutdown (server.ts L572\u2013574). Cycle 69: that drain's wait list is four named units (server.ts L397\u2013420); inbound MCP CallTool (mcpServerCore.ts L88\u2013120, Q-014 generate_image at apiTools.ts L2096\u20132108) is not tracked. mcpShutdown (mcpServer.ts L260\u2013261) is unused by runDrain. Copy chatbotTurn (server.ts L288\u2013301), do not HTTP-split. Cycle 70: local MCP Map (mcpServer.ts L307\u2013315) and rehydrateAndServe (L441) share that CallTool; wrap it once (cronJobRegistry.ts L1\u20139). Rehydrate is finite HTTP (mcpSessionRehydration.ts L15\u201318); inner mcpFetch still needs a new loopback. Cycle 71: AgentWebPro empty on mcpServerCore.ts / mcpServer.ts / mcpSessionRehydration.ts / cronJobRegistry.ts / asgLifecycleGuard.ts / server.ts (20 PRs). Wrap after kvnloo#2, not instead of Q-014. Cycle 72: local GET /mcp (mcpServer.ts L508\u2013531) is timeout-0 SSE; mcpShutdown must follow CallTool wait, then server.close(). Cycle 73: server.close/io.close (server.ts L440\u2013455) are not awaited; asgLifecycleGuard.ts L262\u2013273 completes the hook when drain resolves. Cycle 74: workerShutdownGuards.ts L1\u201318 ignores SIGTERM (ENG-201); parent SIGKILLs after pendingRequests (generateMarketingResponseWorkerService.ts L379\u2013384). A fifth listen() gets default SIGTERM. Cycle 75: RecordLifecycleActionHeartbeat is never called (asgLifecycleGuard.ts L26 comment only); eb-deploy.sh L612 --heartbeat-timeout 900 and .ebextensions/rolling.config Timeout 900 sit above DRAIN_CEILING_MS 10 min (shutdownConstants.ts L8). Hermes: one process. See COMPOSITION.md. Cycle 76: nginx agent-mode-timeout.conf L5\u20137 is global 600s (GET /mcp); websocket.conf L5\u201316 is /socket.io/ 3600s; ALB IdleTimeout 600 (timeout.config L5\u20136); DeregistrationDelay is eb-deploy.sh ensure_deregistration_delay (ENG-823), not .ebextensions. Cycle 77: generate_image mcpFetch has no timeoutMs (apiTools.ts L2096\u20132108); httpClient.ts L205 defaults to 5 min, inside nginx 10. v0 tools pass timeoutMs 25 min on the same hop. Cycle 78: leaf IMAGE_GENERATION_TIMEOUT_MS is 8 min (imageGeneration.ts L69\u201379 ENG-510) under GENERATION_TIMEOUT_MS 10 min; MCP generate_image still uses 5 min mcpFetch default. Cycle 79: emmaApi.ts L174\u2013187 has no abort listener; generateImage has no AbortSignal; meter imageGeneration.ts L546\u2013562 still fires after success. A-006 cannot cancel. Cycle 80: emmaApi generate-image never calls tryClaimSessionGeneration (agentModeController.ts L951); keyedMutex is chatbot append only. Quota is the MCP brake. Cycle 81: requireEmmaTokenBudget is check-then-act (emmaTokenBudget.ts L171-196 checkTokenUsage GET then next); increment is AFTER vendor success via fire-and-forget meterUserUsage (usageRecorderService.ts L482-531; imageGeneration.ts L546-562). applyMonthlyChargeAtomic conditions on month, not remaining quota (db.ts L1878). spendChargingService.chargeForCall/reserveSpend unused by imageGeneration/emmaApi; ENG-1250 admission is Harsha (spendChargingService.ts L17-20). A fifth listen() duplicates the GET. Cycle 82: image meterUserUsage is costUsdOverride with 0 tokens (imageGeneration.ts L551-563); checkTokenUsage default allowed is tokenAllowed (tokenUsageService.ts L342-396). spendChargingService has zero production imports; dual-write is observe-only (spendLedgerDualWrite.ts L12-13). Hermes: one process. See COMPOSITION.md. Cycle 83: MCP CallTool is not serialized. mcpServer.ts L312-313/L492 reuses one StreamableHTTPServerTransport; SDK webStandardStreamableHttp.ts v1.25.2 L678 mints a streamId per POST and onmessage with no queue. mcpRateLimiter is count/min (mcpServer.ts L106/L142 oauth 60), not in-flight. mcpSessionRehydration.ts L16-18 is one transport per in-flight request. A fifth listen() is not a serializer.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -185,7 +190,9 @@
         "backend/.platform/nginx/conf.d/agent-mode-timeout.conf",
         "backend/.platform/nginx/conf.d/elasticbeanstalk/websocket.conf",
         "backend/.ebextensions/timeout.config",
-        "research/sdlc/COMPOSITION.md"
+        "research/sdlc/COMPOSITION.md",
+        "backend/src/middleware/rateLimiter.ts",
+        "backend/src/mcp/server/registry.ts"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
       "harsha_db": false
@@ -224,12 +231,12 @@
         "backend/src/services/codingAgentService.ts",
         "backend/src/emma/tools.ts"
       ],
-      "first_slice": "PARK until after Q-014 / A-002 / A-007. Then: prefer context.llmModel || DEFAULT_CODING_AGENT_MODEL, delete the agentModeService import. Tests spy getCodingAgentDefaultModel — update those spies. Do not edit emma/tools.ts while #2832 is open. Do not spawn a process.",
+      "first_slice": "PARK until after Q-014 / A-002 / A-007. Then: prefer context.llmModel || DEFAULT_CODING_AGENT_MODEL, delete the agentModeService import. Tests spy getCodingAgentDefaultModel \u2014 update those spies. Do not edit emma/tools.ts while #2832 is open. Do not spawn a process.",
       "harsha_db": false
     },
     {
       "id": "A-016",
-      "title": "AST guard: mcp/client ↛ mcp/server and reverse (OMP DAG already true)",
+      "title": "AST guard: mcp/client \u219b mcp/server and reverse (OMP DAG already true)",
       "status": "park",
       "leverage": 2,
       "product": 2,
@@ -237,7 +244,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 23,
-      "why": "Cycle 56. Prod mcp/client does not import mcp/server; reverse also empty. Shared parent anonymousToolAccess.ts is the ENG-822 leaf (OMP pi-telemetry). backend/package.json has no workspaces. HTTP-splitting these folders would recreate the cycle 29 self-MCP skip. Park until kvnloo#3 (A-002) merges — do not stack a second import-guard PR.",
+      "why": "Cycle 56. Prod mcp/client does not import mcp/server; reverse also empty. Shared parent anonymousToolAccess.ts is the ENG-822 leaf (OMP pi-telemetry). backend/package.json has no workspaces. HTTP-splitting these folders would recreate the cycle 29 self-MCP skip. Park until kvnloo#3 (A-002) merges \u2014 do not stack a second import-guard PR.",
       "files": [
         "backend/src/mcp/client/mcpClientService.ts",
         "backend/src/mcp/client/toolRegistry.ts",
@@ -278,7 +285,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 29,
-      "why": "Cycle 47. Hermes has one tools/list. AgentWeb has three catalogs for generate_image: MCP internal flag (apiTools.ts L2077), chatbot pageToolMap images page (chatbotService.ts L5211), Agent Mode buildSkillContext without generate_image in DEFAULT_FOUNDATION_TOOLS (describe_image was promoted ENG-260 L6166–6171; generate_image was not). #2861 is promoting convert_to_pdf to foundation — do not piggyback. Q-014 lists for authenticated MCP; it is not a page or skill gate.",
+      "why": "Cycle 47. Hermes has one tools/list. AgentWeb has three catalogs for generate_image: MCP internal flag (apiTools.ts L2077), chatbot pageToolMap images page (chatbotService.ts L5211), Agent Mode buildSkillContext without generate_image in DEFAULT_FOUNDATION_TOOLS (describe_image was promoted ENG-260 L6166\u20136171; generate_image was not). #2861 is promoting convert_to_pdf to foundation \u2014 do not piggyback. Q-014 lists for authenticated MCP; it is not a page or skill gate.",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/services/chatbotService.ts",
@@ -298,7 +305,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 31,
-      "why": "Cycle 49–51. anonymousTransport.ts: tools/list is anonymously permitted when MCP_ANONYMOUS_DISCOVERY=true (default OFF). ANONYMOUS_TOOLS is an empty Set — look but not run. generate_image has no requiresUserAccount in apiTools.ts; the transport allowlist is the first spend door. Cycle 50: leaked CallTool dies at mcpFetch lookupUser before a JWT. Cycle 51: requireEmmaTokenBudget is not a fail for anon_* (checkTokenUsage L293–305 allows; _svc skips DB). Do not make generate_image the unshipped demo tool.",
+      "why": "Cycle 49\u201351. anonymousTransport.ts: tools/list is anonymously permitted when MCP_ANONYMOUS_DISCOVERY=true (default OFF). ANONYMOUS_TOOLS is an empty Set \u2014 look but not run. generate_image has no requiresUserAccount in apiTools.ts; the transport allowlist is the first spend door. Cycle 50: leaked CallTool dies at mcpFetch lookupUser before a JWT. Cycle 51: requireEmmaTokenBudget is not a fail for anon_* (checkTokenUsage L293\u2013305 allows; _svc skips DB). Do not make generate_image the unshipped demo tool.",
       "files": [
         "backend/src/mcp/server/anonymousTransport.ts",
         "backend/src/mcp/server/mcpServer.ts",
@@ -338,7 +345,7 @@
       "evidence": 5,
       "collision": 4,
       "score": 16,
-      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. Cycle 57: #2271 also edits slackChannelAdapter.ts, app.ts, and db.ts (Harsha). Do not start at WhatsApp/messaging-channels either. Cycle 59 sibling A-017 is the listen-module leak (crm/server), not controllers. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
+      "why": "Cycle 42\u201343. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter \u2014 do not compete on routes/slack.ts. Cycle 57: #2271 also edits slackChannelAdapter.ts, app.ts, and db.ts (Harsha). Do not start at WhatsApp/messaging-channels either. Cycle 59 sibling A-017 is the listen-module leak (crm/server), not controllers. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
       "files": [
         "backend/src/services/emmaEmailService.ts",
         "backend/src/services/revisionService.ts",
@@ -360,7 +367,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 19,
-      "why": "Cycle 59–63. server.ts L2 imports app; crm.ts L24 imports io from server — ENG-1286. registerIo exists; MinimalIo cannot emit so worker L184 and crmEnrichmentService L67 require('../server'). Cycle 63: ten more await import('../server') sites — gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237, agentModeController.ts L1201/1302/1381/1419/1585/1695/1732 — documented at gtmPlan.ts L12–13 as a load-time dodge. Cycle 60: Fathom get/register analog. Cycle 62: only socket.join is server.ts L186 user:; CRM socket.id; codingAgent sessionId with no join. Cycle 61: AgentWebPro empty on sessionSockets / worker / crmEnrichment; crm.ts #1544+#1790; app.ts #2271+#1814. A-013 family. Not A-006. Do not start at agentModeController (14,929 lines).",
+      "why": "Cycle 59\u201363. server.ts L2 imports app; crm.ts L24 imports io from server \u2014 ENG-1286. registerIo exists; MinimalIo cannot emit so worker L184 and crmEnrichmentService L67 require('../server'). Cycle 63: ten more await import('../server') sites \u2014 gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237, agentModeController.ts L1201/1302/1381/1419/1585/1695/1732 \u2014 documented at gtmPlan.ts L12\u201313 as a load-time dodge. Cycle 60: Fathom get/register analog. Cycle 62: only socket.join is server.ts L186 user:; CRM socket.id; codingAgent sessionId with no join. Cycle 61: AgentWebPro empty on sessionSockets / worker / crmEnrichment; crm.ts #1544+#1790; app.ts #2271+#1814. A-013 family. Not A-006. Do not start at agentModeController (14,929 lines).",
       "files": [
         "backend/src/services/sessionSockets.ts",
         "backend/src/services/generateMarketingResponseWorkerService.ts",
@@ -378,7 +385,7 @@
         "backend/src/services/agentMode/streamEvents.ts",
         "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo(). Do not absorb sseProgress / RunEmitter (cycle 64–65: worker IPC type:progress vs type:socketEmit; Maps are parent-local — child worker never imports sseProgress; clearTerminalProgress L322 on death). Do not introduce Redis. Do not edit crm.ts (#1544 #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice. Later: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM/SSE. Do not edit app.ts (#2271 + #1814).",
+      "first_slice": "PARK until after Q-014 / A-002, not instead. Expand sessionSockets MinimalIo with to(room).emit as a string-room passthrough (cycle 62). Switch generateMarketingResponseWorkerService L184 and crmEnrichmentService L67 from require('../server') to getIo(). Do not absorb sseProgress / RunEmitter (cycle 64\u201365: worker IPC type:progress vs type:socketEmit; Maps are parent-local \u2014 child worker never imports sseProgress; clearTerminalProgress L322 on death). Do not introduce Redis. Do not edit crm.ts (#1544 #1790). Do not fold agentModeController.ts seven dynamic imports into the first slice. Later: gtmPlan.ts L1495, admin.ts L4749, durableLandingService.ts L237. Do not add Socket.IO to LoopPorts. Do not HTTP-split CRM/GTM/SSE. Do not edit app.ts (#2271 + #1814).",
       "harsha_db": false
     }
   ]

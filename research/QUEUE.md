@@ -136,4 +136,6 @@ quota. Do not wire ENG-1250 admission. A-006 stays discarded.
 Cycle 82: image spend does not increment `totalTokens`; default
 hard gate is tokens. Do not flip `ENFORCE_COST_CAP`. A-006 stays
 discarded.
+Cycle 83: MCP CallTool is not serialized (SDK streamId per POST;
+rate limiter is count/min). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
