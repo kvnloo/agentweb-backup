@@ -1323,9 +1323,35 @@ export class UserDB {
     return false;
   }
 
+  /** One paginated index traversal; retain only counts, not full task/session rows. */
+  private async countUsersByIndex(
+    params: AWS.DynamoDB.DocumentClient.ScanInput,
+    userIds: Set<string>,
+  ): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.docClient.scan({
+        ...params,
+        ProjectionExpression: "userId",
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      if (result.Items !== undefined && !Array.isArray(result.Items)) {
+        throw new Error(`Invalid items returned from ${params.TableName}`);
+      }
+      for (const item of result.Items ?? []) {
+        if (typeof item?.userId === "string" && userIds.has(item.userId)) {
+          counts.set(item.userId, (counts.get(item.userId) ?? 0) + 1);
+        }
+      }
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return counts;
+  }
+
   async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
     try {
-      const allItems: any[] = [];
+      const allItems: User[] = [];
       let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
       do {
         const params: AWS.DynamoDB.DocumentClient.ScanInput = {
@@ -1333,36 +1359,56 @@ export class UserDB {
           ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
         };
         const result = await this.docClient.scan(params).promise();
-        allItems.push(...(result.Items || []));
+        if (result.Items !== undefined && !Array.isArray(result.Items)) {
+          throw new Error("Invalid user items returned from DynamoDB");
+        }
+        for (const item of result.Items ?? []) {
+          // Reject malformed identities at the shared boundary, before any caller
+          // can use them for user lookups or bot filtering. Preserve all raw fields.
+          if (!item || typeof item.userId !== "string" || !item.userId ||
+              (item.email != null && typeof item.email !== "string")) {
+            throw new Error("Invalid user record returned from DynamoDB");
+          }
+          allItems.push(item as User);
+        }
         lastEvaluatedKey = result.LastEvaluatedKey;
       } while (lastEvaluatedKey);
 
       const users = allItems.filter(
         (u) =>
-          !u.userId?.startsWith("deleted_") &&
+          !u.userId.startsWith("deleted_") &&
           (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
-
-      // Get task and workflow counts for each user
-      const usersWithCounts = await Promise.all(
-        users.map(async (user) => {
-          const [taskCount, workflowCount, chatSessionCount] =
-            await Promise.all([
-              taskDb.getUserTaskCount(user.userId),
-              workflowDb.getUserWorkflowCount(user.userId),
-              this.getChatSessionCount(user.userId),
-            ]);
-
-          return {
-            ...user,
-            taskCount,
-            workflowCount,
-            chatSessionCount,
-          } as UserWithCounts;
-        })
-      );
-
-      return usersWithCounts;
+      if (users.length === 0) return [];
+      const userIds = new Set(users.map(user => user.userId));
+      // Scan the same indexes as the single-user queries to preserve sparse
+      // index membership. Task/workflow failures retain their zero fallback;
+      // chat failures still propagate instead of returning partial counts.
+      const [taskCounts, workflowCounts, chatSessionCounts] = await Promise.all([
+        this.countUsersByIndex({
+          TableName: `${TABLE_PREFIX}AW-Tasks`, IndexName: "UserTasksIndex",
+        }, userIds).catch(error => {
+          console.error("Error getting task counts:", error);
+          return new Map<string, number>();
+        }),
+        this.countUsersByIndex({
+          TableName: `${TABLE_PREFIX}AW-Workflows`, IndexName: "UserWorkflowsIndex",
+        }, userIds).catch(error => {
+          console.error("Error getting workflow counts:", error);
+          return new Map<string, number>();
+        }),
+        this.countUsersByIndex({
+          TableName: CHAT_SESSIONS_TABLE, IndexName: "UserIdIndex",
+          FilterExpression: "(attribute_not_exists(archived) OR archived = :archivedFalse)",
+          ExpressionAttributeValues: { ":archivedFalse": false },
+        }, userIds),
+      ]);
+      return users.map(user => ({
+        ...user,
+        taskCount: taskCounts.get(user.userId) ?? 0,
+        workflowCount: workflowCounts.get(user.userId) ?? 0,
+        chatSessionCount: chatSessionCounts.get(user.userId) ?? 0,
+      }));
     } catch (error) {
       console.error("Error in getAllUsers:", error);
       throw error;
