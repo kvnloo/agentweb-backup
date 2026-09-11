@@ -20,16 +20,15 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
-| — | A-013 | 18 | park | Stop services importing HTTP controllers (inventory) |
+| — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
 | — | A-003 | 16 | park | Wire `executeAgentStep` (Harsha / Q-010) |
 | — | A-009 | 15 | park | Do not invert `llmClients` ↔ meter to copy OMP |
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 42: six service files import `controllers/` (`emmaEmailService`
-statically imports `generateSessionResponse`). `revisionService.ts`
-L11–16 is the in-app `confirm=true` path; do not copy onto Q-014.
-A-013 parks the family. A-006 stays discard.
+Cycle 43: loop root is `runVerifiedChat` L5019 / `runScheduledChat`
+L5362 / `generateSessionResponse` L7908. **#2393** owns Slack
+`conversation/channelPort`. A-013 collision 4. A-006 stays discard.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T19:52:00Z",
+  "updated_at": "2026-09-11T19:54:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -247,17 +247,18 @@
       "product": 1,
       "mergeability": 2,
       "evidence": 5,
-      "collision": 3,
-      "score": 18,
-      "why": "Cycle 42. Cycle 41's blog import is one of six: emmaEmailService.ts L5 statically imports generateSessionResponse from agentModeController (14k) and also agentModeService; revisionService L144 and humanEvalActionService L30 dynamic-import runVerifiedChat; chatbotService L7-10 imports release/docsController and Express Request/Response. revisionService L11-16 is the confirm=true in-app revision path — do not copy onto Q-014/MCP. Hermes/OMP do not import HTTP handlers from packages. Not A-006.",
+      "collision": 4,
+      "score": 16,
+      "why": "Cycle 42–43. Six services import controllers. The live loop root is three exports on agentModeController.ts: runVerifiedChat L5019, runScheduledChat L5362, generateSessionResponse L7908. #2393 already extracts services/conversation/channelPort + Slack adapter — do not compete on routes/slack.ts. revisionService L11-16 is confirm=true in-app; do not copy onto Q-014. Not A-006.",
       "files": [
         "backend/src/services/emmaEmailService.ts",
         "backend/src/services/revisionService.ts",
         "backend/src/services/humanEvalActionService.ts",
         "backend/src/services/chatbotService.ts",
-        "research/sdlc/SERVICES_DAG.md"
+        "backend/src/controllers/agentModeController.ts",
+        "research/sdlc/COMPOSITION.md"
       ],
-      "first_slice": "PARK. After A-012, lift runVerifiedChat/generateSessionResponse behind an application-service port so email/eval/revision do not import agentModeController. Do not do this instead of Q-014. Do not add HTTP. #1076 touches chatbotService — do not start there.",
+      "first_slice": "PARK. Do not start at routes/slack.ts (#2393). After #2393, email/eval can implement conversation/channelPort. Do not lift generateSessionResponse instead of Q-014. Do not add HTTP. #1076 touches chatbotService.",
       "harsha_db": false
     }
   ]

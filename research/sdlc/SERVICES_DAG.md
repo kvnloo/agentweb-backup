@@ -63,7 +63,7 @@ path (Matt / Slack). Not MCP. A-013 parks the family. Do not HTTP-split.
 |---|---|---|
 | `services/creative/` | `imageGeneration`, `videoGeneration`, `remotionService`, `voiceoverService`, `onboardingAdImageService`, `workPlanThumbnailService` | **No.** Meter + C2PA + CRITICAL LOGO already live in the leaf (`imageGeneration.ts` L5 / L575–578 / L477–484). Policy (category / HITL / persisted logo) stays in `agentModeService`. First slice: `git mv` + path shim. |
 | `services/money/` | `usageRecorderService`, stripe helpers | **No.** 20 prod importers; moving is path churn for billing tests. |
-| `services/agent/` | later, after strangler | **No.** |
+| `services/agent/` | later, after strangler | **No.** Live inbound root is still `agentModeController` three exports (cycle 43). #2393 adds `services/conversation/` — do not duplicate. |
 | `services/gtm/` | meta, ads, hubspot, crm enrichment | **Do not pick up** (contractor PRs). |
 | *(root)* | `db.ts`, `connectedAccountsDb.ts` | **Pinned.** |
 

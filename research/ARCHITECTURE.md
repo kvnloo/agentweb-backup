@@ -255,6 +255,9 @@ A-012 parks lifting `generateBlogImage`. A-008 does not fix it.
 Cycle 42: six services import controllers (`emmaEmailService.ts` L5
 static `generateSessionResponse`). A-013 parks the family. A-002 still
 must not walk `loops/instances/` (`rcaEnricher.ts` L25 / L227).
+Cycle 43: those imports land on three exports (`runVerifiedChat` L5019,
+`runScheduledChat` L5362, `generateSessionResponse` L7908). **#2393**
+is the Slack channel-port extract — do not compete. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

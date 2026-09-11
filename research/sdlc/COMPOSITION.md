@@ -207,3 +207,19 @@ is `export * from './creative/imageGeneration'`. Closest analog:
   (`agentModeService.ts` L29894 → `controllers/blog.ts`). Cycle 42: five
   more service files do the same (`emmaEmailService.ts` L5 is a **static**
   import of `generateSessionResponse`). A-013 parks the family.
+
+## Loop inbound faces (cycle 43)
+
+`agentModeController.ts` (14,929 lines) is already the in-process
+composition root — three exports, many adapters, one process:
+
+| Export | Line |
+|---|---|
+| `runVerifiedChat` | L5019 |
+| `runScheduledChat` | L5362 |
+| `generateSessionResponse` | L7908 |
+
+Upstream: email, Slack, GTM, admin, imageReports, human eval, revision.
+**#2393** (ENG-272) extracts `services/conversation/channelPort.ts` + Slack
+adapter — the OMP/Hermes move, already in flight. Do not compete. Do not
+HTTP-split Emma. `executeAgentStep` still throws (A-003).

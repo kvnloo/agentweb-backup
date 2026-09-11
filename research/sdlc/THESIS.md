@@ -6,8 +6,9 @@ Do **not** explode Emma into a mesh of HTTP nanoservices. AgentWeb is
 already a **multi-runtime system** with a **god-object backend**. The
 cutting-edge move for *agentic* development is a **modular monolith**
 (Hermes / OMP shape): in-process packages with ports, one tool per file,
-a typed loop, and extract-to-network only where a deploy unit already
-exists.
+   a typed loop, and extract-to-network only where a deploy unit already
+exists. AgentWebPro **#2393** is already extracting a Slack channel port
+in-process — that is the move; do not add a fifth HTTP service.
 
 Q-013 (rewrite `agentModeService.ts`) stays **discard**. Network-splitting
 the chat loop is the same idea with more latency and a billing footgun.

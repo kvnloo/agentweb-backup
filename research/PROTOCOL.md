@@ -75,6 +75,8 @@ Known live programs (bootstrap):
 - Open PR: X post ranking scores (`emma/tools.ts`) — #2832 — do not edit that file for Q-004
 - Open PR: WhatsApp Cloud API — #2271
 - Open PR: convert_to_pdf foundation tool — #2861
+- Open PR: Slack conversation channel port — #2393 (ENG-272). Architecture
+  A-013 must not start at `routes/slack.ts`.
 - Open PR: autonomous report work plan — #2871
 - Open PR: dead AgentMode transports — #2563
 - Open PR: renewal-health alert — #2875
