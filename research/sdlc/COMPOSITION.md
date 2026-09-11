@@ -536,6 +536,11 @@ PASSes with Partner skipped. Fixtures still say `Partner portal
 tests`; live job is `Partner portal build`. Failure FAILs
 (`n_bad`); skip/cancel does not.
 
+Cycle 132: **no `WORKFLOW_JOBS`.** Test L1196–1198: editing
+`merge-evidence.sh` PASSes with `CI script tests` skipped.
+That job runs `merge-evidence.test.sh` (`tests.yml` L142).
+The gate does not require the job that tests the gate.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

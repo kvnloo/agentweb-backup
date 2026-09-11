@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 131
+cycles_completed: 132
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 132
+next_cycle: 133
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 131: merge-evidence has no PARTNER_JOBS; a partner-only PR
-  PASSes with Partner skipped. Cycle 132: cheapest remaining.
-  Candidate: same hole for CI script tests — editing
-  merge-evidence.sh PASSes with CI script tests skipped
-  (test L1196-1198). No WORKFLOW_JOBS.
+  Cycle 132: no WORKFLOW_JOBS; editing merge-evidence.sh PASSes
+  with CI script tests skipped. Cycle 133: cheapest remaining.
+  Candidate: ENG-1377/1463 relay and remotion builds are unnamed
+  in merge-evidence — same skip/cancel hole, not even in
+  NON_BACKEND.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

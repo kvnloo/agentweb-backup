@@ -216,6 +216,9 @@ merge-evidence section 7. Every tests.yml job except Detect
 changed projects is a job-level path skip. Do not add A-021.
 Cycle 131: merge-evidence has no `PARTNER_JOBS`. Partner-only
 PASSes with Partner skipped (test L1047). Do not add A-021.
+Cycle 132: no `WORKFLOW_JOBS`. Editing `merge-evidence.sh`
+PASSes with CI script tests skipped (test L1196–1198). Do not
+add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

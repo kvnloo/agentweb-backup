@@ -399,6 +399,10 @@ Cycle 131: **no `PARTNER_JOBS`.** Test L1047: partner-only diff
 PASSes with Partner skipped. Fixtures still say `Partner portal
 tests`; live job is `Partner portal build` (`tests.yml` L92).
 Failure still FAILs (`n_bad`). Skip/cancel does not.
+Cycle 132: **no `WORKFLOW_JOBS`.** Test L1196–1198: editing
+`merge-evidence.sh` PASSes with `CI script tests` skipped.
+That job runs `merge-evidence.test.sh` (`tests.yml` L142).
+Name-exists invariant does not list it (test L1498).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

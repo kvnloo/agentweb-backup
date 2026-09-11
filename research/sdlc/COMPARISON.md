@@ -324,3 +324,5 @@ reverted. Do not copy that as A-006.
   merge-evidence section 7. Not A-006.
 - Cycle 131: merge-evidence has no PARTNER_JOBS; partner-only
   PASSes with Partner skipped. Not A-006.
+- Cycle 132: no WORKFLOW_JOBS; editing merge-evidence.sh PASSes
+  with CI script tests skipped. Not A-006.
