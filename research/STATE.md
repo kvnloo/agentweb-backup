@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 127
+cycles_completed: 128
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 128
+next_cycle: 129
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
-  adds Backend build to GitHub required contexts. Cycle 128:
-  cheapest remaining. Candidate: Dependabot Integrity Check is
-  required in comments but skipped for non-Dependabot PRs —
-  does this tree document GitHub skip-of-required semantics?
+  Cycle 128: merge-evidence labels Dependabot skip as a path-filter
+  skip; #2491 PASSes with it skipped. Cycle 129: cheapest remaining.
+  Candidate: GitHub skip-of-required semantics vs this tree.
+  Job-level if skip is Success and does not block; workflow skip
+  stays Pending and does.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

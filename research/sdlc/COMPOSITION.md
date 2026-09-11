@@ -516,6 +516,11 @@ No script updates `required_status_checks`. `BACKEND_JOBS`
 Auto-merge waits on the required set only
 (`tasks/lessons.md` L237).
 
+Cycle 128: **merge-evidence labels Dependabot skip as a
+path-filter skip.** #2491 fixture L437 is `skipped` on a
+different check_suite; the gate PASSes (test L452). L974
+cannot tell a job-level `if` from a path-filter skip.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

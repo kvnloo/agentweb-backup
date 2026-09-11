@@ -381,6 +381,11 @@ Cycle 127: **ENG-1373 is still an unlanded comment**
 `BACKEND_JOBS` is script-local (L160). Dependabot yml L20 is
 also a comment. Auto-merge waits on the required set only
 (`tasks/lessons.md` L237).
+Cycle 128: **merge-evidence labels Dependabot skip as a
+path-filter skip.** The #2491 fixture includes
+`Dependabot Integrity Check` `skipped` (test L437, different
+check_suite) and PASSes (L452). L974 cannot tell that job-level
+`if` from a path-filter skip.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

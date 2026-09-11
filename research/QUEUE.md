@@ -231,4 +231,6 @@ the cancelled PASS. A-006 stays discarded.
 Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
 adds Backend build to GitHub required contexts. A-006 stays
 discarded.
+Cycle 128: merge-evidence labels Dependabot skip as a path-filter
+skip; #2491 PASSes with it skipped. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

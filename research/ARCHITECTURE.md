@@ -479,6 +479,8 @@ Cycle 126: in-flight ENG-836 is PENDING; cancel-in-progress turns
 it into the cancelled PASS. A-006 discarded.
 Cycle 127: ENG-1373 is still an unlanded comment; nothing in git
 adds Backend build to GitHub required contexts. A-006 discarded.
+Cycle 128: merge-evidence labels Dependabot skip as a path-filter
+skip; #2491 PASSes with it skipped. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
