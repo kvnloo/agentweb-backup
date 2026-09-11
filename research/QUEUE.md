@@ -156,4 +156,7 @@ Cycle 91: live MCP face is `/mcp`; `/mcp/server` is stale
 inspector + AGENT_API L129. Q-001 runbook already matches.
 Cycle 92: inspector is `--transport sse` against that dead
 path; GET `/mcp` without session is 400. A-006 stays discarded.
+Cycle 93: `mcpShutdown` runs on SIGTERM **before** `runDrain`
+(`mcpServer.ts` L269–270 vs `server.ts` L474–475). A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -226,3 +226,6 @@ reverted. Do not copy that as A-006.
 - Cycle 92: `mcp:inspector` is `--transport sse` against `/mcp/server`.
   Live initialize is POST `/mcp`. GET `/mcp` without session is 400.
   Do not HTTP-split to fix a script.
+- Cycle 93: two SIGTERM listeners. `mcpShutdown` closes inbound
+  CallTool first; `runDrain` waits second. ASG still drains before
+  SIGTERM. Do not HTTP-split to get one handler. OMP still 0.85.1.

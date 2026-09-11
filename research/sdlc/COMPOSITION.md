@@ -314,6 +314,13 @@ initialize is POST `/mcp`. GET `/mcp` SSE needs `mcp-session-id`
 (L512–515) or 400. Q-001 is Streamable HTTP at `/mcp`. Do not
 HTTP-split to make the inspector work.
 
+Cycle 93: **`mcpShutdown` races `runDrain` on SIGTERM.**
+`mcpServer.ts` L269–270 registers first (via `app.ts` L204 during
+`server.ts` L2 import). `server.ts` L474–475 is second. SIGTERM
+`transport.close()`s inbound CallTool, then drain waits. ASG still
+drains before SIGTERM (cycle 68). Inspector cannot open GET;
+Hermes can (`MCP_DISCOVERY.md` L15). OMP still 0.85.1.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

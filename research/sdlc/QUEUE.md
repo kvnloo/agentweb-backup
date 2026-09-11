@@ -102,7 +102,10 @@ Park A-018. Cycle 91: live HTTP face is `/mcp` only;
 `/mcp/server` is stale inspector + AGENT_API L129. Product READY
 unchanged. Cycle 92: that inspector is `--transport sse` against a
 Streamable HTTP POST `/mcp`; GET `/mcp` without session is 400.
-Product READY unchanged.
+Product READY unchanged. Cycle 93: `mcpShutdown` still unused by
+`runDrain`; on SIGTERM it runs **first** (`mcpServer.ts` L269–270
+before `server.ts` L474–475) and `transport.close()`s inbound CallTool.
+OMP still 0.85.1.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

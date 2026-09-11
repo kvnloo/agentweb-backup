@@ -412,6 +412,8 @@ is stale inspector + AGENT_API L129. Q-001 runbook is correct.
 A-006 discarded.
 Cycle 92: inspector `--transport sse` + `/mcp/server`. GET `/mcp`
 SSE needs session id or 400. A-006 discarded.
+Cycle 93: two SIGTERM listeners; `mcpShutdown` closes inbound
+CallTool before `runDrain`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

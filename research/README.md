@@ -231,6 +231,10 @@ Cycle 91: live MCP face is **`/mcp`** (`mcpServer.ts` L298).
 Cycle 92: that inspector is **SSE**. Live initialize is POST
 `/mcp` Streamable HTTP. GET `/mcp` without `mcp-session-id` is
 400 (`mcpServer.ts` L512–515). Do not HTTP-split to fix `npm run mcp:inspector`.
+Cycle 93: `mcpShutdown` is still unused by `runDrain`, but SIGTERM
+closes inbound MCP **first** (`mcpServer.ts` L269–270 registered
+via `app.ts` L204). Wrap CallTool after #2; then call `mcpShutdown`
+after the wait. Do not treat GET SSE as dead — Hermes can open it.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
