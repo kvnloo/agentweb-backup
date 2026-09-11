@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:25:00Z",
+  "updated_at": "2026-09-11T20:32:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -151,7 +151,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–46: chat forks generateMarketingResponseWorker.ts (new AgentModeService); parent is I/O (HTTP/Socket.IO/cron/MCP server, instanceState in-memory); worker is compute (no listen, socketEmit IPC). Chatbot still executeTool on the parent (chatbotService.ts L5461). generateImage already has three faces. Cycle 50: the MCP hop's surviving spend door after an A-015 leak is lookupUser in httpClient.ts L57–66, not a fifth process. A sixth HTTP image process that skipped that lookup would be a client of both OS processes. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–46: chat forks generateMarketingResponseWorker.ts (new AgentModeService); parent is I/O; worker is compute. Cycle 50: surviving MCP-hop spend door after an A-015 leak is lookupUser (httpClient.ts L57–66), not a fifth process. Cycle 51: copying requireEmmaTokenBudget is not that door — checkTokenUsage allow-lists anon_* ($2 vs ChatSessions, tokenUsageService.ts L293–305); _svc JWTs skip getUserById (auth.ts L155–167); leaf meter is void/no_user. A sixth HTTP image process that skipped lookupUser would uncapped-spend. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",
@@ -159,6 +159,9 @@
         "backend/src/routes/emmaApi.ts",
         "backend/src/workers/generateMarketingResponseWorker.ts",
         "backend/src/services/generateMarketingResponseWorkerService.ts",
+        "backend/src/middleware/auth.ts",
+        "backend/src/middleware/emmaTokenBudget.ts",
+        "backend/src/services/tokenUsageService.ts",
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "DISCARD. Keep imageGeneration.ts as an in-process module. MCP is the composition bus.",
@@ -251,7 +254,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 31,
-      "why": "Cycle 49–50. anonymousTransport.ts: tools/list is anonymously permitted when MCP_ANONYMOUS_DISCOVERY=true (default OFF). ANONYMOUS_TOOLS is an empty Set — look but not run. generate_image has no requiresUserAccount in apiTools.ts; the transport allowlist is the first spend door (comment L16–25 cites ENG-973). Cycle 50: a leaked CallTool still dies at mcpFetch lookupUser (httpClient.ts L57–66) before a JWT; ENG-822 does not rewrite User not found. Q-014 listing will advertise the tool to anonymous tools/list when the flag is on. Do not make generate_image the unshipped demo tool.",
+      "why": "Cycle 49–51. anonymousTransport.ts: tools/list is anonymously permitted when MCP_ANONYMOUS_DISCOVERY=true (default OFF). ANONYMOUS_TOOLS is an empty Set — look but not run. generate_image has no requiresUserAccount in apiTools.ts; the transport allowlist is the first spend door. Cycle 50: leaked CallTool dies at mcpFetch lookupUser before a JWT. Cycle 51: requireEmmaTokenBudget is not a fail for anon_* (checkTokenUsage L293–305 allows; _svc skips DB). Do not make generate_image the unshipped demo tool.",
       "files": [
         "backend/src/mcp/server/anonymousTransport.ts",
         "backend/src/mcp/server/mcpServer.ts",

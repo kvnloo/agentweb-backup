@@ -61,6 +61,11 @@ as part of this listing PR. A leaked CallTool already dies at
 `lookupUser` (`httpClient.ts` L57–66) before spend. ENG-822 on this
 tool would only change the error string, not the product.
 
+Cycle 51: do **not** treat `requireEmmaTokenBudget` as the anonymous
+spend door. `checkTokenUsage` allow-lists `anon_*` under $2 vs
+ChatSessions; MCP image calls do not create those rows. Authenticated
+Hermes still hits a real user row and the monthly cap.
+
 Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
 The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
 or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as

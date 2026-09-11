@@ -284,6 +284,9 @@ A-006 discarded.
 Cycle 50: leaked CallTool still dies at `mcpFetch` `lookupUser`
 (`httpClient.ts` L57–66 / L169) before a JWT. ENG-822 does not fire.
 A-006 discarded.
+Cycle 51: Emma meter **allows** `anon_*` (`tokenUsageService.ts`
+L293–305, $2 vs ChatSessions). `_svc` skips `getUserById`. Leaf meter
+drops `no_user`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

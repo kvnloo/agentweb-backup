@@ -78,7 +78,10 @@ is empty — look but not run (`anonymousTransport.ts`). Do not add
 a self-call JWT (`httpClient.ts` L57–66 / L169) — no leaf, no vendor.
 ENG-822 does not rewrite that error (`generate_image` has no
 `requiresUserAccount`). Copying `emmaApi` “because it is metered” is
-not the same door (cycle 51).
+not a spend door: `checkTokenUsage` **allows** `anon_*` under a $2
+ChatSessions cap (`tokenUsageService.ts` L293–305) and `_svc` JWTs skip
+`getUserById` (`auth.ts` L155–167). The leaf `meterUserUsage` is
+fire-and-forget and drops `no_user` (cycle 51).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -68,5 +68,6 @@ comparing Hermes / Oh My Pi. **Do not HTTP-split Emma.** See
 Cycle 46: parent is I/O, worker is compute; chatbot still `executeTool`
 on the parent. Cycle 47: three catalogs for `generate_image`; A-014
 parks copying page/skill gates onto MCP. Cycle 50: A-015 leak still
-cannot spend (`httpClient.ts` `lookupUser`). A-006 stays discarded.
+cannot spend (`httpClient.ts` `lookupUser`). Cycle 51: copying the
+Emma meter is not that door (`anon_*` is allow-listed). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

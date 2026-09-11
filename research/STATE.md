@@ -7,18 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 50
+cycles_completed: 51
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 51
+next_cycle: 52
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 50: even if A-015 leaked CallTool, mcpFetch lookupUser throws
-  before a JWT (httpClient.ts L57–66 / L169). ENG-822 does not fire
-  (no requiresUserAccount on generate_image). Cycle 51: map what
-  requireEmmaTokenBudget actually does for anon_* — it is not a fail.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 51: requireEmmaTokenBudget allow-lists anon_* ($2 vs
+  ChatSessions, not MCP). _svc JWTs skip getUserById. Leaf meter
+  is void / no_user. lookupUser remains the MCP-hop spend door.
+  Cycle 52: collision refresh. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

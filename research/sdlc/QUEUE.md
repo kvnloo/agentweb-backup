@@ -28,10 +28,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 50: A-015 leak still cannot spend — `mcpFetch` `lookupUser` throws
-before a JWT (`httpClient.ts` L57–66 / L169). ENG-822 does not fire.
-A-015 stays park. A-007 waits on kvnloo#2. A-006 stays discard.
-Product READY unchanged.
+Cycle 51: the Emma meter **allows** `anon_*` (ENG-1163 $2 vs
+ChatSessions). MCP-hop spend door remains `lookupUser`, not
+`requireEmmaTokenBudget`. A-015 stays park. A-007 waits on kvnloo#2.
+A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -217,6 +217,15 @@ ENG-822 was written to hide, not a picture. That is UX, not spend.
 Do not treat `requireEmmaTokenBudget` as the third fail on this path
 (the request never arrives).
 
+Cycle 51: **the Emma meter allow-lists `anon_*`.** `auth.ts` L155–167
+trusts `_svc` claims with no user row. `checkTokenUsage` L293–305
+returns `allowed` while ChatSessions `totalCost` is under **$2**
+(`ANONYMOUS_SESSION_COST_CAP_USD` L182). MCP image calls do not create
+those sessions, so `costUsed` stays 0. `imageGeneration.ts` L551
+`void meterUserUsage`; `incrementUserTokenUsage` L567–570 is `no_user`.
+If A-006 copied “the metered route” and skipped `lookupUser`, vendor
+spend would be uncapped. Identity stays in the host (`httpClient.ts`).
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:
