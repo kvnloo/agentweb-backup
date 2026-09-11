@@ -73,7 +73,7 @@ Model choice is verified against the provider: staging reproduced HTTP 404 for
 `gemini-2.5-flash` (unavailable to new projects), whose response directs callers to
 `gemini-3.6-flash`. The image model uses the maintained GA release listed in
 [Google’s lifecycle documentation](https://ai.google.dev/gemini-api/docs/deprecations).
-Creative requests require image-only output so the provider cannot satisfy the request with only a text description ([Google image-generation API](https://ai.google.dev/gemini-api/docs/generate-content/image-generation)).
+Creative requests use image-only output and an explicit image-rendering task; staging reproduced `NO_IMAGE` when the broad shared task permitted a written concept ([Google image-generation API](https://ai.google.dev/gemini-api/docs/generate-content/image-generation)).
 There is no fallback chain or user-selected model.
 
 ## Storage and deployment
