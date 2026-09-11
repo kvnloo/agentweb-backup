@@ -351,6 +351,21 @@ export function imageGenerationCostUsd(model: string, resolution?: '1K'): number
   return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
 }
 
+/** Gemini 3.1 Flash Image at explicit 1K: official standard rates, verified 2026-09-11. */
+export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
+  const data = usage && typeof usage === 'object' ? usage as Record<string, unknown> : {};
+  const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const inputTokens = count(data.promptTokenCount);
+  const candidates = count(data.candidatesTokenCount);
+  const thinking = count(data.thoughtsTokenCount);
+  const imageTokens = hasImage ? 1120 : 0;
+  return {
+    inputTokens, outputTokens: candidates + thinking,
+    costUsdOverride: (hasImage ? imageGenerationCostUsd('gemini-3.1-flash-image', '1K') : 0) +
+      (inputTokens * 0.5 + (Math.max(0, candidates - imageTokens) + thinking) * 3) / 1e6,
+  };
+}
+
 /**
  * Per-generation USD cost for a video model. Video is billed per 8s clip; a longer
  * requested duration bills as ceil(seconds / 8) clips.

@@ -1,5 +1,5 @@
 import { recordUsage } from './usageRecorderService';
-import { imageGenerationCostUsd } from '../utils/llmPricing';
+import { geminiFlashImageUsage } from '../utils/llmPricing';
 import sharp from 'sharp';
 import { evaluationStore } from './evaluationStore';
 import { EvaluationDenied, requireActiveEvaluation } from './evaluationPolicy';
@@ -30,20 +30,22 @@ export async function runEvaluation(userId: string, input: EvaluationAction) {
       httpOptions: { timeout: 90000, retryOptions: { attempts: 1 } },
     },
   });
+  const candidates = response?.candidates;
+  const parts = Array.isArray(candidates) && candidates.length === 1 && candidates[0]?.content?.parts;
+  const validParts = Array.isArray(parts) && parts.length > 0 && parts.every(p => p && typeof p === 'object' && !Array.isArray(p));
+  const images = validParts ? parts.filter(p => p.inlineData !== undefined) : [];
+  const hasImage = images.length === 1 && typeof images[0].inlineData?.data === 'string' &&
+    ['image/png', 'image/jpeg', 'image/webp'].includes(images[0].inlineData?.mimeType) && images[0].inlineData.data.length > 0 && images[0].inlineData.data.length <= 20000000;
   if (input.action === 'generate_creative') {
+    // Meter completed provider work even when its output is rejected or access revoked.
     // The shared token wrapper intentionally skips per-generation-priced models.
-    // Use the existing allocation price book; atomic admission remains the hard cap.
     await recordUsage({ userId, model: 'gemini-3.1-flash-image', provider: 'gemini', feature: 'evaluation',
-      inputTokens: 0, outputTokens: 0, costUsdOverride: imageGenerationCostUsd('gemini-3.1-flash-image', '1K') });
+      ...geminiFlashImageUsage(response?.usageMetadata, hasImage) });
   }
   await requireActiveEvaluation(userId);
-  const candidates = response?.candidates;
-  if (!Array.isArray(candidates) || candidates.length !== 1 || !candidates[0] || typeof candidates[0] !== 'object') throw new EvaluationDenied();
-  const parts = candidates[0].content?.parts;
-  if (!Array.isArray(parts) || parts.length === 0 || parts.some(p => !p || typeof p !== 'object' || Array.isArray(p))) throw new EvaluationDenied();
+  if (!validParts) throw new EvaluationDenied();
   if (input.action === 'generate_creative') {
-    const images = parts.filter(p => p.inlineData !== undefined);
-    if (images.length !== 1 || typeof images[0].inlineData?.data !== 'string' || !['image/png', 'image/jpeg', 'image/webp'].includes(images[0].inlineData?.mimeType) || images[0].inlineData.data.length > 20000000) throw new EvaluationDenied();
+    if (!hasImage) throw new EvaluationDenied();
     const source = Buffer.from(images[0].inlineData.data, 'base64');
     let content = Buffer.alloc(0);
     for (let width = 1024; width >= 64; width /= 2) {

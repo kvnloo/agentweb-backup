@@ -40,6 +40,16 @@ describe('ENG-1870 approved-material-only generation and bounded spend', () => {
   it('the supported analysis model has nonzero spend accounting', () => {
     expect(getModelPrice('gemini-3.6-flash')).toMatchObject({ inPerM: 0.75, outPerM: 3.75 });
   });
+  it.each([
+    ['text-only', { candidates: [{ content: { parts: [{ text: 'No image generated' }] } }], usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 200, thoughtsTokenCount: 100 } }, 0.0014],
+    ['blocked', { candidates: [], usageMetadata: { promptTokenCount: 1000 } }, 0.0005],
+  ])('records billed tokens without an image charge for %s responses', async (_name, response, cost) => {
+    generateContent.mockResolvedValueOnce(response);
+    await expect(runEvaluation('eval_test', { action: 'generate_creative', prompt: 'Synthetic concept' })).rejects.toThrow();
+    const usage = (recordUsage as jest.Mock).mock.calls[0][0];
+    expect(usage.inputTokens).toBe(1000);
+    expect(usage.costUsdOverride).toBeCloseTo(cost as number, 8);
+  });
   it('exhausted budget makes no provider call', async () => {
     (evaluationStore.reserve as jest.Mock).mockRejectedValue(new Error('budget exhausted'));
     await expect(runEvaluation('eval_test', { action: 'analyze', prompt: 'Strategy' })).rejects.toThrow();
@@ -64,10 +74,10 @@ describe('ENG-1870 approved-material-only generation and bounded spend', () => {
   });
   it('stores a high-entropy generated creative within the private artifact size limit', async () => {
     const image = await sharp(randomBytes(1024 * 1024 * 3), { raw: { width: 1024, height: 1024, channels: 3 } }).png().toBuffer();
-    generateContent.mockResolvedValueOnce({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: image.toString('base64') } }] } }] });
+    generateContent.mockResolvedValueOnce({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: image.toString('base64') } }] } }], usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 1200, thoughtsTokenCount: 100 } });
     await runEvaluation('eval_test', { action: 'generate_creative', prompt: 'Create an evaluation image' });
     expect((evaluationStore.saveArtifact as jest.Mock).mock.calls[0][1].length).toBeLessThanOrEqual(240000);
     expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'eval_test', feature: 'evaluation', costUsdOverride: expect.any(Number) }));
-    expect((recordUsage as jest.Mock).mock.calls[0][0].costUsdOverride).toBe(0.0672);
+    expect((recordUsage as jest.Mock).mock.calls[0][0].costUsdOverride).toBeCloseTo(0.06824, 8);
   });
 });
