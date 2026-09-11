@@ -351,6 +351,12 @@ Worker L363/L443 already refuses new work. `mcp/server/` still
 has zero `cronJobRegistry` imports. Wrap CallTool after #2 must
 copy the worker pair, or Hermes POSTs extend the 10 min ceiling.
 
+Cycle 99: **`chatbotTurn` is the wrap preview.** `server.ts`
+L286–301 tracks Socket.IO `'message'` with no `isCronEnabled`.
+`chatSocketHandler.ts` has zero drain checks. `io.close` is after
+the four-way wait. `/socket.io/` is 3600s. New Emma turns during
+drain keep `inFlight.size` > 0.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

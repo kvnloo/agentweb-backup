@@ -256,6 +256,10 @@ Cycle 98: `cronJobRegistry.drain()` is a live `while (size > 0)`
 The worker already refuses new `runInWorker` (L443). Wrap
 CallTool after #2 must copy that pair, or Hermes POSTs during
 overlap hold the 10 min ceiling.
+Cycle 99: that wrap already exists for Emma chat.
+`cronJobRegistry.track('chatbotTurn', …)` (`server.ts` L301) has
+no `isCronEnabled`. `io.close` is after the four-way wait.
+`/socket.io/` is 3600s. Do not HTTP-split to get a draining flag.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

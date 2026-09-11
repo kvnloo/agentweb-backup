@@ -121,6 +121,9 @@ Cycle 98: `cronJobRegistry.drain()` is a live `while (size > 0)`
 (L68); `track()` has no `draining` flag. Worker already refuses
 new `runInWorker` (L443). Wrap CallTool after #2 must copy that
 pair. Product READY unchanged.
+Cycle 99: `chatbotTurn` already `track()`s Socket.IO `'message'`
+(`server.ts` L301) with no `isCronEnabled`. `io.close` is after
+the wait. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

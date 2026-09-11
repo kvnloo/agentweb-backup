@@ -244,3 +244,6 @@ reverted. Do not copy that as A-006.
 - Cycle 98: `cronJobRegistry.drain()` is live (`inFlight.size`).
   `track()` has no `draining` flag; the worker does. Wrap CallTool
   after #2 must copy that pair, not `track()` alone.
+- Cycle 99: `chatbotTurn` already `track()`s Socket.IO with no
+  admission. `io.close` is after the wait. The wrap footgun is
+  in-app Emma today, not only a future MCP wrap.

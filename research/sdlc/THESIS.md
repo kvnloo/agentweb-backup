@@ -130,6 +130,8 @@ Cycle 97: drain 503s scheduled chats only; `/health` and `/mcp`
 stay open until unawaited `server.close`.
 Cycle 98: `cronJobRegistry.drain()` is live; `track()` has no
 gate. Worker already refuses new `runInWorker`.
+Cycle 99: `chatbotTurn` already extends that live drain; wrap
+CallTool after #2 must copy the worker pair.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -171,4 +171,6 @@ stay open until unawaited `server.close`. A-006 stays discarded.
 Cycle 98: `cronJobRegistry.drain()` is live; `track()` has no gate.
 Wrap CallTool after #2 must copy worker `draining`. A-006 stays
 discarded.
+Cycle 99: `chatbotTurn` already extends that live drain (`server.ts`
+L301, no `isCronEnabled`). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
