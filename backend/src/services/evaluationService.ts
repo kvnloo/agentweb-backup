@@ -1,5 +1,5 @@
 import { recordUsage } from './usageRecorderService';
-import { imageGenerationCostUsd } from '../utils/llmPricing';
+import { geminiFlashImageUsage } from '../utils/llmPricing';
 import sharp from 'sharp';
 import { evaluationStore } from './evaluationStore';
 import { EvaluationDenied, requireActiveEvaluation } from './evaluationPolicy';
@@ -30,36 +30,22 @@ export async function runEvaluation(userId: string, input: EvaluationAction) {
       httpOptions: { timeout: 90000, retryOptions: { attempts: 1 } },
     },
   });
-  const meterCreative = async (includeImage: boolean) => {
-    if (input.action !== 'generate_creative') return;
-    const usage = response?.usageMetadata;
-    const tokens = (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0 ? value as number : 0;
-    const inputTokens = tokens(usage?.promptTokenCount);
-    const candidateTokens = tokens(usage?.candidatesTokenCount);
-    const thoughtTokens = tokens(usage?.thoughtsTokenCount);
-    const tokenCost = (inputTokens * 0.5 + (candidateTokens + thoughtTokens) * 3) / 1_000_000;
-    await recordUsage({ userId, model: 'gemini-3.1-flash-image', provider: 'gemini', feature: 'evaluation',
-      inputTokens, outputTokens: candidateTokens + thoughtTokens,
-      costUsdOverride: tokenCost + (includeImage ? imageGenerationCostUsd('gemini-3.1-flash-image', '1K') : 0) });
-  };
-  await requireActiveEvaluation(userId);
   const candidates = response?.candidates;
-  if (!Array.isArray(candidates) || candidates.length !== 1 || !candidates[0] || typeof candidates[0] !== 'object') {
-    await meterCreative(false);
-    throw new EvaluationDenied();
-  }
-  const parts = candidates[0].content?.parts;
-  if (!Array.isArray(parts) || parts.length === 0 || parts.some(p => !p || typeof p !== 'object' || Array.isArray(p))) {
-    await meterCreative(false);
-    throw new EvaluationDenied();
-  }
+  const parts = Array.isArray(candidates) && candidates.length === 1 && candidates[0]?.content?.parts;
+  const validParts = Array.isArray(parts) && parts.length > 0 && parts.every(p => p && typeof p === 'object' && !Array.isArray(p));
+  const images = validParts ? parts.filter(p => p.inlineData !== undefined) : [];
+  const hasImage = images.length === 1 && typeof images[0].inlineData?.data === 'string' &&
+    ['image/png', 'image/jpeg', 'image/webp'].includes(images[0].inlineData?.mimeType) && images[0].inlineData.data.length > 0 && images[0].inlineData.data.length <= 20000000;
   if (input.action === 'generate_creative') {
-    const images = parts.filter(p => p.inlineData !== undefined);
-    if (images.length !== 1 || typeof images[0].inlineData?.data !== 'string' || !['image/png', 'image/jpeg', 'image/webp'].includes(images[0].inlineData?.mimeType) || images[0].inlineData.data.length > 20000000) {
-      await meterCreative(false);
-      throw new EvaluationDenied();
-    }
-    await meterCreative(true);
+    // Meter completed provider work even when its output is rejected or access revoked.
+    // The shared token wrapper intentionally skips per-generation-priced models.
+    await recordUsage({ userId, model: 'gemini-3.1-flash-image', provider: 'gemini', feature: 'evaluation',
+      ...geminiFlashImageUsage(response?.usageMetadata, hasImage) });
+  }
+  await requireActiveEvaluation(userId);
+  if (!validParts) throw new EvaluationDenied();
+  if (input.action === 'generate_creative') {
+    if (!hasImage) throw new EvaluationDenied();
     const source = Buffer.from(images[0].inlineData.data, 'base64');
     let content = Buffer.alloc(0);
     for (let width = 1024; width >= 64; width /= 2) {
