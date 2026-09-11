@@ -67,6 +67,11 @@ class StagingContract(unittest.TestCase):
             self.assertIn('${{ secrets.' + name + ' }}', step('Configure AWS credentials'))
         self.assertNotIn('secrets.', workflow[:workflow.index('  backend-staging-deploy:')])
         self.assertLess(workflow.index('name: Transfer deployment package'), workflow.index('  backend-staging-deploy:'))
+        deploy_job = workflow.split('  backend-staging-deploy:\n', 1)[1]
+        job_timeout = int(re.search(r'^    timeout-minutes: (\d+)$', deploy_job, re.M).group(1))
+        deploy_timeout = int(re.search(r"EB_TOTAL_TIMEOUT_SECONDS: '(\d+)'", deploy_job).group(1))
+        green_timeout = int(re.search(r'STAGING_GREEN_TIMEOUT_SECONDS:-(\d+)', deploy_job).group(1))
+        self.assertGreater(job_timeout * 60, deploy_timeout + green_timeout)
 
     def test_empty_ref_cannot_fall_back_to_main(self):
         self.assertIn('DEPLOY_REF: ${{ inputs.ref }}', step('Validate explicit ref'))
