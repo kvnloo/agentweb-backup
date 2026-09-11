@@ -22,7 +22,7 @@ routing/eval, and external-agent (Hermes/MCP) operation*.
 | `kvnloo/hermes-agent` (+ `hermes-keel`, `hermes-talk`, Linear Hermes HITL) | Deep Hermes contributor | AgentWeb just shipped **Hermes native OAuth** for Emma MCP (`backend/docs/HERMES_MCP_OAUTH.md`). Operator UX is still PTY+paste. Kevin can make Emma-via-Hermes actually usable. |
 | `kvnloo/frontier-kb` | Cross-harness research (OMP/Hermes/Codex/Claude/Cursor/Pi) | Agent-mode loops already emit reliability events. Read-only harness export, not a runtime swap. |
 | `kvnloo/oss-factory` + `verified-oss-loop` | HITL contribution factory, KEEP/DISCARD receipts | Use the *protocol* here (this research loop). Do not run factory spray against AgentWeb. |
-| `kvnloo/hyperframes`, `open-design`, `MoneyPrinterTurbo`, `openavatar` | Agent-native video/design/identity | Remotion Lambda already brands Veo/Seedance clips. Expand compositions; don't replace Veo. |
+| `kvnloo/hyperframes`, `open-design`, `MoneyPrinterTurbo`, `openavatar` | HyperFrames: HTML→MP4. MPT: LLM short-video. open-design: local design + HyperFrames. | Remotion `BrandedVideo` already has intro lower-third + CTA end card on Veo/Seedance clips. **Do not port.** Extra compositions are product intent (Q-007 parked). Video MCP is Q-016, after Q-014. |
 | `kvnloo/headroom` | Compress tool output before the LLM | Agent Mode already has message-size guards and S3 offload seams; worth a later cycle, not first. |
 | `kvnloo/harbor`, `factorio-learning-environment` | Agent eval environments | Evaluation workspaces (ENG-1870) are a **connector-free Meta simulator**, not an LM arena. Different product; possible creative-eval harness later. |
 
@@ -58,7 +58,9 @@ Kevin should not be a generic AgentWeb engineer. The first useful role is:
 
 1. **Operator of Emma-from-Hermes** (OAuth path that already exists, UX that does not).
 2. **Creative routing scientist** — wire DesignArena + Matt's image eval into model choice without a new database.
-3. **Optional Comfy/Remotion graph node** behind the existing `generate_image` / `compose_video` tools, metered the same way.
+3. **Do not port Comfy/HyperFrames/MPT.** Remotion is already the graph node
+   (intro + outro). Comfy stays an optional image backend (Q-009). Hermes
+   video listing waits on Q-014 (Q-016).
 
 CRM, Stripe, Meta payload plumbing, and `agentModeService.ts` rewrites are
 someone else's lane.

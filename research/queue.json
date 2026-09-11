@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:34:00Z",
+  "updated_at": "2026-09-11T17:37:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -122,19 +122,21 @@
     {
       "id": "Q-007",
       "title": "Remotion compositions beyond intro/outro",
-      "status": "triage",
+      "status": "park",
       "leverage": 4,
-      "product": 3,
+      "product": 2,
       "mergeability": 4,
-      "evidence": 3,
+      "evidence": 5,
       "collision": 1,
-      "score": 27,
-      "why": "hyperframes/open-design/MoneyPrinterTurbo overlap. Remotion is the only graph-like post node today. Safe because it does not touch Veo/Seedance providers.",
+      "score": 24,
+      "why": "Cycle 10: IntroOverlay (lower-third) and OutroOverlay (CTA end card) already ship in the single BrandedVideo composition. Root.tsx has one Composition id. Do not port HyperFrames (HTML→MP4) or MoneyPrinterTurbo. Extra compositions (captions, mid-roll still) need product intent.",
       "files": [
+        "remotion-lambda/src/Root.tsx",
         "remotion-lambda/src/compositions/BrandedVideo.tsx",
-        "backend/src/services/remotionService.ts"
+        "backend/src/services/remotionService.ts",
+        "research/mappings/content-gen-graph.md"
       ],
-      "first_slice": "Second composition (lower-third / product plate) behind compose_video. Metering unchanged.",
+      "first_slice": "PARK. Revisit only if Matt asks for captions or a second named composition. Metering already on remotion vendor usage.",
       "harsha_db": false
     },
     {
@@ -281,6 +283,25 @@
         "backend/src/__tests__/security.mcpServer.test.ts"
       ],
       "first_slice": "See research/briefs/Q-015-hide-admin-mcp-tools.md. internal+internalOnly on the three always-admin tools. No ListTools DB lookup. Leave manage_* for ENG-983.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-016",
+      "title": "Expose generate_video / compose_video on external MCP after Q-014",
+      "status": "park",
+      "leverage": 4,
+      "product": 3,
+      "mergeability": 3,
+      "evidence": 5,
+      "collision": 2,
+      "score": 26,
+      "why": "Video tools exist only on emmaToolRegistry. MCP grep is empty. seedance-2.0 is $1.55/8s vs image $0.04. ENG-973 hid generate_image for cost; listing video first repeats that at 40×. Park until Q-014 ships and there is product intent for Hermes ads-video.",
+      "files": [
+        "backend/src/emma/tools.ts",
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/services/videoGeneration.ts"
+      ],
+      "first_slice": "PARK. After Q-014: optional emma_compose_video wrapper, same meter, required duration. Do not add HyperFrames as a provider.",
       "harsha_db": false
     }
   ]

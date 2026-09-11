@@ -29,7 +29,9 @@ manage_user_notes. Do not unlist `manage_*` (ENG-983).
 
 CRM, HubSpot, Meta payload bugs, billing ledger, `agentModeService.ts`
 rewrites, Kerdoios-inside-AgentWeb, ENG-983 catalogue unlisting, WhatsApp
-Cloud API (#2271), ngrok revival of `local-agent-relay`.
+Cloud API (#2271), ngrok revival of `local-agent-relay`, porting HyperFrames
+or MoneyPrinterTurbo into Remotion, listing `generate_video` on MCP before
+Q-014.
 
 ## If we only do one thing
 

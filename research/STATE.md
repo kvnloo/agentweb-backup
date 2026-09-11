@@ -6,16 +6,16 @@ owner: cursor-cloud bc-658f6e8c-e6a2-4e2e-99d4-8bee7362c95b
 branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
-cycles_completed: 9
+cycles_completed: 10
 target_cycles: 7
 stop_after: 2026-09-11T20:15:00Z
-next_cycle: 10
+next_cycle: 11
 focus: optional-refine-until-stop_after
 next_focus_hint: |
   briefing_ready is true. Implementation order remains Q-001, Q-014,
-  Q-003. Hygiene READY: Q-006, Q-015. Do not un-ready those without a
-  new citation. Optional until 20:15 UTC: Q-007 Remotion compositions
-  vs hyperframes (file-level), or Q-004 post_on_account brief. If
+  Q-003. Hygiene READY: Q-006, Q-015. Q-007 parked (intro/outro shipped).
+  Q-016 parked (video MCP after Q-014). Optional until 20:15 UTC:
+  Q-004 post_on_account brief, or collision refresh of open PRs. If
   stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 ```

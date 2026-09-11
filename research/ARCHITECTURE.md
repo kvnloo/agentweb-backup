@@ -129,8 +129,11 @@ picker.** Cycle 8 proved `mcp-bench-router` cannot pick Emma providers
 flip the production default until Matt says so. See
 `mappings/designarena-image-models.md`.
 
-Video: Seedance (Higgsfield MCP) → Veo; Remotion `BrandedVideo` for brand
-overlays. That is the only graph-like node today (Q-007 / Comfy later).
+Video: Seedance (Higgsfield) → Veo; Remotion `BrandedVideo` for brand
+overlays. Cycle 10: that composition **already** has the lower-third intro
+and CTA end card (`Root.tsx` has one id). HyperFrames (HTML→MP4) and
+MoneyPrinterTurbo are not drop-in providers. Extra compositions: Q-007
+parked. Video on MCP: Q-016, after Q-014. Comfy: Q-009.
 
 **Do not touch:** `meterUserUsage`, C2PA default-on, `logoImage` preservation.
 
@@ -178,8 +181,9 @@ Hygiene READY (after the first three): **Q-006** hide deprecated
 full-file edit; **Q-015** hide always-admin tools. KEEP: **Q-004**
 `post_on_account` `internalOnly` only.
 
-Parked: Comfy backend, Agent Mode strangler, ENG-381 until Harsha says it's
-yours (ownership not visible from this clone or from Linear `0ism`).
+Parked: Comfy backend (Q-009), extra Remotion compositions (Q-007 —
+intro/outro already ship), MCP video (Q-016, after Q-014), Agent Mode
+strangler, ENG-381 until Harsha says it's yours.
 
 Customer-portal code is **not in this clone**. Anything you want to see in
 the app UI needs the other repo.

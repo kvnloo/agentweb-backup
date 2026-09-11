@@ -47,4 +47,7 @@ are ready to implement.
 - `briefs/Q-003-designarena-adapter.md` (third in implementation order)
 - `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` (MCP hygiene)
 
+Mapping: `mappings/designarena-image-models.md`,
+`mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy).
+
 The loop may keep refining until `stop_after` (20:15 UTC).
