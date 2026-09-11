@@ -6,6 +6,7 @@ import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+    getAllUsers: jest.fn(),
   },
   crmDb: {
     getLeadListsByUserId: jest.fn(),
@@ -32,6 +33,10 @@ const accountDayRows = () => writtenRows().filter((r: any) => r.rowType === 'acc
 
 jest.mock('../services/metaAccountCredentials', () => ({
   getMetaAccountCredentials: jest.fn(),
+  // Real implementation, not a jest.fn() — enumerateDistinctMetaAdAccounts uses this to
+  // dedupe accounts, and its actual stripping behavior (not just "some function exists")
+  // is what the multi-account tests below depend on.
+  cleanAccountId: (id: string) => (id || '').replace('act_', ''),
 }));
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -455,16 +460,30 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   });
 });
 
-describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failure isolation)', () => {
+describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settling window, per-account + per-day failure isolation)', () => {
   const cronModule = jest.requireActual('../cron/metaMetricsSnapshotCron');
+
+  /** A single user with a single connected Meta account — the degenerate, pre-widening case. */
+  function makeSingleAccountUser(overrides: Partial<{ userId: string; accountId: string; createdAt: string }> = {}) {
+    const userId = overrides.userId ?? TEST_USER_ID_MATCHING_CRON;
+    const accountId = overrides.accountId ?? '1000000000000001';
+    return {
+      userId,
+      connected_accounts: [
+        {
+          platform: 'meta',
+          account_id: accountId,
+          created_at: overrides.createdAt ?? '2026-01-01T00:00:00.000Z',
+          config: { account_type: 'ad_account', access_token: 'tok', ad_account_id: accountId },
+        },
+      ],
+    };
+  }
 
   beforeEach(() => {
     jest.resetAllMocks();
     global.fetch = jest.fn();
-    mockUserDb.getUserById.mockResolvedValue({
-      userId: TEST_USER_ID_MATCHING_CRON,
-      connected_accounts: [{ platform: 'meta', config: { account_type: 'ad_account', access_token: 'tok' } }],
-    } as any);
+    mockUserDb.getAllUsers.mockResolvedValue([makeSingleAccountUser()] as any);
     mockGetCreds.mockResolvedValue({ accountId: '1000000000000001', accessToken: 'tok', accountName: 'Test Account' });
     mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
     mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
@@ -531,7 +550,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
     errorSpy.mockRestore();
   });
 
-  it('resolves Meta credentials ONCE for the whole run, not once per day', async () => {
+  it('resolves Meta credentials ONCE per account, not once per day', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
@@ -543,9 +562,11 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
 
     // getMetaAccountCredentials can refresh and PERSIST the Meta token inline, so resolving it
     // per day meant 28 reads (and 28 chances to write) against a live managed client's record
-    // every run. One resolution is reused for every day in the settling window.
+    // every run. One resolution per account is reused for every day in that account's settling
+    // window. (No more getUserById call here at all — enumerateDistinctMetaAdAccounts already
+    // carries the full user record from getAllUsers.)
     expect(mockGetCreds).toHaveBeenCalledTimes(1);
-    expect(mockUserDb.getUserById).toHaveBeenCalledTimes(1);
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     // ...while every day in the window still got written.
     const datesWritten = mockAdsDb.putSnapshot.mock.calls.map((c: any) => c[0].date);
     expect(new Set(datesWritten).size).toBe(28);
@@ -561,15 +582,15 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
 
     await runMetaMetricsSnapshot();
 
-    // If credentials are dead no day can succeed, so the run must fail fast with one clear line
-    // rather than repeating the identical error once per day in the settling window.
+    // If credentials are dead no day can succeed for this (only) account, so the run must fail
+    // fast with one clear line rather than repeating the identical error once per day.
     expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
     expect(global.fetch).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledTimes(1);
     errorSpy.mockRestore();
   });
 
-  it('walks the CRM lead lists ONCE for the whole window, not once per day', async () => {
+  it('walks the CRM lead lists ONCE per account for the whole window, not once per day', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
@@ -581,7 +602,7 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
 
     // getLeadsForListOnDate cannot early-stop (AW-Leads orders by leadId, not createdAt), so it
     // scans every page of every list. Calling it per day meant 28 identical full walks per run.
-    // One walk now serves the whole settling window, bucketed by date.
+    // One walk now serves the whole settling window per account, bucketed by date.
     expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(1);
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
     // ...and every day in the window still got written.
@@ -605,9 +626,162 @@ describe('ENG-916 runMetaMetricsSnapshot (28-day settling window + per-day failu
       expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
     }
   });
+
+  // ── ENG-1552 widening: multi-account behavior ──────────────────────────────────────────
+  describe('multi-account enumeration (ENG-1552 widening)', () => {
+    it('snapshots every distinct account, resolving credentials independently for each', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-a', accountId: '111111111111' }),
+        makeSingleAccountUser({ userId: 'user-b', accountId: '222222222222' }),
+      ] as any);
+      mockGetCreds.mockImplementation(async (_user: any, _userId: any, accountId: any) => ({
+        accountId,
+        accessToken: `tok-${accountId}`,
+        accountName: 'Test',
+      }));
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([
+          { campaign_id: 'camp1', campaign_name: 'C1', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        ]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      expect(mockGetCreds).toHaveBeenCalledTimes(2);
+      expect(mockGetCreds).toHaveBeenCalledWith(expect.anything(), 'user-a', '111111111111');
+      expect(mockGetCreds).toHaveBeenCalledWith(expect.anything(), 'user-b', '222222222222');
+      const accountsWritten = new Set(writtenRows().map((r: any) => r.accountId));
+      expect(accountsWritten).toEqual(new Set(['111111111111', '222222222222']));
+    });
+
+    it('one account failing entirely does not stop the other accounts from being snapshotted', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-a', accountId: '111111111111' }),
+        makeSingleAccountUser({ userId: 'user-b', accountId: '222222222222' }),
+      ] as any);
+      mockGetCreds.mockImplementation(async (_user: any, _userId: any, accountId: any) => {
+        if (accountId === '111111111111') throw new Error('token expired');
+        return { accountId, accessToken: `tok-${accountId}`, accountName: 'Test' };
+      });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([
+          { campaign_id: 'camp1', campaign_name: 'C1', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+        ]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      const accountsWritten = new Set(writtenRows().map((r: any) => r.accountId));
+      expect(accountsWritten).toEqual(new Set(['222222222222']));
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it('dedupes a shared account reachable from multiple users, picking the EARLIEST-connected user as canonical', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'later-user', accountId: 'shared-acct', createdAt: '2026-06-01T00:00:00.000Z' }),
+        makeSingleAccountUser({ userId: 'earlier-user', accountId: 'shared-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
+      ] as any);
+      mockGetCreds.mockResolvedValue({ accountId: 'shared-acct', accessToken: 'tok', accountName: 'Test' });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      // Exactly one credential resolution for the shared account — deduped, not double-snapshotted.
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      expect(mockGetCreds).toHaveBeenCalledWith(expect.anything(), 'earlier-user', 'shared-acct');
+      expect(mockGetCreds).not.toHaveBeenCalledWith(expect.anything(), 'later-user', expect.anything());
+    });
+
+    // Review finding: the tie-break's own edge cases (an exact tie, and every candidate
+    // missing created_at) were correct by hand-trace but had no direct test — closing that
+    // gap here rather than leaving the correctness unverified.
+    it('an exact created_at tie still resolves to exactly one canonical user, without crashing', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-x', accountId: 'tied-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
+        makeSingleAccountUser({ userId: 'user-y', accountId: 'tied-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
+      ] as any);
+      mockGetCreds.mockResolvedValue({ accountId: 'tied-acct', accessToken: 'tok', accountName: 'Test' });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      // Exactly one resolution — a tie must still dedupe to a single canonical user, not
+      // snapshot the account twice or throw.
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      const [, resolvedUserId] = mockGetCreds.mock.calls[0];
+      expect(['user-x', 'user-y']).toContain(resolvedUserId);
+    });
+
+    it('every candidate missing created_at still resolves to exactly one canonical user', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-a', accountId: 'undated-acct', createdAt: '' }),
+        makeSingleAccountUser({ userId: 'user-b', accountId: 'undated-acct', createdAt: '' }),
+      ] as any);
+      mockGetCreds.mockResolvedValue({ accountId: 'undated-acct', accessToken: 'tok', accountName: 'Test' });
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      // Missing created_at must not crash the Date.parse/Infinity comparison, and must
+      // still dedupe to exactly one resolution rather than skipping the account entirely
+      // or double-snapshotting it.
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      const [, resolvedUserId] = mockGetCreds.mock.calls[0];
+      expect(['user-a', 'user-b']).toContain(resolvedUserId);
+    });
+
+    it('excludes an account id in EXCLUDED_META_ACCOUNT_IDS entirely — no credential resolution, no rows', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'every-io-user', accountId: '1358071355944019' }),
+      ] as any);
+
+      await runMetaMetricsSnapshot();
+
+      expect(mockGetCreds).not.toHaveBeenCalled();
+      expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
+    });
+
+    it('an empty account list (no users with a Meta ad account) completes cleanly with zero writes', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([] as any);
+
+      await runMetaMetricsSnapshot();
+
+      expect(mockGetCreds).not.toHaveBeenCalled();
+      expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('ENG-1601 leads whose campaign id lives only in customFields', () => {
+  // These tests call snapshotMetaMetricsForDate directly with resolvedCredentials undefined,
+  // exercising its standalone fallback (resolves its own user + credentials via getUserById),
+  // not the account-enumerated path runMetaMetricsSnapshot now uses — so this block needs its
+  // own explicit mock setup rather than depending on state left behind by a sibling describe.
+  beforeEach(() => {
+    jest.resetAllMocks();
+    global.fetch = jest.fn();
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: TEST_USER_ID_MATCHING_CRON,
+      connected_accounts: [{ platform: 'meta', config: { account_type: 'ad_account', access_token: 'tok' } }],
+    } as any);
+    mockGetCreds.mockResolvedValue({ accountId: '1000000000000001', accessToken: 'tok', accountName: 'Test Account' });
+    mockCrmDb.getLeadListsByUserId.mockResolvedValue([{ listId: 'list_test', userId: TEST_USER_ID_MATCHING_CRON }] as any);
+    mockAdsDb.putSnapshot.mockResolvedValue(undefined as any);
+  });
+
   const INSIGHTS = () => ({
     ok: true,
     json: async () => makeCampaignInsightsResponse([
