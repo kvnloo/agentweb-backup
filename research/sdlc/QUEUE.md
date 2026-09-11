@@ -102,6 +102,7 @@ Park A-018. Cycle 91: live HTTP face is `/mcp` only;
 `/mcp/server` is stale inspector + AGENT_API L129. Product READY
 unchanged. Cycle 92: that inspector is `--transport sse` against a
 Streamable HTTP POST `/mcp`; GET `/mcp` without session is 400.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
