@@ -200,6 +200,8 @@ Cycle 122: detect-changes skips drafts. ENG-836 never sees a
 draft `/mcp` PR. Product READY unchanged.
 Cycle 123: re-draft is `NO_EVIDENCE` (`merge-evidence.sh` L264).
 Product READY unchanged.
+Cycle 124: ENG-836 skip is not draft; conflict job is not the
+discriminator. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

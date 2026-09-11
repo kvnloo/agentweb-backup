@@ -308,3 +308,5 @@ reverted. Do not copy that as A-006.
   ENG-836 never sees a draft `/mcp` PR. Pass ≠ deployable.
 - Cycle 123: re-draft is `NO_EVIDENCE` (`merge-evidence.sh` L264).
   `gh pr checks` can still look green. Not A-006.
+- Cycle 124: ENG-836 skip is not draft. Discriminator has no path
+  filter. Conflict job is not `BACKEND_JOBS`. Not A-006.

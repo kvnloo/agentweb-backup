@@ -471,6 +471,8 @@ Cycle 122: detect-changes skips drafts (`tests.yml` L18); ENG-836
 never sees a draft `/mcp` PR. A-006 discarded.
 Cycle 123: re-draft is `NO_EVIDENCE` (`merge-evidence.sh` L264).
 A-006 discarded.
+Cycle 124: ENG-836 skip is not draft; conflict job is not the
+discriminator. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

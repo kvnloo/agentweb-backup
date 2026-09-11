@@ -492,6 +492,12 @@ L262–267 exits 3 on `pr_draft`. Missing `converted_to_draft`
 can still look green (L14–25). Discriminator is
 `Detect changed projects` (L147).
 
+Cycle 124: **ENG-836 skip is not draft.** Discriminator has no
+path filter (`merge-evidence.test.sh` L1426–1433). AC5: path-
+filter skips do not block PASS. `BACKEND_JOBS` is only
+`Backend build` (script L160). Conflict job `if: ebconfig`
+(`tests.yml` L246) cannot be the discriminator (script L74–76).
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

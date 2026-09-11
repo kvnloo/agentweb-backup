@@ -364,6 +364,10 @@ refuses deployability (test L200–201).
 Cycle 123: **re-draft is `NO_EVIDENCE`** (`merge-evidence.sh`
 L264). Missing `converted_to_draft` does not let a `/mcp` PR
 merge. `gh pr checks` can still look green (L14–25).
+Cycle 124: **ENG-836 skip is not draft.** Discriminator is
+`Detect changed projects` with no path filter (test L1426–1433).
+`BACKEND_JOBS` is only `Backend build` (script L160). Conflict
+job timeout/cancel is outside the evidence set (L586–591).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

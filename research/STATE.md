@@ -7,17 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 123
+cycles_completed: 124
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 124
+next_cycle: 125
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 123: re-draft is NO_EVIDENCE; gh pr checks can still look
-  green. Cycle 124: cheapest remaining. Candidate: would ENG-836
-  path-filter skip be misread as draft? Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 124: ENG-836 skip is not draft; conflict job is not the
+  discriminator. Cycle 125: cheapest remaining. Candidate:
+  merge-evidence.sh L588 says 5-minute ceiling; tests.yml L248
+  is 12 — stale, and does hung ENG-836 still fail to block merge?
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```
