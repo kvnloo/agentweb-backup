@@ -50,6 +50,14 @@ describe('ENG-1870 approved-material-only generation and bounded spend', () => {
     expect(usage.inputTokens).toBe(1000);
     expect(usage.costUsdOverride).toBeCloseTo(cost as number, 8);
   });
+  it('requests rendered image output for creative generation instead of permitting a text-only concept', async () => {
+    // Staging returned STOP with one text/thoughtSignature part (430 output
+    // tokens) when TEXT was allowed. The image API supports IMAGE-only output.
+    generateContent.mockResolvedValueOnce({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Synthetic concept description', thoughtSignature: 'synthetic' }] } }], usageMetadata: { promptTokenCount: 125, candidatesTokenCount: 430 } });
+    await expect(runEvaluation('eval_test', { action: 'generate_creative', prompt: 'Create a bicycle advertising concept' })).rejects.toThrow();
+    expect(generateContent.mock.calls[0][0].config.responseModalities).toEqual(['IMAGE']);
+    expect(evaluationStore.saveArtifact).not.toHaveBeenCalled();
+  });
   it('exhausted budget makes no provider call', async () => {
     (evaluationStore.reserve as jest.Mock).mockRejectedValue(new Error('budget exhausted'));
     await expect(runEvaluation('eval_test', { action: 'analyze', prompt: 'Strategy' })).rejects.toThrow();
