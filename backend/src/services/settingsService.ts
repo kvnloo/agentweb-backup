@@ -94,8 +94,12 @@ export class SettingsService {
     const settings: Setting[] = [];
     const uniqueNames = [...new Set(settingNames.filter(name => typeof name === 'string' && name.length > 0))];
 
+    const chunks: string[][] = [];
     for (let index = 0; index < uniqueNames.length; index += 100) {
-      const names = uniqueNames.slice(index, index + 100);
+      chunks.push(uniqueNames.slice(index, index + 100));
+    }
+
+    const results = await Promise.all(chunks.map(async names => {
       try {
         const result = await dynamodb.batchGet({
           RequestItems: {
@@ -106,17 +110,17 @@ export class SettingsService {
           },
         }).promise();
         const items = result.Responses?.[this.tableName];
-        if (Array.isArray(items)) {
-          settings.push(...items.filter(
-            (item): item is Setting =>
-              typeof item?.settingName === 'string' && typeof item?.settingValue === 'string',
-          ));
-        }
+        return Array.isArray(items) ? items.filter(
+          (item): item is Setting =>
+            typeof item?.settingName === 'string' && typeof item?.settingValue === 'string',
+        ) : [];
       } catch (error) {
         console.error('Error batch getting settings:', error);
+        return [];
       }
-    }
+    }));
 
+    for (const items of results) settings.push(...items);
     return settings;
   }
 
