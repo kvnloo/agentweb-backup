@@ -282,6 +282,12 @@ mcpFetchs POST `/generate` with **no** `timeoutMs` (5 min
 default). Inner `/generate` **does** cancel on `req.close`
 (L9094–9104). Q-014 `generate_image` mcpFetch does not cancel the
 leaf. Do not HTTP-split either hop.
+Cycle 105: that POST is **not** retried on `fetch failed`
+(`httpClient.ts` L116–118; `mcp.httpClient.test.ts` L163–176).
+GET `emma_get_session` retries 3× into `server.close` and still
+fails (L411–413). Hermes already on the new instance never sees
+the old session’s `isError`. Do not add POST retry (duplicate
+risk). Do not HTTP-split the hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

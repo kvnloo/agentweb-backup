@@ -142,6 +142,11 @@ unchanged.
 Cycle 104: listed `emma_send_message` mcpFetchs POST `/generate`
 with no `timeoutMs` (default 5 min). Inner `generateResponse`
 cancels on `req.close` (L9094–9104). Product READY unchanged.
+Cycle 105: that POST is not retried on `fetch failed`
+(`httpClient.ts` L116–118; test L163–176). GET `emma_get_session`
+retries 3× into a closed listener and still fails (`server.ts`
+L411–413). Hermes on the new instance never sees the old
+`isError`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

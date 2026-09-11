@@ -185,4 +185,7 @@ Cycle 103: listed `emma_get_session` mcpFetchs that GET. A-006
 stays discarded.
 Cycle 104: `emma_send_message` 5 min mcpFetch around `/generate`
 (cancels on close). A-006 stays discarded.
+Cycle 105: that POST is not retried after `server.close`
+(`httpClient.ts` L116–118). GET `emma_get_session` retries 3×
+into a closed listener. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

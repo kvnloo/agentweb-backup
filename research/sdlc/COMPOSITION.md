@@ -383,6 +383,12 @@ L213–216, no `timeoutMs`; `httpClient.ts` L205 default 5 min.
 Inner `req.on('close')` L9094–9104 `requestCancel`s. Inbound
 CallTool untracked. Q-014 image hop does not cancel the leaf.
 
+Cycle 105: **that POST is not retried after `server.close`.**
+GET/PUT retry 3× (`httpClient.ts` L116–118); POST is one fetch
+(test L163–176). Undici keep-alive default 4s (client.js L247)
+<< 10 min drain. Wrapped `isError` stays on the old session.
+Hermes on the new instance never reads it.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -143,6 +143,9 @@ starts that continuation. Do not HTTP-split the leaf.
 Cycle 104: listed `emma_send_message` is a 5 min mcpFetch around
 `/generate` that *does* cancel on abort. Q-014’s image hop does
 not. One process, two clocks.
+Cycle 105: that POST is not retried after `server.close`. GET
+`emma_get_session` retries 3× into a closed listener. Hermes on
+the new instance is a different process.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -263,3 +263,7 @@ reverted. Do not copy that as A-006.
 - Cycle 104: `emma_send_message` default mcpFetch 5 min;
   `/generate` cancel-on-close; drain waiter 10 min. Image leaf
   ignores abort. Not a send_message nanoservice.
+- Cycle 105: POST self-call is not retried (`httpClient.ts`
+  L116–118). GET `emma_get_session` retries 3× after close and
+  still fails. Hermes on the new instance never sees the old
+  `isError`. Not A-006.
