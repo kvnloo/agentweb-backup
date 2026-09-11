@@ -40,6 +40,15 @@ describe('ENG-1870 Emma-operable lifecycle', () => {
     expect(evaluationStore.revoke).not.toHaveBeenCalled();
     expect(runEvaluation).not.toHaveBeenCalled();
   });
+  it.each([{ externalMcp: true }, { isInternal: true }])('transport without delegation provenance cannot mutate lifecycle: %p', async flags => {
+    await expect(mcpToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin', ...flags })).rejects.toThrow();
+    expect(evaluationStore.revoke).not.toHaveBeenCalled();
+  });
+  it('wrong-type admin flags cannot authorize lifecycle mutations', async () => {
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({ userId: 'admin', isAdmin: 'false', isActive: true });
+    await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin' })).rejects.toThrow();
+    expect(evaluationStore.revoke).not.toHaveBeenCalled();
+  });
   it('delegated staff cannot operate lifecycle controls', async () => {
     await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin', delegateInfo: { isDelegated: true } })).rejects.toThrow();
     expect(evaluationStore.revoke).not.toHaveBeenCalled();

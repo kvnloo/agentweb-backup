@@ -18,8 +18,19 @@ export async function requireActiveEvaluation(userId: string) {
 }
 
 /** No inferred read-only classifications: reads can expose staff/customer material. */
-export async function enforceEvaluationTool(userId: unknown, name: string) {
+export async function enforceEvaluationTool(userId: unknown, name: string, extraContext?: Record<string, unknown>) {
+  if ((isEvaluationUser(userId) || isEvaluationUser(extraContext?.userId)) &&
+      extraContext && 'userId' in extraContext && extraContext.userId !== userId) throw new EvaluationDenied();
   if (typeof userId !== 'string' || !isEvaluationUser(userId)) return;
   await requireActiveEvaluation(userId);
   if (name !== 'evaluation_workspace') throw new EvaluationDenied();
+}
+
+/** Lifecycle mutations require a current app/Emma administrator, never ambient MCP authority. */
+export async function requireEvaluationAdmin(userId: string, context?: Record<string, unknown>) {
+  if (isEvaluationUser(userId) || context?.externalMcp || context?.isInternal || context?.delegateInfo ||
+      context?.isDelegatedAdmin || context?.isDelegatedAccess) throw new EvaluationDenied();
+  const { userDb } = await import('./db');
+  const admin = await userDb.getUserByIdConsistent(userId);
+  if (!admin || admin.userId !== userId || admin.isAdmin !== true || admin.isActive !== true) throw new EvaluationDenied();
 }

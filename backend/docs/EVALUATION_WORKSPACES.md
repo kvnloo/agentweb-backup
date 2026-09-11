@@ -8,7 +8,9 @@ unreadable policy denies access. Normal customer behavior is unchanged.
 
 A real, non-delegated administrator can use Emma's `evaluation_workspace` tool with
 `action: provision` and a `provision` object, or POST `/api/admin/evaluations` with
-the same object under an authenticated admin app session:
+the same object under an authenticated admin app session. HTTP MCP lifecycle mutations
+are refused because that transport does not preserve app delegation provenance;
+in-process Emma and the admin REST API are the supported controller paths:
 
 ```json
 {
@@ -38,7 +40,8 @@ Revoke with Emma's `evaluation_workspace` tool (`action: revoke`,
 Revocation commits the deny state and invalidates account session/delegation epochs
 before cleaning up stored API keys, OAuth code/token families, MCP session metadata,
 and schedules. The response includes audit identifiers and cleanup counts. Retry
-revoke if cleanup fails: access remains denied and cleanup is idempotent. Revocation
+revoke if cleanup fails: access remains denied and cleanup is idempotent. Cleanup failure receives its own audit event after the deny
+commit; incomplete cleanup is never reported as success. Revocation
 retains the policy, audit, and private artifacts; it is not a data-erasure operation.
 
 ## Security and spend invariants
@@ -57,7 +60,7 @@ retains the policy, audit, and private artifacts; it is not a data-erasure opera
 - Generation admits 1–100 calls per evaluation with an atomic decrement. There are
   no refunds or automatic retries. Inputs are limited to 8,000 prompt characters
   plus 30,000 characters of approved material; one candidate and 2,048 output tokens
-  use fixed Gemini models. Failed/in-flight calls consume budget. Revocation cannot
+  use fixed `gemini-3.6-flash` / `gemini-3.1-flash-image` models. Failed/in-flight calls consume budget. Revocation cannot
   unsend an already-admitted provider request, but its result is not stored/returned
   after revocation. The runtime receives no connector, browser, URL-fetch, org,
   conversation, or production-tool capability.
@@ -66,6 +69,12 @@ retains the policy, audit, and private artifacts; it is not a data-erasure opera
   decoded with a pixel cap and re-encoded. Downloads require current authorization,
   use attachment/no-store/nosniff/sandbox headers, and never yield public URLs.
 
+Model choice is verified against the provider: staging reproduced HTTP 404 for
+`gemini-2.5-flash` (unavailable to new projects), whose response directs callers to
+`gemini-3.6-flash`. The image model uses the maintained GA release listed in
+[Google’s lifecycle documentation](https://ai.google.dev/gemini-api/docs/deprecations).
+There is no fallback chain or user-selected model.
+
 ## Storage and deployment
 
 `backend/scripts/provision-evaluation-storage.sh dev|prod` provisions the dedicated
@@ -73,7 +82,8 @@ retains the policy, audit, and private artifacts; it is not a data-erasure opera
 on-demand billing, encryption, deletion protection, PITR). Runtime uses the existing
 backend AWS identity. Policies, audit records, and artifact bytes live only here;
 no S3, client asset table, ad account, or connector credential is an artifact target.
-Dev/prod table selection follows the existing `NODE_ENV` convention.
+Dev/prod table selection follows the existing `NODE_ENV` convention. Provisioning
+pins the same region as runtime (`AWS_REGION`, default `us-west-2`).
 
 Harsha explicitly authorized the required production auth/security/data-plane and
 persistence changes in the ENG-1870 implementation request. Dev and production

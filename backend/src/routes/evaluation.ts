@@ -1,17 +1,33 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from '../middleware/auth';
 import { evaluationStore } from '../services/evaluationStore';
-import { requireActiveEvaluation, EvaluationDenied } from '../services/evaluationPolicy';
+import { requireActiveEvaluation, EvaluationDenied, requireEvaluationAdmin } from '../services/evaluationPolicy';
 import { runEvaluation } from '../services/evaluationService';
 
 function handler(fn: (req: AuthenticatedRequest, res: Response) => Promise<unknown>) {
-  return (req: Request, res: Response) => { void fn(req as AuthenticatedRequest, res).catch(() => res.status(403).json({ error: 'Evaluation access denied' })); };
+  return (req: Request, res: Response, next: NextFunction) => { void fn(req as AuthenticatedRequest, res).catch(error => {
+    const reasons = error?.CancellationReasons;
+    const conditionalDenial = error?.code === 'ConditionalCheckFailedException' ||
+      (error?.code === 'TransactionCanceledException' && Array.isArray(reasons) &&
+       reasons.some(r => r?.Code === 'ConditionalCheckFailed') && reasons.every(r => ['None', 'ConditionalCheckFailed'].includes(r?.Code)));
+    if (error instanceof EvaluationDenied || conditionalDenial) return res.status(403).json({ error: 'Evaluation access denied' });
+    // Provider exceptions can contain request headers/prompts. Report the failed
+    // operation through the global handler without exposing credential material.
+    next(new Error('Evaluation operation failed'));
+  }); };
+
 }
 
 export const evaluationAdminRoutes = Router();
 evaluationAdminRoutes.use(authenticateToken, requireAdmin);
-evaluationAdminRoutes.post('/', handler(async (req, res) => res.status(201).json(await evaluationStore.provision(req.user.userId, req.body))));
-evaluationAdminRoutes.post('/:userId/revoke', handler(async (req, res) => res.json(await evaluationStore.revoke(req.user.userId, req.params.userId))));
+evaluationAdminRoutes.post('/', handler(async (req, res) => {
+  await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
+  res.status(201).json(await evaluationStore.provision(req.user.userId, req.body));
+}));
+evaluationAdminRoutes.post('/:userId/revoke', handler(async (req, res) => {
+  await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
+  res.json(await evaluationStore.revoke(req.user.userId, req.params.userId));
+}));
 
 export const evaluationRoutes = Router();
 evaluationRoutes.use(authenticateToken);

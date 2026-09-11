@@ -8881,7 +8881,7 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
-    await enforceEvaluationTool(userId, toolName);
+    await enforceEvaluationTool(userId, toolName, extraContext);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({

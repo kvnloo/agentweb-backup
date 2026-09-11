@@ -140,7 +140,13 @@ export class EvaluationStore {
           reasons.some((r, i) => i !== 1 && r?.Code !== 'None')) throw error;
       await this.db.transactWrite({ TransactItems: [writes[0], writes[2]] }).promise();
     }
-    const cleanup = await this.cleanupCredentials(userId);
+    let cleanup: Record<string, number>;
+    try { cleanup = await this.cleanupCredentials(userId); } catch (error) {
+      try { await this.db.transactWrite({ TransactItems: [this.audit(userId, actor, 'revocation-cleanup-failed')] }).promise(); } catch {
+        // The original revoke audit is already committed. Keep the cleanup failure.
+      }
+      throw error;
+    }
     const cleanupAudit = this.audit(userId, actor, 'revocation-cleanup');
     await this.db.transactWrite({ TransactItems: [{ Put: { ...cleanupAudit.Put, Item: { ...cleanupAudit.Put.Item, cleanup } } }] }).promise();
     return { userId, status: 'revoked', audit: audit.Put.Item, cleanup, cleanupAudit: cleanupAudit.Put.Item };
@@ -149,7 +155,7 @@ export class EvaluationStore {
   private async cleanupCredentials(userId: string) {
     const counts: Record<string, number> = {};
     // Primary-table scans avoid stale identity indexes during revocation. Only key + owner
-    // are read; credential material never enters this process or its audit evidence.
+    // are read for conditional deletion; row keys and credential values are never logged.
     for (const [table, key, owner] of [
       ['AW-AgentApiKeys', 'keyId', 'userId'], ['AW-MCPOAuthTokens', 'tokenHash', 'userId'],
       ['AW-MCPOAuthCodes', 'code', 'userId'], ['AW-MCPSessions', 'sessionId', 'agentUserId'],
@@ -160,7 +166,7 @@ export class EvaluationStore {
       do {
         let page: AWS.DynamoDB.DocumentClient.ScanOutput;
         try {
-          page = await this.db.scan({ TableName: `${this.prefix}${table}`, ConsistentRead: true,
+          page = await this.db.scan({ TableName: `${this.prefix}${table}`, ConsistentRead: true, Limit: 100,
             FilterExpression: '#owner = :user', ProjectionExpression: '#key, #owner',
             ExpressionAttributeNames: { '#key': key, '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
             ...(cursor ? { ExclusiveStartKey: cursor } : {}),
@@ -177,8 +183,8 @@ export class EvaluationStore {
             await this.db.delete({ TableName: `${this.prefix}${table}`, Key: { [key]: item[key] },
               ConditionExpression: '#owner = :user', ExpressionAttributeNames: { '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
             }).promise();
+            counts[table]++;
           } catch (error: any) { if (error?.code !== 'ConditionalCheckFailedException') throw error; }
-          counts[table]++;
         }
         cursor = page.LastEvaluatedKey;
       } while (cursor);

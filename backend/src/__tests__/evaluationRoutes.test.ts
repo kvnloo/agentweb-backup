@@ -1,3 +1,4 @@
+import { userDb } from '../services/db';
 import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
@@ -8,6 +9,7 @@ import { evaluationStore } from '../services/evaluationStore';
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'synthetic-route-signing-secret' }));
 jest.mock('../services/evaluationService', () => ({ runEvaluation: jest.fn() }));
 jest.mock('../services/db', () => ({ userDb: {
+  getUserByIdConsistent: jest.fn(async (userId: string) => ({ userId, isAdmin: userId === 'admin', isActive: true })),
   getUserById: jest.fn(async (userId: string) => ({ userId, email: 'test@example.invalid', isAdmin: userId === 'admin' })),
   getUserByEmailConsistent: jest.fn(async () => ({ userId: 'eval_test', email: 'test@example.invalid', isActive: true, isAdmin: false })),
 } }));
@@ -18,12 +20,24 @@ describe('ENG-1870 product lifecycle and artifact routes', () => {
   app.use(express.json(), evaluationHttpBoundary);
   app.use('/api/evaluation', evaluationRoutes);
   app.use('/api/admin/evaluations', evaluationAdminRoutes);
+  app.use((_error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(500).json({ error: 'Internal server error' }));
   const token = (userId: string) => jwt.sign({ userId, email: 'test@example.invalid', isAdmin: userId === 'admin' }, 'synthetic-route-signing-secret');
   beforeEach(() => {
     jest.clearAllMocks();
     (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: 'test@example.invalid', status: 'active', expiresAt: Date.now() + 60000 });
     (evaluationStore.provision as jest.Mock).mockResolvedValue({ userId: 'eval_new' });
     (evaluationStore.saveArtifact as jest.Mock).mockResolvedValue({ artifactId: 'file' });
+  });
+  it('a stale admin session cannot provision after administrator deactivation', async () => {
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce({ userId: 'admin', isAdmin: true, isActive: false });
+    const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send({});
+    expect(result.status).toBe(403);
+    expect(evaluationStore.provision).not.toHaveBeenCalled();
+  });
+  it('provider/storage failure reaches the error handler instead of masquerading as a denial', async () => {
+    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new Error('synthetic storage failure'));
+    const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send({});
+    expect(result.status).toBe(500);
   });
   it('admin can provision through the product API', async () => {
     const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send({ displayName: 'Synthetic' });

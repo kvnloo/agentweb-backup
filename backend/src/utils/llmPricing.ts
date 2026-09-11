@@ -173,6 +173,8 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.5-flash': withDerivedCache(1.5, 9), // was 0.15/0.6 — stale
   // Google's official introductory rate (ai.google.dev), verified live 2026-08-19.
   // Scheduled to increase to $1.50/$7.50 on 2027-01-01 — not modeled here yet.
+  // Official Gemini API rate verified 2026-09-11; same introductory window as 3.7.
+  'gemini-3.6-flash': withDerivedCache(0.75, 3.75),
   'gemini-3.7-flash': withDerivedCache(0.75, 3.75),
   'gemini-3.8-flash': GEMINI_3_8_FLASH_PRICE,
   'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
@@ -343,7 +345,9 @@ export function isPerGenerationPriced(model: string | undefined | null): boolean
   );
 }
 
-export function imageGenerationCostUsd(model: string): number {
+export function imageGenerationCostUsd(model: string, resolution?: '1K'): number {
+  // Explicit 1K output: 1,120 image tokens × $60/M (ai.google.dev/gemini-api/docs/pricing, 2026-09-11).
+  if (model === 'gemini-3.1-flash-image' && resolution === '1K') return 0.0672;
   return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
 }
 

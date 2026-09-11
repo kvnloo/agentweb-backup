@@ -1,9 +1,8 @@
 import { emmaToolRegistry } from '../../emma/registry';
 import { mcpToolRegistry } from './registry';
 import { evaluationStore } from '../../services/evaluationStore';
-import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation } from '../../services/evaluationPolicy';
+import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, requireEvaluationAdmin } from '../../services/evaluationPolicy';
 import { runEvaluation } from '../../services/evaluationService';
-import { userDb } from '../../services/db';
 
 mcpToolRegistry.register({
   name: 'evaluation_workspace',
@@ -34,8 +33,7 @@ mcpToolRegistry.register({
       } else result = await runEvaluation(userId, { action: args.action, prompt: args.prompt });
       await requireActiveEvaluation(userId);
     } else {
-      const admin = await userDb.getUserByIdConsistent(userId);
-      if (!admin?.isAdmin || admin.isActive !== true || context?.delegateInfo || context?.isDelegatedAdmin || context?.isDelegatedAccess) throw new EvaluationDenied();
+      await requireEvaluationAdmin(userId, context);
       if (args.action === 'provision') result = await evaluationStore.provision(userId, args.provision);
       else if (args.action === 'revoke') result = await evaluationStore.revoke(userId, args.evaluation_user_id);
       else throw new EvaluationDenied();

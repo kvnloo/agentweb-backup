@@ -1,3 +1,4 @@
+import { enforceEvaluationTool, EvaluationDenied } from '../services/evaluationPolicy';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpToolRegistry } from '../mcp/server/registry';
 import { getUserFromToken } from '../middleware/auth';
@@ -41,6 +42,9 @@ describe('ENG-1870 acceptance: production side effects cannot execute', () => {
     expect(result.user).toBeNull();
   });
 
+  it.each(['admin', undefined, null])('evaluation lifecycle cannot replace its execution identity with %p', async override => {
+    await expect((enforceEvaluationTool as any)('eval_test', 'evaluation_workspace', { userId: override })).rejects.toBeInstanceOf(EvaluationDenied);
+  });
   it('ordinary customer tool execution is unchanged', async () => {
     const registry = new ToolRegistry();
     registry.register({ name: 'create_meta_campaign', definition: {}, execute });
