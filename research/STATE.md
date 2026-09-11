@@ -6,19 +6,16 @@ owner: cursor-cloud bc-658f6e8c-e6a2-4e2e-99d4-8bee7362c95b
 branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: false
-cycles_completed: 2
+cycles_completed: 4
 target_cycles: 7
 stop_after: 2026-09-11T20:15:00Z
-next_cycle: 3
-focus: mcp-tools-list-as-hermes-sees-it
+next_cycle: 5
+focus: agent-engine-vs-agent-mode
 next_focus_hint: |
-  Cycle 3: MCP tools/list + oauth routes — enumerate what Hermes actually
-  sees (externalMcp=true). Count internal vs internalOnly vs exposed outbound
-  tools. Cite mcpServerCore and a sample of social/ads publish tools.
-  Cycle 4: humanEvalService stored shape — can Q-002 routing use existing
-  items with no new GSI?
-  Cycle 5: agent-engine vs Agent Mode — where browser-use still matters.
-  Cycle 6: synthesize ARCHITECTURE.md teach-in + promote 1–2 READY briefs.
+  Cycle 5: agent-engine vs Agent Mode — where browser-use still matters;
+  cookie sync; why WhatsApp/WeChat fail; relation to #2271.
+  Cycle 6: synthesize ARCHITECTURE.md teach-in + promote 1–2 READY briefs
+  (Q-001 and Q-014 or Q-015).
   Cycle 7: freeze queue, set briefing_ready true, stop timer.
 timer_name: agentweb-research-cycle
 ```

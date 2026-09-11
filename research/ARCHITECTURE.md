@@ -1,6 +1,6 @@
 # Architecture brief (living)
 
-Status: **cycle 2**. Deepens every cycle. Full teach-in after `briefing_ready`.
+Status: **cycle 4**. Deepens every cycle. Full teach-in after `briefing_ready`.
 
 ## What AgentWeb actually is
 
@@ -58,9 +58,15 @@ In-process Emma tools register into `emmaToolRegistry`, copied into Agent Mode.
 MCP HTTP tools wrap REST with a short-lived JWT so external agents cannot IDOR.
 Flags that matter: `internal` (hide from `tools/list`, still callable — used for
 metered cost tools, ENG-973), `internalOnly` (hide **and** refuse for
-`externalMcp`, ENG-974), `requiresUserAccount`, evaluation gate. As of cycle 2,
-only four API tools are `internalOnly`. `edit_landing_page_file` is still a
-live deprecated tool.
+`externalMcp`, ENG-974), `requiresUserAccount`, evaluation gate.
+
+**Hermes sees a different catalogue than Emma.** MCP lists ~80 REST-wrapping
+tools (`apiTools` + `emma_*` workflow layer + `evaluation_workspace`) and
+**hides** `generate_image`. `coding_agent`, `generate_video`, and
+`compose_video` are not on MCP at all. ENG-982 added job-shaped `emma_*`
+tools; ENG-983 (unlist the granular CRUD) is the team's planned follow-up —
+do not duplicate it. `edit_landing_page_file` is still listed and deprecated.
+`freeze_user_account` is listed to every OAuth client.
 
 ## Money and models
 

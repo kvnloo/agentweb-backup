@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:35:00Z",
+  "updated_at": "2026-09-11T17:45:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "items": [
     {
@@ -19,7 +19,7 @@
         "backend/src/mcp/oauth/oauthRoutes.ts",
         "backend/docs/AGENT_API.md"
       ],
-      "first_slice": "Docs + a tiny Hermes-side runbook/skill; optional non-schema callback helper. Do not Slack-bridge PKCE on the server.",
+      "first_slice": "Docs + a tiny Hermes-side runbook/skill; optional non-schema callback helper. Do not Slack-bridge PKCE on the server. After OAuth works, Hermes still will not see generate_image until Q-014.",
       "harsha_db": false
     },
     {
@@ -27,12 +27,12 @@
       "title": "Eval-informed image model routing (no new table)",
       "status": "triage",
       "leverage": 5,
-      "product": 5,
+      "product": 4,
       "mergeability": 3,
-      "evidence": 4,
+      "evidence": 5,
       "collision": 1,
-      "score": 31,
-      "why": "Matt's creative_image queue + onboarding like-rates exist; getImageGenerationFallbackModel is a static list. DesignArena/mcp-bench-router is Kevin's live arena experiment.",
+      "score": 29,
+      "why": "No imageModel attribute on HumanEvalCandidate. Model name is only in outputSummary text. listCandidates is a scan. Signal is unstructured Slack. Weaker than DesignArena (Q-003) as a live router; keep as offline parser later.",
       "files": [
         "backend/src/services/agentModeService.ts",
         "backend/src/services/humanEvalService.ts",
@@ -49,9 +49,9 @@
       "leverage": 5,
       "product": 4,
       "mergeability": 4,
-      "evidence": 3,
+      "evidence": 4,
       "collision": 1,
-      "score": 30,
+      "score": 31,
       "why": "mcp-bench-router already picks DesignArena #1 via OpenRouter. AgentWeb image path is not OpenRouter. Adapter can inform default model id, not replace providers.",
       "files": [
         "backend/src/services/imageGeneration.ts",
@@ -62,21 +62,21 @@
     },
     {
       "id": "Q-004",
-      "title": "MCP tools/list curation for external agents",
-      "status": "triage",
-      "leverage": 4,
-      "product": 3,
-      "mergeability": 5,
-      "evidence": 4,
-      "collision": 0,
-      "score": 30,
-      "why": "Hermes/DesignArena clients drown in 60+ tools. Registry already has internal/internalOnly. Curation is flags + tests.",
+      "title": "Mark remaining outbound/admin MCP tools internalOnly",
+      "status": "keep",
+      "leverage": 3,
+      "product": 4,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 3,
+      "score": 24,
+      "why": "Do NOT unlist the CRUD catalogue (ENG-983). Do mark post_on_account and freeze_user_account internalOnly. Collision with ENG-983 if we hide manage_*.",
       "files": [
         "backend/src/mcp/server/registry.ts",
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/emma/tools.ts"
       ],
-      "first_slice": "Inventory tools/list as externalMcp=true; mark publish/side-effect tools internalOnly if not already.",
+      "first_slice": "internalOnly on post_on_account + freeze_user_account + tests that they disappear from getToolDefinitions and refuse externalMcp. Leave manage_* listed until ENG-983.",
       "harsha_db": false
     },
     {
@@ -99,7 +99,7 @@
     },
     {
       "id": "Q-006",
-      "title": "Hide deprecated edit_landing_page_file; fix OpenRouter doc drift",
+      "title": "Hide deprecated edit_landing_page_file; stop recommending missing coding_agent on MCP",
       "status": "keep",
       "leverage": 2,
       "product": 4,
@@ -107,7 +107,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 27,
-      "why": "edit_landing_page_file is still registered and executable (apiTools.ts ~L1769) despite DEPRECATED copy. coding_agent is the real path. OpenRouter gateway doc still lists coding agent as Bedrock/Vertex. Collision: do not touch callLLM retry (#2862).",
+      "why": "edit_landing_page_file is still listed. Descriptions tell MCP clients to use coding_agent, which is not registered on mcpToolRegistry at all. OpenRouter gateway doc still lists coding agent as Bedrock/Vertex. Collision: do not touch callLLM retry (#2862).",
       "files": [
         "backend/docs/OPENROUTER_GATEWAY.md",
         "backend/src/services/codingAgentService.ts",
@@ -239,6 +239,43 @@
         "backend/src/services/agentModeService.ts"
       ],
       "first_slice": "Never as a queue item for implementation.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-014",
+      "title": "Expose generate_image on external MCP tools/list",
+      "status": "keep",
+      "leverage": 5,
+      "product": 4,
+      "mergeability": 4,
+      "evidence": 5,
+      "collision": 2,
+      "score": 34,
+      "why": "Hermes cannot discover image gen: generate_image is internal (hidden, still callable). generate_video is absent. This is the content-gen + DesignArena wedge. ENG-973 hid it as a cost tool — un-hiding is a product choice, not a schema change. Keep metering.",
+      "files": [
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/registry.ts",
+        "backend/src/mcp/server/workflowTools.ts"
+      ],
+      "first_slice": "Remove internal:true from generate_image (or add an emma_generate_image workflow tool). Tests: listed for external, still metered. Do not expose send_email.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-015",
+      "title": "Hide admin MCP tools from non-admin tools/list",
+      "status": "keep",
+      "leverage": 2,
+      "product": 4,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 27,
+      "why": "freeze_user_account, list_all_clients, and similar admin tools are in every OAuth client's tools/list. REST 403 is not enough; names pollute Hermes context and look like a privilege oracle.",
+      "files": [
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/adminClientScope.ts"
+      ],
+      "first_slice": "internal: true on freeze_user_account / list_all_clients unless caller is admin (list-time filter), or internalOnly. Characterization test on getToolDefinitions.",
       "harsha_db": false
     }
   ]
