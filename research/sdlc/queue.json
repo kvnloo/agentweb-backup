@@ -426,7 +426,7 @@
     },
     {
       "id": "A-019",
-      "title": "Refuse new CronJobRegistry.track() while draining (copy worker.draining)",
+      "title": "Refuse new track() and tryClaim while draining (one instanceState bit)",
       "status": "park",
       "leverage": 3,
       "product": 3,
