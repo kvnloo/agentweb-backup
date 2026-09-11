@@ -140,3 +140,8 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 68: ASG does not wait on SIGTERM drain (`asgLifecycleGuard.ts`
   L4–16, session `d7e4863c`). Hook + `drainForShutdown` are this
   `listen()`. Hermes/OMP: one process, no ASG hook.
+- Cycle 69: `runDrain` awaits worker / cron / sessions / live voice
+  (`server.ts` L397–420). Inbound MCP `CallTool` (Q-014) is not
+  tracked. Chatbot was wrapped (`chatbotTurn`, L288–301); MCP was
+  not. Hermes keeps the tool in-process so there is no second hop
+  to drain.

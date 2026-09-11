@@ -96,4 +96,8 @@ routing; share Dynamo metadata, rehydrate in-process. Not a fifth
 Cycle 68: ENG-764 ASG hook (`asgLifecycleGuard.ts`) is why drain
 runs before the instance dies. A fifth `listen()` is not parked in
 `Terminating:Wait`. A-006 stays discarded.
+Cycle 69: `runDrain` (`server.ts` L397–420) does not wait on inbound
+MCP `CallTool`. Q-014 `generate_image` is that hop. Copy
+`chatbotTurn`; do not call `mcpShutdown` from drain. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

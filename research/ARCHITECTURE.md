@@ -343,6 +343,10 @@ Cycle 68: ASG terminates before drain (`asgLifecycleGuard.ts`
 L4–16). Hook `agentweb-drain-before-terminate` + `server.ts`
 L572–574. Install is `eb-deploy.sh`, not `.ebextensions`
 (ENG-818). A-006 discarded.
+Cycle 69: `runDrain` L397–420 is four named drains. Inbound MCP
+`CallTool` (`mcpServerCore.ts` L88–120) is not tracked.
+`mcpShutdown` (`mcpServer.ts` L260–270) is unused by `server.ts`.
+Q-014 stays ready. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

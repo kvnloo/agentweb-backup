@@ -56,7 +56,10 @@ routing; scale-out is Dynamo metadata + in-process rehydrate
 MaxSize=4 — do not treat either as live AWS. Cycle 68: ASG
 terminates before drain (`asgLifecycleGuard.ts` L4–16); the hook
 calls **this** `drainForShutdown` (`server.ts` L572–574). A fifth
-`listen()` is not in that hook. A-006 stays discard. Product READY
+`listen()` is not in that hook. Cycle 69: `runDrain` L397–420 is
+four named drains; inbound MCP `CallTool` is not one
+(`mcpServerCore.ts` L88–120). `mcpShutdown` is unused by the main
+server. Copy `chatbotTurn`, do not revive A-006. Product READY
 unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)

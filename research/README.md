@@ -134,7 +134,11 @@ MCP session table onto generate locks (Harsha). Cycle 68: even
 that in-process work is killed on deploy unless `asgLifecycleGuard`
 parks the ASG (`asgLifecycleGuard.ts` L4–16 / `server.ts` L572–574).
 A fifth image process would need its own hook + `eb-deploy.sh`
-install (ENG-818: not `.ebextensions`).
+install (ENG-818: not `.ebextensions`). Cycle 69: even on this
+process, inbound MCP `CallTool` is not in the four-way wait list
+(`server.ts` L397–420 vs `mcpServerCore.ts` L88–120). Q-014
+`generate_image` mcpFetchs localhost; chatbot was wrapped
+(`chatbotTurn`); MCP was not. Do not HTTP-split to “fix” drain.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

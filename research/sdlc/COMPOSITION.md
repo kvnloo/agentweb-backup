@@ -140,6 +140,14 @@ run. Hook `agentweb-drain-before-terminate` + `drainForShutdown`
 (`server.ts` L361–370 / L572–574). `.ebextensions` cannot install the
 hook (ENG-818). A-006 would reproduce that kill.
 
+Cycle 69: **inbound MCP is off the drain wait list.** `runDrain`
+(`server.ts` L397–420) awaits worker / cron / `activeSessionGenerations`
+/ live voice. Q-014 `generate_image` (`apiTools.ts` L2096–2108) is
+localhost mcpFetch from `CallTool` (`mcpServerCore.ts` L88–120) with
+no `cronJobRegistry.track`. `mcpShutdown` (`mcpServer.ts` L260–261)
+is never called from `server.ts`. Chatbot was the last “untracked
+path” (`server.ts` L288–301). Copy that wrap; do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

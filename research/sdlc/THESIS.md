@@ -65,7 +65,10 @@ rehydrate, no sticky routing) — not a fifth `listen()`. Cycle 68:
 ASG kill is faster than drain (`asgLifecycleGuard.ts` L4–16);
 hook `agentweb-drain-before-terminate` parks **this** process
 (`server.ts` L572–574). `.ebextensions` cannot install it (ENG-818).
-The listed face is a
+Cycle 69: that drain’s wait list is four named units (`server.ts`
+L397–420); inbound MCP `CallTool` is not one (`mcpServerCore.ts`
+L88–120 has no `cronJobRegistry.track`). `mcpShutdown` is unused
+by `runDrain`. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.
