@@ -88,7 +88,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'send_email', 'save_file', 'post_on_account'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);
@@ -96,6 +96,7 @@ describe('apiTools', () => {
         expect(externalNames).not.toContain(name);
       }
       expect(allNames).not.toContain('search_web');
+      expect(externalNames).toContain('generate_image');
     });
 
     it('should NOT register old tool names (portal_*, read_brand_guidelines, etc.)', () => {
@@ -402,8 +403,7 @@ describe('apiTools', () => {
   // the model supply the value. `required` is what actually gets the category
   // declared. If it is dropped here, the model stops sending it and EVERY image
   // generation fails at the guard, so this schema is load-bearing, not cosmetic.
-  // `generate_image` is `internal: true`, so it is absent from getToolDefinitions()
-  // — read it via getTool() or this assertion silently tests nothing.
+  // Read via getTool() so the assertion still holds if listing ever flips.
   describe('generate_image category declaration (ENG-343)', () => {
     const schema = () => mcpToolRegistry.getTool('generate_image')!.definition.inputSchema;
 
