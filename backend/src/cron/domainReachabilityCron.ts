@@ -16,6 +16,7 @@
  */
 import AWS from "aws-sdk";
 import { probeDomain, decideFromVerdict } from "../services/domainReachabilityService";
+import { addCustomDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -35,6 +36,8 @@ export interface SweepSummary {
   recovered: number;
   stillSuspect: number;
   errors: number;
+  reconciled: number;
+  reconcileErrors: number;
 }
 
 async function scanAll(table: string): Promise<any[]> {
@@ -152,6 +155,72 @@ export function selectDomainsToProbe(
   );
 }
 
+export interface ReconcileSummary {
+  reconciled: number;
+  errors: number;
+  /** Newly-registered records, so the caller can fold them into the same sweep run rather than waiting a day. */
+  created: any[];
+}
+
+/**
+ * A page's `customDomainUrl` is supposed to always have a matching `AW-CustomDomains` record —
+ * that's what makes it visible to `selectDomainsToProbe` at all. That invariant is only true
+ * while every write to `customDomainUrl` goes through `addCustomDomain`/`addSubdomain`. It does
+ * NOT hold against a direct table write that bypasses the app entirely (ENG-1839 follow-up,
+ * 2026-09-11: a standing DynamoDB grant issued for an unrelated repair was reused to repoint a
+ * live customer's domain, with no corresponding domain record ever created — the page kept
+ * reading `deployed`, and the domain went completely unmonitored, silently).
+ *
+ * Reconciles the gap by finding any deployed page whose `customDomainUrl` host has no matching
+ * domain record, and registering it through `addCustomDomain` — the exact path a real user
+ * action takes, not a hand-crafted record. That gets real Vercel-side verification instead of an
+ * assumed `active` status, and `addCustomDomain` already reuses-in-place rather than
+ * duplicating, so this is safe to run on every sweep unconditionally.
+ *
+ * Scoped to CUSTOM domains only — hosts under `agentwebforms.com` are deliberately excluded.
+ * Managed subdomains are registered atomically as part of page creation (`addSubdomain`), so an
+ * unregistered one indicates a DIFFERENT bug in that path, not this kind of drift. Silently
+ * "fixing" it here via the wrong registration function (`addCustomDomain` writes `type: "custom"`,
+ * not `type: "subdomain"`) would paper over that instead of surfacing it.
+ */
+export async function reconcileUnregisteredDomains(
+  domains: any[],
+  pages: any[]
+): Promise<ReconcileSummary> {
+  const summary: ReconcileSummary = { reconciled: 0, errors: 0, created: [] };
+  const registeredHosts = new Set(domains.map((d) => d.domain).filter(Boolean));
+  const managedSuffix = `.${SUBDOMAIN_BASE}`;
+
+  for (const p of pages) {
+    if (p.status !== "deployed" || !p.customDomainUrl || !p.vercelProjectId || !p.userId) continue;
+
+    let host: string;
+    try {
+      host = new URL(p.customDomainUrl).host;
+    } catch {
+      continue; // unparseable stored URL — not this function's problem to fix
+    }
+
+    if (registeredHosts.has(host)) continue;
+    if (host === SUBDOMAIN_BASE || host.endsWith(managedSuffix)) continue;
+
+    try {
+      const record = await addCustomDomain(p.userId, p.vercelProjectId, host);
+      registeredHosts.add(host); // avoid a duplicate attempt if another page shares the host
+      summary.reconciled++;
+      summary.created.push(record);
+      console.log(`[DomainReachability] Reconciled unregistered domain "${host}" (page ${p.id})`);
+    } catch (err: any) {
+      summary.errors++;
+      console.warn(
+        `[DomainReachability] Failed to reconcile "${host}" (page ${p.id}): ${err?.message}`
+      );
+    }
+  }
+
+  return summary;
+}
+
 /** Run `worker` over `items` with at most `limit` in flight. */
 async function mapLimit<T, R>(
   items: T[],
@@ -206,9 +275,19 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
     recovered: 0,
     stillSuspect: 0,
     errors: 0,
+    reconciled: 0,
+    reconcileErrors: 0,
   };
 
   const [domains, pages] = await Promise.all([scanAll(DOMAINS_TABLE), scanAll(PAGES_TABLE)]);
+
+  const reconcileResult = await reconcileUnregisteredDomains(domains, pages);
+  summary.reconciled = reconcileResult.reconciled;
+  summary.reconcileErrors = reconcileResult.errors;
+  if (reconcileResult.reconciled > 0) {
+    domains.push(...reconcileResult.created); // fold into this run, don't wait a day
+  }
+
   summary.considered = domains.length;
 
   const targets = selectDomainsToProbe(domains, pages);
@@ -275,7 +354,8 @@ export async function runDomainReachabilitySweep(): Promise<SweepSummary> {
   console.log(
     `[DomainReachability] probed=${summary.probed} reachable=${summary.reachable} ` +
       `newly-unhealthy=${summary.markedUnhealthy} recovered=${summary.recovered} ` +
-      `suspect-not-yet-believed=${summary.stillSuspect} errors=${summary.errors}`
+      `suspect-not-yet-believed=${summary.stillSuspect} errors=${summary.errors} ` +
+      `reconciled=${summary.reconciled} reconcile-errors=${summary.reconcileErrors}`
   );
   return summary;
 }
