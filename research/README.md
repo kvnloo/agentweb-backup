@@ -48,6 +48,7 @@ are ready to implement.
 - `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` / `briefs/Q-004-post-on-account-internalOnly.md` (MCP hygiene; land Q-004 with Q-014)
 
 Mapping: `mappings/designarena-image-models.md`,
-`mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy).
+`mappings/content-gen-graph.md` (Remotion vs HyperFrames/Comfy),
+`mappings/eval-output-summary.md` (Q-002 parser, not a live router).
 
 The loop may keep refining until `stop_after` (20:15 UTC).

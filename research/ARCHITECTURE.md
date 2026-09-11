@@ -127,7 +127,9 @@ picker.** Cycle 8 proved `mcp-bench-router` cannot pick Emma providers
 `gpt-image-2` is #3 and $0.04; the hardcoded default
 `gemini-3-pro-image-preview` is #22 and $0.134. Map with fail-open; do not
 flip the production default until Matt says so. See
-`mappings/designarena-image-models.md`.
+`mappings/designarena-image-models.md`. Cycle 12: `outputSummary` has
+`Model: <id>` but feedback is untyped Slack — Q-002 is an offline parser
+only (`mappings/eval-output-summary.md`), never a per-request scan.
 
 Video: Seedance (Higgsfield) → Veo; Remotion `BrandedVideo` for brand
 overlays. Cycle 10: that composition **already** has the lower-third intro

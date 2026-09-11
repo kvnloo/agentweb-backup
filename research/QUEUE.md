@@ -3,12 +3,14 @@
 Source of truth: `queue.json`. Protocol score is research leverage.
 **Implementation order** (first PRs when unlocked): Q-001, Q-014, Q-003.
 Cycle 8 promoted Q-003. Cycle 9 promoted Q-006 / Q-015. Cycle 11 promoted
-Q-004 (`post_on_account`). It did not un-ready Q-001 / Q-014 / Q-003.
+Q-004. Cycle 12 parked Q-002 (offline parser only). It did not un-ready
+Q-001 / Q-014 / Q-003.
 
 **Do not implement yet.** `coding_unlocked: false`. `briefing_ready: true`.
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
 Mapping: `mappings/designarena-image-models.md`,
-`mappings/content-gen-graph.md`.
+`mappings/content-gen-graph.md`,
+`mappings/eval-output-summary.md`.
 
 ## How Kevin can help (thesis)
 
@@ -25,9 +27,8 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 | 2 | Q-001 | 34 | **ready** | Emma-via-Hermes operator path — `briefs/Q-001-hermes-oauth.md` |
 | 3 | Q-014 | 34 | **ready** | Expose generate_image on MCP tools/list — `briefs/Q-014-generate-image-mcp.md` |
 | 4 | Q-004 | 32 | **ready** | post_on_account internalOnly — `briefs/Q-004-post-on-account-internalOnly.md` |
-| 5 | Q-002 | 29 | triage | Eval-informed image routing (parse outputSummary; not a live router) |
-| 6 | Q-006 | 27 | **ready** | Hide edit_landing_page_file — `briefs/Q-006-hide-edit-landing-page.md` |
-| 7 | Q-015 | 27 | **ready** | Hide admin MCP tools — `briefs/Q-015-hide-admin-mcp-tools.md` |
+| 5 | Q-006 | 27 | **ready** | Hide edit_landing_page_file — `briefs/Q-006-hide-edit-landing-page.md` |
+| 6 | Q-015 | 27 | **ready** | Hide admin MCP tools — `briefs/Q-015-hide-admin-mcp-tools.md` |
 
 ## Parked
 
@@ -36,6 +37,7 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 | Q-016 | 26 | MCP video after Q-014; $1.55/clip vs $0.04 image (ENG-973) |
 | Q-011 | 26 | Hermes as ENG-381 local-agent successor; confirm ownership; not #2271 |
 | Q-007 | 24 | Intro/outro already in BrandedVideo; do not port HyperFrames/MPT |
+| Q-002 | 23 | Offline Model: parser only; live router is Q-003; no new eval attribute |
 | Q-005 | 22 | Tool prompt already requires parallel variant calls |
 | Q-008 | 22 | Eval workspace just shipped (ENG-1870) |
 | Q-009 | 21 | ComfyUI backend — ops-heavy; Remotion is the existing graph node |

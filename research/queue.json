@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:39:00Z",
+  "updated_at": "2026-09-11T17:41:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -26,21 +26,20 @@
     {
       "id": "Q-002",
       "title": "Eval-informed image model routing (no new table)",
-      "status": "triage",
+      "status": "park",
       "leverage": 5,
-      "product": 4,
+      "product": 2,
       "mergeability": 3,
       "evidence": 5,
       "collision": 1,
-      "score": 29,
-      "why": "No imageModel attribute on HumanEvalCandidate. Model name is only in outputSummary text. listCandidates is a scan. Signal is unstructured Slack. Weaker than DesignArena (Q-003) as a live router; keep as offline parser later.",
+      "score": 23,
+      "why": "Cycle 12: model id is only in outputSummary text (regex Model: <id>). Feedback is unstructured Slack with no like/reject. listCandidates is a scan. Weaker than DesignArena (Q-003) as a live router. Adding imageModel on AW-HumanEvalQueue is Harsha. Park as offline report only.",
       "files": [
         "backend/src/services/agentModeService.ts",
         "backend/src/services/humanEvalService.ts",
-        "backend/src/services/imagePromptQualityService.ts",
-        "backend/src/services/adImageVariantRatingService.ts"
+        "research/mappings/eval-output-summary.md"
       ],
-      "first_slice": "Read existing eval items and like-rates; propose a pure function that reorders fallbackOrder. Cycle 4 must prove no new GSI is required.",
+      "first_slice": "PARK. Offline parse of reviewed creative_image rows only. Never from generateImage. See mappings/eval-output-summary.md.",
       "harsha_db": false
     },
     {
