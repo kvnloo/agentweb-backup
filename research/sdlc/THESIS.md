@@ -211,6 +211,9 @@ add A-021.
 Cycle 129: GitHub treats a job-level `if` skip as Success.
 Dependabot’s REQUIRED comment only bites when the job runs.
 Do not add A-021.
+Cycle 130: naming `Backend build` as required cannot reproduce
+merge-evidence section 7. Every tests.yml job except Detect
+changed projects is a job-level path skip. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

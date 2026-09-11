@@ -320,3 +320,5 @@ reverted. Do not copy that as A-006.
   path-filter skip; #2491 PASSes with it skipped. Not A-006.
 - Cycle 129: GitHub treats a job-level `if` skip as Success;
   Dependabot REQUIRED only bites when the job runs. Not A-006.
+- Cycle 130: naming Backend build as required cannot reproduce
+  merge-evidence section 7. Not A-006.

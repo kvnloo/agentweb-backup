@@ -7,17 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 129
+cycles_completed: 130
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 130
+next_cycle: 131
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 129: GitHub treats a job-level if skip as Success;
-  Dependabot's REQUIRED comment only bites when the job runs.
-  Cycle 130: cheapest remaining. Candidate: the same GitHub
-  rule on Backend build (job-level if on path + draft) — ENG-1373
-  adding that name would still not gate partner-only PRs.
+  Cycle 130: naming Backend build as required cannot reproduce
+  merge-evidence section 7. Cycle 131: cheapest remaining.
+  Candidate: merge-evidence has no PARTNER_JOBS — cancelled /
+  skipped Partner portal build is the same hole as ENG-836.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

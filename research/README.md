@@ -391,6 +391,10 @@ Dependabot’s “REQUIRED” comment, if true, only bites on
 Dependabot PRs. Workflow-level skip stays Pending and blocks.
 Docs vs API: skipped reports Success for merge; API conclusion
 is still `skipped`.
+Cycle 130: **naming `Backend build` as required cannot
+reproduce merge-evidence section 7.** Every `tests.yml` job
+except Detect changed projects is a job-level path skip
+(L70). GitHub required checks are names, not path-conditional.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -526,6 +526,11 @@ Dependabot yml L46 is that skip. Workflow-level skip stays
 Pending and blocks. Docs vs API: merge Success; conclusion
 `skipped`. The REQUIRED comment only bites on Dependabot PRs.
 
+Cycle 130: **naming `Backend build` as required cannot reproduce
+merge-evidence section 7.** Every `tests.yml` job except Detect
+changed projects is a job-level path skip (`tests.yml` L70).
+GitHub required checks are names, not path-conditional.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
