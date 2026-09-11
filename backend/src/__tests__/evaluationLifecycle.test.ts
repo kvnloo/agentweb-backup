@@ -71,11 +71,20 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     expect(remove).toHaveBeenCalledTimes(2);
     expect(remove.mock.calls.every(([params]) => params.ExpressionAttributeValues[':user'] === 'eval_test')).toBe(true);
   });
-  it('does not count a conditional ownership mismatch as a deletion', async () => {
-    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email } }) });
-    scan.mockImplementation((params: any) => ({ promise: async () => ({ Items: params.TableName.endsWith('AW-AgentApiKeys') ? [{ userId: 'eval_test', keyId: 'changed-owner' }] : [], LastEvaluatedKey: undefined }) }));
-    remove.mockImplementationOnce(() => ({ promise: async () => { throw Object.assign(new Error('synthetic mismatch'), { code: 'ConditionalCheckFailedException' }); } }));
+
+
+  it('does not report a credential as deleted when the ownership condition loses a race', async () => {
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email, status: 'active' } }) });
+    scan.mockImplementation((params: any) => ({ promise: async () => ({
+      Items: params.TableName.endsWith('AW-AgentApiKeys') ? [{ userId: 'eval_test', keyId: 'raced' }] : [],
+      LastEvaluatedKey: undefined,
+    }) }));
+    remove.mockReturnValueOnce({
+      promise: async () => { throw Object.assign(new Error('ownership changed'), { code: 'ConditionalCheckFailedException' }); },
+    });
+
     const result = await store.revoke('admin', 'eval_test');
+
     expect(result.cleanup['AW-AgentApiKeys']).toBe(0);
   });
   it('records cleanup failure after the authoritative revoke commit', async () => {
