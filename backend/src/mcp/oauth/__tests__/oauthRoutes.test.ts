@@ -23,7 +23,10 @@ const mockRecordMcpOAuthTokenIssued = jest.fn();
 jest.mock('../oauthService', () => ({
   mcpOAuthService: {
     registerClient: (...args: any[]) => mockRegisterClient(...args),
-    getClient: (...args: any[]) => mockGetClient(...args),
+    getClient: async (...args: any[]) => {
+      const client = await mockGetClient(...args);
+      return client && { tokenEndpointAuthMethod: 'none', ...client };
+    },
     createAuthorizationCode: (...args: any[]) => mockCreateAuthorizationCode(...args),
     consumeAuthorizationCode: (...args: any[]) => mockConsumeAuthorizationCode(...args),
     createTokenPair: (...args: any[]) => mockCreateTokenPair(...args),
@@ -621,7 +624,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         tokenEndpointAuthMethod: 'none',
       });
-      mockValidatePkce.mockReturnValue(false);
+      mockConsumeAuthorizationCode.mockResolvedValue(null); // Service owns PKCE validation before consumption.
 
       const res = await request(app)
         .post('/oauth/token')
@@ -653,6 +656,7 @@ describe('MCP OAuth Routes', () => {
         .send({
           grant_type: 'refresh_token',
           refresh_token: 'old-refresh-token',
+          client_id: 'client-123',
         })
         .expect(200);
 
@@ -669,6 +673,7 @@ describe('MCP OAuth Routes', () => {
         .send({
           grant_type: 'refresh_token',
           refresh_token: 'bad-refresh',
+          client_id: 'client-123',
         })
         .expect(400);
 
@@ -737,7 +742,7 @@ describe('Hermes callback security boundaries (ENG-1869)', () => {
   it('preserves OAuth 2.1 exchange without a redundant redirect_uri', async () => {
     await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
       code: 'one-time-code', client_id: 'hermes', code_verifier: 'verifier' }).expect(200);
-    expect(mockValidatePkce).toHaveBeenCalled();
+    expect(mockConsumeAuthorizationCode).toHaveBeenCalledWith('one-time-code', 'hermes', undefined, 'verifier');
     expect(mockCreateTokenPair).toHaveBeenCalledWith(expect.objectContaining({ clientId: 'hermes' }));
   });
   it.each([
@@ -746,6 +751,7 @@ describe('Hermes callback security boundaries (ENG-1869)', () => {
     { redirect_uri: 'http://localhost:49152/callback' },
     { redirect_uri: 'http://127.0.0.1:49152/other' },
   ])('rejects changed callback bindings %p', async changed => {
+    mockConsumeAuthorizationCode.mockResolvedValue(null);
     await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
       code: 'one-time-code', client_id: 'hermes', redirect_uri: redirect, code_verifier: 'verifier', ...changed }).expect(400);
     expect(mockCreateTokenPair).not.toHaveBeenCalled();
