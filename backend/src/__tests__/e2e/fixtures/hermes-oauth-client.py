@@ -63,10 +63,13 @@ async def flow(bad_state=False, bad_pkce=False):
     provider = Provider(server_url=base + '/mcp', storage=storage,
         client_metadata=native._build_client_metadata({'_resolved_port': port}),
         redirect_handler=redirect, callback_handler=callback)
-    if bad_pkce:
-        original = provider._exchange_token_authorization_code
-        async def corrupt(code, verifier): return await original(code, 'x' * 43)
-        provider._exchange_token_authorization_code = corrupt
+    original = provider._exchange_token_authorization_code
+    valid_verifier = None
+    async def capture(code, verifier):
+        nonlocal valid_verifier
+        valid_verifier = verifier
+        return await original(code, 'x' * 43 if bad_pkce else verifier)
+    provider._exchange_token_authorization_code = capture
     headers = {'Accept': 'application/json, text/event-stream'}
     async with httpx.AsyncClient(auth=provider, headers=headers) as client:
         response = await client.post(base + '/mcp', json={'jsonrpc': '2.0', 'id': 1,
@@ -87,7 +90,7 @@ async def flow(bad_state=False, bad_pkce=False):
             code = parse_qs(urlsplit(callback_url).query)['code'][0]
             replay = await raw.post(base + '/oauth/token', data={'grant_type': 'authorization_code',
                 'code': code, 'client_id': storage.info.client_id,
-                'redirect_uri': str(storage.info.redirect_uris[0]), 'code_verifier': 'x' * 43})
+                'redirect_uri': str(storage.info.redirect_uris[0]), 'code_verifier': valid_verifier})
             assert replay.status_code == 400 and replay.json()['error'] == 'invalid_grant'
         await client.delete(base + '/mcp', headers=headers)
 

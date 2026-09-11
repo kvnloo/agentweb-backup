@@ -11,6 +11,7 @@ const mockPut = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue
 const mockGet = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 const mockQuery = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
 const mockUpdate = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+const mockTransactWrite = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 const mockDelete = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 
 jest.mock('aws-sdk', () => ({
@@ -24,6 +25,7 @@ jest.mock('aws-sdk', () => ({
         query: mockQuery,
         update: mockUpdate,
         delete: mockDelete,
+        transactWrite: mockTransactWrite,
       })),
     },
   },
@@ -219,7 +221,7 @@ describe('McpOAuthService', () => {
         userId: 'user-456',
         redirectUri: 'https://example.com/cb',
         scope: 'mcp:tools',
-        codeChallenge: 'challenge',
+        codeChallenge: crypto.createHash('sha256').update('verifier').digest('base64url'),
         codeChallengeMethod: 'S256',
         used: false,
         expiresAt: Math.floor(Date.now() / 1000) + 600,
@@ -228,7 +230,7 @@ describe('McpOAuthService', () => {
         promise: jest.fn().mockResolvedValue({ Item: codeRecord }),
       });
 
-      const result = await service.consumeAuthorizationCode('test-code');
+      const result = await service.consumeAuthorizationCode('test-code', 'client-123', 'https://example.com/cb', 'verifier');
       expect(result).toBeDefined();
       expect(result!.clientId).toBe('client-123');
       expect(mockUpdate).toHaveBeenCalledTimes(1); // marks as used
@@ -380,88 +382,42 @@ describe('McpOAuthService', () => {
   // ─── Refresh Flow ─────────────────────────────────────────────────────
 
   describe('refreshTokens', () => {
-    it('should issue new token pair and revoke old', async () => {
-      const rawRefresh = crypto.randomBytes(48).toString('hex');
-      const refreshHash = crypto.createHash('sha256').update(rawRefresh).digest('hex');
-
-      mockQuery.mockReturnValueOnce({
-        promise: jest.fn().mockResolvedValue({
-          Items: [
-            {
-              tokenHash: 'old-access-hash',
-              refreshTokenHash: refreshHash,
-              userId: 'user-456',
-              clientId: 'client-123',
-              scope: 'mcp:tools',
-              expiresAt: Math.floor(Date.now() / 1000) + 86400,
-              refreshExpiresAt: Math.floor(Date.now() / 1000) + 86400 * 30,
-              revoked: false,
-            },
-          ],
-        }),
-      });
-
-      const result = await service.refreshTokens(rawRefresh);
-      expect(result).toBeDefined();
-      expect(result!.accessToken).toBeDefined();
-      expect(result!.refreshToken).toBeDefined();
-      expect(result!.tokenType).toBe('Bearer');
-
-      // Old token record should be revoked (update call)
-      expect(mockUpdate).toHaveBeenCalledTimes(1);
-      // New token pair should be stored
-      expect(mockPut).toHaveBeenCalledTimes(1);
-    });
-
+    // Successful rotation, atomicity and replay are exercised with the real
+    // service + stateful storage in oauthSecurity.test.ts, replacing a write-count
+    // mock that could not distinguish atomic rotation from the vulnerable flow.
     it('should return null for invalid refresh token', async () => {
       mockQuery.mockReturnValueOnce({
         promise: jest.fn().mockResolvedValue({ Items: [] }),
       });
 
-      const result = await service.refreshTokens('bad-refresh-token');
+      const result = await service.refreshTokens('bad-refresh-token', 'client-123');
       expect(result).toBeNull();
     });
 
-    it('should return null for revoked refresh token', async () => {
+    it.each([true, false])('rejects a primary refresh record with revoked=%s or expired lifetime', async revoked => {
       const rawRefresh = crypto.randomBytes(48).toString('hex');
       const refreshHash = crypto.createHash('sha256').update(rawRefresh).digest('hex');
+      const record = {
+        tokenHash: 'old-hash', refreshTokenHash: refreshHash,
+        clientId: 'client-123', userId: 'user-456', scope: 'mcp:tools',
+        familyId: 'root-hash', revoked,
+        refreshExpiresAt: Math.floor(Date.now() / 1000) + (revoked ? 3600 : -60),
+      };
+      mockQuery.mockReturnValueOnce({ promise: async () => ({ Items: [{ tokenHash: record.tokenHash }] }) });
+      mockGet.mockReturnValueOnce({ promise: async () => ({ Item: record }) });
 
-      mockQuery.mockReturnValueOnce({
-        promise: jest.fn().mockResolvedValue({
-          Items: [
-            {
-              tokenHash: 'old-hash',
-              refreshTokenHash: refreshHash,
-              revoked: true,
-              refreshExpiresAt: Math.floor(Date.now() / 1000) + 86400 * 30,
-            },
-          ],
-        }),
-      });
-
-      const result = await service.refreshTokens(rawRefresh);
-      expect(result).toBeNull();
-    });
-
-    it('should return null for expired refresh token', async () => {
-      const rawRefresh = crypto.randomBytes(48).toString('hex');
-      const refreshHash = crypto.createHash('sha256').update(rawRefresh).digest('hex');
-
-      mockQuery.mockReturnValueOnce({
-        promise: jest.fn().mockResolvedValue({
-          Items: [
-            {
-              tokenHash: 'old-hash',
-              refreshTokenHash: refreshHash,
-              revoked: false,
-              refreshExpiresAt: Math.floor(Date.now() / 1000) - 60,
-            },
-          ],
-        }),
-      });
-
-      const result = await service.refreshTokens(rawRefresh);
-      expect(result).toBeNull();
+      expect(await service.refreshTokens(rawRefresh, 'client-123')).toBeNull();
+      expect(mockGet).toHaveBeenCalledWith(expect.objectContaining({
+        Key: { tokenHash: record.tokenHash }, ConsistentRead: true,
+      }));
+      if (revoked) {
+        expect(mockUpdate).toHaveBeenCalledWith(expect.objectContaining({
+          Key: { tokenHash: 'root-hash' }, UpdateExpression: 'SET familyRevoked = :revoked',
+        }));
+      } else {
+        expect(mockUpdate).not.toHaveBeenCalled();
+      }
+      expect(mockTransactWrite).not.toHaveBeenCalled();
     });
   });
 
@@ -487,17 +443,21 @@ describe('Hermes one-time code and registration invariants (ENG-1869)', () => {
   const service = new McpOAuthService();
   beforeEach(() => jest.clearAllMocks());
   it('allows only one concurrent code redemption even when both reads see unused', async () => {
-    const record = { code: 'race-code', used: false, expiresAt: Math.floor(Date.now() / 1000) + 600 };
+    const record = { code: 'race-code', clientId: 'client', userId: 'user', scope: 'mcp:tools', redirectUri: 'https://example.com/cb', used: false, expiresAt: Math.floor(Date.now() / 1000) + 600,
+      codeChallenge: crypto.createHash('sha256').update('verifier').digest('base64url'), codeChallengeMethod: 'S256' };
     mockGet.mockReturnValue({ promise: async () => ({ Item: { ...record } }) });
     let used = false;
     mockUpdate.mockImplementation(params => ({ promise: async () => {
-      if (params.ConditionExpression && used) {
+      expect(params.ConditionExpression).toBe('used = :unused AND expiresAt > :now AND codeChallenge = :challenge AND codeChallengeMethod = :method AND clientId = :clientId AND redirectUri = :redirectUri');
+      expect(params.ExpressionAttributeValues).toEqual({ ':used': true, ':unused': false, ':now': expect.any(Number), ':challenge': record.codeChallenge, ':method': 'S256', ':clientId': 'client', ':redirectUri': 'https://example.com/cb' });
+      if (used === params.ExpressionAttributeValues[':unused'] && record.expiresAt > params.ExpressionAttributeValues[':now']) {
+        used = params.ExpressionAttributeValues[':used'];
+        return {};
+      } else {
         throw Object.assign(new Error('Conditional failure'), { code: 'ConditionalCheckFailedException' });
       }
-      used = true;
-      return {};
     } }));
-    const results = await Promise.all([service.consumeAuthorizationCode('race-code'), service.consumeAuthorizationCode('race-code')]);
+    const results = await Promise.all([service.consumeAuthorizationCode('race-code', 'client', 'https://example.com/cb', 'verifier'), service.consumeAuthorizationCode('race-code', 'client', 'https://example.com/cb', 'verifier')]);
     expect(results.filter(Boolean)).toHaveLength(1);
   });
   it.each(['https://example.com/callback#fragment', 'http://user:password@127.0.0.1:49152/callback'])('rejects unsafe registered redirect %s', async redirect => {
@@ -518,9 +478,9 @@ describe('Rejected callback bindings do not consume the code', () => {
   ])('preserves the code for client %s / redirect %s', async (clientId, redirectUri) => {
     jest.clearAllMocks();
     mockGet.mockReturnValue({ promise: async () => ({ Item: { code: 'bound-code', used: false,
-      clientId: 'hermes', redirectUri: 'http://127.0.0.1:49152/callback', expiresAt: Math.floor(Date.now() / 1000) + 600 } }) });
+      clientId: 'hermes', userId: 'user', scope: 'mcp:tools', codeChallenge: crypto.createHash('sha256').update('verifier').digest('base64url'), codeChallengeMethod: 'S256', redirectUri: 'http://127.0.0.1:49152/callback', expiresAt: Math.floor(Date.now() / 1000) + 600 } }) });
     const service = new McpOAuthService();
-    const result = await service.consumeAuthorizationCode('bound-code', clientId, redirectUri);
+    const result = await service.consumeAuthorizationCode('bound-code', clientId, redirectUri, 'verifier');
     expect(result).toBeNull();
     expect(mockUpdate).not.toHaveBeenCalled();
   });

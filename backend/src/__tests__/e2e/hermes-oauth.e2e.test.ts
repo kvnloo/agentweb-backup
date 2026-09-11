@@ -4,20 +4,11 @@ import { execFile } from 'child_process';
 import path from 'path';
 import { promisify } from 'util';
 
-const mockRows = new Map<string, any>();
-const mockKey = (table: string, item: any) => `${table}:${item.clientId && !item.code && !item.tokenHash ? item.clientId : item.code || item.tokenHash}`;
+import { OAuthDynamoFixture } from '../../mcp/oauth/__tests__/fixtures/dynamo';
+const mockDb = new OAuthDynamoFixture();
+const mockRows = mockDb.rows;
 jest.mock('aws-sdk', () => ({ __esModule: true, default: {
-  DynamoDB: { DocumentClient: jest.fn(() => ({
-    put: ({ TableName, Item }: any) => ({ promise: async () => { mockRows.set(mockKey(TableName, Item), { ...Item }); } }),
-    get: ({ TableName, Key }: any) => ({ promise: async () => ({ Item: mockRows.get(mockKey(TableName, Key)) }) }),
-    update: ({ TableName, Key, ConditionExpression, ExpressionAttributeValues: v }: any) => ({ promise: async () => {
-      const row = mockRows.get(mockKey(TableName, Key));
-      if (ConditionExpression && (!row || row.used || row.expiresAt <= v[':now'])) {
-        throw Object.assign(new Error('Conditional failure'), { code: 'ConditionalCheckFailedException' });
-      }
-      row.used = true;
-    } }),
-  })) },
+  DynamoDB: { DocumentClient: jest.fn(() => mockDb) },
 } }));
 jest.mock('../../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {

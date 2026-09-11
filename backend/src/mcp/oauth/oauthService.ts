@@ -59,6 +59,9 @@ export interface OAuthTokenRecord {
   scope: string;
   expiresAt: number; // epoch seconds (DynamoDB TTL)
   refreshExpiresAt: number;
+  accessExpiresAt?: number; // Legacy records use expiresAt for access expiry.
+  familyId?: string; // Root tokenHash; legacy refresh tokens without lineage require login.
+  familyRevoked?: boolean; // Only authoritative on the root; retained until family expiry.
   revoked: boolean;
   createdAt: string;
 }
@@ -108,6 +111,7 @@ export interface CreateTokenPairParams {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+const SUPPORTED_AUTH_METHODS = ['none', 'client_secret_basic', 'client_secret_post'];
 const AUTH_CODE_TTL_SEC = 600; // 10 minutes
 const ACCESS_TOKEN_TTL_SEC = 3600; // 1 hour
 const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 3600; // 30 days
@@ -154,7 +158,8 @@ export class McpOAuthService {
     }
 
     const clientId = uuidv4();
-    const authMethod = params.tokenEndpointAuthMethod || 'none';
+    const authMethod = params.tokenEndpointAuthMethod === undefined ? 'none' : params.tokenEndpointAuthMethod;
+    if (!SUPPORTED_AUTH_METHODS.includes(authMethod)) throw new Error('invalid_client_metadata');
     const isConfidential = authMethod !== 'none';
 
     let clientSecret: string | undefined;
@@ -202,7 +207,12 @@ export class McpOAuthService {
       Key: { clientId },
     }).promise();
 
-    return (result.Item as OAuthClient) || null;
+    const client = result.Item as OAuthClient | undefined;
+    if (!client || client.clientId !== clientId || typeof client.clientName !== 'string' ||
+        !Array.isArray(client.redirectUris) || !client.redirectUris.every(uri => typeof uri === 'string') ||
+        !SUPPORTED_AUTH_METHODS.includes(client.tokenEndpointAuthMethod) ||
+        (client.tokenEndpointAuthMethod !== 'none' && typeof client.clientSecretHash !== 'string')) return null;
+    return client;
   }
 
   // ─── PKCE Validation ───────────────────────────────────────────────────
@@ -245,24 +255,31 @@ export class McpOAuthService {
     return { code };
   }
 
-  async consumeAuthorizationCode(code: string, clientId?: string, redirectUri?: string): Promise<OAuthAuthorizationCode | null> {
+  async consumeAuthorizationCode(code: string, clientId?: string, redirectUri?: string, codeVerifier?: string): Promise<OAuthAuthorizationCode | null> {
     const result = await dynamodb.get({
       TableName: this.codesTable,
       Key: { code },
     }).promise();
 
     const record = result.Item as OAuthAuthorizationCode | undefined;
-    if (!record) return null;
-    if (record.used) return null;
+    if (!record || record.used !== false || record.code !== code ||
+        typeof record.clientId !== 'string' || typeof record.userId !== 'string' ||
+        typeof record.scope !== 'string' || typeof record.redirectUri !== 'string' ||
+        !Number.isFinite(record.expiresAt)) return null;
 
     const nowSec = Math.floor(Date.now() / 1000);
     if (record.expiresAt <= nowSec) return null;
     if (clientId !== undefined && record.clientId !== clientId) return null;
     if (redirectUri !== undefined && record.redirectUri !== redirectUri) return null;
 
-    const conditions = ['used = :unused', 'expiresAt > :now'];
+    if (!codeVerifier || typeof record.codeChallenge !== 'string' || record.codeChallengeMethod !== 'S256' ||
+        !this.validatePkce(codeVerifier, record.codeChallenge, record.codeChallengeMethod)) return null;
+
+    const conditions = ['used = :unused', 'expiresAt > :now',
+      'codeChallenge = :challenge', 'codeChallengeMethod = :method'];
     const values: Record<string, string | number | boolean> = {
       ':used': true, ':unused': false, ':now': Math.floor(Date.now() / 1000),
+      ':challenge': record.codeChallenge, ':method': 'S256',
     };
     if (clientId !== undefined) {
       conditions.push('clientId = :clientId');
@@ -294,6 +311,13 @@ export class McpOAuthService {
   // ─── Token Pair ────────────────────────────────────────────────────────
 
   async createTokenPair(params: CreateTokenPairParams): Promise<TokenPairResponse> {
+    const { record, response } = this.newTokenPair(params);
+    await dynamodb.put({ TableName: this.tokensTable, Item: record }).promise();
+    return response;
+  }
+
+  private newTokenPair(params: CreateTokenPairParams, familyId?: string, familyExpiresAt?: number):
+    { record: OAuthTokenRecord; response: TokenPairResponse } {
     const accessToken = crypto.randomBytes(48).toString('hex');
     const refreshToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(accessToken).digest('hex');
@@ -306,24 +330,23 @@ export class McpOAuthService {
       userId: params.userId,
       clientId: params.clientId,
       scope: params.scope,
-      expiresAt: nowSec + ACCESS_TOKEN_TTL_SEC,
-      refreshExpiresAt: nowSec + REFRESH_TOKEN_TTL_SEC,
+      // TTL must retain ancestors for replay detection, not just access validity.
+      expiresAt: familyExpiresAt ?? nowSec + REFRESH_TOKEN_TTL_SEC,
+      accessExpiresAt: Math.min(nowSec + ACCESS_TOKEN_TTL_SEC, familyExpiresAt ?? Infinity),
+      refreshExpiresAt: familyExpiresAt ?? nowSec + REFRESH_TOKEN_TTL_SEC,
+      familyId: familyId ?? tokenHash,
+      ...(!familyId && { familyRevoked: false }),
       revoked: false,
       createdAt: new Date().toISOString(),
     };
 
-    await dynamodb.put({
-      TableName: this.tokensTable,
-      Item: record,
-    }).promise();
-
-    return {
+    return { record, response: {
       accessToken,
       refreshToken,
       tokenType: 'Bearer',
-      expiresIn: ACCESS_TOKEN_TTL_SEC,
+      expiresIn: record.accessExpiresAt! - nowSec,
       scope: params.scope,
-    };
+    } };
   }
 
   // ─── Token Validation ─────────────────────────────────────────────────
@@ -334,53 +357,131 @@ export class McpOAuthService {
     const result = await dynamodb.get({
       TableName: this.tokensTable,
       Key: { tokenHash },
+      ConsistentRead: true,
     }).promise();
 
     const record = result.Item as OAuthTokenRecord | undefined;
-    if (!record) return null;
-    if (record.revoked) return null;
+    if (!record || record.revoked !== false || record.tokenHash !== tokenHash ||
+        typeof record.clientId !== 'string' || typeof record.userId !== 'string' || typeof record.scope !== 'string') return null;
 
     const nowSec = Math.floor(Date.now() / 1000);
-    if (record.expiresAt <= nowSec) return null;
+    const accessExpiry = record.familyId === undefined ? record.expiresAt : record.accessExpiresAt;
+    if (typeof accessExpiry !== 'number' || !Number.isFinite(accessExpiry) || accessExpiry <= nowSec) return null;
+    if (record.familyId !== undefined && !await this.activeFamily(record)) return null;
 
     return record;
   }
 
   // ─── Refresh Flow ─────────────────────────────────────────────────────
 
-  async refreshTokens(rawRefreshToken: string): Promise<TokenPairResponse | null> {
-    const refreshTokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
+  private async tokenRecord(tokenHash: string): Promise<OAuthTokenRecord | null> {
+    const result = await dynamodb.get({
+      TableName: this.tokensTable, Key: { tokenHash }, ConsistentRead: true,
+    }).promise();
+    return result.Item as OAuthTokenRecord || null;
+  }
 
-    // Look up by refresh token hash
+  private async activeFamily(record: OAuthTokenRecord): Promise<boolean> {
+    if (typeof record.familyId !== 'string' || !record.familyId) return false;
+    const root = await this.tokenRecord(record.familyId);
+    return !!root && root.familyId === record.familyId && root.familyRevoked === false &&
+      root.clientId === record.clientId && root.userId === record.userId &&
+      Number.isFinite(root.refreshExpiresAt) && root.refreshExpiresAt > Math.floor(Date.now() / 1000);
+  }
+
+  private async retryTransactionConflict<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try { return await operation(); } catch (error) {
+        const failure = error as { code?: string; CancellationReasons?: { Code?: string }[] };
+        const reasons = failure.CancellationReasons;
+        const conflict = failure.code === 'TransactionConflictException' ||
+          (failure.code === 'TransactionCanceledException' && Array.isArray(reasons) &&
+            reasons.some(reason => reason?.Code === 'TransactionConflict') &&
+            reasons.every(reason => reason?.Code === 'None' || reason?.Code === 'TransactionConflict'));
+        if (!conflict || attempt >= 3) throw error;
+        await new Promise(resolve => setTimeout(resolve, 10 * 2 ** attempt));
+      }
+    }
+  }
+
+  private async revokeFamily(record: OAuthTokenRecord): Promise<void> {
+    if (!record.familyId) return; // Legacy consumed records have no recoverable lineage.
+    try {
+      await this.retryTransactionConflict(() => dynamodb.update({
+        TableName: this.tokensTable, Key: { tokenHash: record.familyId },
+        UpdateExpression: 'SET familyRevoked = :revoked',
+        ConditionExpression: 'familyId = :familyId AND clientId = :clientId',
+        ExpressionAttributeValues: { ':revoked': true, ':familyId': record.familyId, ':clientId': record.clientId },
+      }).promise());
+    } catch (error) {
+      // Missing root already disables every descendant; never recreate a TTL-deleted root.
+      if ((error as { code?: string }).code !== 'ConditionalCheckFailedException') throw error;
+    }
+  }
+
+  async refreshTokens(rawRefreshToken: string, clientId?: string): Promise<TokenPairResponse | null> {
+    if (!clientId) return null;
+    const refreshTokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
     const result = await dynamodb.query({
       TableName: this.tokensTable,
       IndexName: 'RefreshTokenHashIndex',
       KeyConditionExpression: 'refreshTokenHash = :hash',
       ExpressionAttributeValues: { ':hash': refreshTokenHash },
     }).promise();
-
-    if (!result.Items || result.Items.length === 0) return null;
-
-    const record = result.Items[0] as OAuthTokenRecord;
-    if (record.revoked) return null;
-
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (record.refreshExpiresAt <= nowSec) return null;
-
-    // Revoke the old token pair
-    await dynamodb.update({
-      TableName: this.tokensTable,
-      Key: { tokenHash: record.tokenHash },
-      UpdateExpression: 'SET revoked = :revoked',
-      ExpressionAttributeValues: { ':revoked': true },
-    }).promise();
-
-    // Issue new pair
-    return this.createTokenPair({
-      clientId: record.clientId,
-      userId: record.userId,
-      scope: record.scope,
-    });
+    // The GSI is only a locator: never trust its eventually consistent revoked state.
+    if (!Array.isArray(result.Items) || result.Items.length !== 1 ||
+        typeof result.Items[0]?.tokenHash !== 'string') return null;
+    const record = await this.tokenRecord(result.Items[0].tokenHash);
+    const now = Math.floor(Date.now() / 1000);
+    if (!record || record.refreshTokenHash !== refreshTokenHash || record.clientId !== clientId ||
+        typeof record.userId !== 'string' || typeof record.scope !== 'string' ||
+        typeof record.revoked !== 'boolean' || !Number.isFinite(record.refreshExpiresAt) ||
+        record.refreshExpiresAt <= now) return null;
+    if (record.revoked) {
+      await this.revokeFamily(record);
+      return null;
+    }
+    // Legacy rows cannot prove their ancestry. Keep existing access validity, but
+    // require fresh authorization rather than accepting an untraceable refresh chain.
+    if (!await this.activeFamily(record)) return null;
+    const familyId = record.familyId!;
+    const { record: successor, response } = this.newTokenPair(record, familyId, record.refreshExpiresAt);
+    const conditions = ['revoked = :unused', 'refreshExpiresAt > :now',
+      'refreshTokenHash = :hash', 'clientId = :clientId'];
+    const values: AWS.DynamoDB.DocumentClient.ExpressionAttributeValueMap = {
+      ':unused': false, ':used': true, ':now': now, ':hash': refreshTokenHash, ':clientId': clientId,
+    };
+    if (familyId === record.tokenHash) conditions.push('familyRevoked = :unused');
+    const TransactItems: AWS.DynamoDB.DocumentClient.TransactWriteItemList = [
+      { Update: { TableName: this.tokensTable, Key: { tokenHash: record.tokenHash },
+        UpdateExpression: 'SET revoked = :used', ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } },
+      { Put: { TableName: this.tokensTable, Item: successor, ConditionExpression: 'attribute_not_exists(tokenHash)' } },
+    ];
+    if (familyId !== record.tokenHash) {
+      TransactItems.push({ ConditionCheck: {
+        TableName: this.tokensTable, Key: { tokenHash: familyId },
+        ConditionExpression: 'familyRevoked = :unused AND refreshExpiresAt > :now',
+        ExpressionAttributeValues: { ':unused': false, ':now': now },
+      } });
+    }
+    try {
+      const transaction = { TransactItems, ClientRequestToken: uuidv4() };
+      await this.retryTransactionConflict(() => dynamodb.transactWrite(transaction).promise());
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'TransactionCanceledException') throw error;
+      const current = await this.tokenRecord(record.tokenHash);
+      // Only authenticated, correctly bound replay revokes. Storage errors must not
+      // masquerade as replay or silently revoke an otherwise usable grant.
+      if (current?.revoked && current.clientId === clientId && current.refreshTokenHash === refreshTokenHash) {
+        await this.revokeFamily(current);
+        return null;
+      }
+      if (current?.familyId && !await this.activeFamily(current)) return null;
+      const reasons = (error as { CancellationReasons?: { Code?: string }[] }).CancellationReasons;
+      if (Array.isArray(reasons) && reasons.some(reason => reason?.Code === 'ConditionalCheckFailed')) return null;
+      throw error;
+    }
+    return response;
   }
 
   // ─── Client Secret Validation ─────────────────────────────────────────

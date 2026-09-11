@@ -37,34 +37,79 @@ already applies that timeout floor. If expired, start a fresh
 login. Never paste an access token, refresh token, or password into chat. Treat
 callback URLs as short-lived credentials; do not put them into logs or issues.
 
-## Server hardening and verification
+## Security and persistence behavior
 
-The investigation reproduced gaps in the requested security invariants:
-non-atomic code consumption, unvalidated denial redirects, missing PKCE on a
-direct consent submission, optional client identity at token exchange, and malformed
-parameter coercion. The patch closes these without changing successful Hermes
-requests, token formats, scopes, persistence schema, or adding an auth path.
+Credentials are validated before an authorization code is consumed: registered
+client authentication first, then exact supplied client/redirect binding and PKCE
+S256. The conditional write rechecks unused state, expiry, challenge, method and
+supplied bindings. Wrong verifiers or secrets leave the valid code usable;
+concurrent valid exchanges issue one pair. OAuth 2.1 permits omission of the
+redundant token-request `redirect_uri`; supplied values must match exactly.
 
-TDD on the two OAuth suites: **RED 15 failed / 54 passed**, then **GREEN 69 passed**.
-Review caught one overrestriction in that first iteration: OAuth 2.1 token
-requests need not repeat `redirect_uri`. Its mandatory-field assertion was
-withdrawn; the replacement compatibility test captured **RED 1 failed / 72
-passed**, then passed after preserving omission support. Supplied redirect
-URIs still require exact matching; registered consent redirects and PKCE remain
-mandatory. See [OAuth 2.1 §10.2](https://www.ietf.org/ietf-ftp/internet-drafts/draft-ietf-oauth-v2-1-16.html#section-10.2).
-Four additional exact-binding regressions and two code-preservation tests bring the final OAuth/MCP run to
-**121 passed across 4 suites**. Native fixture: **1 passed**. Production build and
-full typecheck passed on Atem. The final two binding tests captured RED
-(2 failed / 31 passed) before moving client/redirect validation ahead of code
-consumption and into the conditional update. The native fixture also passes unchanged base
-`745c4549b`: this is security hardening and a headless usage diagnosis, not evidence
-of a newly repaired server interoperability failure. The existing neighboring
-MCP suites emit a timer-teardown warning; the native fixture exits cleanly.
+Refresh requires the issuing `client_id` (or Basic identity) and authenticates
+confidential clients using their registered Basic or POST method. The existing `RefreshTokenHashIndex` only locates a record;
+strongly consistent primary-key reads establish current state. One DynamoDB
+transaction consumes the old refresh token, creates its successor, and checks
+that the root family is active. Recognized transaction conflicts receive bounded
+retries; other storage failures propagate and do not issue tokens.
+
+Authenticated, correctly bound replay sets the root's `familyRevoked` flag.
+Every descendant refresh and access validation checks that root. Concurrent use
+therefore yields one token response, but the losing replay disables the winning
+family too: the server cannot determine which caller is legitimate. Clients must
+serialize refresh and reauthenticate after replay or a lost successful response.
+This follows [RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2).
+
+No table, key, index, TTL configuration, migration, or backfill is required.
+Existing token items gain `familyId`, root-only `familyRevoked`, and
+`accessExpiresAt`. `expiresAt` remains DynamoDB's TTL attribute but now retains
+all family records through the fixed 30-day refresh expiry; access remains valid
+for at most one hour. Refresh does not extend the family deadline. DynamoDB
+transactions and consistent reads increase per-request storage work, and replay
+records remain longer than the former one-hour TTL.
+
+**Legacy compatibility:** existing access tokens keep their original expiry.
+Existing refresh tokens without family lineage require a new authorization/login;
+there is no reliable way to tell whether an old record has already-rotated
+ancestors. Previously consumed legacy tokens cannot identify their successors.
+Missing/TTL-deleted records also require login. No production data is changed by
+this PR before deployment, and no backfill is proposed.
+
+**Rollback:** do not blindly revert the access-token reader after new records
+have been issued: old code would mistake the retention TTL for access expiry and
+would ignore family revocation. Retain the new access-expiry/family checks during
+a partial rollback, or explicitly revoke affected families before reverting them
+(a separate approved data-plane action). Reverting the refresh writer alone also
+reopens the original refresh vulnerabilities. Prefer a forward fix.
+
+## Verification
+
+All checks run in this worktree on Atem. Strict TDD evidence for this review:
+
+- Initial RED: **17 failed, 6 passed** (credential preservation and refresh protection).
+- Boundary/legacy RED: **11 failed, 33 passed** (malformed data, untraceable legacy refresh, actual access lifetime).
+- Transaction-conflict RED: **2 failed, 44 passed**.
+- Registration-review RED: **5 failed, 46 passed**.
+- Credential-transport RED: **4 failed, 51 passed**.
+- Final GREEN: **164 tests passed across six suites**, including native Hermes and
+  the neighboring MCP auth/security suites. Their existing timer-teardown warning
+  remains; the native fixture exits cleanly.
+
+The original native replay assertion now retries with the **original valid PKCE
+verifier**, so rejection proves one-time use. The concurrency tests assert the
+exact conditional write and evaluate each condition against mutable storage,
+including changes between read and write. The shared storage fixture evaluates
+supported DynamoDB expressions and transaction atomicity; it fails on unsupported
+syntax. It is not a live DynamoDB service or an IAM/deployment test.
+
 Run from repository root:
 
 ```sh
-node backend/node_modules/jest/bin/jest.js --config backend/jest.config.js --runInBand --runTestsByPath backend/src/mcp/oauth/__tests__/oauthRoutes.test.ts backend/src/mcp/oauth/__tests__/oauthService.test.ts
+node backend/node_modules/jest/bin/jest.js --config backend/jest.config.js --runInBand --runTestsByPath backend/src/mcp/oauth/__tests__/oauthRoutes.test.ts backend/src/mcp/oauth/__tests__/oauthService.test.ts backend/src/mcp/oauth/__tests__/oauthSecurity.test.ts
 HERMES_REPO=/path/to/hermes-agent node backend/node_modules/jest/bin/jest.js --config backend/jest.config.js --runInBand --testPathIgnorePatterns=/node_modules/ --runTestsByPath backend/src/__tests__/e2e/hermes-oauth.e2e.test.ts
+cd backend
+npm run typecheck
+npm run build
 ```
 
 The explicit native test requires Hermes's installed `venv/bin/python`; it fails
@@ -72,9 +117,16 @@ rather than silently skips when unavailable. It exercises real Emma routes,
 OAuth service, MCP authentication/transport, Hermes provider and native callback
 waiter/paste reader. DynamoDB, portal login/consent UI, telemetry, and business tool
 inventory are fixtures. It verifies state rejection, incorrect PKCE rejection,
-code replay rejection, token hashing, and an MCP tool seeing the authenticated
-user as external. It does **not** prove a live Slack adapter or real portal login.
+valid-verifier code replay rejection, token hashing, and an MCP tool seeing the
+authenticated user as external. It does **not** prove a live Slack adapter or real
+portal login. This PR implements no Slack callback bridge: Hermes orchestration
+must forward a later Slack callback message into the **original persistent
+process's stdin**; a fresh process or another Slack message alone cannot finish it.
 
-Rollback: revert this PR; no migration or backfill. Post-deploy smoke (not run;
-this PR must not merge): complete the native flow above with an authorized test
-account, verify tools connect, and verify a replay fails without exposing tokens.
+Post-deploy smoke (not run; **do not merge this PR**): complete the native flow
+with an authorized test account, verify tools connect, reject a wrong verifier
+without consuming the code, verify valid-verifier replay rejection, refresh once,
+then replay the ancestor and verify the successor is unusable. Avoid logging
+callback URLs or tokens. Production discovery/DCR/authorization redirects were
+probed in the original investigation; no production token/tool round-trip or
+production refresh transaction has been exercised.
