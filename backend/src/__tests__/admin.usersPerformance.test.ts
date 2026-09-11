@@ -12,7 +12,9 @@ jest.mock('aws-sdk', () => ({
   SecretsManager: jest.fn(() => ({ getSecretValue: () => ({ promise: async () => ({ SecretString: 'test-secret' }) }) })),
 }));
 
-jest.mock('../services/settingsService', () => ({ settingsService: { getSetting: jest.fn() } }));
+jest.mock('../services/settingsService', () => ({
+  settingsService: { getSetting: jest.fn(), getAllSettings: jest.fn() },
+}));
 import { userDb, orgDb } from '../services/db';
 import adminRoutes from '../routes/admin';
 import { settingsService } from '../services/settingsService';
@@ -42,6 +44,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   jest.spyOn(orgDb, 'getOrgById').mockResolvedValue(null);
   (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+  (settingsService.getAllSettings as jest.Mock).mockResolvedValue([]);
   rows = {
     'AW-Users': users,
     'AW-Tasks': users.map(u => ({ userId: u.userId })),
@@ -157,10 +160,15 @@ it('preserves AdminDashboard fields for five known users through the real storag
   (orgDb.getOrgById as jest.Mock).mockResolvedValue({
     name: 'Known Company', ownerUserId: 'user-0', shareSettings: { analytics: { enabled: true } },
   });
-  (settingsService.getSetting as jest.Mock).mockImplementation(async key => ({
-    settingValue: JSON.stringify({ replayUrl: `https://clarity.microsoft.com/${key}` }),
-  }));
+  (settingsService.getAllSettings as jest.Mock).mockResolvedValue(
+    rows['AW-Users'].map((u: any) => ({
+      settingName: `replay_sessions_${u.userId}`,
+      settingValue: JSON.stringify({ replayUrl: `https://clarity.microsoft.com/replay_sessions_${u.userId}` }),
+    }))
+  );
   const result = await getAdminUsers();
+  expect(settingsService.getAllSettings).toHaveBeenCalledTimes(1);
+  expect(settingsService.getSetting).not.toHaveBeenCalled();
   expect(result).toHaveLength(5);
   rows['AW-Users'].forEach((u, i) => expect(result[i]).toMatchObject({
     userId: u.userId, email: u.email, displayName: u.displayName,

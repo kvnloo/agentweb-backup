@@ -837,18 +837,29 @@ router.get("/users", async (req, res) => {
       }
     }
 
-    // Batch-fetch Clarity replay session URLs for all users
-    const replayResults = await Promise.all(
-      sanitized.map((user: any) =>
-        settingsService.getSetting(`replay_sessions_${user.userId}`).catch(() => null)
-      )
-    );
-    for (let i = 0; i < sanitized.length; i++) {
-      const setting = replayResults[i];
-      if (setting?.settingValue) {
+    // Fetch replay settings in one paginated table traversal instead of one
+    // point read per user. Preserve the old per-setting best-effort behavior.
+    const allSettings = await settingsService.getAllSettings().catch(() => []);
+    const replayByUserId = new Map<string, string>();
+    if (Array.isArray(allSettings)) {
+      for (const setting of allSettings) {
+        if (typeof setting?.settingName !== "string" ||
+            !setting.settingName.startsWith("replay_sessions_") ||
+            typeof setting.settingValue !== "string") {
+          continue;
+        }
+        replayByUserId.set(
+          setting.settingName.slice("replay_sessions_".length),
+          setting.settingValue,
+        );
+      }
+    }
+    for (const user of sanitized) {
+      const settingValue = replayByUserId.get(user.userId);
+      if (settingValue) {
         try {
-          const parsed = JSON.parse(setting.settingValue);
-          sanitized[i].replayUrl = parsed.replayUrl;
+          const parsed = JSON.parse(settingValue);
+          user.replayUrl = parsed.replayUrl;
         } catch {
           // skip malformed setting
         }
