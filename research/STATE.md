@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 111
+cycles_completed: 112
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 112
+next_cycle: 113
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 111: Sunday recycle and Immutable do not stack a third
-  backend. Cycle 112: cheapest remaining. Candidate: 3×1200s
-  Must-be-Ready wait while recycle overlap continues. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 112: 3×1200s is not a wait; settle fail() exits attempt 1.
+  Cycle 113: cheapest remaining. Candidate: settle fail() is
+  before ensure_termination_lifecycle_hook. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
+  passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

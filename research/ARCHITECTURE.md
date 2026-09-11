@@ -450,6 +450,8 @@ Cycle 110: weekly refresh overlaps without the deploy probe.
 A-006 discarded.
 Cycle 111: Sunday + Immutable do not stack a third backend.
 A-006 discarded.
+Cycle 112: 3×1200s settle is not a wait; `fail()` exits attempt 1.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

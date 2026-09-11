@@ -319,6 +319,10 @@ Cycle 111: Sunday recycle and Immutable **do not stack** a third
 L668–680). Wait 1200s then fail. ENG-1127 is a 31s ASG join abort,
 not a third fleet. Do not HTTP-split to survive a stack this tree
 already refuses.
+Cycle 112: 3×1200s settle is **not** a wait. Never-Ready
+`fail()`s attempt 1 (`eb-deploy.sh` L639–640 / L155–158). The
+2700s total budget caps retries (`deploy.yml` L187; test
+L518–534). Recycle overlap continues without CI adding a listen().
 
 ### 4. Hermes / Oh My Pi vs this tree
 

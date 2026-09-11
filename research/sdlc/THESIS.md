@@ -162,6 +162,9 @@ Cycle 110: Sunday recycle overlaps without that probe. A-019 is
 weekly, not only on merge. Do not disable `InstanceRefreshEnabled`.
 Cycle 111: Sunday + Immutable serialize or fail the GitHub deploy
 (`Must be Ready`). Not a three-process mesh.
+Cycle 112: 3×1200s is not a wait. Settle expiry `fail()`s
+(`exit 1`); the 2700s total budget caps retries. Not a
+3600s third clock.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

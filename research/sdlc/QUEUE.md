@@ -169,6 +169,9 @@ only on merge. Product READY unchanged.
 Cycle 111: Sunday recycle and Immutable do **not** stack a third
 backend. Must be Ready; wait 1200s or fail. Product READY
 unchanged.
+Cycle 112: 3×1200s settle is **not** a wait. Never-Ready
+`fail()`s attempt 1 (`eb-deploy.sh` L639–640 / L155–158). Total
+budget 2700s caps retries. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

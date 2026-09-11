@@ -421,6 +421,12 @@ Cycle 111: **Sunday + Immutable do not stack a third listen().**
 `eb-deploy.sh` L668–680 Must be Ready. Wait 1200s (`deploy.yml`
 L211) then fail. ENG-1127 abort is 31s ASG join, not a third fleet.
 
+Cycle 112: **3×1200s settle is not a wait.**
+`wait_for_environment_ready` `fail()`s (`eb-deploy.sh` L639–640,
+`exit 1` L155–158) — it does not return to the attempt loop.
+`EB_TOTAL_TIMEOUT_SECONDS` 2700 (`deploy.yml` L187) is the
+absolute cap (`capped_deadline` L201–209). Test L518–534.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
