@@ -177,8 +177,8 @@ export class EvaluationStore {
             await this.db.delete({ TableName: `${this.prefix}${table}`, Key: { [key]: item[key] },
               ConditionExpression: '#owner = :user', ExpressionAttributeNames: { '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
             }).promise();
+            counts[table]++;
           } catch (error: any) { if (error?.code !== 'ConditionalCheckFailedException') throw error; }
-          counts[table]++;
         }
         cursor = page.LastEvaluatedKey;
       } while (cursor);
