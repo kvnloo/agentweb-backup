@@ -59,8 +59,9 @@ calls **this** `drainForShutdown` (`server.ts` L572–574). A fifth
 `listen()` is not in that hook. Cycle 69: `runDrain` L397–420 is
 four named drains; inbound MCP `CallTool` is not one
 (`mcpServerCore.ts` L88–120). `mcpShutdown` is unused by the main
-server. Copy `chatbotTurn`, do not revive A-006. Product READY
-unchanged.
+server. Copy `chatbotTurn`, do not revive A-006. Cycle 70: wrap
+`CallTool` once (covers local Map and `rehydrateAndServe`); do not
+wrap only the ENG-114 face. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

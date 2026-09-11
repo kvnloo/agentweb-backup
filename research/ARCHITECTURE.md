@@ -347,6 +347,9 @@ Cycle 69: `runDrain` L397–420 is four named drains. Inbound MCP
 `CallTool` (`mcpServerCore.ts` L88–120) is not tracked.
 `mcpShutdown` (`mcpServer.ts` L260–270) is unused by `server.ts`.
 Q-014 stays ready. A-006 discarded.
+Cycle 70: local `/mcp` (L307–315) vs `rehydrateAndServe` (L441)
+share `CallTool`. Wrap once (`cronJobRegistry.ts` L1–9 names the
+gap). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

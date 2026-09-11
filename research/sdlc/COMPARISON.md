@@ -145,3 +145,6 @@ submodule of the leaf package (A-008, not A-006).
   tracked. Chatbot was wrapped (`chatbotTurn`, L288–301); MCP was
   not. Hermes keeps the tool in-process so there is no second hop
   to drain.
+- Cycle 70: two inbound MCP faces (local Map vs ENG-114 rehydrate)
+  share `CallTool`. Wrap that once. Node `server.close()` is not
+  the waiter for inner mcpFetch.

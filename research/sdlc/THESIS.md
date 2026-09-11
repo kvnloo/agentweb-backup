@@ -68,7 +68,10 @@ hook `agentweb-drain-before-terminate` parks **this** process
 Cycle 69: that drain’s wait list is four named units (`server.ts`
 L397–420); inbound MCP `CallTool` is not one (`mcpServerCore.ts`
 L88–120 has no `cronJobRegistry.track`). `mcpShutdown` is unused
-by `runDrain`. The listed face is a
+by `runDrain`. Cycle 70: local Map (`mcpServer.ts` L307–315) and
+`rehydrateAndServe` (L441) share that CallTool; wrap it once.
+Rehydrate is finite HTTP (`mcpSessionRehydration.ts` L15–18);
+mcpFetch still needs a new loopback. The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

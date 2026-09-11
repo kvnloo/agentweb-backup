@@ -148,6 +148,13 @@ no `cronJobRegistry.track`. `mcpShutdown` (`mcpServer.ts` L260–261)
 is never called from `server.ts`. Chatbot was the last “untracked
 path” (`server.ts` L288–301). Copy that wrap; do not HTTP-split.
 
+Cycle 70: **two inbound faces, one wrap site.** Local
+`sessions.has` (`mcpServer.ts` L307–315) reuses a lingering
+Streamable HTTP transport. Cross-instance miss (L441) is finite
+JSON (`mcpSessionRehydration.ts` L15–18 / L115–118). Both execute
+the same untracked `CallTool`. `cronJobRegistry.ts` L1–9 already
+describes this job. Wrap `CallTool`, not only rehydrate.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

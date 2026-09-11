@@ -100,4 +100,6 @@ Cycle 69: `runDrain` (`server.ts` L397–420) does not wait on inbound
 MCP `CallTool`. Q-014 `generate_image` is that hop. Copy
 `chatbotTurn`; do not call `mcpShutdown` from drain. A-006 stays
 discarded.
+Cycle 70: local MCP Map vs `rehydrateAndServe` share `CallTool`.
+Wrap that once (`cronJobRegistry.ts` L1–9). A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

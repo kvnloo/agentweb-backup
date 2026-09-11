@@ -139,6 +139,9 @@ process, inbound MCP `CallTool` is not in the four-way wait list
 (`server.ts` L397–420 vs `mcpServerCore.ts` L88–120). Q-014
 `generate_image` mcpFetchs localhost; chatbot was wrapped
 (`chatbotTurn`); MCP was not. Do not HTTP-split to “fix” drain.
+Cycle 70: local `/mcp` reuse vs ENG-114 rehydrate are two faces of
+the same untracked `CallTool`. Wrap `mcpServerCore`, not a fifth
+process.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
