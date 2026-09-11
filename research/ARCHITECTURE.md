@@ -416,6 +416,8 @@ Cycle 93: two SIGTERM listeners; `mcpShutdown` closes inbound
 CallTool before `runDrain`. A-006 discarded.
 Cycle 94: shutdown is local-only; `DELETE /mcp` is the only
 `sessionStore.delete`. A-006 discarded.
+Cycle 95: `MCP_SESSION_STORE` unset in git; default memory. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

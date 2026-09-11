@@ -232,3 +232,6 @@ reverted. Do not copy that as A-006.
 - Cycle 94: shutdown does not `sessionStore.delete`. Hermes session
   ids rehydrate on the next instance (ENG-114). A fifth `listen()`
   is another local Map plus the same Dynamo mirror.
+- Cycle 95: this tree never sets `MCP_SESSION_STORE`. Default memory.
+  Dynamo rehydrate is opt-in. Do not HTTP-split to survive deploys;
+  Hermes already re-inits on 404.

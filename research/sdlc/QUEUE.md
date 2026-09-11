@@ -107,6 +107,9 @@ Product READY unchanged. Cycle 93: `mcpShutdown` still unused by
 before `server.ts` L474–475) and `transport.close()`s inbound CallTool.
 OMP still 0.85.1. Cycle 94: that closer does not `sessionStore.delete`;
 only client `DELETE /mcp` evicts ENG-114. Product READY unchanged.
+Cycle 95: this tree never sets `MCP_SESSION_STORE`; factory
+default is memory. Dynamo rehydrate is opt-in, not git-proven live.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

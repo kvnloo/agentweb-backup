@@ -124,6 +124,7 @@ Cycle 91: live HTTP face is `/mcp`; `/mcp/server` is stale.
 Cycle 92: inspector is SSE against that dead path; GET `/mcp` needs a session.
 Cycle 93: SIGTERM closes inbound MCP before `runDrain` waits.
 Cycle 94: that close does not evict ENG-114; only `DELETE /mcp` does.
+Cycle 95: `MCP_SESSION_STORE` unset in git; default memory.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

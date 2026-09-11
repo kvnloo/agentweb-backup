@@ -239,6 +239,9 @@ Cycle 94: `mcpShutdown` / stale cleanup never `sessionStore.delete`.
 Only client `DELETE /mcp` evicts the ENG-114 mirror. Dynamo
 sessions rehydrate on the next instance. Do not HTTP-split that
 metadata; do not delete it on drain.
+Cycle 95: this tree never sets `MCP_SESSION_STORE` (zero hits in
+`.env.example`, `.ebextensions/`, `.github/`). Default is memory.
+Do not treat Dynamo rehydrate as a production fact from git.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -327,6 +327,12 @@ Cycle 94: **`mcpShutdown` is local-only.** L245–257 and
 outlive SIGTERM so the next instance rehydrates. Do not evict
 the store on drain. Do not HTTP-split session metadata.
 
+Cycle 95: **`MCP_SESSION_STORE` is unset in this tree.**
+`.env.example` / `.ebextensions/` / `.github/` have zero hits.
+Factory default is memory (`mcpSessionStore.ts` L205–210).
+`AW-MCPSessions` exists in `create-tables.ts` L1816. Do not flip
+the env from Q-014. Live AWS console unverified.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

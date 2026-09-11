@@ -115,6 +115,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 92: inspector is SSE against that dead path.
   Cycle 93: mcpShutdown races runDrain on SIGTERM (closes first).
   Cycle 94: shutdown is local-only; ENG-114 store outlives SIGTERM.
+  Cycle 95: MCP_SESSION_STORE unset in tree; default memory.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

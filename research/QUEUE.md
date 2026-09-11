@@ -161,4 +161,6 @@ Cycle 93: `mcpShutdown` runs on SIGTERM **before** `runDrain`
 discarded.
 Cycle 94: `mcpShutdown` does not evict ENG-114; only `DELETE /mcp`
 does. A-006 stays discarded.
+Cycle 95: `MCP_SESSION_STORE` unset in this tree; default memory.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
