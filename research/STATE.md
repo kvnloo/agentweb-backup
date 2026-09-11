@@ -7,16 +7,15 @@ branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 21
+cycles_completed: 22
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 22
+next_cycle: 23
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 21: no open PR on apiTools/imageGeneration/loops/core.
-  A-002 sketch uses sdkConstructionGuard, not depcruise.
-  Cycle 22: same collision filter; check whether agentMode/core
-  already imports agentModeService (would block copying the guard).
+  Cycle 22: agentMode/core ↛ agentModeService, but core imports the
+  gateway — do not copy loops/core's forbid-all-services rule there.
+  Cycle 23: collision-only on apiTools/imageGeneration/loops/core.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

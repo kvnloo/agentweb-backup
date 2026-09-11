@@ -35,12 +35,25 @@ is the AWS host.
 surface. The sdkConstructionGuard pattern is already in CI and already
 catches alias/`require` lies that a regex grep would miss.
 
-## Second ratchet (same PR or A-008)
+## Second ratchet (A-008, not the same as loops/core)
 
-Once `services/creative/` exists, the same walker forbids
-`creative/**` → `agentModeService` (OMP `pi-ai ↛ pi-agent-core`).
-Until the folder exists, walk `imageGeneration.ts` /
-`videoGeneration.ts` / `remotionService.ts` instead.
+Once `services/creative/` exists, forbid `creative/**` → `agentModeService`
+(OMP `pi-ai ↛ pi-agent-core`). Until the folder exists, walk
+`imageGeneration.ts` / `videoGeneration.ts` / `remotionService.ts`.
+
+## Do not copy the loops/core rule onto `agentMode/core` (cycle 22)
+
+`agentMode/core/**` does **not** import `agentModeService.ts` (no static
+or `import()`). But `core/toolDispatch.ts` L28 imports
+`../../agentToolGatewayService` (type-only). A “forbid all of `services/`”
+walker would fail today.
+
+The copied rule for core is narrower: **forbid only `agentModeService.ts`**
+(the 40.5k monolith). Allow gateway, `utils/`, `observability/`.
+
+Do **not** walk all of `services/agentMode/` — `brandLogo.ts` L600–603
+`await import('../agentModeService')` is a deliberate cycle break.
+That file is outside `core/`.
 
 ## Acceptance
 
