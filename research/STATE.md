@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 78
+cycles_completed: 79
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 79
+next_cycle: 80
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 78: leaf IMAGE_GENERATION_TIMEOUT_MS is 8 min (ENG-510);
-  MCP mcpFetch is 5. Align timeoutMs after Q-014, not a fifth
-  listen(). Cycle 79: cheapest remaining mapping. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 79: mcpFetch abort does not cancel generateImage or skip
+  the leaf meter. Align timeoutMs; do not HTTP-split. Cycle 80:
+  cheapest remaining mapping. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

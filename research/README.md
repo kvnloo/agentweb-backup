@@ -173,6 +173,10 @@ ENG-510) so a hung provider leaves 2 min under the 10 min turn.
 MCP’s 5 min abort is stricter than that leaf. Align `timeoutMs`
 on mcpFetch after listing; do not extract a process to get the
 8 min.
+Cycle 79: that 5 min abort does not cancel `generateImage`
+(`emmaApi.ts` L174–187) and does not skip the leaf meter
+(L546–562). Do not HTTP-split to get a cancel protocol; do not
+touch billing.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

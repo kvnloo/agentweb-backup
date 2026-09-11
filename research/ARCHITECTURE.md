@@ -377,6 +377,8 @@ Cycle 78: `imageGeneration.ts` L69–79 default 8 min (ENG-510);
 must stay under `GENERATION_TIMEOUT_MS` 10 min
 (`agentModeController.ts` L1100–1101). MCP 5 min is stricter.
 A-006 discarded.
+Cycle 79: `emmaApi.ts` L174–187 no abort; meter L546–562 after
+success. mcpFetch abort can still bill. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

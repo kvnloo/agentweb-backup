@@ -213,6 +213,11 @@ Cycle 78: **leaf is 8 min; MCP is 5.** `IMAGE_GENERATION_TIMEOUT_MS`
 so Hermes loses 3 min of allowed vendor time. Align on this PORT
 after #2; do not HTTP-split.
 
+Cycle 79: **abort ≠ cancel.** `emmaApi.ts` L174–187 has no
+`req.on('close')`. `withTimeout` races and does not abort the
+vendor promise. Meter L546–562 still fires. A-006 would need a
+distributed cancel this tree does not have. Align `timeoutMs`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

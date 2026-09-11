@@ -124,4 +124,7 @@ A-006 stays discarded.
 Cycle 78: leaf `IMAGE_GENERATION_TIMEOUT_MS` is 8 min (ENG-510);
 MCP mcpFetch is 5. Align `timeoutMs` after Q-014. A-006 stays
 discarded.
+Cycle 79: `emmaApi` generate-image has no abort listener; leaf
+meters after success even if MCP already aborted. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

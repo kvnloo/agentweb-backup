@@ -174,3 +174,6 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 78: leaf `IMAGE_GENERATION_TIMEOUT_MS` is 8 min (ENG-510,
   below the 10 min turn). MCP abort is 5. Two clocks on one leaf.
   Align `timeoutMs`; do not add a process.
+- Cycle 79: aborting mcpFetch does not stop `generateImage` or skip
+  the leaf meter. Hermes execute() abort is the same promise.
+  Do not add a hop whose cancel story does not exist.

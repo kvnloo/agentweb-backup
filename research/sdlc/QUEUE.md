@@ -73,7 +73,9 @@ fallback (`eb-deploy.sh` L612). Cycle 76: GET `/mcp` is nginx/ALB
 600s (`agent-mode-timeout.conf`), not `/socket.io/` 3600s.
 Cycle 77: `generate_image` mcpFetch default abort is 5 min
 (`httpClient.ts` L205); no `timeoutMs`. Cycle 78: leaf is 8 min
-(ENG-510); MCP 5 min is the stricter face. Product READY unchanged.
+(ENG-510); MCP 5 min is the stricter face. Cycle 79: mcpFetch
+abort does not cancel the leaf or skip the meter. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
