@@ -1,8 +1,7 @@
 # A-007 split map (research only — do not land this PR yet)
 
-`coding_unlocked` is false. Cycle 24. Collision on `apiTools.ts`: **empty**
-through cycle 32 (20 open PRs; expanded filter still only #2563 on
-`sdkConstructionGuard.test.ts`).
+`coding_unlocked` is **true**. Cycle 24, refined through cycle 53. Collision
+on `apiTools.ts`: AgentWebPro **empty**; this fork **#2** owns Q-014.
 
 Cycle 18 listed section *line numbers*. This file names the **tools** and
 corrects the draft tree in `MODULE_MAP.md`.
@@ -95,6 +94,10 @@ Acceptance: `mcp.apiTools.test.ts` still green **after** Q-014 drops
 `generate_image` from the L91 `internalTools` list (cycle 34). Until
 that flag flip, L91 still expects it hidden. `generate_image` still
 registered once; no new `mcp → agentModeService` edge in the new file.
+Keep `ctx(context)` on `generate_image` (cycle 53). Do **not** copy
+`resolveClientScopedContext` from `list_tasks` — that ENG-1596
+`overrideToken` path is admin list/manage only and is the only in-tree
+skip of `lookupUser`.
 
 ## Later section files (not the first PR)
 

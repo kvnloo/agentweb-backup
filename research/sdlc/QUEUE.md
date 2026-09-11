@@ -28,11 +28,9 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 51: the Emma meter **allows** `anon_*` (ENG-1163 $2 vs
-ChatSessions). MCP-hop spend door remains `lookupUser`, not
-`requireEmmaTokenBudget`. Cycle 52: AgentWebPro still empty on those
-files; this fork #2/#3 still own Q-014 / A-002. A-015 stays park.
-A-007 waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
+Cycle 53: MCP `generate_image` uses `ctx()` — no `overrideToken`, so
+ENG-1596 cannot skip `lookupUser`. A-007 must keep `ctx()`. A-015 stays
+park. A-007 waits on kvnloo#2. A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

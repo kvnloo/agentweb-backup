@@ -66,6 +66,10 @@ spend door. `checkTokenUsage` allow-lists `anon_*` under $2 vs
 ChatSessions; MCP image calls do not create those rows. Authenticated
 Hermes still hits a real user row and the monthly cap.
 
+Cycle 53: do **not** add `client_id` / `resolveClientScopedContext` on
+MCP `generate_image`. Execute stays `ctx(context)`. That skip of
+`lookupUser` is admin list/manage only.
+
 Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
 The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
 or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as

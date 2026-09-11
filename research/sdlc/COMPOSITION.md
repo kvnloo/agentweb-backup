@@ -226,6 +226,13 @@ those sessions, so `costUsed` stays 0. `imageGeneration.ts` L551
 If A-006 copied “the metered route” and skipped `lookupUser`, vendor
 spend would be uncapped. Identity stays in the host (`httpClient.ts`).
 
+Cycle 53: **MCP `generate_image` cannot take the ENG-1596 skip.**
+Execute is `ctx(context)` (`apiTools.ts` L2096–2098). `ctx()`
+(`toolHelpers.ts` L10–22) does not forward `overrideToken`.
+`resolveClientScopedContext` is admin-only and used on list/manage
+tools, not this one. Chatbot/ishare `$2` is a **different face**
+(`executeTool` in-process). A-007 `infrastructure.ts` must keep `ctx()`.
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

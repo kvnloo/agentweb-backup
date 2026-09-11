@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:38:00Z",
+  "updated_at": "2026-09-11T20:28:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -130,7 +130,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 29,
-      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template. evaluationTools.ts is the anti-template. Cycle 48: kvnloo#2 owns apiTools.ts (Q-014+Q-004) — wait for merge. ListTools is getToolDefinitions with no skill gate (mcpServerCore.ts L76–83). Cycle 52: AgentWebPro still empty on apiTools.ts.",
+      "why": "Hermes-shaped MCP catalog without touching emma/tools.ts (#2832). 85 registers. Content section is blog+agentModeService (L1381), not generate_image. generate_image is the mcpFetch infrastructure island (L1996–2146). ENG-982 workflowTools.ts is the template. evaluationTools.ts is the anti-template. Cycle 48: kvnloo#2 owns apiTools.ts (Q-014+Q-004) — wait for merge. ListTools is getToolDefinitions with no skill gate (mcpServerCore.ts L76–83). Cycle 52: AgentWebPro still empty on apiTools.ts. Cycle 53: keep ctx(context) on generate_image — do not copy resolveClientScopedContext (ENG-1596 overrideToken skip is admin list/manage only).",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/mcpServerCore.ts",
@@ -138,7 +138,7 @@
         "backend/src/mcp/server/evaluationTools.ts",
         "research/sdlc/A-007-split-map.md"
       ],
-      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Copy workflowTools.ts (mcpFetch + exported name list), not evaluationTools.ts. Barrel via import './tools/infrastructure' in apiTools.ts only (do not also import from mcpServerCore — that pattern is for workflowTools because it is not in the apiTools barrel). Keep send_email internal+internalOnly (L2113–2115). Leave Content/blog and install_skills in apiTools.ts. mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
+      "first_slice": "When coding unlocked, after or with Q-014: move the five mcpFetch infrastructure tools (you_search_web, you_search_news, google_search_web, generate_image, send_email) to mcp/server/tools/infrastructure.ts. Copy workflowTools.ts (mcpFetch + exported name list), not evaluationTools.ts. Barrel via import './tools/infrastructure' in apiTools.ts only (do not also import from mcpServerCore — that pattern is for workflowTools because it is not in the apiTools barrel). Keep send_email internal+internalOnly (L2113–2115). Keep generate_image on ctx(context) — do not wire resolveClientScopedContext / client_id (cycle 53: that skip of lookupUser is admin-only). Leave Content/blog and install_skills in apiTools.ts. mcp.apiTools.test.ts still green. Do not edit emma/tools.ts. Do not land 85 one-tool files.",
       "harsha_db": false
     },
     {
@@ -151,7 +151,7 @@
       "evidence": 5,
       "collision": 5,
       "score": 6,
-      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–46: chat forks generateMarketingResponseWorker.ts (new AgentModeService); parent is I/O; worker is compute. Cycle 50: surviving MCP-hop spend door after an A-015 leak is lookupUser (httpClient.ts L57–66), not a fifth process. Cycle 51: copying requireEmmaTokenBudget is not that door — checkTokenUsage allow-lists anon_* ($2 vs ChatSessions, tokenUsageService.ts L293–305); _svc JWTs skip getUserById (auth.ts L155–167); leaf meter is void/no_user. A sixth HTTP image process that skipped lookupUser would uncapped-spend. See COMPOSITION.md.",
+      "why": "Cycle 25+29: MCP generate_image already mcpFetchs localhost into agentModeService.generateImage. Cycle 36: meter/C2PA/CRITICAL LOGO live in the leaf. Cycle 40: quota is per-face. Cycle 44–46: chat forks generateMarketingResponseWorker.ts (new AgentModeService); parent is I/O; worker is compute. Cycle 50: surviving MCP-hop spend door after an A-015 leak is lookupUser (httpClient.ts L57–66), not a fifth process. Cycle 51: copying requireEmmaTokenBudget is not that door — checkTokenUsage allow-lists anon_* ($2 vs ChatSessions, tokenUsageService.ts L293–305); _svc JWTs skip getUserById (auth.ts L155–167); leaf meter is void/no_user. Cycle 53: generate_image cannot take the ENG-1596 overrideToken skip (ctx() only; resolveClientScopedContext is admin list/manage). A sixth HTTP image process that skipped lookupUser would uncapped-spend. See COMPOSITION.md.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/mcp/server/apiTools.ts",

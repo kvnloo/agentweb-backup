@@ -81,7 +81,9 @@ ENG-822 does not rewrite that error (`generate_image` has no
 not a spend door: `checkTokenUsage` **allows** `anon_*` under a $2
 ChatSessions cap (`tokenUsageService.ts` L293–305) and `_svc` JWTs skip
 `getUserById` (`auth.ts` L155–167). The leaf `meterUserUsage` is
-fire-and-forget and drops `no_user` (cycle 51).
+fire-and-forget and drops `no_user` (cycle 51). Cycle 53: MCP
+`generate_image` uses `ctx()` and cannot take the ENG-1596
+`overrideToken` skip; chatbot/ishare `$2` is a different face.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
