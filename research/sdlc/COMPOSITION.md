@@ -176,6 +176,21 @@ Cycle 46: there is a **third execute on the parent** that is neither
 row: Emma chatbot `chatbotService.ts` L5461 `executeTool` (in-process,
 no fork, no mcpFetch). Three faces, one policy method, two OS processes.
 
+## Three catalogs (cycle 47)
+
+Hermes: one `tools/list`. AgentWeb’s three faces do **not** share a
+catalog:
+
+| Face | Catalog |
+|---|---|
+| MCP | `internal: true` at `apiTools.ts` L2077; `getToolDefinitions()` L82–84 |
+| Chatbot | `pageToolMap['images']` includes `generate_image` (`chatbotService.ts` L5211) on top of `buildSkillContext` |
+| Agent Mode | `FOUNDATION_TOOLS` + skills + `__other_skills__`. `generate_image` is **not** foundation. `describe_image` **is** (ENG-260 L6166–6171). `get_visual_context` is the page-only exclusion (`getUnassociatedTools` L6375–6376) |
+
+Q-014 flips the MCP row only. A-014 parks copying the other two
+catalogs onto that list. A-006 would have to pick one policy or
+reimplement all three.
+
 ## MCP schema is thinner (cycle 39)
 
 Hermes one-handler-table vs AgentWeb’s HTTP adapter:

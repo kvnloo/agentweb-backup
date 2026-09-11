@@ -17,6 +17,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
 | 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
+| — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
@@ -26,10 +27,10 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-012 | 14 | park | Stop `agentModeService` importing `controllers/blog` |
 | — | A-006 | 6 | **discard** | HTTP nanoservice per tool |
 
-Cycle 46: parent is **I/O** (HTTP / Socket.IO / cron / MCP server);
-worker is **compute** (`generateMarketingResponse`). Chatbot still
-`executeTool` on the parent (`chatbotService.ts` L5461). A-006 stays
-discard. Product READY unchanged.
+Cycle 47: three **catalogs** for `generate_image` (MCP `internal`,
+chatbot `pageToolMap` L5211, Agent Mode foundation/skills —
+`describe_image` is foundation, generation is not). A-014 parked.
+A-006 stays discard. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

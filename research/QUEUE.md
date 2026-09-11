@@ -73,4 +73,6 @@ comparing Hermes / Oh My Pi. **Do not HTTP-split Emma.** See
 `sdlc/THESIS.md`. Track queue: `sdlc/QUEUE.md`. First SDLC coding
 (after unlock, not instead of Q-014): A-002 then A-007 then A-008.
 Cycle 46: parent is I/O, worker is compute; chatbot still `executeTool`
-on the parent. A-006 stays discarded. Q-001 / Q-014 / Q-003 stay ready.
+on the parent. Cycle 47: three catalogs for `generate_image`; A-014
+parks copying page/skill gates onto MCP. A-006 stays discarded.
+Q-001 / Q-014 / Q-003 stay ready.

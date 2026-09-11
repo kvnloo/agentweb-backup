@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T20:00:00Z",
+  "updated_at": "2026-09-11T20:05:00Z",
   "track": "architecture-sdlc",
   "scoring": "same PROTOCOL formula; these items are not product ranks",
   "implementation_order_when_unlocked": ["A-002", "A-007", "A-008", "A-005"],
@@ -219,6 +219,26 @@
         "research/sdlc/COMPOSITION.md"
       ],
       "first_slice": "PARK. Q-014 stays drop internal L2077 + mcp.apiTools.test.ts L91. Do not add confirm/metrics_verified/session_id. Optional later after Q-001 Hermes smoke proves generation. Never write MCP session UUIDs into chatbotDb as Emma chats.",
+      "harsha_db": false
+    },
+    {
+      "id": "A-014",
+      "title": "Do not copy chatbot pageToolMap or FOUNDATION_TOOLS onto MCP generate_image",
+      "status": "park",
+      "leverage": 3,
+      "product": 3,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 2,
+      "score": 29,
+      "why": "Cycle 47. Hermes has one tools/list. AgentWeb has three catalogs for generate_image: MCP internal flag (apiTools.ts L2077), chatbot pageToolMap images page (chatbotService.ts L5211), Agent Mode buildSkillContext without generate_image in DEFAULT_FOUNDATION_TOOLS (describe_image was promoted ENG-260 L6166–6171; generate_image was not). #2861 is promoting convert_to_pdf to foundation — do not piggyback. Q-014 lists for authenticated MCP; it is not a page or skill gate.",
+      "files": [
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/services/chatbotService.ts",
+        "backend/src/services/agentModeService.ts",
+        "research/sdlc/COMPOSITION.md"
+      ],
+      "first_slice": "PARK. Q-014 stays drop internal L2077 + test L91. Do not add generate_image to DEFAULT_FOUNDATION_TOOLS. Do not copy pageToolMap onto MCP. Do not edit chatbotService.ts (#1076).",
       "harsha_db": false
     },
     {

@@ -91,3 +91,7 @@ AgentWeb mapping does not need them. `pi-ai` ≈ `imageGeneration.ts`;
   already split parent **I/O** from worker **compute**, then left Emma
   chatbot `executeTool` on the parent. Do not HTTP-split `generateImage`
   (three faces: parent MCP, parent chatbot, worker chat).
+- Cycle 47: Hermes one `tools/list`. AgentWeb three catalogs for
+  `generate_image` (MCP `internal`, chatbot `images` page, Agent Mode
+  skills — not foundation). Q-014 lists MCP; A-014 parks copying the
+  other catalogs.

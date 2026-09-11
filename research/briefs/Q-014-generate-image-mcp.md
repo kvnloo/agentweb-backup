@@ -41,6 +41,15 @@ Keep `you_search_*` / `google_search_web` internal in this slice.
 
 ComfyUI backend, DesignArena routing (Q-003), video, changing prices.
 
+Cycle 47: do **not** copy in-app availability onto MCP. Chatbot injects
+`generate_image` only on the `images` page (`chatbotService.ts` L5211).
+Agent Mode uses `buildSkillContext` and does **not** put
+`generate_image` in `DEFAULT_FOUNDATION_TOOLS` (`describe_image` was
+promoted instead, ENG-260, L6166–6171). Hermes has no AgentWeb URL and
+no skill install step — Q-014 is `tools/list` for an authenticated MCP
+session. Do not add the name to `DEFAULT_FOUNDATION_TOOLS` (#2861 is
+that move for `convert_to_pdf`). Do not edit `chatbotService.ts` (#1076).
+
 Cycle 39: do **not** copy Emma’s in-app schema onto MCP in this slice.
 The MCP face (`apiTools.ts` L2075–2094) is snake_case, has no `confirm`
 or `metrics_verified`, and `emmaApi.ts` L181 passes `confirm` as

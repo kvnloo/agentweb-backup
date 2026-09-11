@@ -269,6 +269,11 @@ Cycle 46: parent is I/O (cron `server.ts` L563, in-memory
 (`generateMarketingResponse`). Chatbot still `executeTool` on parent
 (`chatbotService.ts` L5461). `generateImage` has three faces. A-006
 discarded.
+Cycle 47: those faces have **three catalogs**. MCP `internal` (Q-014
+flips this). Chatbot `pageToolMap['images']` L5211. Agent Mode
+`buildSkillContext` — `describe_image` is foundation (ENG-260),
+`generate_image` is not. A-014 parked. Do not copy page/skill gates
+onto Hermes `tools/list`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
