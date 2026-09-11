@@ -34,7 +34,7 @@ None of the first slices needs a Dynamo table.
 | 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
 
-**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts).
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`).
 
 ---
 
@@ -221,6 +221,10 @@ Cycle 89: Hermes `mcp_tool.py` is still a **client**. Parallel
 `CallTool` is `supports_parallel_tool_calls` (default false).
 The Emma OAuth runbook does not set it. Q-014 lists; do not add
 a server mutex; do not rewrite Q-001.
+Cycle 90: self `"agentweb-tools"` skip is **file-config only**
+(`mcpClientService.ts` L420–432). Dynamo `mcp_servers` has no
+`isInternal` filter; admin localhost URLs connect. Park A-018;
+do not HTTP-split; do not delay Q-014.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
@@ -228,7 +232,7 @@ a server mutex; do not rewrite Q-001.
 |---|---|---|
 | Agent loop | One process, packages | 40,571-line `agentModeService.ts` |
 | Tool catalog | One registry / `tools/list` | Four in-process registries + three availability policies |
-| MCP | **Client** to other servers | **Server** for Hermes *and* client to vendors; self `"agentweb-tools"` skipped |
+| MCP | **Client** to other servers | **Server** for Hermes *and* client to vendors; self `"agentweb-tools"` skipped on file config; DB path can still loopback (cycle 90) |
 | Extract | MCP outbound; OMP packages | Fork for health checks; DAG inverted (`services/` import `controllers/`) |
 
 Cutting-edge 2026 (Microsoft modular-monolith first): folders + AST

@@ -30,9 +30,12 @@ ownership forces it.
 A 60-tool HTTP mesh would recreate MCP poorly: `apiTools.ts` already
 `mcpFetch`s `http://localhost:${PORT}/api/emma/*`. The MCP *client* even
 had a self-server `"agentweb-tools"` (`mcp_config.ts` L3–10) and
-**skips it** (`mcpClientService.ts` L420–432) as a circular dependency.
-Q-014 lists `generate_image` for *external* Hermes; it does not re-enable
-that self-client. `ListTools` is `getToolDefinitions()` with **no skill
+**skips it on the file-config path** (`mcpClientService.ts` L420–432)
+as a circular dependency. Cycle 90: the Dynamo `mcp_servers` loader
+does not copy that filter; admin localhost URLs still connect. Park
+A-018 (copy the skip, do not HTTP-split). Q-014 lists `generate_image`
+for *external* Hermes; it does not re-enable that self-client.
+`ListTools` is `getToolDefinitions()` with **no skill
 gate** (`mcpServerCore.ts` L76–83, cycle 48). Anonymous discovery
 (cycle 49) may **list** that tool when the ENG-984 flag is on;
 `ANONYMOUS_TOOLS` is empty so they cannot **run** it. Cycle 50: a leaked
@@ -116,6 +119,7 @@ video uses the same `$` / 0-token meter and is not on MCP.
 Cycle 87: AgentWebPro empty on those files plus `apiTools.ts`.
 Cycle 88: OMP 0.85.1 unpublished experimental client/server.
 Cycle 89: Hermes MCP parallel is opt-in (default false).
+Cycle 90: self-MCP skip is file-config only; DB path can loopback.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

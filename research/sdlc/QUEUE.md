@@ -22,6 +22,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-005 | 23 | park | File-size ratchet — 7 PRs on `agentModeService.ts` |
 | — | A-010 | 23 | park | codingAgent ↛ agentModeService (not a subprocess) |
 | — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
+| — | A-018 | 28 | park | Copy isInternal skip onto DB MCP load path (not a fifth listen) |
 | — | A-017 | 19 | park | Stop CRM/worker importing `server.ts`; expand sessionSockets emit |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
@@ -95,7 +96,9 @@ is $0.04; cost caps are Dynamo not git. Cycle 86: `generate_video` is the same
 `emmaTokenBudget.ts`, `imageGeneration.ts`). Cycle 88: OMP
 still 0.85.1; they unpublished experimental client/server.
 Cycle 89: Hermes is still MCP client-only; parallel is opt-in
-(default false). Product READY unchanged.
+(default false). Cycle 90: file-config still skips
+`"agentweb-tools"`; the Dynamo `mcp_servers` path does not.
+Park A-018. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

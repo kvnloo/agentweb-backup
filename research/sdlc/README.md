@@ -8,6 +8,8 @@ This is a **parallel track** to the product queue (`QUEUE.md`). It does
 **not** un-ready Q-001 / Q-014 / Q-003. `coding_unlocked` is **true**
 (Kevin asked for real PRs; product work is on `#2` / `#3`, not this
 research branch). Cycle 59 parked A-017 (CRM/worker → `server.ts`).
+Cycle 90 parked A-018 (copy the file-config `isInternal` skip onto
+the Dynamo MCP loader; do not HTTP-split).
 
 | Artifact | Role |
 |---|---|

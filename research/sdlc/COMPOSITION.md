@@ -294,6 +294,14 @@ Parallel is opt-in (`supports_parallel_tool_calls`, default
 false). `HERMES_MCP_OAUTH.md` does not set it. Q-014 lists;
 Hermes serializes unless Kevin opts in.
 
+Cycle 90: **self-MCP skip is file-config only.**
+`initialize()` L420–432 still skips `mcp_config.ts`
+`"agentweb-tools"`. Dynamo `mcp_servers` L435–450 does not.
+Admin localhost URLs connect (`mcpServers.ts` L87–90);
+`syncMcpAndRecycleWorker` L64–82 reloads parent + worker.
+Discover L443–465 is a third `listTools` with no skip.
+Park A-018. Do not HTTP-split.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
@@ -363,8 +371,16 @@ Hermes: MCP **client** to other servers; tools stay in-process.
 AgentWeb: MCP **server** (`mcp/server`, loopback `mcpFetch`) *and* MCP
 **client** (`mcp/client/mcpClientService.ts`) to GitHub/Playwright/Higgsfield.
 `mcp_config.ts` L3–10 still names `"agentweb-tools"` → `http://localhost/mcp`.
-`initialize()` L420–432 **skips `isInternal`** so Emma does not MCP-call
-herself. That skip is the in-tree rejection of A-006. Cycle 56: the
+`initialize()` L420–432 **skips `isInternal` on file config only** so Emma
+does not MCP-call herself from `mcp_config.ts`. Cycle 90: the Dynamo
+`mcp_servers` path (L435–450) has no that filter; `this.clients.has`
+cannot see skipped names; tests (`mcp.mcpClientService.test.ts`
+L1041–1048) connect `isInternal: true` via DB on purpose. Admin
+`isValidUrl` (`mcpServers.ts` L87–90) allows localhost; the partner
+tab has no `isInternal` Switch (default false) but a URL field.
+`syncMcpAndRecycleWorker` (L64–82) reloads parent + worker onto that
+row. That skip is still the in-tree rejection of A-006 — incomplete,
+not a reason to HTTP-split. Park A-018. Cycle 56: the
 folders already encode it — prod `mcp/client` ↛ `mcp/server` and reverse.
 Shared `mcp/anonymousToolAccess.ts` only (ENG-822). Do not HTTP-split
 that DAG; park A-016 until A-002. Vendor MCP

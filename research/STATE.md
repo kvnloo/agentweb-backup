@@ -7,15 +7,15 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 89
+cycles_completed: 90
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 90
+next_cycle: 91
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 89: Hermes is still MCP client-only; parallel CallTool
-  is opt-in (default false). Cycle 90: cheapest remaining.
-  Candidate: mcpClientService still skips self agentweb-tools.
+  Cycle 90: self-MCP skip is file-config only; A-018 parked.
+  Cycle 91: cheapest remaining. Candidate: getSessionClient
+  still reachable with agentweb-tools if serverConfigs is stuffed.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

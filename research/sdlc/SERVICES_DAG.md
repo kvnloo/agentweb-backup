@@ -110,6 +110,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 87: AgentWebPro empty on apiTools / meter / wrap files.
   Cycle 88: OMP 0.85.1 unpublished experimental client/server.
   Cycle 89: Hermes still MCP client; parallel opt-in default false.
+  Cycle 90: self-MCP skip is file-config only; DB path can loopback.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

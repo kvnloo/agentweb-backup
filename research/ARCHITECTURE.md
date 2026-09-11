@@ -403,6 +403,10 @@ A-006 discarded.
 Cycle 89: Hermes `mcp_tool.py` is still a client loader;
 `mcp_tool_server_run.py` is remote-session lifecycle. Parallel
 is `supports_parallel_tool_calls` default false. A-006 discarded.
+Cycle 90: file-config still skips `"agentweb-tools"`
+(`mcpClientService.ts` L420–432); Dynamo `mcp_servers` L435–450
+does not. Admin `isValidUrl` allows localhost. Park A-018.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
