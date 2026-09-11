@@ -1109,7 +1109,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         sessionId: 'test-session-123'
       }));
 
-      // Wait for the fire-and-forget to execute, fail, restart worker, wait 3s, and retry
+      // Wait for the fire-and-forget to execute, fail, pass the health check (mocked
+      // healthy by default), wait the short retry backoff, and retry.
       await new Promise(resolve => setTimeout(resolve, 4000));
 
       // First failure should be logged as warning
@@ -1143,8 +1144,9 @@ describe('AgentModeController - createSessionWithPlan', () => {
       const res = mockResponse();
       await agentModeController.createSessionWithPlan(req, res);
 
-      // No restart delay to wait out this time — should settle quickly.
-      await new Promise(resolve => setTimeout(resolve, 200));
+      // No restart (and no 3s restart-path wait) to wait out — just the shorter
+      // healthy-path retry backoff.
+      await new Promise(resolve => setTimeout(resolve, 1500));
 
       expect(generateMarketingResponseWorkerService.isWorkerHealthy).toHaveBeenCalled();
       expect(generateMarketingResponseWorkerService.restartWorker).not.toHaveBeenCalled();
@@ -1158,7 +1160,10 @@ describe('AgentModeController - createSessionWithPlan', () => {
       jest.spyOn(console, 'warn').mockImplementation(() => {});
       jest.spyOn(console, 'error').mockImplementation(() => {});
       const { generateMarketingResponseWorkerService } = jest.requireMock('../services/generateMarketingResponseWorkerService');
-      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValue(false);
+      // Once, not a standing override: clearMocks (jest.config.js) only resets call
+      // history between tests, not implementations — a plain mockResolvedValue(false)
+      // here would leak "unhealthy" into every later test in this file.
+      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValueOnce(false);
 
       const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
       const res = mockResponse();
