@@ -26,6 +26,7 @@ import {
   parsePageSize,
   Orientation,
 } from "../utils/pdfPrintLayout";
+import { assertPublicHostname } from "../utils/ssrfGuard";
 
 const CHROME_PATH = "/usr/bin/google-chrome";
 const CHROME_ARGS = [
@@ -99,6 +100,25 @@ export async function renderHtmlToPdf(
     const page = await browser.newPage();
 
     if (opts.url) {
+      // SSRF guard: a url-sourced render fetches whatever server-side content
+      // the caller points it at (e.g. the convert_to_pdf agent tool, reachable
+      // by every session as a foundation tool). Validate the requested URL up
+      // front, then re-validate on EVERY navigation request Chrome makes for
+      // this page — including redirect hops — since assertPublicHostname on
+      // just the starting URL doesn't stop a public URL that 302s to
+      // 169.254.169.254 (the metadata endpoint) or another internal host.
+      await assertPublicHostname(opts.url);
+      await page.setRequestInterception(true);
+      page.on("request", (req: any) => {
+        if (!req.isNavigationRequest() || req.frame() !== page.mainFrame()) {
+          req.continue();
+          return;
+        }
+        assertPublicHostname(req.url()).then(
+          () => req.continue(),
+          () => req.abort("blockedbyclient")
+        );
+      });
       await page.goto(opts.url, { waitUntil: "networkidle0", timeout });
     } else {
       await page.setContent(opts.html as string, {
