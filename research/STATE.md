@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 117
+cycles_completed: 118
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 118
+next_cycle: 119
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 117: runDrain never stops nginx; stop order is
-  live-AWS-only. Cycle 118: cheapest remaining. Candidate:
-  websocket.conf hardcodes 8080 vs PORT default 3001. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 118: PORT=8080 is not in git. Cycle 119: cheapest
+  remaining. Candidate: unvendored platform nginx.conf is the
+  only /mcp proxy_pass. Do not un-ready Q-001 / Q-014 / Q-003.
+  Do not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

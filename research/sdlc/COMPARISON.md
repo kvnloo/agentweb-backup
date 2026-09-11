@@ -296,3 +296,5 @@ reverted. Do not copy that as A-006.
   `TimeoutStopSec` is live-AWS-only. Not A-006.
 - Cycle 117: `runDrain` never stops nginx. Stop order is
   live-AWS-only. Not a fifth `listen()`.
+- Cycle 118: `PORT=8080` is not in git. `.env.example` is 3001.
+  Only git `proxy_pass` is `/socket.io/`. Not A-006.

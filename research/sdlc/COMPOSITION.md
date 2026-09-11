@@ -455,6 +455,11 @@ Cycle 117: **`runDrain` never stops nginx.**
 (`httpClient.ts` L94–96). `server.ts` L404–440 `server.close` only.
 Sunday nginx-vs-Node stop order is live-AWS-only.
 
+Cycle 118: **`PORT=8080` is not in git.**
+`.env.example` L1 `PORT=3001`. Tests pin mcpFetch 3001
+(`mcp.httpClient.test.ts` L27 / L239). Only git `proxy_pass` is
+`/socket.io/`. `/mcp` is unvendored platform nginx.conf.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

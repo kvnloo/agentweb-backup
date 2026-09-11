@@ -343,6 +343,9 @@ Cycle 117: `runDrain` never stops nginx (`server.ts` L404–440).
 `nginx.service` is named in `dev.md` L1934; `websocket.conf` L6
 hardcodes `127.0.0.1:8080`. mcpFetch skips nginx. Sunday
 nginx-vs-Node stop order is live-AWS-only.
+Cycle 118: `PORT=8080` is **not** in git. `.env.example` L1 is
+`PORT=3001`. Tests pin mcpFetch to 3001. Only git `proxy_pass` is
+`/socket.io/`. Hermes `/mcp` is unvendored platform nginx.conf.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -180,6 +180,9 @@ Cycle 116: `06-log-retention.config` names `systemd-journald`.
 live-AWS-only. Do not copy agent-engine’s 30s.
 Cycle 117: `runDrain` never stops `nginx.service`. Hermes inbound
 needs nginx; mcpFetch does not. Stop order is live-AWS-only.
+Cycle 118: `PORT=8080` is not in git. `.env.example` L1 is 3001.
+Only git `proxy_pass` is `/socket.io/` → 8080. `/mcp` is
+unvendored.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
