@@ -76,7 +76,11 @@ Cycle 77: `generate_image` mcpFetch default abort is 5 min
 (ENG-510); MCP 5 min is the stricter face. Cycle 79: mcpFetch
 abort does not cancel the leaf or skip the meter. Cycle 80:
 MCP generate-image is outside `tryClaimSessionGeneration`; quota
-is the brake. Product READY unchanged.
+is the brake. Cycle 81: that brake is `checkTokenUsage` then
+`next()` (`emmaTokenBudget.ts` L171–196); increment is AFTER
+vendor success (`meterUserUsage` void) and ADD does not refuse
+overshoot. `reserveSpend` is unused on this path (ENG-1250
+admission is Harsha). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

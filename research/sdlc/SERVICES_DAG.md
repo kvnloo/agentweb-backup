@@ -101,6 +101,7 @@ is the rest of the leak. Do not start A-017 at the 15k controller.
   Cycle 78: leaf withTimeout is 8 min (ENG-510); MCP is 5.
   Cycle 79: mcpFetch abort does not cancel the leaf or skip meter.
   Cycle 80: MCP generate-image is outside tryClaimSessionGeneration.
+  Cycle 81: quota is check-then-act; increment after success.
 - Not moving `db.ts` behind an API.
 - Not npm workspaces (OMP publishes packages; AgentWeb does not need
   that until a second deploy unit exists). Folders + a boundary test

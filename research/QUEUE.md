@@ -130,4 +130,7 @@ discarded.
 Cycle 80: MCP `POST /generate-image` is not under
 `tryClaimSessionGeneration`. Do not copy that Set onto Q-014.
 A-006 stays discarded.
+Cycle 81: `requireEmmaTokenBudget` is check-then-act; increment
+is after vendor success and does not condition on remaining
+quota. Do not wire ENG-1250 admission. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

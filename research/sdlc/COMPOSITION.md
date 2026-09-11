@@ -225,6 +225,18 @@ Cycle 80: **MCP is outside the session claim.**
 quota, not a claim. Cycle 66’s “A-006 would race the Set” does
 not apply to this face — there is no Set. Still do not HTTP-split.
 
+Cycle 81: **that quota is check-then-act.**
+`requireEmmaTokenBudget` (`emmaTokenBudget.ts` L171–196) GETs
+`checkTokenUsage` then `next()`. Charge is AFTER vendor success
+(`imageGeneration.ts` L546–562 `void meterUserUsage`).
+`meterUserUsage` is fire-and-forget (`usageRecorderService.ts`
+L482–531). `applyMonthlyChargeAtomic` conditions on **month**,
+not remaining quota (`db.ts` L1878). `spendChargingService`
+reserve/settle exists; **admission is absent** (L17–20, Harsha)
+and unused by this leaf. Two parallel Hermes `CallTool`s can
+both pass. A fifth `listen()` copies the GET. Do not wire
+ENG-1250 onto Q-014.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -180,3 +180,9 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 80: `tryClaimSessionGeneration` is Agent Mode only.
   MCP generate_image is unclaimed. Hermes loop is the concurrency
   bound. Do not copy the Set onto emmaApi; do not HTTP-split.
+- Cycle 81: MCP quota is check-then-act (`checkTokenUsage` GET,
+  then `next()`). Increment is post-success, fire-and-forget,
+  month-conditioned ADD — not a remaining-quota reject.
+  Hermes bounds parallel tools in the loop; AgentWeb MCP is a
+  server that admits N Express POSTs. Do not HTTP-split to
+  “atomize” a GET. Do not wire ENG-1250 admission (Harsha).

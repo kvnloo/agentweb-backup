@@ -100,7 +100,11 @@ no close listener; `generateImage` has no AbortSignal); meter
 still runs after success (`imageGeneration.ts` L546–562). Cycle 80:
 MCP `POST /generate-image` never calls `tryClaimSessionGeneration`
 (`emmaApi.ts` L174–182 vs `agentModeController.ts` L951). Quota is
-the brake. The listed face is a
+the brake. Cycle 81: that brake is a GET
+(`checkTokenUsage` via UserIdIndex GSI) then `next()`; the ADD
+is after success and does not condition on remaining allowance.
+`reserveSpend` is unused here (ENG-1250 admission is Harsha).
+The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
 Hop diagram: `COMPOSITION.md`.

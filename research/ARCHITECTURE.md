@@ -382,6 +382,10 @@ success. mcpFetch abort can still bill. A-006 discarded.
 Cycle 80: `emmaApi` generate-image is outside
 `tryClaimSessionGeneration`. `keyedMutex` is chatbot append only.
 Quota is the MCP brake. A-006 discarded.
+Cycle 81: that quota is `checkTokenUsage` then `next()`
+(`emmaTokenBudget.ts` L171–196). Charge is `void meterUserUsage`
+after vendor success; ADD does not refuse overshoot.
+`reserveSpend` unused on this path. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

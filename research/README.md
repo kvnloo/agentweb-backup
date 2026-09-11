@@ -182,6 +182,13 @@ Cycle 80: that orphan leaf is also **unclaimed**.
 has quota (`requireEmmaTokenBudget`), not the session Set.
 Q-014 lists the tool; it does not add a lock. Do not HTTP-split
 to get one.
+Cycle 81: that quota is **check-then-act**.
+`requireEmmaTokenBudget` GETs `checkTokenUsage` then `next()`.
+`meterUserUsage` is `void` after vendor success; ADD conditions
+on month, not remaining allowance. `spendChargingService`
+reservation exists; admission is Harsha and unused here. Two
+parallel Hermes `CallTool`s can both pass. A fifth process
+copies the GET. Do not wire a reservation onto Q-014.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
