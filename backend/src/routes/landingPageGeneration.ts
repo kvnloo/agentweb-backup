@@ -1885,6 +1885,17 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     const checkRuns = checksRes.data?.check_runs || [];
     const testsCheck = checkRuns.find((check: { name?: string }) => check.name === "Tests");
 
+    // Checks posted by GitHub Apps we KNOW are not test runners — Vercel's own integration
+    // auto-deploys and posts a check ("Vercel Preview Comments") for ANY PR on a connected
+    // project, unconditionally, and this route always opens a PR as its first step. Filtered by
+    // `app.slug` (a stable identifier) rather than the check's display name, which Vercel could
+    // change without notice.
+    const KNOWN_NON_TEST_CHECK_APP_SLUGS = new Set(["vercel"]);
+    const nonBenignCheckRuns = checkRuns.filter(
+      (check: { app?: { slug?: string } }) =>
+        !KNOWN_NON_TEST_CHECK_APP_SLUGS.has(check.app?.slug?.toLowerCase() ?? "")
+    );
+
     // Is this a repo that can never produce a Tests check at all?
     //
     // The gate is correct for a repo that runs tests and UNSATISFIABLE for one that does not.
@@ -1893,32 +1904,29 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     // said "retry after GitHub starts it", which GitHub never would. That blocked a customer's
     // rebuilt page from being published at all.
     //
-    // ENG-1856: an earlier version of this fix also required `checkRuns.length === 0` before
-    // trusting the workflow count, reasoning that a repo whose checks come from a GitHub App
-    // (CircleCI, Buildkite, a bespoke checker) reports `actions/workflows` total_count 0 while
-    // real checks exist — so demanding zero check runs kept the gate honest for that case.
+    // ENG-1856: an earlier version of this fix required `checkRuns.length === 0` before
+    // trusting the workflow count — a repo whose checks come from a GitHub App (CircleCI,
+    // Buildkite, a bespoke checker) reports `actions/workflows` total_count 0 while real checks
+    // exist, so demanding zero check runs kept the gate honest for that case. In practice
+    // `checkRuns.length` was never actually 0 on a real publish attempt (Vercel's own bot check
+    // is always present, for the reason above), so the workflow-count check never ran and the
+    // gate reproduced the exact unsatisfiable-forever bug it was built to close. Confirmed
+    // live: zero of a random sample of generated repos ever had a merged publish PR since this
+    // gate shipped.
     //
-    // That reasoning was correct in general and wrong for this specific, closed repo
-    // population. Vercel's own GitHub integration auto-deploys and posts a check run
-    // ("Vercel Preview Comments") for ANY PR on a connected project, unconditionally — and this
-    // route always opens a PR as its first step. So `checkRuns.length` is never actually 0 on a
-    // real publish attempt, the workflow-count check never runs, and the gate reproduces the
-    // exact unsatisfiable-forever bug it was built to close — just via a harmless bot check
-    // instead of an empty list. Confirmed live: zero of a random sample of generated repos ever
-    // had a merged publish PR since this gate shipped.
+    // Dropping the length check entirely (an earlier version of this fix) was too broad: Vercel's
+    // own app is itself proof that a check CAN appear here without a human wiring up CI, and
+    // nothing currently blocks a `.circleci/`-style config from landing in one of these repos via
+    // the chat-editing routes (only `.github/` is blocked there) — so "no other check can ever
+    // exist" is not something this code actually guarantees. Filtering out the one KNOWN-benign
+    // source by identity, rather than trusting `checkRuns.length` at all, keeps protection against
+    // any other real check while still closing the confirmed bug.
     //
-    // Generated landing-page repos are created identically by one generator, never by a human
-    // wiring up their own CI — the non-Actions-CI scenario this guarded against cannot occur
-    // here structurally, not just didn't-happen-to-occur. And the asymmetry favors dropping it:
-    // if some future repo somehow did have a real non-Actions check pending, the cost is that
-    // ONE publish goes through slightly early; the cost of keeping the guard, proven here, is
-    // the entire publish feature silently not working for anyone.
-    //
-    // FAIL CLOSED still holds: the workflow count is consulted whenever no "Tests" check has
-    // reported, and any error leaves it non-zero so the gate applies. "Could not determine
-    // whether this repo has CI" must never be read as "it has none".
+    // FAIL CLOSED still holds: the workflow count is consulted only when nothing OTHER than the
+    // known-benign check has reported, and any error leaves it non-zero so the gate applies.
+    // "Could not determine whether this repo has CI" must never be read as "it has none".
     let noCiAtAll = false;
-    if (!testsCheck) {
+    if (!testsCheck && nonBenignCheckRuns.length === 0) {
       let workflowCount = 1;
       try {
         const workflowsRes = await axios.get<any>(`${repoBase}/actions/workflows`, {

@@ -174,8 +174,19 @@ export interface ReconcileSummary {
  * Reconciles the gap by finding any deployed page whose `customDomainUrl` host has no matching
  * domain record, and registering it through `addCustomDomain` — the exact path a real user
  * action takes, not a hand-crafted record. That gets real Vercel-side verification instead of an
- * assumed `active` status, and `addCustomDomain` already reuses-in-place rather than
- * duplicating, so this is safe to run on every sweep unconditionally.
+ * assumed `active` status.
+ *
+ * MULTI-INSTANCE: unlike the probe/write step below, `addCustomDomain`'s reuse-in-place is NOT
+ * safe against concurrent callers — it does its own `listDomains` read then a plain `put`, no
+ * condition. The fixed-clock schedule (see server.ts) makes every instance fire this at the
+ * same moment, so two instances racing the SAME unregistered host would both read "nothing
+ * exists" and both mint a fresh row — the exact duplication `addSubdomain`'s own comment already
+ * worries about for `bestByOwnerProject` tie-breaking. Closed here with an atomic claim: a
+ * conditional put on a DETERMINISTIC id derived from the host, `attribute_not_exists(id)`, before
+ * ever calling `addCustomDomain`. Only the instance that wins the claim proceeds; a losing
+ * instance's `ConditionalCheckFailedException` means another instance is already handling this
+ * host, not an error. `addCustomDomain` then finds the claim row by `domain` match and reuses its
+ * id, exactly as a legitimate re-add would.
  *
  * Scoped to CUSTOM domains only — hosts under `agentwebforms.com` are deliberately excluded.
  * Managed subdomains are registered atomically as part of page creation (`addSubdomain`), so an
@@ -203,6 +214,35 @@ export async function reconcileUnregisteredDomains(
 
     if (registeredHosts.has(host)) continue;
     if (host === SUBDOMAIN_BASE || host.endsWith(managedSuffix)) continue;
+
+    // Claim first, atomically, before any Vercel call — see the doc comment above. The claim
+    // id is deterministic (not uuidv4()) specifically so two racing instances compute the SAME
+    // key and only one write can win.
+    try {
+      await dynamodb
+        .put({
+          TableName: DOMAINS_TABLE,
+          Item: {
+            id: `reconcile:${host}`,
+            userId: p.userId,
+            domain: host,
+            type: "custom",
+            status: "pending_verification",
+            vercelProjectId: p.vercelProjectId,
+            createdAt: new Date().toISOString(),
+          },
+          ConditionExpression: "attribute_not_exists(id)",
+        })
+        .promise();
+    } catch (claimErr: any) {
+      if (claimErr?.code === "ConditionalCheckFailedException") {
+        registeredHosts.add(host); // another instance is already handling this host
+        continue;
+      }
+      summary.errors++;
+      console.warn(`[DomainReachability] Failed to claim "${host}" (page ${p.id}): ${claimErr?.message}`);
+      continue;
+    }
 
     try {
       const record = await addCustomDomain(p.userId, p.vercelProjectId, host);

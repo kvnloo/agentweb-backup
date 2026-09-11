@@ -1428,7 +1428,7 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({
         // Vercel's bot check — present on every real publish attempt, unrelated to test execution.
-        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success" }] },
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
       })
       .mockResolvedValueOnce({ data: { total_count: 0 } }) // no Actions workflow can ever run
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
@@ -1460,7 +1460,7 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
       .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
       .mockResolvedValueOnce({ data: [] })
       .mockResolvedValueOnce({
-        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success" }] },
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
       })
       .mockResolvedValueOnce({ data: { total_count: 1 } }); // a real Actions workflow exists
     mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
@@ -1473,6 +1473,31 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(res.body.error).toBe("required_tests_pending");
     expect(mockAxios.post).not.toHaveBeenCalledWith(
       expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("keeps the gate for a check from an app that is NOT the known-benign allowlist", async () => {
+    // This is the narrower protection ENG-1856 preserves: only a check identified as Vercel's
+    // own app is filtered out. Any OTHER app's check — a real CI tool, or anything unexpected —
+    // still counts toward checkRuns.length and keeps the gate, never even asking about
+    // workflows. Filtering everything unconditionally was the wrong fix; this pins the boundary.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success", app: { slug: "buildkite" } }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(mockAxios.get).not.toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
     );
   });
 

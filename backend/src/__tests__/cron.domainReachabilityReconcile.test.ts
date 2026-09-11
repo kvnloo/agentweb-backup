@@ -17,7 +17,23 @@ jest.mock("../services/customDomainService", () => ({
   SUBDOMAIN_BASE: "agentwebforms.com",
 }));
 
+const mockPut = jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) });
+jest.mock("aws-sdk", () => ({
+  __esModule: true,
+  default: {
+    DynamoDB: {
+      DocumentClient: jest.fn().mockImplementation(() => ({
+        put: (...a: unknown[]) => mockPut(...a),
+      })),
+    },
+  },
+}));
+
 import { reconcileUnregisteredDomains } from "../cron/domainReachabilityCron";
+
+class ConditionalCheckFailedException extends Error {
+  code = "ConditionalCheckFailedException";
+}
 
 const page = (over: Record<string, any> = {}) => ({
   id: "page-1",
@@ -32,6 +48,8 @@ describe("reconcileUnregisteredDomains", () => {
   beforeEach(() => {
     mockAddCustomDomain.mockReset();
     mockAddCustomDomain.mockResolvedValue({ id: "new-dom", domain: "campaign.acme.com" });
+    mockPut.mockReset();
+    mockPut.mockReturnValue({ promise: () => Promise.resolve({}) });
   });
 
   it("registers a deployed page's domain that has no matching record", async () => {
@@ -118,5 +136,63 @@ describe("reconcileUnregisteredDomains", () => {
   it("skips a page missing userId or vercelProjectId — addCustomDomain requires both", async () => {
     const result = await reconcileUnregisteredDomains([], [page({ vercelProjectId: undefined })]);
     expect(mockAddCustomDomain).not.toHaveBeenCalled();
+  });
+});
+
+describe("reconcileUnregisteredDomains — cross-instance race (review finding)", () => {
+  beforeEach(() => {
+    mockAddCustomDomain.mockReset();
+    mockAddCustomDomain.mockResolvedValue({ id: "new-dom", domain: "campaign.acme.com" });
+    mockPut.mockReset();
+    mockPut.mockReturnValue({ promise: () => Promise.resolve({}) });
+  });
+
+  it("claims the domain atomically, with a deterministic id, before ever calling addCustomDomain", async () => {
+    await reconcileUnregisteredDomains([], [page()]);
+
+    expect(mockPut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        Item: expect.objectContaining({ id: "reconcile:campaign.acme.com", domain: "campaign.acme.com" }),
+        ConditionExpression: "attribute_not_exists(id)",
+      })
+    );
+    // The claim must land before the Vercel-calling registration, not after.
+    const putOrder = mockPut.mock.invocationCallOrder[0];
+    const addOrder = mockAddCustomDomain.mock.invocationCallOrder[0];
+    expect(putOrder).toBeLessThan(addOrder);
+  });
+
+  it("a losing instance backs off cleanly when another instance already claimed the host", async () => {
+    // This is the exact race the review flagged: two instances see the same unregistered host
+    // in the same sweep. The claim is what makes only one of them proceed.
+    mockPut.mockReturnValueOnce({
+      promise: () => Promise.reject(new ConditionalCheckFailedException("already claimed")),
+    });
+
+    const result = await reconcileUnregisteredDomains([], [page()]);
+
+    expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    expect(result.reconciled).toBe(0);
+    expect(result.errors).toBe(0); // losing the race is expected behavior, not a failure
+  });
+
+  it("a genuine claim-write failure (not the race) counts as an error and does not call addCustomDomain", async () => {
+    mockPut.mockReturnValueOnce({ promise: () => Promise.reject(new Error("DynamoDB throttled")) });
+
+    const result = await reconcileUnregisteredDomains([], [page()]);
+
+    expect(mockAddCustomDomain).not.toHaveBeenCalled();
+    expect(result.errors).toBe(1);
+  });
+
+  it("two pages sharing a host only attempt the claim once — the in-memory host set still short-circuits", async () => {
+    const pages = [
+      page({ id: "page-1", customDomainUrl: "https://shared.acme.com" }),
+      page({ id: "page-2", customDomainUrl: "https://shared.acme.com" }),
+    ];
+    await reconcileUnregisteredDomains([], pages);
+
+    expect(mockPut).toHaveBeenCalledTimes(1);
+    expect(mockAddCustomDomain).toHaveBeenCalledTimes(1);
   });
 });
