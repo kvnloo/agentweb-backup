@@ -135,6 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           bash .github/scripts/eb-deploy.test.sh
+          bash .github/scripts/staging-deploy.test.sh
           bash .github/scripts/dependabot-only-pr.test.sh
           bash .github/scripts/dependabot-integrity-check.test.sh
           bash .github/scripts/dependabot-config.test.sh
