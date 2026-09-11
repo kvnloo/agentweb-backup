@@ -200,6 +200,9 @@ Streamable HTTP mints a `streamId` per POST; OAuth 60/min is a
 count window; ENG-114 rehydrate is one transport per in-flight
 request. Hermes’ loop is the concurrency bound. Do not HTTP-split
 to get a lock.
+Cycle 84: `checkExtraCostUsage` has zero production callers.
+Images do not write `extraCostUsage` (CRM enrichment does).
+Do not wire that dead API onto Q-014.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

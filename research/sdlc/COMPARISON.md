@@ -193,3 +193,7 @@ submodule of the leaf package (A-008, not A-006).
 - Cycle 83: MCP Streamable HTTP SDK fans out CallTool (new
   `streamId` per POST). Hermes loop is the bound; AgentWeb server
   is not. Do not HTTP-split to get a mutex the SDK does not have.
+- Cycle 84: `checkExtraCostUsage` is tests-only. Images do not
+  write `extraCostUsage` (CRM enrichment does). Three counters;
+  MCP images move only observe-only `$`. Do not HTTP-split to
+  inherit a dead gate.

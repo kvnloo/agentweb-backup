@@ -253,6 +253,13 @@ limit is 60/min (`mcpServer.ts` L142), not in-flight. Rehydrate
 (`mcpSessionRehydration.ts` L16–18) is one transport per in-flight
 request by design. A fifth `listen()` is not a serializer.
 
+Cycle 84: **extra-cost admission is dead for images.**
+`checkExtraCostUsage` (`tokenUsageService.ts` L663) has zero
+production callers. `incrementExtraCostUsage` is CRM
+enrichment only (`crmEnrichmentService.ts` L1958). Images write
+`tokenUsage.totalCost` (cycle 82), not `extraCostUsage`. Do not
+wire that API onto Q-014.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

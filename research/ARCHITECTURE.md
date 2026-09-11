@@ -390,6 +390,8 @@ Cycle 82: image `meterUserUsage` is `costUsdOverride` with 0
 tokens. Default gate is tokens. A-006 discarded.
 Cycle 83: SDK `streamId` per POST; OAuth 60/min is not in-flight;
 rehydrate is one transport per request. A-006 discarded.
+Cycle 84: `checkExtraCostUsage` tests-only; images do not write
+`extraCostUsage`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

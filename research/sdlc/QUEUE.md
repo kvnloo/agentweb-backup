@@ -85,7 +85,9 @@ tokens (`imageGeneration.ts` L551–563); default hard gate is
 tokens (`tokenUsageService.ts` L342–396). Cycle 80 brake is
 the cost dimension. Cycle 83: CallTool is not serialized
 (SDK `streamId` per POST; rate limiter is count/min; rehydrate
-is one transport per in-flight request). Product READY unchanged.
+is one transport per in-flight request). Cycle 84:
+`checkExtraCostUsage` is tests-only; images do not write
+`extraCostUsage` (CRM enrichment does). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

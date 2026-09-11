@@ -7,16 +7,16 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 83
+cycles_completed: 84
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 84
+next_cycle: 85
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 83: CallTool is not serialized — SDK streamId per POST,
-  rate limiter is count/min, rehydrate is one transport per
-  in-flight request. Cycle 84: cheapest remaining. Candidate:
-  extraCostUsage unread by checkTokenUsage. Do not un-ready
+  Cycle 84: checkExtraCostUsage is tests-only; images do not
+  write extraCostUsage (CRM enrichment does). Cycle 85: cheapest
+  remaining. Candidate: imageGenerationCostUsd vs token
+  allowances (blast radius if cost gated). Do not un-ready
   Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
   passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
