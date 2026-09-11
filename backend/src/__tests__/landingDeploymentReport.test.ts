@@ -140,4 +140,67 @@ describe('landingDeploymentReport', () => {
       expect(reconcileLandingDeploymentReport(failureText, [] as any)).toBe(failureText);
     });
   });
+
+  // ENG-1868: "deployed successfully" is a true BUILD claim — the smoke-test/tracking
+  // caveat is a SEPARATE, additional truth appended after it, never a rewrite.
+  describe('reconcileLandingDeploymentReport — launch-readiness caveat (ENG-1868)', () => {
+    const failureText =
+      'I have successfully drafted the content for your landing page, but the final deployment step timed out. You can review your saved draft in the dashboard.';
+
+    it('appends a caveat when the smoke test failed', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] },
+          },
+        },
+      ]);
+      expect(out).toContain('was deployed successfully');
+      expect(out).toContain(DEPLOYED_URL);
+      expect(out).toContain('Not launch-ready yet');
+      expect(out).toContain('Post-deploy smoke test failed');
+    });
+
+    it('appends no caveat when ready', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: true, reasons: [] },
+          },
+        },
+      ]);
+      expect(out).not.toContain('Not launch-ready yet');
+    });
+
+    it('appends no caveat when launchReadiness is absent (older/unrelated tool results)', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL } },
+      ]);
+      expect(out).not.toContain('Not launch-ready yet');
+    });
+
+    it('never removes or rewrites the "deployed successfully" line — append-only', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: false, reasons: ['No conversion tracking (GTM) installed'] },
+          },
+        },
+      ]);
+      expect(out).toContain(failureText);
+      expect(out).toMatch(/deployed successfully.*Not launch-ready yet/s);
+    });
+  });
 });
