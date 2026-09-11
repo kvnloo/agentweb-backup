@@ -45,5 +45,6 @@ are ready to implement.
 - `briefs/Q-001-hermes-oauth.md`
 - `briefs/Q-014-generate-image-mcp.md`
 - `briefs/Q-003-designarena-adapter.md` (third in implementation order)
+- `briefs/Q-006-hide-edit-landing-page.md` / `briefs/Q-015-hide-admin-mcp-tools.md` (MCP hygiene)
 
 The loop may keep refining until `stop_after` (20:15 UTC).

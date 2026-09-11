@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T17:29:00Z",
+  "updated_at": "2026-09-11T17:34:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": ["Q-001", "Q-014", "Q-003"],
   "items": [
@@ -65,7 +65,7 @@
     },
     {
       "id": "Q-004",
-      "title": "Mark remaining outbound/admin MCP tools internalOnly",
+      "title": "Mark post_on_account internalOnly for external MCP",
       "status": "keep",
       "leverage": 3,
       "product": 4,
@@ -73,13 +73,12 @@
       "evidence": 5,
       "collision": 3,
       "score": 24,
-      "why": "Do NOT unlist the CRUD catalogue (ENG-983). Do mark post_on_account and freeze_user_account internalOnly. Collision with ENG-983 if we hide manage_*.",
+      "why": "Customer social publish is outbound (ENG-827 withdraw exists). freeze_user_account moved to Q-015 (admin, not outbound). Do NOT unlist manage_* (ENG-983).",
       "files": [
         "backend/src/mcp/server/registry.ts",
-        "backend/src/mcp/server/apiTools.ts",
-        "backend/src/emma/tools.ts"
+        "backend/src/mcp/server/apiTools.ts"
       ],
-      "first_slice": "internalOnly on post_on_account + freeze_user_account + tests that they disappear from getToolDefinitions and refuse externalMcp. Leave manage_* listed until ENG-983.",
+      "first_slice": "internal + internalOnly on post_on_account only. Tests: hidden from getToolDefinitions and refused for externalMcp. Leave manage_* listed until ENG-983.",
       "harsha_db": false
     },
     {
@@ -103,20 +102,21 @@
     {
       "id": "Q-006",
       "title": "Hide deprecated edit_landing_page_file; stop recommending missing coding_agent on MCP",
-      "status": "keep",
+      "status": "ready",
       "leverage": 2,
       "product": 4,
       "mergeability": 5,
       "evidence": 5,
       "collision": 1,
       "score": 27,
-      "why": "edit_landing_page_file is still listed. Descriptions tell MCP clients to use coding_agent, which is not registered on mcpToolRegistry at all. OpenRouter gateway doc still lists coding agent as Bedrock/Vertex. Collision: do not touch callLLM retry (#2862).",
+      "why": "Listed full-file GitHub write. Description tells Hermes to call coding_agent, which exists only on emmaToolRegistry. Four sibling tools repeat the lie. Do not register coding_agent on MCP in this slice.",
       "files": [
-        "backend/docs/OPENROUTER_GATEWAY.md",
-        "backend/src/services/codingAgentService.ts",
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/registry.ts",
+        "backend/src/__tests__/security.mcpServer.test.ts",
         "backend/src/emma/tools.ts"
       ],
-      "first_slice": "Doc fix + test that landing edits go through coding_agent. Collision: #2563 dead transports, #2862 429 retry.",
+      "first_slice": "See research/briefs/Q-006-hide-edit-landing-page.md. internal+internalOnly on edit_landing_page_file; rewrite four descriptions; do not add coding_agent to MCP.",
       "harsha_db": false
     },
     {
@@ -267,19 +267,20 @@
     {
       "id": "Q-015",
       "title": "Hide admin MCP tools from non-admin tools/list",
-      "status": "keep",
+      "status": "ready",
       "leverage": 2,
       "product": 4,
       "mergeability": 5,
       "evidence": 5,
       "collision": 1,
       "score": 27,
-      "why": "freeze_user_account, list_all_clients, and similar admin tools are in every OAuth client's tools/list. REST 403 is not enough; names pollute Hermes context and look like a privilege oracle.",
+      "why": "ListTools has no isAdmin. freeze_user_account, list_all_clients, manage_user_notes are in every OAuth tools/list. REST 403 is not enough. Dual-use client_id tools stay listed. freeze is not Q-004.",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
-        "backend/src/mcp/server/adminClientScope.ts"
+        "backend/src/mcp/server/mcpServerCore.ts",
+        "backend/src/__tests__/security.mcpServer.test.ts"
       ],
-      "first_slice": "internal: true on freeze_user_account / list_all_clients unless caller is admin (list-time filter), or internalOnly. Characterization test on getToolDefinitions.",
+      "first_slice": "See research/briefs/Q-015-hide-admin-mcp-tools.md. internal+internalOnly on the three always-admin tools. No ListTools DB lookup. Leave manage_* for ENG-983.",
       "harsha_db": false
     }
   ]

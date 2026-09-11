@@ -21,6 +21,10 @@ snapshot is live; it still waits until Matt is ok with a default flip.
 
 None of these needs Harsha or a table.
 
+MCP hygiene after those (or parallel once Q-014's listing tests exist):
+Q-006 hide `edit_landing_page_file`; Q-015 hide freeze / list_all_clients /
+manage_user_notes. Do not unlist `manage_*` (ENG-983).
+
 ## Do not pick up
 
 CRM, HubSpot, Meta payload bugs, billing ledger, `agentModeService.ts`

@@ -6,18 +6,17 @@ owner: cursor-cloud bc-658f6e8c-e6a2-4e2e-99d4-8bee7362c95b
 branch: cursor/research-loop-c95b
 coding_unlocked: false
 briefing_ready: true
-cycles_completed: 8
+cycles_completed: 9
 target_cycles: 7
 stop_after: 2026-09-11T20:15:00Z
-next_cycle: 9
+next_cycle: 10
 focus: optional-refine-until-stop_after
 next_focus_hint: |
-  briefing_ready is true. READY is Q-001, Q-014, Q-003 (implementation
-  order, not score). Do not un-ready those without a new citation.
-  ENG-381 ownership still unconfirmable from this clone. Optional until
-  20:15 UTC: Q-006/Q-015 MCP hide sketches, or Comfy/Remotion only if
-  a new file-level fact appears. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  briefing_ready is true. Implementation order remains Q-001, Q-014,
+  Q-003. Hygiene READY: Q-006, Q-015. Do not un-ready those without a
+  new citation. Optional until 20:15 UTC: Q-007 Remotion compositions
+  vs hyperframes (file-level), or Q-004 post_on_account brief. If
+  stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 ```
 

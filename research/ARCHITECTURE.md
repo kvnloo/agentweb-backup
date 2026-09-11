@@ -82,7 +82,10 @@ to for landing-page diffs. The 2026-03 "Emma can't edit files" write-up is
 
 `tools/list` drops `internal`. `internalOnly` also **refuses** execute for
 `externalMcp` (ENG-974). Only four tools are `internalOnly` (blog, skills,
-email). `post_on_account` and `freeze_user_account` are still listed.
+email). `post_on_account` and always-admin tools (`freeze_user_account`,
+`list_all_clients`, `manage_user_notes`, …) are still listed. ListTools
+has **no** `isAdmin` (cycle 9). `edit_landing_page_file` is listed and
+points at missing `coding_agent` (Q-006).
 
 ENG-982 added job-shaped `emma_*` tools (`emma_run_marketing_task`, …).
 **ENG-983 will unlist the CRUD catalogue.** Do not do ENG-983 for them.
@@ -171,8 +174,9 @@ READY, no schema. **Code in this order**, not by raw score:
    Score is highest (38) because the arena evidence is now live, but a
    default flip has customer blast radius. Matt before production.
 
-Next KEEP: **Q-006** hide deprecated full-file edit; **Q-015** hide admin
-tools from `tools/list`.
+Hygiene READY (after the first three): **Q-006** hide deprecated
+full-file edit; **Q-015** hide always-admin tools. KEEP: **Q-004**
+`post_on_account` `internalOnly` only.
 
 Parked: Comfy backend, Agent Mode strangler, ENG-381 until Harsha says it's
 yours (ownership not visible from this clone or from Linear `0ism`).
