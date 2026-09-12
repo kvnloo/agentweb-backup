@@ -5,6 +5,8 @@ Source of truth: `queue.json`. Protocol score is research leverage.
 Land **Q-004 with Q-014** (kvnloo#2). Cycle 209: Kevin asked to
 reprioritize; score ≠ shipping order. Cycle 228: Linear PER-1522 +
 frontier-kb + ten-agent arsenal scan; order unchanged; park Q-017.
+Cycle 229: deep-read of that dump (issue bodies + Host-0 map) still
+does not invert order and does not mint Q-018.
 
 Artifact (findings + priorities at the top): [`README.md`](README.md).
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
@@ -20,6 +22,7 @@ mapper (not a default flip; not mcp-bench-router's OpenRouter chat map).
 Do not port HyperFrames, MoneyPrinterTurbo, or ComfyUI — Remotion already
 owns intro/outro. Local logged-in browser is ENG-381. Cycle 228: do not
 port Homebase / OpenAvatar / Pipeline Studio / SoL-Pi; park Q-017.
+Cycle 229: PER-1522 remains DRAFT; do not YES-create Linear projects.
 
 ## Ranked (by score)
 
@@ -46,7 +49,7 @@ Score ≠ shipping order (cycle 209). Ship Q-014 / Q-004 first.
 | Q-008 | 22 | Eval workspace just shipped (ENG-1870) |
 | Q-009 | 21 | ComfyUI backend — ops-heavy; Remotion is the existing graph node |
 | Q-010 | 19 | callLLM strangler — Harsha gravity; target loop is Hermes-shaped |
-| Q-017 | 28 | MCP initialize instructions + `additionalProperties:false` after #2 and Q-001 smoke (cycle 228; PER-868 / PER-1074). Not the listing PR. |
+| Q-017 | 28 | MCP initialize instructions + `additionalProperties:false` after #2 and Q-001 smoke (cycle 228; PER-868 / PER-1074). Cycle 229: Linear dump did not mint a second handshake item. Not the listing PR. |
 
 ## Discarded
 
@@ -581,3 +584,8 @@ port Homebase / OpenAvatar /
 Pipeline Studio / SoL-Pi /
 AODL / MCP Tasks. A-006 stays
 discarded.
+Cycle 229: Linear dump deep-read
+(PER-1522 bodies + Host-0 map +
+Muse / Vercel / PER-1261 /
+PER-469). No new Q-id. PER-1522
+stays DRAFT. A-006 stays discarded.

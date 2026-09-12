@@ -728,3 +728,8 @@ reverted. Do not copy that as A-006.
   packages. MCP remains the external
   bus; A-007/A-008 stay in-process.
   Not A-006.
+- Cycle 229: Linear dump deep-read.
+  Narrow-twin lesson reconfirms
+  A-006 discard. Muse persistent
+  scouts / Vercel HUD are Company
+  OS, not Emma packages.

@@ -640,3 +640,11 @@ SoL-Pi is a host port; AgentWeb MCP is already the external bus.
 Linear PER-1522: **narrow twins ship**. A-006 stays discarded. Product
 order unchanged. Parked Q-017 is MCP handshake hygiene, not a fifth
 `listen()`.
+
+## Cycle 229 (Linear dump deep-read)
+
+PER-1522 + Host-0 lineage map are the past-ideas dump. Four buckets
+only. Turning AgentWeb into zerOS / Pipeline Studio / Dash / an HTTP
+nanoservice mesh is the named failure mode. Hermes lineage cards
+(PER-150 family) are private synthesis jobs, not a public idea list.
+No new Q-id. A-006 stays discarded.

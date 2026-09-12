@@ -635,6 +635,10 @@ READY unchanged.
    Q-017. Do **not** import SoL-Pi /
    OMP / OpenHands. A-006 stays
    discarded.
+   Cycle 229: Linear dump deep-read
+   does not invert this order. Do
+   **not** YES PER-1522 from this
+   repo.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

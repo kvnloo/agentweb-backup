@@ -12,7 +12,8 @@ Kevin asked to reprioritize. Q-001 is Kevin Hermes smoke after #2
 (existing runbook). Q-003 waits on Matt before a default flip.
 Next architecture after #2+#3 is **A-019** (HTTP 503 POST `/mcp` `tools/call`; GET 405 not 503; `mcpShutdown` after the wait).
 Cycle 228: arsenal + Linear PER-1522 + frontier-kb re-rank did **not**
-invert that order. Park Q-017.
+invert that order. Park Q-017. Cycle 229: Linear dump deep-read (issue
+bodies + Host-0 map) still does not invert it and does not mint Q-018.
 
 ---
 
@@ -699,6 +700,12 @@ omits `additionalProperties`). Do not port
 Homebase / OpenAvatar / Pipeline Studio /
 SoL-Pi / AODL / MCP Tasks. A-006 stays
 discarded.
+Cycle 229: Linear dump deep-read. PER-1522
+is still **DRAFT**. Hermes lineage cards are
+task prompts, not a public idea list.
+PER-1261 is OMP DesignArena roles (not
+Q-003). PER-469 is Content Factory, not
+Remotion. No new Q-id.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -1655,3 +1655,10 @@ Do not add a Tasks extension or a fifth `listen()` because Linear
 PER-1257 / PER-1355 exist. Q-017 (park) is initialize `instructions` +
 `additionalProperties: false` on advertised roots — handshake
 hygiene, not a hop.
+
+## Cycle 229
+
+PER-1522 four buckets: AgentWeb already occupies **operator** (MCP
+server for Hermes) plus **creative-loop** (image/video/eval). Do not
+add a fifth `listen()` to absorb Pipeline Studio, Artifact Ledger, or
+Dash Orchestra. Q-017 stays handshake hygiene.

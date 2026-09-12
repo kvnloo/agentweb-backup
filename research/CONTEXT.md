@@ -65,20 +65,38 @@ Kevin should not be a generic AgentWeb engineer. The first useful role is:
 CRM, Stripe, Meta payload plumbing, and `agentModeService.ts` rewrites are
 someone else's lane.
 
-## Linear past-ideas (cycle 228)
+## Linear past-ideas (cycles 228–229)
 
 Kevin's Linear workspace **zer0 / `0ism`** is the human-viewable dump of
 ideas from other projects. Do **not** file AgentWeb issues there
-(PER-80: no zer0-company 26k dump).
+(PER-80: no zer0-company 26k dump). Do **not** YES PER-1522 (create /
+rename / archive Linear projects) from this repo.
+
+The dump Kevin pointed at (created **2026-09-12**, same hour):
 
 | Linear | What it is | AgentWeb |
 |---|---|---|
-| [PER-1522](https://linear.app/0ism/issue/PER-1522) + [Host-0 product lineage map](https://linear.app/0ism/document/host-0-product-lineage-map-a88b2a7a1758) | 2026-09-12 audit of `/products` vs Linear. Lesson: **narrow twins ship; operating systems of everything do not.** | AgentWeb is already a narrow twin (Emma + MCP for Hermes). Do not become zerOS. |
-| PER-299 / PER-80 | Linear = company mind; Hermes Kanban = execution | AgentWeb is not a fourth control plane. |
-| PER-1257 / PER-1355 | OMP/Hermes MCP Tasks | Factory leaves. Not an AgentWeb first slice. |
-| PER-1074 / PER-868 | Codex `additionalProperties:false`; GitNexus initialize `instructions` | Parked Q-017. File-level: `apiTools.ts` L2081–2094 omits the flag; `mcpServerCore.ts` L58–65 has no `instructions`. |
+| [PER-1522](https://linear.app/0ism/issue/PER-1522) + [Host-0 product lineage map](https://linear.app/0ism/document/host-0-product-lineage-map-a88b2a7a1758) | `/products` vs Linear. **DRAFT until Kevin YES.** Lesson: **narrow twins ship; operating systems of everything do not.** Four buckets: twin, control-plane, identity/brain, creative-loop. | AgentWeb is already a narrow twin (Emma + MCP for Hermes). Do not become zerOS / Dash / Pipeline Studio / an HTTP nanoservice mesh. |
+| [Development surface](https://linear.app/0ism/document/development-surface-o8-hermes-omp-feec5345cab2) + PER-299 / PER-80 | Talk in OMP; Hermes is inspectable runtime; Linear is the mind | AgentWeb is **not** a fourth control plane. |
+| PER-150 / 161 / 164 / 174 / 199 / 200 / 207 / 198 | Hermes Kanban **meta syntheses** (private host-0 artifacts) | Bodies are task prompts, not a public idea list. Do not port titles. |
+| PER-1488 / 1489 / 1490 / 1491 | Homebase dream-loop (live narrow twin) | DISCARD as AgentWeb item. Template for *twins*, not Emma. |
+| PER-1424 / 1425 | OpenAvatar claim + local likeness (recovered 2026-09-11; not Dash) | DISCARD. Identity card, not Emma brand. Duplicate Open Avatar / OpenAvatar is a zer0 merge, not ours. |
+| PER-1515–1521 | Jarvis SFT / Tinker (non-PII) | DISCARD. Private brain. |
+| PER-1431 / 1459–1462 | Dash phone + AODL catalog | DISCARD. Host HUD / IR, not Emma packages. |
+| PER-1261 | OMP DesignArena **role** resolution + free OpenCode Zen pool | Q-003 stays Emma `SUPPORTED_MODELS` mapper. Do not port Zen `:free`. |
+| PER-469 | Claude launch-ad image→video DAG (Content Factory, no spend) | Q-007 / Q-016 already park extra Remotion / MCP video. |
+| [Vercel `design.md`](https://linear.app/0ism/document/frontier-harness-ideas-vercel-designmd-2026-08-31-bf538104ace2) / [Muse Code](https://linear.app/0ism/document/frontier-harness-ideas-muse-code-2026-08-31-d6963aac5232) | Company OS HUD; persistent scouts | HUD is `kvnloo/company-os`. Persistent scouts are not an Emma feature. |
+| PER-1257 / PER-1355 | OMP/Hermes MCP Tasks | Factory leaves. Inbound CallTool already held via `mcpFetch`. |
+| PER-1074 / PER-868 | Codex `additionalProperties:false`; initialize `instructions` | Parked Q-017. File-level: `apiTools.ts` L2081–2094 omits the flag; `mcpServerCore.ts` L58–65 has no `instructions`. |
 | PER-620 | crush RFC 9207 `iss` | Crush-side. Do not rewrite `HERMES_MCP_OAUTH.md`. |
-| PER-1506 / MEMORY Ad Arena / Pipeline Studio | Flux Comfy stills; creative DAG; ad ranking | Q-009 / Q-007 / Q-003 already cover the AgentWeb twins. Do not port the products. |
+| PER-1506 / PER-288 / PER-58 / PER-294 | Flux Comfy stills; Spatial Canvas; paused donors | Q-009 parks Comfy. Spatial / Monument / Halo stay zer0 donors. |
 
-Homebase, OpenAvatar, Spatial Canvas, Pythia, Paperclip, Dash, ACE,
-PitchTwin, Hardware Studio stay zer0 products.
+MEMORY titles on PER-1522 (titles only): Spatial Canvas, Pipeline Studio,
+Ad Arena, Pythia, Paperclip **retired**, Temple Guard vs Flow State vs
+Latency-First Aim Trainer. Ad Arena's AgentWeb twin is Q-003 (arena
+signal) + Q-002 parked (no new eval table). Hardware Studio, ACE,
+PitchTwin, FactoryMind, netplay, taste, COD stay zer0.
+
+Theory E (lineage map): durable primitive is **artifact + receipt +
+loop**. AgentWeb already has S3 + meter + Slack/Matt eval. Do not mint
+an Artifact Ledger inside Emma.

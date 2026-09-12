@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-12T05:58:00Z",
+  "updated_at": "2026-09-12T06:20:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": [
     "Q-014",
@@ -57,7 +57,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 38,
-      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11T17:28Z and re-fetch 18:30Z: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134 (logo #40). Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt). Cycle 170: default flip would land unspecified+logo+edit on Azure [0]-only. Cycle 180: onboarding pins Gemini 3 so the mapper never sees Brick 8 ads. Cycle 209: stays ready and highest by formula; implementation after Q-014 listing and Q-001 smoke.",
+      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11T17:28Z and re-fetch 18:30Z: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134 (logo #40). Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt). Cycle 170: default flip would land unspecified+logo+edit on Azure [0]-only. Cycle 180: onboarding pins Gemini 3 so the mapper never sees Brick 8 ads. Cycle 209: stays ready and highest by formula; implementation after Q-014 listing and Q-001 smoke. Cycle 229: PER-1261 is OMP free-pool-first DesignArena *role* resolution (OpenCode Zen); do not port Zen :free pools into Emma image providers.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/agentModeService.ts",
@@ -319,7 +319,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 28,
-      "why": "Cycle 228 (PER-868 / PER-1074; ten-agent arsenal scan). createMcpServer (mcpServerCore.ts L58-65) has no initialize instructions. generate_image inputSchema (apiTools.ts L2081-2094) omits additionalProperties; only evaluationTools.ts and one apiTools lookup pin false. Codex/ChatGPT hosts reject that class. Do not expand Q-014 listing (A-011). Do not copy GitNexus tools/list fanout (PER-1089; cycle 211). Do not rewrite HERMES_MCP_OAUTH.md for RFC 9207 (PER-620 crush-side). Harsha if initialize copy is customer-facing.",
+      "why": "Cycle 228 (PER-868 / PER-1074; ten-agent arsenal scan). Cycle 229: Linear dump deep-read did not mint a second handshake item. createMcpServer (mcpServerCore.ts L58-65) has no initialize instructions. generate_image inputSchema (apiTools.ts L2081-2094) omits additionalProperties; only evaluationTools.ts and one apiTools lookup pin false. Codex/ChatGPT hosts reject that class. Do not expand Q-014 listing (A-011). Do not copy GitNexus tools/list fanout (PER-1089; cycle 211). Do not rewrite HERMES_MCP_OAUTH.md for RFC 9207 (PER-620 crush-side). Harsha if initialize copy is customer-facing.",
       "files": [
         "backend/src/mcp/server/mcpServerCore.ts",
         "backend/src/mcp/server/apiTools.ts",
