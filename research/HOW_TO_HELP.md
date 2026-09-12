@@ -83,5 +83,9 @@ not await `send()`). Closed POST SSE is not ENG-97 404 reinit
 (cycle 219: POST `_handleSseStream(..., false)`; no `eventStore`;
 Q-001 fixture is httpx `next(data:)`). Default SDK `callTool()`
 is 60s (`Protocol.request`); inbound CallTool has none (cycle 220).
+`notifications/cancelled` is a **new POST**, not the CallTool SSE
+(cycle 221: client HTTP `send()` ignores `relatedRequestId`; server
+202s; after `mcpShutdown` it cannot abort the original CallTool). Do
+**not** 503 that notification. Copy `method === 'tools/call'`.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

@@ -526,3 +526,10 @@ Cycle 220: 60s is client
 CallTool. `mcpClientService` 3600000
 is AgentWeb as client. Hermes 315s
 is OAuth add. A-006 stays discarded.
+Cycle 221: `notifications/cancelled`
+is a new POST, not the CallTool SSE.
+Client HTTP `send()` ignores
+`relatedRequestId`. After
+`mcpShutdown` it cannot abort the
+original CallTool. Do not 503 it.
+A-006 stays discarded.

@@ -1262,6 +1262,25 @@ abandon `generate_image` at 60s
 while mcpFetch+leaf still bill.
 Not A-006.
 
+Cycle 221: **`notifications/cancelled`
+is a new POST, not the CallTool
+SSE.** Client `send()` always
+POSTs (`streamableHttp.js`
+L288–305) and ignores
+`relatedRequestId` (a server-send
+option, `transport.d.ts` L22–24).
+Notification POSTs 202
+(`webStandardStreamableHttp.js`
+L434–441). After `mcpShutdown`
+`sessions.clear()` the next POST
+rehydrates a new Protocol or 404s
+and cannot `_oncancel` the
+original. During the wait, copy
+`method === 'tools/call'` so
+cancelled is not 503. Protocol
+L351 then skips `send()` if
+cancelled did land. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

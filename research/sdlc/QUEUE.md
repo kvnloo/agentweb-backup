@@ -497,6 +497,13 @@ Cycle 220: 60s is client
 CallTool. `mcpClientService` 3600000
 is AgentWeb as client. Hermes 315s
 is OAuth add. Product READY unchanged.
+Cycle 221: `notifications/cancelled`
+is a new POST, not the CallTool SSE.
+Client HTTP `send()` ignores
+`relatedRequestId`. After
+`mcpShutdown` `sessions.clear()` it
+cannot abort the original CallTool.
+Do not 503 it. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -544,7 +551,10 @@ is OAuth add. Product READY unchanged.
    POST `_handleSseStream(..., false)`; no `eventStore`). Do **not**
    copy `mcpClientService` 3600000 onto inbound CallTool
    (cycle 220: 60s is client `Protocol.request()`; AgentWeb
-   handler has none). Wrap stays
+   handler has none). Do **not** 503
+   `notifications/cancelled` (cycle 221:
+   new POST; copy `method === 'tools/call'`,
+   not every draining POST). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

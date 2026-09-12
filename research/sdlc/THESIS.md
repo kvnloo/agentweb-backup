@@ -509,6 +509,12 @@ Cycle 220: 60s is client
 CallTool. `mcpClientService` 3600000
 is AgentWeb as client. Hermes 315s
 is OAuth add. Do not add A-021.
+Cycle 221: `notifications/cancelled`
+is a new POST. Client HTTP `send()`
+ignores `relatedRequestId`. After
+`mcpShutdown` it cannot abort the
+original CallTool. Do not 503 it.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
