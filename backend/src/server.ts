@@ -1,4 +1,5 @@
-import { isEvaluationUser } from './services/evaluationPolicy';
+import { requireActiveEvaluation } from './services/evaluationPolicy';
+import { evaluationSocketDecision } from './utils/socketEvaluationAuth';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -122,12 +123,23 @@ io.use(async (socket, next) => {
     try {
       const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
+        email?: string;
         sv?: number;
         delegateAccess?: unknown;
         _svc?: boolean;
+        isAdmin?: boolean;
       };
 
-      if (isEvaluationUser(decoded.userId) || isEvaluationUser((decoded.delegateAccess as any)?.targetUserId) || isEvaluationUser((decoded.delegateAccess as any)?.adminUserId)) return next(new Error('Authentication error'));
+      // Sandbox principals stream Emma over this socket like any customer, on the
+      // same policy check as the HTTP layer; the primary record is read by email
+      // because a just-provisioned account may not be in the userId GSI yet.
+      const evaluationDecision = await evaluationSocketDecision(decoded, requireActiveEvaluation,
+        async claims => (typeof claims.email === 'string' ? userDb.getUserByEmailConsistent(claims.email) : null));
+      if (evaluationDecision === 'deny') return next(new Error('Authentication error'));
+      if (evaluationDecision === 'allow') {
+        socket.data.user = decoded;
+        return next();
+      }
 
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are
