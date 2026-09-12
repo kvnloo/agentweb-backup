@@ -714,3 +714,5 @@ discarded.
 Cycle 261: unset XFF opt-in skips like
 partner. Do not pin AWS defaults. A-006
 stays discarded.
+Cycle 262: do not piggyback XFF on the
+delay opt-in. A-006 stays discarded.

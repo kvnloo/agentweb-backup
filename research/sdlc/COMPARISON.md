@@ -848,3 +848,6 @@ reverted. Do not copy that as A-006.
 - Cycle 261: unset XFF opt-in skips like
   partner. Hermes has no empty-desired
   pin-defaults fork. Not A-006.
+- Cycle 262: do not piggyback XFF on the
+  delay opt-in. Hermes has no TG-timeout
+  vs XFF deploy fork. Not A-006.

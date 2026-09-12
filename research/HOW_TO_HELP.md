@@ -184,6 +184,8 @@ Cycle 260: treat empty XFF Describe like `20`. Do not add
 hook `[ -z ]` from A-019. Do not add A-021.
 Cycle 261: unset XFF opt-in skips like partner (and
 staging). Do not pin AWS defaults. Do not add A-021.
+Cycle 262: do not piggyback XFF on the delay opt-in.
+Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

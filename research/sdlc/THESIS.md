@@ -868,3 +868,8 @@ A-020. Not A-006.
 Copy L798. Do not pin AWS defaults on empty desired.
 Partner and staging omit the delay var. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 262 (do not piggyback XFF on delay opt-in)
+
+Delay `desired` is TG seconds. XFF is LB `xff_*`.
+Own opt-in. Not A-019. Not A-020. Not A-006.

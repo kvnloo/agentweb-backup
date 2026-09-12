@@ -765,6 +765,8 @@ READY unchanged.
    Cycle 261: unset XFF opt-in skips like
    partner (and staging). Do **not** pin
    AWS defaults from A-019.
+   Cycle 262: do **not** piggyback XFF on
+   `EB_DEREGISTRATION_DELAY_SECONDS`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
