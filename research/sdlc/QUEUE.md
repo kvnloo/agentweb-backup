@@ -457,6 +457,11 @@ Cycle 214: GET cleanup is
 await `server.close` for the hang. Local
 never `enableJsonResponse`. Product READY
 unchanged.
+Cycle 215: rehydrate CallTool is the
+`mcpServerCore` wrap, not `mcpShutdown`.
+JSON `close()` does not `resolveJson`.
+Do not `sessions.set` that transport.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -484,7 +489,10 @@ unchanged.
    ASG never fires that listener). Do **not** await `server.close`
    to finish GET (cycle 214: Hono `writable.end()` after
    `controller.close()`). Do **not** set `enableJsonResponse`
-   on the live transport. Do **not** edit `slack.ts`
+   on the live transport. Do **not** `sessions.set` a
+   rehydrate transport (cycle 215: JSON `close()` hangs
+   `handleRequest`). Wrap stays in `mcpServerCore`. Do
+   **not** edit `slack.ts`
    (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section

@@ -470,6 +470,11 @@ Cycle 214: GET cleanup is
 `writable.end()`. Do not await
 `server.close` for the hang. Local never
 `enableJsonResponse`. Do not add A-021.
+Cycle 215: rehydrate CallTool is the
+`mcpServerCore` wrap. JSON `close()`
+does not `resolveJson`. Do not
+`sessions.set` that transport. Do not
+add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -487,3 +487,8 @@ Cycle 214: GET closer is SDK
 `writable.end()`. Do not await
 `server.close` for the hang. A-006 stays
 discarded.
+Cycle 215: rehydrate CallTool is the
+`mcpServerCore` wrap, not `mcpShutdown`.
+JSON `close()` hangs `handleRequest`.
+Do not `sessions.set` that transport.
+A-006 stays discarded.

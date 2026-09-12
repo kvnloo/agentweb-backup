@@ -71,6 +71,7 @@ Do not refuse inside `track()` (the promise is already running).
 Do not make `tryClaim` return false (that 409s). `mcpShutdown`
 triggers GET `streamController.close()`; Hono then
 `writable.end()`s — do not await `server.close` for that hang
-(cycle 214). That is the billed-image drain gate. Not A-007
-packaging. Not persist (occupied `agentModeService.ts` /
-`app.ts` / `emma/tools.ts`).
+(cycle 214). Wrap `CallTool` in `mcpServerCore` so rehydrate is
+covered; do not `sessions.set` that JSON transport (cycle 215).
+That is the billed-image drain gate. Not A-007 packaging. Not persist
+(occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

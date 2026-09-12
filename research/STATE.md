@@ -7,23 +7,23 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 214
+cycles_completed: 215
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 215
+next_cycle: 216
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 214: transport.close() GET
-  cleanup is streamController.close();
-  Hono flow({done}) writable.end().
-  Do not await server.close for the
-  hang. Cycle 215: JSON-mode cleanup
-  does not resolveJson (webStandard
-  L458-460). Rehydrate transport is
-  not on the local Map. File-level
-  only: does the CallTool wrap already
-  cover rehydrate at drain ceiling, or
-  can that Promise outlive mcpShutdown?
+  Cycle 215: rehydrate CallTool is the
+  mcpServerCore wrap, not mcpShutdown.
+  JSON close() does not resolveJson;
+  do not sessions.set that transport.
+  Cycle 216: resolveJson (L706) does
+  not stream.cleanup(); SSE else does
+  (L712-714). Mapping stays until
+  finally close(). File-level only:
+  is that finally load-bearing, or
+  does skipped close() after resolved
+  JSON still leak the transport?
   Do not add A-021. Do not start another
   S3/Referer matcher. Do not un-ready
   Q-001 / Q-014 / Q-003. Do not revive

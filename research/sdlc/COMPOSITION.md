@@ -1169,6 +1169,19 @@ for the hang. Local never
 `enableJsonResponse` (only rehydrate L90).
 Not A-006.
 
+Cycle 215: **Rehydrate CallTool is the
+wrap, not `mcpShutdown`.**
+`rehydrateAndServe` builds a JSON
+transport (`mcpSessionRehydration.ts`
+L88–90) and `close()`s it in `finally`
+(L115–118). Never `sessions.set`. JSON
+`cleanup` does not `resolveJson`
+(`webStandardStreamableHttp.js`
+L458–460 / L696–706). Closing it
+mid-CallTool hangs `handleRequest`.
+POST 503 at L298 is before the
+rehydrate branch (L439). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

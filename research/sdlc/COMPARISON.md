@@ -696,3 +696,9 @@ reverted. Do not copy that as A-006.
   `writable.end()`. Do not await
   `server.close` as the hang fix. Local
   never `enableJsonResponse`. Not A-006.
+- Cycle 215: rehydrate is request-scoped
+  JSON (`mcpSessionRehydration.ts` L90 /
+  L115). Wrap `CallTool` in core; do not
+  `sessions.set` that transport (JSON
+  `close()` hangs `handleRequest`). Not
+  A-006.

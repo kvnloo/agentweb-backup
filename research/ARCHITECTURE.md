@@ -747,6 +747,11 @@ Cycle 214: GET cleanup is
 `writable.end()`. Do not await
 `server.close` for the hang.
 A-006 discarded.
+Cycle 215: rehydrate CallTool is the
+`mcpServerCore` wrap. JSON `close()`
+does not `resolveJson`. Do not
+`sessions.set` that transport.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
