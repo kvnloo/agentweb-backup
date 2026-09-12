@@ -419,4 +419,7 @@ A-006 stays discarded.
 Cycle 195: video processInputImage is Path C
 (no UA, no SVG). Seedance default never calls it.
 Q-016 stays parked. A-006 stays discarded.
+Cycle 196: generateKeyframes persist-then-Path-C
+is Veo-only; Seedance ignores useKeyframes.
+Q-016 stays parked. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -1006,6 +1006,15 @@ Fallback L994–1000 re-enters `generateVideo` with
 the same frames. Tests pin Higgsfield import;
 spy Veo on fallback. Q-016 parked. Not A-006.
 
+Cycle 196: **`generateKeyframes` persist-then-Path-C
+is Veo-only.** L851–897 calls `imageService.generateImage`
+with no `imageModel` (Gemini 3). L1032 feeds those
+Family A URLs into Veo Path C. `useKeyframes` is
+read only inside the Veo multi-clip branch. Seedance
+ignores it; fallback L1000 can suddenly bill N+1
+images. Tests grep empty. REST omits the flag.
+Q-016 parked. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

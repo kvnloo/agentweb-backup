@@ -670,6 +670,10 @@ Cycle 195: video processInputImage is a second Path C
 Seedance default is media_import_url. Fallback
 re-enters with the same frames. Q-016 parked.
 A-006 discarded.
+Cycle 196: generateKeyframes persist-then-Path-C
+is Veo-only. Seedance ignores useKeyframes. Fallback
+can bill N+1 Gemini 3 images then Path-C GET private
+S3. Q-016 parked. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

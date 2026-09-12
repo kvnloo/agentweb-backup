@@ -582,3 +582,9 @@ reverted. Do not copy that as A-006.
   L1000 re-enters with the same startFrame. Tests
   spy generateWithVeo31; grep processInputImage
   empty. Hermes one fetch. Not A-006.
+- Cycle 196: generateKeyframes L875 calls image
+  leaf with no imageModel (Gemini 3 default) then
+  Veo L1032 Path-C GETs those Family A URLs.
+  useKeyframes is Veo multi-clip only; Seedance
+  never reads it. Tests grep empty. Hermes pass
+  bytes, not persist-then-HTTP. Not A-006.

@@ -7,17 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 195
+cycles_completed: 196
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 196
+next_cycle: 197
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 195: video processInputImage is Path C;
-  Seedance default uses media_import_url instead.
-  Cycle 196: cheapest remaining. Candidate:
-  generateKeyframes L875 persist then Veo Path C
-  at L1032. Or brand-guide matcher L15132.
+  Cycle 196: generateKeyframes persist-then-Path-C
+  is Veo-only; Seedance ignores useKeyframes.
+  Cycle 197: cheapest remaining. Candidate:
+  brand-guide matcher L15132 includes('.s3.').
+  Or Higgsfield media_import_url of character
+  referenceImageUrl (Emma L5385) — Path D.
   File-level. A-011 parks field unify — do not add
   A-021. Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,
