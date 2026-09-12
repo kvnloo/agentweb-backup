@@ -383,3 +383,6 @@ reverted. Do not copy that as A-006.
 - Cycle 154: Drive has ENG-1624 count+time bounds (L23581
   perBatchTarget L23879); clickupService.ts grep TIMEOUT /
   MAX_MS / deadline is empty. Copy the bound shape. Not A-006.
+- Cycle 155: Drive folder trees Promise.all (L24080);
+  ClickUp docs sequential await (L24148-24156). Drive
+  post-query file reads also sequential (L24105). Not A-006.

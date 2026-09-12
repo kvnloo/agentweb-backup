@@ -499,6 +499,11 @@ ENG-1624 `DRIVE_LIST_WALK_MAX_MS = 90_000` (L23581) and
 `perBatchTarget` (L23879). `clickupService.ts` grep
 TIMEOUT/MAX_MS/deadline is empty. Copy the bound shape
 in-process.
+Cycle 155: **ClickUp docs walk sequentially; Drive trees
+do not.** Drive L24080 `Promise.all` across registered
+roots, then one `fullText` query. ClickUp L24148 nested
+`for`/`await` (workspace, then every doc, then every
+page). Do not wrap ClickUp in unbounded `Promise.all`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

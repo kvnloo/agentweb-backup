@@ -543,6 +543,10 @@ A-006 discarded.
 Cycle 154: Drive search has count+time bounds (ENG-1624);
 `clickupService.ts` has zero TIMEOUT/MAX_MS/deadline. A-006
 discarded.
+Cycle 155: Drive folder trees `Promise.all` (L24080); ClickUp
+docs walk sequential `await` per workspace then per doc
+(L24148–24156). Drive file reads after the query are also
+sequential (L24105). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

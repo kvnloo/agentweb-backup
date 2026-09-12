@@ -276,6 +276,9 @@ Cycle 153: `readDocContent` runs before `includes()`;
 unchanged.
 Cycle 154: Drive search has count+time bounds (ENG-1624);
 ClickUp docs search has neither. Product READY unchanged.
+Cycle 155: Drive folder trees `Promise.all` (L24080);
+ClickUp docs sequential `await` (L24148–24156). Product
+READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

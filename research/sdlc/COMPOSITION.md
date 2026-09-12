@@ -678,6 +678,16 @@ TIMEOUT/MAX_MS/deadline/AbortSignal/timeout is empty.
 `listDocs` L106–119 is `do/while (cursor)`. Copy Drive’s
 bound shape in-process. Not A-006.
 
+Cycle 155: **ClickUp docs walk sequentially; Drive trees
+do not.** Drive L24080–24082 `Promise.all` of
+`getGoogleDriveFolderTreeIds` (each still
+`DRIVE_LIST_WALK_MAX_MS`). ClickUp L24148–24156 nested
+sequential `await`: workspace → `listDocs` → each
+`readClickUpDocContent` (cycle 153 pages). Drive file
+**content** reads after the query are also sequential
+(L24105–24121). Parallelism without a deadline is a
+worse blast radius. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
