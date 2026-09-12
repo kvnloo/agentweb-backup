@@ -265,4 +265,8 @@ the cap lives at the source. A-006 stays discarded.
 Cycle 142: those faces do not share source sets. Agent Mode
 is a Drive/ClickUp superset; Emma RAG and Growth Genius are
 not. A-006 stays discarded.
+Cycle 143: listed MCP `search_knowledge_base` already hops to
+that Agent Mode superset; `generate_image` is still
+`internal: true`. Q-014 is listing, not a new hop. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -244,6 +244,10 @@ lesson as `generate_image`. Do not add A-021.
 Cycle 142: those faces do not share source sets. Agent Mode
 is a Drive/ClickUp superset after the Vertex leaf; Emma RAG
 and Growth Genius are not. Do not add A-021.
+Cycle 143: listed MCP `search_knowledge_base` already hops to
+that superset (`emmaApi.ts` L98–101); `generate_image` is
+still `internal: true`. Q-014 is listing, not a new hop. Do
+not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

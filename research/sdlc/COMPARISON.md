@@ -347,3 +347,6 @@ reverted. Do not copy that as A-006.
 - Cycle 142: those faces do not share source sets. Agent Mode
   is a Drive/ClickUp superset; Emma RAG and Growth Genius are
   Vertex-only. Hermes/OMP: one name, one source set. Not A-006.
+- Cycle 143: listed MCP search_knowledge_base already hops to
+  that Agent Mode superset; generate_image is still internal.
+  Q-014 is listing, not a new hop. Not A-006.

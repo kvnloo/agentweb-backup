@@ -243,6 +243,10 @@ the cap lives at the source. Product READY unchanged.
 Cycle 142: those faces do not share source sets. Agent Mode
 is a Drive/ClickUp superset; Emma RAG and Growth Genius are
 not. Product READY unchanged.
+Cycle 143: listed MCP `search_knowledge_base` already hops to
+that Agent Mode superset; `generate_image` is still
+`internal: true`. Q-014 is listing, not a new hop. Product
+READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

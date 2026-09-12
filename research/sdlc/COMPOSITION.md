@@ -595,6 +595,15 @@ the Vertex leaf would not give GG Drive; extracting the whole
 method would pull `clickupService` OAuth into a fifth
 process. Not A-006.
 
+Cycle 143: **listed MCP `search_knowledge_base` already hops
+to that superset.** `apiTools.ts` L1264–1284 has no
+`internal: true` and sits before the internal banner (L1936).
+`emmaApi.ts` L98–101 calls Agent Mode. Sibling `generate_image`
+is still `internal: true` (L2077). Test L78 vs L91. MCP’s
+listed description (L1268) does not mention Drive/ClickUp;
+the hop still walks them. Q-014 is listing, not a new hop.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

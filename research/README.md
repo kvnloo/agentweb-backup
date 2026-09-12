@@ -445,6 +445,11 @@ Vertex leaf. Emma RAG is Vertex + local chunks (L5093 /
 L5106). Growth Genius is Vertex-only (L71). Emma’s *tool*
 (`emma/tools.ts` L5593) is the Agent Mode superset. HTTP-split
 the leaf would not equalize Drive.
+Cycle 143: **listed MCP `search_knowledge_base` already hops
+to that superset.** `apiTools.ts` L1264–1284 has no
+`internal: true`; `emmaApi.ts` L98–101 calls Agent Mode.
+Sibling `generate_image` is still hidden (L2077). Test L78
+vs L91. Q-014 is listing, not a new hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
