@@ -87,5 +87,8 @@ is 60s (`Protocol.request`); inbound CallTool has none (cycle 220).
 (cycle 221: client HTTP `send()` ignores `relatedRequestId`; server
 202s; after `mcpShutdown` it cannot abort the original CallTool). Do
 **not** 503 that notification. Copy `method === 'tools/call'`.
+Skip-send after cancelled does **not** `stream.cleanup()` (cycle 222:
+POST SSE stays mapped until `mcpShutdown` `close()`, same closer as
+GET).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

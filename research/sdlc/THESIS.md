@@ -515,6 +515,11 @@ ignores `relatedRequestId`. After
 `mcpShutdown` it cannot abort the
 original CallTool. Do not 503 it.
 Do not add A-021.
+Cycle 222: skip-send does not
+`stream.cleanup()`. Local POST SSE
+stays mapped until `mcpShutdown`
+`close()` (same closer as GET).
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

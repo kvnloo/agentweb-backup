@@ -533,3 +533,7 @@ Client HTTP `send()` ignores
 `mcpShutdown` it cannot abort the
 original CallTool. Do not 503 it.
 A-006 stays discarded.
+Cycle 222: skip-send does not
+`stream.cleanup()`. Local POST SSE
+stays mapped until `mcpShutdown`
+`close()`. A-006 stays discarded.

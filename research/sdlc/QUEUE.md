@@ -504,6 +504,11 @@ Client HTTP `send()` ignores
 `mcpShutdown` `sessions.clear()` it
 cannot abort the original CallTool.
 Do not 503 it. Product READY unchanged.
+Cycle 222: skip-send does not
+`stream.cleanup()`. Local POST SSE
+stays in `_streamMapping` until
+`mcpShutdown` `close()`. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -554,7 +559,10 @@ Do not 503 it. Product READY unchanged.
    handler has none). Do **not** 503
    `notifications/cancelled` (cycle 221:
    new POST; copy `method === 'tools/call'`,
-   not every draining POST). Wrap stays
+   not every draining POST). Do **not**
+   treat skip-send as `stream.cleanup()`
+   (cycle 222: POST SSE stays mapped until
+   `mcpShutdown` `close()`). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

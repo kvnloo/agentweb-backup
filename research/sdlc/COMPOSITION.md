@@ -1281,6 +1281,20 @@ cancelled is not 503. Protocol
 L351 then skips `send()` if
 cancelled did land. Not A-006.
 
+Cycle 222: **skip-send does not
+`stream.cleanup()`.** Cleanup is
+only `send()` L712–714 after a
+JSON-RPC result/error. Aborted
+`_onrequest` `return`s without
+`send()`; `_requestToStreamMapping`
+stays. Local POST already returned
+200 SSE. `mcpShutdown` `close()`
+is the hang closer for GET **and**
+that orphaned POST (same
+`streamController.close()`).
+`extra.closeSSEStream` is unset
+(no `eventStore`). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
