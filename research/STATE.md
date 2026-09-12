@@ -7,19 +7,18 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 146
+cycles_completed: 147
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 147
+next_cycle: 148
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 146: same search_knowledge_base name, three JSON
-  schemas; GG requires reason. Cycle 147: cheapest remaining.
-  Candidate: GG logs reason (L174) and never passes it to
-  searchKnowledgeBase(query, userId) (L177). Required field
-  is prompt-only. Do not un-ready Q-001 / Q-014 / Q-003. Do
-  not revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 147: GG reason is required on the schema and discarded
+  before the Vertex leaf. Cycle 148: cheapest remaining.
+  Candidate: GG hardcodes maxResults=10 (L71); Emma/MCP
+  default 5 then Agent Mode min(,10) L24050. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
+  passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

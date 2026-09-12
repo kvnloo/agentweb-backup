@@ -256,6 +256,8 @@ Product READY unchanged.
 Cycle 146: three JSON schemas for `search_knowledge_base`.
 GG requires `reason`; Emma/MCP do not. A-011 already parks
 this pattern. Product READY unchanged.
+Cycle 147: GG `reason` is required then discarded before the
+Vertex leaf. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

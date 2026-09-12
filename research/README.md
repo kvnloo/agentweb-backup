@@ -464,6 +464,10 @@ Cycle 146: **three JSON schemas for that name.** GG L147
 requires `query`+`reason`. Emma L5590 and MCP L1275 require
 `query` only and have `max_results`. A-011 already parks
 this pattern for `generate_image`. Do not add A-021.
+Cycle 147: **GG `reason` never reaches the leaf.** L174 logs
+it; L177 calls `searchKnowledgeBase(query, userId)` only.
+Tool result L188–192 omits it. Unifying that field away is a
+no-op on Vertex, unlike `confirm` on `generate_image` (A-011).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

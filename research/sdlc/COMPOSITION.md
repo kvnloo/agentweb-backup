@@ -624,6 +624,13 @@ requires `query`+`reason`. Emma L5590 and MCP L1275 require
 Emma’s shape. A-011 already parks this pattern for
 `generate_image`. Do not add A-021. Not A-006.
 
+Cycle 147: **GG `reason` never reaches the leaf.** L174 logs
+it; L177 `searchKnowledgeBase(functionArgs.query, userId)`.
+Tool result L188–192 is `{ query, results, count }`. Cycle 39
+`confirm` *does* reach `generateImage` policy — that is why
+A-011 parks unifying images. This field is the opposite
+no-op. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

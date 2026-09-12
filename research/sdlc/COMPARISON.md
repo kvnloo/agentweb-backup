@@ -360,3 +360,6 @@ reverted. Do not copy that as A-006.
 - Cycle 146: three JSON schemas for search_knowledge_base.
   GG requires reason; Emma/MCP require query only. A-011
   already parks this pattern for generate_image. Not A-006.
+- Cycle 147: GG reason is required then discarded before the
+  Vertex leaf (L174 vs L177). Unifying it away is a no-op
+  on retrieval, unlike confirm on generate_image. Not A-006.
