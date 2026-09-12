@@ -374,4 +374,7 @@ A-006 stays discarded.
 Cycle 181: onboarding 180s race does not abort the 8 min
 leaf. Nested Promise.race, no AbortSignal. A-006 stays
 discarded.
+Cycle 182: late Gemini success S3-uploads a key nobody
+stores. s3Utils has no DeleteObject. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

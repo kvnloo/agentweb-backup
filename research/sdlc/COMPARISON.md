@@ -489,3 +489,7 @@ reverted. Do not copy that as A-006.
   is 8 min. Meter L551 after inner success; UI already
   placeholder. Test L375 blesses elapsed not cancel.
   Not A-006.
+- Cycle 182: Gemini 3 data URL takes L566-587 S3 upload
+  (not cycle 174 HTTPS skip). Key users/{userId}/files
+  (s3Utils L264). Zero DeleteObject. ENG-792 only fails
+  liveCount===0. Not A-006.

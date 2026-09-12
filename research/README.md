@@ -631,6 +631,10 @@ Cycle 181: **Onboarding 180s race does not abort the 8 min
 leaf.** Nested `Promise.race`, no `AbortSignal`. Meter
 L551 after inner success; UI already has placeholder.
 Test L375 blesses elapsed, not cancel.
+Cycle 182: **Late Gemini success S3-uploads a key nobody
+stores.** Data URL path L566–587; `users/{userId}/files/…`.
+`s3Utils.ts` has no DeleteObject. ENG-792 only fails
+all-placeholder. C2PA still strips the discarded buffer.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

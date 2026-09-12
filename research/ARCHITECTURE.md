@@ -620,6 +620,9 @@ aspect ratios. Do not un-ready Q-003. A-006 discarded.
 Cycle 181: onboarding 180s race does not abort the 8 min
 leaf. Nested Promise.race, no AbortSignal. A-006
 discarded.
+Cycle 182: late Gemini success S3-uploads users/{userId}/files
+with no DeleteObject. User keeps placeholder. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -874,6 +874,15 @@ elapsed < 2s, not cancel. Three parallel variants
 (L663). Cycle 104’s MCP 5 min hop is the same hole.
 Not A-006.
 
+Cycle 182: **Late Gemini success S3-uploads a key
+nobody stores.** Cycle 180 pins Gemini 3 data URLs, so
+L566–587 runs (not L570 HTTPS skip). Key
+`users/${userId}/files/${Date.now()}/{token}/ad-image-…`
+(`s3Utils.ts` L264). Metadata `uploaded-by: agent-mode`
+(L276). Grep DeleteObject empty. ENG-792 L1100–1111
+fails only all-placeholder. C2PA L575 still strips the
+discarded buffer. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
