@@ -26295,7 +26295,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   private static escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   /** Convert inline markdown to HTML string. */
@@ -31900,14 +31900,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // here (not on the LLM's output afterward) is the only point where "this came from
       // a value" and "this is the template's own static markup" are still distinguishable
       // — post-hoc sanitizing final_html can't tell the two apart.
-      const { escapeHtml } = await import('../utils/markdownHtmlReport');
       const escapedVariableValuesObj = Object.fromEntries(
-        Object.entries(variableValuesObj).map(([key, value]) => [key, escapeHtml(String(value))])
+        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.escapeHtml(String(value))])
       );
       const escapedArrayVariableValuesObj = Object.fromEntries(
         Object.entries(arrayVariableValuesObj).map(([key, values]) => [
           key,
-          (values as string[]).map((value) => escapeHtml(String(value))),
+          (values as string[]).map((value) => AgentModeService.escapeHtml(String(value))),
         ])
       );
 
