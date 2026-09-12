@@ -1248,6 +1248,28 @@ describe('Client Health - listAllClients', () => {
     expect(result.clients[0].email).toBe('admin@example.com');
   });
 
+  // ENG-1907: a sandbox take-home account looks like a Pro customer with a Meta
+  // connection; it must not appear in the admin client roster or its health sweep.
+  it('never lists a sandbox (eval_) principal as a client', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      { userId: 'customer-1', email: 'customer@example.com', isAdmin: false },
+      { userId: 'eval_5d5d5d5d-0000-4000-8000-000000000000', email: 'candidate@example.invalid', isAdmin: false },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([]);
+
+    const result = await listAllClients(adminUserId);
+
+    expect(result.success).toBe(true);
+    expect(result.clients.map((c: any) => c.email)).toEqual(['customer@example.com']);
+    expect(getAccountsByUserId).not.toHaveBeenCalledWith(expect.stringMatching(/^eval_/));
+  });
+
   // FAIL test 3: Error handling when DB fails
   it('should handle database errors gracefully', async () => {
     const adminUserId = 'admin-user';
