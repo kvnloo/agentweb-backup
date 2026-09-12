@@ -291,6 +291,15 @@ Cycle 160: Hermes loop still client; two opt-in stdio
 servers. Product READY unchanged.
 Cycle 161: hermes-tools `image_generate` is in-process
 dispatch. Product READY unchanged.
+Cycle 162: Hermes `image_generate` schema is not MCP
+`generate_image`. A-011 already parks Emma vs MCP. Do
+not add A-021. Product READY unchanged.
+Cycle 163: Hermes capability-gates tools/list; AgentWeb
+MCP is a static literal. Product READY unchanged.
+Cycle 164: generateImage does not refuse input_images
+on Emma’s t2i-described model. Product READY unchanged.
+Cycle 165: logo_image is mutated into inputImages before
+model routing. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

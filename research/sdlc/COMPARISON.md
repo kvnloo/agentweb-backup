@@ -3,6 +3,8 @@
 Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **19:17Z** (cycle 30);
 Hermes/OMP versions reconfirmed **2026-09-12T00:38Z** (cycle 159:
 OMP still v0.85.1; Hermes `v2026.9.11` + main MCP client ~24 files).
+Schema pin **2026-09-12T00:45Z** (cycles 162–165: live
+`image_generation_tool.py` 833 lines; `IMAGE_GENERATE_SCHEMA` L522).
 
 ## Size (what an agent must hold)
 
@@ -77,7 +79,7 @@ reverted. Do not copy that as A-006.
 | Eval / bench on tools | OMP “benchmaxxed” edits; metaharness package | `loops/` framework; human eval for images (not a router) |
 | Module boundary in CI | package graph / AST `discover_builtin_tools` | **No** (A-002 sketch only) |
 | Skills as files | `skills/` + optional-skills | Skills in system prompt + DB `foundation_tools` |
-| MCP | Loop is **client** (`mcp_tool.py` skipped by discover; parallel default **false**, cycle 89). Two opt-in **stdio** servers: `hermes mcp serve` (conversations) and `hermes-tools` for Codex including `image_generate` (cycle 160). Dashboard `/api/mcp/oauth/callback` is outbound config, not `tools/list`. | Server for Hermes **and** client to vendors; self `"agentweb-tools"` skipped **on file config only** (`mcpClientService.ts` L420–432); DB `mcp_servers` does not (cycle 90) |
+| MCP | Loop is **client** (`mcp_tool.py` skipped by discover; parallel default **false**, cycle 89). Two opt-in **stdio** servers: `hermes mcp serve` (conversations) and `hermes-tools` for Codex including `image_generate` (cycle 160). `image_generate` schema is capability-gated (`dynamic_schema_overrides`, cycle 163) and fail-closed at the leaf (cycle 164). Dashboard `/api/mcp/oauth/callback` is outbound config, not `tools/list`. | Server for Hermes **and** client to vendors; self `"agentweb-tools"` skipped **on file config only** (`mcpClientService.ts` L420–432); DB `mcp_servers` does not (cycle 90). Listed `generate_image` is a static superset (cycle 162–165) |
 
 ## Implications (not a port)
 
@@ -406,3 +408,21 @@ reverted. Do not copy that as A-006.
 - Cycle 161: hermes-tools image_generate dispatches
   handle_function_call in-process (L90). Q-014 lists;
   AgentWeb mcpFetch is the adapter. Not A-006.
+- Cycle 162: Hermes image_generate schema is prompt +
+  aspect_ratio (IMAGE_GENERATE_SCHEMA L522–554). MCP
+  generate_image requires prompt+filename+category (L2093).
+  A-011 already parks Emma vs MCP. Do not add A-021.
+  Not A-006.
+- Cycle 163: Hermes dynamic_schema_overrides hides
+  image_url on t2i-only models (L781–815; test_t2i_only_
+  model_hides_edit_args). AgentWeb MCP always lists
+  input_images. Agentic-dev quality is an in-process
+  builder, not a fifth listen(). Not A-006.
+- Cycle 164: Hermes also refuses at _prepare_fal_request
+  L367–370. AgentWeb validateParams is quality+filename
+  only (L1514–1533); generateWithGoogleGemini still edits
+  on the model Emma calls t2i-only (L924). Not A-006.
+- Cycle 165: logo_image is inputImages.push before the
+  model switch (L477–485). Emma “no logo compositing”
+  is catalog text; the leaf mutates. Hermes has no logo
+  field and fail-closes. Not A-006.

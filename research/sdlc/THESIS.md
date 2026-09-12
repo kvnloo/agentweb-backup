@@ -297,6 +297,14 @@ Cycle 160: Hermes loop still client; two opt-in stdio
 MCP servers. Do not add A-021.
 Cycle 161: hermes-tools `image_generate` is in-process
 `handle_function_call`. Do not add A-021.
+Cycle 162: Hermes `image_generate` schema is not MCP
+`generate_image`. Third origin. Do not add A-021.
+Cycle 163: Hermes capability-gates tools/list; AgentWeb
+MCP is a literal. Do not add A-021.
+Cycle 164: generateImage does not refuse input_images
+on Emma’s t2i-described model. Do not add A-021.
+Cycle 165: logo_image is mutated into inputImages before
+routing. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

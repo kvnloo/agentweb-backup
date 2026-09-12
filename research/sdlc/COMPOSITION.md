@@ -740,6 +740,30 @@ Cycle 161: **Codex-facing `image_generate` is in-process.**
 (`emmaApi.ts`); Hermes listed the leaf without that hop.
 Not A-006.
 
+Cycle 162: **Hermes schema ≠ MCP `generate_image`.**
+Live `IMAGE_GENERATE_SCHEMA` L522–554: name
+`image_generate`, required `prompt` only, `aspect_ratio`.
+MCP L2093 requires `prompt`+`filename`+`category`.
+Execute still forwards `input_images` (L2102). A-011
+parks Emma vs MCP; do not add A-021 for Hermes. Not A-006.
+
+Cycle 163: **Hermes capability-gates tools/list.**
+`_build_dynamic_image_schema` L781–815. AgentWeb MCP
+L2081–2093 is a static literal. Q-014 lists that literal.
+Not A-006.
+
+Cycle 164: **Leaf does not refuse t2i+edit.** Emma L5035
+says gemini-2.5-flash-image is t2i-only;
+`generateWithGoogleGemini` L924 still edits.
+`validateParams` L1514–1533 has no matrix. Hermes
+`_prepare_fal_request` L367–370 raises. Not A-006.
+
+Cycle 165: **`logo_image` is mutated into `inputImages`
+before routing** (L477–485). HITL L28893 keys off caller
+`inputImages`, so logo-only skips confirm then takes
+`/images/edits`. CRITICAL LOGO stays in this leaf. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

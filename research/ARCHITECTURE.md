@@ -564,6 +564,18 @@ Cycle 160: Hermes loop still MCP client; two opt-in stdio
 servers (`mcp_serve`, `hermes-tools`). A-006 discarded.
 Cycle 161: Hermes `image_generate` on stdio MCP is
 in-process `handle_function_call`. A-006 discarded.
+Cycle 162: Hermes `image_generate` schema ≠ MCP
+`generate_image`. Third origin after Emma vs MCP
+(A-011). Do not add A-021. A-006 discarded.
+Cycle 163: Hermes hides edit args the active model
+cannot honor; AgentWeb MCP always lists them. A-006
+discarded.
+Cycle 164: Emma text says gemini-2.5-flash-image is
+t2i-only; the leaf still takes the edit branch.
+`validateParams` has no capability check. A-006
+discarded.
+Cycle 165: `logo_image` is mutated into `inputImages`
+before model routing. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

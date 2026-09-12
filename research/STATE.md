@@ -7,20 +7,21 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 161
+cycles_completed: 165
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 162
+next_cycle: 166
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 161: Hermes hermes-tools image_generate is
-  in-process handle_function_call (stdio bus). Cycle 162:
-  cheapest remaining. Candidate: Hermes image_generate
-  JSON schema from get_tool_definitions vs AgentWeb MCP
-  generate_image (apiTools.ts L2075). A-011 already parks
-  Emma vs MCP unify — do not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 165: logo_image is pushed onto inputImages before
+  model routing. Cycle 166: cheapest remaining. Candidate:
+  MCP image_model is an untyped string (apiTools.ts L2090);
+  Emma has an enum (L5036); leaf SUPPORTED_MODELS L16–28
+  includes a preview alias Emma does not. Three model
+  catalogs, one leaf. A-011 parks field unify — do not
+  add A-021. Do not un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

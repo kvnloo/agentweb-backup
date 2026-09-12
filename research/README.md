@@ -535,6 +535,24 @@ Cycle 161: **Hermes listed `image_generate` without an
 HTTP hop.** `handle_function_call` in the same process
 (`hermes_tools_mcp_server.py` L90). Q-014 lists AgentWeb’s
 leaf; the mcpFetch hop is the adapter, not a nanoservice.
+Cycle 162: **Hermes `image_generate` schema is not MCP
+`generate_image`.** Live `IMAGE_GENERATE_SCHEMA` L522–554:
+required `prompt` only; `aspect_ratio`; no `filename` /
+`category`. MCP requires the eval triple (L2093). A-011
+already parks Emma vs MCP. Do not add A-021.
+Cycle 163: **Hermes capability-gates tools/list.**
+`_build_dynamic_image_schema` L781–815 hides `image_url`
+when the model is t2i-only. AgentWeb MCP L2081–2093 is a
+literal. Tests in `test_image_generate_schema.py`.
+Cycle 164: **AgentWeb does not refuse the unadvertised
+edit.** Emma L5035 says gemini-2.5-flash-image is t2i-only;
+`generateWithGoogleGemini` L924 still edits. Hermes
+`_prepare_fal_request` L367–370 raises. Two layers vs a
+comment.
+Cycle 165: **`logo_image` becomes `inputImages` before
+routing.** Leaf L477–485, then `hasInputImages` L488.
+Logo-only skips HITL (L28893 keys off caller images) and
+still takes `/images/edits`. Catalog vs mutation.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -313,4 +313,17 @@ Cycle 160: Loop still client; two opt-in stdio MCP servers.
 A-006 stays discarded.
 Cycle 161: Codex-facing `image_generate` is in-process
 dispatch, not an HTTP hop. A-006 stays discarded.
+Cycle 162: Hermes `image_generate` schema is not MCP
+`generate_image` (name, required, size, no category).
+A-011 already parks Emma vs MCP. Do not add A-021.
+A-006 stays discarded.
+Cycle 163: Hermes capability-gates tools/list
+(`dynamic_schema_overrides`); AgentWeb MCP is a literal.
+A-006 stays discarded.
+Cycle 164: `generateImage` does not refuse `input_images`
+on Emma’s t2i-described model; the leaf still edits.
+A-006 stays discarded.
+Cycle 165: `logo_image` is `inputImages.push` before the
+model switch. Catalog text vs leaf mutation. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
