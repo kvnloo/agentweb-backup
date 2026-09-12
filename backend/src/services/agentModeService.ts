@@ -26319,16 +26319,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
-   * Collects every string leaf (however deeply nested) that actually needed escaping —
-   * i.e. contained at least one of & < > " ' — so the LLM's output can be checked for
-   * whether it decoded any of them back to raw HTML. Escaping the PROMPT proves nothing
-   * about the RESPONSE: substitution is LLM-driven, not a deterministic string-replace,
-   * so nothing guarantees the model reproduces an escaped entity as-is rather than
-   * "cleaning up" what looks like a stray HTML entity mid-generation.
+   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>` —
+   * so the LLM's output can be checked for whether it decoded either back to raw HTML.
+   * Escaping the PROMPT proves nothing about the RESPONSE: substitution is LLM-driven,
+   * not a deterministic string-replace, so nothing guarantees the model reproduces an
+   * escaped entity as-is rather than "cleaning up" what looks like a stray HTML entity
+   * mid-generation.
+   *
+   * Deliberately narrower than the 5-character escape set (& < > " ') applied on the way
+   * IN: `<`/`>` can construct a genuinely new element regardless of surrounding markup,
+   * so a raw one resurfacing is unambiguously dangerous. `&`, `"`, and `'` alone cannot —
+   * they only matter for breaking out of an ALREADY-quoted attribute using that exact
+   * quote character, a narrower, template-structure-dependent risk the live template
+   * doesn't even have today (text-node placeholders only). Including them here caused a
+   * real false-positive class: an ordinary apostrophe in a real name ("O'Brien's Q3")
+   * could trip this check if that short substring coincidentally reappeared anywhere
+   * else in the output, failing a legitimate report for no real security benefit.
    */
   private static collectDangerousRawValues(value: any, out: Set<string>): void {
     if (typeof value === 'string') {
-      if (/[&<>"']/.test(value)) out.add(value);
+      if (/[<>]/.test(value)) out.add(value);
     } else if (Array.isArray(value)) {
       value.forEach((v) => AgentModeService.collectDangerousRawValues(v, out));
     } else if (value !== null && typeof value === 'object') {
