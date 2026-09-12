@@ -12,7 +12,7 @@ import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
-import { isEvaluationUser, requireActiveEvaluation } from '../services/evaluationPolicy';
+import { isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
 
 const router = express.Router();
 
@@ -63,11 +63,10 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
     // A sandbox principal (ENG-1907) gets the one field the portal needs for its
     // "Sandbox" pill; a revoked or expired sandbox must not receive a normal profile.
-    let sandboxInfo: { isSandbox: true; label: string; expiresAt: number } | undefined;
+    let sandboxInfo: ReturnType<typeof buildSandboxInfo> | undefined;
     if (isEvaluationUser(userId)) {
       try {
-        const record = await requireActiveEvaluation(userId);
-        sandboxInfo = { isSandbox: true, label: 'Sandbox', expiresAt: record.expiresAt };
+        sandboxInfo = buildSandboxInfo(await requireActiveEvaluation(userId));
       } catch {
         return res.status(401).json({ code: 'session_invalid', message: 'Invalid token' });
       }

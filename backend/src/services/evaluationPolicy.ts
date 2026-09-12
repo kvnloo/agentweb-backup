@@ -118,7 +118,8 @@ export async function requireEvaluationReviewer(userId: string, context?: Record
 export function sandboxInfo(record: EvaluationRecord) {
   return {
     isSandbox: true as const,
-    label: record.label,
+    // Rows provisioned before ENG-1907 carry no label.
+    label: record.label || 'Sandbox',
     datasetId: record.datasetId ?? null,
     datasetVersion: record.datasetVersion ?? null,
     expiresAt: record.expiresAt,

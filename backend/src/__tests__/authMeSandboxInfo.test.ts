@@ -60,7 +60,7 @@ describe('GET /api/auth/me — sandboxInfo', () => {
 
   it('carries sandboxInfo for an active sandbox principal', async () => {
     const res = await callAs('eval_test').expect(200);
-    expect(res.body.sandboxInfo).toEqual({ isSandbox: true, label: 'Sandbox', expiresAt });
+    expect(res.body.sandboxInfo).toEqual({ isSandbox: true, label: 'Sandbox', datasetId: null, datasetVersion: null, expiresAt });
     expect(res.body.password).toBeUndefined();
   });
   it('carries no sandboxInfo for an ordinary customer', async () => {
