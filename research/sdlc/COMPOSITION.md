@@ -1085,6 +1085,14 @@ Probe L495 Mozilla only. Referer-gated CDN
 403s both after scrape found the URL. Ads fail
 closed. Occupied app.ts #2271. Not A-006.
 
+Cycle 207: **generate_image.filename is the
+output name.** Required with prompt+category
+(MCP L2093 / Emma L5052). Leaf L1526 non-empty
+only. Cycle 205's asset.filename (logo.png /
+'url') is a different contract. logo_image
+optional; ENG-326 recovers omit. Hermes native
+schema requires prompt only. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

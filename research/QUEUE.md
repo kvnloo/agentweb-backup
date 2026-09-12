@@ -446,4 +446,7 @@ not logoUrl. A-006 stays discarded.
 Cycle 206: pin/probe omit Referer; Chrome scrape
 still sends it on <img>/icon. Ads fail closed.
 A-006 stays discarded.
+Cycle 207: generate_image.filename is the output
+name, not asset.filename. Leaf accepts 'url'.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

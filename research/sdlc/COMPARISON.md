@@ -650,3 +650,10 @@ reverted. Do not copy that as A-006.
   L239 no headers. app.ts L193 inbound no-referrer
   is leak-prevention (#2271). Hermes one client.
   Not A-006.
+- Cycle 207: generate_image.filename is output
+  (MCP L2085 / Emma L5008, required L2093/L5052).
+  Leaf L1526 non-empty only. S3 key last segment
+  that string. HITL L28895 interpolates it.
+  logo_image optional; ENG-326 recovers omit.
+  Hermes IMAGE_GENERATE_SCHEMA requires prompt
+  only. Not A-006.

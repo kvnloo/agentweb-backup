@@ -709,6 +709,9 @@ already prints the URL. A-006 discarded.
 Cycle 206: pin/probe omit Referer; Chrome scrape
 still sends it on subresources. Tests pin pin GET
 has no headers. Ads fail closed. A-006 discarded.
+Cycle 207: generate_image.filename is the output
+name, not asset.filename. Leaf accepts 'url'.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

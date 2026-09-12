@@ -425,6 +425,11 @@ Cycle 206: pin/probe omit Referer; Chrome scrape
 still sends it on <img>/icon during networkidle2.
 Referer-gated CDN 403s both pin and probe. Ads
 fail closed. Do not add A-021.
+Cycle 207: generate_image.filename is the output
+name (required, non-empty only), not cycle 205
+asset.filename. logo_image optional; ENG-326
+recovers omit. Hermes native schema requires
+prompt only. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -417,6 +417,10 @@ already prints the URL. Product READY unchanged.
 Cycle 206: pin/probe omit Referer; Chrome scrape
 still sends it on subresources. Tests pin pin GET
 has no headers. Ads fail closed. Product READY unchanged.
+Cycle 207: generate_image.filename is the output
+name, not asset.filename. Leaf accepts 'url'.
+logo_image optional; ENG-326 recovers omit.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

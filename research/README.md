@@ -657,11 +657,12 @@ Cycle 187: **Email rewrite matches one S3 host;
 `s3.us-west-2` only. Brand delete already extracted a
 bucket matcher (`brand.ts` L84). Rewrite tests never
 use the region-less URL `/asset/` tests pin.
-Cycle 188–206: S3 writers, matchers, fetch paths.
-Latest (206): pin/probe omit `Referer`; Chrome
-scrape still sends it on `<img>`/icon. A
-Referer-gated CDN 403s both pin and probe after
-scrape found the URL. Ads fail closed.
+Cycle 188–207: S3 writers, matchers, fetch paths.
+Latest (207): `generate_image.filename` is the
+output name (required, non-empty only), not
+cycle 205's `asset.filename` (`logo.png` /
+`'url'`). `logo_image` is optional; ENG-326
+recovers omit.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
