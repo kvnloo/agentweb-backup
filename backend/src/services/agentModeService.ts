@@ -1596,6 +1596,18 @@ export class AgentModeService {
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
+    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
+    // instanceId alone proved a second, empty-registry instance answers requests
+    // inside the same worker process, but every known construction site (module
+    // singleton, the worker's own instance, chatbotService.ts's per-message
+    // throwaway) traces to a call graph that shouldn't reach the worker a second
+    // time. Capturing the actual construction stack settles which site it really
+    // is instead of continuing to reason about it from the outside.
+    console.log('[ENG-1852-CTOR]', JSON.stringify({
+      pid: process.pid,
+      instanceId: this.instanceId,
+      uptimeSec: Math.round(process.uptime()),
+    }), new Error('construction site').stack);
   }
 
   public async initialize() {
