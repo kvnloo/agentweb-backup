@@ -989,6 +989,14 @@ L29585 / L29705. REST `POST /remove-c2pa` L216
 metered; no emmaApi for background. MCP grep empty.
 Axios shape = `processInputImage` L816. Not A-006.
 
+Cycle 194: **Leaf `processInputImage` is Path C.**
+L816–823, no presign, no data: skip. Gemini L929 /
+L1024 / L1240; Runway L1371 skips data. `logoImage`
+push L477 then L492 Gemini 3. ENG-792 onboarding
+L707 / `classifyBrandLogoUrl` L478. Tests mock
+axios for `example.com`; Runway pins data URL.
+Q-014 listing still ready. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

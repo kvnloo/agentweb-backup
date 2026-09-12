@@ -567,3 +567,11 @@ reverted. Do not copy that as A-006.
   REST for background. MCP grep empty. Same axios
   shape as processInputImage L816. Hermes one
   fetch. Not A-006.
+- Cycle 194: leaf processInputImage L816 is Path C.
+  Gemini 2.5 L929/L1024 and Gemini 3 L1240 have no
+  data: skip; Runway L1371 does. logoImage L477
+  then L492 Gemini 3 default. ENG-792
+  classifyBrandLogoUrl L478 is a 15s Path C probe
+  because that GET throws. Tests mock axios for
+  example.com; grep processInputImage empty.
+  Hermes one fetch. Not A-006.

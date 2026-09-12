@@ -661,6 +661,10 @@ Cycle 193: Emma C2PA/background advertise S3 URL;
 C2PA test pins axios.get of path-style S3.
 Write is uploadFileToS3. REST only for C2PA. MCP
 empty. A-006 discarded.
+Cycle 194: leaf processInputImage is Path C (L816).
+Gemini has no data: skip; Runway L1371 does.
+logoImage push + Gemini 3 default hit it. ENG-792
+preflights because that GET throws. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

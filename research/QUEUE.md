@@ -413,4 +413,7 @@ discarded.
 Cycle 193: Emma C2PA/background advertise S3;
 tests pin Path C. REST only for C2PA. MCP empty.
 A-006 stays discarded.
+Cycle 194: leaf processInputImage is Path C.
+Gemini has no data: skip. Do not un-ready Q-014.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
