@@ -1040,6 +1040,13 @@ the real key. Skip-re-pin L15242 uses real
 `isS3Url` (hits A). Occupied `agentModeService.ts`.
 Not A-006.
 
+Cycle 200: **ENG-792 probe is Path C of own-bucket
+Family A.** `classifyBrandLogoUrl` L492 axios GET;
+`brandLogo.ts` has no `isS3Url`. Ads
+`isBrandLogoFetchable` fail closed on 4xx.
+`filesController` L35 already SDK-streams. Tests
+inject `https://s3/logo.png`. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

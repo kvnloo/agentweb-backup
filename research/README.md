@@ -657,10 +657,10 @@ Cycle 187: **Email rewrite matches one S3 host;
 `s3.us-west-2` only. Brand delete already extracted a
 bucket matcher (`brand.ts` L84). Rewrite tests never
 use the region-less URL `/asset/` tests pin.
-Cycle 188–199: S3 writers, matchers, fetch paths.
-Latest (199): `downloadBrandLogoToS3` is Family A
-and drops `result.Key`; `auto-logo-*` blocks
-delete’s `deriveOwnBucketKey` fallback.
+Cycle 188–200: S3 writers, matchers, fetch paths.
+Latest (200): `classifyBrandLogoUrl` Path-C GETs the
+Family A URL auto-pin just wrote; ads fail closed
+on 4xx. Same repo already SDK-streams own bucket.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

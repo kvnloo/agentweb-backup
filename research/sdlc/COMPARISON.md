@@ -608,3 +608,10 @@ reverted. Do not copy that as A-006.
   (hits A). Tests pin Family B skip and real delete
   keys; grep auto-logo empty. Hermes one persist
   result. Not A-006.
+- Cycle 200: classifyBrandLogoUrl L492 is Path C of
+  that Family A URL (15s, UA). brandLogo.ts grep
+  isS3Url empty. Ads isBrandLogoFetchable L727 fail
+  closed on 4xx; persist rediscovery fail-open on
+  unknown. Tests inject https://s3/logo.png.
+  filesController L35 already SDK-streams. Hermes
+  one fetch of bytes it has. Not A-006.
