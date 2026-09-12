@@ -65,6 +65,26 @@ describe('AWS credentials guard (ENG-1603)', () => {
         sessionToken: 'session_tok',
       });
     });
+
+    // A partial pair is exactly as broken as no pair at all — AWS SDK v2's
+    // DocumentClient constructor requires both accessKeyId and
+    // secretAccessKey to authenticate; passing just one raises its own
+    // "Missing credentials" error immediately, before ever reaching the
+    // default provider chain this guard exists to protect. The `&&` in the
+    // guard condition (not `||`) is what enforces that — this pins it.
+    it('omits credentials when only accessKeyId is set', () => {
+      setEnv('AKIA_TEST', undefined);
+      require('../services/workPlanService');
+      const args = DocumentClientMock.mock.calls[0][0];
+      expect(args.credentials).toBeUndefined();
+    });
+
+    it('omits credentials when only secretAccessKey is set', () => {
+      setEnv(undefined, 'secret_test');
+      require('../services/workPlanService');
+      const args = DocumentClientMock.mock.calls[0][0];
+      expect(args.credentials).toBeUndefined();
+    });
   });
 
   describe('config/aws.ts', () => {
@@ -93,6 +113,22 @@ describe('AWS credentials guard (ENG-1603)', () => {
       const args = updateMock.mock.calls[0][0];
       expect(args.accessKeyId).toBe('AKIA_TEST');
       expect(args.secretAccessKey).toBe('secret_test');
+    });
+
+    it('omits both keys when only accessKeyId is set', () => {
+      setEnv('AKIA_TEST', undefined);
+      require('../config/aws');
+      const args = updateMock.mock.calls[0][0];
+      expect(args).not.toHaveProperty('accessKeyId');
+      expect(args).not.toHaveProperty('secretAccessKey');
+    });
+
+    it('omits both keys when only secretAccessKey is set', () => {
+      setEnv(undefined, 'secret_test');
+      require('../config/aws');
+      const args = updateMock.mock.calls[0][0];
+      expect(args).not.toHaveProperty('accessKeyId');
+      expect(args).not.toHaveProperty('secretAccessKey');
     });
   });
 });
