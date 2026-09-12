@@ -491,6 +491,13 @@ does not abort; CallTool ignores
 `extra`; mcpFetch abort is
 timeout-only. A-019 wait is the
 billed hop. Do not add A-021.
+Cycle 218: `send()` after `close()`
+is Protocol `_onerror`, not
+`mcpServerCore` `isError`. Handler
+already billed. Wrap handler return,
+not only `execute`. Drain polls size
+every 2s and does not await `send()`.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

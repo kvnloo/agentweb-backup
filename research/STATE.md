@@ -7,28 +7,25 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 217
+cycles_completed: 218
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 218
+next_cycle: 219
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 217: mcpShutdown never
-  cancels generate_image. _onclose
-  does not abort; CallTool ignores
-  extra; mcpFetch AbortController
-  is timeout-only. A-019 wait is
-  the billed hop.
-  Cycle 218: after local close()
-  mid-CallTool, send() still runs
-  (signal not aborted). close()
-  clears _streamMapping not
-  _requestToStreamMapping so send
-  throws No connection established
-  (L672-694). File-level only: is
-  that throw inside Protocol
-  (Hermes hang) or mcpServerCore
-  isError after the leaf billed?
+  Cycle 218: send() after close() is
+  Protocol _onerror, not mcpServerCore
+  isError. Handler already billed.
+  Wrap CallTool handler return, not
+  only execute. Drain polls size every
+  2s and does not await send().
+  Cycle 219: if close() mid-CallTool,
+  send() throws and _onerror logs.
+  File-level only: does the vendored
+  Streamable HTTP client treat a
+  closed POST SSE as retry/reinit
+  (404) vs terminal, and does the
+  Q-001 fixture ever see that?
   Do not add A-021. Do not start
   another S3/Referer matcher. Do
   not un-ready Q-001 / Q-014 /

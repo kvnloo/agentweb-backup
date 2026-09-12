@@ -508,3 +508,10 @@ does not abort; CallTool ignores
 `extra`; mcpFetch abort is
 timeout-only. A-019 wait is the
 billed hop. A-006 stays discarded.
+Cycle 218: `send()` after `close()`
+is Protocol `_onerror`, not
+`mcpServerCore` `isError`. Handler
+already billed. Wrap handler return,
+not only `execute`. Drain polls size
+every 2s and does not await `send()`.
+A-006 stays discarded.

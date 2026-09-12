@@ -59,7 +59,7 @@ Land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).
 
 **A-019.** HTTP 503 on POST `/mcp` when the body contains
 `tools/call` (copy `anonymousTransport` batch fail-closed), then
-wrap CallTool in `track()` so drain waits. `/generate` gets 503
+wrap CallTool **handler return** in `track()` so drain waits. `/generate` gets 503
 before `tryClaim`. Do **not** drain-gate ListTools or initialize
 (cycle 211). Do **not** 503 GET `/mcp` (cycle 212: SDK throws;
 405 is the optional-SSE skip). After the four-way wait,
@@ -76,6 +76,9 @@ covered; do not `sessions.set` that JSON transport (cycle 215).
 Keep rehydrate `finally close()` after `handleRequest` returns
 (cycle 216: leftover `_streamMapping`; cannot hang).
 `mcpShutdown` is not `generate_image` cancel (cycle 217: the
-wait is the billed hop).
+wait is the billed hop). Wrap the CallTool **handler return**,
+not only `execute` (cycle 218: `send()` after `close()` is
+Protocol `_onerror`, not `isError`; drain polls size and does
+not await `send()`).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

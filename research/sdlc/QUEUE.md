@@ -479,6 +479,13 @@ does not abort; CallTool ignores
 `extra`; mcpFetch abort is
 timeout-only. A-019 wait is the
 billed hop. Product READY unchanged.
+Cycle 218: `send()` after `close()`
+is Protocol `_onerror`, not
+`mcpServerCore` `isError`. Handler
+already billed. Wrap handler return,
+not only `execute`. Drain polls size
+every 2s and does not await `send()`.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -491,8 +498,10 @@ billed hop. Product READY unchanged.
    **In flight: kvnloo#3.**
 2. **A-019** — after kvnloo#2: HTTP 503 on POST `/mcp` when the
    body contains `tools/call` (copy `anonymousTransport.ts` L68–83
-   batch fail-closed), then `track('mcpCallTool', …)` for the
-   drain wait. GET `/mcp`: **405** if draining, **not** 503
+   batch fail-closed), then `track('mcpCallTool', …)` around the
+   **handler return** (not only `execute`;
+   cycle 218: Protocol `send()` is the next
+   `.then`; drain polls size every 2s). GET `/mcp`: **405** if draining, **not** 503
    (SDK `_startOrAuthSse` throws on 503). `/generate` 503 like
    `runScheduledChats` L13031 **before** `tryClaim`. Do **not**
    503 ListTools or initialize. Do **not** return CallTool
@@ -514,7 +523,11 @@ billed hop. Product READY unchanged.
    after resolved JSON does not leak Express). Do **not**
    treat `mcpShutdown` as `generate_image` cancel (cycle 217:
    `_onclose` does not abort; handler ignores `extra`; mcpFetch
-   abort is timeout-only). Wrap stays
+   abort is timeout-only). Do **not**
+   expect `mcpServerCore` `isError` to catch
+   a post-close `send()` throw (cycle 218:
+   Protocol `_onerror` only; wrap the
+   handler return, not only `execute`). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

@@ -1214,6 +1214,25 @@ has no `req.on('close')`. Loopback
 is a different socket. The wait is
 the billed hop. Not A-006.
 
+Cycle 218: **`send()` after `close()`
+is Protocol `_onerror`, not
+`isError`.** `_onrequest` awaits
+the handler then `send()`s
+(`protocol.js` L350–370). CallTool
+**returns** `{ isError }`
+(`mcpServerCore.ts` L164–174) so
+Protocol takes the success `.then`.
+`close()` clears `_streamMapping`
+not `_requestToStreamMapping`
+(L604–613); `send()` then throws
+`No connection established` (L694)
+into L398 `_onerror`. `drain()`
+polls `inFlight.size` every 2s
+(`cronJobRegistry.ts` L62–70) and
+does not await `send()`. Wrap the
+handler return, not only `execute`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
