@@ -62,7 +62,7 @@ export const AUTONOMOUS_REPORT_WORKPLAN_DESCRIPTION =
   'unattended on a schedule and deliver a report to the customer without any prompts. ' +
   'Phase A — created private, reachable only via admin-triggered runs; not yet visible ' +
   'to customers. Depends on the multi_campaign_performance_report template (ENG-1879) ' +
-  'and the widened metrics cron (ENG-1880) both being live in prod. Publishing ' +
+  'and the widened metrics cron (ENG-916) both being live in prod. Publishing ' +
   '(Phase C, flip to visibility: system) is a deliberate, separate, human-reviewed step ' +
   '— never done by this script.';
 
