@@ -494,6 +494,11 @@ Cycle 153: **`readDocContent` runs before `includes()`.**
 L24155 computes `nameMatch`; L24156 always fetches pages
 (`clickupService.ts` L137–165). Name miss still pays the
 page tree. Drive reads hits only (L24104–24109).
+Cycle 154: **Drive has count+time bounds; ClickUp does not.**
+ENG-1624 `DRIVE_LIST_WALK_MAX_MS = 90_000` (L23581) and
+`perBatchTarget` (L23879). `clickupService.ts` grep
+TIMEOUT/MAX_MS/deadline is empty. Copy the bound shape
+in-process.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

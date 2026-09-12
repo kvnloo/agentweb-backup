@@ -274,6 +274,8 @@ name+description. Product READY unchanged.
 Cycle 153: `readDocContent` runs before `includes()`;
 `nameMatch` does not skip the fetch. Product READY
 unchanged.
+Cycle 154: Drive search has count+time bounds (ENG-1624);
+ClickUp docs search has neither. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

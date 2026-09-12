@@ -295,4 +295,7 @@ name+description. A-006 stays discarded.
 Cycle 153: `readDocContent` lists pages and may GET each page
 before `includes()`; `nameMatch` does not skip the fetch.
 A-006 stays discarded.
+Cycle 154: Drive search has count+time bounds (ENG-1624);
+`clickupService.ts` has zero TIMEOUT/MAX_MS/deadline. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

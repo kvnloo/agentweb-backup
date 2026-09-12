@@ -380,3 +380,6 @@ reverted. Do not copy that as A-006.
 - Cycle 153: readDocContent lists pages then may GET each
   (L137-165) before includes(); nameMatch L24155 does not
   skip the fetch. Drive reads hits only. Not A-006.
+- Cycle 154: Drive has ENG-1624 count+time bounds (L23581
+  perBatchTarget L23879); clickupService.ts grep TIMEOUT /
+  MAX_MS / deadline is empty. Copy the bound shape. Not A-006.

@@ -670,6 +670,14 @@ Agent Mode L24155 computes `nameMatch`; L24156 always
 pages then GET empty pages. Drive L24104–24109 reads
 `fullText` hits only. Listed MCP hops here. Not A-006.
 
+Cycle 154: **Drive has count+time bounds; ClickUp does not.**
+ENG-1624 L23552–23581: folder count, `perBatchTarget`,
+`DRIVE_LIST_WALK_MAX_MS = 90_000`. Search passes
+`limitedMaxResults` (L24094). `clickupService.ts` grep
+TIMEOUT/MAX_MS/deadline/AbortSignal/timeout is empty.
+`listDocs` L106–119 is `do/while (cursor)`. Copy Drive’s
+bound shape in-process. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
