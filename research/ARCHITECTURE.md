@@ -517,6 +517,9 @@ that Agent Mode superset; `generate_image` is still
 discarded.
 Cycle 144: Agent Mode still recaps Vertex after ENG-1057
 capped the leaf; L24062 comment is stale. A-006 discarded.
+Cycle 145: three TypeScript `searchKnowledgeBase` symbols;
+Emma’s export is Azure embeddings, not the Vertex leaf.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

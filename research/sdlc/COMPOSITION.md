@@ -611,6 +611,13 @@ L321–334 mock the leaf to 6000 chars. L24062 “never capped”
 is stale. Drive/ClickUp caps at L24113 / L24161 / L24199
 stay on the face (cycle 142). Not A-006.
 
+Cycle 145: **three `searchKnowledgeBase` symbols.** Emma
+export L4674 → `findRelevantChunks` L515 (Azure embeddings
+over in-memory `knowledgeBase` L4293). Agent Mode L24032 is
+the superset (MCP `emmaApi.ts` L101). Growth Genius L66 is
+Vertex-only; inline schema L142–147 requires `reason`.
+Hermes/OMP: one name, one handler. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

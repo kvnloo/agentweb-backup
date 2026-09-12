@@ -272,4 +272,7 @@ discarded.
 Cycle 144: Agent Mode still recaps Vertex after ENG-1057
 capped the leaf; L24062 comment is stale. A-006 stays
 discarded.
+Cycle 145: three TypeScript `searchKnowledgeBase` symbols;
+Emma’s export is Azure embeddings, not the Vertex leaf.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

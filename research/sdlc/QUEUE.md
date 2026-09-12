@@ -250,6 +250,9 @@ READY unchanged.
 Cycle 144: Agent Mode still recaps Vertex after ENG-1057
 capped the leaf; L24062 comment is stale. Product READY
 unchanged.
+Cycle 145: three TypeScript `searchKnowledgeBase` symbols;
+Emma’s export is Azure embeddings, not the Vertex leaf.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

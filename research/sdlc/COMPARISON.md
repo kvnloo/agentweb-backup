@@ -353,3 +353,7 @@ reverted. Do not copy that as A-006.
 - Cycle 144: Agent Mode still recaps Vertex after ENG-1057
   capped the leaf; L24062 comment is stale. Face test mocks
   the leaf. Not A-006.
+- Cycle 145: three TypeScript searchKnowledgeBase symbols.
+  Emma export is Azure embeddings over in-memory docs;
+  Agent Mode is the Drive/ClickUp superset; Growth Genius
+  is Vertex-only. Hermes: one name, one handler. Not A-006.

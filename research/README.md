@@ -455,13 +455,18 @@ caps at `chatbotService.ts` L4800–4804 / L4852. Face L24065
 plus test L321–334 mock the leaf to 6000 chars. L24062
 “never capped” is stale. Drive/ClickUp caps stay on the
 face (cycle 142). Not a fifth hop.
+Cycle 145: **three `searchKnowledgeBase` symbols.** Emma
+export L4674 is Azure embeddings over in-memory docs
+(`findRelevantChunks` L515). Agent Mode L24032 is the
+superset. Growth Genius L66 is Vertex-only and requires
+`reason` on the inline tool. Hermes: one name, one handler.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
 | Practice | Hermes / OMP | AgentWeb |
 |---|---|---|
 | Agent loop | One process, packages | 40,571-line `agentModeService.ts` |
-| Tool catalog | One registry / `tools/list` | Four registries + Growth Genius inline `search_knowledge_base` (cycle 139) + three availability policies |
+| Tool catalog | One registry / `tools/list` | Four registries + Growth Genius inline `search_knowledge_base` (cycle 139) + three `searchKnowledgeBase` symbols (cycle 145) + three availability policies |
 | MCP | **Client** to other servers | **Server** for Hermes *and* client to vendors; self `"agentweb-tools"` skipped on file config; DB path can still loopback (cycle 90) |
 | Extract | MCP outbound; OMP packages | Fork for health checks; DAG inverted (`services/` import `controllers/`) |
 
