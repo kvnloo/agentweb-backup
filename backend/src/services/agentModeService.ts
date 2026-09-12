@@ -1603,11 +1603,15 @@ export class AgentModeService {
     // throwaway) traces to a call graph that shouldn't reach the worker a second
     // time. Capturing the actual construction stack settles which site it really
     // is instead of continuing to reason about it from the outside.
+    // Stack goes inside the same JSON blob (not a second console.log argument) so a
+    // log shipper that splits on newline can't separate it from its pid/instanceId —
+    // a raw multi-line stack string passed alongside would risk exactly that.
     console.log('[ENG-1852-CTOR]', JSON.stringify({
       pid: process.pid,
       instanceId: this.instanceId,
       uptimeSec: Math.round(process.uptime()),
-    }), new Error('construction site').stack);
+      stack: new Error('construction site').stack,
+    }));
   }
 
   public async initialize() {
