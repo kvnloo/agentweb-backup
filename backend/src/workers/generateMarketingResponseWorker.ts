@@ -3,7 +3,7 @@
  * This prevents blocking the main event loop during long-running operations
  */
 
-import { AgentModeService } from '../services/agentModeService';
+import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
@@ -12,8 +12,22 @@ import { installWorkerShutdownGuards } from './workerShutdownGuards';
 // disconnect. Install before any heavy init so the guards are active immediately.
 installWorkerShutdownGuards();
 
-// Initialize the service
-const agentModeService = new AgentModeService();
+// ENG-1852: use the module's own exported singleton, not a separate `new AgentModeService()`.
+// agentModeService.ts's own module body constructs and exports `agentModeService` as soon as
+// the module loads — which happens the moment this file's import above resolves, regardless
+// of what we do with it. Constructing ANOTHER instance here just meant this worker process
+// carried two live AgentModeService objects: this one (deliberately `.initialize()`'d below)
+// and the module's own singleton, which nothing in this file ever initialized. The vast
+// majority of AgentModeService methods are stateless proxies to external APIs and don't care
+// which instance answers, but a handful of tool handlers in emma/tools.ts and apiTools.ts
+// (install_skills, getUnassociatedToolNames, ...) import that plain singleton directly rather
+// than going through the caller-scoped `context.service`, and DO depend on per-instance state
+// populated only by .initialize() (this.toolRegistry, this.mcpClientService). Whichever of the
+// two objects happened to be constructed calling that particular tool decided whether the call
+// saw the correctly-populated 264-tool registry or a permanently empty one — confirmed live via
+// a captured construction stack trace showing both instances alive in the same worker pid.
+// Using the singleton here means there is only ever one object per process again, matching
+// what emma/tools.ts and apiTools.ts already assume.
 
 // Initialize once when worker starts (not per message)
 let initialized = false;
