@@ -79,6 +79,8 @@ Keep rehydrate `finally close()` after `handleRequest` returns
 wait is the billed hop). Wrap the CallTool **handler return**,
 not only `execute` (cycle 218: `send()` after `close()` is
 Protocol `_onerror`, not `isError`; drain polls size and does
-not await `send()`).
+not await `send()`). Closed POST SSE is not ENG-97 404 reinit
+(cycle 219: POST `_handleSseStream(..., false)`; no `eventStore`;
+Q-001 fixture is httpx `next(data:)`).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

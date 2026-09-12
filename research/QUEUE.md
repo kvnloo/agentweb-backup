@@ -515,3 +515,9 @@ already billed. Wrap handler return,
 not only `execute`. Drain polls size
 every 2s and does not await `send()`.
 A-006 stays discarded.
+Cycle 219: closed POST SSE is not
+404 reinit. Vendored POST
+`_handleSseStream(..., false)`; no
+`eventStore` so no priming. Q-001
+fixture is httpx `next(data:)`.
+A-006 stays discarded.

@@ -486,6 +486,12 @@ already billed. Wrap handler return,
 not only `execute`. Drain polls size
 every 2s and does not await `send()`.
 Product READY unchanged.
+Cycle 219: closed POST SSE is not
+404 reinit. Vendored POST
+`_handleSseStream(..., false)`; no
+`eventStore` so no priming. Q-001
+fixture is httpx `next(data:)`.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -527,7 +533,10 @@ Product READY unchanged.
    expect `mcpServerCore` `isError` to catch
    a post-close `send()` throw (cycle 218:
    Protocol `_onerror` only; wrap the
-   handler return, not only `execute`). Wrap stays
+   handler return, not only `execute`). Do **not**
+   treat ENG-97 404 as covering an in-flight CallTool
+   whose POST already returned 200 SSE (cycle 219:
+   POST `_handleSseStream(..., false)`; no `eventStore`). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

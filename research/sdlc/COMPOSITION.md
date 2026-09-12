@@ -1233,6 +1233,20 @@ does not await `send()`. Wrap the
 handler return, not only `execute`.
 Not A-006.
 
+Cycle 219: **Closed POST SSE is not
+404 reinit.** SDK `send()` POST
+uses `_handleSseStream(..., false)`
+(`streamableHttp.js` L390).
+Reconnect needs priming `id`;
+`writePrimingEvent` returns without
+`eventStore` (L157–160). `mcp/` has
+zero `eventStore`. 404 is a later
+POST after `sessions.clear()`
+(`mcpServer.ts` L448–460). Q-001
+fixture is httpx `next(data:)`
+(L81–86), protocol `2025-06-18`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

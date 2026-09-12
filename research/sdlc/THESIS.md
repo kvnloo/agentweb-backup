@@ -498,6 +498,12 @@ already billed. Wrap handler return,
 not only `execute`. Drain polls size
 every 2s and does not await `send()`.
 Do not add A-021.
+Cycle 219: closed POST SSE is not
+404 reinit. Vendored POST
+`_handleSseStream(..., false)`; no
+`eventStore` so no priming. Q-001
+fixture is httpx `next(data:)`.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
