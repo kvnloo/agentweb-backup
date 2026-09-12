@@ -260,4 +260,6 @@ discarded.
 Cycle 140: `searchPlatformKnowledgeBase` is a leaf trapped in
 a file that cycles with `agentModeService`. A-006 stays
 discarded.
+Cycle 141: ENG-1057 already named three in-process KB faces;
+the cap lives at the source. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

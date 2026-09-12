@@ -238,6 +238,8 @@ unchanged.
 Cycle 140: `searchPlatformKnowledgeBase` is a leaf trapped in
 a file that cycles with `agentModeService`. Product READY
 unchanged.
+Cycle 141: ENG-1057 already named three in-process KB faces;
+the cap lives at the source. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

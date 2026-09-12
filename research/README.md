@@ -435,6 +435,10 @@ Cycle 140: **the KB helper is a leaf; the file cycles.**
 Function L4711–4867 is Vertex-only. `chatbotService.ts` L24
 imports `AgentModeService`; `agentModeService.ts` L26 imports
 the leaf from that file. A-002 does not cover this.
+Cycle 141: **ENG-1057 already named three KB faces.** Test
+header L1–10; callers L5106 / L24059 / L71. Cap at the
+source after a 2026-08-10 single-instance crash. Same lesson
+as `generate_image`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

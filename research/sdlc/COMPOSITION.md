@@ -580,6 +580,10 @@ Cycle 140: **the KB helper is a leaf; the file cycles.**
 Function L4711–4867 is Vertex-only. `chatbotService.ts` L24
 ↔ `agentModeService.ts` L26. A-002 does not cover this.
 
+Cycle 141: **ENG-1057 already named three KB faces.** Test
+header L1–10; callers L5106 / L24059 / L71. Cap at the
+source. Same lesson as `generate_image`.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

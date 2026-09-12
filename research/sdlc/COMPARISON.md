@@ -342,3 +342,5 @@ reverted. Do not copy that as A-006.
   (inline search_knowledge_base + Emma KB). Not A-006.
 - Cycle 140: KB search is a leaf trapped in a file that
   cycles with agentModeService. Not A-006.
+- Cycle 141: ENG-1057 already named three in-process KB faces;
+  cap at the source. Not A-006.
