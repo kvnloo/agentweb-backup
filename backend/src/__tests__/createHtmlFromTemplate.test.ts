@@ -172,6 +172,53 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       expect(result.success).toBe(true);
       expect(agentModeService.callLLM).toHaveBeenCalled();
+
+      // ENG-1877 regression guard: an earlier version of the escaping fix ran every
+      // value through String(value), which collapses an object array item to the
+      // literal text "[object Object]" instead of preserving its real fields — a
+      // silent full data-loss regression a bare success-flag check would not catch.
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+      expect(promptContent).not.toContain('[object Object]');
+      expect(promptContent).toContain('Item 1');
+      expect(promptContent).toContain('Item 2');
+    });
+
+    // ENG-1877 follow-up (round 2 review): escaping must preserve structure (objects,
+    // arrays, null) while still escaping every STRING leaf, however deeply nested —
+    // not flatten everything through String(value).
+    it('should escape string leaves nested inside object array items without losing structure', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items'],
+        html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [{ item: '<script>alert(1)</script>' }, { item: 'Safe Item', note: null }] },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('[object Object]');
+      expect(promptContent).not.toContain('<script>alert(1)</script>');
+      expect(promptContent).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(promptContent).toContain('Safe Item');
+      // null is a real JSON value, not the literal text "null" a String(value) coercion
+      // would have produced.
+      expect(promptContent).toContain('"note": null');
+      expect(promptContent).not.toContain('"note": "null"');
     });
 
     // ENG-1877: variable values (campaign names, CRM data) are not trusted HTML, but the
