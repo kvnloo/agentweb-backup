@@ -738,6 +738,10 @@ READY unchanged.
    must use `LoadBalancers[*].Name`, not
    `AutoScalingGroups[0]`. Do **not**
    copy hook discovery.
+   Cycle 253: this tree and AWS immutable
+   do not return two `LoadBalancers[*]`
+   ARNs during Updating. Do **not** add
+   a uniqueness check from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

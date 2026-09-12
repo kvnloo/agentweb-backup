@@ -1524,6 +1524,13 @@ Cycle 252: **XFF must use
 Updating: two ASGs, one ALB. Not
 A-019. Not A-020. Not A-006.
 
+Cycle 253: **this tree and AWS
+immutable do not return two
+`LoadBalancers[*]` ARNs during
+Updating.** Tests fixture one ARN.
+SharedLoadBalancer unused. Not
+A-019. Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

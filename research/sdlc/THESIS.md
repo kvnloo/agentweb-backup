@@ -815,3 +815,10 @@ A-006.
 
 Sunday Updating: two ASGs, one ALB. Hook discovery is `[0]`.
 Not A-019. Not A-020. Not A-006.
+
+## Cycle 253 (one ALB ARN, not two, during Updating)
+
+This tree and AWS immutable do not return two
+`LoadBalancers[*]` ARNs during Updating. Tests fixture one
+ARN. SharedLoadBalancer unused. Classic names filtered.
+Not A-019. Not A-020. Not A-006.

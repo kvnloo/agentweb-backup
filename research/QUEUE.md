@@ -686,3 +686,7 @@ Cycle 252: XFF must use
 LoadBalancers[*].Name, not
 AutoScalingGroups[0]. A-006 stays
 discarded.
+Cycle 253: this tree and AWS immutable
+do not return two LoadBalancers[*]
+ARNs during Updating. A-006 stays
+discarded.
