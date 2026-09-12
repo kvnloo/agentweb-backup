@@ -591,6 +591,11 @@ returns vendor URLs; meter already ran. `gen4_image` /
 Emma `remove_c2pa_from_image` + `POST /remove-c2pa`, not
 on MCP. Cycle 36’s L575–578 invariant is after the
 data-URL gate.
+Cycle 175: **`generateWithOpenAI` else is unreachable.**
+L533–534. Every `SUPPORTED_MODELS` id hits Azure /
+Gemini / Gemini 3 / Runway. Cycle 174’s URL skip is
+Runway-only; DALL-E persist is dead. `getOpenAIClient`
+is imported only for that method.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -813,6 +813,12 @@ Tests pin `https://runway.com/image.png`. Emma
 `remove_c2pa_from_image` downloads HTTP; MCP grep empty.
 Not A-006.
 
+Cycle 175: **`generateWithOpenAI` else is unreachable.**
+L533–534. All eight `SUPPORTED_MODELS` ids dispatch
+earlier. `getOpenAIClient` L4/L1454 and `getApiKey`
+OpenAI else L371–375 are the same dead path. Meter
+comment L549 still names it. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

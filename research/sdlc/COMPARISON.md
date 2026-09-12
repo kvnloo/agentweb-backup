@@ -455,3 +455,6 @@ reverted. Do not copy that as A-006.
 - Cycle 174: Runway L1400 HTTPS skips L570–572 C2PA+S3;
   meter already ran. 2 of 8 models. Strip is a second
   Emma/REST tool, not MCP. Not A-006.
+- Cycle 175: generateWithOpenAI else L533–534 unreachable
+  after includes(SUPPORTED_MODELS). DALL-E URL persist is
+  dead; Runway is the live URL skip. Not A-006.

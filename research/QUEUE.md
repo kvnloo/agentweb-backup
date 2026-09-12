@@ -351,4 +351,7 @@ A-006 stays discarded.
 Cycle 174: Runway HTTPS skips C2PA and S3; meter still
 fires. Emma strip + REST exist; MCP has no
 `remove_c2pa`. A-006 stays discarded.
+Cycle 175: `generateWithOpenAI` else L533–534 is
+unreachable after `SUPPORTED_MODELS` includes().
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 174
+cycles_completed: 175
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 175
+next_cycle: 176
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 174: Runway HTTPS skips C2PA and S3; meter still
-  fires. Cycle 175: cheapest remaining. Candidate:
-  generateWithOpenAI else L534 is unreachable after
-  SUPPORTED_MODELS includes() — dead DALL-E URL sibling
-  of the Runway skip. File-level.
+  Cycle 175: generateWithOpenAI else unreachable.
+  Cycle 176: cheapest remaining. Candidate: meter
+  provider ternary L554-558 — gemini_2.5_flash
+  (underscore, Runway) meters as runway; Google
+  gemini-2.5-flash-image as gemini. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

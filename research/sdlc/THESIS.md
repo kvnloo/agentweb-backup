@@ -323,6 +323,8 @@ Cycle 173: S3 upload always image/png. Gemini 3 data-URL
 MIME discarded. Do not add A-021.
 Cycle 174: Runway HTTPS skips C2PA and S3. Do not add
 A-021.
+Cycle 175: generateWithOpenAI else unreachable. Do not
+add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
