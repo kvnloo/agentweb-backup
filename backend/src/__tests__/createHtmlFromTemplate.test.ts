@@ -306,6 +306,36 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(false);
     });
 
+    // Round-3 review finding: an exact, case-sensitive match let a model evade the
+    // output-verification check via trivial reformatting — `<SCRIPT>` is just as
+    // browser-executable as `<script>`, so a case-sensitive check missing it entirely
+    // would defeat the fail-closed guarantee for zero real difficulty on the model's part.
+    it('should fail closed even if the LLM reproduces the raw value with different casing', async () => {
+      const maliciousTitle = '<script>alert(1)</script>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1><SCRIPT>alert(1)</SCRIPT></h1><p>Test Content</p></body></html>',
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+    });
+
     // Round-3 review finding: including '/&/" in the output-verification check made an
     // ordinary apostrophe in a real name ("O'Brien's Q3") a false-positive trigger if that
     // short substring coincidentally reappeared anywhere else in the LLM's output — failing
