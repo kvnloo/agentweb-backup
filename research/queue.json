@@ -1,8 +1,13 @@
 {
   "version": 1,
-  "updated_at": "2026-09-11T18:31:00Z",
+  "updated_at": "2026-09-12T03:40:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
-  "implementation_order": ["Q-001", "Q-014", "Q-003"],
+  "implementation_order": [
+    "Q-014",
+    "Q-004",
+    "Q-001",
+    "Q-003"
+  ],
   "items": [
     {
       "id": "Q-001",
@@ -14,13 +19,13 @@
       "evidence": 5,
       "collision": 1,
       "score": 34,
-      "why": "ENG-1869 shipped native OAuth; remaining friction is client-side PTY+callback paste. Kevin is a Hermes contributor. Unblocks external Emma without schema.",
+      "why": "ENG-1869 shipped native OAuth; remaining friction is client-side PTY+callback paste. Kevin is a Hermes contributor. Unblocks external Emma without schema. Cycle 209: smoke AFTER kvnloo#2 so tools/list includes generate_image.",
       "files": [
         "backend/docs/HERMES_MCP_OAUTH.md",
         "backend/src/mcp/oauth/oauthRoutes.ts",
         "backend/docs/AGENT_API.md"
       ],
-      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. In-repo runbook already exists. Remaining: Kevin operator smoke + optional Hermes skill. After OAuth, Hermes still will not see generate_image until Q-014.",
+      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. In-repo runbook already exists. Remaining: Kevin operator smoke + optional Hermes skill. Cycle 209: run the smoke after kvnloo#2 merges so generate_image is listed.",
       "harsha_db": false
     },
     {
@@ -52,7 +57,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 38,
-      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11T17:28Z and re-fetch 18:30Z: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134 (logo #40). Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt).",
+      "why": "mcp-bench-router STATIC_MAP is OpenRouter chat IDs, not Emma image providers. DesignArena category=image overlaps SUPPORTED_MODELS by exact modelId. Live snapshot 2026-09-11T17:28Z and re-fetch 18:30Z: gpt-image-2 is #3/$0.04; current default gemini-3-pro-image-preview is #22/$0.134 (logo #40). Failover already prefers gpt-image-2. First slice is a fail-open mapper, not a silent prod default flip (Matt). Cycle 170: default flip would land unspecified+logo+edit on Azure [0]-only. Cycle 180: onboarding pins Gemini 3 so the mapper never sees Brick 8 ads. Cycle 209: stays ready and highest by formula; implementation after Q-014 listing and Q-001 smoke.",
       "files": [
         "backend/src/services/imageGeneration.ts",
         "backend/src/services/agentModeService.ts",
@@ -91,12 +96,12 @@
       "evidence": 5,
       "collision": 1,
       "score": 22,
-      "why": "emma/tools.ts generate_image description already tells the model to emit N parallel calls in one turn. An n= parameter is convenience, not a gap. Revisit only if telemetry shows the model ignores the instruction.",
+      "why": "Cycle 208: extractGeneratedImageFilenames de-dupes on filename (L5889); tests pin a.png twice \u2192 one. N billed S3 objects named logo.png surface as one already-made asset. Emma generate_image L4999 asks for N parallel calls and never says filenames must be unique. MCP one-line description has no variants paragraph. Revisit is unique output names (A-008 persist handle), not an n= parameter. Occupied emma/tools.ts #2832.",
       "files": [
         "backend/src/emma/tools.ts",
         "backend/src/services/onboardingAdImageService.ts"
       ],
-      "first_slice": "Optional variants param; meter each success independently; keep category required.",
+      "first_slice": "PARK. Revisit as unique output filenames per variant (not n=). Meter each success independently; keep category required. Occupied emma/tools.ts.",
       "harsha_db": false
     },
     {
@@ -129,7 +134,7 @@
       "evidence": 5,
       "collision": 1,
       "score": 24,
-      "why": "Cycle 10: IntroOverlay (lower-third) and OutroOverlay (CTA end card) already ship in the single BrandedVideo composition. Root.tsx has one Composition id. Do not port HyperFrames (HTML→MP4) or MoneyPrinterTurbo. Extra compositions (captions, mid-roll still) need product intent.",
+      "why": "Cycle 10: IntroOverlay (lower-third) and OutroOverlay (CTA end card) already ship in the single BrandedVideo composition. Root.tsx has one Composition id. Do not port HyperFrames (HTML\u2192MP4) or MoneyPrinterTurbo. Extra compositions (captions, mid-roll still) need product intent.",
       "files": [
         "remotion-lambda/src/Root.tsx",
         "remotion-lambda/src/compositions/BrandedVideo.tsx",
@@ -155,7 +160,7 @@
         "backend/src/services/evaluationService.ts"
       ],
       "first_slice": "Park until Q-002 routing exists; then a pairwise image eval inside the existing Evaluations table.",
-      "harsha_db": "maybe — prefer existing Evaluations table"
+      "harsha_db": "maybe \u2014 prefer existing Evaluations table"
     },
     {
       "id": "Q-009",
@@ -257,7 +262,7 @@
       "evidence": 5,
       "collision": 2,
       "score": 34,
-      "why": "Hermes cannot discover image gen: generate_image is internal (hidden, still callable). generate_video is absent. This is the content-gen + DesignArena wedge. ENG-973 hid it as a cost tool — un-hiding is a product choice, not a schema change. Keep metering.",
+      "why": "Hermes cannot discover image gen: generate_image is internal (hidden, still callable). generate_video is absent. This is the content-gen + DesignArena wedge. ENG-973 hid it as a cost tool \u2014 un-hiding is a product choice, not a schema change. Keep metering. Cycle 207/209: listing is necessary and thinner than hoped (one-line schema, required filename+category, no confirm). Do not expand (A-011). In flight: kvnloo#2.",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/registry.ts",
@@ -290,12 +295,12 @@
       "title": "Expose generate_video / compose_video on external MCP after Q-014",
       "status": "park",
       "leverage": 4,
-      "product": 3,
+      "product": 2,
       "mergeability": 3,
       "evidence": 5,
       "collision": 2,
-      "score": 26,
-      "why": "Video tools exist only on emmaToolRegistry. MCP grep is empty. seedance-2.0 is $1.55/8s vs image $0.04. ENG-973 hid generate_image for cost; listing video first repeats that at 40×. Park until Q-014 ships and there is product intent for Hermes ads-video.",
+      "score": 25,
+      "why": "Video tools exist only on emmaToolRegistry. MCP grep is empty. seedance-2.0 is $1.55/8s vs image $0.04. ENG-973 hid generate_image for cost; listing video first repeats that at 40\u00d7. Cycles 195\u2013197: Path C/D fetch, keyframes Veo-only, character Path D vendor-fetches private S3. Cycle 209: product 3\u21922. Park until Q-014 ships and there is product intent for Hermes ads-video.",
       "files": [
         "backend/src/emma/tools.ts",
         "backend/src/mcp/server/apiTools.ts",

@@ -1,21 +1,27 @@
 # Feature queue
 
 Source of truth: `queue.json`. Protocol score is research leverage.
-**Implementation order** (first PRs): Q-001, Q-014, Q-003.
-Land **Q-004 with or before Q-014**.
+**Implementation order** (first PRs): Q-014, Q-004, Q-001, Q-003.
+Land **Q-004 with Q-014** (kvnloo#2). Cycle 209: Kevin asked to
+reprioritize; score ≠ shipping order.
 
 Artifact (findings + priorities at the top): [`README.md`](README.md).
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
 `coding_unlocked: true`. `briefing_ready: true`.
+`product_queue_frozen: false` (Kevin asked 2026-09-12).
 
 ## How Kevin can help (thesis)
 
-Hermes operator + MCP creative discovery first. Then a fail-open
-DesignArena → `SUPPORTED_MODELS` mapper (not mcp-bench-router's OpenRouter
-chat map). Do not port HyperFrames, MoneyPrinterTurbo, or ComfyUI —
-Remotion already owns intro/outro. Local logged-in browser is ENG-381.
+Land kvnloo#2 (`generate_image` on MCP `tools/list` + hide
+`post_on_account`). Then Kevin Hermes OAuth smoke so that list includes
+the image tool. Then a fail-open DesignArena → `SUPPORTED_MODELS`
+mapper (not a default flip; not mcp-bench-router's OpenRouter chat map).
+Do not port HyperFrames, MoneyPrinterTurbo, or ComfyUI — Remotion already
+owns intro/outro. Local logged-in browser is ENG-381.
 
 ## Ranked (by score)
+
+Score ≠ shipping order (cycle 209). Ship Q-014 / Q-004 first.
 
 | Rank | ID | Score | Status | Title |
 |---|---|---|---|---|
@@ -30,11 +36,11 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 
 | ID | Score | Why parked |
 |---|---|---|
-| Q-016 | 26 | MCP video after Q-014; $1.55/clip vs $0.04 image (ENG-973) |
 | Q-011 | 26 | Hermes as ENG-381 local-agent successor; confirm ownership; not #2271 |
+| Q-016 | 25 | MCP video after Q-014; 40× cost + Path C/D (cycles 195–197) |
 | Q-007 | 24 | Intro/outro already in BrandedVideo; do not port HyperFrames/MPT |
 | Q-002 | 23 | Offline Model: parser only; live router is Q-003; no new eval attribute |
-| Q-005 | 22 | Tool prompt already requires parallel variant calls |
+| Q-005 | 22 | Filename identity collapses N variants named `logo.png` (cycle 208) |
 | Q-008 | 22 | Eval workspace just shipped (ENG-1870) |
 | Q-009 | 21 | ComfyUI backend — ops-heavy; Remotion is the existing graph node |
 | Q-010 | 19 | callLLM strangler — Harsha gravity; target loop is Hermes-shaped |
@@ -48,14 +54,15 @@ Remotion already owns intro/outro. Local logged-in browser is ENG-381.
 
 ## First coding (when unlocked)
 
-1. **Q-001** — Kevin operator smoke on the existing `HERMES_MCP_OAUTH.md`
-   recipe (not another in-repo doc PR).
-2. **Q-014** — list `generate_image` on MCP (metering unchanged).
-3. **Q-003** — fail-open DesignArena mapper; Matt before flipping the
-   production default to `gpt-image-2`.
-4. **Q-006 / Q-015 / Q-004** — MCP hygiene. Land **Q-004 with or before
-   Q-014** so listing `generate_image` does not leave live social publish
-   in the same `tools/list`.
+1. **Q-014** — list `generate_image` on MCP (metering unchanged).
+   **In flight: kvnloo#2.**
+2. **Q-004** — same PR: `internal`+`internalOnly` on MCP `post_on_account`.
+3. **Q-001** — Kevin operator smoke on the existing `HERMES_MCP_OAUTH.md`
+   recipe after #2, so `tools/list` includes `generate_image`.
+4. **Q-003** — fail-open DesignArena mapper; Matt before flipping the
+   production default to `gpt-image-2` (cycle 170 Azure `[0]`; cycle 180
+   onboarding already pins Gemini 3).
+5. **Q-006 / Q-015** — MCP hygiene after #2 merges (same `apiTools.ts`).
 
 None of these needs a database change.
 
@@ -64,7 +71,7 @@ None of these needs a database change.
 Kevin asked to research breaking the repo into nanoservices and
 comparing Hermes / Oh My Pi. **Do not HTTP-split Emma.** See
 `sdlc/THESIS.md`. Track queue: `sdlc/QUEUE.md`. First SDLC coding
-(after unlock, not instead of Q-014): A-002 then A-007 then A-008.
+(after unlock, not instead of Q-014): A-002 then A-019 then A-007 then A-008.
 Cycle 46: parent is I/O, worker is compute; chatbot still `executeTool`
 on the parent. Cycle 47: three catalogs for `generate_image`; A-014
 parks copying page/skill gates onto MCP. Cycle 50: A-015 leak still
@@ -452,4 +459,9 @@ A-006 stays discarded.
 Cycle 208: work-plan continue de-dupes on
 filename; tests pin a.png twice → one. A-006
 stays discarded.
-Q-001 / Q-014 / Q-003 stay ready.
+Cycle 209: Kevin asked to reprioritize.
+Product order Q-014 → Q-004 → Q-001 → Q-003.
+Architecture A-002 → A-019 → A-007 → A-008.
+A-019 unparked. Q-016 product 3→2. A-008
+product 2→3. Q-001 / Q-014 / Q-003 stay ready.
+A-006 stays discarded.

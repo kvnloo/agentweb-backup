@@ -80,6 +80,12 @@ sessions. After the flag drop, update the stale comment at
 `mcp.apiTools.test.ts` L405–406 (tool will be in `getToolDefinitions()`);
 keep L407–421 via `getTool()`.
 
+Cycle 207 / 209: listing is necessary and **thinner than hoped**. MCP
+description is one line; `filename` is the output name (required with
+prompt+category); no unique-filename hint; no `confirm`. Do **not**
+expand this PR to unify Emma camelCase vs MCP snake (A-011). In flight:
+kvnloo#2.
+
 ## Collision
 
 ENG-983 unlists CRUD; this is additive. Don't touch `manage_*` listing.

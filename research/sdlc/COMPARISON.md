@@ -662,3 +662,9 @@ reverted. Do not copy that as A-006.
   a.png twice → one. Awareness L5909 uses that
   length. scanMessagesForAssets de-dupes by URL.
   Hermes one URL handle. Not A-006.
+- Cycle 209: Kevin asked to reprioritize.
+  Implementation A-002 → A-019 → A-007 → A-008
+  (not score). A-019 is the billed-image drain
+  gate Hermes needs once Q-014 lists
+  generate_image. Persist stays in-process
+  (A-008). Not A-006.

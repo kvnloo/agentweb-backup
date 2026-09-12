@@ -7,8 +7,10 @@ not on a tool-per-HTTP mesh.
 
 Coding is unlocked. First product PRs are **in flight**:
 [Q-014 + Q-004](https://github.com/kvnloo/agentweb/pull/2),
-[A-002](https://github.com/kvnloo/agentweb/pull/3). Q-001 is Kevin
-Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
+[A-002](https://github.com/kvnloo/agentweb/pull/3). Cycle 209:
+Kevin asked to reprioritize. Q-001 is Kevin Hermes smoke after #2
+(existing runbook). Q-003 waits on Matt before a default flip.
+Next architecture after #2+#3 is **A-019** (CallTool drain wrap).
 
 ---
 
@@ -20,8 +22,8 @@ Hermes smoke (existing runbook). Q-003 waits on Matt before a default flip.
 |---|---|---|---|
 | 1 | **Q-014** | Drop `internal: true` on MCP `generate_image` (`apiTools.ts` L2077). Test: `mcp.apiTools.test.ts` L91. Metering unchanged. **In flight: [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).** MCP `ListTools` is `getToolDefinitions()` with no skill gate (`mcpServerCore.ts` L76–83). | Dual-register like `evaluationTools`. Unify Emma vs MCP schema (`confirm`). Add to `DEFAULT_FOUNDATION_TOOLS`. Copy chatbot page-gating. Add to `ANONYMOUS_TOOLS` (A-015). |
 | 1b | **Q-004** | Same PR or before: `internal` + `internalOnly` on MCP `post_on_account` only | Edit `emma/tools.ts` (#2832). Unlist `manage_*` (ENG-983). |
-| 2 | **Q-001** | Kevin OAuth smoke on `HERMES_MCP_OAUTH.md` (315s PTY). Parent already refreshes OAuth (`server.ts` L586). | Rewrite the in-repo runbook unless smoke finds a lie. |
-| 3 | **Q-003** | Fail-open DesignArena → `SUPPORTED_MODELS`. Live: `gpt-image-2` image **#3 / $0.04**, logo **#1**. Hardcoded default `gemini-3-pro-image-preview` is image **#22 / $0.134**, logo **#40**. | Flip prod default without Matt. Add Riverflow / `gpt-image-2.5` in the first slice. |
+| 2 | **Q-001** | Kevin OAuth smoke on `HERMES_MCP_OAUTH.md` (315s PTY) **after #2**, so `tools/list` includes `generate_image`. Parent already refreshes OAuth (`server.ts` L586). | Rewrite the in-repo runbook unless smoke finds a lie. |
+| 3 | **Q-003** | Fail-open DesignArena → `SUPPORTED_MODELS`. Live: `gpt-image-2` image **#3 / $0.04**, logo **#1**. Hardcoded default `gemini-3-pro-image-preview` is image **#22 / $0.134**, logo **#40**. Mapper does **not** run when caller passed `imageModel` or `logoImage`. | Flip prod default without Matt. Add Riverflow / `gpt-image-2.5` in the first slice. Azure `[0]` would drop logo bytes (cycle 170). |
 | hygiene | Q-006 / Q-015 | Hide `edit_landing_page_file` and admin MCP tools | — |
 
 None of the first slices needs a Dynamo table.
@@ -31,10 +33,19 @@ None of the first slices needs a Dynamo table.
 | Order | ID | Do this | Do not |
 |---|---|---|---|
 | 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts`. **In flight: [kvnloo#3](https://github.com/kvnloo/agentweb/pull/3).** | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
-| 2 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
-| 3 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim | HTTP-split the leaf. |
+| 2 | **A-019** | After #2: wrap `CallTool` like `server.ts` L301 `chatbotTurn`; one `instanceState` draining bit on `track()` **and** `tryClaim`. 503 like scheduled chats. | Edit `slack.ts` (#2393). HTTP-split. Start at the 14k controller. |
+| 3 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` (wait for #2) | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
+| 4 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim. Persist unification after the pile shrinks. | HTTP-split the leaf. Patch occupied `app.ts` / `emma/tools.ts` / `agentModeService.ts`. |
 
-**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`). **A-019** — refuse new `track()` **and** `tryClaim` while draining (one `instanceState` bit; do not edit `slack.ts`). **A-020** — second `put-lifecycle-hook` after Immutable verify (surviving ASG; do not `.ebextensions`).
+**Discarded:** A-006 (HTTP nanoservice per tool). **Parked:** A-013 — do not start at Slack (`AgentWebPro#2393` owns `conversation/channelPort`). **A-017** — stop CRM/worker importing `server.ts`; expand `sessionSockets` emit (not `crm.ts`, not LoopPorts). **A-018** — copy file-config `isInternal` skip onto Dynamo `mcp_servers` (not a fifth `listen()`). **A-020** — second `put-lifecycle-hook` after Immutable verify (surviving ASG; do not `.ebextensions`). **A-011** — do not unify MCP vs Emma `generate_image` schemas in Q-014. **Q-016** — MCP video after Q-014; 40× cost.
+
+### If we only do one thing
+
+| Constraint | Do this |
+|---|---|
+| One product thing | **Q-014** — land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2) |
+| One Kevin-unique thing after #2 | **Q-001** smoke so `tools/list` includes `generate_image` |
+| One architecture thing after #2 and #3 | **A-019** CallTool wrap + drain refuse |
 
 ---
 

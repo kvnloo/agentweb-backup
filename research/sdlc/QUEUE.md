@@ -1,8 +1,8 @@
 # Architecture / SDLC queue
 
 Source of truth: `research/sdlc/queue.json`. **Not** the product queue.
-Product implementation order is still Q-001 → Q-014 → Q-003.
-`coding_unlocked: true`.
+Product implementation order is Q-014 → Q-004 → Q-001 → Q-003
+(cycle 209). `coding_unlocked: true`.
 
 Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 `MODULE_MAP.md`. Services DAG: `SERVICES_DAG.md`. A-007 map:
@@ -10,12 +10,15 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 
 ## Ranked (architecture track)
 
+**Implementation order** (not score): A-002 → A-019 → A-007 → A-008.
+
 | Rank | ID | Score | Status | Title |
 |---|---|---|---|---|
 | 1 | A-001 | 32 | **ready** | Modular monolith thesis (this folder) |
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
-| 3 | A-002 | 28 | **ready** | CI import boundary for `loops/core` |
-| 4 | A-008 | 26 | **ready** | Folder-move creative cluster + re-export |
+| 3 | A-008 | 29 | **ready** | Folder-move creative cluster + persist unification later |
+| 4 | A-002 | 28 | **ready** | CI import boundary for `loops/core` (**in flight kvnloo#3**) |
+| 5 | A-019 | 27 | **ready** | Wrap CallTool + refuse `track()`/`tryClaim` while draining (after #2) |
 | — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
@@ -24,7 +27,6 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | — | A-016 | 23 | park | mcp/client ↛ mcp/server (DAG already true; wait on #3) |
 | — | A-018 | 28 | park | Copy isInternal skip onto DB MCP load path (not a fifth listen) |
 | — | A-020 | 29 | park | Second `put-lifecycle-hook` after Immutable verify |
-| — | A-019 | 27 | park | Refuse new `track()` **and** `tryClaim` while draining |
 | — | A-017 | 19 | park | Stop CRM/worker importing `server.ts`; expand sessionSockets emit |
 | — | A-004 | 19 | park | Split `emma/tools.ts` after #2832 |
 | — | A-013 | 16 | park | Stop services importing HTTP controllers (#2393 owns Slack) |
@@ -424,6 +426,12 @@ Product READY unchanged.
 Cycle 208: extractGeneratedImageFilenames de-dupes
 on filename; tests pin a.png twice → one.
 Continue prompt uses that length. Product READY unchanged.
+Cycle 209: Kevin asked to reprioritize. Product order
+Q-014 → Q-004 → Q-001 → Q-003. Architecture
+A-002 → A-019 → A-007 → A-008. A-019 unparked
+(CallTool wrap + drain refuse after #2). A-008
+product 2→3 (persist is the prize). Q-016 product
+3→2. Product READY unchanged. Do not revive A-006.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -433,12 +441,20 @@ Continue prompt uses that length. Product READY unchanged.
    Allow exactly `orchestrator` / `instanceRunner` → `../index`. Also
    walk `loops/index.ts` (only `./core/types`). Do **not** copy
    forbid-all-services onto `agentMode/core` or `mcp/server`.
-2. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
+   **In flight: kvnloo#3.**
+2. **A-019** — after kvnloo#2: wrap `CallTool` (`mcpServerCore.ts`)
+   like `server.ts` L301 `chatbotTurn`, then one `instanceState`
+   draining bit on `track()` **and** `tryClaim`. 503 like scheduled
+   chats, not 409. Do **not** edit `slack.ts` (#2393).
+3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
-3. **A-008** — `git mv` + **path shim** at `services/imageGeneration.ts`
+   Wait for #2.
+4. **A-008** — `git mv` + **path shim** at `services/imageGeneration.ts`
    (`export * from './creative/imageGeneration'`). Not `swarm/index.ts`.
-   Boundary test `creative ↛ agentModeService`.
-4. **A-005** — only after the `agentModeService.ts` PR pile shrinks.
+   Boundary test `creative ↛ agentModeService`. Persist unification
+   after the god-object pile shrinks.
+
+A-005 stays park until the `agentModeService.ts` PR pile shrinks.
 
 Never A-006. Never a Kubernetes slice of Emma as a first architecture PR.

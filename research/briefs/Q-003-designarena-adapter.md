@@ -1,8 +1,8 @@
 # Q-003 brief — DesignArena adapter for Emma image default
 
 Status: **ready** (pure map + fail-open fetch; no schema). **Not the first
-PR.** Implementation order: Q-001, Q-014, then this. Needs Matt before any
-production default flip.
+PR.** Implementation order (cycle 209): Q-014, Q-004, Q-001, then this.
+Needs Matt before any production default flip.
 
 ## Problem
 
@@ -27,7 +27,10 @@ router. DesignArena can.
 3. Fetch `https://www.designarena.ai/api/leaderboard` with
    `{arenaType:"models", category:"image"}`, cache ≤2h, **fail open**.
 4. Does not run when the caller passed an explicit `imageModel`, or when
-   `inputImages` / `logoImage` is set (brand/edit invariant).
+   `inputImages` / `logoImage` is set (brand/edit invariant). Cycle 180:
+   onboarding already passes `gemini-3-pro-image-preview`, so the mapper
+   never sees Brick 8 ads. Cycle 170: do **not** flip the hardcoded default
+   to `gpt-image-2` — unspecified+logo+edit would land on Azure `[0]`.
 5. Does not add `gpt-image-2.5-*`, Riverflow, Imagen, or a Dynamo table.
 6. `meterUserUsage` still fires on the model that actually generated.
 7. `image-models.ts` stale `'openai-image-1'` fallback is **out of scope**.

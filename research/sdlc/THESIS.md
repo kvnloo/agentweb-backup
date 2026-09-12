@@ -434,6 +434,12 @@ Cycle 208: extractGeneratedImageFilenames
 de-dupes on filename; tests pin a.png twice →
 one. Continue prompt uses that length. S3/URL
 scan are unique per upload. Do not add A-021.
+Cycle 209: Kevin asked to reprioritize.
+Product order Q-014 → Q-004 → Q-001 → Q-003.
+Architecture A-002 → A-019 → A-007 → A-008.
+A-019 unparked (CallTool wrap + drain refuse).
+A-008 persist is the prize; git-mv is the first
+slice. Do not revive A-006. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

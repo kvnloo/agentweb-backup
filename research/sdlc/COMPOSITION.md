@@ -1100,6 +1100,14 @@ Awareness L5909 lists that length. Persist
 marker de-dupes assets by URL (L29093). S3
 keys unique per upload. Not A-006.
 
+Cycle 209: **Reprioritize.** Product Q-014 →
+Q-004 → Q-001 → Q-003. Architecture A-002 →
+A-019 → A-007 → A-008. A-019 unparks because
+CallTool is still untracked (mcpServerCore.ts
+L88–120) after Q-014 will bill images on this
+PORT. A-008 persist (one URL handle) waits on
+the pile. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

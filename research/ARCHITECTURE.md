@@ -715,6 +715,10 @@ A-006 discarded.
 Cycle 208: work-plan continue de-dupes on
 filename; tests pin a.png twice → one. S3/URL
 scan are unique per upload. A-006 discarded.
+Cycle 209: Kevin asked to reprioritize.
+Product Q-014 → Q-004 → Q-001 → Q-003.
+Architecture A-002 → A-019 → A-007 → A-008.
+A-019 unparked. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

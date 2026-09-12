@@ -7,27 +7,27 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 208
+cycles_completed: 209
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 209
+next_cycle: 210
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 208: extractGeneratedImageFilenames
-  de-dupes on filename; tests pin a.png twice
-  → one. Continue prompt uses that length.
-  S3/URL scan are unique per upload.
-  Cycle 209: cheapest remaining. Candidate:
-  work-plan gate Math.max(filenameCount,
-  extractProducedAssetCount) can still see N
-  tool successes while awareness lists 1.
-  File-level.
-  A-011 parks field unify — do not add A-021.
+  Cycle 209: Kevin asked to reprioritize.
+  Product order is now Q-014 → Q-004 →
+  Q-001 → Q-003. Architecture: A-002 →
+  A-019 → A-007 → A-008. A-019 unparked.
+  product_queue_frozen: false.
+  Cycle 210: follow that order. Do not
+  start another S3/Referer matcher.
+  Land #2; Kevin smokes Q-001; A-019
+  wrap after #2. A-011 parks field unify
+  — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Do not revive A-006. If stop_after
+  passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
-product_queue_frozen: true
+product_queue_frozen: false
 ```
 
 ## Stop conditions
@@ -35,3 +35,5 @@ product_queue_frozen: true
 Timer may stop when now > `stop_after`. Do not unset `briefing_ready`.
 Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
+Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
+of those three does not.

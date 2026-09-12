@@ -31,6 +31,7 @@ has the copy-paste recipe (`hermes mcp add emma --url https://api.agentweb.pro/m
 2. Optional: a Hermes skill in `hermes-agent` / `oss-factory`, **not** a
    new AgentWeb service.
 3. After login, Q-014 is what makes `generate_image` appear in `tools/list`.
+   Cycle 209: run this smoke **after** kvnloo#2 merges so the list includes it.
 
 ## Out of scope
 
