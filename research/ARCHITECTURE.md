@@ -551,6 +551,9 @@ Cycle 156: Search Drive/ClickUp helpers have no download
 cap; materialize has 200MB (`L25626`); named-read truncates
 to 1M after fetch. Search then keeps 5000 chars. A-006
 discarded.
+Cycle 157: Search Drive query omits `size` (`L24093`);
+listing, named-read, and materialize request it. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

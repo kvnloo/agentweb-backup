@@ -699,6 +699,14 @@ to 1M **after** fetch. Search face keeps 5000 chars
 (L24113 / L24161). Copy the materialize shape in-process.
 Not A-006.
 
+Cycle 157: **Search Drive query omits `size`.** Search
+L24093 `files(id, name, mimeType, parents)`. Listing
+L24690 `files(id, name, mimeType, size, modifiedTime)`.
+Named-read L25482 includes `size, modifiedTime, parents`.
+Materialize L25678 includes `size, parents`. Helper L23941
+`fields: nextPageToken, ${fields}`. Search cannot refuse
+on metadata it never asked for. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

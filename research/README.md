@@ -510,6 +510,11 @@ the whole file. Materialize refuses at 200MB (`L25626`).
 Named-read truncates to 1M after fetch. Search then keeps
 5000 chars (`L24113` / `L24161`). Copy the materialize
 shape onto the search helper in-process.
+Cycle 157: **Search Drive query omits `size`.** L24093
+`files(id, name, mimeType, parents)`. Listing L24690,
+named-read L25482, materialize L25678 all request `size`.
+The helper already interpolates the caller’s string
+(L23941). Adding `size` is a call-site change, not a hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

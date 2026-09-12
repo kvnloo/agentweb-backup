@@ -390,3 +390,6 @@ reverted. Do not copy that as A-006.
   and readDocContent (L134) have no download cap.
   Materialize 200MB (L25626); named-read 1M after fetch.
   Search keeps 5000 chars. Not A-006.
+- Cycle 157: search query fields omit size (L24093);
+  listing L24690, named-read L25482, materialize L25678
+  request it. Helper interpolates (L23941). Not A-006.

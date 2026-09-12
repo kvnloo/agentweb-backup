@@ -281,6 +281,8 @@ ClickUp docs sequential `await` (L24148–24156). Product
 READY unchanged.
 Cycle 156: Search Drive/ClickUp helpers have no download
 cap; 200MB/1M live on other faces. Product READY unchanged.
+Cycle 157: Search Drive query omits `size` (L24093);
+other faces request it. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

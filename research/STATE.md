@@ -7,21 +7,21 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 156
+cycles_completed: 157
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 157
+next_cycle: 158
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 156: search Drive/ClickUp reads have no download
-  cap; materialize has 200MB; named-read truncates to 1M
-  after fetch. Cycle 157: cheapest remaining. Candidate:
-  queryDriveFilesAcrossFolders fields string (L24093)
-  `files(id, name, mimeType, parents)` — no size, so a
-  search-side byte refuse cannot use Drive metadata. File-
-  level. Do not un-ready Q-001 / Q-014 / Q-003. Do not
-  revive A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 157: search Drive query omits size (L24093);
+  listing/named-read/materialize request it. Cycle 158:
+  cheapest remaining. Candidate: Google Workspace export
+  mimeTypes (L25198) often have empty size — a size refuse
+  would miss docs/sheets/slides that files.export still
+  buffers. File-level. Or refresh Oh My Pi / Hermes live
+  versions vs COMPARISON.md 2026-09-11 snapshot. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
+  stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

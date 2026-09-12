@@ -285,6 +285,9 @@ Cycle 155: Drive folder trees `Promise.all` (L24080);
 ClickUp docs sequential (L24148). Do not add A-021.
 Cycle 156: Search helpers unbounded; 200MB/1M caps are
 on materialize and named-read. Do not add A-021.
+Cycle 157: Search Drive query omits `size` (L24093);
+listing/named-read/materialize request it. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

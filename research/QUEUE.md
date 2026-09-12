@@ -303,4 +303,6 @@ docs sequential `await` (L24148–24156). Do not wrap ClickUp
 in unbounded parallel page GETs. A-006 stays discarded.
 Cycle 156: Search Drive/ClickUp helpers unbounded; 200MB
 and 1M caps are on other faces. A-006 stays discarded.
+Cycle 157: Search query omits `size`; other faces request
+it. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
