@@ -774,3 +774,9 @@ Not A-019. Not A-006.
 ENG-823 already uses TG Describe without listing it.
 LB Describe is never called. Denied TG Describe mock has
 zero tests. Not A-019. Not A-006.
+
+## Cycle 246 (XFF no-op still needs LB Describe)
+
+ENG-823 skip is after Describe. Already-600s still
+Describes. Partner unset is the only zero-call path.
+Not A-019. Not A-006.

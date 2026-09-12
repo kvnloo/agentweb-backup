@@ -709,6 +709,10 @@ READY unchanged.
    Cycle 245: `DescribeLoadBalancerAttributes`
    is also unnamed. Do **not** infer it
    from backend SUCCESS.
+   Cycle 246: an XFF no-op still needs LB
+   Describe on every opted-in backend
+   SUCCESS. Do **not** treat already-correct
+   as skipping Describe.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

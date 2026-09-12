@@ -797,3 +797,7 @@ reverted. Do not copy that as A-006.
 - Cycle 245: LB Describe is also unnamed
   and never called. Hermes has no
   ENG-823 re-read. Not A-006.
+- Cycle 246: XFF no-op still Describes
+  on every opted-in backend SUCCESS.
+  Hermes has no post-verify elbv2 skip.
+  Not A-006.

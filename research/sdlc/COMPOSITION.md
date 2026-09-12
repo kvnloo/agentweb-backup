@@ -1484,6 +1484,12 @@ is also unnamed.** ENG-823 TG Describe
 is used; LB Describe is never called.
 Not A-019. Not A-006.
 
+Cycle 246: **an XFF no-op still needs LB
+Describe on every opted-in backend
+SUCCESS.** ENG-823 skip is after
+Describe. Partner unset is the only
+zero-call path. Not A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

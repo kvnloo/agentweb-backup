@@ -661,3 +661,6 @@ live-AWS-only. A-006 stays discarded.
 Cycle 245: DescribeLoadBalancerAttributes
 is also unnamed. LB Describe is never
 called. A-006 stays discarded.
+Cycle 246: an XFF no-op still needs LB
+Describe on every opted-in backend
+SUCCESS. A-006 stays discarded.
