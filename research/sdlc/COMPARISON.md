@@ -374,3 +374,6 @@ reverted. Do not copy that as A-006.
 - Cycle 151: ClickUp docs search is list-all then includes()
   (clickupService.ts L103-119; AM L24150-24158). Drive is
   fullText contains (L24092). Not A-006.
+- Cycle 152: listTasks enriches attachments (L219-258);
+  search only uses name+description (L24194-24196). List
+  tool uses attachmentCount (L24887). Not A-006.

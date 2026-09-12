@@ -290,4 +290,6 @@ ClickUp; no short-circuit after L24070. A-006 stays discarded.
 Cycle 151: ClickUp docs “search” is list-all then
 `includes()`; Drive already has `fullText contains`. A-006
 stays discarded.
+Cycle 152: `listTasks` enriches attachments; search only uses
+name+description. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

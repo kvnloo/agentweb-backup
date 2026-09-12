@@ -485,6 +485,11 @@ Cycle 151: **ClickUp docs “search” is list-all then
 doc (no query). L24156 reads each doc’s pages until N
 matches. Drive L24092 is `fullText contains`. Listed MCP hops
 here. Not a fifth hop.
+Cycle 152: **`listTasks` enriches attachments; search ignores
+them.** `clickupService.ts` L219–258 `getTask`s in batches
+of 10. Search L24194–24196 uses name+description only. List
+tool L24887 uses `attachmentCount`. One adapter, two
+contracts. Not a fifth hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -657,6 +657,13 @@ each doc’s pages until N matches. Drive L24092 is
 `fullText contains` then read-hits-only. Listed MCP hops
 here. Not A-006.
 
+Cycle 152: **`listTasks` enriches attachments; search ignores
+them.** `clickupService.ts` L219–258 paginates all tasks then
+`getTask` in batches of 10. Search L24181 / L24194–24196
+uses name+description only. `listKnowledgeBaseFiles` L24887
+uses `attachmentCount`. One adapter, two contracts. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

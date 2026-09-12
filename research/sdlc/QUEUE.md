@@ -269,6 +269,8 @@ unchanged.
 Cycle 151: ClickUp docs “search” is list-all then
 `includes()`; Drive already has `fullText contains`. Product
 READY unchanged.
+Cycle 152: `listTasks` enriches attachments; search only uses
+name+description. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
