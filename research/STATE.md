@@ -7,28 +7,28 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 236
+cycles_completed: 237
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 237
+next_cycle: 238
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 236: HTTP 503 does not poison
-  transport.sessionId. Only
-  terminateSession clears it. Later
-  tools/call can rehydrate (ENG-114)
-  if the store has the row; default
-  memory 404s like any swap. Do not
-  404 drain. Cycle 237: is JSON 503
-  (runScheduledChats L13032) enough
-  for SDK send() which text()s !ok,
-  or would an SSE-shaped 503 change
-  anything? Do not add Retry-After.
-  Do not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive
-  A-006. stop_after has passed; leave
-  briefing_ready. Do not mint a timer
-  unless Kevin asks.
+  Cycle 237: JSON 503 is enough for SDK
+  send(). Content-Type is only read
+  after response.ok. SSE-shaped 503
+  would still throw StreamableHTTPError
+  (503). GET 503 still throws (405 skip
+  only). Cycle 238: this tree's
+  .platform has zero error_page /
+  proxy_intercept_errors. Can
+  unvendored platform nginx still rewrite
+  a JSON 503 before Hermes sees it
+  (cycle 119)? Do not add error_page
+  (cycle 107). Do not add A-021. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. stop_after has
+  passed; leave briefing_ready. Do not
+  mint a timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -40,7 +40,8 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–236: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–237: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
-poison `sessionId`. A-006 stays discarded.
+poison `sessionId`; JSON 503 is enough for `send()`. A-006 stays
+discarded.

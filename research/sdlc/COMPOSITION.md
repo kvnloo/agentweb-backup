@@ -1433,6 +1433,12 @@ Cycle 236: **HTTP 503 does not poison
 `tools/call` can rehydrate. Do not
 404 drain. Not A-006.
 
+Cycle 237: **JSON 503 is enough for
+SDK `send()`.** Content-Type is only
+read after `ok`. SSE 503 still
+throws. Do not emit event-stream
+drain. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

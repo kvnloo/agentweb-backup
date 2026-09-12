@@ -711,3 +711,11 @@ mcpFetch does not retry POST. The 5s poll is
 `terminateSession` clears it. Later POST can
 `rehydrateAndServe` if the store has the row. Do not 404
 drain. Do not `sessionStore.delete` on 503. Not A-006.
+
+## Cycle 237 (JSON 503 is enough for `send()`)
+
+`send()` reads Content-Type only after `response.ok`. On
+`!ok` it `text()`s and throws `StreamableHTTPError(status)`.
+SSE-shaped 503 would not reach `_handleSseStream`. GET 503
+still throws (405 skip only). Copy `runScheduledChats` L13032
+`.json()`. Not A-006.

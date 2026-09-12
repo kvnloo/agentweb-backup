@@ -765,3 +765,6 @@ reverted. Do not copy that as A-006.
 - Cycle 236: 503 keeps
   `sessionId`. Hermes has no
   ENG-114. Not A-006.
+- Cycle 237: JSON 503 is the
+  transport face. SSE 503 would
+  not change `send()`. Not A-006.

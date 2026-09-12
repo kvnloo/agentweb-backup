@@ -671,6 +671,9 @@ READY unchanged.
    `sessionId`. Do **not** 404 drain.
    Do **not** `sessionStore.delete` on
    the 503 path.
+   Cycle 237: JSON 503 is enough for
+   `send()`. Do **not** emit SSE 503.
+   Do **not** add `Retry-After`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

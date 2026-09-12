@@ -629,3 +629,6 @@ Cycle 236: 503 does not poison
 sessionId. Later tools/call can
 rehydrate. Do not 404 drain. A-006
 stays discarded.
+Cycle 237: JSON 503 is enough for
+SDK send(). Do not emit SSE 503.
+A-006 stays discarded.

@@ -125,6 +125,7 @@ A-019. Do not restore `07-termination-lifecycle.config`.
 Cycle 234: Hermes can see A-019 503 while `/health` stays 200.
 Do not 503 `/health` to “help” ALB. Cycle 235: that 503 is a
 one-shot in this tree. Do not add a 503 retry in A-019. Cycle 236:
-503 does not poison `sessionId`. Do not 404 drain. A-006 stays discarded.
+503 does not poison `sessionId`. Do not 404 drain. Cycle 237: JSON
+503 is enough for SDK `send()`. Do not emit SSE 503. A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).
