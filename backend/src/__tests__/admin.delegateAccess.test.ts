@@ -88,6 +88,38 @@ describe('Admin delegate access endpoint', () => {
     expect(hoursUntilExpiration).toBeLessThan(8.5);
   });
 
+  it('routes an evaluation target to the dedicated workspace with a fragment-only delegate token', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'eval_ryan', email: 'case@example.invalid', roles: ['customer'], delegateTokenEpoch: 2, sessionVersion: 3 } as any);
+    const res = await request(app).post('/api/admin/users/eval_ryan/delegate-access').set('Host', 'evaluation.example.invalid').expect(200);
+    const url = new URL(res.body.customerPortalUrl);
+    expect(url.origin).toBe(new URL(process.env.BACKEND_URL || 'http://evaluation.example.invalid').origin);
+    expect(url.pathname).toBe('/evaluation');
+    expect(url.search).toBe('');
+    expect(new URLSearchParams(url.hash.slice(1)).get('token')).toBe(res.body.delegateToken);
+    expect(jwt.decode(res.body.delegateToken)).toMatchObject({ userId: 'eval_ryan', dte: 2, sv: 3, isAdmin: false, delegateAccess: { scope: 'evaluation', targetUserId: 'eval_ryan' } });
+    expect(res.body.expiresIn).toBe('8h');
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it.each([undefined, 'https://staging.example.invalid/'])('keeps evaluation delegation in its own backend environment (%s)', async backendUrl => {
+    const original = process.env.BACKEND_URL;
+    try {
+      if (backendUrl) process.env.BACKEND_URL = backendUrl; else delete process.env.BACKEND_URL;
+      mockUserDb.getUserById.mockResolvedValue({ userId: 'eval_local', email: 'case@example.invalid', roles: ['customer'] } as any);
+      const res = await request(app).post('/api/admin/users/eval_local/delegate-access').set('Host', 'local.example.invalid').expect(200);
+      expect(new URL(res.body.customerPortalUrl).origin).toBe(backendUrl ? new URL(backendUrl).origin : 'http://local.example.invalid');
+    } finally {
+      if (original === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = original;
+    }
+  });
+
+  it('preserves the existing customer portal callback for non-evaluation users', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'customer', email: 'case@example.invalid', roles: ['customer'] } as any);
+    const res = await request(app).post('/api/admin/users/customer/delegate-access').expect(200);
+    expect(res.body.customerPortalUrl).toBe(`${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/oauth-callback?token=${res.body.delegateToken}`);
+    expect((jwt.decode(res.body.delegateToken) as any).delegateAccess.scope).toBeUndefined();
+  });
+
   // A user who has never been delegated to, or predates the field entirely, has
   // no epoch. That must mint 0 rather than undefined, or the claim is absent and
   // the middleware's `?? 0` silently compares nothing.
