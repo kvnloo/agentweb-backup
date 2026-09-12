@@ -436,4 +436,7 @@ Cycle 201: pin GET has no UA; probe/discovery do.
 A-006 stays discarded.
 Cycle 202: pin skips ssrfGuard; cssExtractor
 validateURL is company-URL-only. A-006 stays discarded.
+Cycle 203: company-scrape validateURL misses
+FORBIDDEN_HOSTNAMES / 169.254 / DNS-pin; page.goto
+follows after the string check. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

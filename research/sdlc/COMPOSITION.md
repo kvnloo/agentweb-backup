@@ -1059,6 +1059,13 @@ module-private and company-URL-only. describe_image
 L9363 already uses fetchBufferFollowingRedirects.
 Emma logoUrl is a free string (L2063). Not A-006.
 
+Cycle 203: **Company-scrape validateURL misses
+FORBIDDEN_HOSTNAMES / DNS-pin.** Tests L298-311
+pin localhost/10/192.168/ftp. Preferred path is
+page.goto L559 after the string check. Axios HTML
+fetch omits maxRedirects:0. webContentFetcher is a
+third local copy that does DNS+169.254. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

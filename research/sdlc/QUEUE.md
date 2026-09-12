@@ -404,6 +404,10 @@ Cycle 202: pin does not call ssrfGuard;
 cssExtractor validateURL is thinner and
 company-URL-only. describe_image already uses
 fetchBufferFollowingRedirects. Product READY unchanged.
+Cycle 203: company-scrape validateURL misses
+FORBIDDEN_HOSTNAMES / 169.254 / DNS-pin.
+Tests pin localhost/10/192.168/ftp. Preferred
+path is page.goto. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

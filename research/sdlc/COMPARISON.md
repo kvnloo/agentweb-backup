@@ -626,3 +626,10 @@ reverted. Do not copy that as A-006.
   company-URL-only (tests L298-307). describe_image
   L9363 already hop-by-hop pins. Emma logoUrl L2063
   free string. Hermes one fetch client. Not A-006.
+- Cycle 203: company scrape itself uses that
+  string matcher then page.goto L559 (networkidle2).
+  Tests omit 169.254 / metadata.google.internal.
+  ssrfGuard.test.ts L55 / L96 already pins those.
+  Axios HTML fetch has no maxRedirects:0.
+  webContentFetcher is a third local copy that
+  does DNS+169.254. Hermes one client. Not A-006.

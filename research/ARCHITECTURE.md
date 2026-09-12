@@ -695,6 +695,11 @@ cssExtractor do. Tests pin no headers. A-006 discarded.
 Cycle 202: pin does not call ssrfGuard; cssExtractor
 validateURL is thinner and company-URL-only.
 describe_image already uses the helper. A-006 discarded.
+Cycle 203: that validateURL on the company scrape
+itself misses FORBIDDEN_HOSTNAMES / 169.254 /
+DNS-pin. Tests pin localhost/10/192.168/ftp.
+Preferred path is page.goto after the string check.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

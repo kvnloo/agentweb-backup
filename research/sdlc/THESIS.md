@@ -410,6 +410,10 @@ Cycle 202: pin does not call ssrfGuard;
 cssExtractor validateURL is company-URL-only.
 describe_image already uses the in-process guard.
 Do not add A-021.
+Cycle 203: company-scrape validateURL misses
+FORBIDDEN_HOSTNAMES / 169.254 / DNS-pin.
+Tests pin localhost/10/192.168/ftp. Preferred
+path is page.goto. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
