@@ -1495,6 +1495,12 @@ GitHub-red / prod-green, not an A-019
 503.** SUCCESS is logged before the pin.
 No abort. Not A-006.
 
+Cycle 248: **a later XFF pin can fail
+closed before `update-environment`.**
+Hook slot L655. Copying ENG-823
+after-verify is a choice. Not A-019.
+Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

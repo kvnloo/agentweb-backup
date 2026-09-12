@@ -804,3 +804,6 @@ reverted. Do not copy that as A-006.
 - Cycle 247: XFF IAM miss is GitHub-red /
   prod-green. Hermes is already on the
   new instance. Not A-019 503. Not A-006.
+- Cycle 248: XFF pin can fail closed
+  before apply (hook slot). Hermes has
+  no update-environment. Not A-006.

@@ -150,6 +150,9 @@ Do not add A-021.
 Cycle 247: a later XFF IAM miss is GitHub-red / prod-green, not an
 A-019 503. Do not 503 `/health` because the deploy job is red. Do not
 add A-021.
+Cycle 248: a later XFF pin can fail closed before `update-environment`.
+Do not fold it into the hook. Do not un-park A-020 for that slot. Do
+not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

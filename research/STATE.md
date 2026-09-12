@@ -7,26 +7,26 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 247
+cycles_completed: 248
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 248
+next_cycle: 249
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 247: a later XFF IAM miss is
-  GitHub-red / prod-green, not an A-019
-  503. SUCCESS is logged before the pin.
-  No abort-environment-update. Cycle 248:
-  ENG-823 is after verify because it
-  repairs the surviving TG after
-  Immutable ASG swap. The ALB ARN already
-  exists before update-environment (cycle
-  242). Could a later XFF pin run before
-  update-environment so IAM miss fails
-  closed without applying the version?
-  Do not add that pin from A-019. Do not
-  un-park A-020. Do not 503 /health. Do
-  not add A-021. Do not un-ready Q-001 /
+  Cycle 248: a later XFF pin can fail
+  closed before update-environment (hook
+  slot L655). Copying ENG-823 after-verify
+  is a choice that makes IAM miss
+  prod-green. Cycle 249: Sunday never
+  calls eb-deploy.sh (cycle 110), so
+  neither slot runs weekly. Does
+  fail-closed-before-apply only help
+  GitHub merges, leaving Sunday console
+  XFF drift in the IdleTimeout class
+  (cycle 242)? Do not un-park A-020 for
+  a weekly XFF pin. Do not add that pin
+  from A-019. Do not 503 /health. Do not
+  add A-021. Do not un-ready Q-001 /
   Q-014 / Q-003. Do not revive A-006.
   stop_after has passed; leave
   briefing_ready. Do not mint a timer
@@ -42,16 +42,15 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–247: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–248: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
 rewrite it; ALB passes Application 503 through (does not rewrite to
 502); A-019 does not pin ALB XFF attributes (ENG-493); an XFF pin is
 `modify-load-balancer-attributes` on the LB ARN, not A-019 or A-020;
-that ARN stays across Immutable and Sunday (IdleTimeout does not
-reapply weekly); that pin is the only in-tree reassert without
-recreate; deploy IAM does not list the Modify grant (live-AWS-only);
-LB Describe is also unnamed; an XFF no-op still needs that Describe
-on every opted-in backend SUCCESS; an IAM miss after verify is
-GitHub-red / prod-green, not A-019 503. A-006 stays discarded.
+that ARN stays across Immutable and Sunday; that pin is the only
+in-tree reassert without recreate; deploy IAM does not list the grant;
+an XFF no-op still needs LB Describe; after-verify IAM miss is
+GitHub-red / prod-green; a later pin **can** fail closed before apply
+(hook slot). A-006 stays discarded.

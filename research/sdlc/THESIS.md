@@ -786,3 +786,9 @@ Not A-019. Not A-006.
 SUCCESS is logged before the pin. `fail()` exits 1 with
 no abort. Hermes is already on the new instance. Not A-019
 503. Not A-006.
+
+## Cycle 248 (XFF pin can fail closed before apply)
+
+Hook slot L655 is before `update-environment`. Copying
+ENG-823 after-verify is a choice. Not A-019. Not A-020.
+Not A-006.

@@ -717,6 +717,10 @@ READY unchanged.
    GitHub-red / prod-green, not an A-019
    503. Do **not** 503 `/health` because
    the deploy job is red.
+   Cycle 248: a later XFF pin can fail
+   closed before `update-environment`.
+   Do **not** fold it into the hook. Do
+   **not** un-park A-020 for that slot.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

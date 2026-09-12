@@ -667,3 +667,7 @@ SUCCESS. A-006 stays discarded.
 Cycle 247: a later XFF IAM miss is
 GitHub-red / prod-green, not an A-019
 503. A-006 stays discarded.
+Cycle 248: a later XFF pin can fail
+closed before update-environment. Do
+not un-park A-020 for that slot. A-006
+stays discarded.
