@@ -733,3 +733,10 @@ reverted. Do not copy that as A-006.
   A-006 discard. Muse persistent
   scouts / Vercel HUD are Company
   OS, not Emma packages.
+- Cycle 230: A-019 503 is
+  Application 5xx color, not ASG
+  replace. Hermes exit *is* health
+  fail. AgentWeb keeps `/health`
+  200 until close and Wait on the
+  hook. Not `HealthCheckType: ELB`.
+  Not A-006.

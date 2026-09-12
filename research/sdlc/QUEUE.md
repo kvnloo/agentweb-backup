@@ -639,6 +639,11 @@ READY unchanged.
    does not invert this order. Do
    **not** YES PER-1522 from this
    repo.
+   Cycle 230: A-019 `tools/call`
+   503 is Application 5xx color,
+   not Wait replace. Do **not**
+   set `HealthCheckType: ELB`.
+   Do **not** 503 `/health`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

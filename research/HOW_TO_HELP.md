@@ -112,5 +112,8 @@ command; after close, `/health` 502 is a side effect). Do not 503
 Cycle 228: arsenal + Linear PER-1522 + frontier-kb re-rank did **not**
 invert Q-014 → Q-004 → Q-001 → Q-003. Park Q-017. A-006 stays discarded.
 Cycle 229: Linear dump deep-read still does not invert that order.
+Cycle 230: A-019 `tools/call` 503 is Application 5xx color, not
+Wait replace. Do not set `HealthCheckType: ELB`. Do not 503
+`/health`. A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

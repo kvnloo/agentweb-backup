@@ -1374,6 +1374,18 @@ rules, not `/health`. Do not 503
 `/health` during the wait. Not
 A-006.
 
+Cycle 230: **A-019 `tools/call` 503
+is not a Wait replace.** AWS
+enhanced-health rules can only
+customize 4xx; 5xx cannot be
+ignored. Zero `HealthCheckType`
+in git. ALB target stays `/` and
+`/health` 200 until close
+(`app.ts` L547–553). Copy
+`runScheduledChats` 503. Do not
+set `HealthCheckType: ELB`. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

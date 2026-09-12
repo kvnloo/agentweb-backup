@@ -648,3 +648,13 @@ only. Turning AgentWeb into zerOS / Pipeline Studio / Dash / an HTTP
 nanoservice mesh is the named failure mode. Hermes lineage cards
 (PER-150 family) are private synthesis jobs, not a public idea list.
 No new Q-id. A-006 stays discarded.
+
+## Cycle 230 (A-019 503 is color, not Wait replace)
+
+`04-disk-alarm.config` L21–25 enables 4xx only because AWS enhanced
+health cannot ignore 5xx. POST `/mcp` `tools/call` 503 is
+Application 5xx in logs — same class as `runScheduledChats`
+L13031–13032. Zero `HealthCheckType` in git; default ASG check is
+EC2, not ELB. `Terminating:Wait` is already the replace. Do not set
+`HealthCheckType: ELB` (would treat post-close `/health` 502 as ASG
+unhealthy). Not a fifth `listen()`.
