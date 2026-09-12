@@ -561,3 +561,9 @@ sources (`dev.md` L1853); only ASG
 replacement is the hook. Do not add
 `TimeoutStopSec` from A-019. A-006
 stays discarded.
+Cycle 227: `IgnoreHealthCheck: false`
+is a deploy command, not a Wait
+SIGTERM. After A-019 close, `/health`
+502 is a side effect. Do not 503
+`/health` during the wait. A-006
+stays discarded.

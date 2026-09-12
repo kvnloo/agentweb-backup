@@ -545,6 +545,12 @@ sources (`dev.md` L1853); only ASG
 replacement is the hook. Do not add
 `TimeoutStopSec` from A-019.
 Do not add A-021.
+Cycle 227: `IgnoreHealthCheck: false`
+is a deploy command, not a Wait
+SIGTERM. After A-019 close, `/health`
+502 is a side effect. Do not 503
+`/health` during the wait. Do not
+add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

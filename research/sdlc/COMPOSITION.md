@@ -1359,6 +1359,21 @@ Node `TimeoutStopSec` in git
 as a pin that cycle 225 cannot
 happen with the hook. Not A-006.
 
+Cycle 227: **`IgnoreHealthCheck:
+false` is not a Wait SIGTERM.**
+`rolling.config` L2–4 is
+`aws:elasticbeanstalk:command`
+(Immutable deploy). After A-019
+unawaited `server.close`, nginx
+502s `/health` (cycle 107) while
+`completeAction` can still run
+(cycle 223). That is not
+`process.exit(0)`.
+`04-disk-alarm.config` names 4xx
+rules, not `/health`. Do not 503
+`/health` during the wait. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

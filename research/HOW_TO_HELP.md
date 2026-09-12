@@ -101,5 +101,8 @@ fail-safe; do not await the hook from `gracefulShutdown` in A-019).
 withholds SIGTERM for the whole `Terminating:Wait` (cycle 226:
 `dev.md` L1853 names deploy / ASG replacement / health-check restart;
 only replacement is the hook). Do not add `TimeoutStopSec` from A-019.
+`IgnoreHealthCheck: false` is not a Wait SIGTERM (cycle 227: deploy
+command; after close, `/health` 502 is a side effect). Do not 503
+`/health` during the wait.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

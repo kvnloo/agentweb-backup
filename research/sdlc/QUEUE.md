@@ -537,6 +537,12 @@ sources; only ASG replacement is
 the hook. Do not add
 `TimeoutStopSec` / `KillMode` from
 A-019. Product READY unchanged.
+Cycle 227: `IgnoreHealthCheck: false`
+is a deploy command, not a Wait
+SIGTERM. After A-019 close, `/health`
+502 is a side effect. Do not 503
+`/health` during the wait. Product
+READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -612,6 +618,14 @@ A-019. Product READY unchanged.
    health-check restart still SIGTERM).
    Do **not** add `TimeoutStopSec` /
    `KillMode` from A-019 (cycle 116).
+   Do **not** treat
+   `IgnoreHealthCheck: false` as a
+   runtime restart that SIGTERMs
+   `Terminating:Wait` (cycle 227:
+   deploy command). Do **not** 503
+   `/health` during the wait (cycle
+   108). Do **not** add
+   `HealthCheckPath` from A-019.
    Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`

@@ -716,3 +716,8 @@ reverted. Do not copy that as A-006.
   a pin that EB withholds SIGTERM for
   `Terminating:Wait`. Hermes/OMP: one
   process, no ASG hook. Not A-006.
+- Cycle 227: `IgnoreHealthCheck:
+  false` is a deploy command, not a
+  Wait SIGTERM. After close, `/health`
+  502 is a side effect. Hermes exit
+  *is* health fail. Not A-006.
