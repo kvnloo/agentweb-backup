@@ -1,53 +1,42 @@
 import { emmaToolRegistry } from '../../emma/registry';
 import { mcpToolRegistry } from './registry';
 import { evaluationStore } from '../../services/evaluationStore';
-import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, requireEvaluationAdmin, requireEvaluationReviewer, evaluationView } from '../../services/evaluationPolicy';
-import { runEvaluation } from '../../services/evaluationService';
+import { EvaluationDenied, isEvaluationUser, requireEvaluationAdmin, requireEvaluationReviewer } from '../../services/evaluationPolicy';
 
 mcpToolRegistry.register({
   name: 'evaluation_workspace',
   requiresUserAccount: true,
   definition: {
     name: 'evaluation_workspace',
-    description: 'Evaluation workspace: query frozen approved campaigns; simulate campaigns, ad sets, ads, creatives, budgets, schedules, pause, activate, and publish; reset disposable state; analyze and generate creatives. Simulation complete — not sent to Meta. Explicitly assigned reviewers can inspect results. Administrators can provision and revoke. No Meta connector or production access.',
+    description: 'Sandbox account lifecycle (administrators only). Provision a sandbox account for a hiring take-home or customer pilot: a real customer-portal account with a simulated Meta connection, seeded brand guidelines, the Sandbox subscription tier, and a policy record that denies outbound tool classes (connectors, sends, social, publish, third-party writes, browser, automation). Revoke it (invalidates every session, token, key and schedule) or review its status and audit trail as an assigned reviewer. Sandbox principals cannot call this tool.',
     inputSchema: {
       type: 'object', additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['inspect', 'analyze', 'generate_creative', 'upload_artifact', 'provision', 'revoke', 'simulate', 'review'] },
-        command: { type: 'object', additionalProperties: false, properties: {
-          operation: { type: 'string', enum: ['query', 'inspect', 'create', 'update', 'pause', 'activate', 'publish', 'reset'] },
-          kind: { type: 'string', enum: ['campaign', 'adset', 'ad', 'creative'] },
-          source: { type: 'string', enum: ['approved', 'current'] }, id: { type: 'string' },
-          fields: { type: 'object', description: 'name; campaign objective AWARENESS/TRAFFIC/LEADS/SALES; budget (integer USD cents) with budgetType daily/lifetime; startTime/endTime UTC ISO; adset parentId and targeting text; ad parentId and creativeId; creative text, own artifactId, or upload {mime,base64} <=24 KB. Only returned simulated IDs. No URLs/credentials.' },
-        }, required: ['operation'] },
-        artifact_id: { type: 'string', description: 'Review an explicitly assigned evaluation artifact; returns private base64 bytes.' },
-        prompt: { type: 'string' }, text: { type: 'string' },
-        evaluation_user_id: { type: 'string' },
-        provision: { type: 'object', description: 'Admin provisioning request with email, displayName, password, generationBudget, expiresAt (epoch milliseconds), approved sanitized materials (title, text, approved=true), optional reviewerUserIds, and simulationPacket {approved:true,objects:[{key,kind,name,...fields,parentKey?,creativeKey?,metrics?}]}. Packet keys are local labels, never Meta IDs; maximum 30 objects / 50 KB.' },
+        action: { type: 'string', enum: ['provision', 'revoke', 'review'] },
+        evaluation_user_id: { type: 'string', description: 'The eval_ user id to revoke or review.' },
+        provision: {
+          type: 'object', additionalProperties: false,
+          description: 'Provisioning request: email, displayName, password (12–72 chars, handed over privately), expiresAt (epoch ms, ≤30 days out), brandGuidelines {brandName, website?, description?}, optional reviewerUserIds (≤5), label (badge text, default "Sandbox"), datasetId/datasetVersion (pinned frozen dataset), deniedToolClasses (subset of the tool classes; lifecycle is always denied).',
+          properties: {
+            email: { type: 'string' }, displayName: { type: 'string' }, password: { type: 'string' }, expiresAt: { type: 'number' },
+            brandGuidelines: { type: 'object', additionalProperties: false, properties: { brandName: { type: 'string' }, website: { type: 'string' }, description: { type: 'string' } }, required: ['brandName'] },
+            reviewerUserIds: { type: 'array', items: { type: 'string' } },
+            label: { type: 'string' }, datasetId: { type: 'string' }, datasetVersion: { type: 'number' },
+            deniedToolClasses: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['email', 'displayName', 'password', 'expiresAt', 'brandGuidelines'],
+        },
       }, required: ['action'],
     },
   },
   execute: async (args, context) => {
     const userId = context?.userId;
-    if (typeof userId !== 'string' || !args || typeof args !== 'object' || Array.isArray(args)) throw new EvaluationDenied();
+    if (typeof userId !== 'string' || isEvaluationUser(userId) || !args || typeof args !== 'object' || Array.isArray(args)) throw new EvaluationDenied();
     let result: unknown;
-    if (isEvaluationUser(userId)) {
-      await requireActiveEvaluation(userId);
-      if (args.evaluation_user_id || args.provision || Object.keys(args).some(k => !['action', 'prompt', 'text', 'command'].includes(k))) throw new EvaluationDenied();
-      if (args.action === 'simulate') result = await evaluationStore.simulate(userId, args.command);
-      else if (args.action === 'inspect') result = evaluationView(await requireActiveEvaluation(userId));
-      else if (args.action === 'upload_artifact' && typeof args.text === 'string') {
-        result = await evaluationStore.saveArtifact(userId, Buffer.from(args.text), 'text/plain');
-      } else result = await runEvaluation(userId, { action: args.action, prompt: args.prompt });
-      await requireActiveEvaluation(userId);
-    } else if (args.action === 'review') {
-      if (Object.keys(args).some(k => !['action', 'evaluation_user_id', 'artifact_id'].includes(k))) throw new EvaluationDenied();
+    if (args.action === 'review') {
+      if (Object.keys(args).some(k => !['action', 'evaluation_user_id'].includes(k))) throw new EvaluationDenied();
       await requireEvaluationReviewer(userId, context);
-      if (args.artifact_id !== undefined) {
-        await evaluationStore.requireReview(userId, args.evaluation_user_id);
-        const artifact = await evaluationStore.getArtifact(args.evaluation_user_id, args.artifact_id);
-        result = { mime: artifact.mime, base64: artifact.content.toString('base64') };
-      } else result = await evaluationStore.review(userId, args.evaluation_user_id);
+      result = await evaluationStore.review(userId, args.evaluation_user_id);
       await requireEvaluationReviewer(userId, context);
     } else {
       await requireEvaluationAdmin(userId, context);
