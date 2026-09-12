@@ -7,21 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 160
+cycles_completed: 161
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 161
+next_cycle: 162
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 160: Hermes loop still MCP client; two opt-in
-  stdio servers (mcp_serve conversations; hermes-tools
-  for Codex including image_generate). Cycle 161: cheapest
-  remaining. Candidate: hermes_tools_mcp_server.py L90
-  handle_function_call — in-process leaf vs AgentWeb
-  emmaApi.ts mcpFetch. File-level. Do not rewrite
-  HERMES_MCP_OAUTH.md. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 161: Hermes hermes-tools image_generate is
+  in-process handle_function_call (stdio bus). Cycle 162:
+  cheapest remaining. Candidate: Hermes image_generate
+  JSON schema from get_tool_definitions vs AgentWeb MCP
+  generate_image (apiTools.ts L2075). A-011 already parks
+  Emma vs MCP unify — do not add A-021. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive A-006. If
+  stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

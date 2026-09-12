@@ -289,6 +289,8 @@ Cycle 159: Hermes MCP client ~24 files; OMP still v0.85.1.
 Product READY unchanged.
 Cycle 160: Hermes loop still client; two opt-in stdio
 servers. Product READY unchanged.
+Cycle 161: hermes-tools `image_generate` is in-process
+dispatch. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

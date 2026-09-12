@@ -732,6 +732,14 @@ Cycle 160: **Loop still client; two opt-in stdio servers.**
 `web_routers/mcp.py` is outbound OAuth. Cycle 89 overstated
 the repo, not the loop. Not A-006.
 
+Cycle 161: **Codex-facing `image_generate` is in-process.**
+`hermes_tools_mcp_server.py` L90
+`handle_function_call(tool_name, kwargs)`. Stdio
+`server.run()` L139. `mcp_serve.py` is a second allowlist
+(conversations only). AgentWeb Q-014 lists via mcpFetch
+(`emmaApi.ts`); Hermes listed the leaf without that hop.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

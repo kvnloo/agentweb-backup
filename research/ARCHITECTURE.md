@@ -562,6 +562,8 @@ still v0.85.1. Registry still skips `mcp_tool.py`. A-006
 discarded.
 Cycle 160: Hermes loop still MCP client; two opt-in stdio
 servers (`mcp_serve`, `hermes-tools`). A-006 discarded.
+Cycle 161: Hermes `image_generate` on stdio MCP is
+in-process `handle_function_call`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

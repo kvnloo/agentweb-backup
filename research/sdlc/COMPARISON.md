@@ -403,3 +403,6 @@ reverted. Do not copy that as A-006.
 - Cycle 160: mcp_tool_server_run.py still connect-only;
   “/mcp refresh” is a slash-command. hermes mcp serve and
   hermes-tools are stdio subprocesses. Not inbound HTTP.
+- Cycle 161: hermes-tools image_generate dispatches
+  handle_function_call in-process (L90). Q-014 lists;
+  AgentWeb mcpFetch is the adapter. Not A-006.

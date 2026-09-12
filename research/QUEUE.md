@@ -311,4 +311,6 @@ Cycle 159: Hermes MCP client ~24 files; OMP still v0.85.1.
 A-006 stays discarded.
 Cycle 160: Loop still client; two opt-in stdio MCP servers.
 A-006 stays discarded.
+Cycle 161: Codex-facing `image_generate` is in-process
+dispatch, not an HTTP hop. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

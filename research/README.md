@@ -531,6 +531,10 @@ Cycle 160: **Loop still client; two opt-in stdio servers.**
 `hermes mcp serve` = conversations (`mcp_serve.py` stdio).
 `hermes-tools` lists `image_generate` for Codex (stdio).
 Not inbound HTTP `/mcp`. Not A-006.
+Cycle 161: **Hermes listed `image_generate` without an
+HTTP hop.** `handle_function_call` in the same process
+(`hermes_tools_mcp_server.py` L90). Q-014 lists AgentWeb’s
+leaf; the mcpFetch hop is the adapter, not a nanoservice.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
