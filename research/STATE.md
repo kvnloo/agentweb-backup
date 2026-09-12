@@ -7,18 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 182
+cycles_completed: 183
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 183
+next_cycle: 184
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 182: late Gemini success S3-uploads
-  users/{userId}/files/... ; s3Utils has no DeleteObject.
-  User keeps placeholder://. ENG-792 only fails all-placeholder.
-  Cycle 183: cheapest remaining. Candidate: uploadFileToS3
-  L276 always uploaded-by agent-mode including onboarding
-  ads and orphans. Provenance lie. File-level.
+  Cycle 183: uploaded-by is a hardcoded agent-mode
+  constant on both helpers (L276 / L352). Thumbnail
+  writer tells the truth (workplan-thumbnails).
+  Cycle 184: cheapest remaining. Candidate: no
+  production reader filters on uploaded-by.
+  getS3ObjectMetadata callers read ContentType only.
+  Write-only lie. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

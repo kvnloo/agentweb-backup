@@ -344,6 +344,9 @@ unchanged.
 Cycle 182: late Gemini success S3-uploads a key nobody
 stores. s3Utils has no DeleteObject. Product READY
 unchanged.
+Cycle 183: uploaded-by is a hardcoded agent-mode
+constant on both helpers; thumbnail writer tells the
+truth. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

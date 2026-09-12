@@ -883,6 +883,15 @@ L566–587 runs (not L570 HTTPS skip). Key
 fails only all-placeholder. C2PA L575 still strips the
 discarded buffer. Not A-006.
 
+Cycle 183: **`uploaded-by` is a hardcoded `agent-mode`
+constant.** Both helpers (L276 / L352); signature
+L230–235 has no caller tag. Thumbnail writer
+(`workPlanThumbnailService.ts` L37) stamps
+`workplan-thumbnails` on its own S3 client. Grep of
+`backend/` is those three lines. Screenshots wrap
+the helper (L397) and inherit the lie. Tests never pin
+the metadata. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

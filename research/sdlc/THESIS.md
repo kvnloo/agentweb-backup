@@ -344,6 +344,9 @@ leaf. Nested Promise.race, no AbortSignal. Do not add
 A-021.
 Cycle 182: late Gemini success S3-uploads a key nobody
 stores. s3Utils has no DeleteObject. Do not add A-021.
+Cycle 183: uploaded-by is a hardcoded agent-mode
+constant on both helpers; thumbnail writer tells the
+truth. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

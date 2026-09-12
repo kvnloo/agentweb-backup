@@ -635,6 +635,11 @@ Cycle 182: **Late Gemini success S3-uploads a key nobody
 stores.** Data URL path L566–587; `users/{userId}/files/…`.
 `s3Utils.ts` has no DeleteObject. ENG-792 only fails
 all-placeholder. C2PA still strips the discarded buffer.
+Cycle 183: **`uploaded-by` is a hardcoded `agent-mode`
+constant.** Both helpers (L276 / L352); signature has
+no caller tag. Thumbnail writer stamps
+`workplan-thumbnails`. Screenshots wrap the helper
+and inherit the lie. Tests never pin the metadata.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -377,4 +377,7 @@ discarded.
 Cycle 182: late Gemini success S3-uploads a key nobody
 stores. s3Utils has no DeleteObject. A-006 stays
 discarded.
+Cycle 183: uploaded-by is a hardcoded agent-mode
+constant on both helpers; thumbnail writer tells the
+truth. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

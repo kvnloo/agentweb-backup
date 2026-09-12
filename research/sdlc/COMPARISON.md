@@ -493,3 +493,8 @@ reverted. Do not copy that as A-006.
   (not cycle 174 HTTPS skip). Key users/{userId}/files
   (s3Utils L264). Zero DeleteObject. ENG-792 only fails
   liveCount===0. Not A-006.
+- Cycle 183: uploaded-by is a hardcoded agent-mode
+  constant (s3Utils L276 and L352). Signature has no
+  caller tag. workPlanThumbnailService.ts L37 stamps
+  workplan-thumbnails on its own S3 client. Hermes
+  persist stays with the producer. Not A-006.
