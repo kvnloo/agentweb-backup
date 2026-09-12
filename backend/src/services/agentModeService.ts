@@ -26318,6 +26318,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return value;
   }
 
+  /**
+   * Collects every string leaf (however deeply nested) that actually needed escaping —
+   * i.e. contained at least one of & < > " ' — so the LLM's output can be checked for
+   * whether it decoded any of them back to raw HTML. Escaping the PROMPT proves nothing
+   * about the RESPONSE: substitution is LLM-driven, not a deterministic string-replace,
+   * so nothing guarantees the model reproduces an escaped entity as-is rather than
+   * "cleaning up" what looks like a stray HTML entity mid-generation.
+   */
+  private static collectDangerousRawValues(value: any, out: Set<string>): void {
+    if (typeof value === 'string') {
+      if (/[&<>"']/.test(value)) out.add(value);
+    } else if (Array.isArray(value)) {
+      value.forEach((v) => AgentModeService.collectDangerousRawValues(v, out));
+    } else if (value !== null && typeof value === 'object') {
+      Object.values(value).forEach((v) => AgentModeService.collectDangerousRawValues(v, out));
+    }
+  }
+
   /** Convert inline markdown to HTML string. */
   private static inlineToHtml(text: string): string {
     let result = '';
@@ -31930,6 +31948,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ])
       );
 
+      // Raw (pre-escape) values that actually contained a dangerous character — checked
+      // against the LLM's OUTPUT below. Escaping the prompt only proves the request was
+      // safe; it does not prove the model didn't decode an entity back to raw HTML.
+      const dangerousRawValues = new Set<string>();
+      AgentModeService.collectDangerousRawValues(variableValuesObj, dangerousRawValues);
+      AgentModeService.collectDangerousRawValues(arrayVariableValuesObj, dangerousRawValues);
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -32027,6 +32052,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       const finalHtml = substitutionData.final_html;
       const finalSubject = substitutionData.final_subject;
+
+      // ENG-1877: fail closed if the model reproduced a value's RAW, unescaped form
+      // instead of the escaped one we sent it — this is the only point that actually
+      // proves the escaping held through generation, rather than just proving the
+      // request was safe. A false positive is possible if a raw dangerous substring
+      // coincidentally already existed in the template's own static markup, but a
+      // blocked report is a far better failure mode here than a silently reopened
+      // injection.
+      for (const rawValue of dangerousRawValues) {
+        if (finalHtml.includes(rawValue) || finalSubject.includes(rawValue)) {
+          throw new Error(
+            'ENG-1877: LLM substitution reproduced a raw, unescaped value in its output — refusing to return unverified HTML'
+          );
+        }
+      }
 
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
