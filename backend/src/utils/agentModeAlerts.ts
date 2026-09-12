@@ -1,10 +1,17 @@
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 
 type AgentModeOncallAlertParams = {
   subject: string;
   message: string;
   sessionId?: string;
+  /**
+   * The principal the alert is about. Sandbox (eval_) principals never page the
+   * on-call (ENG-1907). When omitted, the owner of `sessionId` is looked up instead,
+   * so the existing call sites need no change.
+   */
+  userId?: string;
   context?: Record<string, any>;
   /**
    * Optional dedupe key (e.g. `context_limit:<userId>`). When provided, at most one
@@ -53,6 +60,22 @@ function hasKey(obj: Record<string, any> | undefined, key: string): boolean {
 }
 
 /**
+ * ENG-1907: a take-home candidate deliberately breaking Emma in a sandbox account
+ * must not page anyone. Keyed on identity, never on a caller flag. Fails open: if
+ * the owner cannot be resolved, a real customer's alert still goes out.
+ */
+async function isSandboxPrincipalAlert(userId?: string, sessionId?: string): Promise<boolean> {
+  if (userId) return isEvaluationUser(userId);
+  if (!sessionId) return false;
+  try {
+    const session = await chatbotDb.getChatSession(sessionId);
+    return isEvaluationUser(session?.userId);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Returns true if the alert was actually delivered, false if it was
  * suppressed by dedupe. Callers that only care about "did I fire and
  * forget" can ignore the return value (existing behavior, unchanged);
@@ -63,7 +86,14 @@ function hasKey(obj: Record<string, any> | undefined, key: string): boolean {
 export async function sendAgentModeOncallAlert(
   params: AgentModeOncallAlertParams
 ): Promise<boolean> {
-  const { subject, message, sessionId, context, dedupeKey, dedupeWindowMs, now } = params;
+  const { subject, message, sessionId, context, dedupeKey, dedupeWindowMs, now, userId } = params;
+
+  // Checked before the dedupe reservation so a suppressed sandbox alert can never
+  // consume a real customer's window on a shared key.
+  if (await isSandboxPrincipalAlert(userId, sessionId)) {
+    console.info(`[agentModeAlerts] suppressed oncall alert for sandbox principal: ${subject}${dedupeKey ? ` (${dedupeKey})` : ''}`);
+    return false;
+  }
 
   // Rate-limit/dedupe: when a dedupeKey is supplied, only the first alert per
   // (user, errorClass) window goes out — prevents Notion/oncall flooding on
