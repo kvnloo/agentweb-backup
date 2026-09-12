@@ -1563,6 +1563,11 @@ Cycle 259: **a later XFF pin copies
 ENG-823’s None policy.** Do not add a
 fourth from A-019. Not A-020. Not A-006.
 
+Cycle 260: **treat empty XFF Describe like
+`20`.** Do not add hook `[ -z ]`. Empty
+desired is the partner skip. Not A-019.
+Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

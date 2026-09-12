@@ -708,3 +708,6 @@ discarded.
 Cycle 259: a later XFF pin copies ENG-823
 None policy. Do not add a fourth. A-006
 stays discarded.
+Cycle 260: treat empty XFF Describe like
+20. Do not add hook -z. A-006 stays
+discarded.

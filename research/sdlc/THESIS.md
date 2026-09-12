@@ -856,3 +856,9 @@ ASG discovery. Not A-019. Not A-020. Not A-006.
 
 Four existing None policies. XFF copies ENG-823. Do not
 add a fourth. Not A-019. Not A-020. Not A-006.
+
+## Cycle 260 (empty current is ENG-823 Modify)
+
+Treat empty Describe like `20`. Do not add hook `[ -z ]`.
+Empty desired is a different variable. Not A-019. Not
+A-020. Not A-006.

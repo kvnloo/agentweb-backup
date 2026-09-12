@@ -180,6 +180,8 @@ Cycle 258: do not `fail()` on ALB XFF Describe `None` before
 Modify from A-019. Do not add A-021.
 Cycle 259: a later XFF pin copies ENG-823’s None policy. Do
 not add a fourth from A-019. Do not add A-021.
+Cycle 260: treat empty XFF Describe like `20`. Do not add
+hook `[ -z ]` from A-019. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

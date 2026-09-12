@@ -842,3 +842,6 @@ reverted. Do not copy that as A-006.
 - Cycle 259: XFF copies ENG-823’s None
   policy. Hermes has no four-None script.
   Not A-006.
+- Cycle 260: empty current is Modify, not
+  hook `-z`. Hermes has no empty-vs-None
+  deploy fork. Not A-006.

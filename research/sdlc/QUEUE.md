@@ -759,6 +759,9 @@ READY unchanged.
    Cycle 259: a later XFF pin copies ENG-823’s
    None policy. Do **not** add a fourth from
    A-019.
+   Cycle 260: treat empty XFF Describe like
+   `20`. Do **not** add hook `[ -z ]` from
+   A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
