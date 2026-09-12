@@ -617,3 +617,7 @@ disableCron (IMDS Terminated and
 SIGTERM gracefulShutdown). Wait is
 the park, not the 503. A-006 stays
 discarded.
+Cycle 234: Hermes can see A-019 503
+while /health is 200. Nginx 502 is
+after server.close. 600s starts at
+deregister. A-006 stays discarded.

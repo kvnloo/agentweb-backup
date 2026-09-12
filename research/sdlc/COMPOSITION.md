@@ -1415,6 +1415,13 @@ first). Wait is the park. TODAY
 sibling closer 502s `/mcp` first
 (cycle 213). Not A-006.
 
+Cycle 234: **Hermes can see A-019 503
+while `/health` stays 200.** Nginx
+502 is after `server.close`. 600s
+DeregistrationDelay starts at
+deregister. Do not 503 `/health`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

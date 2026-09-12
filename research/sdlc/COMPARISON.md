@@ -754,3 +754,7 @@ reverted. Do not copy that as A-006.
 - Cycle 233: missing Wait still
   `disableCron`s. Hermes SIGTERM
   *is* the process. Not A-006.
+- Cycle 234: `/health` 200 keeps
+  the ALB target so Node can 503.
+  Hermes exit *is* health fail.
+  Not A-006.

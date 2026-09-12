@@ -122,6 +122,7 @@ Do not disable refresh. Do not set `HealthCheckSuccessThreshold`.
 Cycle 233: Sunday-without-hook still `disableCron`s (IMDS and
 SIGTERM). Wait is the park, not the 503. Do not add systemd from
 A-019. Do not restore `07-termination-lifecycle.config`.
-A-006 stays discarded.
+Cycle 234: Hermes can see A-019 503 while `/health` stays 200.
+Do not 503 `/health` to “help” ALB. A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

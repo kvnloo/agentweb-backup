@@ -660,6 +660,10 @@ READY unchanged.
    still `disableCron`. Wait is
    the park, not the 503. Do
    **not** add systemd from A-019.
+   Cycle 234: Hermes can see A-019
+   503 while `/health` is 200. Do
+   **not** 503 `/health`. Do **not**
+   treat 600s as the no-Wait clock.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

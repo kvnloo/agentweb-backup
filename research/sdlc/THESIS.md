@@ -689,3 +689,10 @@ IMDS `Terminated` (cycle 114) and OS SIGTERM (cycle 115) both
 start `runDrain`. TODAY sibling `mcpServer.ts` closer 502s
 `/mcp` first; A-019 drops that listener. Not systemd. Not
 ENG-818 `.ebextensions`. A-006 stays discarded.
+
+## Cycle 234 (Hermes sees 503 while `/health` is 200)
+
+Always-200 `/health` (`app.ts` L547–553) keeps the ALB target
+through `disableCron`. Nginx 502 is after `server.close`.
+DeregistrationDelay 600s starts at deregister; ENG-764 3m19s
+is the Sunday-without-hook clock. Not A-006.
