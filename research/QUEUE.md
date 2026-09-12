@@ -473,3 +473,6 @@ Cycle 211: do not drain-gate ListTools or
 initialize. A-019 admission is HTTP 503 on
 POST `/mcp` `tools/call`. JSON-RPC `isError`
 is the wrong face. A-006 stays discarded.
+Cycle 212: do not 503 GET `/mcp`. SDK throws
+on GET 503; 405 is the optional-SSE skip.
+A-006 stays discarded.

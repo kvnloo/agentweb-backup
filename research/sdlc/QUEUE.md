@@ -18,7 +18,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-008 | 29 | **ready** | Folder-move creative cluster + persist unification later |
 | 4 | A-002 | 28 | **ready** | CI import boundary for `loops/core` (**in flight kvnloo#3**) |
-| 5 | A-019 | 27 | **ready** | HTTP 503 POST `/mcp` `tools/call` + `/generate`; wrap CallTool in `track()`; do not gate ListTools |
+| 5 | A-019 | 27 | **ready** | HTTP 503 POST `/mcp` `tools/call` + `/generate`; GET 405 not 503; wrap CallTool in `track()` |
 | — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
@@ -440,6 +440,10 @@ Cycle 211: do not drain-gate ListTools or
 initialize. A-019 admission is HTTP 503 on
 POST `/mcp` `tools/call` (batch fail-closed),
 not CallTool `isError`. Product READY unchanged.
+Cycle 212: do not 503 GET `/mcp`. SDK throws
+on GET 503; 405 is the optional-SSE skip.
+Existing SSE still needs `mcpShutdown` after
+the wait. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -453,13 +457,15 @@ not CallTool `isError`. Product READY unchanged.
 2. **A-019** — after kvnloo#2: HTTP 503 on POST `/mcp` when the
    body contains `tools/call` (copy `anonymousTransport.ts` L68–83
    batch fail-closed), then `track('mcpCallTool', …)` for the
-   drain wait. `/generate` 503 like `runScheduledChats` L13031
-   **before** `tryClaim`. Do **not** 503 ListTools or initialize.
-   Do **not** return CallTool `isError` for drain (HTTP 200).
-   Do **not** refuse inside `track()` (promise already started,
-   `server.ts` L301). Do **not** make `tryClaim` return false
-   (that 409s `SESSION_BUSY`). Do **not** wrap
-   `mcpToolRegistry.execute`. Do **not** edit `slack.ts` (#2393).
+   drain wait. GET `/mcp`: **405** if draining, **not** 503
+   (SDK `_startOrAuthSse` throws on 503). `/generate` 503 like
+   `runScheduledChats` L13031 **before** `tryClaim`. Do **not**
+   503 ListTools or initialize. Do **not** return CallTool
+   `isError` for drain (HTTP 200). Do **not** refuse inside
+   `track()` (promise already started, `server.ts` L301). Do
+   **not** make `tryClaim` return false (that 409s
+   `SESSION_BUSY`). Do **not** wrap `mcpToolRegistry.execute`.
+   Do **not** edit `slack.ts` (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

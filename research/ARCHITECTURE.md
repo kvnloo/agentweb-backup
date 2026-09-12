@@ -730,6 +730,11 @@ initialize. POST `/mcp` has zero
 body contains `tools/call`. JSON-RPC
 `isError` is HTTP 200 (wrong face).
 A-006 discarded.
+Cycle 212: do not 503 GET `/mcp`. SDK
+throws on GET 503; 405 is the optional
+SSE skip. Existing SSE still needs
+`mcpShutdown` after the wait.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

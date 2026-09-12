@@ -452,6 +452,12 @@ POST `/mcp` `tools/call` (batch fail-closed),
 not CallTool `isError`. Do not hide
 `generate_image` from the list. Do not add
 A-021.
+Cycle 212: do not 503 GET `/mcp`. The
+vendored Streamable HTTP client throws on
+GET 503; 405 is the optional-SSE skip.
+Existing SSE hang is `mcpShutdown` after
+the wait, not this admission. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

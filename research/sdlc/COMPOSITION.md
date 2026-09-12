@@ -1130,6 +1130,17 @@ asserts 200; SDK 404=reinit vs 400 terminal
 (`mcp.mcpServer.test.ts` L243–249). Wrap
 CallTool in `track()` for the wait. Not A-006.
 
+Cycle 212: **Do not 503 GET `/mcp`.**
+SDK `_startOrAuthSse` throws
+`StreamableHTTPError` on GET 503;
+405 returns and keeps POST
+(`streamableHttp.js` L100–103). Q-001
+fixture never GET. GET is local-Map
+only (L516); no rehydrate. `setTimeout(0)`
+still loses to nginx 600s. Existing SSE:
+`runDrain` still `server.close` without
+`mcpShutdown`. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -679,3 +679,7 @@ reverted. Do not copy that as A-006.
   `isError` would stay 200. A-019 is HTTP 503
   on POST `/mcp` `tools/call` only — do not
   shrink `tools/list` during overlap. Not A-006.
+- Cycle 212: GET `/mcp` is optional SSE. The
+  vendored client throws on GET 503 and only
+  skips on 405. Do not copy tools/call 503
+  onto GET. Not A-006.

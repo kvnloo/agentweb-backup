@@ -61,8 +61,10 @@ Land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).
 `tools/call` (copy `anonymousTransport` batch fail-closed), then
 wrap CallTool in `track()` so drain waits. `/generate` gets 503
 before `tryClaim`. Do **not** drain-gate ListTools or initialize
-(cycle 211). Do not return CallTool `isError` for drain (HTTP 200
-tool-failure). Do not refuse inside `track()` (the promise is
-already running). Do not make `tryClaim` return false (that 409s).
-That is the billed-image drain gate. Not A-007 packaging. Not persist
-(occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).
+(cycle 211). Do **not** 503 GET `/mcp` (cycle 212: SDK throws;
+405 is the optional-SSE skip). Do not return CallTool `isError`
+for drain (HTTP 200 tool-failure). Do not refuse inside `track()`
+(the promise is already running). Do not make `tryClaim`
+return false (that 409s). That is the billed-image drain gate.
+Not A-007 packaging. Not persist (occupied `agentModeService.ts` /
+`app.ts` / `emma/tools.ts`).

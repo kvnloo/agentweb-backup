@@ -10,7 +10,7 @@ Coding is unlocked. First product PRs are **in flight**:
 [A-002](https://github.com/kvnloo/agentweb/pull/3). Cycle 209:
 Kevin asked to reprioritize. Q-001 is Kevin Hermes smoke after #2
 (existing runbook). Q-003 waits on Matt before a default flip.
-Next architecture after #2+#3 is **A-019** (HTTP 503 POST `/mcp` `tools/call`, not ListTools).
+Next architecture after #2+#3 is **A-019** (HTTP 503 POST `/mcp` `tools/call`; GET 405 not 503).
 
 ---
 
@@ -33,7 +33,7 @@ None of the first slices needs a Dynamo table.
 | Order | ID | Do this | Do not |
 |---|---|---|---|
 | 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts`. **In flight: [kvnloo#3](https://github.com/kvnloo/agentweb/pull/3).** | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
-| 2 | **A-019** | After #2: HTTP 503 on POST `/mcp` when the body contains `tools/call` (batch fail-closed); wrap CallTool in `track('mcpCallTool')` for the wait. `/generate` 503 before `tryClaim`. Leave ListTools / initialize ungated. | Drain-gate ListTools or initialize. Return CallTool `isError` for drain (HTTP 200). Refuse inside `track()`. Make `tryClaim` return false (409 `SESSION_BUSY`). Wrap `registry.execute`. Edit `slack.ts` (#2393). |
+| 2 | **A-019** | After #2: HTTP 503 on POST `/mcp` when the body contains `tools/call`; GET `/mcp` **405** (not 503) if draining; wrap CallTool in `track('mcpCallTool')`. `/generate` 503 before `tryClaim`. Leave ListTools / initialize ungated. | Drain-gate ListTools or initialize. 503 GET `/mcp` (SDK throws `StreamableHTTPError`). Return CallTool `isError` for drain. Refuse inside `track()`. Make `tryClaim` return false (409 `SESSION_BUSY`). Wrap `registry.execute`. Edit `slack.ts` (#2393). |
 | 3 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` (wait for #2) | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 4 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim. Persist unification after the pile shrinks. | HTTP-split the leaf. Patch occupied `app.ts` / `emma/tools.ts` / `agentModeService.ts`. |
 
@@ -45,7 +45,7 @@ None of the first slices needs a Dynamo table.
 |---|---|
 | One product thing | **Q-014** — land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2) |
 | One Kevin-unique thing after #2 | **Q-001** smoke so `tools/list` includes `generate_image` |
-| One architecture thing after #2 and #3 | **A-019** HTTP 503 POST `/mcp` `tools/call` + `track()` wrap for the wait |
+| One architecture thing after #2 and #3 | **A-019** HTTP 503 POST `/mcp` `tools/call`; GET 405 not 503 |
 
 ---
 
