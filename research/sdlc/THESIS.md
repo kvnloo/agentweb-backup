@@ -406,6 +406,10 @@ already SDK-streams (filesController L35). Do not add A-021.
 Cycle 201: pin GET has no User-Agent; probe and
 cssExtractor do. Same URL can fail pin and pass
 ads. Do not add A-021.
+Cycle 202: pin does not call ssrfGuard;
+cssExtractor validateURL is company-URL-only.
+describe_image already uses the in-process guard.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -7,17 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 201
+cycles_completed: 202
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 202
+next_cycle: 203
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 201: downloadBrandLogoToS3 GET has no UA;
-  probe and cssExtractor do. Tests pin no headers.
-  Cycle 202: cheapest remaining. Candidate:
-  pin has no validateURL/SSRF (cssExtractor only
-  validates the company URL). File-level.
+  Cycle 202: pin does not call ssrfGuard;
+  cssExtractor validateURL is thinner and
+  company-URL-only. describe_image already uses
+  fetchBufferFollowingRedirects.
+  Cycle 203: cheapest remaining. Candidate:
+  cssExtractor local validateURL vs ssrfGuard
+  FORBIDDEN_HOSTNAMES on the company scrape.
+  File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,

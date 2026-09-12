@@ -400,6 +400,10 @@ rediscovery is fail-open on unknown. Product READY unchanged.
 Cycle 201: downloadBrandLogoToS3 GET has no
 User-Agent; probe and cssExtractor do. Tests pin
 no headers. Product READY unchanged.
+Cycle 202: pin does not call ssrfGuard;
+cssExtractor validateURL is thinner and
+company-URL-only. describe_image already uses
+fetchBufferFollowingRedirects. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

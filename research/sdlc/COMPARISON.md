@@ -621,3 +621,8 @@ reverted. Do not copy that as A-006.
   AgentWeb-CSS-Extractor/1.0. Pin-fail + probe-success
   leaves the external URL unpinned. Hermes one
   client. Not A-006.
+- Cycle 202: pin/probe/leaf do not import ssrfGuard.
+  cssExtractor validateURL L142 is thinner and
+  company-URL-only (tests L298-307). describe_image
+  L9363 already hop-by-hop pins. Emma logoUrl L2063
+  free string. Hermes one fetch client. Not A-006.

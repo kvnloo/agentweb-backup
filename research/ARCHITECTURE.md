@@ -692,6 +692,9 @@ Family A URL (no isS3Url). Ads fail closed on 4xx.
 filesController L35 already SDK-streams. A-006 discarded.
 Cycle 201: pin GET has no User-Agent; probe and
 cssExtractor do. Tests pin no headers. A-006 discarded.
+Cycle 202: pin does not call ssrfGuard; cssExtractor
+validateURL is thinner and company-URL-only.
+describe_image already uses the helper. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

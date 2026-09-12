@@ -1053,6 +1053,12 @@ Mozilla; cssExtractor L131 Extractor/1.0. Pin-fail
 + probe-success leaves the external host as source
 of truth. Not A-006.
 
+Cycle 202: **Pin skips ssrfGuard.** brandLogo.ts
+grep empty. cssExtractor validateURL L142 is
+module-private and company-URL-only. describe_image
+L9363 already uses fetchBufferFollowingRedirects.
+Emma logoUrl is a free string (L2063). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
