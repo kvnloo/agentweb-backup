@@ -449,4 +449,7 @@ A-006 stays discarded.
 Cycle 207: generate_image.filename is the output
 name, not asset.filename. Leaf accepts 'url'.
 A-006 stays discarded.
+Cycle 208: work-plan continue de-dupes on
+filename; tests pin a.png twice → one. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

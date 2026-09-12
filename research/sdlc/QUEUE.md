@@ -421,6 +421,9 @@ Cycle 207: generate_image.filename is the output
 name, not asset.filename. Leaf accepts 'url'.
 logo_image optional; ENG-326 recovers omit.
 Product READY unchanged.
+Cycle 208: extractGeneratedImageFilenames de-dupes
+on filename; tests pin a.png twice → one.
+Continue prompt uses that length. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

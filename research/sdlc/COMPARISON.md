@@ -657,3 +657,8 @@ reverted. Do not copy that as A-006.
   logo_image optional; ENG-326 recovers omit.
   Hermes IMAGE_GENERATE_SCHEMA requires prompt
   only. Not A-006.
+- Cycle 208: extractGeneratedImageFilenames
+  L5889 seen.has(filename). Test L268–274 pins
+  a.png twice → one. Awareness L5909 uses that
+  length. scanMessagesForAssets de-dupes by URL.
+  Hermes one URL handle. Not A-006.

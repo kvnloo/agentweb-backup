@@ -430,6 +430,10 @@ name (required, non-empty only), not cycle 205
 asset.filename. logo_image optional; ENG-326
 recovers omit. Hermes native schema requires
 prompt only. Do not add A-021.
+Cycle 208: extractGeneratedImageFilenames
+de-dupes on filename; tests pin a.png twice →
+one. Continue prompt uses that length. S3/URL
+scan are unique per upload. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

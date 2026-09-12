@@ -712,6 +712,9 @@ has no headers. Ads fail closed. A-006 discarded.
 Cycle 207: generate_image.filename is the output
 name, not asset.filename. Leaf accepts 'url'.
 A-006 discarded.
+Cycle 208: work-plan continue de-dupes on
+filename; tests pin a.png twice → one. S3/URL
+scan are unique per upload. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

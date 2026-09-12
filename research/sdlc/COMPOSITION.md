@@ -1093,6 +1093,13 @@ only. Cycle 205's asset.filename (logo.png /
 optional; ENG-326 recovers omit. Hermes native
 schema requires prompt only. Not A-006.
 
+Cycle 208: **Work-plan continue de-dupes on
+filename.** extractGeneratedImageFilenames
+L5889; test L268–274 pins a.png twice → one.
+Awareness L5909 lists that length. Persist
+marker de-dupes assets by URL (L29093). S3
+keys unique per upload. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

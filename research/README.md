@@ -657,12 +657,12 @@ Cycle 187: **Email rewrite matches one S3 host;
 `s3.us-west-2` only. Brand delete already extracted a
 bucket matcher (`brand.ts` L84). Rewrite tests never
 use the region-less URL `/asset/` tests pin.
-Cycle 188–207: S3 writers, matchers, fetch paths.
-Latest (207): `generate_image.filename` is the
-output name (required, non-empty only), not
-cycle 205's `asset.filename` (`logo.png` /
-`'url'`). `logo_image` is optional; ENG-326
-recovers omit.
+Cycle 188–208: S3 writers, matchers, fetch paths.
+Latest (208): work-plan continue de-dupes on
+`filename` (tests pin `a.png` twice → one).
+S3 keys and `scanMessagesForAssets` are unique
+per upload / URL. N variants named `logo.png`
+surface as one already-made asset.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
