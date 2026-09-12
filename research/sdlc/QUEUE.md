@@ -263,6 +263,9 @@ Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma tool
 Cycle 149: Agent Mode collects per source then slices;
 Vertex-first prefix can discard Drive/ClickUp after paying
 for them. Product READY unchanged.
+Cycle 150: Vertex filling the cap does not skip Drive or
+ClickUp; no short-circuit after L24070. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

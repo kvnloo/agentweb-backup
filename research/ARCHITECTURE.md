@@ -530,6 +530,8 @@ Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma tool
 Cycle 149: Agent Mode collects per source then slices;
 Vertex-first prefix can discard Drive/ClickUp after paying
 for them. Listed MCP hops here. A-006 discarded.
+Cycle 150: Vertex filling the cap does not skip Drive or
+ClickUp; no short-circuit after L24070. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

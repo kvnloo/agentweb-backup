@@ -476,6 +476,10 @@ Cycle 149: **per-source collect, then slice.** L24230–24233
 is the receipt. Vertex is first in `results`; Drive tree
 walk and ClickUp reads still run; `slice(0, N)` can drop
 them. Listed MCP hops here (cycle 143). Not a fifth hop.
+Cycle 150: **no short-circuit after Vertex.** L24070 → L24073
+`if (userId)` Drive with no cap check. ClickUp L24142 /
+L24182 same. Only `results.length === 0` (L24216). Listed
+MCP always fans out the superset.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

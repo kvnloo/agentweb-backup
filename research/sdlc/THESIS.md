@@ -267,6 +267,8 @@ Cycle 149: Agent Mode collects per source then slices
 (L24233). Vertex-first prefix can discard Drive/ClickUp
 after paying for them. Listed MCP hops here. Do not add
 A-021.
+Cycle 150: Vertex filling the cap does not skip Drive or
+ClickUp (L24070 → L24073). Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -643,6 +643,12 @@ Vertex is pushed first (L24059–24070); Drive tree walk
 run; `slice(0, limitedMaxResults)` keeps the prefix. Listed
 MCP `emmaApi.ts` L98–101 hops here. Not A-006.
 
+Cycle 150: **no short-circuit after Vertex.** L24070 maps
+Vertex; L24073 is `if (userId)` Drive. ClickUp L24142 /
+L24182 same. Only empty-set gate is L24216. Grep: no
+`results.length >= limitedMaxResults` in this method.
+Listed MCP always fans out. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

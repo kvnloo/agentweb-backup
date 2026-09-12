@@ -369,3 +369,5 @@ reverted. Do not copy that as A-006.
 - Cycle 149: Agent Mode collects per source then slices
   (L24233). Vertex-first prefix can discard Drive/ClickUp
   after OAuth and reads. Listed MCP hops here. Not A-006.
+- Cycle 150: no short-circuit after Vertex (L24070 → L24073
+  if userId Drive). Only empty-set gate is L24216. Not A-006.
