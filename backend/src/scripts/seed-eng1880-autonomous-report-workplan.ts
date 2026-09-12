@@ -121,7 +121,18 @@ export const AUTONOMOUS_REPORT_WORKPLAN_STEPS: WorkPlanStep[] = [
   },
 ];
 
-export function buildAutonomousReportWorkPlan() {
+// Every other `visibility: 'private'` work plan in the codebase pairs it with a real
+// `ownerId` (userWorkPlanRoutes.ts's create route always sets both together) — an
+// undefined ownerId makes orgShareService.canEditItem's ownership check unconditionally
+// false for every caller, permanently blocking the plan from the standard user-facing
+// edit route. This script has no authenticated "calling user" the way that route does,
+// so it accepts an explicit override and otherwise falls back to the same admin userId
+// the proven internal validation plan (e5763948-...) used.
+const DEFAULT_SEED_OWNER_USER_ID = '1d2547e7-b5b8-4f89-8dd1-740e0a07b8f5';
+
+export function buildAutonomousReportWorkPlan(
+  ownerId: string = process.env.SEED_OWNER_USER_ID || DEFAULT_SEED_OWNER_USER_ID,
+) {
   return {
     title: AUTONOMOUS_REPORT_WORKPLAN_TITLE,
     description: AUTONOMOUS_REPORT_WORKPLAN_DESCRIPTION,
@@ -130,6 +141,7 @@ export function buildAutonomousReportWorkPlan() {
     category: 'Paid Ads',
     defaultModel: 'gemini-3.7-flash',
     visibility: 'private' as const,
+    ownerId,
     showInAgentMode: false,
     isBuiltIn: false,
     autocomplete: true,
