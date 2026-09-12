@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 180
+cycles_completed: 181
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 181
+next_cycle: 182
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 180: onboarding L84/L493 pins Gemini 3 explicitly
-  so Q-003 unspecified mapper never runs. 1080 sizes are
-  Gemini aspect ratios; Azure L712 would take them raw.
-  Cycle 181: cheapest remaining. Candidate:
-  generateWithTimeout Promise.race L487-507 does not
-  abort the leaf at 180s; timed-out variants still meter.
-  File-level. A-011 parks field unify — do not add A-021.
+  Cycle 181: onboarding 180s Promise.race does not abort
+  the 8 min leaf. Timed-out variants still meter + S3
+  if vendor returns between 180s and 8 min.
+  Cycle 182: cheapest remaining. Candidate: late success
+  after the 180s race still S3-uploads (L564+) to a URL
+  nobody stores. Orphan objects, billed. File-level.
+  A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.

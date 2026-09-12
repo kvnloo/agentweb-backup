@@ -865,6 +865,15 @@ never runs. Brief item 4 also skips `logoImage`.
 `size` raw. Three hardcoded defaults, no shared
 constant. Not A-006.
 
+Cycle 181: **Onboarding 180s race does not abort the
+8 min leaf.** Nested `Promise.race` (`generateWithTimeout`
+L487 vs `withTimeout` L89). `AdImageGeneratorDep` has no
+signal. Meter L551 after inner success; S3 L564; UI
+already `placeholder://` (L676). Test L375–408 blesses
+elapsed < 2s, not cancel. Three parallel variants
+(L663). Cycle 104’s MCP 5 min hop is the same hole.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

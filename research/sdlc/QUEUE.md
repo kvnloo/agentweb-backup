@@ -338,6 +338,9 @@ unchanged.
 Cycle 180: onboarding pins Gemini 3 so Q-003 unspecified
 mapper never runs. Do not un-ready Q-003. Product READY
 unchanged.
+Cycle 181: onboarding 180s race does not abort the 8 min
+leaf. Nested Promise.race, no AbortSignal. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

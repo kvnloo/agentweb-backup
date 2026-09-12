@@ -484,3 +484,8 @@ reverted. Do not copy that as A-006.
   fires. Q-003 item 4 skips explicit model and logoImage.
   1080x1350 is Gemini 4:5 (L1157), not Azure size
   (L712 raw). Not A-006.
+- Cycle 181: generateWithTimeout L487-507 is a 180s
+  Promise.race with no AbortSignal. Leaf withTimeout L89
+  is 8 min. Meter L551 after inner success; UI already
+  placeholder. Test L375 blesses elapsed not cancel.
+  Not A-006.

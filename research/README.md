@@ -627,6 +627,10 @@ path never runs.** L84 / L493 always pass
 `imageModel`. Brief item 4 also skips `logoImage`.
 L83 “1080×” is Gemini aspect-ratio, not pixels. Azure
 L712 would send `1080x1350` as size.
+Cycle 181: **Onboarding 180s race does not abort the 8 min
+leaf.** Nested `Promise.race`, no `AbortSignal`. Meter
+L551 after inner success; UI already has placeholder.
+Test L375 blesses elapsed, not cancel.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -371,4 +371,7 @@ discarded.
 Cycle 180: onboarding pins Gemini 3 explicitly; Q-003
 unspecified path never runs. Do not un-ready Q-003.
 A-006 stays discarded.
+Cycle 181: onboarding 180s race does not abort the 8 min
+leaf. Nested Promise.race, no AbortSignal. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.
