@@ -26298,6 +26298,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  /**
+   * Escapes every string leaf of an arbitrarily-nested value while preserving its
+   * structure — unlike `String(value)`, which collapses an object/array to
+   * "[object Object]" and turns `null`/`undefined` into the literal text "null"/
+   * "undefined". Needed because caller-supplied template variable values are not
+   * contractually flat strings (existing callers pass array-of-object items), and
+   * this feeds `JSON.stringify` afterward, which already renders `null`/numbers/
+   * booleans correctly on its own — only string leaves need escaping.
+   */
+  private static deepEscapeHtmlValues(value: any): any {
+    if (typeof value === 'string') return AgentModeService.escapeHtml(value);
+    if (Array.isArray(value)) return value.map((v) => AgentModeService.deepEscapeHtmlValues(v));
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, AgentModeService.deepEscapeHtmlValues(v)])
+      );
+    }
+    return value;
+  }
+
   /** Convert inline markdown to HTML string. */
   private static inlineToHtml(text: string): string {
     let result = '';
@@ -31901,12 +31921,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // a value" and "this is the template's own static markup" are still distinguishable
       // — post-hoc sanitizing final_html can't tell the two apart.
       const escapedVariableValuesObj = Object.fromEntries(
-        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.escapeHtml(String(value))])
+        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.deepEscapeHtmlValues(value)])
       );
       const escapedArrayVariableValuesObj = Object.fromEntries(
         Object.entries(arrayVariableValuesObj).map(([key, values]) => [
           key,
-          (values as string[]).map((value) => AgentModeService.escapeHtml(String(value))),
+          AgentModeService.deepEscapeHtmlValues(values),
         ])
       );
 
