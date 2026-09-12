@@ -690,3 +690,6 @@ Cycle 253: this tree and AWS immutable
 do not return two LoadBalancers[*]
 ARNs during Updating. A-006 stays
 discarded.
+Cycle 254: if two ARNs appeared, copy
+ENG-823 pin-all. Do not fail closed
+on count != 1. A-006 stays discarded.

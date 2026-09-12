@@ -824,3 +824,6 @@ reverted. Do not copy that as A-006.
 - Cycle 253: one ALB ARN during Updating,
   not two. Hermes has no
   `LoadBalancers[*]` list. Not A-006.
+- Cycle 254: pin-all, not fail-closed
+  `count != 1`. Hermes has no uniqueness
+  vs pin-all fork. Not A-006.

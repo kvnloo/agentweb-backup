@@ -742,6 +742,10 @@ READY unchanged.
    do not return two `LoadBalancers[*]`
    ARNs during Updating. Do **not** add
    a uniqueness check from A-019.
+   Cycle 254: if two ARNs appeared, copy
+   ENG-823 pin-all. Do **not** fail
+   closed on `count != 1`. Do **not**
+   take `[0]`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

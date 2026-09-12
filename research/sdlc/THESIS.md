@@ -822,3 +822,9 @@ This tree and AWS immutable do not return two
 `LoadBalancers[*]` ARNs during Updating. Tests fixture one
 ARN. SharedLoadBalancer unused. Classic names filtered.
 Not A-019. Not A-020. Not A-006.
+
+## Cycle 254 (pin-all, not fail-closed count != 1)
+
+If two ARNs appeared, copy ENG-823 pin-all. Do not fail
+closed on `count != 1`. Do not take `[0]`. Not A-019.
+Not A-020. Not A-006.
