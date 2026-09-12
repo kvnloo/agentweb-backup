@@ -12,7 +12,8 @@ jest.mock('../services/db', () => ({ userDb: {
   getUserByEmailConsistent: jest.fn(async () => ({ userId: 'eval_test', email: 'test@example.invalid', isActive: true, isAdmin: false })),
 } }));
 jest.mock('../services/evaluationStore', () => {
-  class SandboxTierMissing extends Error {}
+  // Mirrors the real class: the route forwards its message, which names the fix.
+  class SandboxTierMissing extends Error { constructor() { super('The "Sandbox" subscription tier is not defined; run scripts/ensure-sandbox-tier.ts before provisioning.'); } }
   return { SandboxTierMissing, evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn() } };
 });
 
@@ -36,7 +37,7 @@ describe('ENG-1907 sandbox admin routes', () => {
     expect(result.body.userId).toBe('eval_new');
   });
   it('a missing Sandbox tier row is reported as a precondition failure, not a denial or a crash (AC 4)', async () => {
-    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxTierMissing('Sandbox tier missing — run scripts/ensure-sandbox-tier.ts'));
+    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxTierMissing());
     const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
     expect(result.status).toBe(412);
     expect(result.body.error).toContain('ensure-sandbox-tier');
