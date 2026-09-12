@@ -174,6 +174,8 @@ Cycle 255: do not fork `grep '^arn:'` into an `/app/` filter
 from A-019. Do not add A-021.
 Cycle 256: a `net/` XFF modify fails the job. Do not add
 skip-non-app from A-019. Do not add A-021.
+Cycle 257: NLB `xff_*` Describe is `None`, then Modify, then
+fail. Do not add a None-skip from A-019. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

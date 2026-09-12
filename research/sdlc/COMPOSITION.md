@@ -1548,6 +1548,11 @@ the job.** Do not add skip-non-app.
 `fail()` exits 1. Not A-019. Not
 A-020. Not A-006.
 
+Cycle 257: **NLB `xff_*` Describe is
+`None`, then Modify, then fail.** Skip
+is only `current = desired`. Not A-019.
+Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

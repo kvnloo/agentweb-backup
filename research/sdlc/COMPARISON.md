@@ -833,3 +833,6 @@ reverted. Do not copy that as A-006.
 - Cycle 256: `net/` XFF modify fails the
   job. Hermes has no skip-non-app vs
   `fail()`. Not A-006.
+- Cycle 257: NLB Describe of `xff_*` is
+  `None` then Modify. Hermes has no
+  JMESPath None-skip. Not A-006.

@@ -840,3 +840,9 @@ Not A-020. Not A-006.
 Fail the job is the ENG-823 copy. Do not add skip-non-app.
 After-verify fail is cycle 247. Not A-019. Not A-020.
 Not A-006.
+
+## Cycle 257 (None then Modify, then fail)
+
+NLB `xff_*` Describe is `None`, not a Describe error. Skip
+is only `current = desired`. Do not add a None-skip.
+Not A-019. Not A-020. Not A-006.

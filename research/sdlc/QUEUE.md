@@ -751,6 +751,9 @@ READY unchanged.
    Cycle 256: a `net/` XFF modify fails the
    job. Do **not** add skip-non-app from
    A-019.
+   Cycle 257: NLB `xff_*` Describe is `None`,
+   then Modify, then fail. Do **not** add
+   a None-skip from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

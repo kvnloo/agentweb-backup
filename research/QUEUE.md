@@ -699,3 +699,6 @@ discarded.
 Cycle 256: a net/ XFF modify fails the
 job. Do not add skip-non-app. A-006 stays
 discarded.
+Cycle 257: NLB xff_* Describe is None,
+then Modify, then fail. Do not add a
+None-skip. A-006 stays discarded.
