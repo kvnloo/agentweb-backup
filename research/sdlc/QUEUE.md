@@ -713,6 +713,10 @@ READY unchanged.
    Describe on every opted-in backend
    SUCCESS. Do **not** treat already-correct
    as skipping Describe.
+   Cycle 247: a later XFF IAM miss is
+   GitHub-red / prod-green, not an A-019
+   503. Do **not** 503 `/health` because
+   the deploy job is red.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

@@ -664,3 +664,6 @@ called. A-006 stays discarded.
 Cycle 246: an XFF no-op still needs LB
 Describe on every opted-in backend
 SUCCESS. A-006 stays discarded.
+Cycle 247: a later XFF IAM miss is
+GitHub-red / prod-green, not an A-019
+503. A-006 stays discarded.

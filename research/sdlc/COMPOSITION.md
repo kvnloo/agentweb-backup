@@ -1490,6 +1490,11 @@ SUCCESS.** ENG-823 skip is after
 Describe. Partner unset is the only
 zero-call path. Not A-019. Not A-006.
 
+Cycle 247: **a later XFF IAM miss is
+GitHub-red / prod-green, not an A-019
+503.** SUCCESS is logged before the pin.
+No abort. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

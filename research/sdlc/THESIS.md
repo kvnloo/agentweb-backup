@@ -780,3 +780,9 @@ zero tests. Not A-019. Not A-006.
 ENG-823 skip is after Describe. Already-600s still
 Describes. Partner unset is the only zero-call path.
 Not A-019. Not A-006.
+
+## Cycle 247 (XFF IAM miss is GitHub-red / prod-green)
+
+SUCCESS is logged before the pin. `fail()` exits 1 with
+no abort. Hermes is already on the new instance. Not A-019
+503. Not A-006.
