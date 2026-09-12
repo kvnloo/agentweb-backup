@@ -737,3 +737,6 @@ discarded.
 Cycle 269: XFF ERROR| coverage needs delay
 unset. Do not grep only the shared prefix.
 A-006 stays discarded.
+Cycle 270: do not copy the probe classic
+fixture as XFF empty-ARN coverage. A-006
+stays discarded.

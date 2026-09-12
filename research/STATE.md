@@ -7,26 +7,26 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 269
+cycles_completed: 270
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 270
+next_cycle: 271
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 269: XFF ERROR| coverage needs delay
-  unset; grep the XFF clause, not the shared
-  prefix. Cycle 270: classic name (test L796)
-  is the empty-after-grep path (L811). Probe
-  uses it on a Red rollup without delay. Should
-  an XFF empty-ARN test also unset delay,
-  rather than reuse L796's Red+classic fixture?
-  Do not copy the probe classic fixture as XFF
-  empty-ARN coverage. Do not add that pin from
-  A-019. Do not un-park A-020. Do not 503
-  /health. Do not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave briefing_ready.
-  Do not mint a timer unless Kevin asks.
+  Cycle 270: do not copy the probe classic
+  fixture as XFF empty-ARN coverage (Red never
+  reaches main() pins). Cycle 271: mock NONE
+  prints None; classic prints a bare name.
+  Both fail grep ^arn: and hit the same
+  empty-ARN fail(). Should XFF use one
+  empty-ARN string for None and classic,
+  rather than two? Do not split. Do not add
+  that pin from A-019. Do not un-park A-020.
+  Do not 503 /health. Do not add A-021. Do
+  not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. stop_after has passed; leave
+  briefing_ready. Do not mint a timer unless
+  Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -38,7 +38,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–269: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–270: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -73,4 +73,5 @@ XFF empty-ARN `fail()` uses its own string; do not
 copy L811 or probe UNKNOWN. XFF CLI-fail `fail()` uses
 its own string; do not copy L806. XFF `ERROR|` coverage
 needs delay unset; do not grep only the shared prefix.
-A-006 stays discarded.
+Do not copy the probe classic fixture as XFF empty-ARN
+coverage. A-006 stays discarded.

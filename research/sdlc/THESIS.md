@@ -911,3 +911,8 @@ Do not copy L806 or probe UNKNOWN. Keep
 Delay L806 wins if delay is set. Grep the XFF
 clause, not the shared prefix. Not A-019. Not
 A-020. Not A-006.
+
+## Cycle 270 (do not copy probe classic)
+
+Red never reaches `main()` pins. Green + delay
+unset. Not A-019. Not A-020. Not A-006.

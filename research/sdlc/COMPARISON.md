@@ -871,3 +871,6 @@ reverted. Do not copy that as A-006.
 - Cycle 269: XFF ERROR| needs delay unset.
   Hermes has no delay-first mock fork.
   Not A-006.
+- Cycle 270: do not copy probe classic as
+  XFF empty-ARN. Hermes has no Red vs Green
+  pin-fixture fork. Not A-006.
