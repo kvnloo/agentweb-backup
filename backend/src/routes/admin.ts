@@ -787,7 +787,9 @@ router.get("/email-deliverability/mx-sweep", async (_req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
-    const users = await userDb.getAllUsers(hideBotLike);
+    // The partner-portal roster is where Access Portal lives; sandbox (eval_)
+    // accounts must stay reachable here even though every fleet sweep excludes them.
+    const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
     const sanitized = users.map(compactAdminUserForList);
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.

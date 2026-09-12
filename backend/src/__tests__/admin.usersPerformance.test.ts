@@ -201,3 +201,13 @@ it.each(['AW-Users', ...tables])('handles a malformed outer Items collection fro
     expect(result.every(u => u[field] === 0)).toBe(true);
   }
 });
+
+describe('ENG-1907 sandbox accounts stay reachable from the admin roster', () => {
+  it('GET /users includes an eval_ account (Access Portal lives here) while getAllUsers excludes it by default', async () => {
+    const sandbox = { userId: 'eval_take-home', email: 'candidate@example.invalid', displayName: 'Sandbox candidate', roles: ['customer'] };
+    rows['AW-Users'] = [...users.slice(0, 2), sandbox];
+    expect((await userDb.getAllUsers()).map(u => u.userId)).toEqual(['user-0', 'user-1']);
+    const roster = await getAdminUsers();
+    expect(roster.map((u: any) => u.userId)).toEqual(['user-0', 'user-1', 'eval_take-home']);
+  });
+});
