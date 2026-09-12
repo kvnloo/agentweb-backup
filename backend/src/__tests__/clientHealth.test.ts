@@ -82,6 +82,18 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.error).toMatch(/not found/i);
   });
 
+  it('never treats a sandbox principal found by email as a client (ENG-1907)', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, email: 'admin@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'eval_take-home', email: 'candidate@example.invalid', connected_accounts: [] });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([]);
+
+    const result = await assessClientHealth(adminUserId, 'candidate@example.invalid');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not found/i);
+  });
+
   // FAIL test 3: Client has no ad account configured
   it('should report blocked status when client has no ad account', async () => {
     const adminUserId = 'admin-user';

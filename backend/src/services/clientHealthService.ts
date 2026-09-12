@@ -226,6 +226,8 @@ export async function assessClientHealth(
 
     // Look up client by email first, then by name
     let client = await userDb.getUserByEmail(clientNameOrEmail);
+    // ENG-1907: sandbox principals are not clients — same rule as the name match below.
+    if (client && isEvaluationUser(client.userId)) client = undefined;
 
     if (!client) {
       // Try name match
