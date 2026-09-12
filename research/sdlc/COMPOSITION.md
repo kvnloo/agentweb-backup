@@ -1116,6 +1116,20 @@ L443. tryClaim false is 409 SESSION_BUSY
 CallTool handler-entry isError, then wrap
 execute in track() for the wait. Not A-006.
 
+Cycle 211: **Do not drain-gate ListTools.**
+POST `/mcp` (mcpServer.ts L298) has zero
+`isCronEnabled`. ListTools is ungated
+`getToolDefinitions()` (L81–83). initialize
+still `sessions.set` + Dynamo persist
+(L336–359) so ENG-114 rehydrate can serve a
+retry on the new instance. HTTP 503 only
+when the body contains `tools/call` (copy
+anonymousTransport.ts L68–83). JSON-RPC
+`isError` is HTTP 200 — Hermes fixture L84
+asserts 200; SDK 404=reinit vs 400 terminal
+(`mcp.mcpServer.test.ts` L243–249). Wrap
+CallTool in `track()` for the wait. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -57,10 +57,12 @@ Land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).
 
 ## If we only do one architecture thing after #2 and #3
 
-**A-019.** `isCronEnabled` at the CallTool handler **before**
-`execute`, then wrap in `track()` so drain waits. `/generate`
-gets 503 before `tryClaim`. Do not refuse inside `track()`
-(the promise is already running). Do not make `tryClaim`
-return false (that 409s). That is the billed-image drain gate.
-Not A-007 packaging. Not persist (occupied `agentModeService.ts` /
-`app.ts` / `emma/tools.ts`).
+**A-019.** HTTP 503 on POST `/mcp` when the body contains
+`tools/call` (copy `anonymousTransport` batch fail-closed), then
+wrap CallTool in `track()` so drain waits. `/generate` gets 503
+before `tryClaim`. Do **not** drain-gate ListTools or initialize
+(cycle 211). Do not return CallTool `isError` for drain (HTTP 200
+tool-failure). Do not refuse inside `track()` (the promise is
+already running). Do not make `tryClaim` return false (that 409s).
+That is the billed-image drain gate. Not A-007 packaging. Not persist
+(occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

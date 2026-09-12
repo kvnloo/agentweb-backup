@@ -469,3 +469,7 @@ Cycle 210: track() cannot refuse — callers
 pass an already-started Promise. tryClaim
 false is 409 SESSION_BUSY. A-019 refuse is
 handler-entry. A-006 stays discarded.
+Cycle 211: do not drain-gate ListTools or
+initialize. A-019 admission is HTTP 503 on
+POST `/mcp` `tools/call`. JSON-RPC `isError`
+is the wrong face. A-006 stays discarded.

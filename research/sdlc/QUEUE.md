@@ -18,7 +18,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-008 | 29 | **ready** | Folder-move creative cluster + persist unification later |
 | 4 | A-002 | 28 | **ready** | CI import boundary for `loops/core` (**in flight kvnloo#3**) |
-| 5 | A-019 | 27 | **ready** | Refuse CallTool /generate at handler entry; wrap CallTool in `track()` for drain wait |
+| 5 | A-019 | 27 | **ready** | HTTP 503 POST `/mcp` `tools/call` + `/generate`; wrap CallTool in `track()`; do not gate ListTools |
 | — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
@@ -436,6 +436,10 @@ Cycle 210: track() cannot refuse — callers pass
 an already-started Promise (server.ts L301).
 tryClaim false is 409 SESSION_BUSY. A-019
 refuse is handler-entry. Product READY unchanged.
+Cycle 211: do not drain-gate ListTools or
+initialize. A-019 admission is HTTP 503 on
+POST `/mcp` `tools/call` (batch fail-closed),
+not CallTool `isError`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -446,10 +450,12 @@ refuse is handler-entry. Product READY unchanged.
    walk `loops/index.ts` (only `./core/types`). Do **not** copy
    forbid-all-services onto `agentMode/core` or `mcp/server`.
    **In flight: kvnloo#3.**
-2. **A-019** — after kvnloo#2: `if (!isCronEnabled())` at the
-   CallTool handler **before** `execute`, then
-   `track('mcpCallTool', …)` for the drain wait. `/generate`
-   503 like `runScheduledChats` L13031 **before** `tryClaim`.
+2. **A-019** — after kvnloo#2: HTTP 503 on POST `/mcp` when the
+   body contains `tools/call` (copy `anonymousTransport.ts` L68–83
+   batch fail-closed), then `track('mcpCallTool', …)` for the
+   drain wait. `/generate` 503 like `runScheduledChats` L13031
+   **before** `tryClaim`. Do **not** 503 ListTools or initialize.
+   Do **not** return CallTool `isError` for drain (HTTP 200).
    Do **not** refuse inside `track()` (promise already started,
    `server.ts` L301). Do **not** make `tryClaim` return false
    (that 409s `SESSION_BUSY`). Do **not** wrap

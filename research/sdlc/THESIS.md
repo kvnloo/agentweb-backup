@@ -446,6 +446,12 @@ L301). Worker refuse is inside runInWorker
 before work. tryClaim false is 409. CallTool
 handler-entry is the Q-014 image gate. Do
 not wrap registry.execute. Do not add A-021.
+Cycle 211: do not drain-gate ListTools or
+initialize. A-019 admission is HTTP 503 on
+POST `/mcp` `tools/call` (batch fail-closed),
+not CallTool `isError`. Do not hide
+`generate_image` from the list. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

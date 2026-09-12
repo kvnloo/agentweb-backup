@@ -724,6 +724,12 @@ pass an already-started Promise (L301).
 tryClaim false is 409 not 503. CallTool
 handler-entry is the Q-014 image gate.
 A-006 discarded.
+Cycle 211: do not drain-gate ListTools or
+initialize. POST `/mcp` has zero
+`isCronEnabled`. HTTP 503 only when the
+body contains `tools/call`. JSON-RPC
+`isError` is HTTP 200 (wrong face).
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

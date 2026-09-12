@@ -673,3 +673,9 @@ reverted. Do not copy that as A-006.
   Worker refuse is inside runInWorker.
   tryClaim false is 409. CallTool
   handler-entry is the image gate. Not A-006.
+- Cycle 211: Hermes / the MCP SDK key off
+  HTTP status (404 reinit, 400 terminal,
+  fixture asserts 200 on tools/call). Drain
+  `isError` would stay 200. A-019 is HTTP 503
+  on POST `/mcp` `tools/call` only — do not
+  shrink `tools/list` during overlap. Not A-006.
