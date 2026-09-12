@@ -916,3 +916,8 @@ A-020. Not A-006.
 
 Red never reaches `main()` pins. Green + delay
 unset. Not A-019. Not A-020. Not A-006.
+
+## Cycle 271 (one empty-ARN string)
+
+Do not split `None` vs classic. After grep both
+are empty. Not A-019. Not A-020. Not A-006.

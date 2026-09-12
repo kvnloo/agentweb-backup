@@ -1609,6 +1609,10 @@ fixture as XFF empty-ARN coverage.** Red
 never reaches `main()` pins. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 271: **one XFF empty-ARN string for
+`None` and classic.** Do not split. Not
+A-019. Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

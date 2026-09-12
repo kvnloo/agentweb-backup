@@ -790,6 +790,8 @@ READY unchanged.
    Cycle 270: do **not** copy the probe
    classic fixture as XFF empty-ARN
    coverage.
+   Cycle 271: one XFF empty-ARN string for
+   `None` and classic. Do **not** split.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

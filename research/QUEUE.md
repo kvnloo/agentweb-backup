@@ -740,3 +740,6 @@ A-006 stays discarded.
 Cycle 270: do not copy the probe classic
 fixture as XFF empty-ARN coverage. A-006
 stays discarded.
+Cycle 271: one XFF empty-ARN string for None
+and classic. Do not split. A-006 stays
+discarded.

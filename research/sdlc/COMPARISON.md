@@ -874,3 +874,6 @@ reverted. Do not copy that as A-006.
 - Cycle 270: do not copy probe classic as
   XFF empty-ARN. Hermes has no Red vs Green
   pin-fixture fork. Not A-006.
+- Cycle 271: one XFF empty-ARN string for
+  None and classic. Hermes has no None-vs-
+  classic fail-string fork. Not A-006.
