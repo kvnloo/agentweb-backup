@@ -1,3 +1,4 @@
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
@@ -7,7 +8,7 @@ import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
-import { mintDelegateToken } from "../services/delegateAccessToken";
+import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
 import { waitlistDb } from "../services/waitlistDb";
@@ -1893,7 +1894,8 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     //
     // ENG-1596: minting extracted to delegateAccessToken.ts so the MCP tool layer
     // (apiTools.ts) can mint the same shape of token internally, per tool call.
-    const delegateToken = mintDelegateToken(
+    const evaluationTarget = isEvaluationUser(targetUser.userId);
+    const delegateToken = (evaluationTarget ? mintEvaluationDelegateToken : mintDelegateToken)(
       { userId: adminReq.user.userId, email: adminReq.user.email },
       targetUser,
       DELEGATE_TOKEN_TTL,
@@ -1902,9 +1904,14 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     // Return the delegate token and customer portal URL
     const customerPortalUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
 
-    res.json({
+    const accessUrl = evaluationTarget
+      ? new URL('/evaluation', process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`)
+      : null;
+    if (accessUrl) accessUrl.hash = new URLSearchParams({ token: delegateToken }).toString();
+
+    res.set('Cache-Control', 'no-store').json({
       delegateToken,
-      customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
+      customerPortalUrl: accessUrl?.toString() || `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
       expiresIn: DELEGATE_TOKEN_TTL
     });
   } catch (error) {
