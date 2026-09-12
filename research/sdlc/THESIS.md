@@ -851,3 +851,8 @@ Not A-019. Not A-020. Not A-006.
 
 ENG-823 has no pre-Modify value gate. Hook None-fail is
 ASG discovery. Not A-019. Not A-020. Not A-006.
+
+## Cycle 259 (copy ENG-823 None policy)
+
+Four existing None policies. XFF copies ENG-823. Do not
+add a fourth. Not A-019. Not A-020. Not A-006.

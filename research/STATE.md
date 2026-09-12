@@ -7,20 +7,22 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 258
+cycles_completed: 259
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 259
+next_cycle: 260
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 258: do not fail() on ALB XFF
-  Describe None before Modify from A-019.
-  Cycle 259: eb-deploy.sh already has three
-  None policies (events return 0, hook
-  fail, ENG-823 Modify). Health-probe
-  grep -v None is a fourth. Should a later
-  XFF pin copy ENG-823 and ignore the
-  others? Do not add a fourth from A-019.
+  Cycle 259: a later XFF pin copies
+  ENG-823's None policy; do not add a
+  fourth from A-019. Cycle 260: events
+  treats empty string and None as the
+  same no-op. The hook fail-closed uses
+  both -z and = None. ENG-823 special-cases
+  neither; empty != 600 would Modify.
+  Should a later XFF pin treat empty like
+  20 (ENG-823) rather than like hook
+  empty-OR-None? Do not add -z from A-019.
   Do not un-park A-020. Do not 503 /health.
   Do not add A-021. Do not un-ready Q-001 /
   Q-014 / Q-003. Do not revive A-006.
@@ -38,7 +40,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–258: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–259: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -59,4 +61,6 @@ not fail closed on `count != 1`. Do not fork `grep '^arn:'`
 into an `/app/` filter. A `net/` XFF modify fails the job;
 do not add skip-non-app. NLB `xff_*` Describe is `None`,
 then Modify, then fail; do not add a None-skip. Do not
-`fail()` on ALB XFF Describe `None` before Modify. A-006 stays discarded.
+`fail()` on ALB XFF Describe `None` before Modify. A later
+XFF pin copies ENG-823’s None policy; do not add a fourth.
+A-006 stays discarded.

@@ -705,3 +705,6 @@ None-skip. A-006 stays discarded.
 Cycle 258: do not fail() on ALB XFF
 Describe None before Modify. A-006 stays
 discarded.
+Cycle 259: a later XFF pin copies ENG-823
+None policy. Do not add a fourth. A-006
+stays discarded.
