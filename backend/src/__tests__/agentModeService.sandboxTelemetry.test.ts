@@ -82,8 +82,8 @@ import {
   recordAgentModeRunCompleted,
   recordAgentModeRunFailed,
   recordAgentModeClaimCheckError,
-  __resetSandboxTelemetryRunsForTests,
 } from '../services/agentModeService';
+import { __resetSandboxRunsForTests as __resetSandboxTelemetryRunsForTests } from '../services/agentMode/sandboxTelemetry';
 
 const EVAL_USER = 'eval_1d1d1d1d-0000-4000-8000-000000000000';
 const REAL_USER = 'customer-1';
@@ -143,6 +143,18 @@ describe('ENG-1907: sandbox runs write no reliability telemetry', () => {
     expect(fakeRecorder.toolSucceeded).toHaveBeenCalledTimes(1);
     expect(fakeRecorder.toolFailed).toHaveBeenCalledTimes(1);
     expect(fakeRecorder.runCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminal and claim-check events honour the explicit identity even when the marked set lost the run', () => {
+    const runId = 'evicted:run:1';
+    recordAgentModeRunStarted(runId, { llmModel: 'm', userId: EVAL_USER, sessionId: 's', sessionType: 'regular' });
+    __resetSandboxTelemetryRunsForTests(); // simulate the leak-guard eviction
+
+    recordAgentModeClaimCheckError(runId, 's', new Error('judge down'), EVAL_USER);
+    recordAgentModeRunCompleted(runId, { llmModel: 'm', toolCalls: 0, failedToolCalls: 0 } as any, EVAL_USER);
+    recordAgentModeRunFailed(runId, { llmModel: 'm', toolCalls: 0, failedToolCalls: 0, error: new Error('x') } as any, EVAL_USER);
+
+    expect(recorderCallCount()).toBe(0);
   });
 
   it('a sandbox run id does not leak into a later customer run with the same id', () => {
