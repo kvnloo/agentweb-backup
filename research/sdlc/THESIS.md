@@ -719,3 +719,9 @@ drain. Do not `sessionStore.delete` on 503. Not A-006.
 SSE-shaped 503 would not reach `_handleSseStream`. GET 503
 still throws (405 skip only). Copy `runScheduledChats` L13032
 `.json()`. Not A-006.
+
+## Cycle 238 (this tree cannot rewrite JSON 503)
+
+Zero `error_page` / `proxy_intercept_errors` in `.platform`
+(cycle 107). Catch-all `/mcp` nginx is not in git (`app.ts`
+L152–155). Do not add `error_page` from A-019. Not A-006.

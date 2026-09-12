@@ -632,3 +632,6 @@ stays discarded.
 Cycle 237: JSON 503 is enough for
 SDK send(). Do not emit SSE 503.
 A-006 stays discarded.
+Cycle 238: this tree cannot rewrite
+JSON 503. Do not add error_page.
+A-006 stays discarded.

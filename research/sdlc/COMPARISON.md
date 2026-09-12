@@ -768,3 +768,6 @@ reverted. Do not copy that as A-006.
 - Cycle 237: JSON 503 is the
   transport face. SSE 503 would
   not change `send()`. Not A-006.
+- Cycle 238: no `error_page` in
+  git. Hermes sees Node's 503 if
+  nginx pass-throughs. Not A-006.

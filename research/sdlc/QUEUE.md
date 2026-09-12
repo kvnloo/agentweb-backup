@@ -674,6 +674,9 @@ READY unchanged.
    Cycle 237: JSON 503 is enough for
    `send()`. Do **not** emit SSE 503.
    Do **not** add `Retry-After`.
+   Cycle 238: this tree cannot rewrite
+   JSON 503. Do **not** add
+   `error_page`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

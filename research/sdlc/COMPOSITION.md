@@ -1439,6 +1439,12 @@ read after `ok`. SSE 503 still
 throws. Do not emit event-stream
 drain. Not A-006.
 
+Cycle 238: **this tree cannot rewrite
+JSON 503.** Zero `error_page` in
+`.platform`. Unvendored intercept is
+live-AWS-only. Do not add
+`error_page`. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
