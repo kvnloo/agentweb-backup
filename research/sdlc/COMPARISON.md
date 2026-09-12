@@ -452,3 +452,6 @@ reverted. Do not copy that as A-006.
   L1319–1320 vendor MIME discarded at persist. C2PA
   sharp().png() makes the default path honest. Result
   type has no mimeType. Not A-006.
+- Cycle 174: Runway L1400 HTTPS skips L570–572 C2PA+S3;
+  meter already ran. 2 of 8 models. Strip is a second
+  Emma/REST tool, not MCP. Not A-006.

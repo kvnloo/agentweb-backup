@@ -318,6 +318,8 @@ Product READY unchanged.
 Cycle 173: S3 upload always claims image/png; Gemini 3
 vendor MIME discarded at persist. Product READY
 unchanged.
+Cycle 174: Runway HTTPS skips C2PA and S3; meter still
+fires. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

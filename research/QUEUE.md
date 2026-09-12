@@ -348,4 +348,7 @@ Cycle 173: S3 upload L582–587 always image/png. Gemini 3
 vendor MIME on the data URL is discarded. C2PA
 `sharp().png()` makes the default path honest.
 A-006 stays discarded.
+Cycle 174: Runway HTTPS skips C2PA and S3; meter still
+fires. Emma strip + REST exist; MCP has no
+`remove_c2pa`. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

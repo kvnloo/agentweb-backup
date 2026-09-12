@@ -585,6 +585,12 @@ on the data URL; `split(',')[1]` discards it. Default-on
 C2PA `sharp().png()` makes the successful strip honest;
 `removeC2PA: false` or strip fail can lie. Result type
 has no `mimeType`.
+Cycle 174: **Runway HTTPS skips C2PA and S3.** L570–572
+returns vendor URLs; meter already ran. `gen4_image` /
+`gemini_2.5_flash` are 2 of 8 models. Strip exists as
+Emma `remove_c2pa_from_image` + `POST /remove-c2pa`, not
+on MCP. Cycle 36’s L575–578 invariant is after the
+data-URL gate.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

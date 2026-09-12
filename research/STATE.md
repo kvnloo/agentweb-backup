@@ -7,16 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 173
+cycles_completed: 174
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 174
+next_cycle: 175
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 173: S3 upload L582-587 always image/png.
-  Cycle 174: cheapest remaining. Candidate: Runway
-  L1400 returns a URL so L570-572 skip S3 and C2PA.
-  Does C2PA default-on apply to all vendors? File-level.
+  Cycle 174: Runway HTTPS skips C2PA and S3; meter still
+  fires. Cycle 175: cheapest remaining. Candidate:
+  generateWithOpenAI else L534 is unreachable after
+  SUPPORTED_MODELS includes() — dead DALL-E URL sibling
+  of the Runway skip. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

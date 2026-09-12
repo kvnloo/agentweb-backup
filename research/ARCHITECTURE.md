@@ -593,6 +593,9 @@ discarded.
 Cycle 173: S3 upload always image/png. Gemini 3
 data-URL MIME is discarded at persist. A-006
 discarded.
+Cycle 174: Runway HTTPS skips C2PA and S3; meter
+still fires. Cycle 36 L575–578 is after the data-URL
+gate. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

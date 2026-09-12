@@ -807,6 +807,12 @@ successful strip honest; `removeC2PA: false` or strip
 fail can lie. `ImageGenerationResult` has no `mimeType`.
 Not A-006.
 
+Cycle 174: **Runway HTTPS skips C2PA and S3.** L570–572
+`return result` before L575. Meter L551 already fired.
+Tests pin `https://runway.com/image.png`. Emma
+`remove_c2pa_from_image` downloads HTTP; MCP grep empty.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
