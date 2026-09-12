@@ -905,3 +905,9 @@ Not A-020. Not A-006.
 
 Do not copy L806 or probe UNKNOWN. Keep
 `AWS reported:`. Not A-019. Not A-020. Not A-006.
+
+## Cycle 269 (ERROR| needs delay unset)
+
+Delay L806 wins if delay is set. Grep the XFF
+clause, not the shared prefix. Not A-019. Not
+A-020. Not A-006.

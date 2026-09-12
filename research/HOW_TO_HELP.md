@@ -198,6 +198,8 @@ Cycle 267: XFF empty-ARN `fail()` uses its own
 string. Do not copy L811. Do not add A-021.
 Cycle 268: XFF CLI-fail `fail()` uses its own
 string. Do not copy L806. Do not add A-021.
+Cycle 269: XFF `ERROR|` coverage needs delay unset.
+Do not grep only the shared prefix. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

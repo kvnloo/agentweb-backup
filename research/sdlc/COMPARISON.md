@@ -868,3 +868,6 @@ reverted. Do not copy that as A-006.
 - Cycle 268: XFF CLI-fail fail is its own
   string. Hermes has no L806 vs UNKNOWN
   fork. Not A-006.
+- Cycle 269: XFF ERROR| needs delay unset.
+  Hermes has no delay-first mock fork.
+  Not A-006.

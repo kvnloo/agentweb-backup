@@ -1600,6 +1600,10 @@ Cycle 268: **XFF CLI-fail `fail()` uses its
 own string.** Do not copy L806. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 269: **XFF `ERROR|` coverage needs delay
+unset.** Grep the XFF clause. Not A-019.
+Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
