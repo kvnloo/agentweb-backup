@@ -306,6 +306,39 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.success).toBe(false);
     });
 
+    // Round-3 review finding: including '/&/" in the output-verification check made an
+    // ordinary apostrophe in a real name ("O'Brien's Q3") a false-positive trigger if that
+    // short substring coincidentally reappeared anywhere else in the LLM's output — failing
+    // a legitimate report for no real security benefit, since an apostrophe alone (without
+    // a `<`/`>`) cannot construct a new HTML element regardless of where it lands.
+    it('should NOT fail closed on an ordinary apostrophe reappearing elsewhere in the output', async () => {
+      const clientName = "O'Brien's Q3";
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // The client name legitimately appears twice — once as the real
+              // substitution, once incidentally repeated by the model elsewhere.
+              final_html: `<html><body><h1>${clientName}</h1><p>Report for ${clientName}</p></body></html>`,
+              final_subject: `Report: ${clientName}`
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: clientName, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+    });
+
     it('should HTML-escape array variable values before building the substitution prompt', async () => {
       const templateWithArrays = {
         ...mockTemplate,
