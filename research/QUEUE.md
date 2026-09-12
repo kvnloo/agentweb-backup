@@ -605,3 +605,10 @@ ASG bar. socialPosts Min=Max=1
 is a comment. Do not set that
 threshold from A-019. A-006
 stays discarded.
+Cycle 232: Sunday InstanceRefreshEnabled
+is weekly Immutable (AWS), not
+rolling. L4-6 comment is stale.
+Zero RollingUpdateType in git.
+Dying 5xx cannot fail the new
+weekly instances. Do not disable
+refresh. A-006 stays discarded.

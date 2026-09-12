@@ -284,7 +284,8 @@ reverted. Do not copy that as A-006.
   Zero process callers. `LAGGING` is post-terminate. Not a fifth
   `listen()`.
 - Cycle 110: weekly `InstanceRefreshEnabled` overlaps without
-  `eb-deploy.sh`. Same ASG hook, no ENG-878 probe. Not A-006.
+  `eb-deploy.sh`. Cycle 232: AWS weekly immutable, not rolling.
+  No ENG-878 probe. Not A-006.
 - Cycle 111: Sunday + Immutable do not stack. Must be Ready;
   wait 1200s or fail. Hermes/OMP: one process. Not A-006.
 - Cycle 112: 3×1200s settle is not a wait. `fail()` exits
@@ -745,3 +746,8 @@ reverted. Do not copy that as A-006.
   default). Dying 5xx does not
   fail that bar. Hermes has no
   second group. Not A-006.
+- Cycle 232: Sunday
+  `InstanceRefreshEnabled` is
+  weekly Immutable (AWS), not
+  rolling. Hermes/OMP: no weekly
+  pair. Not A-006.

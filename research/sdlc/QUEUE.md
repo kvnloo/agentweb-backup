@@ -168,7 +168,8 @@ not drain. Zero `backend/src` callers. `LAGGING` is post-terminate
 stale Red. Product READY unchanged.
 Cycle 110: weekly refresh (`Sun:10:00`, `InstanceRefreshEnabled`)
 overlaps without `eb-deploy.sh`. A-019’s window is weekly, not
-only on merge. Product READY unchanged.
+only on merge. Cycle 232: that refresh is Immutable (AWS), not
+rolling. Product READY unchanged.
 Cycle 111: Sunday recycle and Immutable do **not** stack a third
 backend. Must be Ready; wait 1200s or fail. Product READY
 unchanged.
@@ -649,6 +650,12 @@ READY unchanged.
    instance. Do **not** set
    `HealthCheckSuccessThreshold`
    from A-019.
+   Cycle 232: Sunday
+   `InstanceRefreshEnabled` is
+   weekly Immutable, not rolling.
+   Do **not** treat the L4–6
+   comment as AWS. Do **not**
+   disable refresh.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

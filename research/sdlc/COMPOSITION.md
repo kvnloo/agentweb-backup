@@ -1395,6 +1395,18 @@ temporary ASG bar
 threshold). ENG-878 Red is after
 the old row is gone. Not A-006.
 
+Cycle 232: **Sunday
+`InstanceRefreshEnabled` is
+weekly Immutable, not rolling.**
+AWS managed-updates page, not
+the L4–6 comment. Zero
+`RollingUpdateType` in this tree.
+New weekly instances take the
+same `Ok` bar as merge Immutable
+(cycle 231). Sunday still never
+calls `eb-deploy.sh` (cycle 110).
+Park A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

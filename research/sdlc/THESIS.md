@@ -166,8 +166,10 @@ Cycle 112: 3×1200s is not a wait. Settle expiry `fail()`s
 (`exit 1`); the 2700s total budget caps retries. Not a
 3600s third clock.
 Cycle 113: last deploy’s hook is on the ASG Immutable then
-discards. Sunday recycle is rolling on the surviving group
-with no hook. Park A-020 (second put after verify). Not
+discards. Sunday recycle never calls `eb-deploy.sh` (A-020).
+Cycle 232: AWS `InstanceRefreshEnabled` is weekly immutable, not
+rolling; the L4–6 comment was the cycle 110/113 shorthand.
+Park A-020 (second put after verify). Not
 `.ebextensions` (ENG-818).
 Cycle 114: the guard still drains on two IMDS `Terminated`
 reads without a hook. ASG does not wait. 3m19s is overlap,
@@ -667,3 +669,15 @@ wait on the **new** instance. Environment Red after the old row
 is gone is ENG-878 lag (`eb-deploy.sh` L251–257), not overlap
 5xx failing the new Ok. `socialPosts.ts` L16–21 is a comment.
 A-006 stays discarded.
+
+## Cycle 232 (Sunday refresh is Immutable, not rolling)
+
+AWS: `InstanceRefreshEnabled` runs an **immutable update every
+week**, with or without a platform version. Managed updates
+always use immutable overlap (new set beside old; terminate
+old if the new set passes). `05-instance-recycling.config` L4–6
+“rolling” is a stale comment. Zero `RollingUpdateType` in git.
+Cycle 110/113 “rolling on the surviving ASG” was that comment.
+Dying 5xx still cannot fail the new Ok (cycle 231). Sunday
+still never calls `eb-deploy.sh` (A-020 stays park). Not a
+fifth `listen()`.

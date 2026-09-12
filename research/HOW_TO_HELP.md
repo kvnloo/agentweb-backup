@@ -116,6 +116,9 @@ Cycle 230: A-019 `tools/call` 503 is Application 5xx color, not
 Wait replace. Do not set `HealthCheckType: ELB`. Do not 503
 `/health`. Cycle 231: dying 5xx does not fail the new Immutable
 instance. Do not set `HealthCheckSuccessThreshold` from A-019.
+Cycle 232: Sunday `InstanceRefreshEnabled` is weekly Immutable,
+not rolling (`05-instance-recycling.config` L4–6 comment is stale).
+Do not disable refresh. Do not set `HealthCheckSuccessThreshold`.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

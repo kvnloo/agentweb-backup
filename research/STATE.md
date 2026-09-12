@@ -7,30 +7,29 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 231
+cycles_completed: 232
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 232
+next_cycle: 233
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 231: dying-instance 5xx does
-  not fail the NEW Immutable instance.
-  HealthCheckSuccessThreshold unset
-  (default Ok) is the temporary ASG
-  bar. socialPosts Min=Max=1 is a
-  comment. Cycle 232: Sunday
-  InstanceRefreshEnabled is rolling
-  on the surviving ASG (cycle 110),
-  not a temp group. Can old-instance
-  Application 5xx fail that rolling
-  batch? Do not disable refresh. Do
-  not set HealthCheckSuccessThreshold.
-  Do not 503 /health. Do not add
-  A-021. Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave
-  briefing_ready. Do not mint a
-  timer unless Kevin asks.
+  Cycle 232: Sunday InstanceRefreshEnabled
+  is weekly Immutable (AWS), not rolling.
+  L4-6 comment is stale. Zero rolling-
+  update namespace in git. Dying 5xx
+  cannot fail the new weekly instances
+  (same as 231). Cycle 233: if the hook
+  is missing on Sunday (A-020), does
+  A-019 still 503 via SIGTERM
+  gracefulShutdown (cycle 115 / 213)
+  so 5xx happens without Wait? Do not
+  add .platform systemd. Do not restore
+  07-termination-lifecycle.config
+  (ENG-818). Do not add A-021. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. stop_after has
+  passed; leave briefing_ready. Do not
+  mint a timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -43,4 +42,6 @@ Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
 order. Cycle 230: A-019 503 is not a Wait replace. Cycle 231: dying
-5xx does not fail the new Immutable instance. A-006 stays discarded.
+5xx does not fail the new Immutable instance. Cycle 232: Sunday
+`InstanceRefreshEnabled` is weekly Immutable, not rolling. A-006
+stays discarded.
