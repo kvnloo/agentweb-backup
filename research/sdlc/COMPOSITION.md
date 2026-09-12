@@ -900,6 +900,14 @@ L3 imports the helper unused; L117 HEADs with a
 second client for MIME. Helpers have zero `Tagging`.
 Hermes MEDIA tags are read by the gateway. Not A-006.
 
+Cycle 185: **Helpers omit `CacheControl`.** PutObject
+params L269–279 / L345–355 have no CacheControl.
+`filesController.ts` L379 (HTML form save) is the
+README subject. README L1537 / L1553 / L1577 / L1682
+assume origin `max-age=60`. Thumbnail L35 is the
+only S3 `CacheControl`. `serveAsset` L124 hardcodes
+300s on HTTP. Glob `**/*cloudfront*` empty. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

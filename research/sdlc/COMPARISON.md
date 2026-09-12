@@ -504,3 +504,9 @@ reverted. Do not copy that as A-006.
   imports getS3ObjectMetadata unused; L117 HEADs for
   MIME. Helpers have zero Tagging. Hermes MEDIA tags
   are read. Not A-006.
+- Cycle 185: helpers omit CacheControl (s3Utils L269-279
+  / L345-355). filesController L379 is the README HTML
+  form save. README L1537 max-age=60 is CLI copy-object
+  (L1553). Thumbnail L35 is the only PutObject
+  CacheControl (immutable 1y). CloudFront function is a
+  README snippet; glob **/*cloudfront* empty. Not A-006.

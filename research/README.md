@@ -644,6 +644,10 @@ Cycle 184: **`uploaded-by` is write-only.** HEAD
 callers use `ContentType` / `ContentLength`.
 `assetController` imports `getS3ObjectMetadata` and
 never calls it. Helpers set no `Tagging`.
+Cycle 185: **Helpers omit `CacheControl`.** HTML-form
+save (`filesController` L379) is the README’s subject
+and still omits it. README L1537’s `max-age=60` is a
+CLI `copy-object`. Thumbnail L35 is immutable 1y.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -628,6 +628,9 @@ constant on both S3 helpers. Thumbnail writer tells
 the truth. A-006 discarded.
 Cycle 184: uploaded-by is write-only. HEAD is for
 ContentType. No Tagging. A-006 discarded.
+Cycle 185: helpers omit CacheControl. README 60s is
+CLI copy-object. Thumbnail is immutable 1y. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
