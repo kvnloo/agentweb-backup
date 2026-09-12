@@ -410,4 +410,7 @@ A-006 stays discarded.
 Cycle 192: repair axios.gets S3. Same class
 already SDK-streams and presigns. A-006 stays
 discarded.
+Cycle 193: Emma C2PA/background advertise S3;
+tests pin Path C. REST only for C2PA. MCP empty.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

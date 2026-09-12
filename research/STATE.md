@@ -7,21 +7,23 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 192
+cycles_completed: 193
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 193
+next_cycle: 194
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 192: repair axios.gets S3; same class already
-  has SDK stream (L28631) and presign (L9327).
-  Cycle 193: cheapest remaining. Candidate:
-  removeC2PAFromImage L29538 and removeImageBackground
-  L29660 are the same Path C on Emma image tools.
-  File-level. A-011 parks field unify — do not add
-  A-021. Do not un-ready Q-001 / Q-014 / Q-003.
-  Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 193: Emma C2PA/background advertise S3;
+  tests pin Path C axios.get of path-style S3.
+  Cycle 194: cheapest remaining. Candidate:
+  processInputImage (imageGeneration.ts L816) is
+  the same Path C axios used by Gemini/Runway edits.
+  Azure skips it (cycle 171). Q-014 input_images of
+  a private S3 object hits this helper. File-level.
+  A-011 parks field unify — do not add A-021.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

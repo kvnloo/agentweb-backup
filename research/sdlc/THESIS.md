@@ -377,6 +377,9 @@ Do not add A-021.
 Cycle 192: repair axios.gets S3 (L30316 / L30547).
 Same class already SDK-streams and presigns.
 Do not add A-021.
+Cycle 193: Emma C2PA/background advertise S3 URL;
+tests pin Path C axios.get of path-style S3.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

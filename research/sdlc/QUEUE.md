@@ -371,6 +371,9 @@ env bucket. Product READY unchanged.
 Cycle 192: repair axios.gets S3. Same class
 already SDK-streams (L28631) and presigns
 (L9327). Product READY unchanged.
+Cycle 193: Emma C2PA/background advertise S3;
+C2PA test pins Path C on path-style S3. REST
+only for C2PA. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -981,6 +981,14 @@ fetchable. Path C is the private-object miss.
 Tests mock axios. Siblings: `removeC2PAFromImage`
 L29538, `removeImageBackground` L29660. Not A-006.
 
+Cycle 193: **Emma C2PA/background advertise S3.**
+Schema L4936 / L4969. Data URL skips axios. C2PA
+test L143–163 pins `axios.get` of path-style
+`s3.amazonaws.com/bucket/…`. Write `uploadFileToS3`
+L29585 / L29705. REST `POST /remove-c2pa` L216
+metered; no emmaApi for background. MCP grep empty.
+Axios shape = `processInputImage` L816. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

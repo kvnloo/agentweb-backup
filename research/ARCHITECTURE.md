@@ -657,6 +657,10 @@ Cycle 192: repair `axios.get`s S3 (L30316 / L30547).
 Same class already SDK-streams (L28631) and
 presigns (L9327). filesController L35: no public
 access needed. A-006 discarded.
+Cycle 193: Emma C2PA/background advertise S3 URL;
+C2PA test pins axios.get of path-style S3.
+Write is uploadFileToS3. REST only for C2PA. MCP
+empty. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

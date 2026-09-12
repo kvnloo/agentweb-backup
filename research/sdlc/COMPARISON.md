@@ -559,3 +559,11 @@ reverted. Do not copy that as A-006.
   L9304: some screenshot URLs are fetchable.
   Path C fails when the object is private. Hermes
   one persist, one fetch. Not A-006.
+- Cycle 193: Emma remove_c2pa / remove_image_background
+  advertise S3 URL (emma/tools.ts L4936 / L4969).
+  C2PA test L143 pins axios.get of
+  https://s3.amazonaws.com/bucket/… Write is
+  uploadFileToS3. POST /remove-c2pa metered; no
+  REST for background. MCP grep empty. Same axios
+  shape as processInputImage L816. Hermes one
+  fetch. Not A-006.
