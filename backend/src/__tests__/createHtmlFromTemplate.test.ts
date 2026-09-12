@@ -274,6 +274,38 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(promptContent).toContain('&#39; onerror=&#39;alert(1)');
     });
 
+    // Escaping the PROMPT only proves the request was safe — it says nothing about
+    // whether the LLM actually reproduced the escaped form rather than "cleaning up"
+    // what looked like a stray HTML entity. This simulates exactly that failure: the
+    // model is asked to escape but the mocked response leaks the raw value anyway.
+    it('should fail closed if the LLM reproduces a raw, unescaped value in its output', async () => {
+      const maliciousTitle = '<script>alert(1)</script>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // Simulates a misbehaving model that decoded the escaped entity back
+              // to raw HTML instead of reproducing it as sent.
+              final_html: `<html><body><h1>${maliciousTitle}</h1><p>Test Content</p></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+    });
+
     it('should HTML-escape array variable values before building the substitution prompt', async () => {
       const templateWithArrays = {
         ...mockTemplate,
