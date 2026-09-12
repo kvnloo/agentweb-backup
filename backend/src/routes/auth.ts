@@ -12,6 +12,7 @@ import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
+import { isEvaluationUser, requireActiveEvaluation } from '../services/evaluationPolicy';
 
 const router = express.Router();
 
@@ -60,6 +61,17 @@ router.get('/me', authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ message: 'User not authenticated' });
     }
+    // A sandbox principal (ENG-1907) gets the one field the portal needs for its
+    // "Sandbox" pill; a revoked or expired sandbox must not receive a normal profile.
+    let sandboxInfo: { isSandbox: true; label: string; expiresAt: number } | undefined;
+    if (isEvaluationUser(userId)) {
+      try {
+        const record = await requireActiveEvaluation(userId);
+        sandboxInfo = { isSandbox: true, label: 'Sandbox', expiresAt: record.expiresAt };
+      } catch {
+        return res.status(401).json({ code: 'session_invalid', message: 'Invalid token' });
+      }
+    }
     const user = await userDb.getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -69,6 +81,7 @@ router.get('/me', authenticateToken, async (req, res) => {
 
     // Add delegation information if this is a delegate session
     const response: any = userWithoutPassword;
+    if (sandboxInfo) response.sandboxInfo = sandboxInfo;
     if (authenticatedReq.delegateInfo) {
       response.delegateInfo = {
         isDelegated: true,

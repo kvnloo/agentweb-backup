@@ -3,7 +3,6 @@ import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { evaluationHttpBoundary } from '../middleware/evaluation';
 import { authenticateToken } from '../middleware/auth';
-import { evaluationRoutes, evaluationAdminRoutes } from '../routes/evaluation';
 import { evaluationStore } from '../services/evaluationStore';
 import { userDb } from '../services/db';
 import { mintDelegateToken } from '../services/delegateAccessToken';
@@ -11,16 +10,19 @@ import { mintDelegateToken } from '../services/delegateAccessToken';
 const secret = 'synthetic-evaluation-delegation-secret';
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'synthetic-evaluation-delegation-secret' }));
 jest.mock('../services/db', () => ({ userDb: { getUserByIdConsistent: jest.fn(), getUserByEmailConsistent: jest.fn() } }));
-jest.mock('../services/evaluationService', () => ({ runEvaluation: jest.fn() }));
-jest.mock('../services/evaluationStore', () => ({ evaluationStore: { get: jest.fn(), simulate: jest.fn(), provision: jest.fn(), revoke: jest.fn() } }));
+jest.mock('../services/evaluationStore', () => ({ evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn() } }));
 
+/**
+ * ENG-1907 AC5: Admin → Access Portal opens the sandbox account in the REAL
+ * customer portal. The evaluation-scoped delegate authenticates as the
+ * candidate on ordinary portal routes, stays inside the sandbox denylist, and
+ * fails closed on every revocation signal (ENG-1870 criteria 7 and 5).
+ */
 const claims = { userId: 'eval_test', email: 'candidate@example.invalid', isAdmin: false, dte: 2, sv: 3,
   delegateAccess: { scope: 'evaluation', adminUserId: 'admin', adminEmail: 'admin@example.invalid', targetUserId: 'eval_test', targetEmail: 'candidate@example.invalid' } };
 const token = (override = {}, expiresIn = 3600) => jwt.sign({ ...claims, ...override }, secret, { expiresIn });
 const app = express();
 app.use(express.json(), evaluationHttpBoundary);
-app.use('/api/evaluation', evaluationRoutes);
-app.use('/api/admin/evaluations', evaluationAdminRoutes);
 app.get('/api/auth/me', authenticateToken, (req: any, res) => res.json({ user: req.user, delegated: req.delegateInfo?.isDelegated }));
 app.use((_req, res) => res.json({ escaped: true }));
 
@@ -28,22 +30,20 @@ beforeEach(() => {
   jest.clearAllMocks();
   (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({ userId: 'admin', email: 'admin@example.invalid', isAdmin: true, isActive: true });
   (userDb.getUserByEmailConsistent as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: claims.email, isActive: true, delegateTokenEpoch: 2, sessionVersion: 3 });
-  (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: claims.email, status: 'active', expiresAt: Date.now() + 60000, remaining: 5, materials: [] });
-  (evaluationStore.simulate as jest.Mock).mockResolvedValue({ ok: true });
+  (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: claims.email, status: 'active', expiresAt: Date.now() + 60000 });
 });
 
 it('authenticates the scoped delegate as the candidate, never as admin', async () => {
   const result = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token()}`);
   expect(result.status).toBe(200);
   expect(result.body).toMatchObject({ user: { userId: 'eval_test', isAdmin: false }, delegated: true });
-  expect((await request(app).get('/api/evaluation').set('Authorization', `Bearer ${token()}`)).status).toBe(200);
 });
-it('allows candidate simulator reset/reseed with the scoped delegate', async () => {
-  const result = await request(app).post('/api/evaluation').set('Authorization', `Bearer ${token()}`).send({ action: 'simulate', command: { operation: 'reset' } });
+it.each(['/api/agent-mode/generate', '/api/agent-mode/sessions', '/api/brand', '/api/meta/ad-performance', '/api/user-work-plans'])('the scoped delegate reaches the ordinary portal route %s', async path => {
+  const result = await request(app).post(path).set('Authorization', `Bearer ${token()}`).send({});
   expect(result.status).toBe(200);
-  expect(evaluationStore.simulate).toHaveBeenCalledWith('eval_test', { operation: 'reset' });
+  expect(result.body).toEqual({ escaped: true });
 });
-it.each(['/api/admin/evaluations', '/api/admin/evaluations/eval_test/revoke', '/api/admin/users/customer/delegate-access', '/api/meta/campaigns', '/api/oauth/meta/connect', '/api/mcp-servers', '/api/agent-mode/generate', '/api/schedules', '/api/landing-pages/deploy', '/api/future/unknown'])('scoped delegation denies %s', async path => {
+it.each(['/api/admin/evaluations', '/api/admin/evaluations/eval_test/revoke', '/api/admin/users/customer/delegate-access', '/api/oauth/meta/connect-ad-accounts', '/api/admin/mcp-servers', '/api/stripe/checkout', '/api/org/invite', '/api/agent-mode/share', '/api/evaluation'])('scoped delegation is denied on %s', async path => {
   const result = await request(app).post(path).set('Authorization', `Bearer ${token()}`).send({});
   expect(result.status).toBe(403);
   expect(result.body.escaped).toBeUndefined();
@@ -63,7 +63,9 @@ it.each(['invalid', 'expired', 'delegate-revoked', 'session-revoked', 'evaluatio
   if (kind === 'wrong-target') bearer = token({ delegateAccess: { ...claims.delegateAccess, targetUserId: 'customer' } });
   if (kind === 'evaluation-admin') bearer = token({ delegateAccess: { ...claims.delegateAccess, adminUserId: 'eval_admin' } });
   if (kind === 'service') bearer = token({ _svc: true });
-  expect((await request(app).get('/api/evaluation').set('Authorization', `Bearer ${bearer}`)).status).toBe(401);
+  // /api/auth/me carries authenticateToken, so a non-evaluation-shaped garbage
+  // bearer is refused by ordinary auth and every evaluation-shaped one by the boundary.
+  expect((await request(app).get('/api/auth/me').set('Authorization', `Bearer ${bearer}`)).status).toBe(401);
 });
 it('generic minting continues to deny evaluation targets and actors', () => {
   expect(() => mintDelegateToken({ userId: 'admin', email: 'admin@example.invalid' }, { userId: 'eval_test' }, '8h')).toThrow();
