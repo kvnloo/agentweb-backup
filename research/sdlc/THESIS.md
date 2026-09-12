@@ -275,6 +275,9 @@ Cycle 151: ClickUp docs “search” is list-all then
 Cycle 152: `listTasks` enriches attachments (`clickupService.ts`
 L219–258); search only uses name+description. Do not add
 A-021.
+Cycle 153: `readDocContent` runs before `includes()` (L24155
+vs L24156). Name miss still pays the page tree. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

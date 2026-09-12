@@ -537,6 +537,9 @@ Cycle 151: ClickUp docs “search” is list-all then
 discarded.
 Cycle 152: `listTasks` enriches attachments; search only uses
 name+description. A-006 discarded.
+Cycle 153: `readDocContent` lists pages and may GET each page
+before `includes()`; `nameMatch` does not skip the fetch.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -292,4 +292,7 @@ Cycle 151: ClickUp docs “search” is list-all then
 stays discarded.
 Cycle 152: `listTasks` enriches attachments; search only uses
 name+description. A-006 stays discarded.
+Cycle 153: `readDocContent` lists pages and may GET each page
+before `includes()`; `nameMatch` does not skip the fetch.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -490,6 +490,10 @@ them.** `clickupService.ts` L219–258 `getTask`s in batches
 of 10. Search L24194–24196 uses name+description only. List
 tool L24887 uses `attachmentCount`. One adapter, two
 contracts. Not a fifth hop.
+Cycle 153: **`readDocContent` runs before `includes()`.**
+L24155 computes `nameMatch`; L24156 always fetches pages
+(`clickupService.ts` L137–165). Name miss still pays the
+page tree. Drive reads hits only (L24104–24109).
 
 ### 4. Hermes / Oh My Pi vs this tree
 

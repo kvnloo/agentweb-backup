@@ -271,6 +271,9 @@ Cycle 151: ClickUp docs “search” is list-all then
 READY unchanged.
 Cycle 152: `listTasks` enriches attachments; search only uses
 name+description. Product READY unchanged.
+Cycle 153: `readDocContent` runs before `includes()`;
+`nameMatch` does not skip the fetch. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -377,3 +377,6 @@ reverted. Do not copy that as A-006.
 - Cycle 152: listTasks enriches attachments (L219-258);
   search only uses name+description (L24194-24196). List
   tool uses attachmentCount (L24887). Not A-006.
+- Cycle 153: readDocContent lists pages then may GET each
+  (L137-165) before includes(); nameMatch L24155 does not
+  skip the fetch. Drive reads hits only. Not A-006.
