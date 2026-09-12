@@ -448,3 +448,7 @@ reverted. Do not copy that as A-006.
   (30s / UA / SVG). Gemini/Runway use the helper. Not A-006.
 - Cycle 172: Azure FormData contentType image/png always
   (L662). Gemini/Runway pass sniffed MIME. Not A-006.
+- Cycle 173: S3 upload L582–587 always image/png. Gemini 3
+  L1319–1320 vendor MIME discarded at persist. C2PA
+  sharp().png() makes the default path honest. Result
+  type has no mimeType. Not A-006.

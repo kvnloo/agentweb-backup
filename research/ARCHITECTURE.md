@@ -590,6 +590,9 @@ Cycle 171: Azure edit skips processInputImage. A-006
 discarded.
 Cycle 172: Azure FormData always image/png. A-006
 discarded.
+Cycle 173: S3 upload always image/png. Gemini 3
+data-URL MIME is discarded at persist. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

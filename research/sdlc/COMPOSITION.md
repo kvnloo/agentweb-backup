@@ -799,6 +799,14 @@ Cycle 172: **Azure FormData always `image/png`.** L660–
 prefix. Same silent-lie class as cycle 169 `[0]`. Not
 A-006.
 
+Cycle 173: **S3 persist always `image/png`.** L582–587
+literal. Gemini 3 L1319–1320 is the only vendor path
+that puts MIME on the data URL; `split(',')[1]`
+throws it away. C2PA L116–124 `sharp().png()` makes the
+successful strip honest; `removeC2PA: false` or strip
+fail can lie. `ImageGenerationResult` has no `mimeType`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

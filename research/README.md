@@ -579,6 +579,12 @@ are already raster (ENG-933); explicit URLs are not.
 Cycle 172: **Azure FormData always claims `image/png`.**
 L660–662. Gemini/Runway send `processedImage.mimeType`.
 Two silent lies on the same vendor path as cycle 169.
+Cycle 173: **S3 upload always claims `image/png`.**
+L582–587 literal. Gemini 3 L1319–1320 puts vendor MIME
+on the data URL; `split(',')[1]` discards it. Default-on
+C2PA `sharp().png()` makes the successful strip honest;
+`removeC2PA: false` or strip fail can lie. Result type
+has no `mimeType`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

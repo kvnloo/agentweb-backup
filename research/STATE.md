@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 172
+cycles_completed: 173
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 173
+next_cycle: 174
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 172: Azure FormData always claims image/png.
-  Cycle 173: cheapest remaining. Candidate: S3 upload
-  L582-587 always image/png — true for Azure output
-  (b64 png), lie for a vendor that returned JPEG?
-  File-level. A-011 parks field unify — do not add A-021.
+  Cycle 173: S3 upload L582-587 always image/png.
+  Cycle 174: cheapest remaining. Candidate: Runway
+  L1400 returns a URL so L570-572 skip S3 and C2PA.
+  Does C2PA default-on apply to all vendors? File-level.
+  A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
