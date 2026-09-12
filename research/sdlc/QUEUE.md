@@ -384,6 +384,9 @@ Q-016 parked. Product READY unchanged.
 Cycle 196: generateKeyframes persist-then-Path-C
 is Veo-only; Seedance ignores useKeyframes.
 Q-016 parked. Product READY unchanged.
+Cycle 197: character referenceImageUrl is Path D
+on Seedance default (generate_image URL as startFrame).
+Q-016 parked. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

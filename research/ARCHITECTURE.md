@@ -674,6 +674,10 @@ Cycle 196: generateKeyframes persist-then-Path-C
 is Veo-only. Seedance ignores useKeyframes. Fallback
 can bill N+1 Gemini 3 images then Path-C GET private
 S3. Q-016 parked. A-006 discarded.
+Cycle 197: character referenceImageUrl is Path D on
+the Seedance default. Emma create_character stores the
+generate_image S3 URL; media_import_url vendor-fetches
+it. Q-016 parked. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -588,3 +588,9 @@ reverted. Do not copy that as A-006.
   useKeyframes is Veo multi-clip only; Seedance
   never reads it. Tests grep empty. Hermes pass
   bytes, not persist-then-HTTP. Not A-006.
+- Cycle 197: character referenceImageUrl is Path D
+  on Seedance default. Emma L5436 requires the
+  generate_image S3 URL; L5385 pass as startFrame.
+  media_import_url L827 vendor-fetches. Execute
+  L5451 hardcodes empty key. Tests pin example.com.
+  Hermes one persist, pass bytes. Not A-006.

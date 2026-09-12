@@ -422,4 +422,7 @@ Q-016 stays parked. A-006 stays discarded.
 Cycle 196: generateKeyframes persist-then-Path-C
 is Veo-only; Seedance ignores useKeyframes.
 Q-016 stays parked. A-006 stays discarded.
+Cycle 197: character referenceImageUrl is Path D
+on Seedance default. Q-016 stays parked.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

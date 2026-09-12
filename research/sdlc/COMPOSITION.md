@@ -1015,6 +1015,14 @@ ignores it; fallback L1000 can suddenly bill N+1
 images. Tests grep empty. REST omits the flag.
 Q-016 parked. Not A-006.
 
+Cycle 197: **Character `referenceImageUrl` is Path D
+on the Seedance default.** Emma `create_character`
+L5436 requires the `generate_image` S3 URL; L5385
+pass as `startFrame`. `media_import_url` L827 vendor-
+fetches. Execute L5451 `referenceImageKey: ''`. REST
+upload L51 stores the key. MCP grep empty. Tests pin
+`example.com`. Q-016 parked. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

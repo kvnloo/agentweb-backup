@@ -7,20 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 196
+cycles_completed: 197
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 197
+next_cycle: 198
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 196: generateKeyframes persist-then-Path-C
-  is Veo-only; Seedance ignores useKeyframes.
-  Cycle 197: cheapest remaining. Candidate:
-  brand-guide matcher L15132 includes('.s3.').
-  Or Higgsfield media_import_url of character
-  referenceImageUrl (Emma L5385) — Path D.
-  File-level. A-011 parks field unify — do not add
-  A-021. Do not un-ready Q-001 / Q-014 / Q-003.
+  Cycle 197: character referenceImageUrl is Path D
+  on Seedance default (generate_image URL as startFrame).
+  Cycle 198: cheapest remaining. Candidate:
+  brand-guide matcher L15132 includes('.s3.') —
+  Family A path-style s3.amazonaws.com misses it.
+  File-level. Occupied agentModeService.ts pile.
+  A-011 parks field unify — do not add A-021.
+  Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,
   unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
