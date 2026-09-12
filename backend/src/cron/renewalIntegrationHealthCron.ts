@@ -148,7 +148,10 @@ function describeCustomerOutcome(user: any): string {
     case 'onboarding_event':
       return 'paid_ads goal selected during onboarding';
     case null:
-      return 'no stated goal on record (flagged via onboarding event history)';
+      // Should never happen from the would_flag path (see doc comment above) -- if a
+      // future regression ever reaches this, say so honestly rather than falsely
+      // claiming one of the three signals matched when none did.
+      return 'no paid-ads intent signal found on record (this should not be possible here)';
   }
 }
 

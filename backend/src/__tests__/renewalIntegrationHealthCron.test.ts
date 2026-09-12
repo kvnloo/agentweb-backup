@@ -456,6 +456,22 @@ describe('runRenewalIntegrationHealthCheck', () => {
       expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
     });
 
+    /**
+     * Second review round of PR #2875 found this gap: the existing "stale goal"
+     * regression test always paired an unrelated `goal` with a real matching
+     * `emmaHelpInterests`, so it only proved the ALERT TEXT correctly ignored the
+     * stale goal -- never that a stale, unrelated goal ALONE (no other signal at
+     * all) correctly produces no flag whatsoever. `hasPaidAdsIntent`'s strict
+     * `=== 'paid_ads'` check already makes this correct; this is the missing proof.
+     */
+    it('skipped_no_paid_ads_intent: a truthy but unrelated goal alone never counts as intent', async () => {
+      const evaluation = await evaluateRenewalIntegrationHealth(
+        user({ goal: 'seo', emmaHelpInterests: [], connected_accounts: [] }),
+      );
+      expect(evaluation.decision).toBe('skipped_no_paid_ads_intent');
+      expect(evaluation.hasPaidAdsIntent).toBe(false);
+    });
+
     it('skipped_healthy_integration: paid-ads intent, but already has a healthy connection', async () => {
       const evaluation = await evaluateRenewalIntegrationHealth(
         user({ connected_accounts: [adAccount({ expiresAt: NOW + 30 * DAY_MS })] }),
