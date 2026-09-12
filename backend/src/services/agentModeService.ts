@@ -32069,9 +32069,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // request was safe. A false positive is possible if a raw dangerous substring
       // coincidentally already existed in the template's own static markup, but a
       // blocked report is a far better failure mode here than a silently reopened
-      // injection.
+      // injection. Case-insensitive: a model reproducing `<SCRIPT>` instead of
+      // `<script>` is still a browser-executable tag — an exact-case match would
+      // let that trivial reformatting evade detection entirely.
+      const finalHtmlLower = finalHtml.toLowerCase();
+      const finalSubjectLower = finalSubject.toLowerCase();
       for (const rawValue of dangerousRawValues) {
-        if (finalHtml.includes(rawValue) || finalSubject.includes(rawValue)) {
+        const rawValueLower = rawValue.toLowerCase();
+        if (finalHtmlLower.includes(rawValueLower) || finalSubjectLower.includes(rawValueLower)) {
           throw new Error(
             'ENG-1877: LLM substitution reproduced a raw, unescaped value in its output — refusing to return unverified HTML'
           );
