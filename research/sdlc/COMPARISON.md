@@ -862,3 +862,6 @@ reverted. Do not copy that as A-006.
 - Cycle 266: XFF rediscovers after skip.
   Hermes has no duplicated-Describe vs
   shared-helper fork. Not A-006.
+- Cycle 267: XFF empty-ARN fail is its own
+  string. Hermes has no L811 vs UNKNOWN
+  fork. Not A-006.

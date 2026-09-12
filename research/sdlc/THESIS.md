@@ -895,3 +895,8 @@ Not A-019. Not A-020. Not A-006.
 Do not share LB discovery from `main()`. Probe vs
 delay already disagree fail vs UNKNOWN. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 267 (empty-ARN fail own string)
+
+Do not copy L811 or probe UNKNOWN. Not A-019.
+Not A-020. Not A-006.

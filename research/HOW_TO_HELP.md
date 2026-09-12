@@ -194,6 +194,8 @@ Cycle 265: delay first in `main()`. Do not reorder
 delay behind XFF. Do not add A-021.
 Cycle 266: XFF rediscovers after its own skip.
 Do not share from `main()`. Do not add A-021.
+Cycle 267: XFF empty-ARN `fail()` uses its own
+string. Do not copy L811. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

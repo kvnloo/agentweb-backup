@@ -778,6 +778,9 @@ READY unchanged.
    Cycle 266: XFF rediscovers after its own
    skip. Do **not** share LB discovery from
    `main()`.
+   Cycle 267: XFF empty-ARN `fail()` uses
+   its own string. Do **not** copy L811 or
+   probe UNKNOWN.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

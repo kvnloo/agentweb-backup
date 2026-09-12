@@ -728,3 +728,6 @@ discarded.
 Cycle 266: XFF rediscovers after its own
 skip. Do not share from main(). A-006 stays
 discarded.
+Cycle 267: XFF empty-ARN fail() uses its own
+string. Do not copy L811. A-006 stays
+discarded.
