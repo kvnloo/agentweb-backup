@@ -509,6 +509,11 @@ Cycle 222: skip-send does not
 stays in `_streamMapping` until
 `mcpShutdown` `close()`. Product READY
 unchanged.
+Cycle 223: skip-send POST is the
+same `CompleteLifecycleAction` cut
+as GET. `mcpShutdown` starts Hono
+`end()`; `runDrain` does not join
+`server.close`. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -562,7 +567,10 @@ unchanged.
    not every draining POST). Do **not**
    treat skip-send as `stream.cleanup()`
    (cycle 222: POST SSE stays mapped until
-   `mcpShutdown` `close()`). Wrap stays
+   `mcpShutdown` `close()`). Do **not**
+   await `server.close` to join skip-send
+   POST (cycle 223: same ASG cut as GET).
+   Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

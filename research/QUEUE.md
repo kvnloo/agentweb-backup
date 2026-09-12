@@ -537,3 +537,7 @@ Cycle 222: skip-send does not
 `stream.cleanup()`. Local POST SSE
 stays mapped until `mcpShutdown`
 `close()`. A-006 stays discarded.
+Cycle 223: skip-send POST is the
+same `CompleteLifecycleAction` cut
+as GET. Do not await `server.close`.
+A-006 stays discarded.

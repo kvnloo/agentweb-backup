@@ -89,6 +89,7 @@ is 60s (`Protocol.request`); inbound CallTool has none (cycle 220).
 **not** 503 that notification. Copy `method === 'tools/call'`.
 Skip-send after cancelled does **not** `stream.cleanup()` (cycle 222:
 POST SSE stays mapped until `mcpShutdown` `close()`, same closer as
-GET).
+GET). That leftover POST is the same ASG `CompleteLifecycleAction` cut
+as GET (cycle 223: `server.close` unawaited; do not await it in A-019).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

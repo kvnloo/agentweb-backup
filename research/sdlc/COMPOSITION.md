@@ -1295,6 +1295,18 @@ that orphaned POST (same
 `extra.closeSSEStream` is unset
 (no `eventStore`). Not A-006.
 
+Cycle 223: **skip-send POST is the
+same ASG cut as GET.**
+`mcpShutdown` `forEach(cleanup)`
+starts Hono `writable.end()`
+(later tick). `runDrain`
+`server.close` is a callback
+(`server.ts` L440). The hook
+`completeAction`s after drain
+resolve (`asgLifecycleGuard.ts`
+L262–273). Do not await
+`server.close`. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
