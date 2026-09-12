@@ -153,6 +153,9 @@ add A-021.
 Cycle 248: a later XFF pin can fail closed before `update-environment`.
 Do not fold it into the hook. Do not un-park A-020 for that slot. Do
 not add A-021.
+Cycle 249: fail-closed-before-apply only helps GitHub merges. Sunday
+XFF drift is IdleTimeout class. Do not un-park A-020 for a weekly XFF
+pin. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

@@ -671,3 +671,7 @@ Cycle 248: a later XFF pin can fail
 closed before update-environment. Do
 not un-park A-020 for that slot. A-006
 stays discarded.
+Cycle 249: fail-closed-before-apply
+only helps GitHub merges. Sunday XFF
+drift is IdleTimeout class. A-006
+stays discarded.

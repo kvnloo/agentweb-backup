@@ -721,6 +721,11 @@ READY unchanged.
    closed before `update-environment`.
    Do **not** fold it into the hook. Do
    **not** un-park A-020 for that slot.
+   Cycle 249: fail-closed-before-apply
+   only helps GitHub merges. Sunday XFF
+   drift is IdleTimeout class. Do
+   **not** un-park A-020 for a weekly XFF
+   pin.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

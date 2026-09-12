@@ -792,3 +792,9 @@ no abort. Hermes is already on the new instance. Not A-019
 Hook slot L655 is before `update-environment`. Copying
 ENG-823 after-verify is a choice. Not A-019. Not A-020.
 Not A-006.
+
+## Cycle 249 (Sunday XFF drift is IdleTimeout class)
+
+Fail-closed-before-apply is GitHub-only. `deploy.yml` has
+zero `schedule:`. Sunday is EB managed actions. Not A-019.
+Not A-020. Not A-006.
