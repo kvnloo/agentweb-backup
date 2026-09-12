@@ -723,6 +723,15 @@ skip of `mcp_tool.py` is now L97 (cycle 89: L92). OMP
 `v0.85.1` unchanged (2026-09-05). A-007 copies that
 in-process split. Not A-006.
 
+Cycle 160: **Loop still client; two opt-in stdio servers.**
+`mcp_tool_server_run.py` L136 “manual /mcp refresh” is
+`_reconnect_event`, not FastAPI. `mcp_serve.py` L721
+`run_stdio_async()` conversations (`_TOOL_NAMES` L685–688).
+`hermes_tools_mcp_server.py` stdio for Codex;
+`EXPOSED_TOOLS` includes `image_generate`. Dashboard
+`web_routers/mcp.py` is outbound OAuth. Cycle 89 overstated
+the repo, not the loop. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -77,7 +77,7 @@ reverted. Do not copy that as A-006.
 | Eval / bench on tools | OMP “benchmaxxed” edits; metaharness package | `loops/` framework; human eval for images (not a router) |
 | Module boundary in CI | package graph / AST `discover_builtin_tools` | **No** (A-002 sketch only) |
 | Skills as files | `skills/` + optional-skills | Skills in system prompt + DB `foundation_tools` |
-| MCP | Client (`mcp_tool.py` skipped by discover; `supports_parallel_tool_calls` default **false**, cycle 89) | Server for Hermes **and** client to vendors; self `"agentweb-tools"` skipped **on file config only** (`mcpClientService.ts` L420–432); DB `mcp_servers` does not (cycle 90) |
+| MCP | Loop is **client** (`mcp_tool.py` skipped by discover; parallel default **false**, cycle 89). Two opt-in **stdio** servers: `hermes mcp serve` (conversations) and `hermes-tools` for Codex including `image_generate` (cycle 160). Dashboard `/api/mcp/oauth/callback` is outbound config, not `tools/list`. | Server for Hermes **and** client to vendors; self `"agentweb-tools"` skipped **on file config only** (`mcpClientService.ts` L420–432); DB `mcp_servers` does not (cycle 90) |
 
 ## Implications (not a port)
 
@@ -400,3 +400,6 @@ reverted. Do not copy that as A-006.
 - Cycle 159: live Hermes MCP client ~24 tools/mcp_* files;
   registry skip mcp_tool.py now L97. OMP still v0.85.1
   (2026-09-05). In-process split, not a mesh. Not A-006.
+- Cycle 160: mcp_tool_server_run.py still connect-only;
+  “/mcp refresh” is a slash-command. hermes mcp serve and
+  hermes-tools are stdio subprocesses. Not inbound HTTP.

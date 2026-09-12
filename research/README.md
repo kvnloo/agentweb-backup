@@ -526,6 +526,11 @@ Live `NousResearch/hermes-agent` main: `mcp_tool.py` still
 a client; registry skip moved L92→L97. OMP still
 `@earendil-works/pi-ai` v0.85.1. A-007 is that split, not
 A-006.
+Cycle 160: **Loop still client; two opt-in stdio servers.**
+`mcp_tool_server_run.py` `/mcp` is a slash-command refresh.
+`hermes mcp serve` = conversations (`mcp_serve.py` stdio).
+`hermes-tools` lists `image_generate` for Codex (stdio).
+Not inbound HTTP `/mcp`. Not A-006.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
