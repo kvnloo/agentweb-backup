@@ -504,6 +504,11 @@ Cycle 219: closed POST SSE is not
 `eventStore` so no priming. Q-001
 fixture is httpx `next(data:)`.
 Do not add A-021.
+Cycle 220: 60s is client
+`Protocol.request()`, not inbound
+CallTool. `mcpClientService` 3600000
+is AgentWeb as client. Hermes 315s
+is OAuth add. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -521,3 +521,8 @@ Cycle 219: closed POST SSE is not
 `eventStore` so no priming. Q-001
 fixture is httpx `next(data:)`.
 A-006 stays discarded.
+Cycle 220: 60s is client
+`Protocol.request()`, not inbound
+CallTool. `mcpClientService` 3600000
+is AgentWeb as client. Hermes 315s
+is OAuth add. A-006 stays discarded.

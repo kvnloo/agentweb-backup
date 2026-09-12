@@ -1247,6 +1247,21 @@ fixture is httpx `next(data:)`
 (L81–86), protocol `2025-06-18`.
 Not A-006.
 
+Cycle 220: **60s is client
+`Protocol.request()`, not inbound
+CallTool.** `DEFAULT_REQUEST_TIMEOUT_MSEC`
+60000 (`protocol.js` L8 / L691).
+`mcpServerCore` handler has zero
+timeout. AgentWeb as client uses
+3600000 (`mcpClientService.ts`
+L1670). Q-001 fixture is httpx;
+Hermes 315s is OAuth add
+(`HERMES_MCP_OAUTH.md` L21–36).
+Default SDK `callTool()` would
+abandon `generate_image` at 60s
+while mcpFetch+leaf still bill.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

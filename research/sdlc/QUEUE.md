@@ -492,6 +492,11 @@ Cycle 219: closed POST SSE is not
 `eventStore` so no priming. Q-001
 fixture is httpx `next(data:)`.
 Product READY unchanged.
+Cycle 220: 60s is client
+`Protocol.request()`, not inbound
+CallTool. `mcpClientService` 3600000
+is AgentWeb as client. Hermes 315s
+is OAuth add. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -536,7 +541,10 @@ Product READY unchanged.
    handler return, not only `execute`). Do **not**
    treat ENG-97 404 as covering an in-flight CallTool
    whose POST already returned 200 SSE (cycle 219:
-   POST `_handleSseStream(..., false)`; no `eventStore`). Wrap stays
+   POST `_handleSseStream(..., false)`; no `eventStore`). Do **not**
+   copy `mcpClientService` 3600000 onto inbound CallTool
+   (cycle 220: 60s is client `Protocol.request()`; AgentWeb
+   handler has none). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).
