@@ -142,6 +142,8 @@ A-019. Do not add A-021.
 Cycle 244: deploy IAM does not list `ModifyLoadBalancerAttributes`.
 Grant is live-AWS-only. Do not treat L61–65 as a grant. Do not treat
 ENG-823 TG modify as implying LB modify. Do not add A-021.
+Cycle 245: `DescribeLoadBalancerAttributes` is also unnamed. Do not
+infer it from backend SUCCESS. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

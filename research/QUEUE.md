@@ -658,3 +658,6 @@ does not transfer. A-006 stays discarded.
 Cycle 244: deploy IAM does not list
 ModifyLoadBalancerAttributes. Grant is
 live-AWS-only. A-006 stays discarded.
+Cycle 245: DescribeLoadBalancerAttributes
+is also unnamed. LB Describe is never
+called. A-006 stays discarded.

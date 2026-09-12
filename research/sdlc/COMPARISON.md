@@ -794,3 +794,6 @@ reverted. Do not copy that as A-006.
   live-AWS-only. Hermes has no
   `github-actions-deploy-backend`.
   Not A-006.
+- Cycle 245: LB Describe is also unnamed
+  and never called. Hermes has no
+  ENG-823 re-read. Not A-006.

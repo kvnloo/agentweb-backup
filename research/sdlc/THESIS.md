@@ -768,3 +768,9 @@ L61–65 is a probe Describe* comment, not a policy. Deploy
 user is live-AWS (`github-actions-deploy-backend` keys).
 `ModifyTargetGroupAttributes` does not imply LB modify.
 Not A-019. Not A-006.
+
+## Cycle 245 (DescribeLoadBalancerAttributes is also unnamed)
+
+ENG-823 already uses TG Describe without listing it.
+LB Describe is never called. Denied TG Describe mock has
+zero tests. Not A-019. Not A-006.
