@@ -62,9 +62,12 @@ Land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).
 wrap CallTool in `track()` so drain waits. `/generate` gets 503
 before `tryClaim`. Do **not** drain-gate ListTools or initialize
 (cycle 211). Do **not** 503 GET `/mcp` (cycle 212: SDK throws;
-405 is the optional-SSE skip). Do not return CallTool `isError`
-for drain (HTTP 200 tool-failure). Do not refuse inside `track()`
-(the promise is already running). Do not make `tryClaim`
-return false (that 409s). That is the billed-image drain gate.
-Not A-007 packaging. Not persist (occupied `agentModeService.ts` /
-`app.ts` / `emma/tools.ts`).
+405 is the optional-SSE skip). After the four-way wait,
+`await mcpShutdown` then `server.close`; **drop** the sibling
+SIGTERM in `mcpServer.ts` (cycle 213: ASG never fires it;
+Sunday SIGTERM runs it first and aborts the shared transport).
+Do not return CallTool `isError` for drain (HTTP 200 tool-failure).
+Do not refuse inside `track()` (the promise is already running).
+Do not make `tryClaim` return false (that 409s). That is the
+billed-image drain gate. Not A-007 packaging. Not persist
+(occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

@@ -1141,6 +1141,21 @@ still loses to nginx 600s. Existing SSE:
 `runDrain` still `server.close` without
 `mcpShutdown`. Not A-006.
 
+Cycle 213: **`mcpShutdown` after the wait
+belongs in A-019 first_slice.**
+`runDrain` never calls it (`server.ts`
+L440). Sibling `process.on` (`mcpServer.ts`
+L269–270) registers first (`app.ts` L204
+via `server.ts` L2). Sunday SIGTERM
+`transport.close()`s the shared
+`StreamableHTTPServerTransport` (POST
+L313 + GET L530) before the wait. ASG
+`drainForShutdown` is before any SIGTERM
+(`asgLifecycleGuard.ts` L18–21) so
+without a `runDrain` call the closer never
+runs. Do not `sessionStore.delete` (cycle
+94). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -18,7 +18,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-008 | 29 | **ready** | Folder-move creative cluster + persist unification later |
 | 4 | A-002 | 28 | **ready** | CI import boundary for `loops/core` (**in flight kvnloo#3**) |
-| 5 | A-019 | 27 | **ready** | HTTP 503 POST `/mcp` `tools/call` + `/generate`; GET 405 not 503; wrap CallTool in `track()` |
+| 5 | A-019 | 27 | **ready** | HTTP 503 POST `/mcp` `tools/call` + `/generate`; GET 405 not 503; wrap CallTool in `track()`; `mcpShutdown` after wait |
 | — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
@@ -444,6 +444,13 @@ Cycle 212: do not 503 GET `/mcp`. SDK throws
 on GET 503; 405 is the optional-SSE skip.
 Existing SSE still needs `mcpShutdown` after
 the wait. Product READY unchanged.
+Cycle 213: that close belongs in A-019
+first_slice. `await mcpShutdown` after the
+four-way wait; drop sibling SIGTERM
+(`mcpServer.ts` L269–270). ASG drain never
+fires it; Sunday SIGTERM runs it first and
+aborts the shared transport. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -465,7 +472,11 @@ the wait. Product READY unchanged.
    `track()` (promise already started, `server.ts` L301). Do
    **not** make `tryClaim` return false (that 409s
    `SESSION_BUSY`). Do **not** wrap `mcpToolRegistry.execute`.
-   Do **not** edit `slack.ts` (#2393).
+   After the four-way wait: `await (app as any).mcpShutdown?.()`
+   then `server.close`. **Remove** `mcpServer.ts` L269–270
+   (Sunday SIGTERM currently closes the shared transport first;
+   ASG never fires that listener). Do **not** edit `slack.ts`
+   (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

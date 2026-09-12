@@ -683,3 +683,11 @@ reverted. Do not copy that as A-006.
   vendored client throws on GET 503 and only
   skips on 405. Do not copy tools/call 503
   onto GET. Not A-006.
+- Cycle 213: A-019 first_slice includes
+  `mcpShutdown` after the wait and drops
+  sibling SIGTERM. ASG never fires it;
+  Sunday SIGTERM closes the shared
+  transport first (POST CallTool + GET
+  SSE). Hermes is still the MCP client;
+  inbound Streamable HTTP drain is
+  in-process. Not A-006.

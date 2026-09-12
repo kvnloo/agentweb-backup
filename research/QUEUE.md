@@ -476,3 +476,9 @@ is the wrong face. A-006 stays discarded.
 Cycle 212: do not 503 GET `/mcp`. SDK throws
 on GET 503; 405 is the optional-SSE skip.
 A-006 stays discarded.
+Cycle 213: `mcpShutdown` after the wait
+belongs in A-019 first_slice. Drop sibling
+SIGTERM (`mcpServer.ts` L269–270). ASG
+never fires it; Sunday SIGTERM aborts the
+shared transport first. A-006 stays
+discarded.

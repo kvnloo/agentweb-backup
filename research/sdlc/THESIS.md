@@ -458,6 +458,13 @@ GET 503; 405 is the optional-SSE skip.
 Existing SSE hang is `mcpShutdown` after
 the wait, not this admission. Do not add
 A-021.
+Cycle 213: fold that close into A-019
+first_slice. `await mcpShutdown` after the
+four-way wait; drop sibling SIGTERM
+(`mcpServer.ts` L269–270). Shared
+transport: POST CallTool and GET SSE.
+ASG drain never fires the closer; Sunday
+SIGTERM runs it first. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

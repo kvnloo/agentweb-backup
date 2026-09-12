@@ -735,6 +735,13 @@ throws on GET 503; 405 is the optional
 SSE skip. Existing SSE still needs
 `mcpShutdown` after the wait.
 A-006 discarded.
+Cycle 213: fold that close into A-019
+first_slice. `await mcpShutdown` after
+the four-way wait; drop sibling SIGTERM
+(`mcpServer.ts` L269–270). Shared
+transport; ASG never fires the closer;
+Sunday SIGTERM runs it first.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
