@@ -1,37 +1,48 @@
 import AWS from 'aws-sdk';
 import { randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
-import { applySimulation, createSimulation, validateSimulation, SimulationCommand, SimulationPacket, SimulationState } from './evaluationSimulation';
-import { EvaluationDenied, isEvaluationUser } from './evaluationPolicy';
+import { EvaluationDenied, isEvaluationUser, SANDBOX_TOOL_CLASS_NAMES } from './evaluationPolicy';
 
-export interface EvaluationMaterial { title: string; text: string; approved: true }
+/** The sandbox policy: one row per principal, authoritative for every gate. */
 export interface EvaluationRecord {
   userId: string;
   email: string;
   status: 'active' | 'revoked';
   expiresAt: number;
-  remaining: number;
-  materials: EvaluationMaterial[];
-  simulation?: SimulationState;
-  simulationRevision?: number;
-  artifactEpoch?: number;
-  resetArtifacts?: string[];
-  artifacts?: { artifactId: string; mime: string }[];
+  mode: 'sandbox';
+  label: string;
+  datasetId?: string;
+  datasetVersion?: number;
+  connectors: { meta: 'simulated' };
+  deniedToolClasses: string[];
   provisionedBy?: string;
   reviewerUserIds?: string[];
 }
 export interface ProvisionEvaluation {
-  simulationPacket?: SimulationPacket;
-  reviewerUserIds?: string[];
   email: string;
   displayName: string;
   password: string;
-  generationBudget: number;
   expiresAt: number;
-  materials: EvaluationMaterial[];
+  brandGuidelines: { brandName: string; website?: string; description?: string };
+  reviewerUserIds?: string[];
+  label?: string;
+  datasetId?: string;
+  datasetVersion?: number;
+  deniedToolClasses?: string[];
 }
 
-/** Evaluation data never enters customer asset tables, shared S3, or connector storage. */
+export const SANDBOX_TIER_NAME = 'Sandbox';
+
+/** The tier row bounds usage and tool/page/connector visibility; without it the product fails open. */
+export class SandboxTierMissing extends Error {
+  constructor() {
+    super(`The "${SANDBOX_TIER_NAME}" subscription tier is not defined in the subscription_types setting; run scripts/ensure-sandbox-tier.ts before provisioning.`);
+  }
+}
+
+const ID_PATTERN = /^[a-zA-Z0-9-]{1,100}$/;
+
+/** Sandbox policy, audit and (from phase 2) dataset/overlay rows live only in AW-Evaluations. */
 export class EvaluationStore {
   private prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
   private table = `${this.prefix}AW-Evaluations`;
@@ -43,17 +54,28 @@ export class EvaluationStore {
     return { evaluationKey: `evaluation/${userId}` };
   }
 
+  /** Normalizes legacy ENG-1870 rows (budget, materials, artifacts, toy simulation) into the policy shape. */
   async get(userId: string): Promise<EvaluationRecord | null> {
     const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
     if (!result.Item) return null;
-    const record = result.Item as EvaluationRecord;
-    if (record.userId !== userId) throw new EvaluationDenied();
-    if (record.simulation !== undefined) validateSimulation(userId, record.simulation);
-    for (const count of [record.simulationRevision, record.artifactEpoch]) if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) throw new EvaluationDenied();
-    if (record.artifacts !== undefined && (!Array.isArray(record.artifacts) || record.artifacts.length > 100 ||
-      record.artifacts.some(a => !a || typeof a.artifactId !== 'string' || !/^[a-zA-Z0-9-]+$/.test(a.artifactId) || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(a.mime)))) throw new EvaluationDenied();
-    if (record.resetArtifacts !== undefined && (!Array.isArray(record.resetArtifacts) || record.resetArtifacts.length > 100 ||
-      record.resetArtifacts.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(id)))) throw new EvaluationDenied();
+    const item = result.Item as Record<string, unknown>;
+    if (item.userId !== userId) throw new EvaluationDenied();
+    const record: EvaluationRecord = {
+      userId,
+      email: item.email as string,
+      status: item.status as EvaluationRecord['status'],
+      expiresAt: item.expiresAt as number,
+      mode: 'sandbox',
+      label: typeof item.label === 'string' && item.label ? item.label : 'Sandbox',
+      connectors: { meta: 'simulated' },
+      deniedToolClasses: Array.isArray(item.deniedToolClasses)
+        ? item.deniedToolClasses.filter((c): c is string => typeof c === 'string' && SANDBOX_TOOL_CLASS_NAMES.includes(c))
+        : [...SANDBOX_TOOL_CLASS_NAMES],
+    };
+    if (typeof item.datasetId === 'string') record.datasetId = item.datasetId;
+    if (typeof item.datasetVersion === 'number') record.datasetVersion = item.datasetVersion;
+    if (typeof item.provisionedBy === 'string') record.provisionedBy = item.provisionedBy;
+    if (Array.isArray(item.reviewerUserIds)) record.reviewerUserIds = item.reviewerUserIds.filter((id): id is string => typeof id === 'string');
     return record;
   }
 
@@ -64,86 +86,63 @@ export class EvaluationStore {
   }
 
   async provision(actor: string, input: ProvisionEvaluation) {
-    if (!input || typeof input.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email) || input.email.length > 254 ||
+    if (!input || typeof input !== 'object' ||
+        typeof input.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email) || input.email.length > 254 ||
         typeof input.displayName !== 'string' || !input.displayName.trim() || input.displayName.length > 100 ||
         typeof input.password !== 'string' || input.password.length < 12 || input.password.length > 72 ||
-        !Number.isSafeInteger(input.generationBudget) || input.generationBudget < 1 || input.generationBudget > 100 ||
-        !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now() || input.expiresAt > Date.now() + 30 * 86400000 ||
-        !Array.isArray(input.materials) || input.materials.length > 10 ||
-        input.materials.some(m => !m || typeof m !== 'object' || m.approved !== true || typeof m.title !== 'string' || !m.title || m.title.length > 100 || typeof m.text !== 'string' || m.text.length > 10000) ||
-        JSON.stringify(input.materials).length > 30000) throw new EvaluationDenied();
+        !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now() || input.expiresAt > Date.now() + 30 * 86400000) throw new EvaluationDenied();
+    const brand = input.brandGuidelines;
+    if (!brand || typeof brand !== 'object' || typeof brand.brandName !== 'string' || !brand.brandName.trim() || brand.brandName.length > 100 ||
+        (brand.website !== undefined && (typeof brand.website !== 'string' || brand.website.length > 500)) ||
+        (brand.description !== undefined && (typeof brand.description !== 'string' || brand.description.length > 2000))) throw new EvaluationDenied();
     if (input.reviewerUserIds !== undefined && (!Array.isArray(input.reviewerUserIds) || input.reviewerUserIds.length > 5 ||
-      input.reviewerUserIds.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(id)))) throw new EvaluationDenied();
+      input.reviewerUserIds.some(id => typeof id !== 'string' || !ID_PATTERN.test(id)))) throw new EvaluationDenied();
+    if (input.label !== undefined && (typeof input.label !== 'string' || !input.label.trim() || input.label.length > 40)) throw new EvaluationDenied();
+    if (input.datasetId !== undefined && (typeof input.datasetId !== 'string' || !ID_PATTERN.test(input.datasetId))) throw new EvaluationDenied();
+    if (input.datasetVersion !== undefined && (!Number.isSafeInteger(input.datasetVersion) || input.datasetVersion < 1)) throw new EvaluationDenied();
+    if (input.deniedToolClasses !== undefined && (!Array.isArray(input.deniedToolClasses) ||
+      input.deniedToolClasses.some(c => typeof c !== 'string' || !SANDBOX_TOOL_CLASS_NAMES.includes(c)))) throw new EvaluationDenied();
+
+    const { getSubscriptionTypeConfig } = await import('./subscriptionService');
+    if (!(await getSubscriptionTypeConfig(SANDBOX_TIER_NAME))) throw new SandboxTierMissing();
+
     const userId = `eval_${randomUUID()}`;
-    const simulation = createSimulation(userId, input.simulationPacket);
     const email = input.email.toLowerCase();
+    const deniedToolClasses = input.deniedToolClasses === undefined
+      ? [...SANDBOX_TOOL_CLASS_NAMES]
+      : [...new Set([...input.deniedToolClasses, 'lifecycle'])];
     const record: EvaluationRecord = {
-      userId, email, status: 'active', provisionedBy: actor, reviewerUserIds: input.reviewerUserIds || [], simulation, simulationRevision: 0, artifactEpoch: 0, expiresAt: input.expiresAt, remaining: input.generationBudget,
-      materials: input.materials.map(({ title, text }) => ({ title, text, approved: true })),
+      userId, email, status: 'active', expiresAt: input.expiresAt, mode: 'sandbox',
+      label: input.label?.trim() || 'Sandbox', connectors: { meta: 'simulated' }, deniedToolClasses,
+      provisionedBy: actor, reviewerUserIds: input.reviewerUserIds || [],
+      ...(input.datasetId !== undefined ? { datasetId: input.datasetId } : {}),
+      ...(input.datasetVersion !== undefined ? { datasetVersion: input.datasetVersion } : {}),
     };
-    const audit = this.audit(userId, actor, 'provision');
+    const now = new Date().toISOString();
+    // The full brandGuidelines shape (services/db.ts User.brandGuidelines): the portal keys onboarding
+    // off brandData.brandName and the brand page reads every array field.
+    const brandGuidelines = {
+      brandData: {
+        brandName: brand.brandName.trim(), tagline: brand.description?.trim() || '',
+        ...(brand.website ? { domain: brand.website.trim() } : {}),
+        primaryColor: '#ECAC5F', primaryColorEnd: '#ECAC5F', secondaryColor: '#7A6999', fontFamily: 'Inter',
+        toneOfVoice: '', keyMessages: [], brandValues: [], targetAudience: '', brandPersonality: '', isGradient: false, founders: [],
+      },
+      attachments: [], createdAt: now, updatedAt: now,
+    };
+    const audit = this.audit(userId, actor, 'provision', { label: record.label, datasetId: record.datasetId ?? null, deniedToolClasses });
     await this.db.transactWrite({ TransactItems: [
       { Put: { TableName: this.users, Item: {
-        email, userId, displayName: input.displayName, password: await bcrypt.hash(input.password, 12),
+        email, userId, displayName: input.displayName.trim(), password: await bcrypt.hash(input.password, 12),
         isOAuthUser: false, isAdmin: false, isActive: true, roles: ['customer'],
-        subscriptionType: 'Pro', subscription_status: 'active', sessionVersion: 0,
-        signupSource: 'evaluation', createdAt: new Date().toISOString(),
+        subscriptionType: SANDBOX_TIER_NAME, subscription_status: 'active', sessionVersion: 0,
+        signupSource: 'evaluation', createdAt: now, brandGuidelines,
         memoryEnabled: false, emailNotificationsEnabled: false, emmaTipsEnabled: false,
       }, ConditionExpression: 'attribute_not_exists(email)' } },
       { Put: { TableName: this.table, Item: { ...this.key(userId), ...record }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } },
       audit,
     ] }).promise();
-    return { userId, expiresAt: record.expiresAt, remaining: record.remaining, audit: audit.Put.Item };
-  }
-
-  async simulate(userId: string, input: SimulationCommand) {
-    const record = await this.get(userId);
-    this.active(record, userId);
-    const { state, result } = applySimulation(userId, record.simulation || createSimulation(userId), input, (record.artifacts || []).map(a => a.artifactId));
-    if (['query', 'inspect'].includes(input.operation)) {
-      this.active(await this.get(userId), userId);
-      return result;
-    }
-    const revision = record.simulationRevision || 0;
-    const reset = input.operation === 'reset';
-    const artifacts = record.artifacts || [];
-    const pending = [...new Set([...(record.resetArtifacts || []), ...artifacts.map(a => a.artifactId)])];
-    if (pending.length > 100 || pending.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9-]+$/.test(id))) throw new EvaluationDenied();
-    const epoch = (record.artifactEpoch || 0) + 1;
-    const audit = this.audit(userId, userId, `simulation:${input.operation}`, {
-      ok: result.ok, errors: result.errors, warnings: result.warnings, objectId: result.object?.id || null,
-      object: result.object ? { ...result.object, ...(result.object.upload ? { upload: { mime: result.object.upload.mime, bytes: Buffer.from(result.object.upload.base64, 'base64').length } } : {}) } : null, revision: revision + 1,
-    });
-    await this.db.transactWrite({ TransactItems: [{ Update: {
-      TableName: this.table, Key: this.key(userId),
-      UpdateExpression: 'SET simulation = :simulation, simulationRevision = :next' + (reset ? ', artifacts = :empty, artifactEpoch = :epoch, resetArtifacts = :pending' : ''),
-      ConditionExpression: '#status = :active AND expiresAt > :now AND (simulationRevision = :revision OR (attribute_not_exists(simulationRevision) AND :revision = :zero))',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: { ':active': 'active', ':now': Date.now(), ':revision': revision, ':zero': 0, ':next': revision + 1,
-        ':simulation': state, ...(reset ? { ':empty': [], ':epoch': epoch, ':pending': pending } : {}) },
-    } }, audit] }).promise();
-    if (reset) {
-      // Access is already invalidated atomically. Keep cleanup intent durable for retries.
-      // Each batch also checks live policy/epoch, so revoke or another reset stops stale cleanup.
-      const guard = {
-        TableName: this.table, Key: this.key(userId),
-        ConditionExpression: '#status = :active AND expiresAt > :now AND artifactEpoch = :epoch',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':active': 'active', ':now': Date.now(), ':epoch': epoch },
-      };
-      for (let i = 0; i < pending.length; i += 99) {
-        await this.db.transactWrite({ TransactItems: [{ ConditionCheck: guard }, ...pending.slice(i, i + 99).map(id => ({
-          Delete: { TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/artifact/${id}` } },
-        }))] }).promise();
-      }
-      await this.db.transactWrite({ TransactItems: [{ Update: { ...guard, UpdateExpression: 'REMOVE resetArtifacts' } }] }).promise();
-    }
-    this.active(await this.get(userId), userId);
-    return result;
-  }
-
-  private active(record: EvaluationRecord | null, userId: string): asserts record is EvaluationRecord {
-    if (!record || record.userId !== userId || record.status !== 'active' || !Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) throw new EvaluationDenied();
+    return { userId, expiresAt: record.expiresAt, audit: audit.Put.Item };
   }
 
   /** Explicit assignment, never organization membership, authorizes reviewer access. */
@@ -172,49 +171,7 @@ export class EvaluationStore {
       }
       cursor = page.LastEvaluatedKey; pages++;
     } while (cursor && audit.length < 1000 && pages < 100);
-    return { userId, status: record.status, simulation: record.simulation || createSimulation(userId), materials: record.materials,
-      artifacts: record.artifacts || [], audit, truncated: !!cursor };
-  }
-
-  async reserve(userId: string) {
-    await this.db.transactWrite({ TransactItems: [{ Update: {
-      TableName: this.table, Key: this.key(userId),
-      UpdateExpression: 'SET remaining = remaining - :one',
-      ConditionExpression: '#status = :active AND expiresAt > :now AND remaining > :zero',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: { ':active': 'active', ':now': Date.now(), ':zero': 0, ':one': 1 },
-    } }, this.audit(userId, userId, 'generation-reserved')] }).promise();
-  }
-
-  async saveArtifact(userId: string, content: Buffer, mime: 'text/plain' | 'image/jpeg' | 'application/octet-stream', expectedEpoch?: number) {
-    if (!Buffer.isBuffer(content) || content.length === 0 || content.length > 240000 || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(mime)) throw new EvaluationDenied();
-    const record = await this.get(userId);
-    this.active(record, userId);
-    const epoch = expectedEpoch ?? record.artifactEpoch ?? 0;
-    if (epoch !== (record.artifactEpoch || 0) || record.resetArtifacts !== undefined) throw new EvaluationDenied();
-    const artifactId = randomUUID();
-    await this.db.transactWrite({ TransactItems: [
-      { Update: { TableName: this.table, Key: this.key(userId),
-        UpdateExpression: 'SET artifacts = list_append(if_not_exists(artifacts, :empty), :artifact) ADD simulationRevision :one',
-        ConditionExpression: '#status = :active AND expiresAt > :now AND (attribute_not_exists(artifacts) OR size(artifacts) < :limit) AND attribute_not_exists(resetArtifacts) AND (artifactEpoch = :epoch OR (attribute_not_exists(artifactEpoch) AND :epoch = :zero))',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':empty': [], ':artifact': [{ artifactId, mime }], ':active': 'active', ':now': Date.now(), ':limit': 100, ':epoch': epoch, ':zero': 0, ':one': 1 },
-      } },
-      { Put: { TableName: this.table, Item: { evaluationKey: `evaluation/${userId}/artifact/${artifactId}`, userId, content, mime }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } },
-    ] }).promise();
-    return { artifactId, mime };
-  }
-
-  async getArtifact(userId: string, artifactId: string) {
-    this.key(userId);
-    if (!/^[a-zA-Z0-9-]+$/.test(artifactId)) throw new EvaluationDenied();
-    const record = await this.get(userId);
-    if (!record || record.userId !== userId || !Array.isArray(record.artifacts) || !record.artifacts.some(a => a?.artifactId === artifactId)) throw new EvaluationDenied();
-    const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/artifact/${artifactId}` }, ConsistentRead: true }).promise();
-    if (!result.Item || result.Item.userId !== userId || !Buffer.isBuffer(result.Item.content) || !['text/plain', 'image/jpeg', 'application/octet-stream'].includes(result.Item.mime)) throw new EvaluationDenied();
-    const latest = await this.get(userId);
-    if (!latest || (latest.artifactEpoch || 0) !== (record.artifactEpoch || 0) || !latest.artifacts?.some(a => a.artifactId === artifactId)) throw new EvaluationDenied();
-    return { content: result.Item.content as Buffer, mime: result.Item.mime as string };
+    return { userId, status: record.status, audit, truncated: !!cursor };
   }
 
   async discardJob(userId: string, scheduleId: string) {
