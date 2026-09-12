@@ -1427,6 +1427,12 @@ a one-shot in this tree.** Q-001
 fixture asserts 200. SDK `send()`
 throws; only 401 recurses. Not A-006.
 
+Cycle 236: **HTTP 503 does not poison
+`transport.sessionId`.** Only DELETE
+`terminateSession` clears it. Later
+`tools/call` can rehydrate. Do not
+404 drain. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

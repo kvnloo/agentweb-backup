@@ -7,29 +7,28 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 235
+cycles_completed: 236
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 236
+next_cycle: 237
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 235: A-019 POST /mcp 503 is a
-  one-shot in this tree. Q-001 fixture
-  asserts 200. SDK send() throws
-  StreamableHTTPError; only 401
-  recurses. mcpClientService retries
-  browser tools only. Cycle 236:
-  after HTTP 503, does the client keep
-  transport.sessionId so a later
-  tools/call can rehydrate on the new
-  instance (ENG-114)? send() sets
-  _sessionId from the header before
-  !ok. Do not sessions.clear() on the
-  503 path. Do not add A-021. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do
-  not revive A-006. stop_after has
-  passed; leave briefing_ready. Do not
-  mint a timer unless Kevin asks.
+  Cycle 236: HTTP 503 does not poison
+  transport.sessionId. Only
+  terminateSession clears it. Later
+  tools/call can rehydrate (ENG-114)
+  if the store has the row; default
+  memory 404s like any swap. Do not
+  404 drain. Cycle 237: is JSON 503
+  (runScheduledChats L13032) enough
+  for SDK send() which text()s !ok,
+  or would an SSE-shaped 503 change
+  anything? Do not add Retry-After.
+  Do not add A-021. Do not un-ready
+  Q-001 / Q-014 / Q-003. Do not revive
+  A-006. stop_after has passed; leave
+  briefing_ready. Do not mint a timer
+  unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -41,7 +40,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–235: A-019 503 is color, not Wait replace; dying
-5xx does not fail new Immutable; Sunday refresh is Immutable; missing
-Wait still disableCron; Hermes sees 503 while `/health` is 200; that
-503 is a one-shot in this tree. A-006 stays discarded.
+order. Cycle 230–236: A-019 503 is color; dying 5xx does not fail new
+Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
+sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
+poison `sessionId`. A-006 stays discarded.

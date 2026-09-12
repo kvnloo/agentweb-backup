@@ -704,3 +704,10 @@ Q-001 fixture asserts HTTP 200. Vendored `send()` throws
 `mcpClientService` retries `playwright_` / `browser_` only.
 mcpFetch does not retry POST. The 5s poll is
 `/run-scheduled-chats`, not `/mcp`. Not A-006.
+
+## Cycle 236 (503 does not poison sessionId)
+
+`send()` keeps initialize-time `_sessionId`. Only
+`terminateSession` clears it. Later POST can
+`rehydrateAndServe` if the store has the row. Do not 404
+drain. Do not `sessionStore.delete` on 503. Not A-006.

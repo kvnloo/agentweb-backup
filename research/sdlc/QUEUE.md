@@ -667,6 +667,10 @@ READY unchanged.
    Cycle 235: POST `/mcp` 503 is a
    one-shot in this tree. Do **not**
    add a 503 retry in A-019.
+   Cycle 236: 503 does not poison
+   `sessionId`. Do **not** 404 drain.
+   Do **not** `sessionStore.delete` on
+   the 503 path.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

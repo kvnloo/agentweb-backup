@@ -762,3 +762,6 @@ reverted. Do not copy that as A-006.
   client retries POST `/mcp` 503.
   One-shot; later user retry can
   rehydrate. Not A-006.
+- Cycle 236: 503 keeps
+  `sessionId`. Hermes has no
+  ENG-114. Not A-006.

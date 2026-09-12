@@ -625,3 +625,7 @@ Cycle 235: POST /mcp 503 is a one-shot
 in this tree. Q-001 fixture asserts
 200. Do not add a 503 retry in A-019.
 A-006 stays discarded.
+Cycle 236: 503 does not poison
+sessionId. Later tools/call can
+rehydrate. Do not 404 drain. A-006
+stays discarded.
