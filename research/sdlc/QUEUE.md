@@ -514,6 +514,14 @@ same `CompleteLifecycleAction` cut
 as GET. `mcpShutdown` starts Hono
 `end()`; `runDrain` does not join
 `server.close`. Product READY unchanged.
+Cycle 224: Sunday `process.exit(0)`
+after drain can cut Hono `end()` I/O
+(and can cut before `end()` if `flow`
+is on `'drain'`). ASG does not exit.
+Do not put `process.exit` on the ASG
+path. Do not replace Sunday exit with
+`exitCode` in A-019. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -570,6 +578,11 @@ as GET. `mcpShutdown` starts Hono
    `mcpShutdown` `close()`). Do **not**
    await `server.close` to join skip-send
    POST (cycle 223: same ASG cut as GET).
+   Do **not** put `process.exit` on the
+   ASG path (cycle 224). Do **not**
+   replace Sunday `process.exit(0)`
+   with `exitCode` in A-019 (Sunday
+   lifetime is A-020 / cycle 115).
    Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`

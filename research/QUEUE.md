@@ -541,3 +541,10 @@ Cycle 223: skip-send POST is the
 same `CompleteLifecycleAction` cut
 as GET. Do not await `server.close`.
 A-006 stays discarded.
+Cycle 224: Sunday `process.exit(0)`
+after drain can cut Hono `end()` I/O.
+ASG does not exit. Do not put
+`process.exit` on the ASG path. Do
+not replace Sunday exit with
+`exitCode` in A-019. A-006 stays
+discarded.

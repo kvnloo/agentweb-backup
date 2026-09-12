@@ -1307,6 +1307,25 @@ resolve (`asgLifecycleGuard.ts`
 L262–273). Do not await
 `server.close`. Not A-006.
 
+Cycle 224: **Sunday `process.exit(0)`
+cuts Hono end I/O; ASG does not
+exit.** After A-019, skip-send idle
+POST is Hono `reader.read().then(flow)`
+(`index.mjs` L272) so `writable.end()`
+is usually a microtask during
+`mcpShutdown`. `end()` is not joined.
+Sunday then `process.exit(0)`
+(`server.ts` L466–471). Node types
+(`process.d.ts` L869–871) force-exit
+pending I/O. ASG `completeAction`
+(L268–273) leaves the process
+alive. If `flow` is on `'drain'`
+(L289–290), Sunday can cut *before*
+`end()`. Do not put `process.exit`
+on the ASG path. Do not replace
+Sunday exit with `exitCode` in
+A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
