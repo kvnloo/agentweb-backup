@@ -188,6 +188,8 @@ Cycle 262: do not piggyback XFF on the delay opt-in.
 Do not add A-021.
 Cycle 263: new `ensure_xff_*` sibling. Do not stuff
 XFF into delay. Do not add A-021.
+Cycle 264: call XFF from `main()` next to delay.
+Do not copy dryrun cannot-fail. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

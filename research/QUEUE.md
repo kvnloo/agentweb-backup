@@ -719,3 +719,6 @@ delay opt-in. A-006 stays discarded.
 Cycle 263: new ensure_xff_* sibling. Do
 not stuff XFF into delay. A-006 stays
 discarded.
+Cycle 264: call XFF from main() next to
+delay. Do not copy dryrun cannot-fail.
+A-006 stays discarded.

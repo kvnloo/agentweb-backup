@@ -854,3 +854,6 @@ reverted. Do not copy that as A-006.
 - Cycle 263: new XFF sibling, not stuffed
   into delay. Hermes has no two-pins-in-
   one-function fork. Not A-006.
+- Cycle 264: XFF from `main()`, not verify
+  dryrun. Hermes has no observation-vs-pin
+  after-success fork. Not A-006.
