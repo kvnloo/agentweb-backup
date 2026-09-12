@@ -600,3 +600,11 @@ reverted. Do not copy that as A-006.
   Family B so it hits. deriveOwnBucketKey L109
   already parses path-style. Hermes one decoder.
   Not A-006.
+- Cycle 199: downloadBrandLogoToS3 L425 is Family A
+  Location; drops result.Key. auto-logo-* (L15201 /
+  L15264 / brandLogo.ts L610) blocks delete L693
+  URL fallback. REST uploadBrandFile L64 returns
+  the real key. Skip-re-pin L15242 is real isS3Url
+  (hits A). Tests pin Family B skip and real delete
+  keys; grep auto-logo empty. Hermes one persist
+  result. Not A-006.

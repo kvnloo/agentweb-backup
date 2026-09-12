@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 198
+cycles_completed: 199
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 199
+next_cycle: 200
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 198: brand-guide matcher includes('.s3.')
-  misses Family A path-style; delete already
-  parses it (deriveOwnBucketKey). Occupied
+  Cycle 199: downloadBrandLogoToS3 is Family A;
+  drops result.Key; auto-logo-* blocks delete's
+  deriveOwnBucketKey fallback. Occupied
   agentModeService.ts pile.
-  Cycle 199: cheapest remaining. Candidate:
-  downloadBrandLogoToS3 URL shape vs Family A/B
-  (logos skip the matcher). File-level.
+  Cycle 200: cheapest remaining. Candidate:
+  classifyBrandLogoUrl Path C of Family A after
+  persist (ENG-792). File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,

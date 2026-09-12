@@ -1031,6 +1031,15 @@ B so it hits. `deriveOwnBucketKey` L109 already
 parses path-style. Occupied `agentModeService.ts`.
 Not A-006.
 
+Cycle 199: **Auto-pin persist is Family A; fake key
+blocks delete.** `downloadBrandLogoToS3` L425
+returns Location only. Helper L361 also has
+`result.Key`. Three mints stamp `auto-logo-*`.
+Delete L693 prefers stored key. REST L64 stores
+the real key. Skip-re-pin L15242 uses real
+`isS3Url` (hits A). Occupied `agentModeService.ts`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

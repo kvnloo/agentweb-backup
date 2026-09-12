@@ -427,4 +427,7 @@ on Seedance default. Q-016 stays parked.
 A-006 stays discarded.
 Cycle 198: brand-guide matcher misses Family A
 path-style. A-006 stays discarded.
+Cycle 199: auto-pin is Family A and drops result.Key;
+auto-logo-* blocks delete's URL fallback. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

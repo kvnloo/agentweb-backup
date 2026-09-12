@@ -390,6 +390,10 @@ Q-016 parked. Product READY unchanged.
 Cycle 198: brand-guide matcher misses Family A
 path-style; delete already parses it.
 Product READY unchanged.
+Cycle 199: downloadBrandLogoToS3 is Family A;
+drops result.Key; auto-logo-* blocks delete's
+deriveOwnBucketKey fallback. REST file upload
+stores the real key. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -396,6 +396,10 @@ hardcodes empty key. Do not add A-021.
 Cycle 198: brand-guide matcher includes('.s3.')
 misses Family A path-style. deriveOwnBucketKey
 already parses it. Do not add A-021.
+Cycle 199: downloadBrandLogoToS3 is Family A.
+Drops result.Key; auto-logo-* blocks delete's
+URL fallback. REST uploadBrandFile returns the
+real key. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

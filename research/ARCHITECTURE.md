@@ -682,6 +682,11 @@ Cycle 198: brand-guide matcher includes('.s3.') misses
 Family A path-style Location. REST file upload is Family
 B so it hits. Delete already parses path-style.
 A-006 discarded.
+Cycle 199: downloadBrandLogoToS3 is Family A Location.
+Drops result.Key; auto-pin mints auto-logo-* which
+blocks delete's URL fallback (brand.ts L693). REST
+uploadBrandFile returns the real key. Skip-re-pin
+uses real isS3Url (hits A). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
