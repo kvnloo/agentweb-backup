@@ -657,10 +657,10 @@ Cycle 187: **Email rewrite matches one S3 host;
 `s3.us-west-2` only. Brand delete already extracted a
 bucket matcher (`brand.ts` L84). Rewrite tests never
 use the region-less URL `/asset/` tests pin.
-Cycle 188–204: S3 writers, matchers, fetch paths.
-Latest (204): preferred company scrape spoofs Mac
-Chrome/120; axios fallback is `Extractor/1.0`.
-Tests pin no-cache headers, not the UA.
+Cycle 188–205: S3 writers, matchers, fetch paths.
+Latest (205): `read_brand_guidelines` LLM HTML shows
+`asset.filename` (`logo.png` / `'url'`), not
+`logoUrl`. Discovery formatter already prints the URL.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

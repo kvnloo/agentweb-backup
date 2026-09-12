@@ -638,3 +638,8 @@ reverted. Do not copy that as A-006.
   Tests L620 pin Cache-Control, not the UA string.
   LinkedIn L608 is Chrome/131. Hermes one client.
   Not A-006.
+- Cycle 205: formatBrandGuidelines L27884 prints
+  asset.filename; never logoUrl. Update ack L27940
+  filename only. Discovery formatCSSExtractionResult
+  L15631 already prints the URL. generate_image asks
+  for that URL. Hermes one handle. Not A-006.

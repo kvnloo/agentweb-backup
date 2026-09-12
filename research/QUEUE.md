@@ -441,4 +441,6 @@ FORBIDDEN_HOSTNAMES / 169.254 / DNS-pin; page.goto
 follows after the string check. A-006 stays discarded.
 Cycle 204: page.goto spoofs Mac Chrome/120; axios
 fallback is Extractor/1.0. A-006 stays discarded.
+Cycle 205: read_brand_guidelines shows filename
+not logoUrl. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

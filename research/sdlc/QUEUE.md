@@ -411,6 +411,9 @@ path is page.goto. Product READY unchanged.
 Cycle 204: page.goto spoofs Mac Chrome/120;
 axios fallback is Extractor/1.0. Tests pin
 no-cache headers, not the UA. Product READY unchanged.
+Cycle 205: read_brand_guidelines LLM HTML shows
+asset.filename not logoUrl. Discovery formatter
+already prints the URL. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

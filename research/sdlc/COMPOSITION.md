@@ -1071,6 +1071,13 @@ page.setUserAgent L546; axios fallback L131 is
 Extractor/1.0. Tests L620 pin no-cache headers,
 not the UA. LinkedIn L608 is Chrome/131. Not A-006.
 
+Cycle 205: **read_brand_guidelines shows filename.**
+L27884 Primary Logo: asset.filename. Update ack
+L27940 no href. formatCSSExtractionResult L15631
+already prints logoUrl. generate_image L4999
+asks for the URL. MCP does not list this tool.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
