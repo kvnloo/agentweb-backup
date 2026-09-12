@@ -1512,6 +1512,12 @@ would be the git-native Sunday XFF
 reassert.** It does not exist. Not
 A-019. Not A-006.
 
+Cycle 251: **a pin-only Sunday job would
+not hit Must be Ready.** That error is
+`UpdateEnvironment`. elbv2 talks to
+the surviving ALB during Updating. Not
+A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

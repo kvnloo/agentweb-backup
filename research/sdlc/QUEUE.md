@@ -730,6 +730,10 @@ READY unchanged.
    would be the git-native Sunday XFF
    reassert. Do **not** add it from
    A-019.
+   Cycle 251: a pin-only Sunday job
+   would not hit Must be Ready. Do
+   **not** treat Updating as blocking
+   elbv2 on the surviving ALB.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

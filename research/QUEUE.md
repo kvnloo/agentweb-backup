@@ -679,3 +679,6 @@ Cycle 250: a pin-only schedule: would
 be the git-native Sunday XFF reassert.
 Do not add it from A-019. A-006 stays
 discarded.
+Cycle 251: a pin-only Sunday job would
+not hit Must be Ready. A-006 stays
+discarded.

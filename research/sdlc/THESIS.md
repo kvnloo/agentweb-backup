@@ -804,3 +804,9 @@ Not A-020. Not A-006.
 Does not exist. Dependabot Monday `schedule:` is not an ALB
 pin. EventBridge/Lambda would be new AWS. Not A-019. Not
 A-006.
+
+## Cycle 251 (pin-only Sunday job skips Must be Ready)
+
+Must be Ready is `UpdateEnvironment` only. Updating is not
+terminal. elbv2 talks to the surviving ALB. Not A-019. Not
+A-006.

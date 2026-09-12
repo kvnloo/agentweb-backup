@@ -814,3 +814,7 @@ reverted. Do not copy that as A-006.
   be git-native Sunday XFF. Hermes has
   no Actions cron pinning a balancer.
   Not A-006.
+- Cycle 251: Must be Ready is
+  `UpdateEnvironment` only. Hermes has
+  no EB Updating vs elbv2 split. Not
+  A-006.
