@@ -548,3 +548,9 @@ ASG does not exit. Do not put
 not replace Sunday exit with
 `exitCode` in A-019. A-006 stays
 discarded.
+Cycle 225: SIGTERM on a settled
+`drainPromise` can `process.exit(0)`
+before `completeAction`.
+HeartbeatTimeout 900s CONTINUE is
+the fail-safe. Do not await the hook
+from A-019. A-006 stays discarded.

@@ -522,6 +522,13 @@ Do not put `process.exit` on the ASG
 path. Do not replace Sunday exit with
 `exitCode` in A-019. Product READY
 unchanged.
+Cycle 225: SIGTERM on a settled
+`drainPromise` can `process.exit(0)`
+before `completeAction`.
+HeartbeatTimeout 900s CONTINUE is
+the fail-safe. Do not await the hook
+from `gracefulShutdown` in A-019.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -583,6 +590,12 @@ unchanged.
    replace Sunday `process.exit(0)`
    with `exitCode` in A-019 (Sunday
    lifetime is A-020 / cycle 115).
+   Do **not** await `completeAction`
+   from `gracefulShutdown` (cycle 225:
+   settled `drainPromise` then
+   `process.exit(0)` can cut CONTINUE;
+   HeartbeatTimeout 900s is the
+   fail-safe).
    Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`

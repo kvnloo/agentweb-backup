@@ -94,5 +94,8 @@ as GET (cycle 223: `server.close` unawaited; do not await it in A-019).
 Sunday `process.exit(0)` after drain can cut Hono `end()` I/O (cycle 224:
 ASG does not exit; do not put `process.exit` on that path; do not replace
 Sunday exit with `exitCode` in A-019).
+SIGTERM on a settled `drainPromise` can `process.exit(0)` before
+`completeAction` (cycle 225: HeartbeatTimeout 900s CONTINUE is the
+fail-safe; do not await the hook from `gracefulShutdown` in A-019).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

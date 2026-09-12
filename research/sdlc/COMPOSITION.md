@@ -1326,6 +1326,23 @@ on the ASG path. Do not replace
 Sunday exit with `exitCode` in
 A-019. Not A-006.
 
+Cycle 225: **SIGTERM on a settled
+`drainPromise` can exit before
+`completeAction`.** Memoization is
+drain only (`server.ts` L368–370).
+`gracefulShutdown` then
+`process.exit(0)` (L466–471).
+CONTINUE is after
+`onTerminating` (`asgLifecycleGuard.ts`
+L262–273) and starts at
+`await readInstanceId` (IMDS HTTP).
+HeartbeatTimeout 900s CONTINUE
+(`eb-deploy.sh` L612) is the
+fail-safe. Tests pin drain-then-
+complete in one tick and never
+inject SIGTERM. Do not await the
+hook from A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

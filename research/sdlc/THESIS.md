@@ -531,6 +531,13 @@ is on `'drain'`). ASG does not exit.
 Do not put `process.exit` on the ASG
 path. Do not replace Sunday exit with
 `exitCode` in A-019. Do not add A-021.
+Cycle 225: SIGTERM on a settled
+`drainPromise` is `process.exit(0)`
+with no join to `completeAction`.
+HeartbeatTimeout 900s CONTINUE is
+the fail-safe. Do not await the hook
+from `gracefulShutdown` in A-019.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

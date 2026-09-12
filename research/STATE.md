@@ -7,28 +7,26 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 224
+cycles_completed: 225
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 225
+next_cycle: 226
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 224: Sunday process.exit(0)
-  after drain can cut Hono end() I/O
-  (and can cut before end() if flow
-  is on 'drain'). ASG does not exit.
-  Do not put process.exit on the ASG
-  path. Do not replace Sunday exit
-  with exitCode in A-019.
-  Cycle 225: when SIGTERM joins an
-  already-resolved ASG drainPromise,
-  gracefulShutdown process.exit(0)
-  is immediate (server.ts L368-370 /
-  L466-471). File-level only: can
-  that fire while completeAction's
-  readInstanceId is in-flight (both
-  continuations after the same drain
-  resolve)?
+  Cycle 225: SIGTERM on a settled
+  drainPromise is process.exit(0)
+  with no join to completeAction.
+  HeartbeatTimeout 900s CONTINUE
+  is the fail-safe. Do not await
+  completeAction from
+  gracefulShutdown in A-019.
+  Cycle 226: file-level only, does
+  this tree prove EB withholds
+  SIGTERM for the whole
+  Terminating:Wait, or is that
+  live-AWS-only (TimeoutStopSec
+  class)? Header L18-19 vs
+  workerShutdownGuards.ts L1-9.
   Do not add A-021. Do not start
   another S3/Referer matcher. Do
   not un-ready Q-001 / Q-014 /
