@@ -432,4 +432,6 @@ auto-logo-* blocks delete's URL fallback. A-006
 stays discarded.
 Cycle 200: ENG-792 probe is Path C of own-bucket
 Family A. Ads fail closed on 4xx. A-006 stays discarded.
+Cycle 201: pin GET has no UA; probe/discovery do.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

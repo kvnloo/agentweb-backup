@@ -7,18 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 200
+cycles_completed: 201
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 201
+next_cycle: 202
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 200: classifyBrandLogoUrl is Path C of the
-  Family A URL auto-pin just wrote. Ads fail closed
-  on 4xx. brandLogo.ts has no isS3Url.
-  Cycle 201: cheapest remaining. Candidate:
-  downloadBrandLogoToS3 GET has no User-Agent (L374)
-  vs the probe's UA. File-level.
+  Cycle 201: downloadBrandLogoToS3 GET has no UA;
+  probe and cssExtractor do. Tests pin no headers.
+  Cycle 202: cheapest remaining. Candidate:
+  pin has no validateURL/SSRF (cssExtractor only
+  validates the company URL). File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,

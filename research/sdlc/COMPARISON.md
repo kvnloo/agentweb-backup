@@ -615,3 +615,9 @@ reverted. Do not copy that as A-006.
   unknown. Tests inject https://s3/logo.png.
   filesController L35 already SDK-streams. Hermes
   one fetch of bytes it has. Not A-006.
+- Cycle 201: downloadBrandLogoToS3 L374 has no
+  User-Agent; test L243 pins no headers. Probe L495
+  Mozilla (same as leaf L822). cssExtractor L131
+  AgentWeb-CSS-Extractor/1.0. Pin-fail + probe-success
+  leaves the external URL unpinned. Hermes one
+  client. Not A-006.

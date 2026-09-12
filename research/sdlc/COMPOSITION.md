@@ -1047,6 +1047,12 @@ Family A.** `classifyBrandLogoUrl` L492 axios GET;
 `filesController` L35 already SDK-streams. Tests
 inject `https://s3/logo.png`. Not A-006.
 
+Cycle 201: **Pin GET has no User-Agent.** L374–377
+no headers; test L243–246 pins that. Probe L495
+Mozilla; cssExtractor L131 Extractor/1.0. Pin-fail
++ probe-success leaves the external host as source
+of truth. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

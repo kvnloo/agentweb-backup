@@ -690,6 +690,8 @@ uses real isS3Url (hits A). A-006 discarded.
 Cycle 200: classifyBrandLogoUrl is Path C of that
 Family A URL (no isS3Url). Ads fail closed on 4xx.
 filesController L35 already SDK-streams. A-006 discarded.
+Cycle 201: pin GET has no User-Agent; probe and
+cssExtractor do. Tests pin no headers. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

@@ -403,6 +403,9 @@ real key. Do not add A-021.
 Cycle 200: classifyBrandLogoUrl Path-C GETs that
 Family A URL. Ads fail closed on 4xx. Same repo
 already SDK-streams (filesController L35). Do not add A-021.
+Cycle 201: pin GET has no User-Agent; probe and
+cssExtractor do. Same URL can fail pin and pass
+ads. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -397,6 +397,9 @@ stores the real key. Product READY unchanged.
 Cycle 200: classifyBrandLogoUrl Path-C GETs that
 Family A URL. Ads fail closed on 4xx; persist
 rediscovery is fail-open on unknown. Product READY unchanged.
+Cycle 201: downloadBrandLogoToS3 GET has no
+User-Agent; probe and cssExtractor do. Tests pin
+no headers. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
