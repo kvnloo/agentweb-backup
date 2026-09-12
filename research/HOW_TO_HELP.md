@@ -119,6 +119,9 @@ instance. Do not set `HealthCheckSuccessThreshold` from A-019.
 Cycle 232: Sunday `InstanceRefreshEnabled` is weekly Immutable,
 not rolling (`05-instance-recycling.config` L4–6 comment is stale).
 Do not disable refresh. Do not set `HealthCheckSuccessThreshold`.
+Cycle 233: Sunday-without-hook still `disableCron`s (IMDS and
+SIGTERM). Wait is the park, not the 503. Do not add systemd from
+A-019. Do not restore `07-termination-lifecycle.config`.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

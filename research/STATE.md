@@ -7,25 +7,25 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 232
+cycles_completed: 233
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 233
+next_cycle: 234
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 232: Sunday InstanceRefreshEnabled
-  is weekly Immutable (AWS), not rolling.
-  L4-6 comment is stale. Zero rolling-
-  update namespace in git. Dying 5xx
-  cannot fail the new weekly instances
-  (same as 231). Cycle 233: if the hook
-  is missing on Sunday (A-020), does
-  A-019 still 503 via SIGTERM
-  gracefulShutdown (cycle 115 / 213)
-  so 5xx happens without Wait? Do not
-  add .platform systemd. Do not restore
-  07-termination-lifecycle.config
-  (ENG-818). Do not add A-021. Do not
+  Cycle 233: Sunday-without-hook still
+  disableCron (IMDS Terminated and
+  SIGTERM gracefulShutdown). Wait is
+  the park, not the 503. TODAY sibling
+  mcpServer.ts closer 502s /mcp first.
+  Cycle 234: without Wait, can Hermes
+  still see A-019 POST /mcp 503 on the
+  ALB target after disableCron and
+  before SIGKILL (3m19s < 600s
+  DeregistrationDelay), or does
+  nginx/ALB 502 first? Do not 503
+  /health. Do not set HealthCheckType
+  ELB. Do not add A-021. Do not
   un-ready Q-001 / Q-014 / Q-003. Do
   not revive A-006. stop_after has
   passed; leave briefing_ready. Do not
@@ -43,5 +43,5 @@ Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
 order. Cycle 230: A-019 503 is not a Wait replace. Cycle 231: dying
 5xx does not fail the new Immutable instance. Cycle 232: Sunday
-`InstanceRefreshEnabled` is weekly Immutable, not rolling. A-006
-stays discarded.
+`InstanceRefreshEnabled` is weekly Immutable, not rolling. Cycle 233:
+Sunday-without-hook still 503s; Wait is the park. A-006 stays discarded.

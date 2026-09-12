@@ -1407,6 +1407,14 @@ same `Ok` bar as merge Immutable
 calls `eb-deploy.sh` (cycle 110).
 Park A-020. Not A-006.
 
+Cycle 233: **Sunday-without-hook still
+`disableCron`s.** IMDS `Terminated`
+and SIGTERM `gracefulShutdown` both
+start `runDrain` (`server.ts` L387
+first). Wait is the park. TODAY
+sibling closer 502s `/mcp` first
+(cycle 213). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

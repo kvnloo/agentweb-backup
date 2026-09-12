@@ -612,3 +612,8 @@ Zero RollingUpdateType in git.
 Dying 5xx cannot fail the new
 weekly instances. Do not disable
 refresh. A-006 stays discarded.
+Cycle 233: Sunday-without-hook still
+disableCron (IMDS Terminated and
+SIGTERM gracefulShutdown). Wait is
+the park, not the 503. A-006 stays
+discarded.

@@ -681,3 +681,11 @@ Cycle 110/113 “rolling on the surviving ASG” was that comment.
 Dying 5xx still cannot fail the new Ok (cycle 231). Sunday
 still never calls `eb-deploy.sh` (A-020 stays park). Not a
 fifth `listen()`.
+
+## Cycle 233 (Sunday-without-hook still 503s)
+
+Missing `Terminating:Wait` skips the park, not `disableCron`.
+IMDS `Terminated` (cycle 114) and OS SIGTERM (cycle 115) both
+start `runDrain`. TODAY sibling `mcpServer.ts` closer 502s
+`/mcp` first; A-019 drops that listener. Not systemd. Not
+ENG-818 `.ebextensions`. A-006 stays discarded.

@@ -751,3 +751,6 @@ reverted. Do not copy that as A-006.
   weekly Immutable (AWS), not
   rolling. Hermes/OMP: no weekly
   pair. Not A-006.
+- Cycle 233: missing Wait still
+  `disableCron`s. Hermes SIGTERM
+  *is* the process. Not A-006.

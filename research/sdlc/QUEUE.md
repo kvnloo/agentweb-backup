@@ -656,6 +656,10 @@ READY unchanged.
    Do **not** treat the L4–6
    comment as AWS. Do **not**
    disable refresh.
+   Cycle 233: Sunday-without-hook
+   still `disableCron`. Wait is
+   the park, not the 503. Do
+   **not** add systemd from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
