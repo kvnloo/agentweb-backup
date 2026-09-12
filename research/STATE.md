@@ -7,28 +7,27 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 227
+cycles_completed: 228
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 228
+next_cycle: 229
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 227: IgnoreHealthCheck
-  false is a deploy command, not
-  a Terminating:Wait SIGTERM.
-  After A-019 close, /health 502
-  is a side effect. Do not 503
-  /health during the wait.
-  Cycle 228: file-level only,
+  Cycle 228: arsenal + Linear +
+  frontier-kb re-rank. Order
+  unchanged (Q-014 → Q-004 →
+  Q-001 → Q-003). Q-017 parked
+  (initialize instructions +
+  additionalProperties:false).
+  PER-1522: narrow twins ship.
+  Cycle 229: file-level only,
   can A-019 HTTP 503 on tools/call
   trip enhanced-health 5xx rules
   (04-disk-alarm names 4xx only)
-  and replace the instance during
-  Terminating:Wait? Do not 503
-  /health. Do not add A-021. Do
-  not start another S3/Referer
-  matcher. Do not un-ready Q-001
-  / Q-014 / Q-003. Do not revive
+  during Terminating:Wait? Do
+  not 503 /health. Do not add
+  A-021. Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive
   A-006. If stop_after passes,
   unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
@@ -41,4 +40,5 @@ Timer may stop when now > `stop_after`. Do not unset `briefing_ready`.
 Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
-of those three does not.
+of those three does not. Cycle 228: Linear PER-1522 + frontier-kb +
+ten-agent arsenal scan did **not** invert implementation order.

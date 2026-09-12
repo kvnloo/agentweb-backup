@@ -64,3 +64,21 @@ Kevin should not be a generic AgentWeb engineer. The first useful role is:
 
 CRM, Stripe, Meta payload plumbing, and `agentModeService.ts` rewrites are
 someone else's lane.
+
+## Linear past-ideas (cycle 228)
+
+Kevin's Linear workspace **zer0 / `0ism`** is the human-viewable dump of
+ideas from other projects. Do **not** file AgentWeb issues there
+(PER-80: no zer0-company 26k dump).
+
+| Linear | What it is | AgentWeb |
+|---|---|---|
+| [PER-1522](https://linear.app/0ism/issue/PER-1522) + [Host-0 product lineage map](https://linear.app/0ism/document/host-0-product-lineage-map-a88b2a7a1758) | 2026-09-12 audit of `/products` vs Linear. Lesson: **narrow twins ship; operating systems of everything do not.** | AgentWeb is already a narrow twin (Emma + MCP for Hermes). Do not become zerOS. |
+| PER-299 / PER-80 | Linear = company mind; Hermes Kanban = execution | AgentWeb is not a fourth control plane. |
+| PER-1257 / PER-1355 | OMP/Hermes MCP Tasks | Factory leaves. Not an AgentWeb first slice. |
+| PER-1074 / PER-868 | Codex `additionalProperties:false`; GitNexus initialize `instructions` | Parked Q-017. File-level: `apiTools.ts` L2081–2094 omits the flag; `mcpServerCore.ts` L58–65 has no `instructions`. |
+| PER-620 | crush RFC 9207 `iss` | Crush-side. Do not rewrite `HERMES_MCP_OAUTH.md`. |
+| PER-1506 / MEMORY Ad Arena / Pipeline Studio | Flux Comfy stills; creative DAG; ad ranking | Q-009 / Q-007 / Q-003 already cover the AgentWeb twins. Do not port the products. |
+
+Homebase, OpenAvatar, Spatial Canvas, Pythia, Paperclip, Dash, ACE,
+PitchTwin, Hardware Studio stay zer0 products.

@@ -3,7 +3,8 @@
 Source of truth: `queue.json`. Protocol score is research leverage.
 **Implementation order** (first PRs): Q-014, Q-004, Q-001, Q-003.
 Land **Q-004 with Q-014** (kvnloo#2). Cycle 209: Kevin asked to
-reprioritize; score ≠ shipping order.
+reprioritize; score ≠ shipping order. Cycle 228: Linear PER-1522 +
+frontier-kb + ten-agent arsenal scan; order unchanged; park Q-017.
 
 Artifact (findings + priorities at the top): [`README.md`](README.md).
 Teach-in: `ARCHITECTURE.md`. Working agreement: `HOW_TO_HELP.md`.
@@ -17,7 +18,8 @@ Land kvnloo#2 (`generate_image` on MCP `tools/list` + hide
 the image tool. Then a fail-open DesignArena → `SUPPORTED_MODELS`
 mapper (not a default flip; not mcp-bench-router's OpenRouter chat map).
 Do not port HyperFrames, MoneyPrinterTurbo, or ComfyUI — Remotion already
-owns intro/outro. Local logged-in browser is ENG-381.
+owns intro/outro. Local logged-in browser is ENG-381. Cycle 228: do not
+port Homebase / OpenAvatar / Pipeline Studio / SoL-Pi; park Q-017.
 
 ## Ranked (by score)
 
@@ -44,6 +46,7 @@ Score ≠ shipping order (cycle 209). Ship Q-014 / Q-004 first.
 | Q-008 | 22 | Eval workspace just shipped (ENG-1870) |
 | Q-009 | 21 | ComfyUI backend — ops-heavy; Remotion is the existing graph node |
 | Q-010 | 19 | callLLM strangler — Harsha gravity; target loop is Hermes-shaped |
+| Q-017 | 28 | MCP initialize instructions + `additionalProperties:false` after #2 and Q-001 smoke (cycle 228; PER-868 / PER-1074). Not the listing PR. |
 
 ## Discarded
 
@@ -63,6 +66,9 @@ Score ≠ shipping order (cycle 209). Ship Q-014 / Q-004 first.
    production default to `gpt-image-2` (cycle 170 Azure `[0]`; cycle 180
    onboarding already pins Gemini 3).
 5. **Q-006 / Q-015** — MCP hygiene after #2 merges (same `apiTools.ts`).
+6. **Q-017** — parked. After #2 and Q-001 smoke: `additionalProperties: false`
+   on advertised roots and optional initialize `instructions` (cycle 228).
+   Not in kvnloo#2.
 
 None of these needs a database change.
 
@@ -567,3 +573,11 @@ SIGTERM. After A-019 close, `/health`
 502 is a side effect. Do not 503
 `/health` during the wait. A-006
 stays discarded.
+Cycle 228: arsenal + Linear
+PER-1522 + frontier-kb + ten
+agents. Implementation order
+unchanged. Park Q-017. Do not
+port Homebase / OpenAvatar /
+Pipeline Studio / SoL-Pi /
+AODL / MCP Tasks. A-006 stays
+discarded.

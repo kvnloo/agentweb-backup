@@ -34,7 +34,11 @@ CRM, HubSpot, Meta payload bugs, billing ledger, `agentModeService.ts`
 rewrites, Kerdoios-inside-AgentWeb, ENG-983 catalogue unlisting, WhatsApp
 Cloud API (#2271), ngrok revival of `local-agent-relay`, porting HyperFrames
 or MoneyPrinterTurbo into Remotion, listing `generate_video` on MCP before
-Q-014.
+Q-014. Do not mint AgentWeb items for zer0 products dumped in Linear
+PER-1522 (Homebase, OpenAvatar, Pipeline Studio, Spatial Canvas, Ad Arena,
+Pythia, Paperclip, Dash, SoL-Pi, AODL). Do not add MCP Tasks or crush
+RFC 9207 runbook rewrites. Do not add `additionalProperties` / initialize
+`instructions` inside kvnloo#2 (Q-017 parked, cycle 228).
 
 ## Architecture research (parallel)
 
@@ -104,5 +108,7 @@ only replacement is the hook). Do not add `TimeoutStopSec` from A-019.
 `IgnoreHealthCheck: false` is not a Wait SIGTERM (cycle 227: deploy
 command; after close, `/health` 502 is a side effect). Do not 503
 `/health` during the wait.
+Cycle 228: arsenal + Linear PER-1522 + frontier-kb re-rank did **not**
+invert Q-014 → Q-004 → Q-001 → Q-003. Park Q-017. A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

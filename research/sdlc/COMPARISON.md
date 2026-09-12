@@ -721,3 +721,10 @@ reverted. Do not copy that as A-006.
   Wait SIGTERM. After close, `/health`
   502 is a side effect. Hermes exit
   *is* health fail. Not A-006.
+- Cycle 228: Linear PER-1522 +
+  frontier-kb host-port + ten-agent
+  arsenal scan. Do not import OMP /
+  SoL-Pi / OpenHands as AgentWeb
+  packages. MCP remains the external
+  bus; A-007/A-008 stay in-process.
+  Not A-006.

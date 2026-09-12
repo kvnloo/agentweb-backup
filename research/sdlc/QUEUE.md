@@ -630,6 +630,11 @@ READY unchanged.
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).
+   Cycle 228: arsenal re-rank did
+   **not** invert this order. Park
+   Q-017. Do **not** import SoL-Pi /
+   OMP / OpenHands. A-006 stays
+   discarded.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

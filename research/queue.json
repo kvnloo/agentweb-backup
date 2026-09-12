@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-12T03:40:00Z",
+  "updated_at": "2026-09-12T05:58:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": [
     "Q-014",
@@ -19,13 +19,13 @@
       "evidence": 5,
       "collision": 1,
       "score": 34,
-      "why": "ENG-1869 shipped native OAuth; remaining friction is client-side PTY+callback paste. Kevin is a Hermes contributor. Unblocks external Emma without schema. Cycle 209: smoke AFTER kvnloo#2 so tools/list includes generate_image.",
+      "why": "ENG-1869 shipped native OAuth; remaining friction is client-side PTY+callback paste. Kevin is a Hermes contributor. Unblocks external Emma without schema. Cycle 209: smoke AFTER kvnloo#2 so tools/list includes generate_image. Cycle 228: observe whether the host rejects schemas that omit additionalProperties (PER-1074); do not rewrite HERMES_MCP_OAUTH.md for RFC 9207 (PER-620 crush-side). Initialize instructions are Q-017 park, not this smoke.",
       "files": [
         "backend/docs/HERMES_MCP_OAUTH.md",
         "backend/src/mcp/oauth/oauthRoutes.ts",
         "backend/docs/AGENT_API.md"
       ],
-      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. In-repo runbook already exists. Remaining: Kevin operator smoke + optional Hermes skill. Cycle 209: run the smoke after kvnloo#2 merges so generate_image is listed.",
+      "first_slice": "See research/briefs/Q-001-hermes-oauth.md. In-repo runbook already exists. Remaining: Kevin operator smoke + optional Hermes skill. Cycle 209: run the smoke after kvnloo#2 merges so generate_image is listed. Cycle 228: do not rewrite the runbook unless the smoke finds a lie (including RFC 9207 iss). Q-017 stays park until smoke says a host needs additionalProperties or initialize instructions.",
       "harsha_db": false
     },
     {
@@ -262,13 +262,13 @@
       "evidence": 5,
       "collision": 2,
       "score": 34,
-      "why": "Hermes cannot discover image gen: generate_image is internal (hidden, still callable). generate_video is absent. This is the content-gen + DesignArena wedge. ENG-973 hid it as a cost tool \u2014 un-hiding is a product choice, not a schema change. Keep metering. Cycle 207/209: listing is necessary and thinner than hoped (one-line schema, required filename+category, no confirm). Do not expand (A-011). In flight: kvnloo#2.",
+      "why": "Hermes cannot discover image gen: generate_image is internal (hidden, still callable). generate_video is absent. This is the content-gen + DesignArena wedge. ENG-973 hid it as a cost tool \u2014 un-hiding is a product choice, not a schema change. Keep metering. Cycle 207/209: listing is necessary and thinner than hoped (one-line schema, required filename+category, no confirm). Do not expand (A-011). In flight: kvnloo#2. Cycle 228: do not add additionalProperties or initialize instructions in this listing PR (Q-017 park; PER-1074 / PER-868).",
       "files": [
         "backend/src/mcp/server/apiTools.ts",
         "backend/src/mcp/server/registry.ts",
         "backend/src/mcp/server/workflowTools.ts"
       ],
-      "first_slice": "See research/briefs/Q-014-generate-image-mcp.md. Remove internal:true or add emma_generate_image. Tests: listed for external, still metered. Do not expose send_email.",
+      "first_slice": "See research/briefs/Q-014-generate-image-mcp.md. Remove internal:true or add emma_generate_image. Tests: listed for external, still metered. Do not expose send_email. Cycle 228: do not add additionalProperties:false or Server instructions in kvnloo#2 (smallest complete listing; Q-017 park).",
       "harsha_db": false
     },
     {
@@ -307,6 +307,26 @@
         "backend/src/services/videoGeneration.ts"
       ],
       "first_slice": "PARK. After Q-014: optional emma_compose_video wrapper, same meter, required duration. Do not add HyperFrames as a provider.",
+      "harsha_db": false
+    },
+    {
+      "id": "Q-017",
+      "title": "MCP initialize instructions + additionalProperties:false on advertised roots",
+      "status": "park",
+      "leverage": 3,
+      "product": 2,
+      "mergeability": 5,
+      "evidence": 5,
+      "collision": 1,
+      "score": 28,
+      "why": "Cycle 228 (PER-868 / PER-1074; ten-agent arsenal scan). createMcpServer (mcpServerCore.ts L58-65) has no initialize instructions. generate_image inputSchema (apiTools.ts L2081-2094) omits additionalProperties; only evaluationTools.ts and one apiTools lookup pin false. Codex/ChatGPT hosts reject that class. Do not expand Q-014 listing (A-011). Do not copy GitNexus tools/list fanout (PER-1089; cycle 211). Do not rewrite HERMES_MCP_OAUTH.md for RFC 9207 (PER-620 crush-side). Harsha if initialize copy is customer-facing.",
+      "files": [
+        "backend/src/mcp/server/mcpServerCore.ts",
+        "backend/src/mcp/server/apiTools.ts",
+        "backend/src/mcp/server/evaluationTools.ts",
+        "backend/docs/HERMES_MCP_OAUTH.md"
+      ],
+      "first_slice": "PARK. After kvnloo#2 and Q-001 smoke. Flag-only additionalProperties:false on advertised MCP roots (copy evaluationTools). Optional initialize instructions only if smoke shows a host that surfaces them. Do not unify Emma vs MCP properties (A-011). Do not drain-gate ListTools. Do not add MCP Tasks (PER-1257 / PER-1355).",
       "harsha_db": false
     }
   ]

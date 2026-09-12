@@ -1645,3 +1645,13 @@ Upstream: email, Slack, GTM, admin, imageReports, human eval, revision.
 **#2393** (ENG-272) extracts `services/conversation/channelPort.ts` + Slack
 adapter — the OMP/Hermes move, already in flight. Do not compete. Do not
 HTTP-split Emma. `executeAgentStep` still throws (A-003).
+
+## Cycle 228
+
+AgentWeb MCP (`createMcpServer` in `mcpServerCore.ts`) is already the
+**external** composition bus for Hermes. SoL-Pi / OMP packages are
+**host ports** (`perm-20260911-hermes-pi-plugin-adapter-is-host-port-not-abi`).
+Do not add a Tasks extension or a fifth `listen()` because Linear
+PER-1257 / PER-1355 exist. Q-017 (park) is initialize `instructions` +
+`additionalProperties: false` on advertised roots — handshake
+hygiene, not a hop.

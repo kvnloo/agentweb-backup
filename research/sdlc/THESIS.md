@@ -631,3 +631,12 @@ Order is process, not a rewrite:
 - Billing meter stays one success-path.
 - Strangler PRs are his lane (Q-010 / A-003). Kevin’s unique help is
   still Hermes operator + MCP listing, plus *researching* this map.
+
+## Cycle 228 (arsenal / Linear / frontier-kb)
+
+`perm-20260910-no-universal-harness-plugin`: leapfrog is steal typed
+slots, not import OpenHands into Emma. `perm-20260911-hermes-pi-plugin-adapter-is-host-port-not-abi`:
+SoL-Pi is a host port; AgentWeb MCP is already the external bus.
+Linear PER-1522: **narrow twins ship**. A-006 stays discarded. Product
+order unchanged. Parked Q-017 is MCP handshake hygiene, not a fifth
+`listen()`.
