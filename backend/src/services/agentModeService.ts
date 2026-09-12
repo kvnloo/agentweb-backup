@@ -1582,6 +1582,17 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
+  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
+  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
+  // no known code path that mutates the registry in between (see the brain node).
+  // The one remaining live hypothesis is that more than one AgentModeService instance
+  // is answering requests inside the same forked worker process (e.g. the per-message
+  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
+  // worker after all). Stamping each instance at construction settles it directly: if
+  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
+  // reads on the same pid, that's a second instance, proven, not inferred.
+  private readonly instanceId = Math.random().toString(36).slice(2, 10);
+
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
@@ -6394,6 +6405,7 @@ export class AgentModeService {
     // across all lines confirms (a); differing pids confirms (b).
     console.log('[ENG-1852-DIAG]', JSON.stringify({
       pid: process.pid,
+      instanceId: this.instanceId,
       uptimeSec: Math.round(process.uptime()),
       allToolsCount: allTools.length,
       hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
