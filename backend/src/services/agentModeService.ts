@@ -26318,13 +26318,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return value;
   }
 
+  /** Escapes every regex metacharacter so a value can be used as a literal match. */
+  private static escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   /**
-   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>` —
-   * so the LLM's output can be checked for whether it decoded either back to raw HTML.
-   * Escaping the PROMPT proves nothing about the RESPONSE: substitution is LLM-driven,
-   * not a deterministic string-replace, so nothing guarantees the model reproduces an
-   * escaped entity as-is rather than "cleaning up" what looks like a stray HTML entity
-   * mid-generation.
+   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>`,
+   * mapped to its escaped form — so the LLM's OUTPUT can be corrected if it decoded
+   * either back to raw HTML. Escaping the PROMPT proves nothing about the RESPONSE:
+   * substitution is LLM-driven, not a deterministic string-replace, so nothing
+   * guarantees the model reproduces an escaped entity as-is rather than "cleaning up"
+   * what looks like a stray HTML entity mid-generation.
    *
    * Deliberately narrower than the 5-character escape set (& < > " ') applied on the way
    * IN: `<`/`>` can construct a genuinely new element regardless of surrounding markup,
@@ -26336,13 +26341,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * could trip this check if that short substring coincidentally reappeared anywhere
    * else in the output, failing a legitimate report for no real security benefit.
    */
-  private static collectDangerousRawValues(value: any, out: Set<string>): void {
+  private static collectRawToEscapedMap(value: any, out: Map<string, string>): void {
     if (typeof value === 'string') {
-      if (/[<>]/.test(value)) out.add(value);
+      if (/[<>]/.test(value)) out.set(value, AgentModeService.escapeHtml(value));
     } else if (Array.isArray(value)) {
-      value.forEach((v) => AgentModeService.collectDangerousRawValues(v, out));
+      value.forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
     } else if (value !== null && typeof value === 'object') {
-      Object.values(value).forEach((v) => AgentModeService.collectDangerousRawValues(v, out));
+      Object.values(value).forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
     }
   }
 
@@ -31958,12 +31963,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ])
       );
 
-      // Raw (pre-escape) values that actually contained a dangerous character — checked
-      // against the LLM's OUTPUT below. Escaping the prompt only proves the request was
-      // safe; it does not prove the model didn't decode an entity back to raw HTML.
-      const dangerousRawValues = new Set<string>();
-      AgentModeService.collectDangerousRawValues(variableValuesObj, dangerousRawValues);
-      AgentModeService.collectDangerousRawValues(arrayVariableValuesObj, dangerousRawValues);
+      // Raw (pre-escape) values that actually contained a dangerous character, mapped to
+      // their escaped form — used to CORRECT the LLM's OUTPUT below if it resurfaces.
+      // Escaping the prompt only proves the request was safe; it does not prove the
+      // model didn't decode an entity back to raw HTML.
+      const rawToEscapedMap = new Map<string, string>();
+      AgentModeService.collectRawToEscapedMap(variableValuesObj, rawToEscapedMap);
+      AgentModeService.collectRawToEscapedMap(arrayVariableValuesObj, rawToEscapedMap);
 
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
@@ -32060,27 +32066,28 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
-      const finalHtml = substitutionData.final_html;
-      const finalSubject = substitutionData.final_subject;
+      let finalHtml = substitutionData.final_html;
+      let finalSubject = substitutionData.final_subject;
 
-      // ENG-1877: fail closed if the model reproduced a value's RAW, unescaped form
-      // instead of the escaped one we sent it — this is the only point that actually
-      // proves the escaping held through generation, rather than just proving the
-      // request was safe. A false positive is possible if a raw dangerous substring
-      // coincidentally already existed in the template's own static markup, but a
-      // blocked report is a far better failure mode here than a silently reopened
-      // injection. Case-insensitive: a model reproducing `<SCRIPT>` instead of
-      // `<script>` is still a browser-executable tag — an exact-case match would
-      // let that trivial reformatting evade detection entirely.
-      const finalHtmlLower = finalHtml.toLowerCase();
-      const finalSubjectLower = finalSubject.toLowerCase();
-      for (const rawValue of dangerousRawValues) {
-        const rawValueLower = rawValue.toLowerCase();
-        if (finalHtmlLower.includes(rawValueLower) || finalSubjectLower.includes(rawValueLower)) {
-          throw new Error(
-            'ENG-1877: LLM substitution reproduced a raw, unescaped value in its output — refusing to return unverified HTML'
-          );
-        }
+      // ENG-1877: correct the output if the model reproduced a value's RAW, unescaped
+      // form instead of the escaped one we sent it — escaping the prompt only proves the
+      // REQUEST was safe, not that the model preserved it through generation. Auto-
+      // correcting (rather than rejecting outright) means a model that imperfectly
+      // handles escaping on some OTHER template degrades to "silently corrected", not
+      // "report generation hard-fails" — this function is shared by ~35 existing
+      // templates across the platform, most never tested against this change, and a
+      // reject-on-detect design would turn any of their LLM's occasional imperfect
+      // escaping into a customer-visible outage for reasons unrelated to security.
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still
+      // a browser-executable tag — an exact-case match would let that trivial
+      // reformatting evade correction entirely. A false correction is possible if a raw
+      // dangerous substring coincidentally already existed in the template's own static
+      // markup, but replacing that one occurrence with its escaped form is a far safer
+      // failure mode than either a silently reopened injection or a hard failure.
+      for (const [rawValue, escapedValue] of rawToEscapedMap) {
+        const pattern = new RegExp(AgentModeService.escapeRegExp(rawValue), 'gi');
+        finalHtml = finalHtml.replace(pattern, escapedValue);
+        finalSubject = finalSubject.replace(pattern, escapedValue);
       }
 
       // Verify the substitution was correct
