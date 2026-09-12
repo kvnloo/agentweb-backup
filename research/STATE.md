@@ -7,20 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 189
+cycles_completed: 190
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 190
+next_cycle: 191
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 189: Family B is not one function. books.ts
-  encodes each key segment; brand/db/tasks interpolate
-  raw originalname. extractS3KeyFromUrl does not
-  decode; deriveOwnBucketKey does.
-  Cycle 190: cheapest remaining. Candidate: CORS
-  app.ts L224 is exact-string Origin on Family B's
-  host. Family A tests mock path-style Location
-  whose Origin would miss. File-level.
+  Cycle 190: CORS Origin is exact Family B host
+  (credentials: true). cors.test.ts never pins it.
+  CloudFront forms already match agentwebforms regex.
+  Cycle 191: cheapest remaining. Candidate: HTML
+  repair includes('agentweb-user-files.s3') is a
+  third matcher, five sites in agentModeService.ts
+  L30399–30428. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

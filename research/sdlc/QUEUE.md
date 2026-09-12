@@ -362,6 +362,8 @@ Product READY unchanged.
 Cycle 189: Family B encodes in books.ts, raw
 originalname in brand/db/tasks. Product READY
 unchanged.
+Cycle 190: CORS Origin is exact Family B host
+(credentials: true). Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

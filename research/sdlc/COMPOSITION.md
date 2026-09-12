@@ -947,6 +947,15 @@ decodes; `extractS3KeyFromUrl` L27 does not —
 `filesController.ts` L36 HEADs the encoded string.
 No books test pins `encodedKey`. Not A-006.
 
+Cycle 190: **CORS Origin is exact Family B host.**
+`app.ts` L224 string vs regexes; L256 `origin ===`;
+L293 `credentials: true`. `cors.test.ts` pins
+hireemma/ngrok, grep s3 empty. CloudFront forms
+already match L220 `*.agentwebforms.com`. Repair
+`includes('agentweb-user-files.s3')` (L30399)
+is wider; path-style Location Origin misses both.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

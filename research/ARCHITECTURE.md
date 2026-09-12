@@ -644,6 +644,9 @@ Cycle 189: Family B is not one function. books
 encodes; brand interpolates raw originalname.
 extractS3KeyFromUrl does not decode. A-006
 discarded.
+Cycle 190: CORS Origin is exact Family B host
+(credentials: true). cors.test.ts never pins it.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

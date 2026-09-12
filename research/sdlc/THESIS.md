@@ -366,6 +366,9 @@ Cycle 189: Family B is not one function. books
 encodes segments; brand interpolates raw
 originalname. extractS3KeyFromUrl does not decode.
 Do not add A-021.
+Cycle 190: CORS Origin is exact Family B host
+(credentials: true). cors.test.ts never pins it.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

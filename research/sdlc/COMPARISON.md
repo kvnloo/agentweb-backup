@@ -536,3 +536,9 @@ reverted. Do not copy that as A-006.
   extractS3KeyFromUrl L27 does not decode;
   deriveOwnBucketKey L97 does. Hermes one encoding.
   Not A-006.
+- Cycle 190: CORS Origin is origin=== Family B host
+  (app.ts L224 / L256) with credentials: true (L293).
+  cors.test.ts never pins s3. CloudFront forms already
+  match *.agentwebforms.com (L220). Repair
+  includes('agentweb-user-files.s3') is wider.
+  Not A-006.
