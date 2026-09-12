@@ -707,6 +707,15 @@ Materialize L25678 includes `size, parents`. Helper L23941
 `fields: nextPageToken, ${fields}`. Search cannot refuse
 on metadata it never asked for. Not A-006.
 
+Cycle 158: **Workspace exports have empty `size`.**
+`readGoogleDriveFileContent` L25198–25206
+`files.export` for Docs/Sheets/Slides. Named-read L25606
+`file.size ? parseInt : contentStr.length` after the
+export. Materialize L25781 missing size → 0, then
+`buffer.length` (L25798). Cycle 157’s fields-string
+change still covers binary files. Workspace needs a
+post-download bound on the helper. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

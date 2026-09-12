@@ -305,4 +305,6 @@ Cycle 156: Search Drive/ClickUp helpers unbounded; 200MB
 and 1M caps are on other faces. A-006 stays discarded.
 Cycle 157: Search query omits `size`; other faces request
 it. A-006 stays discarded.
+Cycle 158: Workspace exports empty `size`; named-read
+fallback is after download. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

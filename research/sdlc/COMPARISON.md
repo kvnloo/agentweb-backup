@@ -393,3 +393,6 @@ reverted. Do not copy that as A-006.
 - Cycle 157: search query fields omit size (L24093);
   listing L24690, named-read L25482, materialize L25678
   request it. Helper interpolates (L23941). Not A-006.
+- Cycle 158: Workspace files.export (L25198) empty size;
+  named-read L25606 falls back after download. Metadata
+  refuse misses Docs/Sheets/Slides. Not A-006.

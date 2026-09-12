@@ -515,6 +515,12 @@ Cycle 157: **Search Drive query omits `size`.** L24093
 named-read L25482, materialize L25678 all request `size`.
 The helper already interpolates the caller’s string
 (L23941). Adding `size` is a call-site change, not a hop.
+Cycle 158: **Workspace exports have empty `size`.**
+Docs/Sheets/Slides use `files.export` (`L25198–25206`).
+Named-read L25606 falls back to `contentStr.length` after
+the buffer. Materialize treats missing size as 0 then
+checks `buffer.length`. A metadata refuse misses the
+common KB hit. Bound the helper after export.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

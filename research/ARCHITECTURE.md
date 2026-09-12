@@ -554,6 +554,9 @@ discarded.
 Cycle 157: Search Drive query omits `size` (`L24093`);
 listing, named-read, and materialize request it. A-006
 discarded.
+Cycle 158: Workspace `files.export` has empty `size`;
+named-read falls back to `contentStr.length` after download
+(`L25606`). A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
