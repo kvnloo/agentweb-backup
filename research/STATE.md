@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 183
+cycles_completed: 184
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 184
+next_cycle: 185
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 183: uploaded-by is a hardcoded agent-mode
-  constant on both helpers (L276 / L352). Thumbnail
-  writer tells the truth (workplan-thumbnails).
-  Cycle 184: cheapest remaining. Candidate: no
-  production reader filters on uploaded-by.
-  getS3ObjectMetadata callers read ContentType only.
-  Write-only lie. File-level.
+  Cycle 184: uploaded-by is write-only. HEAD callers
+  use ContentType/ContentLength. assetController imports
+  getS3ObjectMetadata and never calls it. No Tagging.
+  Cycle 185: cheapest remaining. Candidate: helpers
+  omit CacheControl; thumbnail L35 is immutable 1y;
+  README wants HTML max-age=60; serveAsset sets 5 min
+  on the HTTP response. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

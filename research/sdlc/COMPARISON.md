@@ -498,3 +498,9 @@ reverted. Do not copy that as A-006.
   caller tag. workPlanThumbnailService.ts L37 stamps
   workplan-thumbnails on its own S3 client. Hermes
   persist stays with the producer. Not A-006.
+- Cycle 184: uploaded-by is write-only. HEAD callers
+  (agentModeService L28645, filesController L39/L307)
+  read ContentType/ContentLength. assetController L3
+  imports getS3ObjectMetadata unused; L117 HEADs for
+  MIME. Helpers have zero Tagging. Hermes MEDIA tags
+  are read. Not A-006.

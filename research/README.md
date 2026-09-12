@@ -640,6 +640,10 @@ constant.** Both helpers (L276 / L352); signature has
 no caller tag. Thumbnail writer stamps
 `workplan-thumbnails`. Screenshots wrap the helper
 and inherit the lie. Tests never pin the metadata.
+Cycle 184: **`uploaded-by` is write-only.** HEAD
+callers use `ContentType` / `ContentLength`.
+`assetController` imports `getS3ObjectMetadata` and
+never calls it. Helpers set no `Tagging`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

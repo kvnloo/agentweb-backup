@@ -380,4 +380,7 @@ discarded.
 Cycle 183: uploaded-by is a hardcoded agent-mode
 constant on both helpers; thumbnail writer tells the
 truth. A-006 stays discarded.
+Cycle 184: uploaded-by is write-only. HEAD callers
+use ContentType. Helpers set no Tagging. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -892,6 +892,14 @@ L230–235 has no caller tag. Thumbnail writer
 the helper (L397) and inherit the lie. Tests never pin
 the metadata. Not A-006.
 
+Cycle 184: **`uploaded-by` is write-only.**
+`getS3ObjectMetadata` callers read `ContentType` /
+`ContentLength` (`agentModeService.ts` L28645,
+`filesController.ts` L39 / L307). `assetController.ts`
+L3 imports the helper unused; L117 HEADs with a
+second client for MIME. Helpers have zero `Tagging`.
+Hermes MEDIA tags are read by the gateway. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

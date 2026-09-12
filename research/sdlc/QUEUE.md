@@ -347,6 +347,8 @@ unchanged.
 Cycle 183: uploaded-by is a hardcoded agent-mode
 constant on both helpers; thumbnail writer tells the
 truth. Product READY unchanged.
+Cycle 184: uploaded-by is write-only. HEAD is for
+ContentType. No Tagging. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
