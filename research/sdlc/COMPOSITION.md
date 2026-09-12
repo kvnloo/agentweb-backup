@@ -1078,6 +1078,13 @@ already prints logoUrl. generate_image L4999
 asks for the URL. MCP does not list this tool.
 Not A-006.
 
+Cycle 206: **Pin/probe omit Referer.** Chrome
+scrape still sends it on <img>/icon during
+networkidle2. Pin L374 no headers (test L243).
+Probe L495 Mozilla only. Referer-gated CDN
+403s both after scrape found the URL. Ads fail
+closed. Occupied app.ts #2271. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

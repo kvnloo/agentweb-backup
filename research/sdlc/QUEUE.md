@@ -414,6 +414,9 @@ no-cache headers, not the UA. Product READY unchanged.
 Cycle 205: read_brand_guidelines LLM HTML shows
 asset.filename not logoUrl. Discovery formatter
 already prints the URL. Product READY unchanged.
+Cycle 206: pin/probe omit Referer; Chrome scrape
+still sends it on subresources. Tests pin pin GET
+has no headers. Ads fail closed. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

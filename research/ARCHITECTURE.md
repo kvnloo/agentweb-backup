@@ -706,6 +706,9 @@ no-cache headers, not the UA. A-006 discarded.
 Cycle 205: read_brand_guidelines LLM HTML shows
 asset.filename, not logoUrl. Discovery formatter
 already prints the URL. A-006 discarded.
+Cycle 206: pin/probe omit Referer; Chrome scrape
+still sends it on subresources. Tests pin pin GET
+has no headers. Ads fail closed. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

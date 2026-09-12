@@ -643,3 +643,10 @@ reverted. Do not copy that as A-006.
   filename only. Discovery formatCSSExtractionResult
   L15631 already prints the URL. generate_image asks
   for that URL. Hermes one handle. Not A-006.
+- Cycle 206: pin L374 has no headers (test L243).
+  Probe L495 Mozilla only. Chrome scrape L554 extra
+  headers omit Referer but networkidle2 still
+  fetches <img>/icon with a browser Referer. Video
+  L239 no headers. app.ts L193 inbound no-referrer
+  is leak-prevention (#2271). Hermes one client.
+  Not A-006.

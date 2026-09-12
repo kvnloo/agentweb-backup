@@ -7,18 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 205
+cycles_completed: 206
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 206
+next_cycle: 207
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 205: read_brand_guidelines LLM HTML shows
-  asset.filename (logo.png / 'url'), not logoUrl.
-  Discovery formatter already prints the URL.
-  Cycle 206: cheapest remaining. Candidate:
-  pin/probe missing Referer (Chrome scrape sends
-  it on subresources). File-level.
+  Cycle 206: pin/probe omit Referer; Chrome scrape
+  still sends it on <img>/icon during networkidle2.
+  Referer-gated CDN 403s both pin and probe.
+  Cycle 207: cheapest remaining. Candidate:
+  generate_image.filename required (MCP L2093 /
+  Emma L5052) colliding with asset.filename
+  'url' / logo.png from cycle 205. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,
