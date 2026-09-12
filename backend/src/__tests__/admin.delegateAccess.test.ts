@@ -88,29 +88,17 @@ describe('Admin delegate access endpoint', () => {
     expect(hoursUntilExpiration).toBeLessThan(8.5);
   });
 
-  it('routes an evaluation target to the dedicated workspace with a fragment-only delegate token', async () => {
+  // ENG-1907 AC5: a sandbox account is a real customer-portal account. Access
+  // Portal opens it through the same callback as everyone else; only the token
+  // scope differs (evaluation), so the auth layer still binds it to the candidate.
+  it('routes an evaluation target through the customer-portal callback with an evaluation-scoped token', async () => {
     mockUserDb.getUserById.mockResolvedValue({ userId: 'eval_ryan', email: 'case@example.invalid', roles: ['customer'], delegateTokenEpoch: 2, sessionVersion: 3 } as any);
     const res = await request(app).post('/api/admin/users/eval_ryan/delegate-access').set('Host', 'evaluation.example.invalid').expect(200);
-    const url = new URL(res.body.customerPortalUrl);
-    expect(url.origin).toBe(new URL(process.env.BACKEND_URL || 'http://evaluation.example.invalid').origin);
-    expect(url.pathname).toBe('/evaluation');
-    expect(url.search).toBe('');
-    expect(new URLSearchParams(url.hash.slice(1)).get('token')).toBe(res.body.delegateToken);
+    expect(res.body.customerPortalUrl).toBe(`${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/oauth-callback?token=${res.body.delegateToken}`);
+    expect(res.body.customerPortalUrl).not.toContain('/evaluation');
     expect(jwt.decode(res.body.delegateToken)).toMatchObject({ userId: 'eval_ryan', dte: 2, sv: 3, isAdmin: false, delegateAccess: { scope: 'evaluation', targetUserId: 'eval_ryan' } });
     expect(res.body.expiresIn).toBe('8h');
     expect(res.headers['cache-control']).toBe('no-store');
-  });
-
-  it.each([undefined, 'https://staging.example.invalid/'])('keeps evaluation delegation in its own backend environment (%s)', async backendUrl => {
-    const original = process.env.BACKEND_URL;
-    try {
-      if (backendUrl) process.env.BACKEND_URL = backendUrl; else delete process.env.BACKEND_URL;
-      mockUserDb.getUserById.mockResolvedValue({ userId: 'eval_local', email: 'case@example.invalid', roles: ['customer'] } as any);
-      const res = await request(app).post('/api/admin/users/eval_local/delegate-access').set('Host', 'local.example.invalid').expect(200);
-      expect(new URL(res.body.customerPortalUrl).origin).toBe(backendUrl ? new URL(backendUrl).origin : 'http://local.example.invalid');
-    } finally {
-      if (original === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = original;
-    }
   });
 
   it('preserves the existing customer portal callback for non-evaluation users', async () => {
