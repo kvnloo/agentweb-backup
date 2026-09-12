@@ -12,7 +12,7 @@ import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
-import { isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
+import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
 
 const router = express.Router();
 
@@ -67,8 +67,11 @@ router.get('/me', authenticateToken, async (req, res) => {
     if (isEvaluationUser(userId)) {
       try {
         sandboxInfo = buildSandboxInfo(await requireActiveEvaluation(userId));
-      } catch {
-        return res.status(401).json({ code: 'session_invalid', message: 'Invalid token' });
+      } catch (error) {
+        // Only a policy denial is a session problem; a store outage must surface as a 500,
+        // not lock every sandbox account out with a "session invalid".
+        if (error instanceof EvaluationDenied) return res.status(401).json({ code: 'session_invalid', message: 'Invalid token' });
+        throw error;
       }
     }
     const user = await userDb.getUserById(userId);

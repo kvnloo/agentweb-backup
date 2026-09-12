@@ -74,9 +74,10 @@ describe('GET /api/auth/me — sandboxInfo', () => {
     expect(res.body.code).toBe('session_invalid');
     expect(res.body.email).toBeUndefined();
   });
-  it('answers 401 when the policy store is unavailable', async () => {
+  it('answers 500, not a session error, when the policy store is unavailable', async () => {
     (evaluationStore.get as jest.Mock).mockRejectedValue(new Error('unavailable'));
-    const res = await callAs('eval_test').expect(401);
-    expect(res.body.code).toBe('session_invalid');
+    const res = await callAs('eval_test').expect(500);
+    expect(res.body.code).toBeUndefined();
+    expect(res.body.email).toBeUndefined();
   });
 });
