@@ -696,6 +696,13 @@ READY unchanged.
    stays. Do **not** treat `IdleTimeout`
    as a weekly re-pin. Do **not**
    un-park A-020 for XFF.
+   Cycle 243: a later ENG-493 pin is the
+   only in-tree reassert of XFF without
+   recreate. Do **not** treat a
+   resource-only IdleTimeout PR as also
+   pinning XFF. Do **not** add
+   `commands:` / hooks / CFN LoadBalancer
+   from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

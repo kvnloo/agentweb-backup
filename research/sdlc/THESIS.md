@@ -753,3 +753,11 @@ AWS immutable is a temporary ASG behind the environment’s
 load balancer. ENG-823 already-600s no-op. ENG-836:
 IdleTimeout is resource and cannot ride instance Immutable.
 Sunday never applies `timeout.config`. Not A-006.
+
+## Cycle 243 (ENG-493 pin is the only in-tree XFF reassert)
+
+IdleTimeout can be a resource-only PR; XFF cannot. No
+`.platform/hooks`. `Resources:` is CloudWatch, not ALB.
+Recreate is out of band (DR L103). Later
+`modify-load-balancer-attributes` sibling is the only
+live-ALB reassert. Not A-019. Not A-006.

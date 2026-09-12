@@ -1468,6 +1468,12 @@ Immutable and Sunday. `IdleTimeout`
 does not reapply weekly (ENG-836).
 Not A-006.
 
+Cycle 243: **a later ENG-493 pin is the
+only in-tree reassert of XFF without
+recreate.** IdleTimeout’s resource-only
+PR does not transfer. Recreate is out
+of band. Not A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

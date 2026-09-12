@@ -135,6 +135,10 @@ ALB XFF attributes. That is ENG-493. Do not add
 the LB ARN after verify — not A-019, not A-020. Do not add A-021.
 Cycle 242: that LB ARN stays across Immutable and Sunday. Console
 XFF drift survives. Do not treat `IdleTimeout` as a weekly re-pin.
+Cycle 243: a later ENG-493 pin is the only in-tree reassert of XFF
+without recreate. Do not treat a resource-only IdleTimeout PR as
+also pinning XFF. Recreate is out of band. Do not add that pin from
+A-019. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

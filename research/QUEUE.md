@@ -651,3 +651,7 @@ Cycle 242: LoadBalancers[*].Name stays
 across Immutable and Sunday. Console
 XFF drift survives. IdleTimeout does
 not reapply weekly. A-006 stays discarded.
+Cycle 243: a later ENG-493 pin is the
+only in-tree reassert of XFF without
+recreate. IdleTimeout resource-only PR
+does not transfer. A-006 stays discarded.

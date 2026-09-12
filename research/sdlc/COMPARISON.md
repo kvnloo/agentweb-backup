@@ -785,3 +785,8 @@ reverted. Do not copy that as A-006.
   Immutable/Sunday. Hermes has no
   weekly pair behind a stable balancer.
   Not A-006.
+- Cycle 243: only a later LB-ARN pin
+  can reassert XFF without recreate.
+  IdleTimeout resource-only PR does
+  not transfer. Hermes has no ALB
+  attributes to pin. Not A-006.
