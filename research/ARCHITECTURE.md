@@ -636,6 +636,10 @@ rewrite hops here. A-006 discarded.
 Cycle 187: rewrite matches one S3 host; /asset/
 accepts three. Brand already has the bucket matcher.
 A-006 discarded.
+Cycle 188: three S3 URL writers. Helpers return
+Location (tests mock path-style). Brand/db/tasks
+construct regional virtual-hosted. Remotion is
+path-style. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

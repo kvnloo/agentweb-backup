@@ -522,3 +522,11 @@ reverted. Do not copy that as A-006.
   Brand deriveOwnBucketKey (L84) already matches bucket
   not hostname spelling. Rewrite tests only use L178.
   Not A-006.
+- Cycle 188: three S3 URL writers. Helpers return
+  result.Location (s3Utils L285; tests mock
+  https://s3.amazonaws.com/bucket/key). Brand L60-64
+  / db L3006 / tasks L1153 construct
+  ${bucket}.s3.${region}.amazonaws.com/${key}. Remotion
+  L204 is path-style s3.${region}/bucket. Zero
+  s3ForcePathStyle. Hermes one persist, one URL shape.
+  Not A-006.

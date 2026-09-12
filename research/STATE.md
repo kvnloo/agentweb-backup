@@ -7,20 +7,21 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 187
+cycles_completed: 188
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 188
+next_cycle: 189
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 187: rewriteS3ImageUrls includes() one
-  regional host; decodeAssetHash accepts region-less
-  + execution-gifs. Brand already extracted a bucket
-  matcher for delete (brand.ts L84).
-  Cycle 188: cheapest remaining. Candidate: helpers
-  return SDK Location; brand L60 constructs
-  regional virtual-hosted URL. Two writers, two
-  spellings. File-level.
+  Cycle 188: three S3 URL writers. Helpers return
+  SDK Location (tests mock path-style). Brand/db/tasks
+  construct regional virtual-hosted. Remotion is
+  path-style s3.<region>/<bucket>.
+  Cycle 189: cheapest remaining. Candidate: Family B
+  still isn't one function — books.ts L43–47 encodes
+  each key segment; brand/db/tasks interpolate raw
+  key. CORS app.ts L224 is the same one-host as
+  rewrite. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

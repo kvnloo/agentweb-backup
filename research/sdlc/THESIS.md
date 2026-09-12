@@ -358,6 +358,10 @@ rewrite hops here. Do not add A-021.
 Cycle 187: rewrite matches one S3 host; /asset/
 accepts three. Brand already extracted deriveOwnBucketKey.
 Do not add A-021.
+Cycle 188: three S3 URL writers. Helpers return
+Location; brand/db/tasks construct regional
+virtual-hosted; Remotion path-style. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

@@ -392,4 +392,8 @@ discarded.
 Cycle 187: rewrite matches one S3 host; /asset/
 accepts three. Brand already extracted a bucket
 matcher. A-006 stays discarded.
+Cycle 188: three S3 URL writers. Helpers return
+Location; brand/db/tasks construct regional
+virtual-hosted; Remotion is path-style. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

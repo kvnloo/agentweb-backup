@@ -925,6 +925,19 @@ hardcoded-prefix lie and L84 matches on bucket.
 Rewrite tests never use the region-less URL L10
 pins. Not A-006.
 
+Cycle 188: **Three S3 URL writers.** Helpers return
+`result.Location` (`s3Utils.ts` L285 / L361;
+thumbs L42). Tests mock global path-style
+(`s3Utils.test.ts` L53). Brand L60–64, `db.ts`
+L3006, `tasks.ts` L1153 / L1333,
+`reportRevisionService.ts` L477, `agentModeService.ts`
+L30469 / L30619 construct regional virtual-hosted.
+`books.ts` L47 encodes segments. Remotion L204 is
+`s3.${region}.amazonaws.com/${bucket}/…` (test L57).
+Zero `s3ForcePathStyle`. CORS L224 allowlists Family
+B’s host only. Image persist is Family A
+(`imageGeneration.ts` L582–593). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
