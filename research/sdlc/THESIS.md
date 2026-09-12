@@ -261,6 +261,8 @@ already parks this for `generate_image`. Do not add A-021.
 Cycle 147: GG `reason` is required then discarded (L174 vs
 L177) before the Vertex leaf. Unifying it away is a no-op
 on retrieval. Do not add A-021.
+Cycle 148: GG L71 and Emma RAG L5106 hardcode 10; Emma tool
+/ MCP default 5. Cardinality is per-face. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

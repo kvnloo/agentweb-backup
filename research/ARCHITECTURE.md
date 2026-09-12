@@ -525,6 +525,8 @@ schemas; GG requires `reason`. A-011 already parks this
 pattern for `generate_image`. A-006 discarded.
 Cycle 147: GG `reason` is required on the schema and
 discarded before the Vertex leaf. A-006 discarded.
+Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma tool
+/ MCP default 5. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

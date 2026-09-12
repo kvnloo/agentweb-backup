@@ -468,6 +468,10 @@ Cycle 147: **GG `reason` never reaches the leaf.** L174 logs
 it; L177 calls `searchKnowledgeBase(query, userId)` only.
 Tool result L188–192 omits it. Unifying that field away is a
 no-op on Vertex, unlike `confirm` on `generate_image` (A-011).
+Cycle 148: **cardinality is per-face.** GG L71 and Emma RAG
+L5106 hardcode **10**. Emma tool L5594 and MCP L1281 default
+**5**, then Agent Mode `Math.min(..., 10)` (L24050). Emma
+disagrees with itself. Not a leaf port.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -363,3 +363,6 @@ reverted. Do not copy that as A-006.
 - Cycle 147: GG reason is required then discarded before the
   Vertex leaf (L174 vs L177). Unifying it away is a no-op
   on retrieval, unlike confirm on generate_image. Not A-006.
+- Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma
+  tool / MCP default 5 then AM min(,10). Cardinality is
+  per-face, not a leaf port. Not A-006.

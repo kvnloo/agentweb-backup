@@ -631,6 +631,11 @@ Tool result L188–192 is `{ query, results, count }`. Cycle 39
 A-011 parks unifying images. This field is the opposite
 no-op. Not A-006.
 
+Cycle 148: **cardinality is per-face.** GG L71 and Emma RAG
+L5106 hardcode 10. Emma tool L5594 and MCP L1281 default 5.
+Agent Mode L24050 caps at 10. Emma disagrees with itself
+(RAG vs tool). Not a leaf port. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
