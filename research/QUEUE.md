@@ -269,4 +269,7 @@ Cycle 143: listed MCP `search_knowledge_base` already hops to
 that Agent Mode superset; `generate_image` is still
 `internal: true`. Q-014 is listing, not a new hop. A-006 stays
 discarded.
+Cycle 144: Agent Mode still recaps Vertex after ENG-1057
+capped the leaf; L24062 comment is stale. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -247,6 +247,9 @@ Cycle 143: listed MCP `search_knowledge_base` already hops to
 that Agent Mode superset; `generate_image` is still
 `internal: true`. Q-014 is listing, not a new hop. Product
 READY unchanged.
+Cycle 144: Agent Mode still recaps Vertex after ENG-1057
+capped the leaf; L24062 comment is stale. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

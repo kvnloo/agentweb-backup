@@ -450,6 +450,11 @@ to that superset.** `apiTools.ts` L1264–1284 has no
 `internal: true`; `emmaApi.ts` L98–101 calls Agent Mode.
 Sibling `generate_image` is still hidden (L2077). Test L78
 vs L91. Q-014 is listing, not a new hop.
+Cycle 144: **Agent Mode still recaps Vertex.** Leaf already
+caps at `chatbotService.ts` L4800–4804 / L4852. Face L24065
+plus test L321–334 mock the leaf to 6000 chars. L24062
+“never capped” is stale. Drive/ClickUp caps stay on the
+face (cycle 142). Not a fifth hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

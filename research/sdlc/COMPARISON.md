@@ -350,3 +350,6 @@ reverted. Do not copy that as A-006.
 - Cycle 143: listed MCP search_knowledge_base already hops to
   that Agent Mode superset; generate_image is still internal.
   Q-014 is listing, not a new hop. Not A-006.
+- Cycle 144: Agent Mode still recaps Vertex after ENG-1057
+  capped the leaf; L24062 comment is stale. Face test mocks
+  the leaf. Not A-006.

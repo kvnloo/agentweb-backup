@@ -604,6 +604,13 @@ listed description (L1268) does not mention Drive/ClickUp;
 the hop still walks them. Q-014 is listing, not a new hop.
 Not A-006.
 
+Cycle 144: **Agent Mode still recaps Vertex.** Leaf
+`chatbotService.ts` L4800–4804 / L4852 already truncates.
+Face L24065 plus `agentModeService.searchKnowledgeBase.test.ts`
+L321–334 mock the leaf to 6000 chars. L24062 “never capped”
+is stale. Drive/ClickUp caps at L24113 / L24161 / L24199
+stay on the face (cycle 142). Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

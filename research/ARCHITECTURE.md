@@ -515,6 +515,8 @@ Cycle 143: listed MCP `search_knowledge_base` already hops to
 that Agent Mode superset; `generate_image` is still
 `internal: true`. Q-014 is listing, not a new hop. A-006
 discarded.
+Cycle 144: Agent Mode still recaps Vertex after ENG-1057
+capped the leaf; L24062 comment is stale. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

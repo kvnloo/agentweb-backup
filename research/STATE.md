@@ -7,19 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 143
+cycles_completed: 144
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 144
+next_cycle: 145
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 143: listed MCP search_knowledge_base already hops to
-  Agent Mode’s Drive/ClickUp superset; generate_image is still
-  internal: true. Cycle 144: cheapest remaining. Candidate:
-  Agent Mode re-caps Vertex at L24065 after ENG-1057 capped
-  the leaf; L24062 comment is stale. Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006. If stop_after passes,
-  unsubscribe agentweb-research-cycle.
+  Cycle 144: Agent Mode still recaps Vertex after ENG-1057
+  capped the leaf; L24062 comment is stale. Cycle 145:
+  cheapest remaining. Candidate: Emma chatbot exports a
+  different searchKnowledgeBase (chatbotService.ts L4674
+  in-memory chunks) than Agent Mode’s method of the same
+  name (L24032). Do not un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

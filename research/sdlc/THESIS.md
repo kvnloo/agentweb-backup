@@ -248,6 +248,9 @@ Cycle 143: listed MCP `search_knowledge_base` already hops to
 that superset (`emmaApi.ts` L98–101); `generate_image` is
 still `internal: true`. Q-014 is listing, not a new hop. Do
 not add A-021.
+Cycle 144: Agent Mode still recaps Vertex (L24065) after
+ENG-1057 capped the leaf (L4800–4804 / L4852). L24062
+comment is stale. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
