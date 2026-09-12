@@ -716,3 +716,6 @@ partner. Do not pin AWS defaults. A-006
 stays discarded.
 Cycle 262: do not piggyback XFF on the
 delay opt-in. A-006 stays discarded.
+Cycle 263: new ensure_xff_* sibling. Do
+not stuff XFF into delay. A-006 stays
+discarded.

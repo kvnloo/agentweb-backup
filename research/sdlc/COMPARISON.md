@@ -851,3 +851,6 @@ reverted. Do not copy that as A-006.
 - Cycle 262: do not piggyback XFF on the
   delay opt-in. Hermes has no TG-timeout
   vs XFF deploy fork. Not A-006.
+- Cycle 263: new XFF sibling, not stuffed
+  into delay. Hermes has no two-pins-in-
+  one-function fork. Not A-006.

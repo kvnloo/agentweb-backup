@@ -873,3 +873,9 @@ Not A-020. Not A-006.
 
 Delay `desired` is TG seconds. XFF is LB `xff_*`.
 Own opt-in. Not A-019. Not A-020. Not A-006.
+
+## Cycle 263 (sibling function, do not stuff)
+
+New `ensure_xff_*`. After L798 is piggyback; before
+hides from ENG-823 opted-out grep. Not A-019. Not
+A-020. Not A-006.

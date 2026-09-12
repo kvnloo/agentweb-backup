@@ -7,26 +7,26 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 262
+cycles_completed: 263
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 263
+next_cycle: 264
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 262: do not piggyback XFF on
-  EB_DEREGISTRATION_DELAY_SECONDS. Cycle 263:
-  cycle 241 said sibling function. Should a
-  later XFF pin be a new
-  ensure_xff_header_processing (own env, own
-  L798 skip) rather than stuffing XFF into
-  ensure_deregistration_delay behind a second
-  var? Do not stuff. Do not add that pin from
-  A-019. Do not un-park A-020. Do not 503
-  /health. Do not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave
-  briefing_ready. Do not mint a timer
-  unless Kevin asks.
+  Cycle 263: new ensure_xff_* sibling; do not
+  stuff XFF into ensure_deregistration_delay.
+  Cycle 264: dryrun runs inside verify after
+  SUCCESS and cannot fail the job. Delay runs
+  from main() after verify and does fail().
+  Should a later XFF sibling be called from
+  main() next to delay, not from verify next
+  to dryrun? Do not copy dryrun cannot-fail.
+  Do not add that pin from A-019. Do not
+  un-park A-020. Do not 503 /health. Do not
+  add A-021. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. stop_after has
+  passed; leave briefing_ready. Do not mint
+  a timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -38,7 +38,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–262: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–263: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -64,4 +64,5 @@ XFF pin copies ENG-823’s None policy; do not add a fourth.
 Treat empty current like `20`; do not add hook `[ -z ]`.
 Unset XFF desired skips like partner; do not pin AWS
 defaults. Do not piggyback XFF on the delay opt-in.
+Do not stuff XFF into `ensure_deregistration_delay`.
 A-006 stays discarded.

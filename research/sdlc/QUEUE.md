@@ -767,6 +767,9 @@ READY unchanged.
    AWS defaults from A-019.
    Cycle 262: do **not** piggyback XFF on
    `EB_DEREGISTRATION_DELAY_SECONDS`.
+   Cycle 263: new `ensure_xff_*` sibling.
+   Do **not** stuff XFF into
+   `ensure_deregistration_delay`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
