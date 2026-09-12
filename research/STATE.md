@@ -7,25 +7,27 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 264
+cycles_completed: 265
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 265
+next_cycle: 266
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 264: call XFF from main() next to
-  delay; do not copy dryrun cannot-fail.
-  Cycle 265: sequential fail() means the
-  first miss never reaches the second.
-  Should delay stay first so a new XFF IAM
-  miss cannot skip today's ENG-823 TG pin?
-  Do not reorder delay behind XFF. Do not
-  add that pin from A-019. Do not un-park
-  A-020. Do not 503 /health. Do not add
-  A-021. Do not un-ready Q-001 / Q-014 /
-  Q-003. Do not revive A-006. stop_after
-  has passed; leave briefing_ready. Do not
-  mint a timer unless Kevin asks.
+  Cycle 265: delay first in main(); do not
+  reorder delay behind XFF. Cycle 266: delay
+  already rediscovers LoadBalancers[*];
+  health probe does too and does not share
+  a helper. Should a later XFF sibling
+  rediscover after its own skip, rather than
+  a shared discovery from main() before both
+  pins? Do not share from main() (would run
+  on partner when both unset). Do not add
+  that pin from A-019. Do not un-park A-020.
+  Do not 503 /health. Do not add A-021. Do
+  not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. stop_after has passed; leave
+  briefing_ready. Do not mint a timer unless
+  Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -37,7 +39,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–264: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–265: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -65,4 +67,5 @@ Unset XFF desired skips like partner; do not pin AWS
 defaults. Do not piggyback XFF on the delay opt-in.
 Do not stuff XFF into `ensure_deregistration_delay`.
 Call XFF from `main()` next to delay; do not copy
-dryrun cannot-fail. A-006 stays discarded.
+dryrun cannot-fail. Delay first; do not reorder delay
+behind XFF. A-006 stays discarded.

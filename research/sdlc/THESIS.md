@@ -884,3 +884,8 @@ A-020. Not A-006.
 
 Dryrun cannot `fail()`. XFF pin must. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 265 (delay first, then XFF)
+
+`fail()` is `exit 1`. XFF-first would skip ENG-823.
+Not A-019. Not A-020. Not A-006.

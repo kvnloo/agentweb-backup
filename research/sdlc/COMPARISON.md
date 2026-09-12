@@ -857,3 +857,5 @@ reverted. Do not copy that as A-006.
 - Cycle 264: XFF from `main()`, not verify
   dryrun. Hermes has no observation-vs-pin
   after-success fork. Not A-006.
+- Cycle 265: delay first, then XFF. Hermes
+  has no two-pin call-order fork. Not A-006.

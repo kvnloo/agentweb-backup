@@ -773,6 +773,8 @@ READY unchanged.
    Cycle 264: call XFF from `main()` next
    to delay. Do **not** copy dryrun
    cannot-fail.
+   Cycle 265: delay first in `main()`. Do
+   **not** reorder delay behind XFF.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.
