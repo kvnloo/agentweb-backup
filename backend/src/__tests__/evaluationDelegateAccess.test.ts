@@ -7,6 +7,9 @@ import { evaluationStore } from '../services/evaluationStore';
 import { userDb } from '../services/db';
 import { mintDelegateToken } from '../services/delegateAccessToken';
 
+// Supertest matrices spin one ephemeral server per request; under the full-suite
+// pre-push run a slow worker can exceed jest's 5s default and surface as "socket hang up".
+jest.setTimeout(30000);
 const secret = 'synthetic-evaluation-delegation-secret';
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'synthetic-evaluation-delegation-secret' }));
 jest.mock('../services/db', () => ({ userDb: { getUserByIdConsistent: jest.fn(), getUserByEmailConsistent: jest.fn() } }));

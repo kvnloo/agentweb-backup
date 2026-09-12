@@ -14,6 +14,10 @@ jest.mock('../services/evaluationStore', () => ({ evaluationStore: { get: jest.f
  * the normal route authorization. ENG-1870's revocation and OAuth-state-replay
  * assertions still hold.
  */
+// Same reason as evaluationDelegateAccess.test.ts: a 60-request supertest matrix under the
+// full-suite pre-push run must not trip jest's 5s default on a slow worker.
+jest.setTimeout(30000);
+
 describe('ENG-1907 sandbox HTTP boundary', () => {
   const app = express();
   app.use(express.json(), evaluationHttpBoundary);
