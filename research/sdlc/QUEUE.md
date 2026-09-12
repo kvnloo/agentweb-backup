@@ -692,6 +692,10 @@ READY unchanged.
    copy the target-group loop. Do
    **not** fold into A-020. Do **not**
    add A-021.
+   Cycle 242: `LoadBalancers[*].Name`
+   stays. Do **not** treat `IdleTimeout`
+   as a weekly re-pin. Do **not**
+   un-park A-020 for XFF.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

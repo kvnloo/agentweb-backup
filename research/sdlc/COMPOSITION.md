@@ -1462,6 +1462,12 @@ Cycle 241: **XFF pin is
 the LB ARN.** Not the TG loop. Not
 A-019. Not A-020. Not A-021. Not A-006.
 
+Cycle 242: **`LoadBalancers[*].Name`
+stays.** Console XFF drift survives
+Immutable and Sunday. `IdleTimeout`
+does not reapply weekly (ENG-836).
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

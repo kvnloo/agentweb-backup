@@ -133,6 +133,8 @@ treat ALB 502 as a rewrite of Node 503. Cycle 240: A-019 does not pin
 ALB XFF attributes. That is ENG-493. Do not add
 `modify-load-balancer-attributes`. Cycle 241: that pin, if ever, is on
 the LB ARN after verify — not A-019, not A-020. Do not add A-021.
+Cycle 242: that LB ARN stays across Immutable and Sunday. Console
+XFF drift survives. Do not treat `IdleTimeout` as a weekly re-pin.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

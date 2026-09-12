@@ -781,3 +781,7 @@ reverted. Do not copy that as A-006.
   `modify-load-balancer-attributes`, not
   A-020’s ASG hook. Hermes has no
   `eb-deploy.sh`. Not A-006.
+- Cycle 242: environment ALB survives
+  Immutable/Sunday. Hermes has no
+  weekly pair behind a stable balancer.
+  Not A-006.

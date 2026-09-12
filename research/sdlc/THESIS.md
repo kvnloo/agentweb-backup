@@ -746,3 +746,10 @@ zero `req.ip`. Pinning is ENG-493 / later
 `ensure_deregistration_delay` descends into target groups.
 XFF is a load-balancer attribute. Sibling after verify; do
 not fold into A-019 or A-020’s second put. Not A-006.
+
+## Cycle 242 (ALB ARN stays; IdleTimeout is not a weekly re-pin)
+
+AWS immutable is a temporary ASG behind the environment’s
+load balancer. ENG-823 already-600s no-op. ENG-836:
+IdleTimeout is resource and cannot ride instance Immutable.
+Sunday never applies `timeout.config`. Not A-006.

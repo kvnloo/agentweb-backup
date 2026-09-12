@@ -647,3 +647,7 @@ Cycle 241: an ENG-493 XFF pin is
 modify-load-balancer-attributes on the
 LB ARN, not A-019 or A-020. Do not add
 A-021. A-006 stays discarded.
+Cycle 242: LoadBalancers[*].Name stays
+across Immutable and Sunday. Console
+XFF drift survives. IdleTimeout does
+not reapply weekly. A-006 stays discarded.
