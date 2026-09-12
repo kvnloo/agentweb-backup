@@ -657,11 +657,10 @@ Cycle 187: **Email rewrite matches one S3 host;
 `s3.us-west-2` only. Brand delete already extracted a
 bucket matcher (`brand.ts` L84). Rewrite tests never
 use the region-less URL `/asset/` tests pin.
-Cycle 188–203: S3 writers, matchers, fetch paths.
-Latest (203): company-scrape `validateURL` misses
-`FORBIDDEN_HOSTNAMES` / `169.254` / DNS-pin.
-Tests pin localhost/10/192.168/ftp. Preferred
-path is `page.goto` after the string check.
+Cycle 188–204: S3 writers, matchers, fetch paths.
+Latest (204): preferred company scrape spoofs Mac
+Chrome/120; axios fallback is `Extractor/1.0`.
+Tests pin no-cache headers, not the UA.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -700,6 +700,9 @@ itself misses FORBIDDEN_HOSTNAMES / 169.254 /
 DNS-pin. Tests pin localhost/10/192.168/ftp.
 Preferred path is page.goto after the string check.
 A-006 discarded.
+Cycle 204: that page.goto spoofs Mac Chrome/120;
+axios fallback is Extractor/1.0. Tests pin
+no-cache headers, not the UA. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

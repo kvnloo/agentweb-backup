@@ -408,6 +408,9 @@ Cycle 203: company-scrape validateURL misses
 FORBIDDEN_HOSTNAMES / 169.254 / DNS-pin.
 Tests pin localhost/10/192.168/ftp. Preferred
 path is page.goto. Product READY unchanged.
+Cycle 204: page.goto spoofs Mac Chrome/120;
+axios fallback is Extractor/1.0. Tests pin
+no-cache headers, not the UA. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

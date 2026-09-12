@@ -633,3 +633,8 @@ reverted. Do not copy that as A-006.
   Axios HTML fetch has no maxRedirects:0.
   webContentFetcher is a third local copy that
   does DNS+169.254. Hermes one client. Not A-006.
+- Cycle 204: page.setUserAgent L546 is Mac
+  Chrome/120; axios fallback L131 is Extractor/1.0.
+  Tests L620 pin Cache-Control, not the UA string.
+  LinkedIn L608 is Chrome/131. Hermes one client.
+  Not A-006.

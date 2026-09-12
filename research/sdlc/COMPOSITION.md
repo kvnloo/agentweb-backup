@@ -1066,6 +1066,11 @@ page.goto L559 after the string check. Axios HTML
 fetch omits maxRedirects:0. webContentFetcher is a
 third local copy that does DNS+169.254. Not A-006.
 
+Cycle 204: **Preferred scrape spoofs Mac Chrome/120.**
+page.setUserAgent L546; axios fallback L131 is
+Extractor/1.0. Tests L620 pin no-cache headers,
+not the UA. LinkedIn L608 is Chrome/131. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
