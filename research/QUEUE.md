@@ -746,3 +746,6 @@ discarded.
 Cycle 272: that one string names classic ELB.
 Do not copy DeregistrationDelay. A-006 stays
 discarded.
+Cycle 273: XFF empty-ARN tests grep the XFF
+clause, not only classic ELB. A-006 stays
+discarded.

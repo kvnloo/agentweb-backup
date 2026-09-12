@@ -794,6 +794,8 @@ READY unchanged.
    `None` and classic. Do **not** split.
    Cycle 272: that one string names classic
    ELB. Do **not** copy DeregistrationDelay.
+   Cycle 273: XFF empty-ARN tests grep the
+   XFF clause, not only `classic ELB`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

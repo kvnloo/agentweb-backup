@@ -7,25 +7,27 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 272
+cycles_completed: 273
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 273
+next_cycle: 274
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 272: XFF's one empty-ARN string names
-  classic ELB; do not copy DeregistrationDelay.
-  Cycle 273: zero tests grep classic ELB even
-  for delay. Should an XFF empty-ARN test grep
-  only the classic parenthetical, or still grep
-  the XFF / modify-load-balancer-attributes
-  clause? Grep the XFF clause (cycles 267 /
-  269). Do not add that pin from A-019. Do
-  not un-park A-020. Do not 503 /health. Do
-  not add A-021. Do not un-ready Q-001 / Q-014
-  / Q-003. Do not revive A-006. stop_after has
-  passed; leave briefing_ready. Do not mint a
-  timer unless Kevin asks.
+  Cycle 273: XFF empty-ARN test greps the XFF
+  clause, not only classic ELB (shared with
+  L811). Cycle 274: check() is one needle;
+  consecutive check() on LAST_OUTPUT is the
+  existing shape (AC1 L404-405). Should an XFF
+  empty-ARN test add a second check() for
+  classic ELB so omitting cycle 272's
+  parenthetical fails? Second check() for
+  classic. Do not add that pin from A-019.
+  Do not un-park A-020. Do not 503 /health.
+  Do not add A-021. Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006.
+  stop_after has passed; leave
+  briefing_ready. Do not mint a timer unless
+  Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -37,7 +39,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–272: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–273: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -75,4 +77,5 @@ needs delay unset; do not grep only the shared prefix.
 Do not copy the probe classic fixture as XFF empty-ARN
 coverage. One XFF empty-ARN string for None and classic;
 do not split. That one string names classic ELB;
-do not copy DeregistrationDelay. A-006 stays discarded.
+do not copy DeregistrationDelay. XFF empty-ARN tests
+grep the XFF clause, not only classic ELB. A-006 stays discarded.

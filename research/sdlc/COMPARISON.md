@@ -880,3 +880,7 @@ reverted. Do not copy that as A-006.
 - Cycle 272: that one string names classic
   ELB. Hermes has no comment-vs-fail
   classic fork. Not A-006.
+- Cycle 273: XFF empty-ARN greps the XFF
+  clause, not only classic ELB. Hermes has
+  no shared-parenthetical grep fork. Not
+  A-006.

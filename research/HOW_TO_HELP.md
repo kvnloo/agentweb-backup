@@ -206,6 +206,8 @@ Cycle 271: one XFF empty-ARN string for `None` and
 classic. Do not split. Do not add A-021.
 Cycle 272: that one string names classic ELB.
 Do not copy DeregistrationDelay. Do not add A-021.
+Cycle 273: XFF empty-ARN tests grep the XFF clause,
+not only `classic ELB`. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

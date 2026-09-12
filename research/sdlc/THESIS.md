@@ -927,3 +927,8 @@ are empty. Not A-019. Not A-020. Not A-006.
 Copy the parenthetical, not
 DeregistrationDelay. Not A-019. Not A-020.
 Not A-006.
+
+## Cycle 273 (grep the XFF clause)
+
+Do not grep only `classic ELB` (shared with
+L811). Not A-019. Not A-020. Not A-006.
