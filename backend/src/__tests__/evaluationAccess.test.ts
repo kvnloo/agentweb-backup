@@ -40,7 +40,9 @@ describe('ENG-1907 sandbox HTTP boundary', () => {
     ['post', '/api/stripe/create-customer-portal-session'], ['post', '/api/stripe/connect/onboard'], ['get', '/api/stripe/status'],
     ['get', '/api/org/other'], ['post', '/api/org/invite'], ['get', '/api/orgs/me/members'], ['get', '/api/orgs/me/share-settings'],
     ['get', '/api/featurebase/identity'],
-    ['post', '/api/agent-mode/share'], ['put', '/api/agent-mode/session/other/transfer'], ['post', '/api/agent-mode/session/other/transfer'],
+    ['post', '/api/agent-mode/share'], ['post', '/api/agent-mode/conversable-share'], ['get', '/api/agent-mode/share/other'], ['get', '/api/agent-mode/share/other/og'],
+    ['get', '/api/agent-mode/ishare/other'], ['post', '/api/agent-mode/ishare/other/generate'], ['delete', '/api/agent-mode/session/other/conversable-share'], ['get', '/api/agent-mode/session/other/share'], ['delete', '/api/agent-mode/session/other/share'],
+    ['put', '/api/agent-mode/session/other/transfer'], ['post', '/api/agent-mode/session/other/transfer'],
     ['post', '/api/settings/replay-sessions'],
     ['get', '/api/admin/users'], ['post', '/api/admin/delegate'], ['get', '/api/admin/evaluations/eval_test'],
     ['get', '/api/evaluation'], ['post', '/api/evaluation'], ['get', '/api/evaluation/artifacts/x'],
@@ -52,7 +54,6 @@ describe('ENG-1907 sandbox HTTP boundary', () => {
 
   it.each([
     ['post', '/api/agent-mode/generate'], ['get', '/api/agent-mode/sessions'], ['get', '/api/agent-mode/session/abc/progress'],
-    ['delete', '/api/agent-mode/session/abc/share'],
     ['get', '/api/brand'], ['put', '/api/brand'],
     ['get', '/api/meta/ad-performance'], ['get', '/api/meta/account-status'], ['get', '/api/meta/v2/pixels'],
     ['get', '/api/oauth/connected-accounts'],

@@ -10038,6 +10038,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId, expirationDays: rawExpirationDays } = req.body;
 
+      // ENG-1907: no transcript leaves a sandbox account.
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || session.userId !== user.userId) {
@@ -10120,6 +10125,10 @@ export const agentModeController = {
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
         return res.status(404).json({ error: 'Conversation not found' });
+      }
+      // ENG-1907: public reader — refuse on the owner, since no token identifies the caller.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
       // Check sharing status
@@ -14435,6 +14444,10 @@ export const agentModeController = {
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
         return res.status(404).json({ error: 'Conversation not found' });
+      }
+      // ENG-1907: public reader — refuse on the owner, since no token identifies the caller.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
       // Must have view-only or interactive sharing enabled

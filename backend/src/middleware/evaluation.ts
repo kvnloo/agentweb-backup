@@ -32,7 +32,10 @@ const DENIED: Array<{ methods?: string[]; pattern: RegExp }> = [
   { pattern: /^\/api\/stripe(\/|$)/ },
   { pattern: /^\/api\/orgs?(\/|$)/ },
   { pattern: /^\/api\/featurebase(\/|$)/ },
-  { methods: ['POST'], pattern: /^\/api\/agent-mode\/share\/?$/ },
+  // The whole share family, not just link creation: conversable shares mint public links and the
+  // public readers (/share/:id, /ishare/:id, /og) would otherwise serve a sandbox transcript.
+  { pattern: /^\/api\/agent-mode\/(share|ishare|conversable-share)(\/|$)/ },
+  { pattern: /^\/api\/agent-mode\/session\/[^/]+\/(share|conversable-share)(\/|$)/ },
   { pattern: /^\/api\/agent-mode\/session\/[^/]+\/transfer\/?$/ },
   { pattern: /^\/api\/settings\/replay-sessions\/?$/ },
   { pattern: /^\/api\/evaluation(\/|$)/ },

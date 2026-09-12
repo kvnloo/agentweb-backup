@@ -14,6 +14,7 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn(),
   },
 }));
 jest.mock('../services/agentModeService', () => ({
@@ -60,6 +61,28 @@ describe('createShareLink', () => {
     await agentModeController.createShareLink({ user: { userId: 'customer' }, body: { sessionId: 'share-1' } } as unknown as Request, res);
     expect(res.status).toHaveBeenCalledWith(200);
     expect(chatbotDb.updateSessionShareMetadata).toHaveBeenCalledWith('share-1', expect.objectContaining({ isShared: true }));
+  });
+});
+
+describe('createConversableShare', () => {
+  it('refuses a sandbox principal before touching the session', async () => {
+    const res = makeRes();
+    await agentModeController.createConversableShare({ user: { userId: 'eval_test' }, body: { sessionId: 'share-1' } } as unknown as Request, res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith(refusal);
+    expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+    expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+  });
+});
+
+describe('public readers refuse a sandbox-owned session', () => {
+  it.each([['getSharedConversation', { conversable: 'tok' }], ['getShareOgMetadata', {}]] as const)('%s', async (handler, query) => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(sharedSession('eval_test'));
+    const res = makeRes();
+    await (agentModeController as any)[handler]({ params: { shareId: 'share-1' }, query } as unknown as Request, res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith(refusal);
+    expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
   });
 });
 
