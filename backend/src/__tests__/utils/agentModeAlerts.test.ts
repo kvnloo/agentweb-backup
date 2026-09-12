@@ -4,7 +4,7 @@ import { sendAgentModeOncallAlert, __resetAgentModeAlertDedupeForTests } from '.
 jest.mock('../../services/chatbotService', () => ({
   chatbotDb: {
     createOrReuseInteractiveShare: jest.fn(),
-    getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
   }
 }));
 
@@ -371,7 +371,7 @@ describe('agentModeAlerts utils', () => {
     });
 
     it('suppresses when only a sessionId is given and that session is owned by a sandbox principal', async () => {
-      (mockedChatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-sbx-2', userId: EVAL_USER });
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-sbx-2', userId: EVAL_USER });
 
       const delivered = await sendAgentModeOncallAlert({
         subject: 'Agent Mode: Context limit exceeded',
@@ -380,12 +380,12 @@ describe('agentModeAlerts utils', () => {
       });
 
       expect(delivered).toBe(false);
-      expect(mockedChatbotDb.getChatSession).toHaveBeenCalledWith('session-sbx-2');
+      expect(mockedChatbotDb.getChatSessionRecord).toHaveBeenCalledWith('session-sbx-2');
       expect(mockedEmailService.sendOncallAlert).not.toHaveBeenCalled();
     });
 
     it('still delivers for a session owned by a normal customer', async () => {
-      (mockedChatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-real', userId: 'customer-1' });
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-real', userId: 'customer-1' });
 
       const delivered = await sendAgentModeOncallAlert({
         subject: 'Agent Mode: worker crashed',
@@ -398,7 +398,7 @@ describe('agentModeAlerts utils', () => {
     });
 
     it('fails open — an owner lookup error must not silence a real alert', async () => {
-      (mockedChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockRejectedValue(new Error('dynamo down'));
 
       const delivered = await sendAgentModeOncallAlert({
         subject: 'Agent Mode: worker crashed',

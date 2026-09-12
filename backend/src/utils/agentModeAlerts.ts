@@ -68,7 +68,9 @@ async function isSandboxPrincipalAlert(userId?: string, sessionId?: string): Pro
   if (userId) return isEvaluationUser(userId);
   if (!sessionId) return false;
   try {
-    const session = await chatbotDb.getChatSession(sessionId);
+    // Record-only read (ENG-521): the owner is all this decision needs. getChatSession would
+    // paginate the whole message history and can trigger the legacy migration write.
+    const session = await chatbotDb.getChatSessionRecord(sessionId);
     return isEvaluationUser(session?.userId);
   } catch {
     return false;
