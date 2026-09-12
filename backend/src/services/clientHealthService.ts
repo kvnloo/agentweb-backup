@@ -13,6 +13,7 @@ import { userDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
 import { getThresholdsForAccount } from './adsThresholdsDb';
 import { resolveThresholds } from './adsThresholds';
+import { isEvaluationUser } from './evaluationPolicy';
 
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
 
@@ -232,8 +233,10 @@ export async function assessClientHealth(
       const searchLower = clientNameOrEmail.toLowerCase();
       client = allUsers.find(
         (u: any) =>
-          (u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
-          (u.email && u.email.toLowerCase().includes(searchLower))
+          // ENG-1907: sandbox principals are not clients.
+          !isEvaluationUser(u.userId) &&
+          ((u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
+            (u.email && u.email.toLowerCase().includes(searchLower)))
       );
     }
 
@@ -661,7 +664,9 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
       };
     }
 
-    const allUsers = await userDb.getAllUsers();
+    // ENG-1907: a sandbox take-home account looks like a Pro customer with a Meta
+    // connection; it is not a client and must not appear in the roster or its health sweep.
+    const allUsers = (await userDb.getAllUsers()).filter((u: any) => !isEvaluationUser(u.userId));
     const landingPageSignalCache: LandingPageSignalCache = new Map();
 
     const clients: ClientSummary[] = await Promise.all(

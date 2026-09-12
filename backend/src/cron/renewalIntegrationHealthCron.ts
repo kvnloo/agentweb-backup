@@ -31,6 +31,7 @@ import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { PlatformType } from '../services/connectedAccountsDb';
 import { isTokenNotExpired } from '../services/connectedAccountsDb';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 
 const TAG = '[renewalIntegrationHealthCron]';
 
@@ -241,6 +242,9 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   }
 
   for (const user of users) {
+    // ENG-1907: this scan bypasses getAllUsers. A sandbox principal is 'active' with
+    // paid-ads intent and no real ad account — exactly the shape that flags. Never alert on it.
+    if (isEvaluationUser(user?.userId)) continue;
     summary.scannedUsers++;
 
     // Isolated on purpose, symmetric to the alert-send try/catch below: today's

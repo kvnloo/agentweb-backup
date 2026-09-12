@@ -17,6 +17,7 @@
 import AWS from "aws-sdk";
 import { probeDomain, decideFromVerdict } from "../services/domainReachabilityService";
 import { addCustomDomain, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { isEvaluationUser } from "../services/evaluationPolicy";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -86,6 +87,8 @@ export function selectDomainsToProbe(
 
   for (const p of pages) {
     if (p.status !== "deployed") continue;
+    // ENG-1907: a sandbox principal's pages never bring a host into monitoring scope.
+    if (isEvaluationUser(p.userId)) continue;
     if (!p.customDomainUrl) {
       if (p.vercelProjectId) deployedProjects.add(p.vercelProjectId);
       continue;
@@ -101,6 +104,8 @@ export function selectDomainsToProbe(
   return domains.filter(
     (d) =>
       d.domain &&
+      // ENG-1907: never probe a sandbox principal's domains.
+      !isEvaluationUser(d.userId) &&
       /*
        * Already checked within this period → skip. This makes the sweep safe to run more than
        * once per period. It is NOT a substitute for a lock, and the difference matters:
@@ -204,6 +209,8 @@ export async function reconcileUnregisteredDomains(
 
   for (const p of pages) {
     if (p.status !== "deployed" || !p.customDomainUrl || !p.vercelProjectId || !p.userId) continue;
+    // ENG-1907: a sandbox principal's page must never trigger a real Vercel registration.
+    if (isEvaluationUser(p.userId)) continue;
 
     let host: string;
     try {
