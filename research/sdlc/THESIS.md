@@ -900,3 +900,8 @@ Not A-020. Not A-006.
 
 Do not copy L811 or probe UNKNOWN. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 268 (CLI-fail fail own string)
+
+Do not copy L806 or probe UNKNOWN. Keep
+`AWS reported:`. Not A-019. Not A-020. Not A-006.

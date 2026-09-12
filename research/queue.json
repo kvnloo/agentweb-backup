@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-12T11:40:00Z",
+  "updated_at": "2026-09-12T11:50:00Z",
   "scoring": "score = 3*leverage + 3*product + 2*mergeability + evidence - 2*collision",
   "implementation_order": [
     "Q-014",

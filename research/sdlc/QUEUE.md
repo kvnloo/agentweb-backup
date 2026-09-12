@@ -781,6 +781,9 @@ READY unchanged.
    Cycle 267: XFF empty-ARN `fail()` uses
    its own string. Do **not** copy L811 or
    probe UNKNOWN.
+   Cycle 268: XFF CLI-fail `fail()` uses
+   its own string. Do **not** copy L806 or
+   probe UNKNOWN.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

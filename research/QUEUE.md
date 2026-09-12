@@ -731,3 +731,6 @@ discarded.
 Cycle 267: XFF empty-ARN fail() uses its own
 string. Do not copy L811. A-006 stays
 discarded.
+Cycle 268: XFF CLI-fail fail() uses its own
+string. Do not copy L806. A-006 stays
+discarded.
