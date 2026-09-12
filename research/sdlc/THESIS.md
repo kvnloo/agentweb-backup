@@ -810,3 +810,8 @@ A-006.
 Must be Ready is `UpdateEnvironment` only. Updating is not
 terminal. elbv2 talks to the surviving ALB. Not A-019. Not
 A-006.
+
+## Cycle 252 (XFF must use LoadBalancers, not ASG[0])
+
+Sunday Updating: two ASGs, one ALB. Hook discovery is `[0]`.
+Not A-019. Not A-020. Not A-006.

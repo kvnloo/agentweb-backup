@@ -734,6 +734,10 @@ READY unchanged.
    would not hit Must be Ready. Do
    **not** treat Updating as blocking
    elbv2 on the surviving ALB.
+   Cycle 252: during Sunday Updating, XFF
+   must use `LoadBalancers[*].Name`, not
+   `AutoScalingGroups[0]`. Do **not**
+   copy hook discovery.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

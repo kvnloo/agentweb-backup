@@ -1518,6 +1518,12 @@ not hit Must be Ready.** That error is
 the surviving ALB during Updating. Not
 A-019. Not A-006.
 
+Cycle 252: **XFF must use
+`LoadBalancers[*].Name`, not
+`AutoScalingGroups[0]`.** Sunday
+Updating: two ASGs, one ALB. Not
+A-019. Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

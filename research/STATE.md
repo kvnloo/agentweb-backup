@@ -7,21 +7,22 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 251
+cycles_completed: 252
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 252
+next_cycle: 253
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 251: a pin-only Sunday job would
-  not hit Must be Ready (UpdateEnvironment
-  only). describe-environment-resources
-  has no Status gate. Cycle 252: during
-  Immutable Updating, AutoScalingGroups[0]
-  may be the temporary ASG (cycle 113 /
-  A-020). Must XFF use only
-  LoadBalancers[*].Name? Do not copy hook
-  discovery. Do not add that workflow from
+  Cycle 252: during Sunday Updating, XFF
+  must use LoadBalancers[*].Name, not
+  AutoScalingGroups[0]. Cycle 253:
+  LoadBalancers[*] plus grep arn: would
+  pin every ALB ARN if the environment
+  ever had two. Cycle 242 assumes one
+  environment balancer. Does this tree
+  or AWS immutable ever return more than
+  one LoadBalancers[*].Name during
+  Updating? Do not add that workflow from
   A-019. Do not un-park A-020. Do not
   503 /health. Do not add A-021. Do not
   un-ready Q-001 / Q-014 / Q-003. Do not
@@ -39,7 +40,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–251: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–252: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -52,4 +53,5 @@ an XFF no-op still needs LB Describe; after-verify IAM miss is
 GitHub-red / prod-green; a later pin can fail closed before apply;
 that fail-closed slot does not run on Sunday; a pin-only `schedule:`
 would be the git-native Sunday reassert and does not exist; Must be
-Ready would not block that pin-only elbv2 call. A-006 stays discarded.
+Ready would not block that pin-only elbv2 call; during Updating
+XFF must not copy `AutoScalingGroups[0]`. A-006 stays discarded.

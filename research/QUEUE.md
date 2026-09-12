@@ -682,3 +682,7 @@ discarded.
 Cycle 251: a pin-only Sunday job would
 not hit Must be Ready. A-006 stays
 discarded.
+Cycle 252: XFF must use
+LoadBalancers[*].Name, not
+AutoScalingGroups[0]. A-006 stays
+discarded.

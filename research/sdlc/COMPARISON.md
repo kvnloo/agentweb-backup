@@ -818,3 +818,6 @@ reverted. Do not copy that as A-006.
   `UpdateEnvironment` only. Hermes has
   no EB Updating vs elbv2 split. Not
   A-006.
+- Cycle 252: XFF must not copy
+  `AutoScalingGroups[0]`. Hermes has no
+  ASG vs ALB discovery. Not A-006.
