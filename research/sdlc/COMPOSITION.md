@@ -1553,6 +1553,12 @@ Cycle 257: **NLB `xff_*` Describe is
 is only `current = desired`. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 258: **do not `fail()` on ALB XFF
+Describe `None` before Modify.** ENG-823
+has no pre-Modify value gate. Hook
+None-fail is the wrong object. Not A-019.
+Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

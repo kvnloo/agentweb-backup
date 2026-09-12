@@ -702,3 +702,6 @@ discarded.
 Cycle 257: NLB xff_* Describe is None,
 then Modify, then fail. Do not add a
 None-skip. A-006 stays discarded.
+Cycle 258: do not fail() on ALB XFF
+Describe None before Modify. A-006 stays
+discarded.

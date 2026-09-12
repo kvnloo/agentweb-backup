@@ -846,3 +846,8 @@ Not A-006.
 NLB `xff_*` Describe is `None`, not a Describe error. Skip
 is only `current = desired`. Do not add a None-skip.
 Not A-019. Not A-020. Not A-006.
+
+## Cycle 258 (do not fail on None before Modify)
+
+ENG-823 has no pre-Modify value gate. Hook None-fail is
+ASG discovery. Not A-019. Not A-020. Not A-006.

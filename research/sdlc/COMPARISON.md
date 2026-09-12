@@ -836,3 +836,6 @@ reverted. Do not copy that as A-006.
 - Cycle 257: NLB Describe of `xff_*` is
   `None` then Modify. Hermes has no
   JMESPath None-skip. Not A-006.
+- Cycle 258: do not fail-on-None before
+  Modify. Hermes has no hook vs ENG-823
+  None fork. Not A-006.
