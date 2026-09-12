@@ -21,7 +21,7 @@ import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { AgentModeService } from './agentModeService';
+import type { AgentModeService as AgentModeServiceType } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
 import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
@@ -4980,6 +4980,17 @@ export async function generateChatResponse(
     const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
     const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
     const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
+    // ENG-1852: lazy, not a top-level import — agentModeService.ts imports chatbotDb/
+    // searchPlatformKnowledgeBase from this file, so a static top-level import of
+    // AgentModeService here created a real circular require. Inside the shared
+    // marketing-response worker process, that circularity caused agentModeService.ts's
+    // own module-level singleton line to execute a second time (once via the worker's
+    // own direct import, once via this file's back-reference), producing a second,
+    // never-initialized AgentModeService instance that intermittently answered tool-
+    // registry reads with an empty result. Confirmed via a captured construction stack
+    // trace, not inferred. Same lazy-import pattern already used by
+    // emmaApi.ts's getAgentModeService() to avoid this exact class of cycle.
+    const { AgentModeService } = await import('./agentModeService') as { AgentModeService: typeof AgentModeServiceType };
     const agentModeService = new AgentModeService();
     let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
     // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
