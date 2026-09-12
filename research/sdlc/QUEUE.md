@@ -529,6 +529,14 @@ HeartbeatTimeout 900s CONTINUE is
 the fail-safe. Do not await the hook
 from `gracefulShutdown` in A-019.
 Product READY unchanged.
+Cycle 226: L18–19 is a comment, not
+a pin that EB withholds SIGTERM for
+the whole `Terminating:Wait`.
+`dev.md` L1853 names three SIGTERM
+sources; only ASG replacement is
+the hook. Do not add
+`TimeoutStopSec` / `KillMode` from
+A-019. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -596,6 +604,14 @@ Product READY unchanged.
    `process.exit(0)` can cut CONTINUE;
    HeartbeatTimeout 900s is the
    fail-safe).
+   Do **not** treat
+   `asgLifecycleGuard.ts` L18–19 as a
+   pin that SIGTERM is withheld for the
+   whole `Terminating:Wait` (cycle 226:
+   comment, not a test; deploy /
+   health-check restart still SIGTERM).
+   Do **not** add `TimeoutStopSec` /
+   `KillMode` from A-019 (cycle 116).
    Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`

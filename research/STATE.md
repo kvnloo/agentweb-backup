@@ -7,26 +7,26 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 225
+cycles_completed: 226
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 226
+next_cycle: 227
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 225: SIGTERM on a settled
-  drainPromise is process.exit(0)
-  with no join to completeAction.
-  HeartbeatTimeout 900s CONTINUE
-  is the fail-safe. Do not await
-  completeAction from
-  gracefulShutdown in A-019.
-  Cycle 226: file-level only, does
-  this tree prove EB withholds
-  SIGTERM for the whole
-  Terminating:Wait, or is that
-  live-AWS-only (TimeoutStopSec
-  class)? Header L18-19 vs
-  workerShutdownGuards.ts L1-9.
+  Cycle 226: asgLifecycleGuard.ts
+  L18-19 is a comment, not a pin
+  that EB withholds SIGTERM for
+  Terminating:Wait. Three
+  platform SIGTERM sources
+  (dev.md L1853); only ASG
+  replacement is the hook.
+  Cycle 227: after A-019
+  server.close, /health can fail
+  while still Terminating:Wait —
+  file-level only, can a health-
+  check restart SIGTERM the
+  process in the cycle 225
+  window? Do not 503 /health.
   Do not add A-021. Do not start
   another S3/Referer matcher. Do
   not un-ready Q-001 / Q-014 /

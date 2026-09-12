@@ -554,3 +554,10 @@ before `completeAction`.
 HeartbeatTimeout 900s CONTINUE is
 the fail-safe. Do not await the hook
 from A-019. A-006 stays discarded.
+Cycle 226: L18–19 is a comment, not
+a pin that EB withholds SIGTERM for
+`Terminating:Wait`. Three SIGTERM
+sources (`dev.md` L1853); only ASG
+replacement is the hook. Do not add
+`TimeoutStopSec` from A-019. A-006
+stays discarded.

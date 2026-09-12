@@ -97,5 +97,9 @@ Sunday exit with `exitCode` in A-019).
 SIGTERM on a settled `drainPromise` can `process.exit(0)` before
 `completeAction` (cycle 225: HeartbeatTimeout 900s CONTINUE is the
 fail-safe; do not await the hook from `gracefulShutdown` in A-019).
+`asgLifecycleGuard.ts` L18–19 is a **comment**, not a pin that EB
+withholds SIGTERM for the whole `Terminating:Wait` (cycle 226:
+`dev.md` L1853 names deploy / ASG replacement / health-check restart;
+only replacement is the hook). Do not add `TimeoutStopSec` from A-019.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

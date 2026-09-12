@@ -702,3 +702,17 @@ reverted. Do not copy that as A-006.
   `sessions.set` that transport (JSON
   `close()` hangs `handleRequest`). Not
   A-006.
+- Cycles 216–225: A-019 wait-then-
+  `mcpShutdown` is not `generate_image`
+  cancel, not 404 reinit, not a 60s
+  inbound timeout, not cancelled-as-
+  same-POST, not skip-send cleanup, not
+  `server.close` join, not ASG
+  `process.exit`. SIGTERM on a settled
+  `drainPromise` can cut CONTINUE
+  (HeartbeatTimeout fail-safe). Not
+  A-006.
+- Cycle 226: L18–19 is a comment, not
+  a pin that EB withholds SIGTERM for
+  `Terminating:Wait`. Hermes/OMP: one
+  process, no ASG hook. Not A-006.

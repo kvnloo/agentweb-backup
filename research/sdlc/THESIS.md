@@ -538,6 +538,13 @@ HeartbeatTimeout 900s CONTINUE is
 the fail-safe. Do not await the hook
 from `gracefulShutdown` in A-019.
 Do not add A-021.
+Cycle 226: L18–19 is a comment, not
+a pin that EB withholds SIGTERM for
+`Terminating:Wait`. Three SIGTERM
+sources (`dev.md` L1853); only ASG
+replacement is the hook. Do not add
+`TimeoutStopSec` from A-019.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

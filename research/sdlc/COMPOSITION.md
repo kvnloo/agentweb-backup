@@ -1343,6 +1343,22 @@ complete in one tick and never
 inject SIGTERM. Do not await the
 hook from A-019. Not A-006.
 
+Cycle 226: **`Terminating:Wait`
+does not pin SIGTERM withheld.**
+L18–19 is IMDS-vs-instance-stop
+order as a comment. Tests never
+inject SIGTERM.
+`workerShutdownGuards.ts` L1–9
+and `dev.md` L1853 name cgroup
+SIGTERM on deploy / ASG
+replacement / health-check
+restart. Only replacement is
+`EC2_INSTANCE_TERMINATING`. No
+Node `TimeoutStopSec` in git
+(cycle 116). Do not treat L18–19
+as a pin that cycle 225 cannot
+happen with the hook. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
