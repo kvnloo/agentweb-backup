@@ -53,6 +53,10 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
+import {
+  assertOpenRouterResponseHasChoices,
+  isMalformedOpenRouterResponseError,
+} from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -3141,21 +3145,11 @@ export class AgentModeService {
     const isRetryableLlmCallError = (error: unknown): boolean => {
       const errorClass = classifyToolErrorClass(error);
       if (errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx') return true;
-      // ENG-1681: OpenRouter occasionally returns a response that is either not
-      // valid JSON (the SDK's own body parse throws "invalid json response
-      // body ... Unexpected end of JSON input") or is valid JSON but structurally
-      // empty (no `choices[0].message` at all -- see the explicit check right
-      // after this call, which raises a MALFORMED_OPENROUTER_RESPONSE-tagged
-      // Error for exactly that case). Neither is a rate limit, network blip, or
-      // 5xx by classifyToolErrorClass's general taxonomy, so both previously
-      // fell straight through to a hard failure on the first occurrence, even
-      // though a fresh request against the same model very often just works —
-      // this hit the same customer session 8 times over 9 days with no fix ever
-      // landing. Matched on message rather than added to the shared classifier:
-      // that taxonomy is used far beyond LLM calls, and 400/404 must stay
-      // non-retryable there for other tools.
-      const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-      return /invalid json response body|unexpected end of json input|malformed_openrouter_response/.test(message);
+      // ENG-1681: see openRouterResponseValidation.ts for the full context —
+      // this covers OpenRouter's malformed/empty-response failure classes,
+      // which are not a rate limit, network blip, or 5xx by
+      // classifyToolErrorClass's general taxonomy.
+      return isMalformedOpenRouterResponseError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
@@ -3185,24 +3179,10 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
-        // ENG-1681: OpenRouter can return a 200 whose body has no `choices`
-        // array at all (not merely an empty one). Left unchecked, the caller's
-        // unguarded `response.choices[0].message` throws a bare
-        // "Cannot read properties of undefined (reading '0')" with no signal
-        // that the cause was an upstream response shape rather than a caller
-        // bug — this hit the same customer session 8 times over 9 days with no
-        // fix ever landing. Converting it into an explicit, retryable error
-        // here means the common case (a fresh request against the same model)
-        // never reaches that unguarded access at all. Checked as "is this an
-        // array" rather than "is it non-empty": an empty `choices: []` is a
-        // separate, already-handled case elsewhere in this function, and this
-        // check must not fire on it.
-        if (!Array.isArray((res as any)?.choices)) {
-          throw new Error(
-            `MALFORMED_OPENROUTER_RESPONSE: model "${model}" returned a response with no choices array `
-            + `(the provider likely returned an empty/degenerate completion).`,
-          );
-        }
+        // ENG-1681: see openRouterResponseValidation.ts — converts a response
+        // with no `choices` array into an explicit, retryable error before it
+        // ever reaches the unguarded `response.choices[0].message` downstream.
+        assertOpenRouterResponseHasChoices(res, model);
         // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
         // impact) -- lets a production incident/verification tie a specific
         // call to the provider it actually landed on without reading
