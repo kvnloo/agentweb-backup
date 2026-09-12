@@ -7,20 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 155
+cycles_completed: 156
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 156
+next_cycle: 157
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 155: Drive folder trees Promise.all (L24080);
-  ClickUp docs sequential await (L24148-24156). Do not
-  wrap ClickUp in unbounded Promise.all. Cycle 156:
-  cheapest remaining. Candidate: readGoogleDriveFileContent
-  (L25194) vs readClickUpDocContent size/time caps; search
-  truncates to 5000 after the fetch (L24113 / L24161).
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
-  A-006. If stop_after passes, unsubscribe
+  Cycle 156: search Drive/ClickUp reads have no download
+  cap; materialize has 200MB; named-read truncates to 1M
+  after fetch. Cycle 157: cheapest remaining. Candidate:
+  queryDriveFilesAcrossFolders fields string (L24093)
+  `files(id, name, mimeType, parents)` — no size, so a
+  search-side byte refuse cannot use Drive metadata. File-
+  level. Do not un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

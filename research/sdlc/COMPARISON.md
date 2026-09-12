@@ -386,3 +386,7 @@ reverted. Do not copy that as A-006.
 - Cycle 155: Drive folder trees Promise.all (L24080);
   ClickUp docs sequential await (L24148-24156). Drive
   post-query file reads also sequential (L24105). Not A-006.
+- Cycle 156: search readGoogleDriveFileContent (L25194)
+  and readDocContent (L134) have no download cap.
+  Materialize 200MB (L25626); named-read 1M after fetch.
+  Search keeps 5000 chars. Not A-006.

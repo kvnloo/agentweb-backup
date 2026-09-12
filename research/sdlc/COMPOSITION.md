@@ -688,6 +688,17 @@ sequential `await`: workspace → `listDocs` → each
 (L24105–24121). Parallelism without a deadline is a
 worse blast radius. Not A-006.
 
+Cycle 156: **Search reads are uncapped; other faces are
+not.** `readGoogleDriveFileContent` L25194–25211
+`responseType: 'arraybuffer'` with no size check.
+`DRIVE_LIST_WALK_MAX_MS` is the folder walk, not this
+download. Materialize L25781–25798 refuses at
+`MATERIALIZE_ASSET_MAX_BYTES` (200MB, L25626). GCS
+named-read L25393 and ClickUp named-read L25870 truncate
+to 1M **after** fetch. Search face keeps 5000 chars
+(L24113 / L24161). Copy the materialize shape in-process.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

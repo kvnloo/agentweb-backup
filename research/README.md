@@ -504,6 +504,12 @@ do not.** Drive L24080 `Promise.all` across registered
 roots, then one `fullText` query. ClickUp L24148 nested
 `for`/`await` (workspace, then every doc, then every
 page). Do not wrap ClickUp in unbounded `Promise.all`.
+Cycle 156: **Search reads are uncapped; other faces are
+not.** `readGoogleDriveFileContent` L25194 downloads
+the whole file. Materialize refuses at 200MB (`L25626`).
+Named-read truncates to 1M after fetch. Search then keeps
+5000 chars (`L24113` / `L24161`). Copy the materialize
+shape onto the search helper in-process.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

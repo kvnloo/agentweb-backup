@@ -279,6 +279,8 @@ ClickUp docs search has neither. Product READY unchanged.
 Cycle 155: Drive folder trees `Promise.all` (L24080);
 ClickUp docs sequential `await` (L24148–24156). Product
 READY unchanged.
+Cycle 156: Search Drive/ClickUp helpers have no download
+cap; 200MB/1M live on other faces. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
