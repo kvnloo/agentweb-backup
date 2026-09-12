@@ -839,6 +839,17 @@ empty. Fallback log L1559 still says OpenAI. Agent-engine
 the GCP worker (`secrets_manager.py` L199–200). A-012
 already parks lifting the controller import. Not A-006.
 
+Cycle 178: **Two deploy units, two image dispatch tables.**
+Python named branches L3249–3301: FLUX / gemini-2.5 /
+gpt-image-1 / else OpenAI. Leaf `SUPPORTED_MODELS` has
+gpt-image-2, Gemini 3, Runway — not FLUX or
+`openai-image-1`. Unspecified Emma → Gemini 3;
+unspecified task (`task_monitor.py` L1242) →
+`openai-image-1`. A task storing `gpt-image-2` hits
+OpenAI else on the worker and Azure on the leaf. CLI
+help L4216 names only two ids. Q-003 already parks
+`image-models.ts` L11. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -468,3 +468,9 @@ reverted. Do not copy that as A-006.
   (blog.ts L648) so L492 Gemini 3 / Google/Image fires.
   Agent-engine web_agent.py L3299 still has a live
   OPENAI_IMAGE_API_KEY. Not A-006.
+- Cycle 178: two deploy units, two image dispatch tables.
+  Intersection gpt-image-1 + gemini-2.5-flash-image.
+  Unspecified Emma → Gemini 3; unspecified browser task →
+  openai-image-1 → OpenAI else (web_agent.py L3295-3301).
+  gpt-image-2 is Azure on the leaf. Q-003 already parks
+  image-models.ts L11. Not A-006.

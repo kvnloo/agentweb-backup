@@ -331,6 +331,9 @@ Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
 Blog heroes omit imageModel → Gemini / Google/Image.
 Agent-engine still has OPENAI_IMAGE_API_KEY. Do not
 add A-021.
+Cycle 178: two deploy units, two image dispatch tables.
+gpt-image-2 is Azure on the leaf, OpenAI-else on the
+worker. Do not un-ready Q-003. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

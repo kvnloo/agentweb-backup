@@ -361,4 +361,8 @@ Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
 Blog heroes omit imageModel → Gemini / Google/Image.
 Agent-engine OpenAI env is a second deploy unit.
 A-006 stays discarded.
+Cycle 178: two deploy units, two image dispatch tables.
+gpt-image-2 is Azure on the leaf, OpenAI-else on the
+worker. Q-003 already parks image-models.ts L11.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

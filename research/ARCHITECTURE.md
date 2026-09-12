@@ -606,6 +606,11 @@ Cycle 177: BLOG_SETUP.md is a stale fifth catalog
 imageModel → Gemini / Google/Image. Agent-engine still
 has OPENAI_IMAGE_API_KEY. A-012 already parks the
 controller import. A-006 discarded.
+Cycle 178: two deploy units, two image dispatch tables.
+Intersection gpt-image-1 + gemini-2.5-flash-image.
+gpt-image-2 is Azure on the leaf, OpenAI-else on the
+worker. Q-003 already parks image-models.ts L11.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

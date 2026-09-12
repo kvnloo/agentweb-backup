@@ -611,6 +611,12 @@ grep of Picsum / DALL-E / `OPENAI_IMAGE_API_KEY` is
 empty. Agent-engine still has a live OpenAI env
 (`web_agent.py` L3299). A-012 already parks the controller
 import.
+Cycle 178: **Two deploy units, two image dispatch tables.**
+Intersection is `gpt-image-1` + `gemini-2.5-flash-image`.
+Unspecified Emma → Gemini 3; unspecified browser task →
+`openai-image-1` → OpenAI else. `gpt-image-2` is Azure
+on the leaf and OpenAI-else on the worker. Q-003 already
+parks `image-models.ts` L11.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

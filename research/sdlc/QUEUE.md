@@ -328,6 +328,10 @@ Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
 Blog heroes omit imageModel → Gemini / Google/Image.
 Agent-engine still has OPENAI_IMAGE_API_KEY. Product
 READY unchanged.
+Cycle 178: two deploy units, two image dispatch tables.
+gpt-image-2 is Azure on the leaf, OpenAI-else on the
+worker. Q-003 already parks image-models.ts L11.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
