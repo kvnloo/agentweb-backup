@@ -9933,6 +9933,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId } = req.body;
 
+      // ENG-1907: no transcript leaves a sandbox account.
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+
       if (!sessionId) {
         return res.status(400).json({ error: 'Session ID is required' });
       }
@@ -10259,6 +10264,11 @@ export const agentModeController = {
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+      // ENG-1907: this route is public, so the sandbox boundary never sees an
+      // evaluation token here — refuse on the session owner before any spend.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
       turnStartCalledFunctions = session.calledFunctions || {};
 
