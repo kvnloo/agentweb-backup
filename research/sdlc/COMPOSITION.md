@@ -819,6 +819,14 @@ earlier. `getOpenAIClient` L4/L1454 and `getApiKey`
 OpenAI else L371–375 are the same dead path. Meter
 comment L549 still names it. Not A-006.
 
+Cycle 176: **Meter `provider` is a prefix.** L554–558
+`startsWith("gpt-image")` → openai though dispatch is
+Azure; `startsWith("gemini-")` misses Runway’s
+`gemini_2.5_flash` (underscore) so that id is runway.
+Dollars are `imageGenerationCostUsd(model)`. Video
+`isHiggsfieldModel` (L37 / L1101) is catalog membership.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

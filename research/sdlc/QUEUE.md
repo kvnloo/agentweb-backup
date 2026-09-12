@@ -322,6 +322,8 @@ Cycle 174: Runway HTTPS skips C2PA and S3; meter still
 fires. Product READY unchanged.
 Cycle 175: generateWithOpenAI else unreachable after
 SUPPORTED_MODELS includes(). Product READY unchanged.
+Cycle 176: meter provider is prefix not dispatch;
+gpt-image labelled openai. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

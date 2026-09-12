@@ -596,6 +596,12 @@ L533–534. Every `SUPPORTED_MODELS` id hits Azure /
 Gemini / Gemini 3 / Runway. Cycle 174’s URL skip is
 Runway-only; DALL-E persist is dead. `getOpenAIClient`
 is imported only for that method.
+Cycle 176: **Meter `provider` is a prefix, not dispatch.**
+L554–558. `gemini_2.5_flash` (underscore) meters as
+runway by accident; `gpt-image-*` is Azure and labelled
+**openai**. Dollars use `costUsdOverride(model)`. Video
+uses `isHiggsfieldModel` from the same catalog as
+dispatch.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

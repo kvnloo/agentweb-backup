@@ -598,6 +598,9 @@ still fires. Cycle 36 L575–578 is after the data-URL
 gate. A-006 discarded.
 Cycle 175: generateWithOpenAI else unreachable. A-006
 discarded.
+Cycle 176: meter provider is prefix not dispatch;
+gpt-image labelled openai while Azure is the vendor.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

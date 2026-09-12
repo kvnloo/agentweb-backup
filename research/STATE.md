@@ -7,17 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 175
+cycles_completed: 176
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 176
+next_cycle: 177
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 175: generateWithOpenAI else unreachable.
-  Cycle 176: cheapest remaining. Candidate: meter
-  provider ternary L554-558 — gemini_2.5_flash
-  (underscore, Runway) meters as runway; Google
-  gemini-2.5-flash-image as gemini. File-level.
+  Cycle 176: meter provider is prefix, not dispatch.
+  gpt-image labelled openai while Azure is the vendor.
+  Cycle 177: cheapest remaining. Candidate: BLOG_SETUP.md
+  L34 still documents OpenAI/Image for a secret cycle 175
+  showed the leaf never fetches on a live path. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

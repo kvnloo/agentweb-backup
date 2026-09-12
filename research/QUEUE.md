@@ -354,4 +354,7 @@ fires. Emma strip + REST exist; MCP has no
 Cycle 175: `generateWithOpenAI` else L533–534 is
 unreachable after `SUPPORTED_MODELS` includes().
 A-006 stays discarded.
+Cycle 176: meter `provider` ternary L554–558 is prefix
+not dispatch; gpt-image labelled openai. Dollars use
+model id. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -458,3 +458,7 @@ reverted. Do not copy that as A-006.
 - Cycle 175: generateWithOpenAI else L533–534 unreachable
   after includes(SUPPORTED_MODELS). DALL-E URL persist is
   dead; Runway is the live URL skip. Not A-006.
+- Cycle 176: meter provider L554–558 is prefix not
+  dispatch. gemini_2.5_flash meters runway by underscore;
+  gpt-image is Azure labelled openai. Video uses
+  isHiggsfieldModel. Not A-006.
