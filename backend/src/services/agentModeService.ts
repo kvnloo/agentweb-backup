@@ -53,6 +53,10 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
+import {
+  assertOpenRouterResponseHasChoices,
+  isMalformedOpenRouterResponseError,
+} from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -3140,7 +3144,12 @@ export class AgentModeService {
     // hard cap, trading one failure mode for a worse one.
     const isRetryableLlmCallError = (error: unknown): boolean => {
       const errorClass = classifyToolErrorClass(error);
-      return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
+      if (errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx') return true;
+      // ENG-1681: see openRouterResponseValidation.ts for the full context —
+      // this covers OpenRouter's malformed/empty-response failure classes,
+      // which are not a rate limit, network blip, or 5xx by
+      // classifyToolErrorClass's general taxonomy.
+      return isMalformedOpenRouterResponseError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
@@ -3170,6 +3179,10 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1681: see openRouterResponseValidation.ts — converts a response
+        // with no `choices` array into an explicit, retryable error before it
+        // ever reaches the unguarded `response.choices[0].message` downstream.
+        assertOpenRouterResponseHasChoices(res, model);
         // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
         // impact) -- lets a production incident/verification tie a specific
         // call to the provider it actually landed on without reading
