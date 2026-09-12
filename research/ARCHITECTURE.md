@@ -611,6 +611,9 @@ Intersection gpt-image-1 + gemini-2.5-flash-image.
 gpt-image-2 is Azure on the leaf, OpenAI-else on the
 worker. Q-003 already parks image-models.ts L11.
 A-006 discarded.
+Cycle 179: ImageModelsSettings seed omits gpt-image-1
+(Azure named). Empty Dynamo auto-inits openai-image-1.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

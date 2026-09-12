@@ -474,3 +474,8 @@ reverted. Do not copy that as A-006.
   openai-image-1 → OpenAI else (web_agent.py L3295-3301).
   gpt-image-2 is Azure on the leaf. Q-003 already parks
   image-models.ts L11. Not A-006.
+- Cycle 179: ImageModelsSettings.tsx L71-89 seeds
+  openai-image-1 + FLUX + gemini-2.5, not gpt-image-1.
+  Empty Dynamo auto-inits that list (L129-131). CLI help
+  L4216 same omission. Worker L3281 is unadvertised.
+  Not A-006.

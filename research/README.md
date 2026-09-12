@@ -617,6 +617,11 @@ Unspecified Emma → Gemini 3; unspecified browser task →
 `openai-image-1` → OpenAI else. `gpt-image-2` is Azure
 on the leaf and OpenAI-else on the worker. Q-003 already
 parks `image-models.ts` L11.
+Cycle 179: **Admin seed omits Azure `gpt-image-1`.**
+`ImageModelsSettings.tsx` L71–89 auto-inits
+openai-image-1 + FLUX + gemini-2.5. Grep of that file
+for `gpt-image-1` is empty. CLI help L4216 same two-id
+lie. Worker named branch L3281 is unadvertised.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -332,6 +332,9 @@ Cycle 178: two deploy units, two image dispatch tables.
 gpt-image-2 is Azure on the leaf, OpenAI-else on the
 worker. Q-003 already parks image-models.ts L11.
 Product READY unchanged.
+Cycle 179: ImageModelsSettings seed omits gpt-image-1.
+Empty Dynamo auto-inits openai-image-1. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

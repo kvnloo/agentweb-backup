@@ -850,6 +850,13 @@ OpenAI else on the worker and Azure on the leaf. CLI
 help L4216 names only two ids. Q-003 already parks
 `image-models.ts` L11. Not A-006.
 
+Cycle 179: **Admin seed omits Azure `gpt-image-1`.**
+`ImageModelsSettings.tsx` L71–89. `fetchConfig` L129–131
+writes that list when Dynamo is empty. Grep of the file
+for `gpt-image-1` is empty. `imageModelService.ts` L22 /
+L83 same fallback. Worker named branch L3281 is
+unadvertised. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
