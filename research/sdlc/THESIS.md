@@ -269,6 +269,9 @@ after paying for them. Listed MCP hops here. Do not add
 A-021.
 Cycle 150: Vertex filling the cap does not skip Drive or
 ClickUp (L24070 → L24073). Do not add A-021.
+Cycle 151: ClickUp docs “search” is list-all then
+`includes()` (`clickupService.ts` L103–119). Drive is
+`fullText contains`. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

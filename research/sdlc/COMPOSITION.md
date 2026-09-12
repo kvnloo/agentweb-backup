@@ -649,6 +649,14 @@ L24182 same. Only empty-set gate is L24216. Grep: no
 `results.length >= limitedMaxResults` in this method.
 Listed MCP always fans out. Not A-006.
 
+Cycle 151: **ClickUp docs “search” is list-all then
+`includes()`.** `clickupService.ts` L103–119 paginates every
+workspace doc (no query param; grep of that file for
+`search`/`query` is empty). Agent Mode L24150–24158 reads
+each doc’s pages until N matches. Drive L24092 is
+`fullText contains` then read-hits-only. Listed MCP hops
+here. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

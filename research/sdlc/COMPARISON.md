@@ -371,3 +371,6 @@ reverted. Do not copy that as A-006.
   after OAuth and reads. Listed MCP hops here. Not A-006.
 - Cycle 150: no short-circuit after Vertex (L24070 → L24073
   if userId Drive). Only empty-set gate is L24216. Not A-006.
+- Cycle 151: ClickUp docs search is list-all then includes()
+  (clickupService.ts L103-119; AM L24150-24158). Drive is
+  fullText contains (L24092). Not A-006.

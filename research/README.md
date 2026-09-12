@@ -480,6 +480,11 @@ Cycle 150: **no short-circuit after Vertex.** L24070 → L24073
 `if (userId)` Drive with no cap check. ClickUp L24142 /
 L24182 same. Only `results.length === 0` (L24216). Listed
 MCP always fans out the superset.
+Cycle 151: **ClickUp docs “search” is list-all then
+`includes()`.** `clickupService.ts` L103–119 paginates every
+doc (no query). L24156 reads each doc’s pages until N
+matches. Drive L24092 is `fullText contains`. Listed MCP hops
+here. Not a fifth hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

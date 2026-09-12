@@ -287,4 +287,7 @@ Vertex-first prefix can discard Drive/ClickUp after paying
 for them. Listed MCP hops here. A-006 stays discarded.
 Cycle 150: Vertex filling the cap does not skip Drive or
 ClickUp; no short-circuit after L24070. A-006 stays discarded.
+Cycle 151: ClickUp docs “search” is list-all then
+`includes()`; Drive already has `fullText contains`. A-006
+stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
