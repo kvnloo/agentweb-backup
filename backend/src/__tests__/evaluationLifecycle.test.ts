@@ -1,37 +1,83 @@
-// Human contract: isolated provision, bounded spend, approved-only material, full revoke.
-import { EvaluationStore } from '../services/evaluationStore';
+// Human contract (ENG-1907 AC 4/5, ENG-1870 AC 1/2/7): tier-gated isolated provision, no production Meta path, full revoke.
+import { EvaluationStore, SandboxTierMissing } from '../services/evaluationStore';
+import { SANDBOX_TOOL_CLASS_NAMES } from '../services/evaluationPolicy';
+import { getSubscriptionTypeConfig } from '../services/subscriptionService';
 
-describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
+jest.mock('../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
+
+describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
   const transactWrite = jest.fn((_request: any) => ({ promise: async () => ({}) }));
   const get = jest.fn();
   const scan = jest.fn((_request: any) => ({ promise: async () => ({ Items: [] as any[], LastEvaluatedKey: undefined as any }) }));
   const update = jest.fn((_request: any) => ({ promise: async () => ({}) }));
   const remove = jest.fn((_request: any) => ({ promise: async () => ({}) }));
   const store = new EvaluationStore({ transactWrite, get, scan, update, delete: remove } as any);
-  const request = { email: 'candidate@example.invalid', displayName: 'Test candidate', password: 'Synthetic-password-123!', generationBudget: 5, expiresAt: Date.now() + 3600000, materials: [{ title: 'Sanitized case', text: 'Synthetic metrics only', approved: true as const }] };
-  beforeEach(() => { jest.clearAllMocks(); });
+  const request = { email: 'Candidate@Example.invalid', displayName: 'Test candidate', password: 'Synthetic-password-123!', expiresAt: Date.now() + 3600000, brandGuidelines: { brandName: 'Synthetic Co', website: 'https://synthetic.invalid', description: 'A synthetic case' } };
+  const userPut = () => transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.TableName.endsWith('AW-Users')).Put;
+  const policyPut = () => transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item?.evaluationKey?.startsWith('evaluation/eval_') && w.Put?.Item?.mode).Put;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (getSubscriptionTypeConfig as jest.Mock).mockResolvedValue({ name: 'Sandbox', allowedPages: ['*'], allowedSkills: ['*'] });
+  });
 
-  it('creates a Pro account and evaluation atomically without inheriting any organization', async () => {
+  it('refuses to provision when the Sandbox tier row does not exist (AC 4)', async () => {
+    (getSubscriptionTypeConfig as jest.Mock).mockResolvedValue(null);
+    await expect(store.provision('admin', request)).rejects.toBeInstanceOf(SandboxTierMissing);
+    await expect(store.provision('admin', request)).rejects.toThrow('ensure-sandbox-tier');
+    expect(getSubscriptionTypeConfig).toHaveBeenCalledWith('Sandbox');
+    expect(transactWrite).not.toHaveBeenCalled();
+  });
+
+  it('creates a Sandbox-tier account and policy atomically without inheriting any organization', async () => {
     const result = await store.provision('admin', request);
     expect(result.userId).toMatch(/^eval_/);
     expect(result.audit).toMatchObject({ actor: 'admin', action: 'provision' });
-    const writes = transactWrite.mock.calls[0][0].TransactItems;
-    const user = writes.find((w: any) => w.Put?.TableName.endsWith('AW-Users')).Put;
-    expect(user.Item).toMatchObject({ isAdmin: false, subscriptionType: 'Pro', roles: ['customer'] });
+    const user = userPut();
+    expect(user.Item).toMatchObject({ isAdmin: false, isActive: true, subscriptionType: 'Sandbox', roles: ['customer'], email: 'candidate@example.invalid', signupSource: 'evaluation' });
     expect(user.Item.orgId).toBeUndefined();
     expect(user.Item.password).not.toBe(request.password);
     expect(user.ConditionExpression).toContain('attribute_not_exists');
+    const writes = transactWrite.mock.calls[0][0].TransactItems;
     expect(writes.filter((w: any) => w.Put?.TableName !== 'AW-Users').every((w: any) => w.Put.TableName === 'AW-Evaluations')).toBe(true);
     expect(writes.some((w: any) => w.Put?.Item.action === 'provision')).toBe(true);
   });
 
-  it.each([null, {}, [{ title: 'Case', text: 'unsafe', approved: false }], ['wrong-type']])('rejects malformed or unapproved material %p before persisting', async materials => {
-    await expect(store.provision('admin', { ...request, materials } as any)).rejects.toThrow();
-    expect(transactWrite).not.toHaveBeenCalled();
+  it('seeds brand guidelines so the portal never routes the account into onboarding', async () => {
+    await store.provision('admin', request);
+    const brand = userPut().Item.brandGuidelines;
+    expect(brand.brandData.brandName).toBe('Synthetic Co');
+    expect(brand.brandData.domain).toBe('https://synthetic.invalid');
+    expect(brand.brandData.tagline).toBe('A synthetic case');
+    expect(Array.isArray(brand.brandData.keyMessages)).toBe(true);
+    expect(Array.isArray(brand.attachments)).toBe(true);
+    expect(typeof brand.updatedAt).toBe('string');
   });
 
-  it.each([0, -1, NaN, Infinity, 1.5])('rejects unbounded/invalid generation budget %p', async generationBudget => {
-    await expect(store.provision('admin', { ...request, generationBudget })).rejects.toThrow();
+  it('never writes the legacy adAccount field (the shared-production-token path)', async () => {
+    await store.provision('admin', { ...request, adAccount: '123456789' } as any);
+    expect(Object.keys(userPut().Item)).not.toContain('adAccount');
+    expect(userPut().Item.connected_accounts).toBeUndefined();
+  });
+
+  it('writes the sandbox policy record with simulated Meta and every tool class denied by default', async () => {
+    await store.provision('admin', request);
+    expect(policyPut().Item).toMatchObject({ mode: 'sandbox', label: 'Sandbox', status: 'active', connectors: { meta: 'simulated' }, provisionedBy: 'admin', reviewerUserIds: [] });
+    expect(policyPut().Item.deniedToolClasses).toEqual(SANDBOX_TOOL_CLASS_NAMES);
+    expect(policyPut().ConditionExpression).toContain('attribute_not_exists');
+  });
+
+  it('honors an explicit subset of denied classes, label, and dataset pin, but always keeps lifecycle denied', async () => {
+    await store.provision('admin', { ...request, label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 1, deniedToolClasses: ['sends'], reviewerUserIds: ['reviewer-1'] });
+    expect(policyPut().Item).toMatchObject({ label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 1, reviewerUserIds: ['reviewer-1'] });
+    expect(policyPut().Item.deniedToolClasses).toEqual(['sends', 'lifecycle']);
+  });
+
+  it.each([
+    { brandGuidelines: undefined }, { brandGuidelines: { brandName: '' } }, { brandGuidelines: { brandName: 'x'.repeat(101) } },
+    { password: 'short' }, { expiresAt: Date.now() - 1 }, { expiresAt: Date.now() + 31 * 86400000 }, { email: 'not-an-email' },
+    { deniedToolClasses: ['not_a_class'] }, { deniedToolClasses: 'sends' }, { datasetVersion: -1 }, { reviewerUserIds: ['bad id'] }, { label: 'x'.repeat(41) },
+  ])('rejects malformed provisioning input %p before persisting', async override => {
+    await expect(store.provision('admin', { ...request, ...override } as any)).rejects.toThrow();
     expect(transactWrite).not.toHaveBeenCalled();
   });
 
@@ -41,25 +87,35 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     expect(get).toHaveBeenCalledWith(expect.objectContaining({ ConsistentRead: true, Key: { evaluationKey: 'evaluation/eval_test' } }));
   });
 
-  it('reserves generation budget atomically against live, unexpired state', async () => {
-    await store.reserve('eval_test');
-    const update = transactWrite.mock.calls[0][0].TransactItems[0].Update;
-    expect(update.ConditionExpression).toContain('remaining > :zero');
-    expect(update.ConditionExpression).toContain('#status = :active');
-    expect(update.ConditionExpression).toContain('expiresAt > :now');
+  it('tolerates a legacy ENG-1870 policy row (materials, budget, artifacts, toy simulation) and normalizes it', async () => {
+    get.mockReturnValue({ promise: async () => ({ Item: {
+      evaluationKey: 'evaluation/eval_test', userId: 'eval_test', email: 'ryan@example.invalid', status: 'active', expiresAt: Date.now() + 60000,
+      remaining: 100, materials: [{ title: 'Case', text: 'x', approved: true }], simulation: { seed: [{ id: 'sim_eval_test_seed_a' }], objects: [] },
+      simulationRevision: 3, artifactEpoch: 1, resetArtifacts: ['old'], artifacts: [{ artifactId: 'a', mime: 'text/plain' }], provisionedBy: 'admin', reviewerUserIds: ['matt'],
+    } }) });
+    const record = await store.get('eval_test');
+    expect(record).toMatchObject({ userId: 'eval_test', status: 'active', mode: 'sandbox', label: 'Sandbox', connectors: { meta: 'simulated' }, provisionedBy: 'admin', reviewerUserIds: ['matt'] });
+    expect(record!.deniedToolClasses).toEqual(SANDBOX_TOOL_CLASS_NAMES);
+    for (const legacy of ['remaining', 'materials', 'simulation', 'simulationRevision', 'artifactEpoch', 'resetArtifacts', 'artifacts']) expect((record as any)[legacy]).toBeUndefined();
+  });
+
+  it('refuses a policy row whose identity does not match the requested principal', async () => {
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_other', status: 'active' } }) });
+    await expect(store.get('eval_test')).rejects.toThrow();
   });
 
   it('revocation atomically records an audit event and disables the account', async () => {
-    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email, status: 'active' } }) });
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: 'candidate@example.invalid', status: 'active' } }) });
     const result = await store.revoke('admin', 'eval_test');
     expect(result.audit).toMatchObject({ actor: 'admin', action: 'revoke' });
     const writes = transactWrite.mock.calls[0][0].TransactItems;
     expect(writes.some((w: any) => w.Update?.ExpressionAttributeValues?.[':revoked'] === 'revoked')).toBe(true);
     expect(writes.some((w: any) => w.Update?.ExpressionAttributeValues?.[':inactive'] === false)).toBe(true);
+    expect(writes.some((w: any) => w.Update?.UpdateExpression?.includes('sessionVersion') && w.Update?.UpdateExpression?.includes('delegateTokenEpoch'))).toBe(true);
     expect(writes.some((w: any) => w.Put?.Item.action === 'revoke')).toBe(true);
   });
   it('revocation invalidates stored keys, OAuth grants, MCP sessions, and jobs with strongly consistent pagination', async () => {
-    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email, status: 'active' } }) });
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: 'candidate@example.invalid', status: 'active' } }) });
     scan.mockImplementation((params: any) => ({ promise: async () => ({
       Items: params.TableName.endsWith('AW-AgentApiKeys') ? [{ userId: 'eval_test', keyId: params.ExclusiveStartKey ? 'second' : 'first' }] : [],
       LastEvaluatedKey: params.TableName.endsWith('AW-AgentApiKeys') && !params.ExclusiveStartKey ? { keyId: 'first' } : undefined,
@@ -71,10 +127,8 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     expect(remove).toHaveBeenCalledTimes(2);
     expect(remove.mock.calls.every(([params]) => params.ExpressionAttributeValues[':user'] === 'eval_test')).toBe(true);
   });
-
-
   it('does not report a credential as deleted when the ownership condition loses a race', async () => {
-    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email, status: 'active' } }) });
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: 'candidate@example.invalid', status: 'active' } }) });
     scan.mockImplementation((params: any) => ({ promise: async () => ({
       Items: params.TableName.endsWith('AW-AgentApiKeys') ? [{ userId: 'eval_test', keyId: 'raced' }] : [],
       LastEvaluatedKey: undefined,
@@ -82,13 +136,11 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     remove.mockReturnValueOnce({
       promise: async () => { throw Object.assign(new Error('ownership changed'), { code: 'ConditionalCheckFailedException' }); },
     });
-
     const result = await store.revoke('admin', 'eval_test');
-
     expect(result.cleanup['AW-AgentApiKeys']).toBe(0);
   });
   it('records cleanup failure after the authoritative revoke commit', async () => {
-    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: request.email } }) });
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', email: 'candidate@example.invalid' } }) });
     scan.mockImplementationOnce(() => ({ promise: async () => { throw new Error('synthetic unavailable'); } }));
     await expect(store.revoke('admin', 'eval_test')).rejects.toThrow();
     const initialRevoke = transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item.action === 'revoke');
@@ -96,23 +148,11 @@ describe('ENG-1870 evaluation lifecycle persistence invariants', () => {
     expect(transactWrite.mock.calls.some(([params]) => params.TransactItems.some((w: any) => w.Put?.Item.action === 'revocation-cleanup-failed'))).toBe(true);
   });
 
-  it('provisioning freezes only a bounded approved packet with synthetic evaluation-scoped IDs', async () => {
-    const result = await store.provision('admin', { ...request, simulationPacket: { approved: true, objects: [{ key: 'case', kind: 'campaign', name: 'Approved', objective: 'LEADS', budget: 5000, budgetType: 'daily', metrics: { clicks: 30 } }] } });
-    const record = transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item.userId === result.userId && w.Put?.Item.simulation).Put.Item;
-    expect(record.simulation.seed).toEqual(record.simulation.objects);
-    expect(record.simulation.seed[0]).toMatchObject({ id: `sim_${result.userId}_seed_case`, metrics: { clicks: 30 } });
-    expect(record.provisionedBy).toBe('admin');
+  it('review is limited to the provisioning admin and explicitly assigned reviewers and returns only status + audit', async () => {
+    get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', status: 'revoked', provisionedBy: 'admin', reviewerUserIds: ['matt'], materials: [{ title: 'x', text: 'y' }] } }) });
+    scan.mockImplementation(() => ({ promise: async () => ({ Items: [{ evaluationKey: 'evaluation/eval_test/audit/1', userId: 'eval_test', action: 'provision' }], LastEvaluatedKey: undefined }) }));
+    const result = await store.review('matt', 'eval_test');
+    expect(result).toEqual({ userId: 'eval_test', status: 'revoked', audit: [expect.objectContaining({ action: 'provision' })], truncated: false });
+    await expect(store.review('stranger', 'eval_test')).rejects.toThrow();
   });
-  it.each([
-    { approved: false, objects: [] }, { approved: true, objects: [null] },
-    { approved: true, objects: [{ key: 'a', kind: 'campaign', name: 'x', objective: 'LEADS', accountId: 'act_123' }] },
-    { approved: true, objects: [{ key: 'a', kind: 'campaign', name: 'x', objective: 'LEADS', metrics: { clicks: '30' } }] },
-    { approved: true, objects: [{ key: 'a', kind: 'creative', name: 'x', text: 'https://example.invalid/private' }] },
-    { approved: true, objects: [{ key: 'a', kind: 'ad', name: 'x', parentKey: 'missing' }] },
-    { approved: true, objects: Array.from({length: 31}, (_, i) => ({ key: `a${i}`, kind: 'creative', name: 'x', text: 'safe' })) },
-  ])('rejects unsafe packet %p before creating an account', async simulationPacket => {
-    await expect(store.provision('admin', { ...request, simulationPacket } as any)).rejects.toThrow();
-    expect(transactWrite).not.toHaveBeenCalled();
-  });
-
 });
