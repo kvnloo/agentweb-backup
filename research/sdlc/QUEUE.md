@@ -260,6 +260,9 @@ Cycle 147: GG `reason` is required then discarded before the
 Vertex leaf. Product READY unchanged.
 Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma tool
 / MCP default 5. Product READY unchanged.
+Cycle 149: Agent Mode collects per source then slices;
+Vertex-first prefix can discard Drive/ClickUp after paying
+for them. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -366,3 +366,6 @@ reverted. Do not copy that as A-006.
 - Cycle 148: GG and Emma RAG hardcode maxResults=10; Emma
   tool / MCP default 5 then AM min(,10). Cardinality is
   per-face, not a leaf port. Not A-006.
+- Cycle 149: Agent Mode collects per source then slices
+  (L24233). Vertex-first prefix can discard Drive/ClickUp
+  after OAuth and reads. Listed MCP hops here. Not A-006.

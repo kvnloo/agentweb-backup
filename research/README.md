@@ -472,6 +472,10 @@ Cycle 148: **cardinality is per-face.** GG L71 and Emma RAG
 L5106 hardcode **10**. Emma tool L5594 and MCP L1281 default
 **5**, then Agent Mode `Math.min(..., 10)` (L24050). Emma
 disagrees with itself. Not a leaf port.
+Cycle 149: **per-source collect, then slice.** L24230–24233
+is the receipt. Vertex is first in `results`; Drive tree
+walk and ClickUp reads still run; `slice(0, N)` can drop
+them. Listed MCP hops here (cycle 143). Not a fifth hop.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

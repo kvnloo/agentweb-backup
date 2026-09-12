@@ -636,6 +636,13 @@ L5106 hardcode 10. Emma tool L5594 and MCP L1281 default 5.
 Agent Mode L24050 caps at 10. Emma disagrees with itself
 (RAG vs tool). Not a leaf port. Not A-006.
 
+Cycle 149: **per-source collect, then slice.** L24230–24233:
+merged list can be several times larger than requested.
+Vertex is pushed first (L24059–24070); Drive tree walk
+(L24080–24121) and ClickUp doc reads (L24150–24156) still
+run; `slice(0, limitedMaxResults)` keeps the prefix. Listed
+MCP `emmaApi.ts` L98–101 hops here. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
