@@ -748,6 +748,9 @@ READY unchanged.
    take `[0]`.
    Cycle 255: do **not** fork `grep '^arn:'`
    into an `/app/` filter from A-019.
+   Cycle 256: a `net/` XFF modify fails the
+   job. Do **not** add skip-non-app from
+   A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

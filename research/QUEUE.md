@@ -696,3 +696,6 @@ on count != 1. A-006 stays discarded.
 Cycle 255: do not fork grep ^arn: into
 an /app/ filter from A-019. A-006 stays
 discarded.
+Cycle 256: a net/ XFF modify fails the
+job. Do not add skip-non-app. A-006 stays
+discarded.

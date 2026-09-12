@@ -172,6 +172,8 @@ Cycle 254: if two ARNs appeared, copy ENG-823 pin-all. Do not
 fail closed on `count != 1`. Do not take `[0]`. Do not add A-021.
 Cycle 255: do not fork `grep '^arn:'` into an `/app/` filter
 from A-019. Do not add A-021.
+Cycle 256: a `net/` XFF modify fails the job. Do not add
+skip-non-app from A-019. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

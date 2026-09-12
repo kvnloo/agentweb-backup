@@ -834,3 +834,9 @@ Not A-020. Not A-006.
 Do not add a `loadbalancer/app/` grep from A-019. XFF
 keys are ALB-only; ENG-823 TG delay is not. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 256 (net/ XFF modify fails the job)
+
+Fail the job is the ENG-823 copy. Do not add skip-non-app.
+After-verify fail is cycle 247. Not A-019. Not A-020.
+Not A-006.
