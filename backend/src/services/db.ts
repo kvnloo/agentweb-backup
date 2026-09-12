@@ -14,6 +14,7 @@ import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
+import { isEvaluationUser } from "./evaluationPolicy";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -1349,7 +1350,13 @@ export class UserDB {
     return counts;
   }
 
-  async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
+  /**
+   * ENG-1907: sandbox (eval_) principals are excluded by default. Every fleet sweep,
+   * cron, and admin listing enumerates through here, so this one filter is what keeps
+   * a take-home or pilot account out of CRM sync, onboarding nudges, Meta crons, and
+   * revenue listings. Only the sandbox lifecycle itself passes `includeSandbox`.
+   */
+  async getAllUsers(hideBotLike = false, options?: { includeSandbox?: boolean }): Promise<UserWithCounts[]> {
     try {
       const allItems: User[] = [];
       let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -1377,6 +1384,7 @@ export class UserDB {
       const users = allItems.filter(
         (u) =>
           !u.userId.startsWith("deleted_") &&
+          (options?.includeSandbox === true || !isEvaluationUser(u.userId)) &&
           (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
       if (users.length === 0) return [];
