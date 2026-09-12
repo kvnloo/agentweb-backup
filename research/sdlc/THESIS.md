@@ -862,3 +862,9 @@ add a fourth. Not A-019. Not A-020. Not A-006.
 Treat empty Describe like `20`. Do not add hook `[ -z ]`.
 Empty desired is a different variable. Not A-019. Not
 A-020. Not A-006.
+
+## Cycle 261 (unset XFF opt-in skips like partner)
+
+Copy L798. Do not pin AWS defaults on empty desired.
+Partner and staging omit the delay var. Not A-019.
+Not A-020. Not A-006.

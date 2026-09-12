@@ -711,3 +711,6 @@ stays discarded.
 Cycle 260: treat empty XFF Describe like
 20. Do not add hook -z. A-006 stays
 discarded.
+Cycle 261: unset XFF opt-in skips like
+partner. Do not pin AWS defaults. A-006
+stays discarded.

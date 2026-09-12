@@ -1568,6 +1568,10 @@ Cycle 260: **treat empty XFF Describe like
 desired is the partner skip. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 261: **unset XFF opt-in skips like
+partner (and staging).** Do not pin AWS
+defaults. Not A-019. Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

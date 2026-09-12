@@ -845,3 +845,6 @@ reverted. Do not copy that as A-006.
 - Cycle 260: empty current is Modify, not
   hook `-z`. Hermes has no empty-vs-None
   deploy fork. Not A-006.
+- Cycle 261: unset XFF opt-in skips like
+  partner. Hermes has no empty-desired
+  pin-defaults fork. Not A-006.

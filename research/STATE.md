@@ -7,26 +7,25 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 260
+cycles_completed: 261
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 261
+next_cycle: 262
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 260: treat empty XFF Describe like
-  20 (ENG-823 Modify); do not add hook -z
-  from A-019. Cycle 261: empty desired (L798)
-  is the partner zero-call path. Should a
-  later XFF opt-in that is unset skip like
-  partner, rather than pin AWS defaults
-  append/false? Do not treat empty desired
-  as pin defaults. Do not add that pin from
-  A-019. Do not un-park A-020. Do not 503
-  /health. Do not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave
-  briefing_ready. Do not mint a timer
-  unless Kevin asks.
+  Cycle 261: unset XFF opt-in skips like
+  partner (and staging); do not pin AWS
+  defaults. Cycle 262: production backend
+  already sets EB_DEREGISTRATION_DELAY_SECONDS.
+  Should a later XFF pin piggyback on that
+  var being set, rather than a separate
+  opt-in? Do not piggyback. Do not add that
+  pin from A-019. Do not un-park A-020. Do
+  not 503 /health. Do not add A-021. Do
+  not un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. stop_after has passed;
+  leave briefing_ready. Do not mint a
+  timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -38,7 +37,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–260: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–261: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -62,4 +61,5 @@ then Modify, then fail; do not add a None-skip. Do not
 `fail()` on ALB XFF Describe `None` before Modify. A later
 XFF pin copies ENG-823’s None policy; do not add a fourth.
 Treat empty current like `20`; do not add hook `[ -z ]`.
-A-006 stays discarded.
+Unset XFF desired skips like partner; do not pin AWS
+defaults. A-006 stays discarded.
