@@ -790,3 +790,7 @@ reverted. Do not copy that as A-006.
   IdleTimeout resource-only PR does
   not transfer. Hermes has no ALB
   attributes to pin. Not A-006.
+- Cycle 244: that pin’s IAM grant is
+  live-AWS-only. Hermes has no
+  `github-actions-deploy-backend`.
+  Not A-006.

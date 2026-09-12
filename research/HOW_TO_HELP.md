@@ -139,6 +139,9 @@ Cycle 243: a later ENG-493 pin is the only in-tree reassert of XFF
 without recreate. Do not treat a resource-only IdleTimeout PR as
 also pinning XFF. Recreate is out of band. Do not add that pin from
 A-019. Do not add A-021.
+Cycle 244: deploy IAM does not list `ModifyLoadBalancerAttributes`.
+Grant is live-AWS-only. Do not treat L61–65 as a grant. Do not treat
+ENG-823 TG modify as implying LB modify. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

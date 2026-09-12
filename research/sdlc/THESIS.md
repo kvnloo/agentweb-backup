@@ -761,3 +761,10 @@ IdleTimeout can be a resource-only PR; XFF cannot. No
 Recreate is out of band (DR L103). Later
 `modify-load-balancer-attributes` sibling is the only
 live-ALB reassert. Not A-019. Not A-006.
+
+## Cycle 244 (deploy IAM does not list ModifyLoadBalancerAttributes)
+
+L61–65 is a probe Describe* comment, not a policy. Deploy
+user is live-AWS (`github-actions-deploy-backend` keys).
+`ModifyTargetGroupAttributes` does not imply LB modify.
+Not A-019. Not A-006.

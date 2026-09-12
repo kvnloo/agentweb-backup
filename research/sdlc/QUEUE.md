@@ -703,6 +703,9 @@ READY unchanged.
    pinning XFF. Do **not** add
    `commands:` / hooks / CFN LoadBalancer
    from A-019.
+   Cycle 244: deploy IAM does **not**
+   list `ModifyLoadBalancerAttributes`.
+   Do **not** treat L61–65 as a grant.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

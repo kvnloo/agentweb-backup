@@ -655,3 +655,6 @@ Cycle 243: a later ENG-493 pin is the
 only in-tree reassert of XFF without
 recreate. IdleTimeout resource-only PR
 does not transfer. A-006 stays discarded.
+Cycle 244: deploy IAM does not list
+ModifyLoadBalancerAttributes. Grant is
+live-AWS-only. A-006 stays discarded.

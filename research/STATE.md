@@ -7,31 +7,33 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 243
+cycles_completed: 244
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 244
+next_cycle: 245
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 243: a later ENG-493 pin is the
-  only in-tree reassert of ALB XFF
-  without recreate. IdleTimeout's
-  resource-only PR does not transfer.
-  Recreate is out of band (DR L103).
-  Cycle 244: does deploy IAM even include
-  elbv2:ModifyLoadBalancerAttributes?
-  Header L61-65 lists probe Describe*
-  only. Denied modify-target-group-
-  attributes already fails the job
-  (eb-deploy.test.sh L876). File-level:
-  IAM in repo vs live-AWS-only. Do not
-  add that pin from A-019. Do not
-  un-park A-020. Do not 503 /health. Do
-  not add A-021. Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave
-  briefing_ready. Do not mint a timer
-  unless Kevin asks.
+  Cycle 244: deploy IAM does not list
+  ModifyLoadBalancerAttributes. Grant is
+  live-AWS-only (github-actions-deploy-
+  backend access keys). L61-65 is probe
+  Describe* comment, not a policy.
+  ModifyTargetGroupAttributes does not
+  imply LB modify. Cycle 245: a later
+  sibling also needs
+  DescribeLoadBalancerAttributes for the
+  ENG-823 re-read. L61-65 names neither
+  on the load balancer.
+  DescribeTargetGroupAttributes is used
+  by ENG-823 without being in that list.
+  Is the re-read also unnamed /
+  live-AWS-only? Do not add that pin from
+  A-019. Do not un-park A-020. Do not
+  503 /health. Do not add A-021. Do not
+  un-ready Q-001 / Q-014 / Q-003. Do not
+  revive A-006. stop_after has passed;
+  leave briefing_ready. Do not mint a
+  timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -43,7 +45,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–243: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–244: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -52,5 +54,5 @@ rewrite it; ALB passes Application 503 through (does not rewrite to
 `modify-load-balancer-attributes` on the LB ARN, not A-019 or A-020;
 that ARN stays across Immutable and Sunday (IdleTimeout does not
 reapply weekly); that pin is the only in-tree reassert without
-recreate (IdleTimeout resource-only PR does not transfer). A-006
-stays discarded.
+recreate; deploy IAM does not list the Modify grant (live-AWS-only).
+A-006 stays discarded.

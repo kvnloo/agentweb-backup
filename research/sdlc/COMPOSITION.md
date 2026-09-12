@@ -1474,6 +1474,11 @@ recreate.** IdleTimeout’s resource-only
 PR does not transfer. Recreate is out
 of band. Not A-019. Not A-006.
 
+Cycle 244: **deploy IAM does not list
+`ModifyLoadBalancerAttributes`.** Grant
+is live-AWS-only. TG modify does not
+imply LB modify. Not A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
