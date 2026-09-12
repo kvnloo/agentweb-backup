@@ -677,6 +677,11 @@ READY unchanged.
    Cycle 238: this tree cannot rewrite
    JSON 503. Do **not** add
    `error_page`.
+   Cycle 239: ALB passes Application
+   503 through. Do **not** add
+   `aws:elbv2:listener` / `fixed-response`
+   from A-019. Do **not** treat ALB 502
+   as a rewrite of Node 503.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

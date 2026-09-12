@@ -1445,6 +1445,13 @@ JSON 503.** Zero `error_page` in
 live-AWS-only. Do not add
 `error_page`. Not A-006.
 
+Cycle 239: **ALB passes Application 503
+through.** Zero listener rules. AWS
+502 is TCP RST / malformed / target
+gone, not a rewrite of Node JSON 503.
+Do not add `aws:elbv2:listener`. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

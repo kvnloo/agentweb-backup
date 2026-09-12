@@ -725,3 +725,11 @@ still throws (405 skip only). Copy `runScheduledChats` L13032
 Zero `error_page` / `proxy_intercept_errors` in `.platform`
 (cycle 107). Catch-all `/mcp` nginx is not in git (`app.ts`
 L152–155). Do not add `error_page` from A-019. Not A-006.
+
+## Cycle 239 (ALB passes Application 503 through)
+
+ALB forwards target HTTP errors (`HTTPCode_Target_5XX_Count`).
+ALB-generated 502 is TCP RST / malformed / target gone.
+Listener actions are only forward / redirect / fixed-response.
+This tree’s only `aws:elbv2:` knob is `IdleTimeout: 600`.
+Zero listener rules. Do not add them from A-019. Not A-006.

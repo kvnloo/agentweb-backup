@@ -771,3 +771,6 @@ reverted. Do not copy that as A-006.
 - Cycle 238: no `error_page` in
   git. Hermes sees Node's 503 if
   nginx pass-throughs. Not A-006.
+- Cycle 239: ALB also pass-throughs
+  Application 503. Hermes/OMP: no
+  ALB hop. Not A-006.
