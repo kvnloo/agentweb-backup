@@ -1386,6 +1386,15 @@ in git. ALB target stays `/` and
 set `HealthCheckType: ELB`. Not
 A-006.
 
+Cycle 231: **dying-instance 5xx
+does not fail the new Immutable
+instance.** `HealthCheckSuccessThreshold`
+unset (default `Ok`) is the
+temporary ASG bar
+(`rolling.config` has no
+threshold). ENG-878 Red is after
+the old row is gone. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

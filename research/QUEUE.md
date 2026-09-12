@@ -597,3 +597,11 @@ ConfigDocument switch. Zero
 HealthCheckType in git. Do not
 set HealthCheckType ELB. Do not
 503 /health. A-006 stays discarded.
+Cycle 231: dying-instance 5xx
+does not fail the NEW Immutable
+instance. HealthCheckSuccessThreshold
+unset (default Ok) is the temp
+ASG bar. socialPosts Min=Max=1
+is a comment. Do not set that
+threshold from A-019. A-006
+stays discarded.

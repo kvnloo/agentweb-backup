@@ -738,5 +738,10 @@ reverted. Do not copy that as A-006.
   replace. Hermes exit *is* health
   fail. AgentWeb keeps `/health`
   200 until close and Wait on the
-  hook. Not `HealthCheckType: ELB`.
+  hook.   Not `HealthCheckType: ELB`.
   Not A-006.
+- Cycle 231: Immutable health is
+  the new temporary ASG (`Ok`
+  default). Dying 5xx does not
+  fail that bar. Hermes has no
+  second group. Not A-006.

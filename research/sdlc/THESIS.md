@@ -658,3 +658,12 @@ L13031–13032. Zero `HealthCheckType` in git; default ASG check is
 EC2, not ELB. `Terminating:Wait` is already the replace. Do not set
 `HealthCheckType: ELB` (would treat post-close `/health` 502 as ASG
 unhealthy). Not a fifth `listen()`.
+
+## Cycle 231 (dying 5xx ≠ new Immutable fail)
+
+`HealthCheckSuccessThreshold` unset; AWS default `Ok` is the
+**temporary ASG** bar. `IgnoreHealthCheck: false` + Timeout 900
+wait on the **new** instance. Environment Red after the old row
+is gone is ENG-878 lag (`eb-deploy.sh` L251–257), not overlap
+5xx failing the new Ok. `socialPosts.ts` L16–21 is a comment.
+A-006 stays discarded.

@@ -644,6 +644,11 @@ READY unchanged.
    not Wait replace. Do **not**
    set `HealthCheckType: ELB`.
    Do **not** 503 `/health`.
+   Cycle 231: dying 5xx does
+   **not** fail the new Immutable
+   instance. Do **not** set
+   `HealthCheckSuccessThreshold`
+   from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

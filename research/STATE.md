@@ -7,32 +7,30 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 230
+cycles_completed: 231
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 231
+next_cycle: 232
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 230: A-019 tools/call 503
-  is Application 5xx color, not
-  Wait replace. 04-disk-alarm names
-  4xx because that is the only
-  ConfigDocument switch; 5xx cannot
-  be ignored. Zero HealthCheckType
-  in git (default EC2). Do not set
-  HealthCheckType ELB. Cycle 231:
-  can dying-instance Application
-  5xx fail HealthCheckSuccessThreshold
-  (unset; default Ok) for the NEW
-  Immutable instance because rollup
-  includes both? socialPosts.ts
-  L16–21 MinSize=MaxSize=1 is a
-  comment. Do not 503 /health. Do
-  not add A-021. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not
-  revive A-006. stop_after has
-  passed; leave briefing_ready. Do
-  not mint a timer unless Kevin asks.
+  Cycle 231: dying-instance 5xx does
+  not fail the NEW Immutable instance.
+  HealthCheckSuccessThreshold unset
+  (default Ok) is the temporary ASG
+  bar. socialPosts Min=Max=1 is a
+  comment. Cycle 232: Sunday
+  InstanceRefreshEnabled is rolling
+  on the surviving ASG (cycle 110),
+  not a temp group. Can old-instance
+  Application 5xx fail that rolling
+  batch? Do not disable refresh. Do
+  not set HealthCheckSuccessThreshold.
+  Do not 503 /health. Do not add
+  A-021. Do not un-ready Q-001 /
+  Q-014 / Q-003. Do not revive A-006.
+  stop_after has passed; leave
+  briefing_ready. Do not mint a
+  timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -44,4 +42,5 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230: A-019 503 is not a Wait replace. A-006 stays discarded.
+order. Cycle 230: A-019 503 is not a Wait replace. Cycle 231: dying
+5xx does not fail the new Immutable instance. A-006 stays discarded.
