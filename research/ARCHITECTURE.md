@@ -557,6 +557,9 @@ discarded.
 Cycle 158: Workspace `files.export` has empty `size`;
 named-read falls back to `contentStr.length` after download
 (`L25606`). A-006 discarded.
+Cycle 159: Hermes MCP client is ~24 in-process files; OMP
+still v0.85.1. Registry still skips `mcp_tool.py`. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

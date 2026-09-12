@@ -285,6 +285,8 @@ Cycle 157: Search Drive query omits `size` (L24093);
 other faces request it. Product READY unchanged.
 Cycle 158: Workspace exports empty `size`; named-read
 fallback is after download. Product READY unchanged.
+Cycle 159: Hermes MCP client ~24 files; OMP still v0.85.1.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

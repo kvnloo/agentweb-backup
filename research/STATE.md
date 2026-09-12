@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 158
+cycles_completed: 159
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 159
+next_cycle: 160
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 158: Workspace exports have empty size; named-read
-  falls back after download (L25606). Cycle 159: cheapest
-  remaining. Refresh Oh My Pi / Hermes live GitHub versions
-  vs COMPARISON.md 2026-09-11 snapshot (OMP v0.85.1 cycle
-  88). Thesis check, not another KB slice. Do not un-ready
-  Q-001 / Q-014 / Q-003. Do not revive A-006. If stop_after
-  passes, unsubscribe agentweb-research-cycle.
+  Cycle 159: Hermes MCP client is ~24 in-process files;
+  OMP still v0.85.1. Cycle 160: cheapest remaining. Candidate:
+  mcp_tool_server_run.py on live main — still connect-only
+  (cycle 89) or inbound /mcp after v2026.9.11? File-level
+  on the live blob. Do not rewrite HERMES_MCP_OAUTH.md.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
+  If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

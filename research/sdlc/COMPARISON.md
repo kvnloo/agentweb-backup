@@ -1,7 +1,8 @@
 # Code-quality comparison for agentic development
 
-Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **19:17Z** (cycle 30). Hermes
-and OMP via public GitHub; AgentWeb from this clone.
+Snapshot: 2026-09-11T18:45Z, OMP DAG refreshed **19:17Z** (cycle 30);
+Hermes/OMP versions reconfirmed **2026-09-12T00:38Z** (cycle 159:
+OMP still v0.85.1; Hermes `v2026.9.11` + main MCP client ~24 files).
 
 ## Size (what an agent must hold)
 
@@ -396,3 +397,6 @@ reverted. Do not copy that as A-006.
 - Cycle 158: Workspace files.export (L25198) empty size;
   named-read L25606 falls back after download. Metadata
   refuse misses Docs/Sheets/Slides. Not A-006.
+- Cycle 159: live Hermes MCP client ~24 tools/mcp_* files;
+  registry skip mcp_tool.py now L97. OMP still v0.85.1
+  (2026-09-05). In-process split, not a mesh. Not A-006.

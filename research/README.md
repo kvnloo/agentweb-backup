@@ -521,6 +521,11 @@ Named-read L25606 falls back to `contentStr.length` after
 the buffer. Materialize treats missing size as 0 then
 checks `buffer.length`. A metadata refuse misses the
 common KB hit. Bound the helper after export.
+Cycle 159: **Hermes MCP client is ~24 in-process files.**
+Live `NousResearch/hermes-agent` main: `mcp_tool.py` still
+a client; registry skip moved L92→L97. OMP still
+`@earendil-works/pi-ai` v0.85.1. A-007 is that split, not
+A-006.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

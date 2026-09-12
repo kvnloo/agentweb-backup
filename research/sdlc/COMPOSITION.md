@@ -716,6 +716,13 @@ export. Materialize L25781 missing size → 0, then
 change still covers binary files. Workspace needs a
 post-download bound on the helper. Not A-006.
 
+Cycle 159: **Hermes decomposed the MCP client, not a
+server.** Live main: ~24 `mcp_tool_*` / `mcp_oauth_*`
+files. `mcp_tool.py` docstring still says client. Registry
+skip of `mcp_tool.py` is now L97 (cycle 89: L92). OMP
+`v0.85.1` unchanged (2026-09-05). A-007 copies that
+in-process split. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
