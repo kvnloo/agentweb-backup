@@ -156,6 +156,9 @@ not add A-021.
 Cycle 249: fail-closed-before-apply only helps GitHub merges. Sunday
 XFF drift is IdleTimeout class. Do not un-park A-020 for a weekly XFF
 pin. Do not add A-021.
+Cycle 250: a pin-only `schedule:` would be the git-native Sunday XFF
+reassert. Do not add it from A-019. Do not treat Dependabot’s Monday
+`schedule:` as an ALB pin. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

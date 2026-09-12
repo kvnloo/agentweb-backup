@@ -798,3 +798,9 @@ Not A-006.
 Fail-closed-before-apply is GitHub-only. `deploy.yml` has
 zero `schedule:`. Sunday is EB managed actions. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 250 (pin-only schedule: would be git-native Sunday XFF)
+
+Does not exist. Dependabot Monday `schedule:` is not an ALB
+pin. EventBridge/Lambda would be new AWS. Not A-019. Not
+A-006.

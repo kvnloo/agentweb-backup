@@ -810,3 +810,7 @@ reverted. Do not copy that as A-006.
 - Cycle 249: Sunday XFF drift is
   IdleTimeout class. Hermes has no
   weekly EB managed update. Not A-006.
+- Cycle 250: pin-only `schedule:` would
+  be git-native Sunday XFF. Hermes has
+  no Actions cron pinning a balancer.
+  Not A-006.

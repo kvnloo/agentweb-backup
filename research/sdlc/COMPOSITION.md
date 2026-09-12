@@ -1507,6 +1507,11 @@ drift is IdleTimeout class. Zero
 `schedule:` on `deploy.yml`. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 250: **a pin-only `schedule:`
+would be the git-native Sunday XFF
+reassert.** It does not exist. Not
+A-019. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

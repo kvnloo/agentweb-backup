@@ -675,3 +675,7 @@ Cycle 249: fail-closed-before-apply
 only helps GitHub merges. Sunday XFF
 drift is IdleTimeout class. A-006
 stays discarded.
+Cycle 250: a pin-only schedule: would
+be the git-native Sunday XFF reassert.
+Do not add it from A-019. A-006 stays
+discarded.

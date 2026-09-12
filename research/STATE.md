@@ -7,29 +7,33 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 249
+cycles_completed: 250
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 250
+next_cycle: 251
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 249: fail-closed-before-apply
-  only helps GitHub merges. Sunday XFF
-  drift is IdleTimeout class. deploy.yml
-  has zero schedule:. Do not un-park
-  A-020 for a weekly XFF pin. Cycle 250:
-  is a GitHub Actions schedule: cron (pin
-  only, not a full deploy) the only
-  in-tree way to reassert XFF on Sunday
-  without waiting for a merge? Do not
-  add that workflow from A-019. Do not
-  disable InstanceRefreshEnabled. Do not
-  un-park A-020. Do not 503 /health. Do
-  not add A-021. Do not un-ready Q-001 /
-  Q-014 / Q-003. Do not revive A-006.
-  stop_after has passed; leave
-  briefing_ready. Do not mint a timer
-  unless Kevin asks.
+  Cycle 250: a pin-only schedule: workflow
+  would be the git-native Sunday XFF
+  reassert. It does not exist. Dependabot
+  Monday schedule is not an ALB pin.
+  Do not add that workflow from A-019.
+  Cycle 251: a pin-only schedule: would
+  not call update-environment, so the
+  Sun:10:00 Must be Ready collision
+  (deploy.yml L199-204) might not apply.
+  wait_for_environment_ready lives only
+  inside update_environment. Could that
+  job still describe-environment-resources
+  during Updating and pin the surviving
+  ALB? Do not add that workflow from
+  A-019. Do not disable
+  InstanceRefreshEnabled. Do not un-park
+  A-020. Do not 503 /health. Do not add
+  A-021. Do not un-ready Q-001 / Q-014 /
+  Q-003. Do not revive A-006. stop_after
+  has passed; leave briefing_ready. Do
+  not mint a timer unless Kevin asks.
 timer_name: agentweb-research-cycle
 product_queue_frozen: false
 ```
@@ -41,7 +45,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–249: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–250: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -52,5 +56,6 @@ that ARN stays across Immutable and Sunday; that pin is the only
 in-tree reassert without recreate; deploy IAM does not list the grant;
 an XFF no-op still needs LB Describe; after-verify IAM miss is
 GitHub-red / prod-green; a later pin can fail closed before apply;
-that fail-closed slot does not run on Sunday (IdleTimeout class).
-A-006 stays discarded.
+that fail-closed slot does not run on Sunday (IdleTimeout class);
+a pin-only `schedule:` would be the git-native Sunday reassert and
+does not exist (not A-019). A-006 stays discarded.
