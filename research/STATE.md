@@ -7,20 +7,21 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 176
+cycles_completed: 177
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 177
+next_cycle: 178
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 176: meter provider is prefix, not dispatch.
-  gpt-image labelled openai while Azure is the vendor.
-  Cycle 177: cheapest remaining. Candidate: BLOG_SETUP.md
-  L34 still documents OpenAI/Image for a secret cycle 175
-  showed the leaf never fetches on a live path. File-level.
-  A-011 parks field unify — do not add A-021.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
-  A-006. If stop_after passes, unsubscribe
+  Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
+  Blog heroes omit imageModel → Gemini / Google/Image.
+  Cycle 178: cheapest remaining. Candidate: agent-engine
+  default "openai-image-1" (web_agent.py L3240) and
+  FLUX.1-Kontext-pro (L3249) are not in backend
+  SUPPORTED_MODELS. Two deploy units, two dispatch
+  tables. File-level. A-011 parks field unify — do not
+  add A-021. Do not un-ready Q-001 / Q-014 / Q-003.
+  Do not revive A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

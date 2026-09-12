@@ -357,4 +357,8 @@ A-006 stays discarded.
 Cycle 176: meter `provider` ternary L554–558 is prefix
 not dispatch; gpt-image labelled openai. Dollars use
 model id. A-006 stays discarded.
+Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
+Blog heroes omit imageModel → Gemini / Google/Image.
+Agent-engine OpenAI env is a second deploy unit.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

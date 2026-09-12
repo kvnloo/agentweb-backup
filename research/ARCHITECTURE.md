@@ -601,6 +601,11 @@ discarded.
 Cycle 176: meter provider is prefix not dispatch;
 gpt-image labelled openai while Azure is the vendor.
 A-006 discarded.
+Cycle 177: BLOG_SETUP.md is a stale fifth catalog
+(OpenAI/Image + DALL-E 3 + Picsum). Blog heroes omit
+imageModel → Gemini / Google/Image. Agent-engine still
+has OPENAI_IMAGE_API_KEY. A-012 already parks the
+controller import. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

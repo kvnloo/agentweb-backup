@@ -827,6 +827,18 @@ Dollars are `imageGenerationCostUsd(model)`. Video
 `isHiggsfieldModel` (L37 / L1101) is catalog membership.
 Not A-006.
 
+Cycle 177: **`BLOG_SETUP.md` is a stale fifth catalog.**
+L9 / L46–67 still name GPT Image 1 + DALL-E 3 + Picsum
+and `OpenAI/Image`. `generateBlogImage` (`blog.ts`
+L648–655) and the HTTP route (L1431–1438) omit
+`imageModel`, so L492 Gemini 3 fires and `isAvailable()`
+L1541 probes `Google/Image`. Backend grep of Picsum /
+DALL-E / `OPENAI_IMAGE_API_KEY` / `blog-images/` is
+empty. Fallback log L1559 still says OpenAI. Agent-engine
+`web_agent.py` L3296–3299 is a **live** OpenAI else on
+the GCP worker (`secrets_manager.py` L199–200). A-012
+already parks lifting the controller import. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

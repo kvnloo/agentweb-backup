@@ -324,6 +324,10 @@ Cycle 175: generateWithOpenAI else unreachable after
 SUPPORTED_MODELS includes(). Product READY unchanged.
 Cycle 176: meter provider is prefix not dispatch;
 gpt-image labelled openai. Product READY unchanged.
+Cycle 177: BLOG_SETUP.md is a stale fifth catalog.
+Blog heroes omit imageModel → Gemini / Google/Image.
+Agent-engine still has OPENAI_IMAGE_API_KEY. Product
+READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

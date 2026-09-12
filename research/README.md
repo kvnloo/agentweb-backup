@@ -602,6 +602,15 @@ runway by accident; `gpt-image-*` is Azure and labelled
 **openai**. Dollars use `costUsdOverride(model)`. Video
 uses `isHiggsfieldModel` from the same catalog as
 dispatch.
+Cycle 177: **`BLOG_SETUP.md` is a stale fifth catalog.**
+L9 / L46–67 still name GPT Image 1 + DALL-E 3 + Picsum
+and `OpenAI/Image`. `generateBlogImage` omits
+`imageModel` (`blog.ts` L648–655) so L492 Gemini 3
+fires; `isAvailable()` probes `Google/Image`. Backend
+grep of Picsum / DALL-E / `OPENAI_IMAGE_API_KEY` is
+empty. Agent-engine still has a live OpenAI env
+(`web_agent.py` L3299). A-012 already parks the controller
+import.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

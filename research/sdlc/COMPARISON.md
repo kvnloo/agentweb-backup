@@ -462,3 +462,9 @@ reverted. Do not copy that as A-006.
   dispatch. gemini_2.5_flash meters runway by underscore;
   gpt-image is Azure labelled openai. Video uses
   isHiggsfieldModel. Not A-006.
+- Cycle 177: BLOG_SETUP.md L9 / L46–67 / L34 is a stale
+  fifth catalog (GPT Image 1 + DALL-E 3 + Picsum +
+  OpenAI/Image). generateBlogImage omits imageModel
+  (blog.ts L648) so L492 Gemini 3 / Google/Image fires.
+  Agent-engine web_agent.py L3299 still has a live
+  OPENAI_IMAGE_API_KEY. Not A-006.
