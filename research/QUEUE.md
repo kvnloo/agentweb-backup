@@ -396,4 +396,8 @@ Cycle 188: three S3 URL writers. Helpers return
 Location; brand/db/tasks construct regional
 virtual-hosted; Remotion is path-style. A-006 stays
 discarded.
+Cycle 189: Family B is not one function. books
+encodes; brand interpolates raw originalname.
+extractS3KeyFromUrl does not decode. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

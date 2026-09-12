@@ -938,6 +938,15 @@ Zero `s3ForcePathStyle`. CORS L224 allowlists Family
 B’s host only. Image persist is Family A
 (`imageGeneration.ts` L582–593). Not A-006.
 
+Cycle 189: **Family B is not one function.** Books
+L43–47 / L1810–1814 encode each segment; brand
+L47–62 interpolates `originalname` into both Key
+and URL. Helpers sanitize first (`s3Utils.ts`
+L248–265; test L91). `deriveOwnBucketKey` L97
+decodes; `extractS3KeyFromUrl` L27 does not —
+`filesController.ts` L36 HEADs the encoded string.
+No books test pins `encodedKey`. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

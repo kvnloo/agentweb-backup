@@ -640,6 +640,10 @@ Cycle 188: three S3 URL writers. Helpers return
 Location (tests mock path-style). Brand/db/tasks
 construct regional virtual-hosted. Remotion is
 path-style. A-006 discarded.
+Cycle 189: Family B is not one function. books
+encodes; brand interpolates raw originalname.
+extractS3KeyFromUrl does not decode. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

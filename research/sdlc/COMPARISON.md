@@ -530,3 +530,9 @@ reverted. Do not copy that as A-006.
   L204 is path-style s3.${region}/bucket. Zero
   s3ForcePathStyle. Hermes one persist, one URL shape.
   Not A-006.
+- Cycle 189: Family B is not one function. books.ts
+  L43-47 encodeURIComponent per segment (again L1810).
+  Brand L47-62 interpolates originalname raw.
+  extractS3KeyFromUrl L27 does not decode;
+  deriveOwnBucketKey L97 does. Hermes one encoding.
+  Not A-006.

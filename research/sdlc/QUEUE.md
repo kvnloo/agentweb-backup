@@ -359,6 +359,9 @@ Product READY unchanged.
 Cycle 188: three S3 URL writers (Location vs
 constructed regional vs Remotion path-style).
 Product READY unchanged.
+Cycle 189: Family B encodes in books.ts, raw
+originalname in brand/db/tasks. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
