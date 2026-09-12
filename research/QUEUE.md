@@ -425,4 +425,6 @@ Q-016 stays parked. A-006 stays discarded.
 Cycle 197: character referenceImageUrl is Path D
 on Seedance default. Q-016 stays parked.
 A-006 stays discarded.
+Cycle 198: brand-guide matcher misses Family A
+path-style. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

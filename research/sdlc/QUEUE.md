@@ -387,6 +387,9 @@ Q-016 parked. Product READY unchanged.
 Cycle 197: character referenceImageUrl is Path D
 on Seedance default (generate_image URL as startFrame).
 Q-016 parked. Product READY unchanged.
+Cycle 198: brand-guide matcher misses Family A
+path-style; delete already parses it.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

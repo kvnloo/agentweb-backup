@@ -594,3 +594,9 @@ reverted. Do not copy that as A-006.
   media_import_url L827 vendor-fetches. Execute
   L5451 hardcodes empty key. Tests pin example.com.
   Hermes one persist, pass bytes. Not A-006.
+- Cycle 198: brand-guide matcher L15132
+  includes('.s3.') misses Family A path-style
+  (s3Utils.test.ts L53). REST brand.ts L60-62 is
+  Family B so it hits. deriveOwnBucketKey L109
+  already parses path-style. Hermes one decoder.
+  Not A-006.

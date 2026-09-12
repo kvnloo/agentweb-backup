@@ -1023,6 +1023,14 @@ fetches. Execute L5451 `referenceImageKey: ''`. REST
 upload L51 stores the key. MCP grep empty. Tests pin
 `example.com`. Q-016 parked. Not A-006.
 
+Cycle 198: **Brand-guide matcher misses Family A.**
+L15132 `includes('.s3.')` is Family B only.
+`s3.amazonaws.com` Location (test L53) stamps
+`filename: 'url'`. REST file upload L60–62 is Family
+B so it hits. `deriveOwnBucketKey` L109 already
+parses path-style. Occupied `agentModeService.ts`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

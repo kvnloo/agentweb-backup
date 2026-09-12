@@ -7,18 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 197
+cycles_completed: 198
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 198
+next_cycle: 199
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 197: character referenceImageUrl is Path D
-  on Seedance default (generate_image URL as startFrame).
-  Cycle 198: cheapest remaining. Candidate:
-  brand-guide matcher L15132 includes('.s3.') —
-  Family A path-style s3.amazonaws.com misses it.
-  File-level. Occupied agentModeService.ts pile.
+  Cycle 198: brand-guide matcher includes('.s3.')
+  misses Family A path-style; delete already
+  parses it (deriveOwnBucketKey). Occupied
+  agentModeService.ts pile.
+  Cycle 199: cheapest remaining. Candidate:
+  downloadBrandLogoToS3 URL shape vs Family A/B
+  (logos skip the matcher). File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,

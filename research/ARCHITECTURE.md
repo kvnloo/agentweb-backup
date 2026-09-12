@@ -678,6 +678,10 @@ Cycle 197: character referenceImageUrl is Path D on
 the Seedance default. Emma create_character stores the
 generate_image S3 URL; media_import_url vendor-fetches
 it. Q-016 parked. A-006 discarded.
+Cycle 198: brand-guide matcher includes('.s3.') misses
+Family A path-style Location. REST file upload is Family
+B so it hits. Delete already parses path-style.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

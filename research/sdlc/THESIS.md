@@ -393,6 +393,9 @@ Do not add A-021.
 Cycle 197: character referenceImageUrl is Path D
 on the Seedance default. Emma create_character
 hardcodes empty key. Do not add A-021.
+Cycle 198: brand-guide matcher includes('.s3.')
+misses Family A path-style. deriveOwnBucketKey
+already parses it. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
