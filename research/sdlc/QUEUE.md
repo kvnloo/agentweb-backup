@@ -353,6 +353,9 @@ Cycle 185: helpers omit CacheControl. README 60s is
 CLI copy-object. Product READY unchanged.
 Cycle 186: serveAsset hardcodes max-age=300. Email
 rewrite hops here. Product READY unchanged.
+Cycle 187: rewrite matches one S3 host; /asset/
+accepts three. Brand already has the matcher.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

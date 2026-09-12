@@ -7,19 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 186
+cycles_completed: 187
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 187
+next_cycle: 188
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 186: serveAsset hardcodes max-age=300. Email
-  rewrite hops here; thumbs use raw S3 URL. Tests
-  never import serveAsset.
-  Cycle 187: cheapest remaining. Candidate:
-  rewriteS3ImageUrls matches only regional
-  agentweb-user-files host; decodeAssetHash accepts
-  non-regional + execution-gifs. File-level.
+  Cycle 187: rewriteS3ImageUrls includes() one
+  regional host; decodeAssetHash accepts region-less
+  + execution-gifs. Brand already extracted a bucket
+  matcher for delete (brand.ts L84).
+  Cycle 188: cheapest remaining. Candidate: helpers
+  return SDK Location; brand L60 constructs
+  regional virtual-hosted URL. Two writers, two
+  spellings. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

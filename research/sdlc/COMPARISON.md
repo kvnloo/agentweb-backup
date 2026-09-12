@@ -516,3 +516,9 @@ reverted. Do not copy that as A-006.
   (drip L187, sequences.ts L353). WorkPlans.tsx L824 uses
   raw thumbnail_url. Tests never import serveAsset.
   Not A-006.
+- Cycle 187: rewrite S3_BUCKET_HOST L178 is one regional
+  hostname. decodeAssetHash accepts region-less +
+  execution-gifs (assetController.test.ts L10/L20/L30).
+  Brand deriveOwnBucketKey (L84) already matches bucket
+  not hostname spelling. Rewrite tests only use L178.
+  Not A-006.

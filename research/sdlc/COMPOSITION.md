@@ -917,6 +917,14 @@ URL (`WorkPlans.tsx` L824). `filesController` stream
 sets no Cache-Control. Tests never import `serveAsset`.
 Not A-006.
 
+Cycle 187: **Rewrite matches one S3 host; `/asset/`
+accepts three.** `S3_BUCKET_HOST` L178 vs
+`extractS3KeyFromUrl` + `ALLOWED_BUCKETS` (user-files
++ execution-gifs). Brand L71–80 already documents the
+hardcoded-prefix lie and L84 matches on bucket.
+Rewrite tests never use the region-less URL L10
+pins. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -652,6 +652,11 @@ Cycle 186: **`serveAsset` hardcodes `max-age=300`.**
 HEAD then overwrites. Email rewrite hops here; work-plan
 thumbs use the raw S3 URL. Tests never import
 `serveAsset`.
+Cycle 187: **Email rewrite matches one S3 host;
+`/asset/` accepts three.** `includes()` of
+`s3.us-west-2` only. Brand delete already extracted a
+bucket matcher (`brand.ts` L84). Rewrite tests never
+use the region-less URL `/asset/` tests pin.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

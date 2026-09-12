@@ -389,4 +389,7 @@ stays discarded.
 Cycle 186: serveAsset hardcodes max-age=300. Email
 rewrite hops here; thumbs use raw S3 URL. A-006 stays
 discarded.
+Cycle 187: rewrite matches one S3 host; /asset/
+accepts three. Brand already extracted a bucket
+matcher. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
