@@ -416,4 +416,7 @@ A-006 stays discarded.
 Cycle 194: leaf processInputImage is Path C.
 Gemini has no data: skip. Do not un-ready Q-014.
 A-006 stays discarded.
+Cycle 195: video processInputImage is Path C
+(no UA, no SVG). Seedance default never calls it.
+Q-016 stays parked. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

@@ -997,6 +997,15 @@ L707 / `classifyBrandLogoUrl` L478. Tests mock
 axios for `example.com`; Runway pins data URL.
 Q-014 listing still ready. Not A-006.
 
+Cycle 195: **Video `processInputImage` is a second
+Path C.** L236–253: 30s axios, no UA, no SVG, MIME
+header or `image/png`. Only Veo start/end (L393 /
+L418). Default `seedance-2.0` (L46) is Higgsfield
+`media_import_url` (L827–838) — vendor fetches.
+Fallback L994–1000 re-enters `generateVideo` with
+the same frames. Tests pin Higgsfield import;
+spy Veo on fallback. Q-016 parked. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -575,3 +575,10 @@ reverted. Do not copy that as A-006.
   because that GET throws. Tests mock axios for
   example.com; grep processInputImage empty.
   Hermes one fetch. Not A-006.
+- Cycle 195: video processInputImage L236 is a
+  second Path C (30s, no UA, no SVG, MIME header
+  or image/png). Only Veo L393/L418. Default
+  seedance-2.0 is media_import_url (L827). Fallback
+  L1000 re-enters with the same startFrame. Tests
+  spy generateWithVeo31; grep processInputImage
+  empty. Hermes one fetch. Not A-006.

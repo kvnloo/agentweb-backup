@@ -377,6 +377,10 @@ only for C2PA. Product READY unchanged.
 Cycle 194: leaf processInputImage is Path C.
 Gemini no data: skip; logo+Gemini 3 default hits
 it. Do not un-ready Q-014. Product READY unchanged.
+Cycle 195: video processInputImage is Path C
+(L236). Seedance default is media_import_url;
+Veo fallback Path-C GETs the same startFrame.
+Q-016 parked. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

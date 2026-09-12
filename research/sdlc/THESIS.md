@@ -383,6 +383,10 @@ Do not add A-021.
 Cycle 194: leaf processInputImage is Path C.
 Gemini has no data: skip. Do not un-ready Q-014.
 Do not add A-021.
+Cycle 195: video processInputImage is a second
+Path C (no UA, no SVG). Seedance default uses
+Higgsfield media_import_url. Q-016 parked.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

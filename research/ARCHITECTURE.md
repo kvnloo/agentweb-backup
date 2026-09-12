@@ -665,6 +665,11 @@ Cycle 194: leaf processInputImage is Path C (L816).
 Gemini has no data: skip; Runway L1371 does.
 logoImage push + Gemini 3 default hit it. ENG-792
 preflights because that GET throws. A-006 discarded.
+Cycle 195: video processInputImage is a second Path C
+(L236: 30s, no UA, no SVG). Only Veo start/end.
+Seedance default is media_import_url. Fallback
+re-enters with the same frames. Q-016 parked.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
