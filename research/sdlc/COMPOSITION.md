@@ -1588,6 +1588,10 @@ Cycle 265: **delay first, then XFF.**
 XFF-first would skip ENG-823. Not A-019.
 Not A-020. Not A-006.
 
+Cycle 266: **XFF rediscovers after its own
+skip.** Do not share from `main()`. Not
+A-019. Not A-020. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

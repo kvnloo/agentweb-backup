@@ -775,6 +775,9 @@ READY unchanged.
    cannot-fail.
    Cycle 265: delay first in `main()`. Do
    **not** reorder delay behind XFF.
+   Cycle 266: XFF rediscovers after its own
+   skip. Do **not** share LB discovery from
+   `main()`.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

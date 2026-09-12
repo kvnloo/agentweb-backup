@@ -192,6 +192,8 @@ Cycle 264: call XFF from `main()` next to delay.
 Do not copy dryrun cannot-fail. Do not add A-021.
 Cycle 265: delay first in `main()`. Do not reorder
 delay behind XFF. Do not add A-021.
+Cycle 266: XFF rediscovers after its own skip.
+Do not share from `main()`. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

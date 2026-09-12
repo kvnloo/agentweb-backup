@@ -859,3 +859,6 @@ reverted. Do not copy that as A-006.
   after-success fork. Not A-006.
 - Cycle 265: delay first, then XFF. Hermes
   has no two-pin call-order fork. Not A-006.
+- Cycle 266: XFF rediscovers after skip.
+  Hermes has no duplicated-Describe vs
+  shared-helper fork. Not A-006.

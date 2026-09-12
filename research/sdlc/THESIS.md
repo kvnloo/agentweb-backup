@@ -889,3 +889,9 @@ Not A-020. Not A-006.
 
 `fail()` is `exit 1`. XFF-first would skip ENG-823.
 Not A-019. Not A-020. Not A-006.
+
+## Cycle 266 (rediscover after skip)
+
+Do not share LB discovery from `main()`. Probe vs
+delay already disagree fail vs UNKNOWN. Not A-019.
+Not A-020. Not A-006.

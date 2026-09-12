@@ -7,21 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 265
+cycles_completed: 266
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 266
+next_cycle: 267
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 265: delay first in main(); do not
-  reorder delay behind XFF. Cycle 266: delay
-  already rediscovers LoadBalancers[*];
-  health probe does too and does not share
-  a helper. Should a later XFF sibling
-  rediscover after its own skip, rather than
-  a shared discovery from main() before both
-  pins? Do not share from main() (would run
-  on partner when both unset). Do not add
+  Cycle 266: XFF rediscovers LoadBalancers[*]
+  after its own skip; do not share from
+  main(). Cycle 267: delay empty-ARN fail()
+  names DeregistrationDelay (L811). Probe
+  empty-ARN is UNKNOWN. Should XFF's empty-ARN
+  fail() use its own string, not copy L811 or
+  probe UNKNOWN? Do not copy L811. Do not add
   that pin from A-019. Do not un-park A-020.
   Do not 503 /health. Do not add A-021. Do
   not un-ready Q-001 / Q-014 / Q-003. Do not
@@ -39,7 +37,7 @@ Do not set `coding_unlocked` unless Kevin asks to code.
 Do not un-ready Q-001 / Q-014 / Q-003 without a falsifying citation.
 Kevin asked 2026-09-12 to reprioritize — ranks may change; ready status
 of those three does not. Cycle 228–229: Linear dump did not invert
-order. Cycle 230–265: A-019 503 is color; dying 5xx does not fail new
+order. Cycle 230–266: A-019 503 is color; dying 5xx does not fail new
 Immutable; Sunday is Immutable; missing Wait still disableCron; Hermes
 sees 503 while `/health` is 200; that 503 is a one-shot; 503 does not
 poison `sessionId`; JSON 503 is enough for `send()`; this tree cannot
@@ -68,4 +66,6 @@ defaults. Do not piggyback XFF on the delay opt-in.
 Do not stuff XFF into `ensure_deregistration_delay`.
 Call XFF from `main()` next to delay; do not copy
 dryrun cannot-fail. Delay first; do not reorder delay
-behind XFF. A-006 stays discarded.
+behind XFF. XFF rediscovers after its own skip;
+do not share LB discovery from `main()`.
+A-006 stays discarded.

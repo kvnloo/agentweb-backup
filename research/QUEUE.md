@@ -725,3 +725,6 @@ A-006 stays discarded.
 Cycle 265: delay first in main(). Do not
 reorder delay behind XFF. A-006 stays
 discarded.
+Cycle 266: XFF rediscovers after its own
+skip. Do not share from main(). A-006 stays
+discarded.
