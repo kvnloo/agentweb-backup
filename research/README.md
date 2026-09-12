@@ -648,6 +648,10 @@ Cycle 185: **Helpers omit `CacheControl`.** HTML-form
 save (`filesController` L379) is the README’s subject
 and still omits it. README L1537’s `max-age=60` is a
 CLI `copy-object`. Thumbnail L35 is immutable 1y.
+Cycle 186: **`serveAsset` hardcodes `max-age=300`.**
+HEAD then overwrites. Email rewrite hops here; work-plan
+thumbs use the raw S3 URL. Tests never import
+`serveAsset`.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

@@ -908,6 +908,15 @@ assume origin `max-age=60`. Thumbnail L35 is the
 only S3 `CacheControl`. `serveAsset` L124 hardcodes
 300s on HTTP. Glob `**/*cloudfront*` empty. Not A-006.
 
+Cycle 186: **`serveAsset` hardcodes `max-age=300`.**
+HEAD L117 then L124 overwrite. Email
+`rewriteS3ImageUrls` (L187) is the live hop
+(`dripSequenceWorker.ts` L187, `sequences.ts` L353).
+`app.ts` L506 is public. Work-plan thumbs use raw S3
+URL (`WorkPlans.tsx` L824). `filesController` stream
+sets no Cache-Control. Tests never import `serveAsset`.
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

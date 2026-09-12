@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 185
+cycles_completed: 186
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 186
+next_cycle: 187
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 185: helpers omit CacheControl. HTML-form save
-  is README's subject and still omits it. Thumbnail
-  L35 is immutable 1y. README 60s is CLI copy-object.
-  Cycle 186: cheapest remaining. Candidate: serveAsset
-  L124 always max-age=300, never forwards
-  headResult.CacheControl. filesController stream same.
-  Reader-side of 185. File-level.
+  Cycle 186: serveAsset hardcodes max-age=300. Email
+  rewrite hops here; thumbs use raw S3 URL. Tests
+  never import serveAsset.
+  Cycle 187: cheapest remaining. Candidate:
+  rewriteS3ImageUrls matches only regional
+  agentweb-user-files host; decodeAssetHash accepts
+  non-regional + execution-gifs. File-level.
   A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe

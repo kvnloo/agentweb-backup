@@ -351,6 +351,8 @@ Cycle 184: uploaded-by is write-only. HEAD is for
 ContentType. No Tagging. Product READY unchanged.
 Cycle 185: helpers omit CacheControl. README 60s is
 CLI copy-object. Product READY unchanged.
+Cycle 186: serveAsset hardcodes max-age=300. Email
+rewrite hops here. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

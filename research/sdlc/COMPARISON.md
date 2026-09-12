@@ -510,3 +510,9 @@ reverted. Do not copy that as A-006.
   (L1553). Thumbnail L35 is the only PutObject
   CacheControl (immutable 1y). CloudFront function is a
   README snippet; glob **/*cloudfront* empty. Not A-006.
+- Cycle 186: serveAsset L124 hardcodes max-age=300 after
+  HEAD L117. headResult.CacheControl never read. Email
+  rewriteS3ImageUrls (emailVariables.ts L187) hops here
+  (drip L187, sequences.ts L353). WorkPlans.tsx L824 uses
+  raw thumbnail_url. Tests never import serveAsset.
+  Not A-006.

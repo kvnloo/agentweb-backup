@@ -353,6 +353,8 @@ A-021.
 Cycle 185: helpers omit CacheControl. README 60s is
 CLI copy-object. Thumbnail L35 is immutable 1y. Do
 not add A-021.
+Cycle 186: serveAsset hardcodes max-age=300. Email
+rewrite hops here. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

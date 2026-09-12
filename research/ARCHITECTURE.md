@@ -631,6 +631,8 @@ ContentType. No Tagging. A-006 discarded.
 Cycle 185: helpers omit CacheControl. README 60s is
 CLI copy-object. Thumbnail is immutable 1y. A-006
 discarded.
+Cycle 186: serveAsset hardcodes max-age=300. Email
+rewrite hops here. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

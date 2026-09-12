@@ -386,4 +386,7 @@ discarded.
 Cycle 185: helpers omit CacheControl. README 60s is
 CLI copy-object. Thumbnail L35 is immutable 1y. A-006
 stays discarded.
+Cycle 186: serveAsset hardcodes max-age=300. Email
+rewrite hops here; thumbs use raw S3 URL. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.
