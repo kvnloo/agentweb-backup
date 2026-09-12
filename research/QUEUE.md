@@ -326,4 +326,13 @@ A-006 stays discarded.
 Cycle 165: `logo_image` is `inputImages.push` before the
 model switch. Catalog text vs leaf mutation. A-006
 stays discarded.
+Cycle 166: Four image-model catalogs; `IMAGE_API_MODELS`
+comment “must match SUPPORTED_MODELS” is false. A-006
+stays discarded.
+Cycle 167: HITL runs before leaf `Invalid imageModel`.
+MCP free-string can waste a confirm. A-006 stays
+discarded.
+Cycle 168: Runway honors mutated `inputImages` as
+`referenceImages`; admin omitting Runway is not a gate.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

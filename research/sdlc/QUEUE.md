@@ -300,6 +300,12 @@ Cycle 164: generateImage does not refuse input_images
 on Emma’s t2i-described model. Product READY unchanged.
 Cycle 165: logo_image is mutated into inputImages before
 model routing. Product READY unchanged.
+Cycle 166: Four image-model catalogs; IMAGE_API_MODELS
+does not match SUPPORTED_MODELS. Product READY unchanged.
+Cycle 167: HITL before leaf Invalid imageModel. Product
+READY unchanged.
+Cycle 168: Runway honors mutated inputImages as
+referenceImages. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

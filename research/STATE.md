@@ -7,20 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 165
+cycles_completed: 168
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 166
+next_cycle: 169
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 165: logo_image is pushed onto inputImages before
-  model routing. Cycle 166: cheapest remaining. Candidate:
-  MCP image_model is an untyped string (apiTools.ts L2090);
-  Emma has an enum (L5036); leaf SUPPORTED_MODELS L16–28
-  includes a preview alias Emma does not. Three model
-  catalogs, one leaf. A-011 parks field unify — do not
-  add A-021. Do not un-ready Q-001 / Q-014 / Q-003. Do
-  not revive A-006. If stop_after passes, unsubscribe
+  Cycle 168: Runway sends mutated inputImages as
+  referenceImages. Cycle 169: cheapest remaining.
+  Candidate: generateWithAzureAI /images/edits L651 uses
+  inputImages[0] only — extras + logo-after-edit drop?
+  File-level. A-011 parks field unify — do not add A-021.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
+  A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true

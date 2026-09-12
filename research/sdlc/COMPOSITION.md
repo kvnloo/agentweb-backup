@@ -764,6 +764,21 @@ before routing** (L477–485). HITL L28893 keys off caller
 `/images/edits`. CRITICAL LOGO stays in this leaf. Not
 A-006.
 
+Cycle 166: **Four image-model catalogs.** MCP L2090 free
+string; Emma L5036 seven ids; leaf L16–28 eight; admin
+L2206 six (no Runway). Comment L2203 “must match” is
+false. Partner-portal L8563 is a second copy of the
+shorter list. Hermes `FAL_MODELS` is one. Not A-006.
+
+Cycle 167: **HITL before catalog refuse.** L28893 then
+L28991 then L502. MCP can confirm then `Invalid
+imageModel`. Not A-006.
+
+Cycle 168: **Runway `referenceImages`.** L1363–1390 after
+the mutate. `textToImage.create` L1394. Admin omitting
+Runway does not stop Emma/MCP from naming it. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

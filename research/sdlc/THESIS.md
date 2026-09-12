@@ -305,6 +305,12 @@ Cycle 164: generateImage does not refuse input_images
 on Emma’s t2i-described model. Do not add A-021.
 Cycle 165: logo_image is mutated into inputImages before
 routing. Do not add A-021.
+Cycle 166: Four image-model catalogs; L2203 must-match
+is false. Do not add A-021.
+Cycle 167: HITL before Invalid imageModel. Do not add
+A-021.
+Cycle 168: Runway referenceImages from the mutated array.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

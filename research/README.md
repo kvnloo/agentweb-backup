@@ -553,6 +553,17 @@ Cycle 165: **`logo_image` becomes `inputImages` before
 routing.** Leaf L477–485, then `hasInputImages` L488.
 Logo-only skips HITL (L28893 keys off caller images) and
 still takes `/images/edits`. Catalog vs mutation.
+Cycle 166: **Four image-model catalogs, one leaf.** MCP
+free string; Emma enum (7, Runway, no preview);
+`SUPPORTED_MODELS` (8); `IMAGE_API_MODELS` (6, no
+Runway). L2203 “must match” is false. Hermes has one
+`FAL_MODELS`.
+Cycle 167: **HITL before `Invalid imageModel`.** Order
+is category → confirm → leaf includes(). MCP can waste
+a confirm on a typo.
+Cycle 168: **Runway does not drop the mutation.** L1363
+`referenceImages` from `params.inputImages`. Admin
+omitting Runway is a default-picker subset, not a gate.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

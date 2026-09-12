@@ -426,3 +426,13 @@ reverted. Do not copy that as A-006.
   model switch (L477–485). Emma “no logo compositing”
   is catalog text; the leaf mutates. Hermes has no logo
   field and fail-closes. Not A-006.
+- Cycle 166: Four catalogs (MCP free string, Emma enum,
+  SUPPORTED_MODELS, IMAGE_API_MODELS). L2203 “must match”
+  is false. Hermes FAL_MODELS is one catalog the tests
+  pin. Not A-006.
+- Cycle 167: HITL L28893 before leaf Invalid imageModel
+  L502. MCP free-string + input_images wastes a confirm.
+  Hermes model is out-of-band hermes tools. Not A-006.
+- Cycle 168: Runway L1363 referenceImages from the mutated
+  array; still textToImage.create. Admin no-Runway is
+  not a capability gate. Not A-006.

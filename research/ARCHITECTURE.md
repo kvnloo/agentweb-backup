@@ -576,6 +576,12 @@ t2i-only; the leaf still takes the edit branch.
 discarded.
 Cycle 165: `logo_image` is mutated into `inputImages`
 before model routing. A-006 discarded.
+Cycle 166: Four image-model catalogs; L2203 “must match”
+is false. A-006 discarded.
+Cycle 167: HITL before leaf Invalid imageModel. A-006
+discarded.
+Cycle 168: Runway `referenceImages` from the mutated
+array. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.
