@@ -278,7 +278,11 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     // whether the LLM actually reproduced the escaped form rather than "cleaning up"
     // what looked like a stray HTML entity. This simulates exactly that failure: the
     // model is asked to escape but the mocked response leaks the raw value anyway.
-    it('should fail closed if the LLM reproduces a raw, unescaped value in its output', async () => {
+    // Auto-CORRECTS rather than rejecting outright — this function is shared by ~35
+    // other real templates never tested against this change, and a reject-on-detect
+    // design would turn any of their models' occasional imperfect escaping into a
+    // customer-visible outage unrelated to security. See round-3 review discussion.
+    it('should auto-correct a raw, unescaped value the LLM reproduced in its output', async () => {
       const maliciousTitle = '<script>alert(1)</script>';
 
       (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
@@ -303,14 +307,18 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
         'session123'
       );
 
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<script>alert(1)</script>');
+      expect(uploadedHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     });
 
     // Round-3 review finding: an exact, case-sensitive match let a model evade the
     // output-verification check via trivial reformatting — `<SCRIPT>` is just as
     // browser-executable as `<script>`, so a case-sensitive check missing it entirely
-    // would defeat the fail-closed guarantee for zero real difficulty on the model's part.
-    it('should fail closed even if the LLM reproduces the raw value with different casing', async () => {
+    // would defeat the correction for zero real difficulty on the model's part.
+    it('should auto-correct even if the LLM reproduces the raw value with different casing', async () => {
       const maliciousTitle = '<script>alert(1)</script>';
 
       (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
@@ -333,7 +341,11 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
         'session123'
       );
 
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml.toLowerCase()).not.toContain('<script>alert(1)</script>');
+      expect(uploadedHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     });
 
     // Round-3 review finding: including '/&/" in the output-verification check made an
