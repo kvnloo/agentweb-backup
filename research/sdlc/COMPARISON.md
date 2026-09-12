@@ -758,3 +758,7 @@ reverted. Do not copy that as A-006.
   the ALB target so Node can 503.
   Hermes exit *is* health fail.
   Not A-006.
+- Cycle 235: no in-repo Hermes
+  client retries POST `/mcp` 503.
+  One-shot; later user retry can
+  rehydrate. Not A-006.

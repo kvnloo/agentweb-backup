@@ -621,3 +621,7 @@ Cycle 234: Hermes can see A-019 503
 while /health is 200. Nginx 502 is
 after server.close. 600s starts at
 deregister. A-006 stays discarded.
+Cycle 235: POST /mcp 503 is a one-shot
+in this tree. Q-001 fixture asserts
+200. Do not add a 503 retry in A-019.
+A-006 stays discarded.

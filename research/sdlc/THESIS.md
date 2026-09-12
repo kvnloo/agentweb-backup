@@ -696,3 +696,11 @@ Always-200 `/health` (`app.ts` L547–553) keeps the ALB target
 through `disableCron`. Nginx 502 is after `server.close`.
 DeregistrationDelay 600s starts at deregister; ENG-764 3m19s
 is the Sunday-without-hook clock. Not A-006.
+
+## Cycle 235 (A-019 503 is a one-shot in this tree)
+
+Q-001 fixture asserts HTTP 200. Vendored `send()` throws
+`StreamableHTTPError` on `!ok`; only 401 recurses.
+`mcpClientService` retries `playwright_` / `browser_` only.
+mcpFetch does not retry POST. The 5s poll is
+`/run-scheduled-chats`, not `/mcp`. Not A-006.

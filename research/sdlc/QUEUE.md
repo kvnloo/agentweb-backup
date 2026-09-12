@@ -664,6 +664,9 @@ READY unchanged.
    503 while `/health` is 200. Do
    **not** 503 `/health`. Do **not**
    treat 600s as the no-Wait clock.
+   Cycle 235: POST `/mcp` 503 is a
+   one-shot in this tree. Do **not**
+   add a 503 retry in A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

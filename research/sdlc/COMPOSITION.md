@@ -1422,6 +1422,11 @@ DeregistrationDelay starts at
 deregister. Do not 503 `/health`.
 Not A-006.
 
+Cycle 235: **A-019 POST `/mcp` 503 is
+a one-shot in this tree.** Q-001
+fixture asserts 200. SDK `send()`
+throws; only 401 recurses. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
