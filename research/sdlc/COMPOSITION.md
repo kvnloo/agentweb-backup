@@ -1156,6 +1156,19 @@ without a `runDrain` call the closer never
 runs. Do not `sessionStore.delete` (cycle
 94). Not A-006.
 
+Cycle 214: **GET cleanup is
+`streamController.close()`.** Vendored
+`close()` (`webStandardStreamableHttp.js`
+L604–613) is sync `forEach(cleanup)`.
+Hono `flow({done})` then `writable.end()`
+(`@hono/node-server` `index.mjs` L287–288).
+`close()` does not await that end; Node
+`server.close` still waits for the
+connection. Do not await `server.close`
+for the hang. Local never
+`enableJsonResponse` (only rehydrate L90).
+Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

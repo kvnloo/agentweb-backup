@@ -691,3 +691,8 @@ reverted. Do not copy that as A-006.
   SSE). Hermes is still the MCP client;
   inbound Streamable HTTP drain is
   in-process. Not A-006.
+- Cycle 214: GET closer is SDK
+  `streamController.close()` then Hono
+  `writable.end()`. Do not await
+  `server.close` as the hang fix. Local
+  never `enableJsonResponse`. Not A-006.

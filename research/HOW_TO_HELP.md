@@ -68,6 +68,9 @@ SIGTERM in `mcpServer.ts` (cycle 213: ASG never fires it;
 Sunday SIGTERM runs it first and aborts the shared transport).
 Do not return CallTool `isError` for drain (HTTP 200 tool-failure).
 Do not refuse inside `track()` (the promise is already running).
-Do not make `tryClaim` return false (that 409s). That is the
-billed-image drain gate. Not A-007 packaging. Not persist
-(occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).
+Do not make `tryClaim` return false (that 409s). `mcpShutdown`
+triggers GET `streamController.close()`; Hono then
+`writable.end()`s — do not await `server.close` for that hang
+(cycle 214). That is the billed-image drain gate. Not A-007
+packaging. Not persist (occupied `agentModeService.ts` /
+`app.ts` / `emma/tools.ts`).

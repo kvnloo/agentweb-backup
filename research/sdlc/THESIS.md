@@ -465,6 +465,11 @@ four-way wait; drop sibling SIGTERM
 transport: POST CallTool and GET SSE.
 ASG drain never fires the closer; Sunday
 SIGTERM runs it first. Do not add A-021.
+Cycle 214: GET cleanup is
+`streamController.close()`; Hono
+`writable.end()`. Do not await
+`server.close` for the hang. Local never
+`enableJsonResponse`. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

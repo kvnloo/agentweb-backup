@@ -482,3 +482,8 @@ SIGTERM (`mcpServer.ts` L269–270). ASG
 never fires it; Sunday SIGTERM aborts the
 shared transport first. A-006 stays
 discarded.
+Cycle 214: GET closer is SDK
+`streamController.close()` then Hono
+`writable.end()`. Do not await
+`server.close` for the hang. A-006 stays
+discarded.

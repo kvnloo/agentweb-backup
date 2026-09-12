@@ -451,6 +451,12 @@ four-way wait; drop sibling SIGTERM
 fires it; Sunday SIGTERM runs it first and
 aborts the shared transport. Product READY
 unchanged.
+Cycle 214: GET cleanup is
+`streamController.close()`; Hono
+`flow({done})` `writable.end()`. Do not
+await `server.close` for the hang. Local
+never `enableJsonResponse`. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -475,7 +481,10 @@ unchanged.
    After the four-way wait: `await (app as any).mcpShutdown?.()`
    then `server.close`. **Remove** `mcpServer.ts` L269–270
    (Sunday SIGTERM currently closes the shared transport first;
-   ASG never fires that listener). Do **not** edit `slack.ts`
+   ASG never fires that listener). Do **not** await `server.close`
+   to finish GET (cycle 214: Hono `writable.end()` after
+   `controller.close()`). Do **not** set `enableJsonResponse`
+   on the live transport. Do **not** edit `slack.ts`
    (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
