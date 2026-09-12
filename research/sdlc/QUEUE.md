@@ -682,6 +682,10 @@ READY unchanged.
    `aws:elbv2:listener` / `fixed-response`
    from A-019. Do **not** treat ALB 502
    as a rewrite of Node 503.
+   Cycle 240: A-019 does **not** pin
+   ALB XFF attributes. Do **not** add
+   `modify-load-balancer-attributes`.
+   That is ENG-493.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

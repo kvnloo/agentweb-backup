@@ -774,3 +774,6 @@ reverted. Do not copy that as A-006.
 - Cycle 239: ALB also pass-throughs
   Application 503. Hermes/OMP: no
   ALB hop. Not A-006.
+- Cycle 240: XFF attributes are ENG-493
+  defaults, not A-019. Hermes has no
+  `trust proxy`. Not A-006.

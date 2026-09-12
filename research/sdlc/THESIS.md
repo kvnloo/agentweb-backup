@@ -733,3 +733,10 @@ ALB-generated 502 is TCP RST / malformed / target gone.
 Listener actions are only forward / redirect / fixed-response.
 This tree’s only `aws:elbv2:` knob is `IdleTimeout: 600`.
 Zero listener rules. Do not add them from A-019. Not A-006.
+
+## Cycle 240 (A-019 does not pin ALB XFF attributes)
+
+`app.ts` L169–176 names defaults (`append` / disabled).
+EB `aws:elbv2:loadbalancer` cannot name `xff_*`. MCP has
+zero `req.ip`. Pinning is ENG-493 / later
+`modify-load-balancer-attributes`, not A-019. Not A-006.

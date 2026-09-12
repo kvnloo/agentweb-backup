@@ -129,6 +129,8 @@ one-shot in this tree. Do not add a 503 retry in A-019. Cycle 236:
 503 is enough for SDK `send()`. Do not emit SSE 503. Cycle 238: this
 tree cannot rewrite JSON 503. Do not add `error_page`. Cycle 239: ALB
 passes Application 503 through. Do not add listener rules. Do not
-treat ALB 502 as a rewrite of Node 503. A-006 stays discarded.
+treat ALB 502 as a rewrite of Node 503. Cycle 240: A-019 does not pin
+ALB XFF attributes. That is ENG-493. Do not add
+`modify-load-balancer-attributes`. A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

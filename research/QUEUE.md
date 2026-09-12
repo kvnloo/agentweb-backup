@@ -639,3 +639,7 @@ Cycle 239: ALB passes Application 503
 through. Zero listener rules. Do not
 add aws:elbv2:listener from A-019.
 A-006 stays discarded.
+Cycle 240: A-019 does not pin ALB XFF
+attributes. AWS defaults; not an EB
+option. MCP has zero req.ip. ENG-493.
+A-006 stays discarded.

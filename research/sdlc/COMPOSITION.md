@@ -1452,6 +1452,11 @@ gone, not a rewrite of Node JSON 503.
 Do not add `aws:elbv2:listener`. Not
 A-006.
 
+Cycle 240: **A-019 does not pin ALB XFF
+attributes.** AWS defaults. Not an EB
+option. MCP has zero `req.ip`. ENG-493
+/ later ops. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
