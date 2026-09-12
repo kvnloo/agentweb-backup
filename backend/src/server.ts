@@ -125,6 +125,7 @@ io.use(async (socket, next) => {
         userId?: string;
         email?: string;
         sv?: number;
+        dte?: number;
         delegateAccess?: unknown;
         _svc?: boolean;
         isAdmin?: boolean;

@@ -4,6 +4,7 @@ export interface SocketTokenClaims {
   userId?: string;
   email?: string;
   sv?: number;
+  dte?: number;
   _svc?: boolean;
   isAdmin?: boolean;
   delegateAccess?: { scope?: string; targetUserId?: string; adminUserId?: string } | unknown;
@@ -16,6 +17,7 @@ export interface SocketAccountRecord {
   isAdmin?: boolean;
   orgId?: string;
   sessionVersion?: number;
+  delegateTokenEpoch?: number;
 }
 
 export type EvaluationSocketDecision = 'not_evaluation' | 'allow' | 'deny';
@@ -45,6 +47,11 @@ export async function evaluationSocketDecision(
     const account = await loadAccount(decoded);
     if (!account || account.userId !== decoded.userId || account.isActive !== true || account.isAdmin || account.orgId) return 'deny';
     if ((decoded.sv ?? 0) < (account.sessionVersion ?? 0)) return 'deny';
+    if (delegate) {
+      // A delegate token is revoked by bumping either epoch; mirror the HTTP branch's exact match.
+      if (!Number.isSafeInteger(decoded.dte) || !Number.isSafeInteger(decoded.sv) ||
+          decoded.dte !== (account.delegateTokenEpoch ?? 0) || decoded.sv !== (account.sessionVersion ?? 0)) return 'deny';
+    }
     return 'allow';
   } catch {
     return 'deny';
