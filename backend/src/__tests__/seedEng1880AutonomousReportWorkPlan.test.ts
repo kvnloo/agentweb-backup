@@ -28,6 +28,20 @@ describe('work plan shape', () => {
     expect(plan.isBuiltIn).toBe(false);
   });
 
+  // Round-2 review finding: every other visibility:'private' plan pairs it with a real
+  // ownerId (userWorkPlanRoutes.ts's create route always sets both together). Without
+  // one, orgShareService.canEditItem's ownership check is unconditionally false for
+  // every caller, permanently blocking the plan from the standard user-facing edit route.
+  it('has a real ownerId — required for the plan to ever be editable via the standard route', () => {
+    expect(plan.ownerId).toBeTruthy();
+    expect(typeof plan.ownerId).toBe('string');
+  });
+
+  it('accepts an explicit ownerId override instead of always using the default', () => {
+    const overridden = buildAutonomousReportWorkPlan('some-other-admin-user-id');
+    expect(overridden.ownerId).toBe('some-other-admin-user-id');
+  });
+
   it('has exactly 3 steps with no structural inputRequest, matching the proven validation-plan shape', () => {
     expect(plan.steps).toHaveLength(3);
     plan.steps.forEach((step) => {
