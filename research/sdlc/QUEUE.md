@@ -746,6 +746,8 @@ READY unchanged.
    ENG-823 pin-all. Do **not** fail
    closed on `count != 1`. Do **not**
    take `[0]`.
+   Cycle 255: do **not** fork `grep '^arn:'`
+   into an `/app/` filter from A-019.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

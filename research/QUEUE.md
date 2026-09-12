@@ -693,3 +693,6 @@ discarded.
 Cycle 254: if two ARNs appeared, copy
 ENG-823 pin-all. Do not fail closed
 on count != 1. A-006 stays discarded.
+Cycle 255: do not fork grep ^arn: into
+an /app/ filter from A-019. A-006 stays
+discarded.

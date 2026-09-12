@@ -827,3 +827,6 @@ reverted. Do not copy that as A-006.
 - Cycle 254: pin-all, not fail-closed
   `count != 1`. Hermes has no uniqueness
   vs pin-all fork. Not A-006.
+- Cycle 255: do not fork `^arn:` into
+  `/app/`. Hermes has no elbv2 ARN
+  grammar. Not A-006.

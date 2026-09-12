@@ -828,3 +828,9 @@ Not A-019. Not A-020. Not A-006.
 If two ARNs appeared, copy ENG-823 pin-all. Do not fail
 closed on `count != 1`. Do not take `[0]`. Not A-019.
 Not A-020. Not A-006.
+
+## Cycle 255 (do not fork ^arn: into /app/)
+
+Do not add a `loadbalancer/app/` grep from A-019. XFF
+keys are ALB-only; ENG-823 TG delay is not. Not A-019.
+Not A-020. Not A-006.
