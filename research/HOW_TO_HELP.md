@@ -204,6 +204,8 @@ Cycle 270: do not copy the probe classic fixture as
 XFF empty-ARN coverage. Do not add A-021.
 Cycle 271: one XFF empty-ARN string for `None` and
 classic. Do not split. Do not add A-021.
+Cycle 272: that one string names classic ELB.
+Do not copy DeregistrationDelay. Do not add A-021.
 A-006 stays discarded.
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

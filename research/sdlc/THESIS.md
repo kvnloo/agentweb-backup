@@ -921,3 +921,9 @@ unset. Not A-019. Not A-020. Not A-006.
 
 Do not split `None` vs classic. After grep both
 are empty. Not A-019. Not A-020. Not A-006.
+
+## Cycle 272 (name classic ELB)
+
+Copy the parenthetical, not
+DeregistrationDelay. Not A-019. Not A-020.
+Not A-006.

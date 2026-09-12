@@ -877,3 +877,6 @@ reverted. Do not copy that as A-006.
 - Cycle 271: one XFF empty-ARN string for
   None and classic. Hermes has no None-vs-
   classic fail-string fork. Not A-006.
+- Cycle 272: that one string names classic
+  ELB. Hermes has no comment-vs-fail
+  classic fork. Not A-006.

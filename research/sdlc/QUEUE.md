@@ -792,6 +792,8 @@ READY unchanged.
    coverage.
    Cycle 271: one XFF empty-ARN string for
    `None` and classic. Do **not** split.
+   Cycle 272: that one string names classic
+   ELB. Do **not** copy DeregistrationDelay.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

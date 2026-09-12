@@ -743,3 +743,6 @@ stays discarded.
 Cycle 271: one XFF empty-ARN string for None
 and classic. Do not split. A-006 stays
 discarded.
+Cycle 272: that one string names classic ELB.
+Do not copy DeregistrationDelay. A-006 stays
+discarded.
