@@ -777,3 +777,7 @@ reverted. Do not copy that as A-006.
 - Cycle 240: XFF attributes are ENG-493
   defaults, not A-019. Hermes has no
   `trust proxy`. Not A-006.
+- Cycle 241: later XFF pin is LB-ARN
+  `modify-load-balancer-attributes`, not
+  A-020’s ASG hook. Hermes has no
+  `eb-deploy.sh`. Not A-006.

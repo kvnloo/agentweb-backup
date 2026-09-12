@@ -740,3 +740,9 @@ Zero listener rules. Do not add them from A-019. Not A-006.
 EB `aws:elbv2:loadbalancer` cannot name `xff_*`. MCP has
 zero `req.ip`. Pinning is ENG-493 / later
 `modify-load-balancer-attributes`, not A-019. Not A-006.
+
+## Cycle 241 (XFF pin is LB ARN, not A-019 / A-020)
+
+`ensure_deregistration_delay` descends into target groups.
+XFF is a load-balancer attribute. Sibling after verify; do
+not fold into A-019 or A-020’s second put. Not A-006.

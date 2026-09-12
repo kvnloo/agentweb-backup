@@ -686,6 +686,12 @@ READY unchanged.
    ALB XFF attributes. Do **not** add
    `modify-load-balancer-attributes`.
    That is ENG-493.
+   Cycle 241: that pin, if ever, is
+   `modify-load-balancer-attributes` on
+   the LB ARN after verify. Do **not**
+   copy the target-group loop. Do
+   **not** fold into A-020. Do **not**
+   add A-021.
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

@@ -643,3 +643,7 @@ Cycle 240: A-019 does not pin ALB XFF
 attributes. AWS defaults; not an EB
 option. MCP has zero req.ip. ENG-493.
 A-006 stays discarded.
+Cycle 241: an ENG-493 XFF pin is
+modify-load-balancer-attributes on the
+LB ARN, not A-019 or A-020. Do not add
+A-021. A-006 stays discarded.

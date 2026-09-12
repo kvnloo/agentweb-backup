@@ -1457,6 +1457,11 @@ attributes.** AWS defaults. Not an EB
 option. MCP has zero `req.ip`. ENG-493
 / later ops. Not A-006.
 
+Cycle 241: **XFF pin is
+`modify-load-balancer-attributes` on
+the LB ARN.** Not the TG loop. Not
+A-019. Not A-020. Not A-021. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
