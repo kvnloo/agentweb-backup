@@ -7,16 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 141
+cycles_completed: 142
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 142
+next_cycle: 143
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 141: ENG-1057 already named three in-process faces for
-  the KB leaf; cap lives at the source. Cycle 142: cheapest
-  remaining. Candidate: Agent Mode searchKnowledgeBase also
-  walks Drive/ClickUp — three faces, unequal source sets.
+  Cycle 142: three ENG-1057 faces share Vertex; Agent Mode is a
+  Drive/ClickUp superset. Cycle 143: cheapest remaining.
+  Candidate: listed MCP search_knowledge_base already hops
+  HTTP to that superset (emmaApi.ts L98-101) while sibling
+  generate_image is still internal: true (apiTools.ts L2077).
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
   If stop_after passes, unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle

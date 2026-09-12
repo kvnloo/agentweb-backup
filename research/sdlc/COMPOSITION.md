@@ -584,6 +584,17 @@ Cycle 141: **ENG-1057 already named three KB faces.** Test
 header L1–10; callers L5106 / L24059 / L71. Cap at the
 source. Same lesson as `generate_image`.
 
+Cycle 142: **those faces do not share source sets.** Agent
+Mode `searchKnowledgeBase` L24059 calls the Vertex leaf, then
+Drive (L24072, ENG-1624) and ClickUp docs/tasks (L24141 /
+L24181). Emma RAG (`chatbotService.ts` L5093 / L5106) is
+Vertex + local `findRelevantChunks` — zero Drive/ClickUp
+imports. Growth Genius L71 is Vertex-only. Emma’s *tool*
+(`emma/tools.ts` L5593) is the Agent Mode superset. HTTP-split
+the Vertex leaf would not give GG Drive; extracting the whole
+method would pull `clickupService` OAuth into a fifth
+process. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

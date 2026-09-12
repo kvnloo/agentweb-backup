@@ -241,6 +241,9 @@ Cycle 140: the KB helper is a Vertex leaf (L4711–4867) trapped
 in a file that cycles with `agentModeService`. Do not add A-021.
 Cycle 141: ENG-1057 three faces; cap at the source. Same
 lesson as `generate_image`. Do not add A-021.
+Cycle 142: those faces do not share source sets. Agent Mode
+is a Drive/ClickUp superset after the Vertex leaf; Emma RAG
+and Growth Genius are not. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

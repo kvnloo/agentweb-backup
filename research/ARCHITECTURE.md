@@ -508,6 +508,9 @@ Cycle 140: `searchPlatformKnowledgeBase` is a leaf trapped in
 a file that cycles with `agentModeService`. A-006 discarded.
 Cycle 141: ENG-1057 already named three in-process KB faces;
 the cap lives at the source. A-006 discarded.
+Cycle 142: those faces do not share source sets. Agent Mode
+is a Drive/ClickUp superset; Emma RAG and Growth Genius are
+not. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

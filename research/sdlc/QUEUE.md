@@ -240,6 +240,9 @@ a file that cycles with `agentModeService`. Product READY
 unchanged.
 Cycle 141: ENG-1057 already named three in-process KB faces;
 the cap lives at the source. Product READY unchanged.
+Cycle 142: those faces do not share source sets. Agent Mode
+is a Drive/ClickUp superset; Emma RAG and Growth Genius are
+not. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

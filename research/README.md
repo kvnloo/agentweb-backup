@@ -439,6 +439,12 @@ Cycle 141: **ENG-1057 already named three KB faces.** Test
 header L1–10; callers L5106 / L24059 / L71. Cap at the
 source after a 2026-08-10 single-instance crash. Same lesson
 as `generate_image`.
+Cycle 142: **those faces do not share source sets.** Agent
+Mode L24072 / L24141 / L24181 walks Drive + ClickUp after the
+Vertex leaf. Emma RAG is Vertex + local chunks (L5093 /
+L5106). Growth Genius is Vertex-only (L71). Emma’s *tool*
+(`emma/tools.ts` L5593) is the Agent Mode superset. HTTP-split
+the leaf would not equalize Drive.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

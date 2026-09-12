@@ -344,3 +344,6 @@ reverted. Do not copy that as A-006.
   cycles with agentModeService. Not A-006.
 - Cycle 141: ENG-1057 already named three in-process KB faces;
   cap at the source. Not A-006.
+- Cycle 142: those faces do not share source sets. Agent Mode
+  is a Drive/ClickUp superset; Emma RAG and Growth Genius are
+  Vertex-only. Hermes/OMP: one name, one source set. Not A-006.
