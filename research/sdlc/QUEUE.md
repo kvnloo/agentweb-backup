@@ -335,6 +335,9 @@ Product READY unchanged.
 Cycle 179: ImageModelsSettings seed omits gpt-image-1.
 Empty Dynamo auto-inits openai-image-1. Product READY
 unchanged.
+Cycle 180: onboarding pins Gemini 3 so Q-003 unspecified
+mapper never runs. Do not un-ready Q-003. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

@@ -857,6 +857,14 @@ for `gpt-image-1` is empty. `imageModelService.ts` L22 /
 L83 same fallback. Worker named branch L3281 is
 unadvertised. Not A-006.
 
+Cycle 180: **Onboarding pins Gemini 3.** L84 / L493
+always set `imageModel`, so L492 unspecified (Q-003)
+never runs. Brief item 4 also skips `logoImage`.
+`convertSizeToAspectRatio` maps 1080x1080 → 1:1 and
+1080x1350 → 4:5 (L1148 / L1157). Azure t2i L712 passes
+`size` raw. Three hardcoded defaults, no shared
+constant. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

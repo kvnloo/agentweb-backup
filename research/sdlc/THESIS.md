@@ -336,6 +336,9 @@ gpt-image-2 is Azure on the leaf, OpenAI-else on the
 worker. Do not un-ready Q-003. Do not add A-021.
 Cycle 179: ImageModelsSettings seed omits gpt-image-1.
 Do not add A-021.
+Cycle 180: onboarding pins Gemini 3 explicitly; Q-003
+unspecified mapper never runs. Do not un-ready Q-003.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

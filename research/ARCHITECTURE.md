@@ -614,6 +614,9 @@ A-006 discarded.
 Cycle 179: ImageModelsSettings seed omits gpt-image-1
 (Azure named). Empty Dynamo auto-inits openai-image-1.
 A-006 discarded.
+Cycle 180: onboarding L84/L493 pins Gemini 3 so Q-003
+unspecified mapper never runs. 1080 sizes are Gemini
+aspect ratios. Do not un-ready Q-003. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

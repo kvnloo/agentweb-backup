@@ -7,20 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 179
+cycles_completed: 180
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 180
+next_cycle: 181
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 179: ImageModelsSettings seed omits gpt-image-1
-  (Azure named branch). Empty Dynamo auto-inits
-  openai-image-1 + FLUX + gemini-2.5.
-  Cycle 180: cheapest remaining. Candidate:
-  onboardingAdImageService.ts L84 DEFAULT_IMAGE_MODEL is
-  gemini-3-pro-image-preview (Emma leaf), not
-  openai-image-1. Third default. File-level.
-  A-011 parks field unify — do not add A-021.
+  Cycle 180: onboarding L84/L493 pins Gemini 3 explicitly
+  so Q-003 unspecified mapper never runs. 1080 sizes are
+  Gemini aspect ratios; Azure L712 would take them raw.
+  Cycle 181: cheapest remaining. Candidate:
+  generateWithTimeout Promise.race L487-507 does not
+  abort the leaf at 180s; timed-out variants still meter.
+  File-level. A-011 parks field unify — do not add A-021.
   Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
   A-006. If stop_after passes, unsubscribe
   agentweb-research-cycle.

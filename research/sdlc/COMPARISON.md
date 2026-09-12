@@ -479,3 +479,8 @@ reverted. Do not copy that as A-006.
   Empty Dynamo auto-inits that list (L129-131). CLI help
   L4216 same omission. Worker L3281 is unadvertised.
   Not A-006.
+- Cycle 180: onboardingAdImageService.ts L84/L493 always
+  passes gemini-3-pro-image-preview so leaf L492 never
+  fires. Q-003 item 4 skips explicit model and logoImage.
+  1080x1350 is Gemini 4:5 (L1157), not Azure size
+  (L712 raw). Not A-006.

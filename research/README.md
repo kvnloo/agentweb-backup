@@ -622,6 +622,11 @@ Cycle 179: **Admin seed omits Azure `gpt-image-1`.**
 openai-image-1 + FLUX + gemini-2.5. Grep of that file
 for `gpt-image-1` is empty. CLI help L4216 same two-id
 lie. Worker named branch L3281 is unadvertised.
+Cycle 180: **Onboarding pins Gemini 3; Q-003 unspecified
+path never runs.** L84 / L493 always pass
+`imageModel`. Brief item 4 also skips `logoImage`.
+L83 “1080×” is Gemini aspect-ratio, not pixels. Azure
+L712 would send `1080x1350` as size.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

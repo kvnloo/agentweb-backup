@@ -368,4 +368,7 @@ A-006 stays discarded.
 Cycle 179: ImageModelsSettings seed omits gpt-image-1.
 Empty Dynamo auto-inits openai-image-1. A-006 stays
 discarded.
+Cycle 180: onboarding pins Gemini 3 explicitly; Q-003
+unspecified path never runs. Do not un-ready Q-003.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.
