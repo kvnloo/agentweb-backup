@@ -462,6 +462,17 @@ Cycle 215: rehydrate CallTool is the
 JSON `close()` does not `resolveJson`.
 Do not `sessions.set` that transport.
 Product READY unchanged.
+Cycle 216: keep rehydrate `finally
+close()`. `resolveJson` never
+`stream.cleanup()`; leftover
+`_streamMapping` until `close()`.
+After `handleRequest` returns,
+close is delete-only and cannot
+hang. Skipping it after resolved
+JSON does not leak Express. JSON
+on a reused transport would
+accumulate one entry per POST.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -491,7 +502,11 @@ Product READY unchanged.
    `controller.close()`). Do **not** set `enableJsonResponse`
    on the live transport. Do **not** `sessions.set` a
    rehydrate transport (cycle 215: JSON `close()` hangs
-   `handleRequest`). Wrap stays in `mcpServerCore`. Do
+   `handleRequest`). **Keep** rehydrate `finally close()`
+   (cycle 216: after `resolveJson` it is leftover
+   `_streamMapping` cleanup and cannot hang; skipping it
+   after resolved JSON does not leak Express). Wrap stays
+   in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch

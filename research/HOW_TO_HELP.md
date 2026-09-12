@@ -73,5 +73,7 @@ triggers GET `streamController.close()`; Hono then
 `writable.end()`s — do not await `server.close` for that hang
 (cycle 214). Wrap `CallTool` in `mcpServerCore` so rehydrate is
 covered; do not `sessions.set` that JSON transport (cycle 215).
+Keep rehydrate `finally close()` after `handleRequest` returns
+(cycle 216: leftover `_streamMapping`; cannot hang).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

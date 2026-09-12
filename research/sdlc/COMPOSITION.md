@@ -1182,6 +1182,23 @@ mid-CallTool hangs `handleRequest`.
 POST 503 at L298 is before the
 rehydrate branch (L439). Not A-006.
 
+Cycle 216: **Keep rehydrate
+`finally close()`.** JSON
+`resolveJson` (L706) never
+`stream.cleanup()`; SSE else
+(L712–714) does. After
+`handleRequest` returns, `close()`
+is delete-only leftover
+`_streamMapping` (initialize +
+CallTool) and cannot hang. Skipping
+it after resolved JSON does not
+leak Express (`writeWebResponse`
+`res.end`). JSON on a reused
+transport would accumulate one
+entry per POST — do not
+`enableJsonResponse` on the live
+Map. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

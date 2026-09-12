@@ -492,3 +492,13 @@ Cycle 215: rehydrate CallTool is the
 JSON `close()` hangs `handleRequest`.
 Do not `sessions.set` that transport.
 A-006 stays discarded.
+Cycle 216: keep rehydrate `finally
+close()`. `resolveJson` never
+`stream.cleanup()`; leftover
+`_streamMapping` until `close()`.
+After `handleRequest` returns,
+close is delete-only and cannot
+hang. Skipping it after resolved
+JSON does not leak Express. JSON
+on a reused transport would
+accumulate. A-006 stays discarded.

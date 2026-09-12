@@ -475,6 +475,16 @@ Cycle 215: rehydrate CallTool is the
 does not `resolveJson`. Do not
 `sessions.set` that transport. Do not
 add A-021.
+Cycle 216: keep rehydrate `finally
+close()`. `resolveJson` (L706) never
+`stream.cleanup()`; SSE else does.
+After `handleRequest` returns, close
+is delete-only leftover
+`_streamMapping` (initialize +
+CallTool). Skipping it after resolved
+JSON does not leak Express; JSON on
+a reused transport would accumulate.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
