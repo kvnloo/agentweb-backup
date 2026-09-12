@@ -440,6 +440,12 @@ Architecture A-002 → A-019 → A-007 → A-008.
 A-019 unparked (CallTool wrap + drain refuse).
 A-008 persist is the prize; git-mv is the first
 slice. Do not revive A-006. Do not add A-021.
+Cycle 210: track() cannot refuse — callers
+pass an already-started Promise (server.ts
+L301). Worker refuse is inside runInWorker
+before work. tryClaim false is 409. CallTool
+handler-entry is the Q-014 image gate. Do
+not wrap registry.execute. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

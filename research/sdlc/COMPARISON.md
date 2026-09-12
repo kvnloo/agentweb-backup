@@ -668,3 +668,8 @@ reverted. Do not copy that as A-006.
   gate Hermes needs once Q-014 lists
   generate_image. Persist stays in-process
   (A-008). Not A-006.
+- Cycle 210: track() cannot refuse. Callers
+  pass an already-started Promise (L301).
+  Worker refuse is inside runInWorker.
+  tryClaim false is 409. CallTool
+  handler-entry is the image gate. Not A-006.

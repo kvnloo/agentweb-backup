@@ -719,6 +719,11 @@ Cycle 209: Kevin asked to reprioritize.
 Product Q-014 → Q-004 → Q-001 → Q-003.
 Architecture A-002 → A-019 → A-007 → A-008.
 A-019 unparked. A-006 discarded.
+Cycle 210: track() cannot refuse — callers
+pass an already-started Promise (L301).
+tryClaim false is 409 not 503. CallTool
+handler-entry is the Q-014 image gate.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

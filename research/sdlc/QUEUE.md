@@ -18,7 +18,7 @@ Thesis: `THESIS.md`. Comparison: `COMPARISON.md`. Module map:
 | 2 | A-007 | 29 | **ready** | Split `apiTools.ts` — first file `tools/infrastructure.ts` (wait on kvnloo#2) |
 | 3 | A-008 | 29 | **ready** | Folder-move creative cluster + persist unification later |
 | 4 | A-002 | 28 | **ready** | CI import boundary for `loops/core` (**in flight kvnloo#3**) |
-| 5 | A-019 | 27 | **ready** | Wrap CallTool + refuse `track()`/`tryClaim` while draining (after #2) |
+| 5 | A-019 | 27 | **ready** | Refuse CallTool /generate at handler entry; wrap CallTool in `track()` for drain wait |
 | — | A-015 | 31 | park | Do not add `generate_image` to `ANONYMOUS_TOOLS` |
 | — | A-011 | 30 | park | Do not unify MCP vs Emma `generate_image` schemas in Q-014 |
 | — | A-014 | 29 | park | Do not copy pageToolMap / FOUNDATION_TOOLS onto MCP list |
@@ -432,6 +432,10 @@ A-002 → A-019 → A-007 → A-008. A-019 unparked
 (CallTool wrap + drain refuse after #2). A-008
 product 2→3 (persist is the prize). Q-016 product
 3→2. Product READY unchanged. Do not revive A-006.
+Cycle 210: track() cannot refuse — callers pass
+an already-started Promise (server.ts L301).
+tryClaim false is 409 SESSION_BUSY. A-019
+refuse is handler-entry. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -442,10 +446,14 @@ product 2→3 (persist is the prize). Q-016 product
    walk `loops/index.ts` (only `./core/types`). Do **not** copy
    forbid-all-services onto `agentMode/core` or `mcp/server`.
    **In flight: kvnloo#3.**
-2. **A-019** — after kvnloo#2: wrap `CallTool` (`mcpServerCore.ts`)
-   like `server.ts` L301 `chatbotTurn`, then one `instanceState`
-   draining bit on `track()` **and** `tryClaim`. 503 like scheduled
-   chats, not 409. Do **not** edit `slack.ts` (#2393).
+2. **A-019** — after kvnloo#2: `if (!isCronEnabled())` at the
+   CallTool handler **before** `execute`, then
+   `track('mcpCallTool', …)` for the drain wait. `/generate`
+   503 like `runScheduledChats` L13031 **before** `tryClaim`.
+   Do **not** refuse inside `track()` (promise already started,
+   `server.ts` L301). Do **not** make `tryClaim` return false
+   (that 409s `SESSION_BUSY`). Do **not** wrap
+   `mcpToolRegistry.execute`. Do **not** edit `slack.ts` (#2393).
 3. **A-007** — `mcp/server/tools/infrastructure.ts` (five mcpFetch
    tools including `generate_image`). Not `content.ts` (that section
    dynamically imports `agentModeService`). Not 85 Hermes files.

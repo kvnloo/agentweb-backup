@@ -465,3 +465,7 @@ Architecture A-002 → A-019 → A-007 → A-008.
 A-019 unparked. Q-016 product 3→2. A-008
 product 2→3. Q-001 / Q-014 / Q-003 stay ready.
 A-006 stays discarded.
+Cycle 210: track() cannot refuse — callers
+pass an already-started Promise. tryClaim
+false is 409 SESSION_BUSY. A-019 refuse is
+handler-entry. A-006 stays discarded.

@@ -1108,6 +1108,14 @@ L88–120) after Q-014 will bill images on this
 PORT. A-008 persist (one URL handle) waits on
 the pile. Not A-006.
 
+Cycle 210: **track() cannot refuse.** Callers
+pass an already-started Promise (server.ts
+L301). Worker refuse is inside runInWorker
+L443. tryClaim false is 409 SESSION_BUSY
+(L9016). Q-014 generate_image never tryClaims.
+CallTool handler-entry isError, then wrap
+execute in track() for the wait. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

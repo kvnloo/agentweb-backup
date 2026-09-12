@@ -33,7 +33,7 @@ None of the first slices needs a Dynamo table.
 | Order | ID | Do this | Do not |
 |---|---|---|---|
 | 1 | **A-002** | New `loopsCoreImportGuard.test.ts` on `loops/core` + `loops/index.ts`. **In flight: [kvnloo#3](https://github.com/kvnloo/agentweb/pull/3).** | Append to `sdkConstructionGuard.test.ts` (#2563). Walk `loops/instances/` (`rcaEnricher` imports `agentModeService`). |
-| 2 | **A-019** | After #2: wrap `CallTool` like `server.ts` L301 `chatbotTurn`; one `instanceState` draining bit on `track()` **and** `tryClaim`. 503 like scheduled chats. | Edit `slack.ts` (#2393). HTTP-split. Start at the 14k controller. |
+| 2 | **A-019** | After #2: `isCronEnabled` at CallTool handler **before** execute; wrap execute in `track('mcpCallTool')` for the wait. `/generate` 503 before `tryClaim`. | Refuse inside `track()` (promise already started). Make `tryClaim` return false (409 `SESSION_BUSY`). Wrap `registry.execute`. Edit `slack.ts` (#2393). |
 | 3 | **A-007** | `mcp/server/tools/infrastructure.ts` copying `workflowTools.ts` (wait for #2) | Copy `evaluationTools.ts`. First file is **not** `content.ts`. Edit `emma/tools.ts`. |
 | 4 | **A-008** | `git mv` `imageGeneration.ts` → `services/creative/` + path shim. Persist unification after the pile shrinks. | HTTP-split the leaf. Patch occupied `app.ts` / `emma/tools.ts` / `agentModeService.ts`. |
 
@@ -45,7 +45,7 @@ None of the first slices needs a Dynamo table.
 |---|---|
 | One product thing | **Q-014** — land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2) |
 | One Kevin-unique thing after #2 | **Q-001** smoke so `tools/list` includes `generate_image` |
-| One architecture thing after #2 and #3 | **A-019** CallTool wrap + drain refuse |
+| One architecture thing after #2 and #3 | **A-019** CallTool handler-entry refuse + `track()` wrap for the wait |
 
 ---
 

@@ -57,7 +57,10 @@ Land [kvnloo#2](https://github.com/kvnloo/agentweb/pull/2).
 
 ## If we only do one architecture thing after #2 and #3
 
-**A-019.** Wrap inbound MCP `CallTool` and refuse new `track()` /
-`tryClaim` while draining. That is the billed-image drain gate.
+**A-019.** `isCronEnabled` at the CallTool handler **before**
+`execute`, then wrap in `track()` so drain waits. `/generate`
+gets 503 before `tryClaim`. Do not refuse inside `track()`
+(the promise is already running). Do not make `tryClaim`
+return false (that 409s). That is the billed-image drain gate.
 Not A-007 packaging. Not persist (occupied `agentModeService.ts` /
 `app.ts` / `emma/tools.ts`).
