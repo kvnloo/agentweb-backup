@@ -551,3 +551,11 @@ reverted. Do not copy that as A-006.
   and never pin totalImagesChecked. Path-style
   that s3Utils.test.ts L340 pins still misses.
   Hermes one persist, one decoder. Not A-006.
+- Cycle 192: repair axios.gets articleUrl (L30316)
+  and images (L30547). Same class already Path A SDK
+  (L28631) and Path B presign (L9327 / L38291).
+  filesController L35: no public access needed.
+  db.ts L2994 uploads without ACL. Gemini comment
+  L9304: some screenshot URLs are fetchable.
+  Path C fails when the object is private. Hermes
+  one persist, one fetch. Not A-006.

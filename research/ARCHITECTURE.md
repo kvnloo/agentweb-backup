@@ -653,6 +653,10 @@ Same class already uses `extractS3KeyFromUrl` at
 L28635. Writer in the same method uses env bucket.
 Tests set `test-bucket` and never pin the matcher.
 A-006 discarded.
+Cycle 192: repair `axios.get`s S3 (L30316 / L30547).
+Same class already SDK-streams (L28631) and
+presigns (L9327). filesController L35: no public
+access needed. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

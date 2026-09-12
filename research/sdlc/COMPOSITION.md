@@ -970,6 +970,17 @@ L30619). Tests set `test-bucket` and never pin
 Emma `repair_blog_article` L2775, `POST
 /repair-blog` L887. Not A-006.
 
+Cycle 192: **Repair `axios.get`s S3.** Article
+L30316 (no host check) and images L30547 (comment
+says “from S3”). Same class already Path A SDK
+(`read_file_content` L28631) and Path B presign
+(`describe_image` L9327; LinkedIn MEDIA L38291).
+`filesController.ts` L35: no public access needed.
+`db.ts` L2994 no ACL. Gemini L9304: some URLs are
+fetchable. Path C is the private-object miss.
+Tests mock axios. Siblings: `removeC2PAFromImage`
+L29538, `removeImageBackground` L29660. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

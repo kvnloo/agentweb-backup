@@ -7,20 +7,17 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 191
+cycles_completed: 192
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 192
+next_cycle: 193
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 191: HTML repair is a third S3 matcher,
-  hardcoded prod bucket, unused parser in the
-  same class. Tests set test-bucket so they never
-  pin it. Cycle 192: cheapest remaining. Candidate:
-  repairBlogArticle axios.gets articleUrl (L30316)
-  with no host check; checkAndResizeImage axios.gets
-  images (L30547) instead of getS3ObjectStream.
-  Same file already SDK-streams at L28635.
+  Cycle 192: repair axios.gets S3; same class already
+  has SDK stream (L28631) and presign (L9327).
+  Cycle 193: cheapest remaining. Candidate:
+  removeC2PAFromImage L29538 and removeImageBackground
+  L29660 are the same Path C on Emma image tools.
   File-level. A-011 parks field unify — do not add
   A-021. Do not un-ready Q-001 / Q-014 / Q-003.
   Do not revive A-006. If stop_after passes,
