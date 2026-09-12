@@ -202,6 +202,31 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(promptContent).toContain('&lt;b&gt;Bold&lt;/b&gt;');
     });
 
+    // A single-quoted HTML attribute (e.g. <img src='{{url}}'>) is valid HTML the template
+    // author could write, and nothing forbids it. Escaping only &, <, >, " (not ') leaves this
+    // vector wide open: a value of `' onerror='alert(1)` breaks out of the attribute without
+    // ever containing any of the 4 escaped characters, so the earlier assertions above (which
+    // only test double-quote/no-quote contexts) would not have caught this gap.
+    it('should HTML-escape single quotes, closing the single-quoted-attribute breakout vector', async () => {
+      const breakoutValue = "' onerror='alert(1)";
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: breakoutValue, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain("' onerror='alert(1)");
+      expect(promptContent).toContain('&#39; onerror=&#39;alert(1)');
+    });
+
     it('should HTML-escape array variable values before building the substitution prompt', async () => {
       const templateWithArrays = {
         ...mockTemplate,
