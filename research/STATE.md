@@ -7,23 +7,24 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 190
+cycles_completed: 191
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 191
+next_cycle: 192
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 190: CORS Origin is exact Family B host
-  (credentials: true). cors.test.ts never pins it.
-  CloudFront forms already match agentwebforms regex.
-  Cycle 191: cheapest remaining. Candidate: HTML
-  repair includes('agentweb-user-files.s3') is a
-  third matcher, five sites in agentModeService.ts
-  L30399–30428. File-level.
-  A-011 parks field unify — do not add A-021.
-  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
-  A-006. If stop_after passes, unsubscribe
-  agentweb-research-cycle.
+  Cycle 191: HTML repair is a third S3 matcher,
+  hardcoded prod bucket, unused parser in the
+  same class. Tests set test-bucket so they never
+  pin it. Cycle 192: cheapest remaining. Candidate:
+  repairBlogArticle axios.gets articleUrl (L30316)
+  with no host check; checkAndResizeImage axios.gets
+  images (L30547) instead of getS3ObjectStream.
+  Same file already SDK-streams at L28635.
+  File-level. A-011 parks field unify — do not add
+  A-021. Do not un-ready Q-001 / Q-014 / Q-003.
+  Do not revive A-006. If stop_after passes,
+  unsubscribe agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

@@ -956,6 +956,20 @@ already match L220 `*.agentwebforms.com`. Repair
 is wider; path-style Location Origin misses both.
 Not A-006.
 
+Cycle 191: **HTML repair is a third matcher.**
+Five `includes('agentweb-user-files.s3')` in
+`repairBlogArticle` (L30399 / L30407 / L30415 /
+L30420 / L30428). Hardcoded prod bucket, not
+`AWS_S3_BUCKET`. Same class already
+`extractS3KeyFromUrl` + `getS3ObjectStream`
+(L28635; comment: private objects). Same method
+writes Family B with env bucket (L30469 /
+L30619). Tests set `test-bucket` and never pin
+`totalImagesChecked`. Path-style that
+`s3Utils.test.ts` L340 pins still misses. Callers:
+Emma `repair_blog_article` L2775, `POST
+/repair-blog` L887. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

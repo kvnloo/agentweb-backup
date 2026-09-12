@@ -647,6 +647,12 @@ discarded.
 Cycle 190: CORS Origin is exact Family B host
 (credentials: true). cors.test.ts never pins it.
 A-006 discarded.
+Cycle 191: HTML repair is a third S3 matcher
+(hardcoded `agentweb-user-files.s3`, five sites).
+Same class already uses `extractS3KeyFromUrl` at
+L28635. Writer in the same method uses env bucket.
+Tests set `test-bucket` and never pin the matcher.
+A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

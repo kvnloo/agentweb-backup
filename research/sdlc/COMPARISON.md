@@ -542,3 +542,12 @@ reverted. Do not copy that as A-006.
   match *.agentwebforms.com (L220). Repair
   includes('agentweb-user-files.s3') is wider.
   Not A-006.
+- Cycle 191: HTML repair is a third matcher, five
+  sites (agentModeService.ts L30399–30428).
+  Hardcoded prod bucket substring. Same class
+  already extractS3KeyFromUrl + getS3ObjectStream
+  (L28635). Same method writes Family B with env
+  bucket (L30469 / L30619). Tests set test-bucket
+  and never pin totalImagesChecked. Path-style
+  that s3Utils.test.ts L340 pins still misses.
+  Hermes one persist, one decoder. Not A-006.

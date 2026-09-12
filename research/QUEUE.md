@@ -403,4 +403,8 @@ discarded.
 Cycle 190: CORS Origin is exact Family B host
 (credentials: true). cors.test.ts never pins it.
 A-006 stays discarded.
+Cycle 191: HTML repair is a third S3 matcher.
+Hardcoded prod bucket; same class already has
+extractS3KeyFromUrl. Tests set test-bucket.
+A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

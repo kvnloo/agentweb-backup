@@ -364,6 +364,10 @@ originalname in brand/db/tasks. Product READY
 unchanged.
 Cycle 190: CORS Origin is exact Family B host
 (credentials: true). Product READY unchanged.
+Cycle 191: HTML repair is a third S3 matcher
+(hardcoded prod bucket, five sites). Same class
+already uses extractS3KeyFromUrl. Writer uses
+env bucket. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

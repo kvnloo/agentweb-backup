@@ -369,6 +369,11 @@ Do not add A-021.
 Cycle 190: CORS Origin is exact Family B host
 (credentials: true). cors.test.ts never pins it.
 Do not add A-021.
+Cycle 191: HTML repair is a third S3 matcher.
+Hardcoded prod `agentweb-user-files.s3`; same
+class already uses extractS3KeyFromUrl (L28635).
+Writer in the same method uses env bucket.
+Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).
