@@ -444,3 +444,7 @@ reverted. Do not copy that as A-006.
   images.” Q-003 cheaper gpt-image-2 default would land
   unspecified on that drop. Mapper stays ready; flip stays
   Matt-gated. Not A-006.
+- Cycle 171: Azure L654 axios.get skips processInputImage
+  (30s / UA / SVG). Gemini/Runway use the helper. Not A-006.
+- Cycle 172: Azure FormData contentType image/png always
+  (L662). Gemini/Runway pass sniffed MIME. Not A-006.

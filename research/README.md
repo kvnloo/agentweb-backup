@@ -572,6 +572,13 @@ Cycle 170: **L492 already documents why the default is
 not `gpt-image-2`.** “supports multiple input images.”
 Q-003 mapper stays ready; the prod default flip stays
 Matt-gated for this reason, not only $/rank.
+Cycle 171: **Azure edit skips `processInputImage`.**
+Bare `axios.get` L654: no 30s timeout, no User-Agent, no
+SVG→PNG. Gemini/Runway use the helper. Persisted logos
+are already raster (ENG-933); explicit URLs are not.
+Cycle 172: **Azure FormData always claims `image/png`.**
+L660–662. Gemini/Runway send `processedImage.mimeType`.
+Two silent lies on the same vendor path as cycle 169.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

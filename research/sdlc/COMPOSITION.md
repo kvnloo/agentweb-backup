@@ -789,6 +789,16 @@ L492–494. `getImageApiDefaultModel` returns undefined so
 this assignment is the unspecified path. Q-003 mapper
 does not have to change it. Not A-006.
 
+Cycle 171: **Azure edit download is not the helper.**
+L654 vs L816. No 30s timeout; only the 8 min
+`withTimeout` (longer than MCP 5 min mcpFetch). ENG-933
+already rasterises persisted logos. Not A-006.
+
+Cycle 172: **Azure FormData always `image/png`.** L660–
+662. Gemini `inlineData.mimeType`; Runway data-URL
+prefix. Same silent-lie class as cycle 169 `[0]`. Not
+A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

@@ -340,4 +340,8 @@ only; logo-at-end drops. A-006 stays discarded.
 Cycle 170: L492 Gemini 3 default is because multi-input;
 Q-003 default flip would land on that drop. Do not
 un-ready Q-003. A-006 stays discarded.
+Cycle 171: Azure edit axios.get skips processInputImage
+(no 30s timeout, UA, SVG). A-006 stays discarded.
+Cycle 172: Azure FormData always claims image/png;
+Gemini/Runway pass sniffed MIME. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

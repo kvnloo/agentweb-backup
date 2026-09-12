@@ -311,6 +311,10 @@ logo-at-end drops. Product READY unchanged.
 Cycle 170: L492 Gemini 3 default is because multi-input;
 Q-003 default flip stays Matt-gated. Product READY
 unchanged.
+Cycle 171: Azure edit skips processInputImage. Product
+READY unchanged.
+Cycle 172: Azure FormData always claims image/png.
+Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 

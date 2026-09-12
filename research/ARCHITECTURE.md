@@ -586,6 +586,10 @@ Cycle 169: Azure `/images/edits` `inputImages[0]` only;
 logo-at-end drops. A-006 discarded.
 Cycle 170: L492 default is Gemini 3 because multi-input;
 Q-003 flip is still Matt-gated. A-006 discarded.
+Cycle 171: Azure edit skips processInputImage. A-006
+discarded.
+Cycle 172: Azure FormData always image/png. A-006
+discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

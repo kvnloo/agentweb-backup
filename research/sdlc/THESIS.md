@@ -315,6 +315,10 @@ Cycle 169: Azure edits inputImages[0] only; logo-at-end
 drops. Do not add A-021.
 Cycle 170: L492 Gemini 3 default is because multi-input.
 Do not un-ready Q-003. Do not add A-021.
+Cycle 171: Azure edit skips processInputImage. Do not
+add A-021.
+Cycle 172: Azure FormData always image/png. Do not add
+A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

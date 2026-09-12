@@ -7,20 +7,20 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 170
+cycles_completed: 172
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 171
+next_cycle: 173
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 170: L492 Gemini 3 default is because multi-input;
-  Q-003 cheaper gpt-image-2 flip would land unspecified
-  calls on Azure [0]-only. Cycle 171: cheapest remaining.
-  Candidate: Azure edit axios.get L654 skips
-  processInputImage (timeout, UA, SVG→PNG). File-level.
-  A-011 parks field unify — do not add A-021. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006.
-  If stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 172: Azure FormData always claims image/png.
+  Cycle 173: cheapest remaining. Candidate: S3 upload
+  L582-587 always image/png — true for Azure output
+  (b64 png), lie for a vendor that returned JPEG?
+  File-level. A-011 parks field unify — do not add A-021.
+  Do not un-ready Q-001 / Q-014 / Q-003. Do not revive
+  A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```
