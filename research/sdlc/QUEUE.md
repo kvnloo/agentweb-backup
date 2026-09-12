@@ -473,6 +473,12 @@ JSON does not leak Express. JSON
 on a reused transport would
 accumulate one entry per POST.
 Product READY unchanged.
+Cycle 217: `mcpShutdown` never
+cancels `generate_image`. `_onclose`
+does not abort; CallTool ignores
+`extra`; mcpFetch abort is
+timeout-only. A-019 wait is the
+billed hop. Product READY unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
@@ -505,7 +511,10 @@ Product READY unchanged.
    `handleRequest`). **Keep** rehydrate `finally close()`
    (cycle 216: after `resolveJson` it is leftover
    `_streamMapping` cleanup and cannot hang; skipping it
-   after resolved JSON does not leak Express). Wrap stays
+   after resolved JSON does not leak Express). Do **not**
+   treat `mcpShutdown` as `generate_image` cancel (cycle 217:
+   `_onclose` does not abort; handler ignores `extra`; mcpFetch
+   abort is timeout-only). Wrap stays
    in `mcpServerCore`. Do
    **not** edit `slack.ts`
    (#2393).

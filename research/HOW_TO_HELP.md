@@ -75,5 +75,7 @@ triggers GET `streamController.close()`; Hono then
 covered; do not `sessions.set` that JSON transport (cycle 215).
 Keep rehydrate `finally close()` after `handleRequest` returns
 (cycle 216: leftover `_streamMapping`; cannot hang).
+`mcpShutdown` is not `generate_image` cancel (cycle 217: the
+wait is the billed hop).
 That is the billed-image drain gate. Not A-007 packaging. Not persist
 (occupied `agentModeService.ts` / `app.ts` / `emma/tools.ts`).

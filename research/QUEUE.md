@@ -502,3 +502,9 @@ hang. Skipping it after resolved
 JSON does not leak Express. JSON
 on a reused transport would
 accumulate. A-006 stays discarded.
+Cycle 217: `mcpShutdown` never
+cancels `generate_image`. `_onclose`
+does not abort; CallTool ignores
+`extra`; mcpFetch abort is
+timeout-only. A-019 wait is the
+billed hop. A-006 stays discarded.

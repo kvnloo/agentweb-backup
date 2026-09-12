@@ -1199,6 +1199,21 @@ entry per POST — do not
 `enableJsonResponse` on the live
 Map. Not A-006.
 
+Cycle 217: **`mcpShutdown` never
+cancels `generate_image`.**
+`_onclose` does not abort
+`_requestHandlerAbortControllers`.
+Only `notifications/cancelled`
+does (`protocol.js` L169–175).
+CallTool is `async (request) =>`
+(`mcpServerCore.ts` L88) — no
+`extra`. mcpFetch abort is a
+5 min timer (`httpClient.ts`
+L204–208). `emmaApi` generate-image
+has no `req.on('close')`. Loopback
+is a different socket. The wait is
+the billed hop. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
