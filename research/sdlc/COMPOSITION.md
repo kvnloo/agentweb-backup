@@ -779,6 +779,16 @@ the mutate. `textToImage.create` L1394. Admin omitting
 Runway does not stop Emma/MCP from naming it. Not
 A-006.
 
+Cycle 169: **Azure `[0]` only.** L651 FormData one
+`image`. Logo is last after L477–485, so src+logo on
+gpt-image-2 drops the logo. Gemini 3 / Runway iterate.
+Hermes `_prepare_fal_request` L365 raises. Not A-006.
+
+Cycle 170: **Default comment is the capability table.**
+L492–494. `getImageApiDefaultModel` returns undefined so
+this assignment is the unspecified path. Q-003 mapper
+does not have to change it. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

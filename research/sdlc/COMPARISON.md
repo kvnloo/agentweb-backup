@@ -436,3 +436,11 @@ reverted. Do not copy that as A-006.
 - Cycle 168: Runway L1363 referenceImages from the mutated
   array; still textToImage.create. Admin no-Runway is
   not a capability gate. Not A-006.
+- Cycle 169: Azure /images/edits L651 inputImages[0] only.
+  Logo push last → edit+logo drops logo bytes, keeps
+  CRITICAL LOGO prompt. Hermes raises rather than drop.
+  Not A-006.
+- Cycle 170: L492 Gemini 3 default “supports multiple input
+  images.” Q-003 cheaper gpt-image-2 default would land
+  unspecified on that drop. Mapper stays ready; flip stays
+  Matt-gated. Not A-006.

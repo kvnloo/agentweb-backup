@@ -564,6 +564,14 @@ a confirm on a typo.
 Cycle 168: **Runway does not drop the mutation.** L1363
 `referenceImages` from `params.inputImages`. Admin
 omitting Runway is a default-picker subset, not a gate.
+Cycle 169: **Azure `/images/edits` uses `[0]` only.**
+L651. Logo is pushed last, so edit+logo on gpt-image-2
+drops the logo bytes and keeps CRITICAL LOGO in the
+prompt. Hermes raises rather than silently dropping.
+Cycle 170: **L492 already documents why the default is
+not `gpt-image-2`.** “supports multiple input images.”
+Q-003 mapper stays ready; the prod default flip stays
+Matt-gated for this reason, not only $/rank.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

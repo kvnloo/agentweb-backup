@@ -306,6 +306,11 @@ Cycle 167: HITL before leaf Invalid imageModel. Product
 READY unchanged.
 Cycle 168: Runway honors mutated inputImages as
 referenceImages. Product READY unchanged.
+Cycle 169: Azure edits uses inputImages[0] only;
+logo-at-end drops. Product READY unchanged.
+Cycle 170: L492 Gemini 3 default is because multi-input;
+Q-003 default flip stays Matt-gated. Product READY
+unchanged.
 
 ## First SDLC coding (only after product unlock, and not instead of Q-014)
 
