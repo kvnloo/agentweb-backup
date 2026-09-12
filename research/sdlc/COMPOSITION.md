@@ -576,6 +576,10 @@ Inline `search_knowledge_base` (L129–150) → Emma
 `searchPlatformKnowledgeBase` (`chatbotService.ts` L4711).
 Two god-objects, one turn, no HTTP.
 
+Cycle 140: **the KB helper is a leaf; the file cycles.**
+Function L4711–4867 is Vertex-only. `chatbotService.ts` L24
+↔ `agentModeService.ts` L26. A-002 does not cover this.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`

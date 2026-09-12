@@ -257,4 +257,7 @@ shares `callLLM` in this process. A-006 stays discarded.
 Cycle 139: Growth Genius is a fifth in-process catalog
 (inline `search_knowledge_base` + Emma KB). A-006 stays
 discarded.
+Cycle 140: `searchPlatformKnowledgeBase` is a leaf trapped in
+a file that cycles with `agentModeService`. A-006 stays
+discarded.
 Q-001 / Q-014 / Q-003 stay ready.

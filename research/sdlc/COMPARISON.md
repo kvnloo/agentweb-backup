@@ -340,3 +340,5 @@ reverted. Do not copy that as A-006.
   this process. Not A-006.
 - Cycle 139: Growth Genius is a fifth in-process catalog
   (inline search_knowledge_base + Emma KB). Not A-006.
+- Cycle 140: KB search is a leaf trapped in a file that
+  cycles with agentModeService. Not A-006.

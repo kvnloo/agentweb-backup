@@ -431,6 +431,10 @@ Cycle 139: **Growth Genius is a fifth in-process catalog.**
 Inline `search_knowledge_base` (`growthGeniusService.ts`
 L129–150) executes Emma’s `searchPlatformKnowledgeBase`
 (`chatbotService.ts` L4711). Two god-objects, one turn, no HTTP.
+Cycle 140: **the KB helper is a leaf; the file cycles.**
+Function L4711–4867 is Vertex-only. `chatbotService.ts` L24
+imports `AgentModeService`; `agentModeService.ts` L26 imports
+the leaf from that file. A-002 does not cover this.
 
 ### 4. Hermes / Oh My Pi vs this tree
 
