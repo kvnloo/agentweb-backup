@@ -275,4 +275,7 @@ discarded.
 Cycle 145: three TypeScript `searchKnowledgeBase` symbols;
 Emma’s export is Azure embeddings, not the Vertex leaf.
 A-006 stays discarded.
+Cycle 146: same `search_knowledge_base` name, three JSON
+schemas; GG requires `reason`. A-011 already parks this
+pattern for `generate_image`. A-006 stays discarded.
 Q-001 / Q-014 / Q-003 stay ready.

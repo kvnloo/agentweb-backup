@@ -460,6 +460,10 @@ export L4674 is Azure embeddings over in-memory docs
 (`findRelevantChunks` L515). Agent Mode L24032 is the
 superset. Growth Genius L66 is Vertex-only and requires
 `reason` on the inline tool. Hermes: one name, one handler.
+Cycle 146: **three JSON schemas for that name.** GG L147
+requires `query`+`reason`. Emma L5590 and MCP L1275 require
+`query` only and have `max_results`. A-011 already parks
+this pattern for `generate_image`. Do not add A-021.
 
 ### 4. Hermes / Oh My Pi vs this tree
 

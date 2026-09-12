@@ -7,19 +7,19 @@ branch: cursor/research-loop-c95b
 coding_unlocked: true
 briefing_ready: true
 initialization_complete: true
-cycles_completed: 145
+cycles_completed: 146
 target_cycles: 7
 stop_after: 2026-09-12T06:00:00Z
-next_cycle: 146
+next_cycle: 147
 focus: architecture-sdlc-modular-monolith
 next_focus_hint: |
-  Cycle 145: three TypeScript searchKnowledgeBase symbols;
-  Emma’s export is Azure embeddings over in-memory docs.
-  Cycle 146: cheapest remaining. Candidate: Growth Genius
-  inline search_knowledge_base requires reason (L142-147);
-  Emma and MCP do not. Same name, three schemas. Do not
-  un-ready Q-001 / Q-014 / Q-003. Do not revive A-006. If
-  stop_after passes, unsubscribe agentweb-research-cycle.
+  Cycle 146: same search_knowledge_base name, three JSON
+  schemas; GG requires reason. Cycle 147: cheapest remaining.
+  Candidate: GG logs reason (L174) and never passes it to
+  searchKnowledgeBase(query, userId) (L177). Required field
+  is prompt-only. Do not un-ready Q-001 / Q-014 / Q-003. Do
+  not revive A-006. If stop_after passes, unsubscribe
+  agentweb-research-cycle.
 timer_name: agentweb-research-cycle
 product_queue_frozen: true
 ```

@@ -357,3 +357,6 @@ reverted. Do not copy that as A-006.
   Emma export is Azure embeddings over in-memory docs;
   Agent Mode is the Drive/ClickUp superset; Growth Genius
   is Vertex-only. Hermes: one name, one handler. Not A-006.
+- Cycle 146: three JSON schemas for search_knowledge_base.
+  GG requires reason; Emma/MCP require query only. A-011
+  already parks this pattern for generate_image. Not A-006.

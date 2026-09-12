@@ -255,6 +255,9 @@ Cycle 145: three TypeScript `searchKnowledgeBase` symbols.
 Emma L4674 is Azure embeddings; Agent Mode L24032 is the
 superset; Growth Genius L66 is Vertex-only. Do not add
 A-021.
+Cycle 146: three JSON schemas for `search_knowledge_base`.
+GG requires `reason`; Emma/MCP require `query` only. A-011
+already parks this for `generate_image`. Do not add A-021.
 The listed face is a
 **thinner** schema than Emma’s in-app tool (cycle 39: no `confirm`,
 `emmaApi.ts` L181) and a **different catalog** (cycle 47).

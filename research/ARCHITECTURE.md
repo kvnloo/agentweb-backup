@@ -520,6 +520,9 @@ capped the leaf; L24062 comment is stale. A-006 discarded.
 Cycle 145: three TypeScript `searchKnowledgeBase` symbols;
 Emma’s export is Azure embeddings, not the Vertex leaf.
 A-006 discarded.
+Cycle 146: same `search_knowledge_base` name, three JSON
+schemas; GG requires `reason`. A-011 already parks this
+pattern for `generate_image`. A-006 discarded.
 Map: `research/sdlc/A-007-split-map.md`.
 Folder map: `research/sdlc/MODULE_MAP.md`. Services DAG:
 `research/sdlc/SERVICES_DAG.md`. Full thesis: `research/sdlc/THESIS.md`.

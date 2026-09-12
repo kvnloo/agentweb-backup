@@ -618,6 +618,12 @@ the superset (MCP `emmaApi.ts` L101). Growth Genius L66 is
 Vertex-only; inline schema L142–147 requires `reason`.
 Hermes/OMP: one name, one handler. Not A-006.
 
+Cycle 146: **three JSON schemas for that name.** GG L147
+requires `query`+`reason`. Emma L5590 and MCP L1275 require
+`query` only + `max_results`. Agent Mode test L66–74 pins
+Emma’s shape. A-011 already parks this pattern for
+`generate_image`. Do not add A-021. Not A-006.
+
 Quota is **not** in `generateImage` (cycle 40). MCP’s HTTP hop skipped
 the controller gate, so ENG-973 attached `requireEmmaTokenBudget` at
 `emmaApi.ts` L16–21. `POST /generate-image` is `metered`
