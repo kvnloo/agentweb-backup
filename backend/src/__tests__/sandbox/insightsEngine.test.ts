@@ -1,4 +1,4 @@
-import { runInsights, createInsightsReport, getInsightsReportStatus, getInsightsReportRows, __resetInsightsReportsForTests } from '../../services/sandbox/insightsEngine';
+import { runInsights, createInsightsReport, getInsightsReportStatus, getInsightsReportRows, parseInsightsParams, __resetInsightsReportsForTests } from '../../services/sandbox/insightsEngine';
 import { computeShiftDays } from '../../services/sandbox/dateShift';
 import { EMPTY_OVERLAY } from '../../services/sandbox/types';
 import { buildFixtureDataset, fixtureTotal, fixtureActionTotal, FIXTURE_IDS, FIXTURE_ACCOUNT_ID, AGE_GENDER_BUCKETS } from './fixtures/fixtureDataset';
@@ -105,6 +105,21 @@ describe('insights engine — sync', () => {
     const overlay = { ...EMPTY_OVERLAY, campaigns: { '120210000000009999': { ...dataset.campaigns[0], id: '120210000000009999', name: 'Candidate campaign' } } };
     const res = runInsights(dataset, overlay, params({ level: 'campaign', fields: ['campaign_id'], datePreset: 'maximum' }), shift, now);
     expect(res.data.some((r: any) => r.campaign_id === '120210000000009999')).toBe(false);
+  });
+
+  it("accepts real Meta's single-quoted time_range shape, exactly as routes/meta.ts and agentModeService.ts build it for a real account (ENG-1912 production proof)", () => {
+    const parsed = parseInsightsParams(
+      { time_range: "{'since':'2026-08-01','until':'2026-08-31'}", fields: 'spend' },
+      { kind: 'account', id: FIXTURE_ACCOUNT_ID },
+    );
+    expect(parsed.timeRange).toEqual({ since: '2026-08-01', until: '2026-08-31' });
+  });
+
+  it('still rejects genuinely malformed time_range, not just any single-quoted string', () => {
+    expect(() => parseInsightsParams(
+      { time_range: "{'since':'not-a-date','until':'2026-08-31'}", fields: 'spend' },
+      { kind: 'account', id: FIXTURE_ACCOUNT_ID },
+    )).toThrow(/time_range/);
   });
 });
 
