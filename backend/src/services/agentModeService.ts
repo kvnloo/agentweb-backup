@@ -449,6 +449,7 @@ import {
   computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
+import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
@@ -21280,13 +21281,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         accountId: gateCreds.accountId,
         resolver: metaService,
       });
+      // ENG-1909: undefined for any real account (byte-for-byte unchanged gate call —
+      // `preflightMetaTrackingGate`'s `deps.fetchHtml ?? defaultFetchHtml` falls back to the
+      // real fetcher); for a sandbox account, answers destination checks from its own frozen
+      // dataset instead of making a real outbound fetch to a fictional/example.invalid URL.
+      const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
       const gate = await runMetaTrackingGate(
         gateCreds,
         gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
-        {},
+        { fetchHtml: sandboxFetchHtml },
         // Activating one ad is judged on that ad's own destination, not its siblings'.
         entity_type === 'AD' ? ad_id : undefined,
         /*
@@ -22241,12 +22247,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        */
       if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
         const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        // ENG-1909: see the comment at the callMetaMarketingApi call site above — undefined
+        // (real fetch, unchanged) for any real account, dataset-backed for a sandbox one.
+        const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
         const gate = await runMetaTrackingGate(
           gateCreds,
           args.campaign_id,
           `${workflow.toUpperCase()}_LAUNCH`,
           args?.override_tracking_check === true,
           args?.session_id,
+          { fetchHtml: sandboxFetchHtml },
         );
         if (!gate.proceed) return gate.blockResult;
       }
