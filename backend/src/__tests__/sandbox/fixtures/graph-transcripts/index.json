@@ -3,7 +3,7 @@
   "recordedAt": "2026-09-13T00:19:30.596Z",
   "graphVersion": "v25.0",
   "accountClass": "agentweb-own-ad-account",
-  "sanitization": "ids remapped deterministically, names/urls replaced, tokens and trace ids removed",
+  "sanitization": "ids remapped deterministically (values and URL paths), names/urls replaced, paging cursors and image hashes synthetic, tokens and trace ids removed",
   "fixtures": [
     {
       "name": "me-adaccounts",

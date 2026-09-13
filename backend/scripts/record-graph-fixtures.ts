@@ -48,7 +48,15 @@ function fakeId(real: string): string {
 const ID_KEYS = new Set(['id', 'account_id', 'campaign_id', 'adset_id', 'ad_id', 'creative_id', 'report_run_id', 'page_id', 'user_id', 'pixel_id', 'business_id', 'custom_conversion_id', 'instagram_actor_id', 'object_story_id', 'target_ids', 'video_id']);
 const NAME_KEYS = new Set(['name', 'campaign_name', 'adset_name', 'ad_name', 'account_name', 'title', 'body', 'message', 'caption', 'description']);
 const URL_KEYS = new Set(['link', 'link_url', 'url', 'image_url', 'thumbnail_url', 'picture', 'website_url', 'next', 'previous']);
-let nameCounter = 0; let assetCounter = 0;
+/** Real paging cursors base64-encode the first/last object id of the page — a decoded cursor is a leak. */
+const CURSOR_KEYS = new Set(['before', 'after']);
+let nameCounter = 0; let assetCounter = 0; let cursorCounter = 0;
+const hashMap = new Map<string, string>();
+/** Real image hashes name assets in the recording account; synthetic hex keeps the shape. */
+function fakeHash(real: string): string {
+  if (!hashMap.has(real)) hashMap.set(real, (hashMap.size + 1).toString(16).padStart(32, 'ab'));
+  return hashMap.get(real)!;
+}
 function sanitize(value: unknown, key = ''): unknown {
   if (Array.isArray(value)) return value.map(v => sanitize(v, key));
   if (value && typeof value === 'object') {
@@ -65,9 +73,12 @@ function sanitize(value: unknown, key = ''): unknown {
     if (value.startsWith('EAA') && value.length > 40) return 'removed';
     if (ID_KEYS.has(key) && /^\d{5,}$/.test(value)) return fakeId(value);
     if (key === 'id' && /^act_\d+$/.test(value)) return `act_${fakeId(value.slice(4))}`;
+    if (CURSOR_KEYS.has(key)) return Buffer.from(`sanitized-cursor-${++cursorCounter}`).toString('base64');
+    if (key === 'image_hash') return fakeHash(value);
     if (URL_KEYS.has(key) || /^https?:\/\//.test(value)) {
       if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(value) || key === 'image_url' || key === 'thumbnail_url' || key === 'picture') return `https://example.invalid/asset/${++assetCounter}.jpg`;
-      try { return `https://example.invalid${new URL(value).pathname}`; } catch { return 'https://example.invalid/'; }
+      // The path of a paging URL carries the ad account id (…/act_<id>/adcreatives); remap it too.
+      try { return `https://example.invalid${sanitizePath(new URL(value).pathname)}`; } catch { return 'https://example.invalid/'; }
     }
     if (NAME_KEYS.has(key)) return `${key === 'title' ? 'Headline' : key === 'body' || key === 'message' ? 'Primary text' : 'Object'} ${++nameCounter}`;
     if (/^\d{5,}$/.test(value) && idMap.has(value)) return idMap.get(value)!;
@@ -103,9 +114,25 @@ async function graph(method: 'GET' | 'POST', p: string, query: Record<string, st
   const body = await res.json();
   return { status: res.status, body };
 }
+/**
+ * Belt and braces over the structural sanitizer: a run of 9+ digits outside the synthetic
+ * 1200… range inside ANY string (a bare id, an act_ id, a URL path, a PAGE_POST compound id)
+ * is a real object id. Refuse to write the fixture rather than ship it.
+ */
+function assertNoRealIds(value: unknown, name: string): void {
+  if (Array.isArray(value)) return value.forEach(v => assertNoRealIds(v, name));
+  if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).forEach(v => assertNoRealIds(v, name));
+  if (typeof value === 'string') {
+    for (const run of value.match(/\d{9,}/g) || []) {
+      if (!run.startsWith('1200')) throw new Error(`${name}: unsanitized id ${run} in "${value.slice(0, 80)}" — fixture not written`);
+    }
+  }
+}
 function write(name: string, kind: Fixture['kind'], method: 'GET' | 'POST', p: string, query: Record<string, string>, status: number, body: unknown) {
   const file = `${name}.json`;
-  fs.writeFileSync(path.join(outDir, file), JSON.stringify({ request: { method, path: sanitizePath(p), query: sanitize(stripSecrets(query)) }, status, body: sanitize(body) }, null, 2));
+  const fixture = { request: { method, path: sanitizePath(p), query: sanitize(stripSecrets(query)) }, status, body: sanitize(body) };
+  assertNoRealIds(fixture, name);
+  fs.writeFileSync(path.join(outDir, file), JSON.stringify(fixture, null, 2));
   fixtures.push({ name, file, kind });
   console.log(`recorded ${name}`);
 }
@@ -162,7 +189,7 @@ async function record(name: string, kind: Fixture['kind'], method: 'GET' | 'POST
   }
   fs.writeFileSync(path.join(outDir, 'index.json'), JSON.stringify({
     source: 'real-account', recordedAt: new Date().toISOString(), graphVersion: 'v25.0',
-    accountClass: 'agentweb-own-ad-account', sanitization: 'ids remapped deterministically, names/urls replaced, tokens and trace ids removed',
+    accountClass: 'agentweb-own-ad-account', sanitization: 'ids remapped deterministically (values and URL paths), names/urls replaced, paging cursors and image hashes synthetic, tokens and trace ids removed',
     fixtures, ...(failures.length ? { notRecorded: failures } : {}),
   }, null, 2));
   console.log(`wrote ${fixtures.length} fixtures + index.json to ${outDir}${failures.length ? `; NOT recorded: ${failures.join(', ')}` : ''}`);

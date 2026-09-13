@@ -76,8 +76,15 @@ describe('recorded Graph transcripts', () => {
       // Graph ids are numeric strings; the ad account node alone is prefixed act_.
       if (NUMERIC_ID_KEYS.has(key)) { expect(typeof v).toBe('string'); expect(v).toMatch(/^(act_)?\d+$/); }
       if (METRIC_KEYS.has(key) || (key === 'value' && ACTION_LISTS.has(parent))) expect(typeof v).toBe('string');
-      // Sanitization held: every object id was remapped onto the synthetic 1200… range.
-      if (typeof v === 'string' && /^(act_)?\d{9,}$/.test(v)) expect(v.replace(/^act_/, '')).toMatch(/^1200/);
+    });
+    // Sanitization held over the whole transcript, request path included: every 9+ digit run
+    // inside ANY string (a bare id, an act_ id, a paging URL path, a PAGE_POST compound id) was
+    // remapped onto the synthetic 1200… range. Numbers (epoch timestamps) are not ids.
+    walk({ request: t.request, body: t.body }, (key, v) => {
+      if (typeof v !== 'string') return;
+      for (const run of v.match(/\d{9,}/g) || []) expect(run).toMatch(/^1200/);
+      // Real paging cursors base64-encode object ids; a recorded cursor must be the synthetic marker.
+      if (key === 'before' || key === 'after') expect(Buffer.from(v, 'base64').toString('utf8')).toMatch(/^sanitized-cursor-\d+$/);
     });
     // Sanitization held: no token-looking strings, no real domains, no trace ids, no addresses.
     const raw = JSON.stringify(t.body);
