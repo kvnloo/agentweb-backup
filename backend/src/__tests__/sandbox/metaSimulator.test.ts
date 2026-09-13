@@ -25,7 +25,7 @@ describe('meta simulator router', () => {
     expect(res.headers['content-type']).toBe('application/json');
     expect(JSON.parse(res.headers['x-business-use-case-usage'])).toEqual({ [FIXTURE_ACCOUNT_ID]: [expect.objectContaining({ type: 'ads_management', call_count: 1 })] });
     expect(body(res).data).toHaveLength(3);
-    expect(d.loadDataset).toHaveBeenCalledWith('fixture-agentweb', 1);
+    expect(d.loadDataset).toHaveBeenCalledWith('fixture-agentweb', 1, 'eval_fixture');
     expect(d.loadOverlay).toHaveBeenCalledWith('eval_fixture');
   });
   it('a principal without an active policy gets an OAuth 190 error, never data', async () => {
@@ -74,4 +74,17 @@ describe('meta simulator router', () => {
     const b = await sim.handle({ ...req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, { fields: 'id' }), version: 'v25.0' });
     expect(body(a)).toEqual(body(b));
   });
+});
+
+test('records successful reads and refused writes, failing closed if audit cannot persist', async () => {
+  const recordAction = jest.fn(async () => {});
+  const sim = createMetaSimulator({ ...deps(), recordAction });
+  const read = req('me');
+  const response = await sim.handle(read);
+  expect(recordAction).toHaveBeenLastCalledWith(read, response, now());
+  const write = req('123', {}, 'DELETE');
+  const denied = await sim.handle(write);
+  expect(recordAction).toHaveBeenLastCalledWith(write, denied, now());
+  recordAction.mockRejectedValueOnce(new Error('audit unavailable'));
+  expect((await sim.handle(read)).status).toBe(500);
 });

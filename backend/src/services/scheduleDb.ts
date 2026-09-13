@@ -1,3 +1,4 @@
+import { writeWithEvaluationGuard } from './evaluationPersistence';
 import { DynamoDB } from 'aws-sdk';
 import { DocumentClient } from 'aws-sdk/clients/dynamodb';
 
@@ -28,10 +29,10 @@ export interface Schedule {
 export const scheduleDb = {
   async createSchedule(schedule: Schedule): Promise<void> {
     try {
-      await dynamodb.put({
+      await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: {
         TableName: SCHEDULES_TABLE,
         Item: schedule
-      }).promise();
+      } });
     } catch (error) {
       console.error('Error creating schedule in DynamoDB:', error);
       console.error('Schedule data:', JSON.stringify(schedule, null, 2));

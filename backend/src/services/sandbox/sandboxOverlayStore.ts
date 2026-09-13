@@ -1,3 +1,4 @@
+import { activeEvaluationCondition } from '../evaluationPersistence';
 import AWS from 'aws-sdk';
 import { randomUUID } from 'crypto';
 import { EvaluationDenied, isEvaluationUser } from '../evaluationPolicy';
@@ -11,8 +12,8 @@ import { EMPTY_OVERLAY, SandboxOverlay } from './types';
  *
  * Optimistic concurrency, same shape as settingsService.ts's setSettingIfValueMatches (ENG-965):
  * read the current revision, compute the next overlay, write conditioned on the exact revision
- * just read. A ConditionalCheckFailedException means another write landed first — the read was
- * stale, so retry from a fresh read rather than trusting it.
+ * just read, transactionally fenced by the root evaluation. An overlay condition failure means
+ * the read was stale; a root condition failure denies the mutation without retrying.
  */
 export interface SandboxOverlayStore {
   /** Returns EMPTY_OVERLAY (revision 0) when no row exists yet — never null, never throws for a missing row. */
@@ -38,9 +39,15 @@ export class SandboxOverlayMutationFailed extends Error {
 
 const MAX_RETRIES = 5;
 
-function isConditionalCheckFailure(error: unknown): boolean {
-  const err = error as { code?: string; name?: string } | undefined;
-  return err?.code === 'ConditionalCheckFailedException' || err?.name === 'ConditionalCheckFailedException';
+function isOverlayConflict(error: unknown): boolean {
+  const err = error as { code?: string; CancellationReasons?: { Code?: string }[] };
+  if (err?.code === 'TransactionConflictException') return true;
+  if (err?.code !== 'TransactionCanceledException' || !Array.isArray(err.CancellationReasons)) return false;
+  const [root, overlay] = err.CancellationReasons;
+  if (root?.Code === 'ConditionalCheckFailed') throw new EvaluationDenied();
+  return err.CancellationReasons.every(reason => reason?.Code === 'None' || reason?.Code === 'TransactionConflict' ||
+    (reason === overlay && reason.Code === 'ConditionalCheckFailed')) &&
+    err.CancellationReasons.some(reason => reason?.Code === 'TransactionConflict' || reason?.Code === 'ConditionalCheckFailed');
 }
 
 class DynamoSandboxOverlayStore implements SandboxOverlayStore {
@@ -71,13 +78,17 @@ class DynamoSandboxOverlayStore implements SandboxOverlayStore {
       const next = mutateFn(current);
       const item = { ...next, revision: current.revision + 1, evaluationKey: this.key(userId).evaluationKey, userId };
       try {
-        await this.db.put({
-          TableName: this.table, Item: item,
-          ConditionExpression: 'attribute_not_exists(evaluationKey) OR revision = :expected',
-          ExpressionAttributeValues: { ':expected': current.revision },
-        }).promise();
+        await this.db.transactWrite({ TransactItems: [
+          activeEvaluationCondition(userId, this.prefix),
+          { Put: {
+            TableName: this.table, Item: item,
+            ConditionExpression: current.revision === 0
+              ? 'attribute_not_exists(evaluationKey) OR revision = :expected' : 'revision = :expected',
+            ExpressionAttributeValues: { ':expected': current.revision },
+          } },
+        ] }).promise();
       } catch (error) {
-        if (isConditionalCheckFailure(error)) continue;
+        if (isOverlayConflict(error)) continue;
         throw error;
       }
       // The overlay write is what matters for correctness; a failed audit append is a

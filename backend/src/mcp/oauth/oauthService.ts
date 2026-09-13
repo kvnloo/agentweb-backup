@@ -1,3 +1,4 @@
+import { activeEvaluationCondition, isTransactionConditionFailure, writeWithEvaluationGuard } from '../../services/evaluationPersistence';
 import { isEvaluationUser, requireActiveEvaluation } from '../../services/evaluationPolicy';
 /**
  * MCP OAuth 2.1 Service
@@ -248,10 +249,10 @@ export class McpOAuthService {
       createdAt: new Date().toISOString(),
     };
 
-    await dynamodb.put({
+    await writeWithEvaluationGuard(dynamodb, params.userId, TABLE_PREFIX, { Put: {
       TableName: this.codesTable,
       Item: record,
-    }).promise();
+    } });
 
     return { code };
   }
@@ -294,15 +295,15 @@ export class McpOAuthService {
     // The read alone cannot enforce single use: callback paste and the listener
     // can race. DynamoDB must elect one redeemer, including at the TTL boundary.
     try {
-      await dynamodb.update({
+      await writeWithEvaluationGuard(dynamodb, record.userId, TABLE_PREFIX, { Update: {
         TableName: this.codesTable,
         Key: { code },
         UpdateExpression: 'SET used = :used',
         ConditionExpression: conditions.join(' AND '),
         ExpressionAttributeValues: values,
-      }).promise();
+      } });
     } catch (error) {
-      if ((error as { code?: string }).code === 'ConditionalCheckFailedException') return null;
+      if ((error as { code?: string }).code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return null;
       throw error;
     }
 
@@ -314,7 +315,7 @@ export class McpOAuthService {
   async createTokenPair(params: CreateTokenPairParams): Promise<TokenPairResponse> {
     if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     const { record, response } = this.newTokenPair(params);
-    await dynamodb.put({ TableName: this.tokensTable, Item: record }).promise();
+    await writeWithEvaluationGuard(dynamodb, params.userId, TABLE_PREFIX, { Put: { TableName: this.tokensTable, Item: record } });
     if (isEvaluationUser(params.userId)) await requireActiveEvaluation(params.userId);
     return response;
   }
@@ -413,15 +414,15 @@ export class McpOAuthService {
   private async revokeFamily(record: OAuthTokenRecord): Promise<void> {
     if (!record.familyId) return; // Legacy consumed records have no recoverable lineage.
     try {
-      await this.retryTransactionConflict(() => dynamodb.update({
-        TableName: this.tokensTable, Key: { tokenHash: record.familyId },
+      await this.retryTransactionConflict(() => writeWithEvaluationGuard(dynamodb, record.userId, TABLE_PREFIX, { Update: {
+        TableName: this.tokensTable, Key: { tokenHash: record.familyId! },
         UpdateExpression: 'SET familyRevoked = :revoked',
         ConditionExpression: 'familyId = :familyId AND clientId = :clientId',
         ExpressionAttributeValues: { ':revoked': true, ':familyId': record.familyId, ':clientId': record.clientId },
-      }).promise());
+      } }));
     } catch (error) {
       // Missing root already disables every descendant; never recreate a TTL-deleted root.
-      if ((error as { code?: string }).code !== 'ConditionalCheckFailedException') throw error;
+      if ((error as { code?: string }).code !== 'ConditionalCheckFailedException' && !isTransactionConditionFailure(error)) throw error;
     }
   }
 
@@ -473,6 +474,7 @@ export class McpOAuthService {
         ExpressionAttributeValues: { ':unused': false, ':now': now },
       } });
     }
+    if (isEvaluationUser(record.userId)) TransactItems.push(activeEvaluationCondition(record.userId, TABLE_PREFIX));
     try {
       const transaction = { TransactItems, ClientRequestToken: uuidv4() };
       await this.retryTransactionConflict(() => dynamodb.transactWrite(transaction).promise());

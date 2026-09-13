@@ -1,3 +1,5 @@
+import { buildFixtureDataset } from './fixtures/fixtureDataset';
+import { sandboxAdAccountId } from '../../services/sandbox/sentinel';
 import { EvaluationDenied } from '../../services/evaluationPolicy';
 import * as metaSimulatorModule from '../../services/sandbox/metaSimulator';
 
@@ -14,6 +16,9 @@ jest.mock('../../services/evaluationPolicy', () => ({
   requireActiveEvaluation: (...args: unknown[]) => requireActiveEvaluation(...args),
 }));
 
+const loadOverlay = jest.fn(async () => ({ revision: 1 }));
+const recordAction = jest.fn(async () => {});
+jest.mock('../../services/sandbox/sandboxStateStore', () => ({ sandboxStateStore: { loadOverlay, recordAction } }));
 const loadDataset = jest.fn();
 jest.mock('../../services/sandbox/sandboxDatasetStore', () => ({
   getSandboxDatasetStore: () => ({ loadDataset }),
@@ -79,9 +84,9 @@ describe('the wired MetaSimulatorDeps', () => {
     await expect(install().loadPolicy('eval_x')).rejects.toThrow('DynamoDB is unavailable');
   });
 
-  it('loadDataset delegates to the dataset store', async () => {
-    loadDataset.mockResolvedValue({ account: { id: 'act_1207000000000001' } });
-    await expect(install().loadDataset('agentweb-2026q2', 1)).resolves.toEqual({ account: { id: 'act_1207000000000001' } });
+  it('loadDataset delegates to immutable store and projects the provisioned account', async () => {
+    loadDataset.mockResolvedValue(buildFixtureDataset());
+    await expect(install().loadDataset('agentweb-2026q2', 1, 'eval_x')).resolves.toMatchObject({ account: { id: `act_${sandboxAdAccountId('eval_x')}` } });
     expect(loadDataset).toHaveBeenCalledWith('agentweb-2026q2', 1);
   });
 
@@ -100,5 +105,13 @@ describe('the wired MetaSimulatorDeps', () => {
     const deps = install();
     await expect(deps.mutateOverlay!('eval_x', fn, audit)).resolves.toBe(EMPTY_OVERLAY);
     expect(mutate).toHaveBeenCalledWith('eval_x', fn, audit);
+  });
+
+  it('recordAction delegates to the durable sandbox audit store (ENG-1910)', async () => {
+    const req = { userId: 'eval_x' } as any;
+    const response = { status: 200 } as any;
+    const at = new Date('2026-09-13T00:00:00Z');
+    await install().recordAction!(req, response, at);
+    expect(recordAction).toHaveBeenCalledWith(req, response, at);
   });
 });

@@ -9,11 +9,12 @@ const USER = 'eval_0f1e2d3c-1111-4222-8333-444455556666';
 
 function fakeDb() {
   const items = new Map<string, any>();
+  items.set(`evaluation/${USER}`, { userId: USER, status: 'active', expiresAt: Date.now() + 3600000 });
   const put = jest.fn((params: any) => ({ promise: async () => {
     const current = items.get(params.Item.evaluationKey);
-    if (params.ConditionExpression === 'attribute_not_exists(evaluationKey) OR revision = :expected') {
+    if (params.ConditionExpression?.includes('revision = :expected')) {
       const expected = params.ExpressionAttributeValues[':expected'];
-      if (current && current.revision !== expected) {
+      if ((current && current.revision !== expected) || (!current && params.ConditionExpression === 'revision = :expected')) {
         throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
       }
     }
@@ -24,7 +25,21 @@ function fakeDb() {
     return {};
   } }));
   const get = jest.fn((params: any) => ({ promise: async () => ({ Item: items.get(params.Key.evaluationKey) }) }));
-  return { db: { put, get } as any, items, put, get };
+  const transactWrite = jest.fn((params: any) => ({ promise: async () => {
+    const [guard, write] = params.TransactItems;
+    const root = items.get(guard.ConditionCheck.Key.evaluationKey);
+    if (!root || root.status !== 'active' || root.lifecycleState !== undefined) throw conflict('ConditionalCheckFailed', 'None');
+    try { return await put(write.Put).promise(); } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') throw conflict();
+      throw error;
+    }
+  } }));
+  return { db: { put, get, transactWrite } as any, items, put, get };
+}
+
+function conflict(root = 'None', overlay = 'ConditionalCheckFailed') {
+  return Object.assign(new Error('conflict'), { code: 'TransactionCanceledException',
+    CancellationReasons: [{ Code: root }, { Code: overlay }] });
 }
 
 describe('sandbox overlay store', () => {
@@ -56,12 +71,12 @@ describe('sandbox overlay store', () => {
   it('a genuine CAS race retries from a fresh read and both mutations end up applied', async () => {
     const { db } = fakeDb();
     const store = getSandboxOverlayStore(db);
-    // Simulate a race: the second mutate's `put` call is made to fail exactly once (as if
+    // Simulate a race: the second mutate's transaction is made to fail exactly once (as if
     // another writer's put landed between this store's read and write), forcing a retry that
     // re-reads the row the first mutation already wrote.
     let putCalls = 0;
-    const originalPut = db.put;
-    (db as any).put = jest.fn((params: any) => {
+    const originalPut = db.transactWrite;
+    (db as any).transactWrite = jest.fn((params: any) => {
       putCalls++;
       if (putCalls === 1) {
         // Let mutation A's put go through for real.
@@ -69,7 +84,7 @@ describe('sandbox overlay store', () => {
       }
       if (putCalls === 2) {
         // Mutation B's FIRST attempt: reject as if A's write landed first.
-        return { promise: async () => { throw Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' }); } };
+        return { promise: async () => { throw conflict(); } };
       }
       return originalPut(params);
     });
@@ -80,12 +95,13 @@ describe('sandbox overlay store', () => {
     // B's retry re-read A's committed state, so both mutations' effects are present.
     expect(resultB.campaigns).toEqual({ a: { id: 'a' } });
     expect(resultB.adsets).toEqual({ b: { id: 'b' } });
+    expect(db.transactWrite).toHaveBeenCalledTimes(3);
     expect(resultB.revision).toBe(2); // A committed at revision 1; B's retry re-read that and committed at 2.
   });
 
   it('exhausting all retries throws SandboxOverlayMutationFailed', async () => {
     const { db } = fakeDb();
-    (db as any).put = jest.fn(() => ({ promise: async () => { throw Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' }); } }));
+    (db as any).transactWrite = jest.fn(() => ({ promise: async () => { throw conflict(); } }));
     const store = getSandboxOverlayStore(db);
     await expect(store.mutate(USER, (current) => current)).rejects.toThrow(SandboxOverlayMutationFailed);
   });
@@ -93,7 +109,7 @@ describe('sandbox overlay store', () => {
   it('a non-conditional-check error propagates immediately, without retrying', async () => {
     const { db } = fakeDb();
     const put = jest.fn(() => ({ promise: async () => { throw new Error('DynamoDB is unavailable'); } }));
-    (db as any).put = put;
+    (db as any).transactWrite = put;
     const store = getSandboxOverlayStore(db);
     await expect(store.mutate(USER, (current) => current)).rejects.toThrow('DynamoDB is unavailable');
     expect(put).toHaveBeenCalledTimes(1);
@@ -122,7 +138,7 @@ describe('sandbox overlay store', () => {
     const originalPut = db.put;
     (db as any).put = jest.fn((params: any) => {
       putCalls++;
-      if (putCalls === 2) return { promise: async () => { throw new Error('audit table unavailable'); } }; // the audit put
+      if (putCalls === 1) return { promise: async () => { throw new Error('audit table unavailable'); } }; // the audit put
       return originalPut(params);
     });
     const store = getSandboxOverlayStore(db);
@@ -133,4 +149,33 @@ describe('sandbox overlay store', () => {
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });
+});
+
+it('a lifecycle denial is not retried as overlay contention', async () => {
+  const { db } = fakeDb();
+  db.transactWrite.mockImplementation(() => ({ promise: async () => { throw conflict('ConditionalCheckFailed', 'None'); } }));
+  await expect(getSandboxOverlayStore(db).mutate(USER, current => current)).rejects.toThrow('Evaluation access denied');
+  expect(db.transactWrite).toHaveBeenCalledTimes(1);
+});
+
+it('a reset deleting an existing overlay cannot accept its stale revision', async () => {
+  const { db, items } = fakeDb();
+  const store = getSandboxOverlayStore(db);
+  await store.mutate(USER, current => ({ ...current, nextId: 20 }));
+  const inputs: number[] = [];
+  const result = await store.mutate(USER, current => {
+    inputs.push(current.nextId);
+    if (inputs.length === 1) items.delete(`evaluation/${USER}/sim`);
+    return { ...current, nextId: current.nextId + 1 };
+  });
+  expect(inputs).toEqual([20, EMPTY_OVERLAY.nextId]);
+  expect(result.nextId).toBe(EMPTY_OVERLAY.nextId + 1);
+  expect(result.revision).toBe(1);
+});
+
+it('transaction infrastructure errors do not become retryable CAS failures', async () => {
+  const { db } = fakeDb();
+  db.transactWrite.mockImplementation(() => ({ promise: async () => { throw conflict('None', 'ValidationError'); } }));
+  await expect(getSandboxOverlayStore(db).mutate(USER, current => current)).rejects.toMatchObject({ code: 'TransactionCanceledException' });
+  expect(db.transactWrite).toHaveBeenCalledTimes(1);
 });

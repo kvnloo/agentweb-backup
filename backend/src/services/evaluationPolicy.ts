@@ -72,7 +72,7 @@ export function classifySandboxTool(name: string): string | null {
 export async function requireActiveEvaluation(userId: string) {
   const { evaluationStore } = await import('./evaluationStore');
   const record = await evaluationStore.get(userId);
-  if (!record || record.userId !== userId || record.status !== 'active' ||
+  if (!record || record.userId !== userId || record.status !== 'active' || record.lifecycleState !== undefined ||
       !Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) {
     throw new EvaluationDenied();
   }

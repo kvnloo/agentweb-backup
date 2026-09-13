@@ -28,9 +28,17 @@ evaluationAdminRoutes.post('/:userId/revoke', handler(async (req, res) => {
   await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
   res.json(await evaluationStore.revoke(req.user.userId, req.params.userId));
 }));
+for (const action of ['reset', 'purge'] as const) {
+  evaluationAdminRoutes.post(`/:userId/${action}`, handler(async (req, res) => {
+    await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
+    res.json(await evaluationStore[action](req.user.userId, req.params.userId));
+  }));
+}
 evaluationAdminRoutes.get('/:userId', handler(async (req, res) => {
   await requireEvaluationReviewer(req.user.userId, { delegateInfo: req.delegateInfo });
   const result = await evaluationStore.review(req.user.userId, req.params.userId);
   await requireEvaluationReviewer(req.user.userId, { delegateInfo: req.delegateInfo });
-  res.set('Cache-Control', 'no-store').json(result);
+  res.set('Cache-Control', 'no-store');
+  if (req.query.format === 'markdown') return res.type('text/markdown').send(result.markdown);
+  res.json(result);
 }));
