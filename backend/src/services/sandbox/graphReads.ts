@@ -505,7 +505,7 @@ class Reader {
       }
       case 'advideos': case 'saved_audiences': case 'customconversions': case 'adrules_library': case 'activities': case 'agencies': return ok(envelope([]));
       case 'adspixels': return this.list(this.dataset.pixels, (p) => this.views.pixel(p), undefined, ['id', 'name']);
-      case 'customaudiences': return this.list(this.dataset.customAudiences, (a) => this.views.audience(a), undefined, ['id', 'name']);
+      case 'customaudiences': return this.list([...this.objects.customAudiences.values()], (a) => this.views.audience(a), undefined, ['id', 'name']);
       case 'insights': return this.insights({ kind: 'account', id: account.account_id });
       case 'targetingsearch': case 'targetingbrowse': return ok(envelope(this.search({ ...this.q, type: this.q.type ?? 'adinterest' })));
       case 'promote_pages': return this.list(this.dataset.pages, (p) => this.views.page(p), undefined, ['id', 'name']);
