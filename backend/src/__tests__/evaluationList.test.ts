@@ -51,6 +51,20 @@ describe('evaluationStore.listAll (admin Sandbox Accounts list)', () => {
     errorSpy.mockRestore();
   });
 
+  it('skips a row with a non-string email instead of crashing the email sort for everyone', async () => {
+    const { db, items } = fakeDb();
+    items.set('evaluation/eval_good', { evaluationKey: 'evaluation/eval_good', userId: 'eval_good', email: 'good@example.invalid', status: 'active', expiresAt: 1 });
+    // A row whose email is present (passes the DynamoDB filter) but not a string — normalize()
+    // must reject this before listAll()'s final rows.sort(...localeCompare...), or one bad row
+    // throws for the entire admin list instead of just being skipped.
+    items.set('evaluation/eval_bad', { evaluationKey: 'evaluation/eval_bad', userId: 'eval_bad', email: 12345, status: 'active', expiresAt: 1 });
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const rows = await new EvaluationStore(db).listAll();
+    expect(rows.map(r => r.userId)).toEqual(['eval_good']);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('eval_bad'));
+    errorSpy.mockRestore();
+  });
+
   it('paginates across multiple scan pages transparently', async () => {
     const { db, items, scan } = fakeDb();
     for (let i = 0; i < 5; i++) {

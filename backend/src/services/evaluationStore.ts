@@ -169,6 +169,13 @@ export class EvaluationStore {
         const record = item as Record<string, unknown>;
         const userId = record.userId;
         if (typeof userId !== 'string' || record.evaluationKey !== `evaluation/${userId}`) continue; // not a root record
+        // A non-string email would otherwise reach the final rows.sort(...localeCompare...) below and
+        // throw for the WHOLE list, not just this row — check it here, before normalize(), so it is
+        // skipped-and-logged like any other malformed row instead of crashing every admin's request.
+        if (typeof record.email !== 'string' || !record.email) {
+          console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}: email is not a non-empty string`);
+          continue;
+        }
         try { rows.push(this.normalize(userId, record)); }
         catch (error) { console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}:`, error instanceof Error ? error.message : error); }
       }
