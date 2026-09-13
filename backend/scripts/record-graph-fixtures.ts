@@ -17,12 +17,21 @@ import * as path from 'path';
 const GRAPH = 'https://graph.facebook.com/v25.0';
 const token = process.env.META_FIXTURE_TOKEN;
 const accountId = process.env.META_FIXTURE_ACCOUNT;
-const outDir = process.argv[2];
-if (!token || !accountId || !outDir) {
+const outDirArg = process.argv[2];
+if (!token || !accountId || !outDirArg) {
   console.error('META_FIXTURE_TOKEN, META_FIXTURE_ACCOUNT and an output directory are required');
   process.exit(2);
 }
 if (!/^\d+$/.test(accountId)) { console.error('META_FIXTURE_ACCOUNT must be numeric'); process.exit(2); }
+// Resolve against and require inside the working directory: an absolute path or `..`
+// traversal in the output-dir argument would otherwise let mkdirSync/writeFileSync create
+// or overwrite files anywhere the invoking user can write.
+const cwd = process.cwd();
+const outDir = path.resolve(cwd, outDirArg);
+if (outDir !== cwd && !outDir.startsWith(cwd + path.sep)) {
+  console.error(`output directory must resolve inside the working directory (${cwd}); got ${outDir}`);
+  process.exit(2);
+}
 
 const CAMPAIGN_READ_FIELDS = 'id,name,status,objective,daily_budget,lifetime_budget,budget_remaining,spend_cap,bid_strategy,start_time,stop_time,effective_status,special_ad_categories';
 const AD_SET_READ_FIELDS = 'id,name,status,campaign_id,optimization_goal,billing_event,destination_type,promoted_object,bid_strategy,bid_amount,daily_budget,lifetime_budget,start_time,end_time,targeting';
@@ -36,12 +45,18 @@ const timeRange = JSON.stringify({ since: day(since), until: day(yesterday) });
 
 // ---- sanitization -------------------------------------------------------------------------
 const idMap = new Map<string, string>();
+/** Every synthetic id this run has ever produced — the exact allowlist the final write-time
+ *  check validates against, instead of merely checking for a "1200" prefix (which a real id
+ *  could theoretically also start with). */
+const syntheticIds = new Set<string>();
 let idCounter = 0;
 function fakeId(real: string): string {
   if (!idMap.has(real)) {
     idCounter += 1;
     const body = String(idCounter).padStart(Math.max(real.length - 4, 1), '0');
-    idMap.set(real, ('1200' + body).slice(0, Math.max(real.length, 5)).padEnd(Math.max(real.length, 5), '0'));
+    const synthetic = ('1200' + body).slice(0, Math.max(real.length, 5)).padEnd(Math.max(real.length, 5), '0');
+    idMap.set(real, synthetic);
+    syntheticIds.add(synthetic);
   }
   return idMap.get(real)!;
 }
@@ -71,10 +86,16 @@ function sanitize(value: unknown, key = ''): unknown {
   }
   if (typeof value === 'string') {
     if (value.startsWith('EAA') && value.length > 40) return 'removed';
-    if (ID_KEYS.has(key) && /^\d{5,}$/.test(value)) return fakeId(value);
+    // A compound id (Meta's `object_story_id` is `<page_id>_<post_id>`) is still all-real
+    // underneath; remap every 5+ digit run inside it rather than requiring the whole value
+    // to be purely digits, which only matched a bare id and let a compound one straight through.
+    if (ID_KEYS.has(key) && /\d{5,}/.test(value)) return value.replace(/\d{5,}/g, run => fakeId(run));
     if (key === 'id' && /^act_\d+$/.test(value)) return `act_${fakeId(value.slice(4))}`;
     if (CURSOR_KEYS.has(key)) return Buffer.from(`sanitized-cursor-${++cursorCounter}`).toString('base64');
     if (key === 'image_hash') return fakeHash(value);
+    // Click-tracking params (utm_*, fbclid, campaign/adset ids embedded in query strings) —
+    // wipe rather than attempt to parse; nothing downstream reads this field's content.
+    if (key === 'url_tags') return 'sanitized';
     if (URL_KEYS.has(key) || /^https?:\/\//.test(value)) {
       if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(value) || key === 'image_url' || key === 'thumbnail_url' || key === 'picture') return `https://example.invalid/asset/${++assetCounter}.jpg`;
       // The path of a paging URL carries the ad account id (…/act_<id>/adcreatives); remap it too.
@@ -115,16 +136,18 @@ async function graph(method: 'GET' | 'POST', p: string, query: Record<string, st
   return { status: res.status, body };
 }
 /**
- * Belt and braces over the structural sanitizer: a run of 9+ digits outside the synthetic
- * 1200… range inside ANY string (a bare id, an act_ id, a URL path, a PAGE_POST compound id)
- * is a real object id. Refuse to write the fixture rather than ship it.
+ * Belt and braces over the structural sanitizer: a run of 9+ digits inside ANY string (a
+ * bare id, an act_ id, a URL path, a compound PAGE_POST id) that is not one of the EXACT
+ * synthetic ids this run generated is a real object id. Checking the exact allowlist rather
+ * than a "1200" prefix means a real id that happened to start with 1200 can't slip past this
+ * check by coincidence. Refuse to write the fixture rather than ship it.
  */
 function assertNoRealIds(value: unknown, name: string): void {
   if (Array.isArray(value)) return value.forEach(v => assertNoRealIds(v, name));
   if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).forEach(v => assertNoRealIds(v, name));
   if (typeof value === 'string') {
     for (const run of value.match(/\d{9,}/g) || []) {
-      if (!run.startsWith('1200')) throw new Error(`${name}: unsanitized id ${run} in "${value.slice(0, 80)}" — fixture not written`);
+      if (!syntheticIds.has(run)) throw new Error(`${name}: unsanitized id ${run} in "${value.slice(0, 80)}" — fixture not written`);
     }
   }
 }
@@ -177,15 +200,23 @@ async function record(name: string, kind: Fixture['kind'], method: 'GET' | 'POST
   if (started?.report_run_id) {
     const rid = started.report_run_id as string;
     let done = false;
+    let endState = '';
     for (let i = 0; i < 30 && !done; i++) {
       const { body } = await graph('GET', rid, {});
       const state = (body as { async_status?: string }).async_status || '';
       if (state === 'Job Completed') done = true;
-      else if (/Failed|Skipped/.test(state)) { console.error(`async report ended in ${state}`); break; }
+      else if (/Failed|Skipped/.test(state)) { endState = state; console.error(`async report ended in ${state}`); break; }
       else await new Promise(r => setTimeout(r, 2000));
     }
     await record('insights-async-status', 'report', 'GET', rid, {});
-    if (done) await record('insights-async-rows', 'insights', 'GET', `${rid}/insights`, { limit: '5000' });
+    if (done) {
+      await record('insights-async-rows', 'insights', 'GET', `${rid}/insights`, { limit: '5000' });
+    } else {
+      // A Failed/Skipped/timed-out report leaves the parity suite without an
+      // insights-async-rows fixture — record that as a real failure (exit 3 below)
+      // rather than letting the run report success with a silently missing fixture.
+      failures.push(`insights-async-rows (${endState || 'timed out'})`);
+    }
   }
   fs.writeFileSync(path.join(outDir, 'index.json'), JSON.stringify({
     source: 'real-account', recordedAt: new Date().toISOString(), graphVersion: 'v25.0',
