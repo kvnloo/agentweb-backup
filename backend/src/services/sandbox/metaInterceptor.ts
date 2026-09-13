@@ -226,7 +226,11 @@ function wrapRequest(state: Installed, protocol: 'http:' | 'https:', original: R
         options = second && typeof second === 'object' ? second : undefined;
         callback = typeof second === 'function' ? second : typeof third === 'function' ? third : undefined;
       } else if (first && typeof first === 'object') {
-        options = first;
+        // Cast (not a plain assignment): `first` is `any` from the rest-args destructure, and
+        // assigning an `any`-typed value doesn't narrow away `undefined` on the declared
+        // `http.RequestOptions | undefined` — the `typeof first === 'object'` guard above already
+        // proved it's a real object, so the cast is just telling the checker what we just checked.
+        options = first as http.RequestOptions;
         callback = typeof second === 'function' ? second : undefined;
         const host = options.hostname || options.host || '';
         const proto = options.protocol || protocol;

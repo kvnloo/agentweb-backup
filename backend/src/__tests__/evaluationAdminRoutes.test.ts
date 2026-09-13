@@ -44,7 +44,7 @@ describe('ENG-1907 sandbox admin routes', () => {
     expect(result.body.error).toContain('ensure-sandbox-tier');
   });
   it('a missing pinned dataset is reported as a precondition failure too (ENG-1908)', async () => {
-    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxDatasetMissing());
+    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxDatasetMissing('agentweb-2026q2', 1));
     const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
     expect(result.status).toBe(412);
     expect(result.body.error).toContain('agentweb-2026q2@1');
