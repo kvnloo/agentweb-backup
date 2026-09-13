@@ -36,6 +36,7 @@ import {
 } from './services/onboardingTelemetry';
 import { createFathomLinearPort } from './services/fathomLinearProductionPort';
 import { registerFathomLinearPort } from './services/fathomLinearPortRegistry';
+import { installSandboxMetaInterceptorAtBoot } from './services/sandbox/bootstrap';
 
 dotenv.config();
 
@@ -577,6 +578,10 @@ createTestAccount().then(async () => {
       console.log('[server] Test runtime — background jobs not started (ENG-1286)');
       return;
     }
+
+    // Sandbox Graph calls must be intercepted before any background service can
+    // initialize a Meta client with the sentinel credential.
+    installSandboxMetaInterceptorAtBoot();
 
     // ENG-764: an EB deploy terminates this instance without waiting for the
     // drain, killing any in-flight scheduled run. Watch for the ASG's termination
