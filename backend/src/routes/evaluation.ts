@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { evaluationStore, SandboxDatasetMissing, SandboxTierMissing } from '../services/evaluationStore';
 import { EvaluationDenied, requireEvaluationAdmin, requireEvaluationReviewer } from '../services/evaluationPolicy';
+import { getSandboxDatasetStore } from '../services/sandbox/sandboxDatasetStore';
 
 function handler(fn: (req: AuthenticatedRequest, res: Response) => Promise<unknown>) {
   return (req: Request, res: Response, next: NextFunction) => { void fn(req as AuthenticatedRequest, res).catch(error => {
@@ -23,6 +24,17 @@ evaluationAdminRoutes.use(authenticateToken);
 evaluationAdminRoutes.post('/', handler(async (req, res) => {
   await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
   res.status(201).json(await evaluationStore.provision(req.user.userId, req.body));
+}));
+// Both literal routes below MUST stay registered before the trailing GET /:userId — Express
+// matches routes in registration order and :userId is a wildcard for any single segment,
+// so a later '/datasets' would be swallowed as a (nonexistent) userId lookup instead.
+evaluationAdminRoutes.get('/', handler(async (req, res) => {
+  await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
+  res.set('Cache-Control', 'no-store').json({ accounts: await evaluationStore.listAll() });
+}));
+evaluationAdminRoutes.get('/datasets', handler(async (req, res) => {
+  await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
+  res.set('Cache-Control', 'no-store').json({ datasets: await getSandboxDatasetStore().listDatasets() });
 }));
 evaluationAdminRoutes.post('/:userId/revoke', handler(async (req, res) => {
   await requireEvaluationAdmin(req.user.userId, { delegateInfo: req.delegateInfo });
