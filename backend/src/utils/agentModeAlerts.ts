@@ -93,7 +93,7 @@ export async function sendAgentModeOncallAlert(
   // Checked before the dedupe reservation so a suppressed sandbox alert can never
   // consume a real customer's window on a shared key.
   if (await isSandboxPrincipalAlert(userId, sessionId)) {
-    console.info(`[agentModeAlerts] suppressed oncall alert for sandbox principal: ${subject}${dedupeKey ? ` (${dedupeKey})` : ''}`);
+    console.info('[agentModeAlerts] suppressed oncall alert for sandbox principal');
     return false;
   }
 

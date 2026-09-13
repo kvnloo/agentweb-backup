@@ -99,6 +99,18 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
     for (const legacy of ['remaining', 'materials', 'simulation', 'simulationRevision', 'artifactEpoch', 'resetArtifacts', 'artifacts']) expect((record as any)[legacy]).toBeUndefined();
   });
 
+  it('fails closed when a persisted non-empty denied class list has no recognized classes', async () => {
+    get.mockReturnValue({ promise: async () => ({ Item: {
+      userId: 'eval_test', status: 'active', deniedToolClasses: ['unknown_class', 42],
+    } }) });
+    expect((await store.get('eval_test'))!.deniedToolClasses).toEqual(SANDBOX_TOOL_CLASS_NAMES);
+
+    get.mockReturnValue({ promise: async () => ({ Item: {
+      userId: 'eval_test', status: 'active', deniedToolClasses: [],
+    } }) });
+    expect((await store.get('eval_test'))!.deniedToolClasses).toEqual([]);
+  });
+
   it('refuses a policy row whose identity does not match the requested principal', async () => {
     get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_other', status: 'active' } }) });
     await expect(store.get('eval_test')).rejects.toThrow();

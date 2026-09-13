@@ -60,6 +60,9 @@ export class EvaluationStore {
     if (!result.Item) return null;
     const item = result.Item as Record<string, unknown>;
     if (item.userId !== userId) throw new EvaluationDenied();
+    const persistedDeniedToolClasses = Array.isArray(item.deniedToolClasses)
+      ? item.deniedToolClasses.filter((c): c is string => typeof c === 'string' && SANDBOX_TOOL_CLASS_NAMES.includes(c))
+      : null;
     const record: EvaluationRecord = {
       userId,
       email: item.email as string,
@@ -68,9 +71,9 @@ export class EvaluationStore {
       mode: 'sandbox',
       label: typeof item.label === 'string' && item.label ? item.label : 'Sandbox',
       connectors: { meta: 'simulated' },
-      deniedToolClasses: Array.isArray(item.deniedToolClasses)
-        ? item.deniedToolClasses.filter((c): c is string => typeof c === 'string' && SANDBOX_TOOL_CLASS_NAMES.includes(c))
-        : [...SANDBOX_TOOL_CLASS_NAMES],
+      deniedToolClasses: persistedDeniedToolClasses === null || (item.deniedToolClasses as unknown[]).length > 0 && persistedDeniedToolClasses.length === 0
+        ? [...SANDBOX_TOOL_CLASS_NAMES]
+        : persistedDeniedToolClasses,
     };
     if (typeof item.datasetId === 'string') record.datasetId = item.datasetId;
     if (typeof item.datasetVersion === 'number') record.datasetVersion = item.datasetVersion;
