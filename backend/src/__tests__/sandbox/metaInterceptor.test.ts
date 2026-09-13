@@ -27,6 +27,8 @@ let server: http.Server; let local: string;
 const originalFetch = globalThis.fetch;
 const originalHttpRequest = http.request;
 const originalHttpsRequest = https.request;
+const originalHttpGet = http.get;
+const originalHttpsGet = https.get;
 const originalAdapter = axios.getAdapter(axios.defaults.adapter);
 
 beforeAll(async () => {
@@ -135,6 +137,24 @@ describe('raw http/https backstop', () => {
     expect(JSON.parse(body).real).toBe(true);
     expect(handle).not.toHaveBeenCalled();
   });
+  // Node implements `get` as a module-local call to its internal `request`, not through the
+  // exported `request` property — wrapping `.request` alone does not cover `.get` (CodeRabbit).
+  it('simulates a raw https.get exactly like https.request', async () => {
+    const body = await new Promise<string>((resolve, reject) => {
+      const req = https.get(SBX25, res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve(b)); });
+      req.on('error', reject);
+    });
+    expect(JSON.parse(body).data[0].name).toBe('Simulated');
+    expect(getInterceptorAudit().backstopHits).toBe(1);
+  });
+  it('passes a raw http.get to a real host through', async () => {
+    const body = await new Promise<string>((resolve, reject) => {
+      const req = http.get(`${local}/raw-get`, res => { let b = ''; res.on('data', c => b += c); res.on('end', () => resolve(b)); });
+      req.on('error', reject);
+    });
+    expect(JSON.parse(body).real).toBe(true);
+    expect(handle).not.toHaveBeenCalled();
+  });
 });
 
 describe('failure handling', () => {
@@ -165,6 +185,8 @@ describe('lifecycle', () => {
     expect(globalThis.fetch).toBe(originalFetch);
     expect(http.request).toBe(originalHttpRequest);
     expect(https.request).toBe(originalHttpsRequest);
+    expect(http.get).toBe(originalHttpGet);
+    expect(https.get).toBe(originalHttpsGet);
     expect(axios.getAdapter(axios.defaults.adapter)).toBe(originalAdapter);
   });
 });

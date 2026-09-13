@@ -80,6 +80,18 @@ describe('insights engine — sync', () => {
     expect(device.data.reduce((n: number, r: any) => n + Number(r.impressions), 0)).toBe(Number(total.impressions));
   });
 
+  it('rejects a breakdowns list whose cartesian product would exceed the bucket cap (CodeRabbit, ENG-1908)', () => {
+    // breakdowns is a plain caller-controlled list with no dedup — repeating one dimension
+    // many times drives the same unbounded multiplication a listing of many distinct
+    // dimensions would (age has 6 buckets; 6^5 = 7776 > the cap), and this synchronous
+    // aggregation runs inside the request handler on a shared process, so it must reject
+    // before doing that work rather than after building millions of rows.
+    expect(() => runInsights(dataset, EMPTY_OVERLAY, params({ level: 'campaign', fields: ['campaign_id', 'impressions'], breakdowns: ['age', 'age', 'age', 'age', 'age'], datePreset: 'maximum' }), shift, now))
+      .toThrow(expect.objectContaining({ graphError: expect.objectContaining({ code: 100 }) }));
+    // A legitimate two-dimension request (already covered above) is nowhere near the cap and still works.
+    expect(() => runInsights(dataset, EMPTY_OVERLAY, params({ level: 'campaign', fields: ['campaign_id', 'impressions'], breakdowns: ['age', 'gender'], datePreset: 'maximum' }), shift, now)).not.toThrow();
+  });
+
   it('emits only requested fields (unknown ones are dropped, like the product-only aliases leads/cost_per_lead), never a window with no rows, and honours limit', () => {
     const res = runInsights(dataset, EMPTY_OVERLAY, params({ level: 'ad', fields: ['ad_id', 'spend', 'not_a_real_field', 'leads', 'cost_per_lead'], datePreset: 'maximum', limit: 2 }), shift, now);
     expect(res.data).toHaveLength(2);

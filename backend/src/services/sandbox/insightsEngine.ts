@@ -135,19 +135,46 @@ const DIMENSION_CATALOG: Record<string, Bucket[]> = {
 
 /** Largest-remainder split — the parts always sum exactly to `total`. */
 export function allocate(total: number, shares: number[]): number[] {
+  if (shares.length === 0) return [];
   const raw = shares.map((s) => total * s);
   const floors = raw.map(Math.floor);
   let remainder = total - floors.reduce((a, b) => a + b, 0);
   const order = raw.map((v, i) => [v - floors[i], i] as const).sort((a, b) => b[0] - a[0] || a[1] - b[1]);
-  for (const [, i] of order) { if (remainder <= 0) break; floors[i] += 1; remainder -= 1; }
+  // Distribute a positive remainder to the largest fractional parts first; correct a
+  // negative one (floating-point error at extreme magnitudes — a synthetic total near
+  // Number.MAX_SAFE_INTEGER can floor to a sum that overshoots by more than one) from the
+  // smallest fractional parts. Either can need more than one pass over `order` when the
+  // excess/shortfall exceeds the bucket count, so wrap with modulo instead of a single scan.
+  for (let i = 0; remainder > 0; i++) { floors[order[i % order.length][1]] += 1; remainder -= 1; }
+  for (let i = 0; remainder < 0; i++) { floors[order[order.length - 1 - (i % order.length)][1]] -= 1; remainder += 1; }
   return floors;
 }
+
+/**
+ * Bound on the cartesian product `cartesianBuckets` may materialize. `allocateDaily` runs
+ * this once per dataset row on every insights request, and it is entirely caller-controlled
+ * (breakdowns is a plain comma-separated string, un-deduped, un-length-capped): a caller who
+ * repeats one dimension many times (or lists all nine catalog dimensions at once) can drive
+ * this into the millions of buckets. That work is synchronous and runs inside the request
+ * handler — on a shared backend process it would stall unrelated requests, not just the
+ * caller's own. A sandbox (evaluation) account, whose whole purpose is untrusted use, can
+ * reach this path through the same Meta-insights tool a real customer uses. Checked
+ * incrementally, during construction, so a request that would exceed the cap never actually
+ * allocates the oversized array. 5000 comfortably covers any realistic legitimate combination
+ * (the largest sensible real request — every non-hourly catalog dimension at once — is in the
+ * hundreds) while blocking the repeated-dimension and all-nine-dimensions cases CodeRabbit
+ * found (2,799,360 and unbounded respectively).
+ */
+const MAX_BREAKDOWN_BUCKETS = 5000;
 
 function cartesianBuckets(dimensions: string[]): Array<{ dims: Record<string, string>; share: number }> {
   let combos: Array<{ dims: Record<string, string>; share: number }> = [{ dims: {}, share: 1 }];
   for (const dimension of dimensions) {
     const catalog = DIMENSION_CATALOG[dimension];
     if (!catalog) throw graphErrors.invalidParam(`breakdowns[0] must be one of the following values: ${Object.keys(DIMENSION_CATALOG).join(', ')}`);
+    if (combos.length * catalog.length > MAX_BREAKDOWN_BUCKETS) {
+      throw graphErrors.invalidParam(`breakdowns would produce more than ${MAX_BREAKDOWN_BUCKETS} buckets — request fewer dimensions or remove repeats`);
+    }
     const next: typeof combos = [];
     for (const combo of combos) for (const bucket of catalog) next.push({ dims: { ...combo.dims, [dimension]: bucket.value }, share: combo.share * bucket.share });
     combos = next;

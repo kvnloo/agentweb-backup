@@ -45,6 +45,8 @@ interface Installed {
   originalAdapterSetting: unknown;
   originalHttpRequest: typeof http.request;
   originalHttpsRequest: typeof https.request;
+  originalHttpGet: typeof http.get;
+  originalHttpsGet: typeof https.get;
 }
 let installed: Installed | null = null;
 
@@ -60,12 +62,21 @@ export function installMetaSandboxInterceptor(options: MetaInterceptorOptions): 
     originalAdapterSetting: axios.defaults.adapter,
     originalHttpRequest: http.request,
     originalHttpsRequest: https.request,
+    originalHttpGet: http.get,
+    originalHttpsGet: https.get,
   };
   installed = state;
   globalThis.fetch = wrapFetch(state);
   axios.defaults.adapter = wrapAdapter(state);
   http.request = wrapRequest(state, 'http:', state.originalHttpRequest) as typeof http.request;
   https.request = wrapRequest(state, 'https:', state.originalHttpsRequest) as typeof https.request;
+  // Node implements `get` as a module-local call to its internal `request`, not through the
+  // exported `request` property — wrapping `.request` alone leaves `.get` calling the
+  // ORIGINAL, unwrapped request path straight through to the real network. `get(...)` is
+  // exactly `request(...).end()`, so reusing the already-wrapped request function and ending
+  // it (`get` never sends a body) reaches the same classification either way.
+  http.get = wrapGet(state, 'http:', state.originalHttpGet as unknown as RequestFn) as typeof http.get;
+  https.get = wrapGet(state, 'https:', state.originalHttpsGet as unknown as RequestFn) as typeof https.get;
 }
 
 export function uninstallMetaSandboxInterceptor(): void {
@@ -74,6 +85,8 @@ export function uninstallMetaSandboxInterceptor(): void {
   axios.defaults.adapter = installed.originalAdapterSetting as AxiosAdapter;
   http.request = installed.originalHttpRequest;
   https.request = installed.originalHttpsRequest;
+  http.get = installed.originalHttpGet;
+  https.get = installed.originalHttpsGet;
   installed = null;
 }
 
@@ -263,6 +276,17 @@ function wrapRequest(state: Installed, protocol: 'http:' | 'https:', original: R
     return req;
   };
   return wrapped as unknown as RequestFn;
+}
+
+/** `get(...)` is `request(...).end()` with no body — reuse the wrapped request so `.get`
+ *  gets the exact same classification as `.request` instead of quietly bypassing it. */
+function wrapGet(state: Installed, protocol: 'http:' | 'https:', original: RequestFn): RequestFn {
+  const request = wrapRequest(state, protocol, original);
+  return function sandboxAwareGet(this: unknown, ...args: any[]): http.ClientRequest {
+    const req = (request as (...a: any[]) => http.ClientRequest).apply(this, args);
+    req.end();
+    return req;
+  } as unknown as RequestFn;
 }
 
 function fakeClientRequest(state: Installed, classification: Exclude<GraphClassification, { kind: 'passthrough' }>, method: string): http.ClientRequest {
