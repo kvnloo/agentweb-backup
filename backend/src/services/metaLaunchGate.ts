@@ -128,6 +128,16 @@ export interface MetaGateDeps {
    * destination has to reach the caller as a failure to verify, not as "nothing there".
    */
   resolveCreativeDestinations?: (creativeId: string, accessToken: string) => Promise<string[]>;
+  /**
+   * Fetch the served HTML for a destination pre-flight check. Threaded straight through to
+   * `preflightMetaTrackingGate`'s own `MetaPreflightDeps.fetchHtml` (ENG-1909) — this gate
+   * used to call it with a hardcoded `{}`, so there was no way for a caller to override it.
+   * A sandbox (evaluation) account's ads point at fictional/example.invalid destinations, so
+   * the default real outbound fetch is meaningless for them; the caller injects a
+   * dataset-backed answer instead. Left undefined, the destination check is byte-for-byte
+   * unchanged from before this field existed — the real `defaultFetchHtml` runs.
+   */
+  fetchHtml?: (url: string, deadlineAt?: number) => Promise<string>;
 }
 
 /** How far back counts as "recent" when explaining a block. */
@@ -919,7 +929,7 @@ export async function runMetaTrackingGate(
    * number of distinct destinations rather than merely a slow ad list.
    */
   const gate = await preflightMetaTrackingGate(
-    destinationUrls, pixelIds, {}, Date.now() + META_LAUNCH_PREFLIGHT_MAX_MS,
+    destinationUrls, pixelIds, { fetchHtml: deps.fetchHtml }, Date.now() + META_LAUNCH_PREFLIGHT_MAX_MS,
   );
   const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 

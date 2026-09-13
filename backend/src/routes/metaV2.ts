@@ -4,6 +4,8 @@ import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { getCachedPixels, setCachedPixels } from '../services/metaPixelsCache';
+import { sandboxManagementUrl } from '../services/sandboxManagementUrl';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import {
   getConnectedMetaAccountsList,
   getMetaAccountCredentials,
@@ -269,7 +271,11 @@ router.post('/create-image-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     const adInfo = {
       adId: ad.id,
@@ -363,7 +369,11 @@ router.post('/create-carousel-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     if (session_id) await appendSessionMessage(session_id, ad_name.trim(), managementUrl);
 
@@ -435,7 +445,11 @@ router.post('/create-video-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     const adInfo = {
       adId: ad.id,
