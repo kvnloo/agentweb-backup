@@ -787,7 +787,9 @@ router.get("/email-deliverability/mx-sweep", async (_req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const hideBotLike = req.query.hideBotLike !== "false";
-    const users = await userDb.getAllUsers(hideBotLike);
+    // The partner-portal roster is where Access Portal lives; sandbox (eval_)
+    // accounts must stay reachable here even though every fleet sweep excludes them.
+    const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
     const sanitized = users.map(compactAdminUserForList);
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
@@ -1901,17 +1903,14 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
       DELEGATE_TOKEN_TTL,
     );
 
-    // Return the delegate token and customer portal URL
+    // Return the delegate token and customer portal URL. A sandbox account is a
+    // real customer-portal account (ENG-1907), so it opens through the same
+    // callback; only the token scope differs.
     const customerPortalUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
-
-    const accessUrl = evaluationTarget
-      ? new URL('/evaluation', process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`)
-      : null;
-    if (accessUrl) accessUrl.hash = new URLSearchParams({ token: delegateToken }).toString();
 
     res.set('Cache-Control', 'no-store').json({
       delegateToken,
-      customerPortalUrl: accessUrl?.toString() || `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
+      customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
       expiresIn: DELEGATE_TOKEN_TTL
     });
   } catch (error) {

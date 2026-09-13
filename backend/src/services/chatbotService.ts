@@ -19,6 +19,7 @@ import { Storage } from '@google-cloud/storage';
 // export to exist) — dropped rather than carried into the lazy form.
 import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
+import { isEvaluationUser } from './evaluationPolicy';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
@@ -763,9 +764,10 @@ export class ChatbotDB {
       throw error;
     }
 
-    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access.
+    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access
+    // and not sandbox (eval_) principals, whose take-home sessions are not customer engagement (ENG-1907).
     // Fire-and-forget: don't fail session creation if this update fails.
-    if (!delegateInfo?.isDelegated) {
+    if (!delegateInfo?.isDelegated && !isEvaluationUser(userId)) {
       userDb.updateUser(userId, { lastActiveAt: timestamp }).catch((err) => {
         console.error(`Failed to update lastActiveAt for user ${userId}:`, err);
       });

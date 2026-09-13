@@ -36,6 +36,7 @@
 
 import { createHash } from 'crypto';
 import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+import { isEvaluationUser } from './evaluationPolicy';
 
 
 const TAG = '[Tracking Monitor]';
@@ -840,6 +841,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     eventMixWatched: 0,
     eventMixStale: 0,
   };
+
+  // ENG-1907: a sandbox principal's Meta connection is simulated. Reading it with a sentinel
+  // token would raise token/blackout alerts about an account that does not exist.
+  if (isEvaluationUser(user?.userId)) return summary;
 
   const fetchActivity =
     deps?.fetchActivity ??

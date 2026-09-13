@@ -211,3 +211,19 @@ describe('onlyAdAccountId scoping', () => {
     expect(summary.accountsChecked).toBe(2);
   });
 });
+
+// ENG-1907: a sandbox account's Meta connection is simulated. Monitoring it would read a
+// sentinel token against Meta and raise blackout/token alerts about an account that does
+// not exist — simulation noise in production alerting. Skipped before any read.
+describe('sandbox principals are never monitored (ENG-1907)', () => {
+  it('performs no reads and raises no alerts for an eval_ user, even with a connected ad account', async () => {
+    const deps = tokenErrorDeps();
+    const u: any = { ...user(), userId: 'eval_0c0c0c0c-0000-4000-8000-000000000000' };
+
+    const summary = await monitorUserTracking(u, deps);
+
+    expect(summary.accountsChecked).toBe(0);
+    expect(deps.fetchActivity).not.toHaveBeenCalled();
+    expect(deps.alertTransport).not.toHaveBeenCalled();
+  });
+});

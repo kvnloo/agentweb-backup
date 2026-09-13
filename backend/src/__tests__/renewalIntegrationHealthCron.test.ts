@@ -221,6 +221,24 @@ describe('runRenewalIntegrationHealthCheck', () => {
       }));
     });
 
+    // ENG-1907: a sandbox account is provisioned with subscription_status 'active' and would
+    // match this scan if it ever carried a current_period_end; it has paid-ads intent by
+    // design and no real ad account, i.e. exactly the shape that flags. Never alert on it.
+    it('never flags a sandbox (eval_) principal, even in the exact shape that flags a customer', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'eval_9b9b9b9b-0000-4000-8000-000000000000', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+        user({ userId: 'paid-ads-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+      ]);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.flagged).toBe(1);
+      expect(mockSendAlert).toHaveBeenCalledTimes(1);
+      expect(mockSendAlert).not.toHaveBeenCalledWith(expect.objectContaining({
+        context: expect.objectContaining({ userId: expect.stringMatching(/^eval_/) }),
+      }));
+    });
+
     // ENG-1270 AC3 named both ThinkingAI and TransAmerica as required regression
     // fixtures; only TransAmerica ever got one. ThinkingAI's real pre-fix state
     // (per the issue's own description): paid-ads customer, no Meta ad account

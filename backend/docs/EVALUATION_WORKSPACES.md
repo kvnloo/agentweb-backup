@@ -1,221 +1,106 @@
-# Evaluation workspaces (ENG-1870)
+# Sandbox accounts (ENG-1906 / ENG-1907)
 
-An evaluation is a dedicated `eval_<UUID>` principal with Pro tier and no organization.
-Its single policy record is authoritative: missing, malformed, expired, revoked, or
-unreadable policy denies access. Normal customer behavior is unchanged.
+A sandbox account is a **real customer-portal account with a simulated Meta connection**, used for
+hiring take-homes and customer pilots. The evaluatee uses the real portal and the real Emma with the
+real tool surface; only the outbound side effects that could reach a third party are denied, and
+(from phase 2) Meta reads and writes are answered by an in-house simulator instead of Graph.
+
+The principal is `eval_<UUID>`. One policy row in `AW-Evaluations` (key `evaluation/<userId>`) is
+authoritative: missing, malformed, expired, revoked, or unreadable policy denies access at every
+gate. Normal customer behavior is unchanged.
+
+Design of record: `SANDBOX-MODE-DESIGN.md` on Harsha's machine; decisions on ENG-1906.
+
+## What phase 1 delivers
+
+- The `/evaluation` page, the single-shot `runEvaluation`, the generation budget, approved
+  materials, private artifacts and the toy simulator are gone. Sandbox principals authenticate
+  and use the product like any customer.
+- `evaluationPolicy.enforceEvaluationTool` denies **tool classes** from the policy record instead
+  of admitting a single tool. Classes: `lifecycle` (`evaluation_workspace`, always denied),
+  `connectors` (connect_account, MCP install/configure; `install_skills` stays allowed),
+  `sends` (email/Slack/notify/human-eval), `social` (LinkedIn, Twitter, posting, calendar),
+  `publish` (landing-page deploy/publish/subdomain, public lead lists), `third_party_writes`
+  (Google Ads, HubSpot, Attio, LinkedIn Ads, enrichment, Google Docs/Sheets/Drive, ClickUp),
+  `browser` (Playwright, site sign-in, captcha, temp inbox, local agent), `automation`
+  (coding agent, scheduled chats and schedules). Every other tool — Meta, generation, search,
+  knowledge base, work plans, internal CRM, landing-page generation — runs normally. The check
+  runs in all three dispatchers (`mcp/client/toolRegistry`, `mcp/server/registry`,
+  `agentModeService.executeTool`), so external MCP and nested calls are covered.
+- Provisioning is gated on the `Sandbox` subscription tier row and seeds the account so the
+  portal never routes it into onboarding.
+
+## Prerequisite: the Sandbox tier row
+
+`subscriptionType: 'Sandbox'` bounds usage and visibility through the ordinary tier machinery.
+An unknown tier name fails open, so `provision` throws `SandboxTierMissing` (HTTP 412) until the
+row exists. Create it once per environment:
+
+```
+cd backend && NODE_ENV=production npx ts-node scripts/ensure-sandbox-tier.ts
+```
+
+The script appends `{ name: 'Sandbox', allowedPages: ['*'], allowedSkills: ['*'],
+allowedConnectedAccounts: ['meta'], allowedFeatures: [], monthlyTokenAllowance: 2000000,
+monthlyCostAllowance: 25, monthlyExtraCostAllowance: 20 }` with a compare-and-set and never edits an
+existing entry. Adjust allowances through the admin settings UI afterwards if a case needs more.
 
 ## Operations
 
-A real, non-delegated administrator can use Emma's `evaluation_workspace` tool with
-`action: provision` and a `provision` object, or POST `/api/admin/evaluations` with
-the same object under an authenticated admin app session. HTTP MCP lifecycle mutations
-are refused because that transport does not preserve app delegation provenance;
-in-process Emma and the admin REST API are the supported controller paths:
+Administrators (real, non-delegated) provision through Emma's `evaluation_workspace` tool
+(`action: provision`) or `POST /api/admin/evaluations`:
 
 ```json
 {
-  "email": "synthetic@example.invalid",
-  "displayName": "Synthetic evaluation",
+  "email": "candidate@example.invalid",
+  "displayName": "Candidate name",
   "password": "<fresh temporary password, 12–72 characters>",
-  "generationBudget": 5,
   "expiresAt": 1800000000000,
-  "materials": [{"title": "Approved case", "text": "Sanitized facts only", "approved": true}]
+  "brandGuidelines": { "brandName": "Case brand", "website": "https://example.invalid", "description": "One-line brief" },
+  "reviewerUserIds": ["<internal user id>"],
+  "label": "Sandbox",
+  "datasetId": "agentweb-2026q2", "datasetVersion": 1,
+  "deniedToolClasses": ["connectors", "sends", "social", "publish", "third_party_writes", "browser", "automation"]
 }
 ```
 
-Supply an actual future expiry no more than 30 days away. Provisioning atomically
-creates the account, policy, and actor-stamped audit record; an existing email
-cannot be overwritten. No invitation or email is sent. Give the evaluator the
-backend's `/evaluation` URL and temporary credentials through an approved private
-channel. Never include credentials in logs, issue comments, or PR evidence.
+`expiresAt` must be a future time no more than 30 days away. Provisioning atomically creates the
+account (Sandbox tier, `roles: ['customer']`, no organization, seeded brand guidelines, never an
+`adAccount`), the policy row and an audit record; an existing email cannot be overwritten. No email
+is sent — hand over credentials through a private channel, or open the account with Admin → Access
+Portal. `datasetId`/`datasetVersion` pin the frozen dataset the phase-2 simulator serves.
 
-The evaluator can inspect approved case material, query the frozen campaign dataset,
-create and update simulated campaigns/ad sets/ads/creatives, change budgets and schedules,
-and simulate publish/pause/activate. They can also ask Emma for strategy/analysis,
-generate an image, upload an opaque artifact, and download their own artifacts.
-The page holds its app token only in memory. The API is `/api/evaluation`; artifact
-downloads use `/api/evaluation/artifacts/<id>`. Generic chat, production tools,
-connectors, credential imports, and organization routes are unavailable.
+Revoke with `action: revoke` / `POST /api/admin/evaluations/<id>/revoke`: commits the deny state,
+bumps the account's session and delegate epochs, then removes API keys, OAuth code/token families,
+MCP session metadata and schedules. Cleanup is idempotent and retryable; revocation retains the
+policy and audit rows. Review with `action: review` / `GET /api/admin/evaluations/<id>` as the
+provisioning admin or an explicitly assigned reviewer: returns status and the audit trail
+(bounded to ~1000 events, `truncated` when incomplete). Reviewer access survives revocation.
 
-Revoke with Emma's `evaluation_workspace` tool (`action: revoke`,
-`evaluation_user_id: <id>`) or POST `/api/admin/evaluations/<id>/revoke`.
-Revocation commits the deny state and invalidates account session/delegation epochs
-before cleaning up stored API keys, OAuth code/token families, MCP session metadata,
-and schedules. The response includes audit identifiers and cleanup counts. Retry
-revoke if cleanup fails: access remains denied and cleanup is idempotent. Cleanup failure receives its own audit event after the deny
-commit; incomplete cleanup is never reported as success. Revocation
-retains the policy, audit, and private artifacts; it is not a data-erasure operation.
+## Invariants
 
-## Connector-free Meta simulation
+- The policy is re-read on every request, tool call, MCP token/API-key use and delegate session;
+  revocation is immediate.
+- Sandbox principals cannot mint or use delegated/service/admin tokens, cannot install
+  connectors, and cannot call the lifecycle tool.
+- `getAllUsers`-driven fleet sweeps, oncall alerts, reliability telemetry and engagement signals
+  exclude sandbox accounts (phase 1, S3 slice).
+- Storage: policy and audit rows only, in `${Dev-}AW-Evaluations` (single string hash key
+  `evaluationKey`; provisioned by `scripts/provision-evaluation-storage.sh`). Phase 2 adds
+  immutable dataset chunks and one per-account overlay item to the same table.
 
-The product name is **Evaluation workspace**. Every simulator result includes
-**Simulation complete — not sent to Meta**. Publishing sets a simulated object to
-published/paused; activation changes its requested status. Effective status accounts
-for paused parents and future/ended schedules. It creates no delivery or scheduling job,
-spend, Meta review, or real object. Meta connectors/read/write APIs, org resources,
-production ad tables, credentials, and remote URL retrieval are never used.
+## What the next phases add
 
-Provisioning accepts an optional `simulationPacket` containing the candidate packet's
-**explicitly approved, sanitized** snapshot. The operator supplies data inline; the
-server never retrieves packet links or imports raw Meta responses. For example:
+2. Sentinel Meta credential, process-level Graph interceptor, read simulator (sync + async
+   insights, date-shifted so the last delivery day is always yesterday).
+3. Write simulator (create/update/delete, image upload to S3, effective_status, exact read-back,
+   launch gate, CAPI, portal-internal management links).
+4. Packet → dataset compiler, `case.yaml`, reset/purge, reviewer action timeline.
+5. Portal "Sandbox" badge (desktop + mobile), outbound Meta links hidden, analytics opt-out.
+6. Production proof with a disposable persona.
 
-```json
-{
-  "approved": true,
-  "objects": [
-    {"key":"campaign","kind":"campaign","name":"Approved acquisition","objective":"LEADS","budget":5000,"budgetType":"daily","metrics":{"impressions":1000,"clicks":30,"spend":1200,"conversions":3}},
-    {"key":"audience","kind":"adset","name":"Approved audience","parentKey":"campaign","targeting":"Sanitized B2B audience"},
-    {"key":"creative","kind":"creative","name":"Approved message","text":"Sanitized creative copy"},
-    {"key":"ad","kind":"ad","name":"Approved ad","parentKey":"audience","creativeKey":"creative"}
-  ]
-}
-```
+## Rollback
 
-This is the value of `simulationPacket` alongside the existing provisioning fields,
-not a separate provisioning endpoint. Up to 30 seed objects / 50 KB are accepted.
-Local packet keys become `sim_<evaluation-user-id>_seed_<key>` IDs; new objects receive
-`sim_<evaluation-user-id>_<UUID>` IDs. Raw account/object IDs, unknown properties,
-invalid relationships, unapproved packets, malformed metrics, and URL/credential
-fields are rejected before account creation. Optional seed `status` is DRAFT,
-PAUSED, or ACTIVE (default DRAFT); metrics are frozen nonnegative integer counts,
-with spend in USD cents. Without a packet, the starting simulation is empty.
-No candidate identity, email, campaign, or external URL is embedded in the feature.
-
-Use Emma's `evaluation_workspace` tool or POST `/api/evaluation` with:
-
-```json
-{"action":"simulate","command":{"operation":"query","source":"approved","kind":"campaign"}}
-```
-
-The same `command` supports:
-
-| Operation | Inputs | Result |
-|---|---|---|
-| `query` | optional `source` approved/current; optional `kind` | Frozen or current object list |
-| `inspect` | `id`; optional `source` | Object state and effective status |
-| `create` | `kind`, `fields` | New synthetic object |
-| `update` | `id`, `fields` | Updated object; immutable IDs and metrics |
-| `publish` / `activate` / `pause` | `id` | Validation, warnings, resulting delivery state |
-| `reset` | none | Restore the frozen seed and remove disposable artifacts |
-
-Editable fields: `name`; campaign `objective` AWARENESS/TRAFFIC/LEADS/SALES;
-campaign/ad set `budget` (100–100000000 integer USD cents) with `budgetType`
-(daily/lifetime); paired `startTime`/`endTime` in UTC ISO format with `.000Z`;
-ad set `parentId` (campaign) and sanitized `targeting` text; ad `parentId` (ad set)
-and `creativeId`; creative `text`, owned `artifactId`, or `upload: {mime,base64}`.
-Lifetime budgets require a schedule. Delivery requires an inherited or local budget;
-activation requires simulated publication. A paused ancestor yields a warning and
-`PARENT_PAUSED`, never a claim of delivery. No Meta API parity is claimed beyond
-these documented simulation rules.
-
-Inline uploads accept canonical base64 up to 24 KB with inert text/plain, image/png,
-image/jpeg, or application/octet-stream MIME types. For larger/generated images,
-use the existing private artifact upload and reference its returned ID. Uploaded
-bytes are never executed or fetched. The current simulation is capped at 50 objects;
-seed plus current state is capped at 150 KB. Validation failures return `ok:false`,
-`errors`, `warnings`, disclosure, and the unchanged existing object when available.
-Authorization/foreign destination overrides fail closed rather than being simulated.
-All mutations and rejected domain validations have actor-stamped revision audits,
-including resulting object fields (inline upload audit contains MIME/byte count).
-
-Reset is idempotent in resulting state and does not refund generation spend, extend
-expiry, restore grants, or reactivate a revoked evaluation. It atomically restores
-seed objects, clears artifact access, increments the artifact epoch, and records
-cleanup intent. Bounded conditional batches delete old bytes; a failed cleanup is
-retryable by repeating reset. Uploads are denied while cleanup is pending. Generation
-pins its starting epoch, so pre-reset output cannot repopulate the workspace. Audits
-and approved materials are retained. Revision checks prevent lost updates and reset
-races; a conflicting command is rejected and can be resubmitted after inspection.
-
-## Assigned review
-
-Provisioning may include up to five `reviewerUserIds` (internal user IDs, not emails).
-The provisioning administrator and these explicitly assigned, currently active,
-non-delegated users can inspect the evaluation. Being in the same organization or
-being an unrelated administrator grants no review access. Existing legacy evaluations
-without recorded assignment fail closed for review; disposable cases should be
-reprovisioned through the normal operation.
-
-Review through the same `/evaluation` page after reviewer login, through Emma with
-`{"action":"review","evaluation_user_id":"eval_..."}`, or GET
-`/api/admin/evaluations/<evaluation-user-id>`. Results include the frozen/current
-simulation, materials, private artifact manifest, and audit events. The audit scan is
-bounded to 100 pages / approximately 1000 events and reports `truncated` when incomplete;
-it never returns another evaluation's rows or a cross-evaluation cursor. Artifacts use
-GET `/api/admin/evaluations/<evaluation-user-id>/artifacts/<artifact-id>` or Emma review
-with `artifact_id`; bytes stay authenticated, attachment-only, and without public URLs.
-Reviewer inspection remains available after candidate revocation. Candidate access
-remains denied. Provision/revoke still require the existing current administrator gate.
-
-## Security and spend invariants
-
-- HTTP has an explicit evaluation-route allowlist. JWT OAuth state cannot bypass
-  it. Evaluation identities cannot mint or use delegated/service/admin tokens.
-- Both tool registries and the agent executor enforce the same policy before mock,
-  indirect, dynamic, or extra-context tool execution. The only admitted tool is
-  `evaluation_workspace`; its evaluator actions cannot specify another user.
-- MCP authenticates credentials on every request, binds local/durable sessions to
-  their owner, and rechecks the active policy before every evaluation tool call.
-  Old in-memory sessions cannot recover revoked access.
-- Scheduled chat/social work refuses evaluation owners before execution and removes
-  only a conditionally matching evaluation-owned schedule. No production provider
-  is invoked by a denied action.
-- Generation admits 1–100 calls per evaluation with an atomic decrement. There are
-  no refunds or automatic retries. Inputs are limited to 8,000 prompt characters
-  plus 30,000 characters of approved material; one candidate and 2,048 output tokens
-  use fixed `gemini-3.6-flash` / `gemini-3.1-flash-image` models. Failed/in-flight calls consume budget. Revocation cannot
-  unsend an already-admitted provider request, but its result is not stored/returned
-  after revocation. The runtime receives no connector, browser, URL-fetch, org,
-  conversation, or production-tool capability.
-- At most 10 approved text materials, 100 artifacts, and 240,000 bytes per artifact.
-  Uploads are opaque bytes, never executable/imported assets. Generated images are
-  decoded with a pixel cap and re-encoded. Downloads require current authorization,
-  use attachment/no-store/nosniff/sandbox headers, and never yield public URLs.
-
-Model choice is verified against the provider: staging reproduced HTTP 404 for
-`gemini-2.5-flash` (unavailable to new projects), whose response directs callers to
-`gemini-3.6-flash`. The image model uses the maintained GA release listed in
-[Google’s lifecycle documentation](https://ai.google.dev/gemini-api/docs/deprecations).
-Creative requests use image-only output and an explicit image-rendering task; staging reproduced `NO_IMAGE` when the broad shared task permitted a written concept ([Google image-generation API](https://ai.google.dev/gemini-api/docs/generate-content/image-generation)).
-There is no fallback chain or user-selected model.
-
-## Storage and deployment
-
-`backend/scripts/provision-evaluation-storage.sh dev|prod` provisions the dedicated
-`Dev-AW-Evaluations` / `AW-Evaluations` DynamoDB table (string `evaluationKey` hash,
-on-demand billing, encryption, deletion protection, PITR). Runtime uses the existing
-backend AWS identity. Policies, audit records, and artifact bytes live only here;
-no S3, client asset table, ad account, or connector credential is an artifact target.
-Dev/prod table selection follows the existing `NODE_ENV` convention. Provisioning
-pins the same region as runtime (`AWS_REGION`, default `us-west-2`).
-
-Harsha explicitly authorized the required production auth/security/data-plane and
-persistence changes in the ENG-1870 implementation request. Dev and production
-storage must exist before enabling the routes. No actual candidate account is
-created by deployment or by the provisioning script.
-
-Credential cleanup deliberately uses strongly consistent, owner-filtered primary
-scans with key/owner projection and conditional deletes. Several grant tables have
-no owner index; eventually consistent GSIs cannot prove complete revocation. This
-is a rare administrative lifecycle operation, not a request hot path. The policy
-barrier—not cleanup timing—is the authorization invariant.
-
-## Verification and rollback
-
-Before release: production build/typecheck, acceptance/security regressions,
-exact-head GitHub merge evidence, and staging provision/use/deny/revoke with fresh
-synthetic principals. Verify analysis, creative generation, binary round-trip,
-foreign artifact denial, production/connector denial, exhausted budget, and old
-JWT/API/OAuth/MCP access after revoke. Never use real client accounts or log tokens.
-Repeat this non-destructive lifecycle on production after observing deployment.
-
-Rollback must preserve the deny boundary while evaluation credentials exist.
-First revoke every active evaluation using the shipped admin path and verify
-cleanup/audit evidence. Then roll back application code; retain the dedicated
-storage and audit records. Do not drop tables or revert auth protection while an
-evaluation remains active. A forward fix that disables provision/generation while
-retaining policy/revocation is the preferred emergency response.
-
-Complexity: one authoritative policy and tool, one dedicated table, one small
-server-rendered page; no second frontend runtime, new dependencies, generalized
-permission matrix, shared asset pipeline, or candidate-specific configuration.
+Revoke every active sandbox through the admin path first, verify the audit rows, then roll back
+application code. Keep the storage table and audit records. Never roll back the auth or policy
+code while a sandbox credential exists.

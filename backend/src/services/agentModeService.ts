@@ -1,4 +1,5 @@
-import { enforceEvaluationTool } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
@@ -556,13 +557,16 @@ export function buildHtmlArtifactFilename(title: string, now: number = Date.now(
  * Keep V0 observability-only: this must not change tool execution, retries,
  * prompts, streaming, or user-facing responses.
  */
-function recordAgentModeToolTelemetry(
+export function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
   toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
   budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
+  userId?: string,
 ): void {
+  // ENG-1907: sandbox runs write no reliability telemetry (see agentMode/sandboxTelemetry.ts).
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
@@ -647,7 +651,7 @@ function recordAgentModeToolTelemetry(
 }
 
 
-function recordAgentModeRunStarted(
+export function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
@@ -656,15 +660,21 @@ function recordAgentModeRunStarted(
   // The traceId is bridged into the recorder's agent_run_started dimensions so
   // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
   startInvokeAgentSpan(runId, info);
+  if (isEvaluationUser(info.userId)) {
+    markSandboxRun(runId);
+    return;
+  }
+  forgetSandboxRun(runId);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   const traceId = getRunTraceId(runId);
   void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
-function recordAgentModeRunCompleted(
+export function recordAgentModeRunCompleted(
   runId: string,
   info: RunTerminalInfo,
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -675,6 +685,7 @@ function recordAgentModeRunCompleted(
     }).verdict,
     responseModel: info.llmModel,
   });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -687,22 +698,25 @@ function recordAgentModeRunCompleted(
  * is the only trace that a truthfulness check was skipped. Best-effort: must
  * never throw into the chat hot path.
  */
-function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+export function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown, userId?: string): void {
   console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
     runId,
     sessionId,
     error: error instanceof Error ? error.message : String(error),
   });
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.claimCheckError(runId, { error, sessionId });
 }
 
-function recordAgentModeRunFailed(
+export function recordAgentModeRunFailed(
   runId: string,
   info: RunTerminalInfo & { error: unknown },
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -4924,7 +4938,7 @@ export class AgentModeService {
               recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
                 mediaAssetsProducedThisRun,
                 mediaGenerationDeadlineMs,
-              }),
+              }, userId),
             recordDuplicateSuppression: (entries) =>
               recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
@@ -5136,7 +5150,7 @@ export class AgentModeService {
                 this.requestFinalizeCorrection(finalText, systemNote, llmModel),
               toolResultError,
               mediaGenProducedAsset,
-              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
             },
           });
           finalizeClaimMismatch = guardOutcome.claimMismatch;
@@ -5182,7 +5196,7 @@ export class AgentModeService {
         } catch (guardError) {
           // Guard is advisory — a guard bug must never block delivery. Loud, not
           // silent: recorded as claim_check_error (same contract as judge failure).
-          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError, userId);
         }
       }
 
@@ -5394,7 +5408,7 @@ export class AgentModeService {
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
-      });
+      }, userId);
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
       // the suggested-replies tail work already gets). Bounded, so never hangs.
@@ -5490,7 +5504,7 @@ export class AgentModeService {
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
         llmModel,
         modelAtStart: originalLlmModel,
-      });
+      }, userId);
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
       throw wrappedError;
