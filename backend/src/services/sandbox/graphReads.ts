@@ -315,7 +315,7 @@ class Reader {
     if (ads.has(id)) return { kind: 'ad', obj: ads.get(id) };
     if (creatives.has(id)) return { kind: 'creative', obj: creatives.get(id) };
     const pixel = this.dataset.pixels.find((p) => p.id === id); if (pixel) return { kind: 'pixel', obj: pixel };
-    const audience = this.dataset.customAudiences.find((a) => a.id === id); if (audience) return { kind: 'audience', obj: audience };
+    const audience = this.objects.customAudiences.get(id); if (audience) return { kind: 'audience', obj: audience };
     const page = this.dataset.pages.find((p) => p.id === id); if (page) return { kind: 'page', obj: page };
     if (id === this.views.business.id) return { kind: 'business', obj: null };
     if (hasInsightsReport(id, this.ctx.now)) return { kind: 'report', obj: null };
@@ -505,7 +505,7 @@ class Reader {
       }
       case 'advideos': case 'saved_audiences': case 'customconversions': case 'adrules_library': case 'activities': case 'agencies': return ok(envelope([]));
       case 'adspixels': return this.list(this.dataset.pixels, (p) => this.views.pixel(p), undefined, ['id', 'name']);
-      case 'customaudiences': return this.list(this.dataset.customAudiences, (a) => this.views.audience(a), undefined, ['id', 'name']);
+      case 'customaudiences': return this.list([...this.objects.customAudiences.values()], (a) => this.views.audience(a), undefined, ['id', 'name']);
       case 'insights': return this.insights({ kind: 'account', id: account.account_id });
       case 'targetingsearch': case 'targetingbrowse': return ok(envelope(this.search({ ...this.q, type: this.q.type ?? 'adinterest' })));
       case 'promote_pages': return this.list(this.dataset.pages, (p) => this.views.page(p), undefined, ['id', 'name']);
