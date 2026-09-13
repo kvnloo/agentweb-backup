@@ -1,14 +1,16 @@
 import { computeShiftDays } from './dateShift';
 import { fbtraceId, GraphError, graphErrors } from './graphError';
 import { handleGraphRead } from './graphReads';
+import { handleGraphWrite } from './metaWriteSimulator';
 import { createInsightsReport, parseInsightsParams } from './insightsEngine';
 import type { SandboxDataset, SandboxOverlay, SimRequest, SimResponse } from './types';
+import type { SandboxOverlayAudit } from './sandboxOverlayStore';
 
 /**
- * The simulator router (ENG-1908). Given a parsed Graph request for a sandbox principal it
- * resolves policy → dataset → overlay, answers reads from graphReads, runs the async insights
- * POST, refuses other writes until phase 3, and never throws: every failure is a Graph error
- * envelope with the headers the product's Meta callers read.
+ * The simulator router (ENG-1908/ENG-1909). Given a parsed Graph request for a sandbox
+ * principal it resolves policy → dataset → overlay, answers reads from graphReads, runs the
+ * async insights POST, dispatches everything else to the write simulator, and never throws:
+ * every failure is a Graph error envelope with the headers the product's Meta callers read.
  */
 export interface SandboxPolicyRef { datasetId: string; datasetVersion: number }
 
@@ -18,6 +20,13 @@ export interface MetaSimulatorDeps {
   loadDataset(datasetId: string, version: number, userId?: string): Promise<SandboxDataset>;
   loadOverlay(userId: string): Promise<SandboxOverlay>;
   recordAction?(req: SimRequest, response: SimResponse, at: Date): Promise<void>;
+  /**
+   * Phase 3 (ENG-1909): applies a write to the account's overlay under its CAS guard.
+   * Optional so a read-only test harness (or a real deps object built before phase 3, none
+   * exist) can omit it — every write attempt without it is graphErrors.sandboxWrite, the same
+   * refusal phase 2 shipped with.
+   */
+  mutateOverlay?(userId: string, mutate: (current: SandboxOverlay) => SandboxOverlay, audit?: SandboxOverlayAudit): Promise<SandboxOverlay>;
   now?: () => Date;
 }
 
@@ -61,6 +70,12 @@ export function createMetaSimulator(deps: MetaSimulatorDeps): MetaSimulator {
         if (req.method === 'POST' && segments.length === 2 && segments[1] === 'insights') {
           const params = parseInsightsParams(requestParams(req), insightsNodeFor(segments[0], dataset));
           return { status: 200, headers: usageHeaders(accountId), body: JSON.stringify(createInsightsReport(dataset, overlay, params, shift, now)) };
+        }
+
+        if (deps.mutateOverlay) {
+          const mutate = (fn: (current: SandboxOverlay) => SandboxOverlay, audit?: SandboxOverlayAudit) => deps.mutateOverlay!(req.userId, fn, audit);
+          const write = await handleGraphWrite(ctx, req, mutate);
+          if (write) return { ...write, headers: { ...usageHeaders(accountId), ...write.headers } };
         }
 
         throw graphErrors.sandboxWrite(req.path);

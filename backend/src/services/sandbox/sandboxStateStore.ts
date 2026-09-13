@@ -44,8 +44,12 @@ export class SandboxStateStore {
     const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `${this.prefix(userId)}/sim` }, ConsistentRead: true }).promise();
     if (!result.Item) return JSON.parse(JSON.stringify(EMPTY_OVERLAY));
     if (result.Item.userId !== userId) throw new EvaluationDenied();
-    validateOverlay(result.Item.overlay);
-    return result.Item.overlay;
+    // ENG-1909 persists the overlay fields directly on the sim row. Accept the
+    // earlier nested fixture shape during rollout, then normalize legacy rows.
+    const { evaluationKey: _key, userId: _user, ...persisted } = result.Item;
+    const overlay = { ...EMPTY_OVERLAY, ...(result.Item.overlay ?? persisted) };
+    validateOverlay(overlay);
+    return overlay;
   }
   async recordAction(req: SimRequest, response: SimResponse, at: Date): Promise<void> {
     const args = { ...req.query, ...(object(req.json) ? req.json : {}), ...req.form, ...req.multipart?.fields };
