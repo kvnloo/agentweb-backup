@@ -130,9 +130,11 @@ describe('write simulator — create, update, delete, effective_status, adimages
     const nodeRead = await sim.handle(req(ad.id, { fields: 'id' }));
     expect(body(nodeRead).error).toMatchObject({ code: 100 });
 
-    // Deleting again is idempotent, not an error.
-    const del2 = await sim.handle(req(ad.id, {}, 'DELETE'));
-    expect(body(del2).error).toMatchObject({ code: 100 }); // unknown to the resolver either way — matches Meta's own 404-on-unknown-id
+    // Deleting again is idempotent, not an error (CodeRabbit, ENG-1909 — the idempotency
+    // check runs BEFORE resolving the object, so a repeated delete never reaches the
+    // "unknown to the resolver" path this test used to assert on).
+    const del2 = body(await sim.handle(req(ad.id, {}, 'DELETE')));
+    expect(del2).toEqual({ success: true });
   });
 
   it('deleting a seeded (dataset) object also removes it from reads', async () => {
@@ -202,5 +204,59 @@ describe('write simulator — create, update, delete, effective_status, adimages
     expect(body(badAdSet).error).toMatchObject({ code: 100 });
     const badAd = await sim.handle(req(`${FIXTURE_IDS.adsets[0]}/ads`, {}, 'POST', { form: { name: 'Ad', creative: JSON.stringify({ creative_id: 'nonexistent' }) } }));
     expect(body(badAd).error).toMatchObject({ code: 100 });
+  });
+
+  it('rejects a bogus status value on create and update instead of silently storing it (CodeRabbit)', async () => {
+    const deps = makeDeps();
+    const sim = createMetaSimulator(deps);
+    const badCreate = await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, {}, 'POST', {
+      form: { name: 'X', objective: 'OUTCOME_LEADS', status: 'BROKEN' },
+    }));
+    expect(body(badCreate).error).toMatchObject({ code: 100 });
+
+    const created = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, {}, 'POST', { form: { name: 'Y', objective: 'OUTCOME_LEADS' } })));
+    const badUpdate = await sim.handle(req(created.id, {}, 'POST', { form: { status: 'BROKEN' } }));
+    expect(body(badUpdate).error).toMatchObject({ code: 100 });
+    const stillGood = body(await sim.handle(req(created.id, { fields: 'id,status' })));
+    expect(stillGood.status).toBe('PAUSED');
+  });
+
+  it('a repeated DELETE on an already-deleted id is idempotent, not an error (CodeRabbit)', async () => {
+    const deps = makeDeps();
+    const sim = createMetaSimulator(deps);
+    const created = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, {}, 'POST', { form: { name: 'Z', objective: 'OUTCOME_LEADS' } })));
+    const first = body(await sim.handle(req(created.id, {}, 'DELETE')));
+    expect(first).toEqual({ success: true });
+    const second = await sim.handle(req(created.id, {}, 'DELETE'));
+    expect(body(second)).toEqual({ success: true });
+    expect(second.status).toBe(200);
+  });
+
+  it('deleting a campaign cascades to its own ad sets and ads — no orphan reads back ACTIVE (CodeRabbit)', async () => {
+    const deps = makeDeps();
+    const sim = createMetaSimulator(deps);
+    const campaign = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, {}, 'POST', { form: { name: 'Parent', objective: 'OUTCOME_LEADS' } })));
+    const adset = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/adsets`, {}, 'POST', {
+      form: { name: 'Child AdSet', campaign_id: campaign.id, status: 'ACTIVE' },
+    })));
+    const creative = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/adcreatives`, {}, 'POST', { form: { name: 'Creative' } })));
+    const ad = body(await sim.handle(req(`${adset.id}/ads`, {}, 'POST', {
+      form: { name: 'Child Ad', status: 'ACTIVE', creative: JSON.stringify({ creative_id: creative.id }) },
+    })));
+
+    const del = body(await sim.handle(req(campaign.id, {}, 'DELETE')));
+    expect(del).toEqual({ success: true });
+
+    const campaigns = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/campaigns`, { fields: 'id' })));
+    expect(campaigns.data.map((c: any) => c.id)).not.toContain(campaign.id);
+    const adsets = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/adsets`, { fields: 'id' })));
+    expect(adsets.data.map((a: any) => a.id)).not.toContain(adset.id);
+    const ads = body(await sim.handle(req(`act_${FIXTURE_ACCOUNT_ID}/ads`, { fields: 'id' })));
+    expect(ads.data.map((a: any) => a.id)).not.toContain(ad.id);
+
+    // Not just absent from lists — a direct read-by-id must also be gone, never falling
+    // through to a spuriously-ACTIVE orphan.
+    expect(body(await sim.handle(req(adset.id, {}))).error).toMatchObject({ code: 100 });
+    expect(body(await sim.handle(req(ad.id, {}))).error).toMatchObject({ code: 100 });
   });
 });

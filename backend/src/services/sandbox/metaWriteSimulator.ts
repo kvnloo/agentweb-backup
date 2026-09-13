@@ -3,7 +3,7 @@ import { graphErrors } from './graphError';
 import { resolveObjects } from './objects';
 import type { GraphReadContext } from './graphReads';
 import type {
-  SandboxAd, SandboxAdSet, SandboxCampaign, SandboxCreative, SandboxCustomAudience, SandboxOverlay, SimRequest, SimResponse,
+  ObjectStatus, SandboxAd, SandboxAdSet, SandboxCampaign, SandboxCreative, SandboxCustomAudience, SandboxOverlay, SimRequest, SimResponse,
 } from './types';
 import type { SandboxOverlayAudit } from './sandboxOverlayStore';
 import { uploadFileToS3WithPath } from '../../utils/s3Utils';
@@ -50,6 +50,14 @@ function jsonParam(params: Params, key: string): unknown {
   if (value === undefined) return undefined;
   if (typeof value !== 'string') return value;
   try { return JSON.parse(value); } catch { throw graphErrors.invalidParam(`${key} must be valid JSON`); }
+}
+const VALID_OBJECT_STATUSES: ReadonlySet<string> = new Set(['ACTIVE', 'PAUSED', 'DELETED', 'ARCHIVED']);
+/** Validates a caller-supplied `status`, falling back (never validating) when it's absent. */
+function parseStatus(params: Params, fallback: ObjectStatus): ObjectStatus {
+  const value = str(params, 'status');
+  if (value === undefined) return fallback;
+  if (!VALID_OBJECT_STATUSES.has(value)) throw graphErrors.invalidParam(`status must be one of ACTIVE, PAUSED, DELETED, ARCHIVED (got "${value}")`);
+  return value as ObjectStatus;
 }
 function nextId(overlay: SandboxOverlay): { id: string; overlay: SandboxOverlay } {
   const id = `9${String(overlay.nextId).padStart(16, '0')}`;
@@ -122,9 +130,10 @@ async function createCampaign(ctx: GraphReadContext, params: Params, mutate: Par
     const { id, overlay } = nextId(current);
     createdId = id;
     const now = unshiftNow(ctx.now, ctx.shift);
+    const status = parseStatus(params, 'PAUSED');
     const campaign: SandboxCampaign = {
-      id, account_id: ctx.dataset.account.account_id, name, status: (str(params, 'status') as SandboxCampaign['status']) || 'PAUSED',
-      effective_status: (str(params, 'status') as string) || 'PAUSED', objective,
+      id, account_id: ctx.dataset.account.account_id, name, status,
+      effective_status: status, objective,
       daily_budget: num(params, 'daily_budget'), lifetime_budget: num(params, 'lifetime_budget'),
       budget_remaining: num(params, 'daily_budget') ?? num(params, 'lifetime_budget'), spend_cap: num(params, 'spend_cap'),
       bid_strategy: str(params, 'bid_strategy'),
@@ -149,10 +158,11 @@ async function createAdSet(ctx: GraphReadContext, params: Params, mutate: Parame
     const { id, overlay } = nextId(current);
     createdId = id;
     const now = unshiftNow(ctx.now, ctx.shift);
+    const status = parseStatus(params, 'PAUSED');
     const adset: SandboxAdSet = {
       id, account_id: ctx.dataset.account.account_id, campaign_id: campaignId, name,
-      status: (str(params, 'status') as SandboxAdSet['status']) || 'PAUSED',
-      effective_status: (str(params, 'status') as string) || 'PAUSED',
+      status,
+      effective_status: status,
       optimization_goal: str(params, 'optimization_goal') || 'LINK_CLICKS', billing_event: str(params, 'billing_event') || 'IMPRESSIONS',
       destination_type: str(params, 'destination_type'), promoted_object: jsonParam(params, 'promoted_object') as Record<string, unknown> | undefined,
       bid_strategy: str(params, 'bid_strategy'), bid_amount: num(params, 'bid_amount'),
@@ -176,7 +186,7 @@ async function createAd(
   const creativeId = creativeParam?.creative_id ?? str(params, 'creative_id');
   if (!name || !adsetId || !creativeId) throw graphErrors.invalidParam('name, adset_id and creative{creative_id} are required');
   let createdId = '';
-  const status = (str(params, 'status') as SandboxAd['status']) || 'PAUSED';
+  const status = parseStatus(params, 'PAUSED');
   await mutate((current) => {
     const resolved = resolveObjects(ctx.dataset, current, ctx.now);
     const adset = resolved.adsets.get(adsetId);
@@ -283,7 +293,7 @@ async function updateNode(ctx: GraphReadContext, id: string, params: Params, mut
         const c = found.obj as SandboxCampaign;
         const updated: SandboxCampaign = {
           ...c,
-          name: str(params, 'name') ?? c.name, status: (str(params, 'status') as SandboxCampaign['status']) ?? c.status,
+          name: str(params, 'name') ?? c.name, status: parseStatus(params, c.status),
           daily_budget: params.daily_budget !== undefined ? num(params, 'daily_budget') : c.daily_budget,
           lifetime_budget: params.lifetime_budget !== undefined ? num(params, 'lifetime_budget') : c.lifetime_budget,
           spend_cap: params.spend_cap !== undefined ? num(params, 'spend_cap') : c.spend_cap,
@@ -298,7 +308,7 @@ async function updateNode(ctx: GraphReadContext, id: string, params: Params, mut
         const a = found.obj as SandboxAdSet;
         const updated: SandboxAdSet = {
           ...a,
-          name: str(params, 'name') ?? a.name, status: (str(params, 'status') as SandboxAdSet['status']) ?? a.status,
+          name: str(params, 'name') ?? a.name, status: parseStatus(params, a.status),
           daily_budget: params.daily_budget !== undefined ? num(params, 'daily_budget') : a.daily_budget,
           lifetime_budget: params.lifetime_budget !== undefined ? num(params, 'lifetime_budget') : a.lifetime_budget,
           bid_amount: params.bid_amount !== undefined ? num(params, 'bid_amount') : a.bid_amount,
@@ -309,7 +319,7 @@ async function updateNode(ctx: GraphReadContext, id: string, params: Params, mut
       }
       case 'ad': {
         const ad = found.obj as SandboxAd;
-        const nextStatus = (str(params, 'status') as SandboxAd['status']) ?? ad.status;
+        const nextStatus = parseStatus(params, ad.status);
         const updated: SandboxAd = { ...ad, name: str(params, 'name') ?? ad.name, status: nextStatus, updated_time: now };
         let next: SandboxOverlay = { ...current, ads: { ...current.ads, [id]: updated } };
         if (nextStatus === 'ACTIVE' && ad.status !== 'ACTIVE') {
@@ -335,10 +345,27 @@ async function updateNode(ctx: GraphReadContext, id: string, params: Params, mut
 
 async function deleteNode(ctx: GraphReadContext, id: string, mutate: Parameters<typeof handleGraphWrite>[2]): Promise<{ success: true }> {
   await mutate((current) => {
+    // Check idempotency BEFORE resolving: resolveExisting reads through the resolved (overlay
+    // - deletedIds) view, so a repeated/concurrent delete on an already-deleted id would
+    // otherwise throw unsupportedGet instead of the idempotent no-op a second DELETE should be.
+    if (current.deletedIds.includes(id)) return current;
     const found = resolveExisting(ctx, current, id);
     if (!found) throw graphErrors.unsupportedGet(id);
-    if (current.deletedIds.includes(id)) return current; // idempotent
-    return { ...current, deletedIds: [...current.deletedIds, id] };
+    // Cascade: real Meta never leaves an ad set/ad pointing at a deleted parent, and
+    // objects.ts's effective_status derivation only special-cases a PRESENT non-active
+    // parent — a MISSING one (deleted) falls through and reads back ACTIVE. Deleting a
+    // campaign or ad set therefore also deletes its children, using the same resolved view
+    // so both seeded and overlay-created descendants are covered.
+    const resolved = resolveObjects(ctx.dataset, current, ctx.now);
+    const deletedIds = new Set(current.deletedIds);
+    deletedIds.add(id);
+    if (found.kind === 'campaign') {
+      for (const adset of resolved.adsets.values()) if (adset.campaign_id === id) deletedIds.add(adset.id);
+      for (const ad of resolved.ads.values()) if (ad.campaign_id === id) deletedIds.add(ad.id);
+    } else if (found.kind === 'adset') {
+      for (const ad of resolved.ads.values()) if (ad.adset_id === id) deletedIds.add(ad.id);
+    }
+    return { ...current, deletedIds: [...deletedIds] };
   }, { action: 'sandbox.delete', details: { objectId: id } });
   return { success: true };
 }

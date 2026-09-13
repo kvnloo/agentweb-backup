@@ -57,7 +57,12 @@ class DynamoSandboxOverlayStore implements SandboxOverlayStore {
     const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
     if (!result.Item) return { ...EMPTY_OVERLAY };
     const { evaluationKey, userId: _u, ...overlay } = result.Item as Record<string, unknown>;
-    return overlay as unknown as SandboxOverlay;
+    // Normalize onto EMPTY_OVERLAY: a row written before a field existed on SandboxOverlay
+    // (exactly what happened here — customAudiences was added after this store shipped)
+    // would otherwise come back missing that field, and merge()'s Object.values(overlay.X)
+    // throws on undefined. Every future field addition gets the same forward-compatibility
+    // for free.
+    return { ...EMPTY_OVERLAY, ...overlay } as SandboxOverlay;
   }
 
   async mutate(userId: string, mutateFn: (current: SandboxOverlay) => SandboxOverlay, audit?: SandboxOverlayAudit): Promise<SandboxOverlay> {

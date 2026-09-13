@@ -99,6 +99,23 @@ describe('sandbox overlay store', () => {
     expect(put).toHaveBeenCalledTimes(1);
   });
 
+  it('load normalizes a legacy row missing newer overlay fields onto EMPTY_OVERLAY (CodeRabbit)', async () => {
+    const { db, items } = fakeDb();
+    // A row written before `customAudiences` existed on SandboxOverlay — exactly what
+    // happened to this store itself when that field was added mid-phase-3.
+    items.set(`evaluation/${USER}/sim`, {
+      evaluationKey: `evaluation/${USER}/sim`, userId: USER, revision: 3, nextId: 7,
+      campaigns: { c1: { id: 'c1' } }, adsets: {}, ads: {}, adcreatives: {}, adimages: {},
+      deletedIds: [], reviewUntil: {}, capiEvents: [],
+      // customAudiences deliberately absent
+    });
+    const store = getSandboxOverlayStore(db);
+    const overlay = await store.load(USER);
+    expect(overlay.customAudiences).toEqual({});
+    expect(overlay.campaigns).toEqual({ c1: { id: 'c1' } }); // real fields still come through
+    expect(overlay.revision).toBe(3);
+  });
+
   it('an audit append failure does not fail the overlay mutation itself', async () => {
     const { db, items } = fakeDb();
     let putCalls = 0;
