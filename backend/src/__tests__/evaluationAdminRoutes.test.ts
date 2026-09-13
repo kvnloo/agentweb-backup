@@ -2,7 +2,7 @@ import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { evaluationAdminRoutes } from '../routes/evaluation';
-import { evaluationStore, SandboxTierMissing } from '../services/evaluationStore';
+import { evaluationStore, SandboxTierMissing, SandboxDatasetMissing } from '../services/evaluationStore';
 import { userDb } from '../services/db';
 
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'synthetic-route-signing-secret' }));
@@ -14,7 +14,8 @@ jest.mock('../services/db', () => ({ userDb: {
 jest.mock('../services/evaluationStore', () => {
   // Mirrors the real class: the route forwards its message, which names the fix.
   class SandboxTierMissing extends Error { constructor() { super('The "Sandbox" subscription tier is not defined; run scripts/ensure-sandbox-tier.ts before provisioning.'); } }
-  return { SandboxTierMissing, evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn() } };
+  class SandboxDatasetMissing extends Error { constructor(id = 'agentweb-2026q2', version = 1) { super(`Sandbox dataset ${id}@${version} is not loaded; compile and load it before provisioning.`); } }
+  return { SandboxTierMissing, SandboxDatasetMissing, evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn() } };
 });
 
 describe('ENG-1907 sandbox admin routes', () => {
@@ -41,6 +42,12 @@ describe('ENG-1907 sandbox admin routes', () => {
     const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
     expect(result.status).toBe(412);
     expect(result.body.error).toContain('ensure-sandbox-tier');
+  });
+  it('a missing pinned dataset is reported as a precondition failure too (ENG-1908)', async () => {
+    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxDatasetMissing());
+    const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
+    expect(result.status).toBe(412);
+    expect(result.body.error).toContain('agentweb-2026q2@1');
   });
   it('a stale admin session cannot provision after administrator deactivation', async () => {
     (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce({ userId: 'admin', isAdmin: true, isActive: false });
