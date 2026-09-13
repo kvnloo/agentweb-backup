@@ -49,6 +49,17 @@ describe('sandbox artifact purge acceptance', () => {
     expect(f.s3.listObjectsV2.mock.calls.map(([p]: any) => p.Prefix)).toContain('tasks/deletedTask/executions/execution1/');
     expect(f.deleteGcsPrefix).not.toHaveBeenCalled();
   });
+  it('counts AgentRun ownership and idempotency rows exactly once', async () => {
+    const f = fixture();
+    f.db.scan.mockImplementation((p: any) => ({ promise: async () => ({ Items:
+      p.TableName === 'AW-AgentRuns' && p.ExpressionAttributeValues?.[':owner'] === '1'
+        ? [{ pk: 'run#1', runId: '1', userId }, { pk: 'idem#1', runId: '1' }]
+        : (p.TableName === 'AW-AgentRuns' ? [{ pk: 'run#1', runId: '1', userId, status: 'completed' }] : [])
+    }) }));
+    const result = await f.cleanup.purge(userId);
+    expect(result['AW-AgentRuns']).toBe(2);
+    expect(f.db.delete.mock.calls.filter(([p]: any) => p.TableName === 'AW-AgentRuns')).toHaveLength(2);
+  });
   it('refuses non-sandbox identities without touching storage', async () => {
     const f = fixture();
     await expect(f.cleanup.purge('real_user')).rejects.toThrow();

@@ -206,6 +206,7 @@ export class SandboxArtifactCleanup {
       }
       counts['AW-ChatMessages'] = messages.length;
       for (const child of children) {
+        let deleted = 0;
         for (const row of child.rows) {
           if (child.table === 'AW-AgentRuns' && row.userId === userId) continue;
           await this.db.delete({ TableName: this.tablePrefix + child.table,
@@ -213,12 +214,13 @@ export class SandboxArtifactCleanup {
             ConditionExpression: '#owner = :owner', ExpressionAttributeNames: { '#owner': child.owner },
             ExpressionAttributeValues: { ':owner': child.value },
           }).promise();
+          deleted++;
         }
-        counts[child.table] = (counts[child.table] ?? 0) + child.rows.length;
+        counts[child.table] = (counts[child.table] ?? 0) + deleted;
       }
       // Shares are fields on AW-ChatSessions; deleting the session invalidates every share.
       for (const [table, key] of TABLES) {
-        counts[table] = 0;
+        counts[table] = counts[table] ?? 0;
         for (const row of inventory.get(table)!) {
           await this.db.delete({ TableName: this.tablePrefix + table, Key: { [key]: row[key], ...(['AW-Characters', 'AW-Books'].includes(table) ? { userId } : {}) },
             ConditionExpression: '#owner = :user', ExpressionAttributeNames: { '#owner': ownerField(table) },

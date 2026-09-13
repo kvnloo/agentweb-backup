@@ -316,8 +316,13 @@ export class EvaluationStore {
       const deleteCredentials = await this.prepareCredentialCleanup(userId);
       const { cleanup } = await this.lifecycle();
       const deleteArtifacts = await cleanup.preparePurge(userId);
-      await this.revokeWithCleanup(actor, userId, deleteCredentials);
+      const revocation = await this.revokeWithCleanup(actor, userId, deleteCredentials);
+      // A credential request can pass its first active-policy check before the
+      // lifecycle lease, then persist after the initial inventory.
+      const lateCredentials = await (await this.prepareCredentialCleanup(userId))();
       const counts = await deleteArtifacts();
+      for (const [table, count] of Object.entries(revocation.cleanup)) counts[table] = (counts[table] ?? 0) + count;
+      for (const [table, count] of Object.entries(lateCredentials)) counts[table] = (counts[table] ?? 0) + count;
       for (const evaluationKey of materialKeys) {
         await this.db.delete({ TableName: this.table, Key: { evaluationKey },
           ConditionExpression: 'attribute_not_exists(userId) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
@@ -398,7 +403,7 @@ export class EvaluationStore {
     do {
       let page: AWS.DynamoDB.DocumentClient.ScanOutput;
       try {
-        page = await this.db.scan({ ...params, ConsistentRead: true, Limit: 100,
+        page = await this.db.scan({ ...params, ConsistentRead: true,
           ...(cursor ? { ExclusiveStartKey: cursor } : {}),
         }).promise();
       } catch (error: any) {

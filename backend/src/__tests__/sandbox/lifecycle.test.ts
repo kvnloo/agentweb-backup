@@ -164,6 +164,24 @@ it('revokes credentials beyond twenty empty pages without trusting a lagging GSI
   expect(result.cleanup['AW-AgentApiKeys']).toBe(1);
   expect(h.db.delete).toHaveBeenCalledWith(expect.objectContaining({ Key: { keyId: 'not-indexed-yet' },
     ConditionExpression: '#owner = :user' }));
+  for (const [params] of h.db.scan.mock.calls) expect(params.Limit).toBeUndefined();
+});
+
+it('purge removes credentials written after the initial inventory', async () => {
+  const h = harness(); let apiKeyInventories = 0;
+  h.db.scan.mockImplementation(({ TableName }: any) => ({ promise: async () => {
+    if (TableName.endsWith('AW-Evaluations')) return { Items: [] };
+    if (TableName.endsWith('AW-AgentApiKeys') && ++apiKeyInventories === 2) {
+      return { Items: [{ keyId: 'late-key', userId: policy.userId }] };
+    }
+    return { Items: [] };
+  } }));
+  const result = await h.store.purge('admin', policy.userId);
+  expect(apiKeyInventories).toBe(2);
+  expect(h.db.delete).toHaveBeenCalledWith(expect.objectContaining({
+    TableName: expect.stringMatching(/AW-AgentApiKeys$/), Key: { keyId: 'late-key' },
+  }));
+  expect(result.cleanup['AW-AgentApiKeys']).toBe(1);
 });
 
 it.each(['repeated', 'malformed', 'foreign', 'late-missing'])('fails closed on %s credential inventory before any deletion', async failure => {
