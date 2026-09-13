@@ -70,6 +70,10 @@ describe('ENG-1907 sandbox HTTP boundary', () => {
     (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'revoked' });
     expect((await request(app).get('/api/brand').set('Authorization', `Bearer ${token}`)).status).toBe(401);
   });
+  it.each(['resetting', 'purging', 'purged'])('a %s policy blocks candidate requests', async lifecycleState => {
+    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', expiresAt: Date.now() + 60000, lifecycleState });
+    expect((await request(app).get('/api/brand').set('Authorization', `Bearer ${token}`)).status).toBe(401);
+  });
   it('an expired policy fails closed', async () => {
     (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', email: 'case@example.invalid', status: 'active', expiresAt: Date.now() - 1 });
     expect((await request(app).get('/api/brand').set('Authorization', `Bearer ${token}`)).status).toBe(401);

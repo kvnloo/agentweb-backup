@@ -1,5 +1,8 @@
 import AWS from 'aws-sdk';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import type { SandboxDataset } from './sandbox/types';
+import { SandboxStateStore } from './sandbox/sandboxStateStore';
+import { buildOverlayDiff, orderSandboxAudit, renderSandboxReviewMarkdown } from './sandbox/review';
 import bcrypt from 'bcryptjs';
 import { EvaluationDenied, isEvaluationUser, SANDBOX_TOOL_CLASS_NAMES } from './evaluationPolicy';
 import { mintSandboxToken, sandboxAdAccountId } from './sandbox/sentinel';
@@ -18,7 +21,9 @@ export interface EvaluationRecord {
   deniedToolClasses: string[];
   provisionedBy?: string;
   reviewerUserIds?: string[];
+  lifecycleState?: 'resetting' | 'purging' | 'purged';
 }
+
 export interface ProvisionEvaluation {
   email: string;
   displayName: string;
@@ -61,8 +66,8 @@ let provisionDeps: SandboxProvisionDeps = {
   // read path (every request) must never pay for.
   loadDatasetSummary: (datasetId, version) => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { sandboxDatasetStore } = require('./sandbox/sandboxDatasetStore');
-    return sandboxDatasetStore.loadDatasetSummary(datasetId, version);
+    const { getSandboxDatasetStore } = require('./sandbox/sandboxDatasetStore');
+    return getSandboxDatasetStore().loadDatasetSummary(datasetId, version);
   },
 };
 /** Test seam (and future alternate dataset sources). */
@@ -75,12 +80,31 @@ const SANDBOX_GRANTED_SCOPES = ['ads_management', 'ads_read'];
 
 const ID_PATTERN = /^[a-zA-Z0-9-]{1,100}$/;
 
+export interface SandboxLifecycleDeps {
+  datasets: { loadDataset(datasetId: string, version: number): Promise<SandboxDataset> };
+  cleanup: {
+    assertQuiescent(userId: string): Promise<void>;
+    deleteSandboxPrefix(userId: string): Promise<number>;
+    purge(userId: string): Promise<Record<string, number>>;
+  };
+}
+
 /** Sandbox policy, audit and (from phase 2) dataset/overlay rows live only in AW-Evaluations. */
 export class EvaluationStore {
   private prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
   private table = `${this.prefix}AW-Evaluations`;
   private users = `${this.prefix}AW-Users`;
-  constructor(private db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' })) {}
+  constructor(private db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' }), private lifecycleDeps?: SandboxLifecycleDeps) {}
+
+  private async lifecycle(): Promise<SandboxLifecycleDeps> {
+    if (!this.lifecycleDeps) {
+      const [{ getSandboxDatasetStore }, { SandboxArtifactCleanup }] = await Promise.all([
+        import('./sandbox/sandboxDatasetStore'), import('./sandbox/artifactCleanup'),
+      ]);
+      this.lifecycleDeps = { datasets: getSandboxDatasetStore(), cleanup: new SandboxArtifactCleanup({ db: this.db }) };
+    }
+    return this.lifecycleDeps;
+  }
 
   private key(userId: string) {
     if (!isEvaluationUser(userId) || !/^eval_[a-zA-Z0-9-]+$/.test(userId)) throw new EvaluationDenied();
@@ -112,6 +136,10 @@ export class EvaluationStore {
     if (typeof item.datasetVersion === 'number') record.datasetVersion = item.datasetVersion;
     if (typeof item.provisionedBy === 'string') record.provisionedBy = item.provisionedBy;
     if (Array.isArray(item.reviewerUserIds)) record.reviewerUserIds = item.reviewerUserIds.filter((id): id is string => typeof id === 'string');
+    if (item.lifecycleState !== undefined) {
+      if (!['resetting', 'purging', 'purged'].includes(item.lifecycleState as string)) throw new EvaluationDenied();
+      record.lifecycleState = item.lifecycleState as EvaluationRecord['lifecycleState'];
+    }
     return record;
   }
 
@@ -209,7 +237,6 @@ export class EvaluationStore {
     const record = await this.requireReview(actor, userId);
     const audit: Record<string, unknown>[] = [];
     let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-    let pages = 0;
     do {
       const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
         FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
@@ -221,9 +248,104 @@ export class EvaluationStore {
         if (!item || item.userId !== userId || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) throw new EvaluationDenied();
         audit.push(item);
       }
-      cursor = page.LastEvaluatedKey; pages++;
-    } while (cursor && audit.length < 1000 && pages < 100);
-    return { userId, status: record.status, audit, truncated: !!cursor };
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+    const orderedAudit = orderSandboxAudit(audit);
+    const overlay = await new SandboxStateStore(this.db).loadOverlay(userId);
+    const dataset = record.datasetId && record.datasetVersion
+      ? await (await this.lifecycle()).datasets.loadDataset(record.datasetId, record.datasetVersion) : null;
+    const result = { userId, status: record.status, audit: orderedAudit,
+      timeline: orderedAudit.filter(item => item.action === 'meta'),
+      overlayDiff: dataset ? buildOverlayDiff(dataset, overlay) : [], truncated: !!cursor };
+    return { ...result, markdown: renderSandboxReviewMarkdown(result) };
+  }
+
+  /** A short lease serializes cleanup. Failed operations retain the deny marker but release the lease for retry. */
+  private async beginLifecycle(actor: string, userId: string, state: 'resetting' | 'purging') {
+    const lease = randomUUID();
+    await this.db.transactWrite({ TransactItems: [
+      { Update: { TableName: this.table, Key: this.key(userId),
+        UpdateExpression: 'SET lifecycleState = :state, lifecycleLease = :lease, lifecycleLeaseUntil = :until',
+        ConditionExpression: 'userId = :user AND (attribute_not_exists(lifecycleLeaseUntil) OR lifecycleLeaseUntil < :now) AND (attribute_not_exists(lifecycleState) OR lifecycleState = :state OR lifecycleState = :resetting)',
+        ExpressionAttributeValues: { ':user': userId, ':state': state, ':resetting': 'resetting', ':lease': lease, ':until': Date.now() + 300000, ':now': Date.now() },
+      } }, this.audit(userId, actor, `${state}-started`),
+    ] }).promise();
+    return lease;
+  }
+
+  private async failLifecycle(actor: string, userId: string, lease: string, action: string) {
+    // The original pending marker remains authoritative even if this audit write fails.
+    try { await this.db.transactWrite({ TransactItems: [
+      { Update: { TableName: this.table, Key: this.key(userId),
+        UpdateExpression: 'REMOVE lifecycleLease, lifecycleLeaseUntil',
+        ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+        ExpressionAttributeValues: { ':user': userId, ':lease': lease },
+      } }, this.audit(userId, actor, `${action}-failed`),
+    ] }).promise(); } catch { /* fail closed */ }
+  }
+
+  async reset(actor: string, userId: string) {
+    const record = await this.get(userId);
+    if (!record?.datasetId || !record.datasetVersion || record.lifecycleState === 'purged') throw new EvaluationDenied();
+    const { datasets, cleanup } = await this.lifecycle();
+    const seed = await datasets.loadDataset(record.datasetId, record.datasetVersion);
+    const seedSha256 = createHash('sha256').update(JSON.stringify(seed)).digest('hex');
+    const lease = await this.beginLifecycle(actor, userId, 'resetting');
+    try {
+      await cleanup.assertQuiescent(userId);
+      const deletedObjects = await cleanup.deleteSandboxPrefix(userId);
+      // The immutable seed never needs rewriting. Removing sim makes the next read load it exactly.
+      await this.db.transactWrite({ TransactItems: [
+        { Delete: { TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/sim` } } },
+        { Update: { TableName: this.table, Key: this.key(userId),
+          UpdateExpression: 'REMOVE lifecycleState, lifecycleLease, lifecycleLeaseUntil',
+          ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+          ExpressionAttributeValues: { ':user': userId, ':lease': lease },
+        } }, this.audit(userId, actor, 'reset', { seedSha256, deletedObjects }),
+      ] }).promise();
+      return { userId, seedSha256, deletedObjects };
+    } catch (error) { await this.failLifecycle(actor, userId, lease, 'reset'); throw error; }
+  }
+
+  async purge(actor: string, userId: string) {
+    const record = await this.get(userId);
+    if (!record || typeof record.email !== 'string') throw new EvaluationDenied();
+    if (record.lifecycleState === 'purged') return { userId, status: 'revoked', cleanup: {} };
+    const lease = await this.beginLifecycle(actor, userId, 'purging');
+    try {
+      await this.revoke(actor, userId);
+      const { cleanup } = await this.lifecycle();
+      await cleanup.assertQuiescent(userId);
+      const counts = await cleanup.purge(userId);
+      // Remove per-account simulator/legacy material rows, never shared datasets, policy or audit.
+      let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+      do {
+        const page = await this.db.scan({ TableName: this.table, ConsistentRead: true,
+          FilterExpression: 'begins_with(evaluationKey, :prefix)',
+          ExpressionAttributeValues: { ':prefix': `evaluation/${userId}/` },
+          ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+        }).promise();
+        if (!Array.isArray(page.Items)) throw new EvaluationDenied();
+        for (const item of page.Items) {
+          if (!item || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/`) ||
+              (item.userId !== undefined && item.userId !== userId)) throw new EvaluationDenied();
+          if (item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) continue;
+          await this.db.delete({ TableName: this.table, Key: { evaluationKey: item.evaluationKey } }).promise();
+        }
+        cursor = page.LastEvaluatedKey;
+      } while (cursor);
+      await this.db.transactWrite({ TransactItems: [
+        { Delete: { TableName: this.users, Key: { email: record.email },
+          ConditionExpression: 'attribute_not_exists(email) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
+        } },
+        { Update: { TableName: this.table, Key: this.key(userId),
+          UpdateExpression: 'SET lifecycleState = :state REMOVE lifecycleLease, lifecycleLeaseUntil',
+          ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+          ExpressionAttributeValues: { ':user': userId, ':lease': lease, ':state': 'purged' },
+        } }, this.audit(userId, actor, 'purge', { cleanup: counts }),
+      ] }).promise();
+      return { userId, status: 'revoked', cleanup: counts };
+    } catch (error) { await this.failLifecycle(actor, userId, lease, 'purge'); throw error; }
   }
 
   async discardJob(userId: string, scheduleId: string) {

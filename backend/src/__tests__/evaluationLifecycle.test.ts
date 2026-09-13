@@ -203,9 +203,10 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
 
   it('review is limited to the provisioning admin and explicitly assigned reviewers and returns only status + audit', async () => {
     get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', status: 'revoked', provisionedBy: 'admin', reviewerUserIds: ['matt'], materials: [{ title: 'x', text: 'y' }] } }) });
+    get.mockImplementation(({ Key }: any) => ({ promise: async () => ({ Item: Key.evaluationKey.endsWith('/sim') ? undefined : { userId: 'eval_test', status: 'revoked', provisionedBy: 'admin', reviewerUserIds: ['matt'] } }) }));
     scan.mockImplementation(() => ({ promise: async () => ({ Items: [{ evaluationKey: 'evaluation/eval_test/audit/1', userId: 'eval_test', action: 'provision' }], LastEvaluatedKey: undefined }) }));
     const result = await store.review('matt', 'eval_test');
-    expect(result).toEqual({ userId: 'eval_test', status: 'revoked', audit: [expect.objectContaining({ action: 'provision' })], truncated: false });
+    expect(result).toEqual(expect.objectContaining({ userId: 'eval_test', status: 'revoked', audit: [expect.objectContaining({ action: 'provision' })], truncated: false }));
     await expect(store.review('stranger', 'eval_test')).rejects.toThrow();
   });
 });

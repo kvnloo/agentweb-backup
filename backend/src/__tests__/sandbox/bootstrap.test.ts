@@ -1,3 +1,5 @@
+import { buildFixtureDataset } from './fixtures/fixtureDataset';
+import { sandboxAdAccountId } from '../../services/sandbox/sentinel';
 import { EvaluationDenied } from '../../services/evaluationPolicy';
 import * as metaSimulatorModule from '../../services/sandbox/metaSimulator';
 
@@ -13,6 +15,9 @@ jest.mock('../../services/evaluationPolicy', () => ({
   requireActiveEvaluation: (...args: unknown[]) => requireActiveEvaluation(...args),
 }));
 
+const loadOverlay = jest.fn(async () => ({ revision: 1 }));
+const recordAction = jest.fn(async () => {});
+jest.mock('../../services/sandbox/sandboxStateStore', () => ({ sandboxStateStore: { loadOverlay, recordAction } }));
 const loadDataset = jest.fn();
 jest.mock('../../services/sandbox/sandboxDatasetStore', () => ({
   getSandboxDatasetStore: () => ({ loadDataset }),
@@ -72,14 +77,14 @@ describe('the wired MetaSimulatorDeps', () => {
     await expect(install().loadPolicy('eval_x')).rejects.toThrow('DynamoDB is unavailable');
   });
 
-  it('loadDataset delegates to the dataset store', async () => {
-    loadDataset.mockResolvedValue({ account: { id: 'act_1207000000000001' } });
-    await expect(install().loadDataset('agentweb-2026q2', 1)).resolves.toEqual({ account: { id: 'act_1207000000000001' } });
+  it('loadDataset delegates to immutable store and projects the provisioned account', async () => {
+    loadDataset.mockResolvedValue(buildFixtureDataset());
+    await expect(install().loadDataset('agentweb-2026q2', 1, 'eval_x')).resolves.toMatchObject({ account: { id: `act_${sandboxAdAccountId('eval_x')}` } });
     expect(loadDataset).toHaveBeenCalledWith('agentweb-2026q2', 1);
   });
 
-  it('loadOverlay always returns the empty overlay (phase 3 has not shipped a real one yet)', async () => {
-    const { EMPTY_OVERLAY } = require('../../services/sandbox/types');
-    await expect(install().loadOverlay('eval_x')).resolves.toBe(EMPTY_OVERLAY);
+  it('loadOverlay delegates to persisted candidate state', async () => {
+    await expect(install().loadOverlay('eval_x')).resolves.toEqual({ revision: 1 });
+    expect(loadOverlay).toHaveBeenCalledWith('eval_x');
   });
 });

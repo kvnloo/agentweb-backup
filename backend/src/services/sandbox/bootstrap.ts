@@ -1,7 +1,8 @@
 import { installMetaSandboxInterceptor } from './metaInterceptor';
 import { createMetaSimulator, type MetaSimulatorDeps } from './metaSimulator';
 import { getSandboxDatasetStore } from './sandboxDatasetStore';
-import { EMPTY_OVERLAY } from './types';
+import { projectSandboxDataset } from './runtimeDataset';
+import { sandboxStateStore } from './sandboxStateStore';
 import { EvaluationDenied, requireActiveEvaluation } from '../evaluationPolicy';
 
 /**
@@ -11,9 +12,6 @@ import { EvaluationDenied, requireActiveEvaluation } from '../evaluationPolicy';
  * sentinel token is not a real Meta credential), not leak anything, but it defeats the whole
  * point of the sandbox. Idempotent: installMetaSandboxInterceptor no-ops on a second call.
  *
- * loadOverlay always returns the empty overlay for now — phase 3 (ENG-1909) is what actually
- * writes an account's overlay; until it ships there is nothing else to read. Update this once
- * that lands.
  */
 const deps: MetaSimulatorDeps = {
   async loadPolicy(userId) {
@@ -26,12 +24,13 @@ const deps: MetaSimulatorDeps = {
       throw error;
     }
   },
-  loadDataset(datasetId, version) {
-    return getSandboxDatasetStore().loadDataset(datasetId, version);
+  async loadDataset(datasetId, version, userId) {
+    const seed = await getSandboxDatasetStore().loadDataset(datasetId, version);
+    if (!userId) throw new EvaluationDenied();
+    return projectSandboxDataset(seed, userId);
   },
-  async loadOverlay() {
-    return EMPTY_OVERLAY;
-  },
+  loadOverlay: userId => sandboxStateStore.loadOverlay(userId),
+  recordAction: (req, response, at) => sandboxStateStore.recordAction(req, response, at),
 };
 
 export function installSandboxMetaInterceptorAtBoot(): void {

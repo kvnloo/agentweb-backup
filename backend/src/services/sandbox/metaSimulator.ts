@@ -15,8 +15,9 @@ export interface SandboxPolicyRef { datasetId: string; datasetVersion: number }
 export interface MetaSimulatorDeps {
   /** Active policy for the principal, or null when revoked/expired/unknown → 190. */
   loadPolicy(userId: string): Promise<SandboxPolicyRef | null>;
-  loadDataset(datasetId: string, version: number): Promise<SandboxDataset>;
+  loadDataset(datasetId: string, version: number, userId?: string): Promise<SandboxDataset>;
   loadOverlay(userId: string): Promise<SandboxOverlay>;
+  recordAction?(req: SimRequest, response: SimResponse, at: Date): Promise<void>;
   now?: () => Date;
 }
 
@@ -38,14 +39,13 @@ function requestParams(req: SimRequest): Record<string, unknown> {
 
 export function createMetaSimulator(deps: MetaSimulatorDeps): MetaSimulator {
   const clock = deps.now ?? (() => new Date());
-  return {
-    async handle(req: SimRequest): Promise<SimResponse> {
+  const dispatch = async (req: SimRequest): Promise<SimResponse> => {
       let accountId: string | null = null;
       try {
         const now = clock();
         const policy = await deps.loadPolicy(req.userId);
         if (!policy) throw graphErrors.invalidToken();
-        const dataset = await deps.loadDataset(policy.datasetId, policy.datasetVersion);
+        const dataset = await deps.loadDataset(policy.datasetId, policy.datasetVersion, req.userId);
         const overlay = await deps.loadOverlay(req.userId);
         accountId = dataset.account.account_id;
         const shift = computeShiftDays(dataset.meta.frozenWindow.until, now);
@@ -68,6 +68,18 @@ export function createMetaSimulator(deps: MetaSimulatorDeps): MetaSimulator {
         if (error instanceof GraphError) return error.toResponse(usageHeaders(accountId));
         console.error('[metaSimulator] unexpected failure', { path: req.path, method: req.method, userId: req.userId, error });
         return graphErrors.unknown().toResponse(usageHeaders(accountId));
+      }
+  };
+  return {
+    async handle(req) {
+      const at = clock();
+      const response = await dispatch(req);
+      try {
+        await deps.recordAction?.(req, response, at);
+        return response;
+      } catch {
+        // A candidate must never receive an unaudited simulated result.
+        return graphErrors.unknown().toResponse(usageHeaders(null));
       }
     },
   };

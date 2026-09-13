@@ -53,6 +53,8 @@ export interface SandboxDatasetMeta {
   /** Human-readable notes on what was synthesised (reach, breakdowns, names). */
   approximations: string[];
   createdAt: string;
+  /** Optional case-specific simulated ad review duration. */
+  reviewWindowSeconds?: number;
 }
 
 export interface SandboxAccount {
@@ -237,6 +239,10 @@ export interface SandboxDataset {
   insightsDaily: SandboxInsightsDaily[];
   insightsBreakdownDaily: SandboxInsightsBreakdownDaily[];
   landers: SandboxLander[];
+  /** Packet asset references; bytes are staged separately, never fetched from Meta. */
+  assetsManifest?: Array<{ assetKey: string; sourcePath: string; sha256: string; bytes: number; width: number; height: number }>;
+  /** Integer metric totals verified against both packet exports and manifest. Spend is cents. */
+  reconciliation?: { packetManifestSha256: string; dailyRows: number; periodRows: number; totals: Record<string, number> };
   targetingCatalog?: { interests: Array<Record<string, unknown>>; geo: Array<Record<string, unknown>> };
 }
 
