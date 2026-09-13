@@ -2,6 +2,7 @@ import AWS from 'aws-sdk';
 import { randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { EvaluationDenied, isEvaluationUser, SANDBOX_TOOL_CLASS_NAMES } from './evaluationPolicy';
+import { mintSandboxToken, sandboxAdAccountId } from './sandbox/sentinel';
 
 /** The sandbox policy: one row per principal, authoritative for every gate. */
 export interface EvaluationRecord {
@@ -24,10 +25,11 @@ export interface ProvisionEvaluation {
   password: string;
   expiresAt: number;
   brandGuidelines: { brandName: string; website?: string; description?: string };
+  /** The frozen dataset the simulated Meta connection serves (ENG-1908). Required: an account with no data is not a sandbox. */
+  datasetId: string;
+  datasetVersion: number;
   reviewerUserIds?: string[];
   label?: string;
-  datasetId?: string;
-  datasetVersion?: number;
   deniedToolClasses?: string[];
 }
 
@@ -39,6 +41,37 @@ export class SandboxTierMissing extends Error {
     super(`The "${SANDBOX_TIER_NAME}" subscription tier is not defined in the subscription_types setting; run scripts/ensure-sandbox-tier.ts before provisioning.`);
   }
 }
+
+/** The pinned dataset must already be loaded; a connection pointing at nothing would read as a broken Meta account. */
+export class SandboxDatasetMissing extends Error {
+  constructor(datasetId: string, version: number) {
+    super(`Sandbox dataset ${datasetId}@${version} is not loaded; compile and load it before provisioning.`);
+  }
+}
+
+/** What provisioning needs to know about a dataset: just enough to write a believable connection row. */
+export interface SandboxDatasetSummary {
+  account: { account_id: string; currency: string; name: string; timezone_name: string };
+}
+export interface SandboxProvisionDeps {
+  loadDatasetSummary(datasetId: string, version: number): Promise<SandboxDatasetSummary | null>;
+}
+let provisionDeps: SandboxProvisionDeps = {
+  // Lazy: the dataset store pulls in the whole simulator module graph, which the policy
+  // read path (every request) must never pay for.
+  loadDatasetSummary: (datasetId, version) => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { sandboxDatasetStore } = require('./sandbox/sandboxDatasetStore');
+    return sandboxDatasetStore.loadDatasetSummary(datasetId, version);
+  },
+};
+/** Test seam (and future alternate dataset sources). */
+export function setSandboxProvisionDeps(deps: SandboxProvisionDeps): void { provisionDeps = deps; }
+
+/** The simulated token must outlive the account by a wide margin so no refresh path ever fires. */
+const SANDBOX_TOKEN_GRACE_MS = 90 * 86400000;
+const SANDBOX_REQUESTED_SCOPES = ['ads_management', 'ads_read', 'business_management', 'pages_show_list'];
+const SANDBOX_GRANTED_SCOPES = ['ads_management', 'ads_read'];
 
 const ID_PATTERN = /^[a-zA-Z0-9-]{1,100}$/;
 
@@ -101,13 +134,15 @@ export class EvaluationStore {
     if (input.reviewerUserIds !== undefined && (!Array.isArray(input.reviewerUserIds) || input.reviewerUserIds.length > 5 ||
       input.reviewerUserIds.some(id => typeof id !== 'string' || !ID_PATTERN.test(id)))) throw new EvaluationDenied();
     if (input.label !== undefined && (typeof input.label !== 'string' || !input.label.trim() || input.label.length > 40)) throw new EvaluationDenied();
-    if (input.datasetId !== undefined && (typeof input.datasetId !== 'string' || !ID_PATTERN.test(input.datasetId))) throw new EvaluationDenied();
-    if (input.datasetVersion !== undefined && (!Number.isSafeInteger(input.datasetVersion) || input.datasetVersion < 1)) throw new EvaluationDenied();
+    if (typeof input.datasetId !== 'string' || !ID_PATTERN.test(input.datasetId)) throw new EvaluationDenied();
+    if (!Number.isSafeInteger(input.datasetVersion) || input.datasetVersion < 1) throw new EvaluationDenied();
     if (input.deniedToolClasses !== undefined && (!Array.isArray(input.deniedToolClasses) ||
       input.deniedToolClasses.some(c => typeof c !== 'string' || !SANDBOX_TOOL_CLASS_NAMES.includes(c)))) throw new EvaluationDenied();
 
     const { getSubscriptionTypeConfig } = await import('./subscriptionService');
     if (!(await getSubscriptionTypeConfig(SANDBOX_TIER_NAME))) throw new SandboxTierMissing();
+    const dataset = await provisionDeps.loadDatasetSummary(input.datasetId, input.datasetVersion);
+    if (!dataset) throw new SandboxDatasetMissing(input.datasetId, input.datasetVersion);
 
     const userId = `eval_${randomUUID()}`;
     const email = input.email.toLowerCase();
@@ -118,10 +153,24 @@ export class EvaluationStore {
       userId, email, status: 'active', expiresAt: input.expiresAt, mode: 'sandbox',
       label: input.label?.trim() || 'Sandbox', connectors: { meta: 'simulated' }, deniedToolClasses,
       provisionedBy: actor, reviewerUserIds: input.reviewerUserIds || [],
-      ...(input.datasetId !== undefined ? { datasetId: input.datasetId } : {}),
-      ...(input.datasetVersion !== undefined ? { datasetVersion: input.datasetVersion } : {}),
+      datasetId: input.datasetId, datasetVersion: input.datasetVersion,
     };
     const now = new Date().toISOString();
+    // The simulated Meta connection (ENG-1908 AC 1). Same shape routes/metaAuth.ts writes for a
+    // real ad account, so Settings → Connected accounts, list_connected_accounts and every
+    // credential resolver treat it as Connected + ads-capable. The token is a sentinel the Graph
+    // interceptor recognizes; it is never sent to Meta and never refreshed (metaTokenRefresh.ts).
+    // The ad account id is derived from the principal, not copied from the dataset, so two
+    // sandboxes on one dataset never share an id.
+    const adAccountId = sandboxAdAccountId(userId);
+    const connectedAccounts = [{
+      platform: 'meta', account_id: adAccountId, account_name: dataset.account.name, created_at: now, updated_at: now,
+      config: {
+        account_type: 'ad_account', ad_account_id: adAccountId, currency: dataset.account.currency, account_status: 1,
+        access_token: mintSandboxToken(userId), token_expires_at: input.expiresAt + SANDBOX_TOKEN_GRACE_MS,
+        scopes: SANDBOX_REQUESTED_SCOPES, granted_scopes: SANDBOX_GRANTED_SCOPES,
+      },
+    }];
     // The full brandGuidelines shape (services/db.ts User.brandGuidelines): the portal keys onboarding
     // off brandData.brandName and the brand page reads every array field.
     const brandGuidelines = {
@@ -133,13 +182,13 @@ export class EvaluationStore {
       },
       attachments: [], createdAt: now, updatedAt: now,
     };
-    const audit = this.audit(userId, actor, 'provision', { label: record.label, datasetId: record.datasetId ?? null, deniedToolClasses });
+    const audit = this.audit(userId, actor, 'provision', { label: record.label, datasetId: record.datasetId, datasetVersion: record.datasetVersion, deniedToolClasses });
     await this.db.transactWrite({ TransactItems: [
       { Put: { TableName: this.users, Item: {
         email, userId, displayName: input.displayName.trim(), password: await bcrypt.hash(input.password, 12),
         isOAuthUser: false, isAdmin: false, isActive: true, roles: ['customer'],
         subscriptionType: SANDBOX_TIER_NAME, subscription_status: 'active', sessionVersion: 0,
-        signupSource: 'evaluation', createdAt: now, brandGuidelines,
+        signupSource: 'evaluation', createdAt: now, brandGuidelines, connected_accounts: connectedAccounts,
         memoryEnabled: false, emailNotificationsEnabled: false, emmaTipsEnabled: false,
       }, ConditionExpression: 'attribute_not_exists(email)' } },
       { Put: { TableName: this.table, Item: { ...this.key(userId), ...record }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } },

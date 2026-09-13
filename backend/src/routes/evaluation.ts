@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { evaluationStore, SandboxTierMissing } from '../services/evaluationStore';
+import { evaluationStore, SandboxDatasetMissing, SandboxTierMissing } from '../services/evaluationStore';
 import { EvaluationDenied, requireEvaluationAdmin, requireEvaluationReviewer } from '../services/evaluationPolicy';
 
 function handler(fn: (req: AuthenticatedRequest, res: Response) => Promise<unknown>) {
@@ -10,7 +10,7 @@ function handler(fn: (req: AuthenticatedRequest, res: Response) => Promise<unkno
       (error?.code === 'TransactionCanceledException' && Array.isArray(reasons) &&
        reasons.some(r => r?.Code === 'ConditionalCheckFailed') && reasons.every(r => ['None', 'ConditionalCheckFailed'].includes(r?.Code)));
     if (error instanceof EvaluationDenied || conditionalDenial) return res.status(403).json({ error: 'Evaluation access denied' });
-    if (error instanceof SandboxTierMissing) return res.status(412).json({ error: error.message });
+    if (error instanceof SandboxTierMissing || error instanceof SandboxDatasetMissing) return res.status(412).json({ error: error.message });
     // Storage exceptions can contain request material. Report the failed operation
     // through the global handler without exposing it.
     next(new Error('Evaluation operation failed'));

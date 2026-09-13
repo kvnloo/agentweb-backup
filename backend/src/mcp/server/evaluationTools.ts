@@ -16,7 +16,7 @@ mcpToolRegistry.register({
         evaluation_user_id: { type: 'string', description: 'The eval_ user id to revoke or review.' },
         provision: {
           type: 'object', additionalProperties: false,
-          description: 'Provisioning request: email, displayName, password (12–72 chars, handed over privately), expiresAt (epoch ms, ≤30 days out), brandGuidelines {brandName, website?, description?}, optional reviewerUserIds (≤5), label (badge text, default "Sandbox"), datasetId/datasetVersion (pinned frozen dataset), deniedToolClasses (subset of the tool classes; lifecycle is always denied).',
+          description: 'Provisioning request: email, displayName, password (12–72 chars, handed over privately), expiresAt (epoch ms, ≤30 days out), brandGuidelines {brandName, website?, description?}, datasetId + datasetVersion (the frozen dataset the simulated Meta connection serves; must already be loaded, e.g. agentweb-2026q2 @ 1), optional reviewerUserIds (≤5), label (badge text, default "Sandbox"), deniedToolClasses (subset of the tool classes; lifecycle is always denied).',
           properties: {
             email: { type: 'string' }, displayName: { type: 'string' }, password: { type: 'string' }, expiresAt: { type: 'number' },
             brandGuidelines: { type: 'object', additionalProperties: false, properties: { brandName: { type: 'string' }, website: { type: 'string' }, description: { type: 'string' } }, required: ['brandName'] },
@@ -24,7 +24,7 @@ mcpToolRegistry.register({
             label: { type: 'string' }, datasetId: { type: 'string' }, datasetVersion: { type: 'number' },
             deniedToolClasses: { type: 'array', items: { type: 'string' } },
           },
-          required: ['email', 'displayName', 'password', 'expiresAt', 'brandGuidelines'],
+          required: ['email', 'displayName', 'password', 'expiresAt', 'brandGuidelines', 'datasetId', 'datasetVersion'],
         },
       }, required: ['action'],
     },

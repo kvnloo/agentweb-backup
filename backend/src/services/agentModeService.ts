@@ -1,4 +1,5 @@
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
@@ -17798,9 +17799,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Polling Engine
         let attempts = 0;
         const maxAttempts = 60;
+        // ENG-1908: see sandboxAwarePollDelayMs — a sandbox account's report is
+        // already complete the instant it's created, so it never waits the real delay.
+        const pollDelayMs = sandboxAwarePollDelayMs(accessToken, 10000);
         while (attempts < maxAttempts) {
           attempts++;
-          await new Promise((resolve) => setTimeout(resolve, 10000));
+          await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
           const statusRes = await axios.get(`${baseUrl}/${rid}`, {
             params: { access_token: accessToken },
           });
