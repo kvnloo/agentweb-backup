@@ -5,12 +5,36 @@
 
 import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
+import { installSandboxMetaInterceptorAtBoot } from '../services/sandbox/bootstrap';
+import { shouldBootstrapBackgroundJobs } from '../utils/instanceState';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
 // isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
 // sole authority on worker termination (SIGKILL after drain); we exit only on IPC
 // disconnect. Install before any heavy init so the guards are active immediately.
 installWorkerShutdownGuards();
+
+// ENG-1912: this worker is a SEPARATE forked process (child_process.fork in
+// generateMarketingResponseWorkerService.ts) with its own V8 isolate and its own
+// globalThis — server.ts's installSandboxMetaInterceptorAtBoot() call in the main
+// process's listen() callback never runs here, so this process's fetch/axios/https
+// were never patched. Found live in production: a sandbox principal's
+// call_meta_ads_insights_api tool call (which runs inside this worker, per the
+// "[Worker]"-prefixed AgentMode tool logs) reached the REAL graph.facebook.com with
+// its sentinel token and got Meta's own real "Bad signature" OAuthException back —
+// exactly the invariant ("zero requests leave the process for graph.facebook.com")
+// this interceptor exists to hold. Same guard reasoning as server.ts: skip under the
+// Jest test-boot path, since this worker module is imported directly by
+// generateMarketingResponseWorker.argOrder.test.ts / .errorStatus.test.ts and
+// metaInterceptor.test.ts owns the module-level singleton's install/uninstall itself.
+if (shouldBootstrapBackgroundJobs()) {
+  try {
+    installSandboxMetaInterceptorAtBoot();
+    console.log('[Worker] Sandbox Meta interceptor installed');
+  } catch (error) {
+    console.error('[Worker] Failed to install sandbox Meta interceptor:', (error as Error).message);
+  }
+}
 
 // ENG-1852: use the module's own exported singleton, not a separate `new AgentModeService()`.
 // agentModeService.ts's own module body constructs and exports `agentModeService` as soon as
