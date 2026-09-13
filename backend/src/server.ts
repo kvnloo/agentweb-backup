@@ -1,5 +1,6 @@
 import { requireActiveEvaluation } from './services/evaluationPolicy';
 import { evaluationSocketDecision } from './utils/socketEvaluationAuth';
+import { installSandboxMetaInterceptorAtBoot } from './services/sandbox/bootstrap';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -576,6 +577,19 @@ createTestAccount().then(async () => {
     if (!shouldBootstrapBackgroundJobs()) {
       console.log('[server] Test runtime — background jobs not started (ENG-1286)');
       return;
+    }
+
+    // ENG-1908: install the sandbox Meta interceptor once, here, in every real runtime
+    // (dev/staging/prod) but never under the Jest test-boot path above — same reasoning as
+    // the ENG-1286 guard: metaInterceptor.test.ts manages its own install/uninstall lifecycle
+    // against the same module-level singleton, and this call is synchronous with no timer or
+    // dynamic import, so it carries none of the risk that guard exists for; it just needs to
+    // stay on this side of the same line so it doesn't fire during an incidental test boot.
+    try {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[server] Sandbox Meta interceptor installed');
+    } catch (error) {
+      console.error('[server] Failed to install sandbox Meta interceptor:', (error as Error).message);
     }
 
     // ENG-764: an EB deploy terminates this instance without waiting for the
