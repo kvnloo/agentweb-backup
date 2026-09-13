@@ -1,5 +1,5 @@
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
-import { isSandboxToken } from './sandbox/sentinel';
+import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
@@ -17799,12 +17799,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Polling Engine
         let attempts = 0;
         const maxAttempts = 60;
-        // ENG-1908: a sandbox (evaluation) account's access token is a sentinel the
-        // process-level Meta simulator answers synchronously and locally, so the
-        // report is already "Job Completed" the instant it is created — there is
-        // no real Graph rate limit to respect. Making a candidate wait through the
-        // product's real per-attempt delay would make the sandbox feel broken.
-        const pollDelayMs = isSandboxToken(accessToken) ? 0 : 10000;
+        // ENG-1908: see sandboxAwarePollDelayMs — a sandbox account's report is
+        // already complete the instant it's created, so it never waits the real delay.
+        const pollDelayMs = sandboxAwarePollDelayMs(accessToken, 10000);
         while (attempts < maxAttempts) {
           attempts++;
           await new Promise((resolve) => setTimeout(resolve, pollDelayMs));

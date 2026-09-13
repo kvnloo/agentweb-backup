@@ -8,7 +8,13 @@ const DAY_MS = 86_400_000;
 export const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 export function isDay(value: unknown): value is string {
-  return typeof value === 'string' && DAY_PATTERN.test(value) && !Number.isNaN(dayToMs(value));
+  if (typeof value !== 'string' || !DAY_PATTERN.test(value)) return false;
+  // Date.UTC rolls an out-of-range component into the next unit instead of returning NaN
+  // (Date.UTC(2025, 1, 31) is a valid timestamp for March 3), so "2025-02-31" would
+  // otherwise pass as a real day. Round-tripping back to a day string catches that: a
+  // genuine calendar date always survives the round trip unchanged.
+  const ms = dayToMs(value);
+  return !Number.isNaN(ms) && dayOf(new Date(ms)) === value;
 }
 
 export function dayToMs(day: string): number {

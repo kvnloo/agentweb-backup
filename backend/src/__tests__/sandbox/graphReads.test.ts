@@ -64,6 +64,15 @@ describe('campaign / adset / ad / creative reads', () => {
     expect(c.lifetime_budget).toBeUndefined();
     expect(c.stop_time).toBeUndefined();
   });
+  it('GREATER_THAN/LESS_THAN filters compare numerically, not lexicographically (CodeRabbit)', () => {
+    // daily_budget is a string on the wire ("1500", "4000", "5000"). A naive string
+    // comparison puts "1500" BELOW "400" (first char '1' < '4'), so a numeric filter
+    // implemented without coercion would wrongly drop the $1500 campaign here.
+    const gt = body(handleGraphRead(ctx, req(`${act}/campaigns`, { fields: 'id,daily_budget', filtering: JSON.stringify([{ field: 'daily_budget', operator: 'GREATER_THAN', value: 400 }]) }))!);
+    expect(gt.data.map((c: any) => c.daily_budget).sort()).toEqual(['1500', '4000', '5000']);
+    const lt = body(handleGraphRead(ctx, req(`${act}/campaigns`, { fields: 'id,daily_budget', filtering: JSON.stringify([{ field: 'daily_budget', operator: 'LESS_THAN', value: 4500 }]) }))!);
+    expect(lt.data.map((c: any) => c.daily_budget).sort()).toEqual(['1500', '4000']);
+  });
   it('adsets: account edge, campaign edge, node read-back with targeting and promoted_object; effective_status inherits CAMPAIGN_PAUSED', () => {
     const all = body(handleGraphRead(ctx, req(`${act}/adsets`, { fields: 'id,name,status,campaign_id,optimization_goal,billing_event,destination_type,promoted_object,bid_strategy,daily_budget,start_time,end_time,targeting,effective_status' }))!);
     expect(all.data).toHaveLength(4);

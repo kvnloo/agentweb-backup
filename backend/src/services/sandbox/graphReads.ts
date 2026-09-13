@@ -371,8 +371,12 @@ class Reader {
           case 'CONTAIN': return value.toLowerCase().includes(list[0].toLowerCase());
           case 'NOT_CONTAIN': return !value.toLowerCase().includes(list[0].toLowerCase());
           case 'STARTS_WITH': return value.toLowerCase().startsWith(list[0].toLowerCase());
-          case 'GREATER_THAN': return value > list[0];
-          case 'LESS_THAN': return value < list[0];
+          // Numeric coercion, matching operatorMatches (insightsEngine.ts) — value and
+          // list[0] are both strings here, so an uncoerced comparison is lexicographic
+          // and a filter like `daily_budget GREATER_THAN 900` would match "1000" as less
+          // than "900".
+          case 'GREATER_THAN': return Number(value) > Number(list[0]);
+          case 'LESS_THAN': return Number(value) < Number(list[0]);
           default: throw graphErrors.invalidParam(`Filter operator ${filter.operator} is invalid`);
         }
       })();

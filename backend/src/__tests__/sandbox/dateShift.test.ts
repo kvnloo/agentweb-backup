@@ -1,4 +1,4 @@
-import { computeShiftDays, shiftDay, shiftIso, unshiftRange, resolveDatePreset, yesterdayUtc, addDays } from '../../services/sandbox/dateShift';
+import { computeShiftDays, shiftDay, shiftIso, unshiftRange, resolveDatePreset, yesterdayUtc, addDays, isDay } from '../../services/sandbox/dateShift';
 
 /** ENG-1908 AC 3: the dataset's most recent delivery day is always "yesterday" whenever the account is used. */
 describe('read-time date shift', () => {
@@ -18,6 +18,17 @@ describe('read-time date shift', () => {
     expect(shiftIso('2026-04-30T13:45:10.000Z', -1)).toBe('2026-04-29T13:45:10+0000');
   });
 
+  it('isDay rejects a calendar date that Date.UTC would silently roll over (CodeRabbit)', () => {
+    // Date.UTC(2025, 1, 31) is a valid timestamp for March 3 (February has no 31st), and
+    // Date.UTC(2025, 12, 1) rolls into January of the next year — a NaN-only guard never
+    // catches either, so both strings passed the old isDay as real days.
+    expect(isDay('2025-02-31')).toBe(false);
+    expect(isDay('2025-13-01')).toBe(false);
+    expect(isDay('2026-04-09')).toBe(true);
+    expect(isDay('2026-02-29')).toBe(false); // 2026 is not a leap year
+    expect(isDay('2024-02-29')).toBe(true); // 2024 IS a leap year — this is a real day
+    expect(isDay('not-a-day')).toBe(false);
+  });
   it('unshifts a current-date range back into the frozen window', () => {
     expect(unshiftRange({ since: '2026-08-30', until: '2026-09-12' }, 135)).toEqual({ since: '2026-04-17', until: '2026-04-30' });
     expect(addDays('2026-02-28', 1)).toBe('2026-03-01');
