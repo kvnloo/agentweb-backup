@@ -98,3 +98,22 @@ describe('ENG-1910 lifecycle acceptance', () => {
     expect(h.record().lifecycleState).toBe('resetting');
   });
 });
+
+it('bounds review scans including empty filtered pages and marks the result truncated', async () => {
+  const h = harness(); let pages = 0;
+  h.db.scan.mockImplementation(() => ({ promise: async () => ({ Items: [], LastEvaluatedKey: { evaluationKey: String(++pages) } }) }));
+  const review = await h.store.review('reviewer', policy.userId);
+  expect(pages).toBe(20);
+  expect(review.truncated).toBe(true);
+  expect(review.markdown).toContain('Audit is truncated');
+});
+it('does not silently complete a purge when the material scan exceeds its budget', async () => {
+  const h = harness(); let pages = 0;
+  h.db.scan.mockImplementation(({ TableName, ExpressionAttributeValues }: any) => ({ promise: async () =>
+    TableName.endsWith('AW-Evaluations') && ExpressionAttributeValues?.[':prefix']
+      ? { Items: [], LastEvaluatedKey: { evaluationKey: String(++pages) } } : { Items: [] } }));
+  await expect(h.store.purge('admin', policy.userId)).rejects.toThrow(/limit/);
+  expect(pages).toBe(20);
+  expect(h.record().lifecycleState).toBe('purging');
+  expect(h.db.delete).not.toHaveBeenCalled();
+});

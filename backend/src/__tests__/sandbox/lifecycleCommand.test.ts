@@ -37,3 +37,13 @@ describe('sandbox lifecycle command authorization and dataset pin', () => {
     expect(evaluationStore.purge).not.toHaveBeenCalled();
   });
 });
+
+it('denies privileged import before publication and forwards the authenticated admin actor', async () => {
+  const { importSandboxDataset } = await import('../../services/sandbox/datasetImport');
+  process.env.NODE_ENV = 'development';
+  (requireEvaluationAdmin as jest.Mock).mockRejectedValueOnce(new Error('denied'));
+  await expect(runSandboxLifecycle(['load-dataset', '--actor', 'candidate', '--directory', '/tmp/dataset'])).rejects.toThrow('denied');
+  expect(importSandboxDataset).not.toHaveBeenCalled();
+  await runSandboxLifecycle(['load-dataset', '--actor', 'admin', '--directory', '/tmp/dataset']);
+  expect(importSandboxDataset).toHaveBeenCalledWith('/tmp/dataset', 'admin');
+});

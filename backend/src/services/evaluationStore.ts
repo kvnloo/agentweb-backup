@@ -237,6 +237,8 @@ export class EvaluationStore {
     const record = await this.requireReview(actor, userId);
     const audit: Record<string, unknown>[] = [];
     let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    let pages = 0, bytes = 0;
+    const seen = new Set<string>();
     do {
       const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
         FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
@@ -248,8 +250,14 @@ export class EvaluationStore {
         if (!item || item.userId !== userId || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) throw new EvaluationDenied();
         audit.push(item);
       }
+      bytes += Buffer.byteLength(JSON.stringify(page.Items));
       cursor = page.LastEvaluatedKey;
-    } while (cursor);
+      if (cursor) {
+        const token = JSON.stringify(cursor);
+        if (seen.has(token)) throw new EvaluationDenied();
+        seen.add(token);
+      }
+    } while (cursor && ++pages < 20 && bytes < 8 * 1024 * 1024);
     const orderedAudit = orderSandboxAudit(audit);
     const overlay = await new SandboxStateStore(this.db).loadOverlay(userId);
     const dataset = record.datasetId && record.datasetVersion
@@ -315,12 +323,15 @@ export class EvaluationStore {
     try {
       await this.revoke(actor, userId);
       const { cleanup } = await this.lifecycle();
-      await cleanup.assertQuiescent(userId);
       const counts = await cleanup.purge(userId);
-      // Remove per-account simulator/legacy material rows, never shared datasets, policy or audit.
+      // AW-Evaluations has only the evaluationKey hash key: prefix Query is not
+      // available. Bound the legacy-material scan; never delete from a partial inventory.
       let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      const materialKeys: string[] = [];
       do {
-        const page = await this.db.scan({ TableName: this.table, ConsistentRead: true,
+        if (++pages > 20) throw new Error('Sandbox material inventory limit exceeded; purge incomplete');
+        const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
           FilterExpression: 'begins_with(evaluationKey, :prefix)',
           ExpressionAttributeValues: { ':prefix': `evaluation/${userId}/` },
           ...(cursor ? { ExclusiveStartKey: cursor } : {}),
@@ -330,10 +341,15 @@ export class EvaluationStore {
           if (!item || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/`) ||
               (item.userId !== undefined && item.userId !== userId)) throw new EvaluationDenied();
           if (item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) continue;
-          await this.db.delete({ TableName: this.table, Key: { evaluationKey: item.evaluationKey } }).promise();
+          materialKeys.push(item.evaluationKey);
         }
         cursor = page.LastEvaluatedKey;
       } while (cursor);
+      for (const evaluationKey of materialKeys) {
+        await this.db.delete({ TableName: this.table, Key: { evaluationKey },
+          ConditionExpression: 'attribute_not_exists(userId) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
+        }).promise();
+      }
       await this.db.transactWrite({ TransactItems: [
         { Delete: { TableName: this.users, Key: { email: record.email },
           ConditionExpression: 'attribute_not_exists(email) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
@@ -406,7 +422,9 @@ export class EvaluationStore {
     ]) {
       counts[table] = 0;
       let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
       do {
+        if (++pages > 20) throw new Error('Sandbox credential cleanup limit exceeded; revocation cleanup incomplete');
         let page: AWS.DynamoDB.DocumentClient.ScanOutput;
         try {
           page = await this.db.scan({ TableName: `${this.prefix}${table}`, ConsistentRead: true, Limit: 100,

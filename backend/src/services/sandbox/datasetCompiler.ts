@@ -1,5 +1,6 @@
+import { readDatasetFile } from './datasetFiles';
 import { createHash } from 'crypto';
-import { readFileSync, realpathSync } from 'fs';
+import { realpathSync } from 'fs';
 import { resolve, sep } from 'path';
 import { parse } from 'csv-parse/sync';
 import { load } from 'js-yaml';
@@ -98,10 +99,11 @@ function checkCase(value: unknown): SandboxCase {
   return c;
 }
 function csv(bytes: Buffer, label: string): Row[] {
-  const rows = parse(bytes, { bom: true, columns: (headers: string[]) => {
+  const rows = parse(bytes, { max_record_size: 64 * 1024, to: 5001, bom: true, columns: (headers: string[]) => {
     if (new Set(headers).size !== headers.length) fail(`duplicate CSV header in ${label}`);
     return headers;
   }, skip_empty_lines: true }) as Row[];
+  if (rows.length > 5000) fail(`CSV row limit exceeded in ${label}`);
   if (!Array.isArray(rows) || rows.some(r => !r || Object.values(r).some(v => typeof v !== 'string'))) fail(`invalid CSV ${label}`);
   return rows;
 }
@@ -131,13 +133,18 @@ function alias(value: string, kind: string): string {
 /** Fully offline: packet checksums are verified before any source values are used. */
 export function compileSandboxDataset(packet: string, config: unknown): SandboxDataset {
   const c = checkCase(config), root = realpathSync(packet);
+  let totalBytes = 0;
   const read = (path: string): Buffer => {
     if (!/^[a-zA-Z0-9_./-]+$/.test(path) || path.split('/').some(p => p === '..' || !p)) fail('unsafe manifest path');
     const full = realpathSync(resolve(root, path));
     if (!full.startsWith(root + sep)) fail('manifest path escapes packet');
-    return readFileSync(full);
+    const bytes = readDatasetFile(full);
+    totalBytes += bytes.length;
+    if (totalBytes > 64 * 1024 * 1024) fail('packet byte limit exceeded');
+    return bytes;
   };
   const manifestBytes = read('manifest.csv'), manifest = csv(manifestBytes, 'manifest.csv');
+  if (manifest.length > 256) fail('manifest file limit exceeded');
   const files = new Map<string, Buffer>(), tables = new Map<string, Row[]>();
   for (const entry of manifest) {
     if (files.has(entry.path) || entry.path === 'manifest.csv') fail('duplicate/circular manifest entry');

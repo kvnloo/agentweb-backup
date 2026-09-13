@@ -34,7 +34,7 @@ export async function runSandboxLifecycle(argv: string[]): Promise<unknown> {
   }
   if (!['development', 'production'].includes(process.env.NODE_ENV || '')) throw new Error('Set NODE_ENV explicitly to development or production for lifecycle writes');
   await requireEvaluationAdmin(actor);
-  if (action === 'load-dataset') return importSandboxDataset(required('--directory'));
+  if (action === 'load-dataset') return importSandboxDataset(required('--directory'), actor);
   if (action === 'provision') {
     const pin = parseDatasetPin(required('--dataset'));
     const input = JSON.parse(await readFile(required('--input'), 'utf8'));

@@ -33,7 +33,7 @@ export function orderSandboxAudit(audit: Record<string, unknown>[]): Record<stri
   return [...audit].sort((a, b) => String(a.at ?? '').localeCompare(String(b.at ?? '')) || String(a.evaluationKey ?? '').localeCompare(String(b.evaluationKey ?? '')));
 }
 export function renderSandboxReviewMarkdown(review: { userId: string; status: string; audit: Record<string, unknown>[]; overlayDiff?: OverlayChange[]; truncated?: boolean }): string {
-  const safe = (value: unknown) => JSON.stringify(value).replace(/`/g, '\\u0060').replace(/</g, '\\u003c');
+  const safe = (value: unknown) => (JSON.stringify(value ?? null) ?? 'null').replace(/`/g, '\\u0060').replace(/</g, '\\u003c');
   const lines = [`# Sandbox review: ${review.userId}`, '', `Status: ${review.status}`, '', '## Meta action timeline', ''];
   for (const event of orderSandboxAudit(review.audit).filter(row => row.action === 'meta')) {
     lines.push(`- ${safe(event.at)} — ${safe(event.method)} ${safe(event.path)} (HTTP ${safe(event.status ?? null)})`, `  - Arguments: ${safe(event.args ?? {})}`, `  - Result: ${safe(event.result ?? null)}`);

@@ -112,3 +112,15 @@ describe('sandbox dataset store', () => {
     await expect(store.loadDataset('fixture', 0)).rejects.toBeInstanceOf(SandboxDatasetInvalid);
   });
 });
+
+it('publishes the manifest and privileged import audit in one transaction, failing closed on audit failure', async () => {
+  const f = fakeDb();
+  f.db.transactWrite = jest.fn(() => ({ promise: async () => { throw new Error('audit unavailable'); } }));
+  const seed = buildFixtureDataset();
+  await expect(new SandboxDatasetStore(f.db).putDataset(seed, 'admin')).rejects.toThrow('audit unavailable');
+  const transaction = f.db.transactWrite.mock.calls[0][0].TransactItems;
+  expect(transaction[0].Put.Item).toMatchObject({ kind: 'dataset', datasetId: seed.meta.datasetId });
+  expect(transaction[1].Put.Item).toMatchObject({ actor: 'admin', action: 'load-dataset', outcome: 'published',
+    sha256: createHash('sha256').update(JSON.stringify(seed)).digest('hex') });
+  expect([...f.items.keys()].some(key => key.endsWith('/meta'))).toBe(false);
+});

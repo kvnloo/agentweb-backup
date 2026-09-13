@@ -54,40 +54,78 @@ export class SandboxArtifactCleanup {
     });
   }
 
-  private async scan(table: string, owner: string, value: string, keys: readonly string[]): Promise<Row[]> {
+  private async ownedRows(table: string, owner: string, value: string, keys: readonly string[], budget: { pages: number; bytes: number }): Promise<Row[]> {
+    // Existing definitions: src/scripts/create-tables.ts. No ownership index
+    // exists for AgentRuns or orphan WorkflowExecutions: bounded scans only.
+    const indexes: Record<string, string> = {
+      'AW-ChatSessions': 'UserIdIndex', 'AW-Tasks': 'UserTasksIndex', 'AW-TaskExecutions': 'UserIdIndex',
+      'AW-Workflows': 'UserWorkflowsIndex', 'AW-LandingPages': 'UserIdIndex', 'AW-WorkPlans': 'OwnerIndex',
+      'AW-LeadLists': 'userId-index', 'AW-Books': 'UserIdIndex', 'AW-BookContents': 'BookIdIndex',
+      'AW-Skills': 'OwnerIndex', 'AW-Deals': 'ownerUserId-heatScore-index',
+    };
+    const primary = ['AW-Characters', 'AW-AccountMemory', 'AW-Leads', 'AW-ChatMessages'].includes(table);
+    const index = indexes[table];
     const rows: Row[] = [];
     let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    const seen = new Set<string>();
+    let pages = 0;
     do {
-      let page: AWS.DynamoDB.DocumentClient.ScanOutput;
+      if (++pages > 20 || ++budget.pages > 100) throw new Error('Sandbox artifact inventory limit exceeded; cleanup incomplete');
+      let items: Row[];
       try {
-        page = await this.db.scan({ TableName: this.tablePrefix + table, ConsistentRead: true,
-          FilterExpression: '#owner = :owner', ExpressionAttributeNames: { '#owner': owner },
-          ExpressionAttributeValues: { ':owner': value }, Limit: 100,
-          ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-        }).promise();
+        if (table === 'AW-Settings') {
+          const result = await this.db.get({ TableName: this.tablePrefix + table, Key: { settingName: value }, ConsistentRead: true }).promise();
+          items = result.Item === undefined ? [] : [result.Item];
+        } else {
+          const params = { TableName: this.tablePrefix + table,
+            ExpressionAttributeNames: { '#owner': owner }, ExpressionAttributeValues: { ':owner': value }, Limit: 100,
+            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+          };
+          const page = index || primary
+            ? await this.db.query({ ...params, KeyConditionExpression: '#owner = :owner', ...(index ? { IndexName: index } : { ConsistentRead: true }) }).promise()
+            : await this.db.scan({ ...params, ConsistentRead: true, FilterExpression: '#owner = :owner' }).promise();
+          items = page.Items as Row[];
+          cursor = page.LastEvaluatedKey;
+        }
       } catch (error: any) {
-        if (error?.code === 'ResourceNotFoundException') break;
+        // Missing GSIs must fail closed, not masquerade as an empty inventory.
+        if (!index && error?.code === 'ResourceNotFoundException') break;
         throw error;
       }
-      if (!Array.isArray(page.Items)) throw new Error('Invalid sandbox artifact scan');
-      for (const row of page.Items) {
-        if (!row || row[owner] !== value) throw new Error('Sandbox artifact ownership mismatch');
+      if (!Array.isArray(items)) throw new Error('Invalid sandbox artifact listing');
+      for (let row of items) {
+        if (!row || typeof row !== 'object' || Array.isArray(row) || row[owner] !== value) throw new Error('Sandbox artifact ownership mismatch');
         for (const key of keys) {
           if (key === 'messageIndex') {
             if (!Number.isSafeInteger(row[key]) || row[key] < 0) throw new Error('Invalid message index');
           } else assertId(row[key]);
         }
+        if (index) {
+          // GSI state can lag: re-read the base row before using status, ownership or file paths.
+          const key = Object.fromEntries(keys.map(key => [key, row[key]]));
+          if (table === 'AW-Books') key.userId = value;
+          const current = await this.db.get({ TableName: this.tablePrefix + table, Key: key, ConsistentRead: true }).promise();
+          if (current.Item === undefined) continue;
+          if (!current.Item || current.Item[owner] !== value || !Object.entries(key).every(([k, v]) => current.Item![k] === v)) throw new Error('Sandbox artifact ownership changed');
+          row = current.Item;
+        }
+        budget.bytes += Buffer.byteLength(JSON.stringify(row));
+        if (budget.bytes > 64 * 1024 * 1024) throw new Error('Sandbox artifact inventory byte limit exceeded; cleanup incomplete');
         rows.push(row);
       }
-      cursor = page.LastEvaluatedKey;
+      if (cursor) {
+        const token = JSON.stringify(cursor);
+        if (seen.has(token)) throw new Error('Invalid sandbox artifact pagination');
+        seen.add(token);
+      }
     } while (cursor);
     return rows;
   }
 
-  private async inventory(userId: string) {
+  private async inventory(userId: string, budget: { pages: number; bytes: number }) {
     assertSandbox(userId);
     const inventory = new Map<string, Row[]>();
-    for (const [table, key] of TABLES) inventory.set(table, await this.scan(table, ownerField(table), userId, [key]));
+    for (const [table, key] of TABLES) inventory.set(table, await this.ownedRows(table, ownerField(table), userId, [key], budget));
     for (const table of ['AW-AgentRuns', 'AW-ChatSessions', 'AW-TaskExecutions', 'AW-WorkflowExecutions', 'AW-LandingPages']) {
       const rows = inventory.get(table)!;
       if (rows.some(row => ACTIVE.has(typeof row.status === 'string' ? row.status.toLowerCase() : '') || row.isProcessing === true)) {
@@ -97,7 +135,7 @@ export class SandboxArtifactCleanup {
     return inventory;
   }
 
-  async assertQuiescent(userId: string): Promise<void> { await this.inventory(userId); }
+  async assertQuiescent(userId: string): Promise<void> { await this.inventory(userId, { pages: 0, bytes: 0 }); }
 
   private async deleteS3Prefix(prefix: string): Promise<number> {
     let token: string | undefined;
@@ -130,7 +168,8 @@ export class SandboxArtifactCleanup {
   }
 
   async purge(userId: string): Promise<Record<string, number>> {
-    const inventory = await this.inventory(userId);
+    const budget = { pages: 0, bytes: 0 };
+    const inventory = await this.inventory(userId, budget);
     // Sandbox publishing is prohibited. A live deployment is unexpected and cannot be
     // silently orphaned or deleted through a shared project without explicit remediation.
     if (inventory.get('AW-LandingPages')!.some(row => row.githubRepoUrl || row.vercelProjectId || row.deploymentId || row.customDomain)) {
@@ -138,7 +177,7 @@ export class SandboxArtifactCleanup {
     }
     const children: Array<{ table: string; owner: string; value: string; keys: string[]; rows: Row[] }> = [];
     const collect = async (table: string, owner: string, value: string, keys: string[]) => {
-      children.push({ table, owner, value, keys, rows: await this.scan(table, owner, value, keys) });
+      children.push({ table, owner, value, keys, rows: await this.ownedRows(table, owner, value, keys, budget) });
     };
     await collect('AW-AccountMemory', 'userId', userId, ['userId', 'memoryId']);
     await collect('AW-Skills', 'ownerId', userId, ['skillId']);
@@ -151,7 +190,7 @@ export class SandboxArtifactCleanup {
     }
     const messages: Row[] = [];
     for (const session of inventory.get('AW-ChatSessions')!) {
-      messages.push(...await this.scan('AW-ChatMessages', 'sessionId', session.sessionId, ['sessionId', 'messageIndex']));
+      messages.push(...await this.ownedRows('AW-ChatMessages', 'sessionId', session.sessionId, ['sessionId', 'messageIndex'], budget));
     }
     // Executions outlive deleted task definitions. Their files remain scoped to the
     // execution owner, so clean that narrow prefix even without a task parent.

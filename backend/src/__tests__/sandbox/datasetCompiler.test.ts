@@ -100,3 +100,9 @@ test.each([
   fixture(values, { 'settings.csv': `level,entity_id,setting,value\n${rows}\n` });
   expect(() => compileSandboxDataset(packet, config)).toThrow(/compatible|budget|bid_amount/);
 });
+
+test('rejects excessive CSV rows before reconciliation or expansion', () => {
+  fixture();
+  writeFileSync(join(packet, 'manifest.csv'), 'path,sha256,bytes,data_rows\n' + 'x,a,1,0\n'.repeat(5001));
+  expect(() => compileSandboxDataset(packet, config)).toThrow(/row limit/);
+});

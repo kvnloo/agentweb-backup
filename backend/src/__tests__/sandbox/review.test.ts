@@ -34,3 +34,11 @@ test('missing overlay is a fresh empty overlay', async () => {
   const db = { get: () => ({ promise: async () => ({}) }) };
   expect(await new SandboxStateStore(db as any).loadOverlay('eval_test')).toEqual(EMPTY_OVERLAY);
 });
+
+test('legacy Meta audit records with missing fields render safely and still escape markup', () => {
+  const markdown = renderSandboxReviewMarkdown({ userId: 'eval_test', status: 'revoked', audit: [
+    { action: 'meta' }, { action: 'meta', path: '<script>`' },
+  ] });
+  expect(markdown).toContain('null — null null (HTTP null)');
+  expect(markdown).toContain('\\u003cscript>\\u0060');
+});

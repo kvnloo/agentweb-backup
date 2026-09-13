@@ -40,7 +40,7 @@ export interface DatasetSummary {
 
 export interface PutDatasetResult { datasetId: string; version: number; bytes: number; sha256: string; chunkCount: number }
 
-type Db = Pick<AWS.DynamoDB.DocumentClient, 'get' | 'put'>;
+type Db = Pick<AWS.DynamoDB.DocumentClient, 'get' | 'put' | 'transactWrite'>;
 
 export function validateDataset(dataset: SandboxDataset): void {
   const fail = (message: string): never => { throw new SandboxDatasetInvalid(message); };
@@ -131,8 +131,9 @@ export class SandboxDatasetStore {
     return `dataset/${datasetId}/${version}`;
   }
 
-  async putDataset(dataset: SandboxDataset): Promise<PutDatasetResult> {
+  async putDataset(dataset: SandboxDataset, actor?: string): Promise<PutDatasetResult> {
     validateDataset(dataset);
+    if (actor !== undefined && (typeof actor !== 'string' || !/^[A-Za-z0-9-]{1,100}$/.test(actor))) throw new SandboxDatasetInvalid('invalid import audit actor');
     const { datasetId, version } = dataset.meta;
     const prefix = this.keyPrefix(datasetId, version);
     if (await this.readMeta(prefix)) throw new SandboxDatasetExists(datasetId, version);
@@ -154,7 +155,17 @@ export class SandboxDatasetStore {
           insightsDaily: dataset.insightsDaily.length, insightsBreakdownDaily: dataset.insightsBreakdownDaily.length, landers: dataset.landers.length,
         },
       };
-      await this.db.put({ TableName: this.table, Item: { evaluationKey: `${prefix}/meta`, kind: 'dataset', ...summary }, ...condition }).promise();
+      const metadata = { TableName: this.table, Item: { evaluationKey: `${prefix}/meta`, kind: 'dataset', ...summary }, ...condition };
+      if (actor) {
+        // Publication and privileged-import audit succeed atomically; a failed audit
+        // cannot leave a published dataset with no accountable actor.
+        await this.db.transactWrite({ TransactItems: [
+          { Put: metadata },
+          { Put: { TableName: this.table, Item: { evaluationKey: `${prefix}/audit/import`,
+            actor, action: 'load-dataset', at: createdAt, datasetId, version, sha256, bytes, outcome: 'published',
+          }, ...condition } },
+        ] }).promise();
+      } else await this.db.put(metadata).promise();
     } catch (error: any) {
       if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') throw new SandboxDatasetExists(datasetId, version);
       throw error;

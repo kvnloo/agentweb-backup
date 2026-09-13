@@ -8,10 +8,14 @@ creatives use a generated one-pixel gray PNG rather than recovered private media
 
 Reproduce from the repository root (no AWS access or server required):
 
+Set `PACKET_ROOT` to the frozen packet directory in your checkout. File output uses
+Linux descriptor-relative writes; on other hosts omit the output directory to emit JSON.
+
 ```sh
+PACKET_ROOT="$PWD/CANDIDATE_PACKET"
 node backend/node_modules/ts-node/dist/bin.js --transpile-only --project backend/tsconfig.json \
   backend/scripts/compile-sandbox-dataset.ts \
-  /home/harsha/ryan-takehome-setup/CANDIDATE_PACKET \
+  "$PACKET_ROOT" \
   backend/datasets/agentweb-2026q2/case.yaml /tmp/agentweb-2026q2-recompiled
 ```
 
@@ -50,3 +54,8 @@ hash while allowing account-specific prefixes to be reset or purged.
 optional reviewWindowSeconds (0–86400). Unknown fields fail closed. The account's
 currency and timezone must agree with the source settings when supplied. The
 compiler does not import arbitrary account settings, historical IDs, URLs or tokens.
+
+At import, daily row count and all reported totals are rechecked against the compiled
+rows. `periodRows` and `packetManifestSha256` are compiler-only provenance, not
+independently verifiable without the source packet. Assets are private, served with
+15-minute signed GET URLs generated on authorized runtime reads.
