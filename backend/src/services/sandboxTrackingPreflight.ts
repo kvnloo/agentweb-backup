@@ -36,27 +36,32 @@ function syntheticLanderHtml(lander: SandboxLander | undefined): string {
  * `fetchHtml` field so a real account's gate call is unaffected (a `deps.fetchHtml` of
  * `undefined` falls back to the real fetcher via `??`, per `MetaPreflightDeps`).
  *
- * Never throws: an inactive/expired/unknown sandbox policy or an unloadable dataset makes this
- * return `undefined` too, so the caller falls back to the REAL fetch path for what is, at that
- * point, an unexpected state — the launch gate's own AC4 ("failure to verify is not permission
- * to proceed") still applies on top: a real fetch against a fictional dataset URL will fail to
- * resolve or find no pixel, and the gate blocks exactly as it should when nothing else is wrong.
+ * Never falls back to the real fetcher for a sandbox principal, and never throws. Once
+ * `isEvaluationUser(userId)` is true, every exit is a synthetic-HTML function — an inactive/
+ * expired/unknown policy, a dataset load failure, or any other unexpected error all resolve to
+ * the same no-pixel synthetic response (ENG-1909, CodeRabbit) rather than `undefined`, which
+ * would otherwise let `preflightMetaTrackingGate`'s `deps.fetchHtml ?? defaultFetchHtml` make a
+ * real outbound request to whatever destination URL the sandbox candidate configured. The
+ * launch gate's own AC4 ("failure to verify is not permission to proceed") means a no-pixel
+ * response still blocks correctly — it just does so without ever touching the real network.
  */
 export async function buildSandboxFetchHtml(
   userId: string,
 ): Promise<((url: string, deadlineAt?: number) => Promise<string>) | undefined> {
   if (!isEvaluationUser(userId)) return undefined;
+  const blocked = async (): Promise<string> => syntheticLanderHtml(undefined);
   try {
     const record = await requireActiveEvaluation(userId);
-    if (!record.datasetId || record.datasetVersion === null || record.datasetVersion === undefined) return undefined;
+    if (!record.datasetId || record.datasetVersion === null || record.datasetVersion === undefined) return blocked;
     const dataset = await getSandboxDatasetStore().loadDataset(record.datasetId, record.datasetVersion);
     return async (url: string): Promise<string> => {
       const lander = dataset.landers.find((l) => l.url === url);
       return syntheticLanderHtml(lander);
     };
   } catch (error) {
-    if (error instanceof EvaluationDenied) return undefined;
-    console.error('[sandboxTrackingPreflight] failed to build sandbox fetchHtml, falling back to the real fetcher:', (error as Error).message);
-    return undefined;
+    if (!(error instanceof EvaluationDenied)) {
+      console.error('[sandboxTrackingPreflight] failed to build sandbox fetchHtml, blocking instead of falling back to the real fetcher:', (error as Error).message);
+    }
+    return blocked;
   }
 }

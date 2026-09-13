@@ -9,5 +9,5 @@
  */
 export function sandboxManagementUrl(campaignId?: string): string {
   const base = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-  return campaignId ? `${base}/meta-campaigns?campaign=${campaignId}` : `${base}/meta-campaigns`;
+  return campaignId ? `${base}/meta-campaigns?campaign=${encodeURIComponent(campaignId)}` : `${base}/meta-campaigns`;
 }

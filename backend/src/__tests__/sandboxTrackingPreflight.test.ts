@@ -35,14 +35,18 @@ describe('buildSandboxFetchHtml', () => {
     expect(requireActiveEvaluation).not.toHaveBeenCalled();
   });
 
-  it('returns undefined when the sandbox policy is denied/expired/unknown', async () => {
+  it('a denied/expired/unknown sandbox policy blocks (no-pixel synthetic HTML), never falls back to a real fetch', async () => {
     requireActiveEvaluation.mockRejectedValue(new EvaluationDenied());
-    expect(await buildSandboxFetchHtml(SANDBOX_USER)).toBeUndefined();
+    const fetchHtml = await buildSandboxFetchHtml(SANDBOX_USER);
+    expect(fetchHtml).toBeDefined();
+    expect(detectMetaPixels(await fetchHtml!('https://landing.example.invalid/anything'))).toEqual([]);
   });
 
-  it('returns undefined when the active record has no dataset pinned (legacy row)', async () => {
+  it('an active record with no dataset pinned (legacy row) blocks, never falls back to a real fetch', async () => {
     requireActiveEvaluation.mockResolvedValue({ userId: SANDBOX_USER, status: 'active', datasetId: null, datasetVersion: null });
-    expect(await buildSandboxFetchHtml(SANDBOX_USER)).toBeUndefined();
+    const fetchHtml = await buildSandboxFetchHtml(SANDBOX_USER);
+    expect(fetchHtml).toBeDefined();
+    expect(detectMetaPixels(await fetchHtml!('https://landing.example.invalid/anything'))).toEqual([]);
   });
 
   it('a declared lander with a real pixel id is detected exactly like a genuine install', async () => {
@@ -70,9 +74,11 @@ describe('buildSandboxFetchHtml', () => {
     expect(detectMetaPixels(html)).toEqual([]);
   });
 
-  it('falls back to undefined (never throws) when the dataset fails to load', async () => {
+  it('blocks (no-pixel synthetic HTML), never throws and never falls back to a real fetch, when the dataset fails to load', async () => {
     requireActiveEvaluation.mockResolvedValue({ userId: SANDBOX_USER, status: 'active', datasetId: 'agentweb-2026q2', datasetVersion: 1 });
     loadDataset.mockRejectedValue(new Error('dataset not found'));
-    await expect(buildSandboxFetchHtml(SANDBOX_USER)).resolves.toBeUndefined();
+    const fetchHtml = await buildSandboxFetchHtml(SANDBOX_USER);
+    expect(fetchHtml).toBeDefined();
+    expect(detectMetaPixels(await fetchHtml!('https://landing.example.invalid/anything'))).toEqual([]);
   });
 });

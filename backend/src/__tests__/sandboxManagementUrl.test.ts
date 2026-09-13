@@ -18,6 +18,11 @@ describe('sandboxManagementUrl', () => {
     delete process.env.CUSTOMER_FRONTEND_URL;
     expect(sandboxManagementUrl('c1')).toBe('http://localhost:5174/meta-campaigns?campaign=c1');
   });
+
+  it('URL-encodes a campaignId containing query-breaking characters (CodeRabbit, ENG-1909)', () => {
+    process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
+    expect(sandboxManagementUrl('camp&id=1')).toBe('https://app.agentweb.pro/meta-campaigns?campaign=camp%26id%3D1');
+  });
 });
 
 /**
