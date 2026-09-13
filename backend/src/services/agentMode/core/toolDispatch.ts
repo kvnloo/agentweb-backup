@@ -36,6 +36,18 @@ import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
 } from '../../../utils/toolResponseS3Ref';
+// ENG-1685 spike ONLY: routes the `email` tool through Agentic Fabriq's Gmail
+// connector instead of the direct emailProviderService path, for exactly one
+// (user, tool) pair at a time, behind a double gate (env flag AND an explicit
+// per-user allowlist — see integrations/agenticFabriq/config.ts). Both default
+// off, so an unset/false flag or an empty allowlist reproduces today's behavior
+// byte-for-byte — see the "spike flag OFF is a no-op" test in toolDispatch.test.ts.
+// Deletable as a unit (this import + the branch below) if the spike is rejected;
+// nothing else in the monolith depends on it.
+import {
+  isUserEligibleForAgenticFabriqSpike,
+  runEmailToolThroughAgenticFabriq,
+} from '../../../integrations/agenticFabriq';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -918,6 +930,47 @@ export async function executePreparedTools(
 
   let toolResults: DispatchToolResult[];
 
+  // ENG-1685 spike: when eligible, run the leaf tool through Agentic Fabriq's
+  // Gmail connector instead of `ports.executePreparedAgentTool`, and log a
+  // grep-able comparison line (latency + which AF tool matched + connection
+  // status — never the token itself) for the AC4 latency/coverage-gap report.
+  // Scoped to exactly the `email` tool per AC3 ("exactly ONE existing
+  // integration") — every other tool name is completely unaffected, flag on
+  // or off, because this check runs BEFORE the eligibility/flag check even
+  // looks at the flag.
+  const AGENTIC_FABRIQ_SPIKE_TOOL_NAME = 'email';
+
+  const runToolThroughAgenticFabriqSpikeIfEligible = async (
+    toolName: string,
+    functionArgs: any,
+  ): Promise<{ handled: true; result: unknown } | { handled: false }> => {
+    if (toolName !== AGENTIC_FABRIQ_SPIKE_TOOL_NAME) return { handled: false };
+    if (!isUserEligibleForAgenticFabriqSpike(userId)) return { handled: false };
+
+    const directStartMs = Date.now(); // reference point only; the direct path itself is not re-run here
+    try {
+      const { outcome, spikeMeta } = await runEmailToolThroughAgenticFabriq(functionArgs, userId);
+      console.log('[ENG-1685 spike] agentic_fabriq_email_tool_call', JSON.stringify({
+        userId,
+        sessionId,
+        action: functionArgs?.action,
+        ...spikeMeta,
+        directPathSkippedAtMs: directStartMs,
+      }));
+      return { handled: true, result: outcome };
+    } catch (error) {
+      // Per the vendor's own RULES: surface the error, never silently fall back
+      // to the direct path (that would hide exactly the failure mode the spike
+      // exists to measure) and never retry under a different identity.
+      console.error('[ENG-1685 spike] agentic_fabriq_email_tool_call_error', {
+        userId,
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  };
+
   const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
     // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
     // its outcome shape, and error propagation are untouched.
@@ -933,28 +986,36 @@ export async function executePreparedTools(
         policyDecision,
         runId: agentRuntimeRunId,
         budgetScopeId: sessionId,
-        execute: () => ports.executePreparedAgentTool({
-          llmModel,
-          toolName: toolCall.function.name,
-          functionArgs,
-          userId,
-          sessionId,
-          mockMode,
-          socketEmit: ports.socketEmit,
-          screenshotUrl,
-          isDelegatedAccess,
-          // Long-render tools (compose_video) read this to hand off before the run's hard
-          // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
-          renderDeadlineMs: mediaGenerationDeadlineMs,
-          // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
-          // killed mid-wait by the generation timeout (ENG-124).
-          runBudgetDeadlineMs: mediaGenerationDeadlineMs,
-          // The turn's real cap, for tools that must hand a result back before the turn
-          // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
-          // a soft media-only budget, so it both under-budgets the work and, once it has
-          // passed, would report no time left while the turn still has minutes.
-          turnHardCapMs,
-        }),
+        execute: async () => {
+          // ENG-1685 spike gate — see the block above runOne. A miss (wrong tool
+          // name, flag off, or user not allow-listed) falls straight through to
+          // the exact same executePreparedAgentTool call that always ran here.
+          const spike = await runToolThroughAgenticFabriqSpikeIfEligible(toolCall.function.name, functionArgs);
+          if (spike.handled) return spike.result;
+
+          return ports.executePreparedAgentTool({
+            llmModel,
+            toolName: toolCall.function.name,
+            functionArgs,
+            userId,
+            sessionId,
+            mockMode,
+            socketEmit: ports.socketEmit,
+            screenshotUrl,
+            isDelegatedAccess,
+            // Long-render tools (compose_video) read this to hand off before the run's hard
+            // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
+            renderDeadlineMs: mediaGenerationDeadlineMs,
+            // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
+            // killed mid-wait by the generation timeout (ENG-124).
+            runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+            // The turn's real cap, for tools that must hand a result back before the turn
+            // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
+            // a soft media-only budget, so it both under-budgets the work and, once it has
+            // passed, would report no time left while the turn still has minutes.
+            turnHardCapMs,
+          });
+        },
       });
       endExecuteToolSpan(span, outcome.status === 'error'
         ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }

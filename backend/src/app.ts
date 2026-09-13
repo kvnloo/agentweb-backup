@@ -44,6 +44,9 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import gmailAuthRoutes from "./routes/gmailAuth";
+// ENG-1685 spike ONLY — mounted below behind isAgenticFabriqSpikeEnabled(), never unconditionally.
+import agenticFabriqSpikeRoutes from "./routes/agenticFabriqSpike";
+import { isAgenticFabriqSpikeEnabled } from "./integrations/agenticFabriq";
 import outlookAuthRoutes from "./routes/outlookAuth";
 import calendlyAuthRoutes from "./routes/calendlyAuth";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
@@ -413,6 +416,12 @@ app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/linkedin-ads", linkedInAdsAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
+// ENG-1685 spike: the route doesn't exist at all unless the master flag is
+// on — see integrations/agenticFabriq/config.ts. This is the strongest form
+// of "no production traffic" (AC5): no code path to accidentally hit.
+if (isAgenticFabriqSpikeEnabled()) {
+  app.use("/api/agentic-fabriq-spike", agenticFabriqSpikeRoutes);
+}
 app.use("/api/oauth/outlook", outlookAuthRoutes);
 app.use("/api/oauth/calendly", calendlyAuthRoutes);
 app.use("/api/oauth/google-drive", googleDriveAuthRoutes);
