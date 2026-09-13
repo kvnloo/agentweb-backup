@@ -51,7 +51,15 @@ function parseJsonish(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
   if (!trimmed.startsWith('[') && !trimmed.startsWith('{')) return value;
-  try { return JSON.parse(trimmed); } catch { throw graphErrors.invalidParam(`Invalid JSON parameter: ${trimmed.slice(0, 60)}`); }
+  try { return JSON.parse(trimmed); } catch {
+    // Meta's real Graph API is documented-tolerant of the Python-dict-style single-quoted
+    // `time_range={'since':'2026-01-01','until':'2026-01-31'}` shape — real product code
+    // (routes/meta.ts, agentModeService.ts, metaMetricsSnapshotCron.ts) builds every
+    // time_range param exactly this way for real accounts, so a real account never sees this
+    // fail. Found via the ENG-1912 production proof: the sandbox must accept it too, or it
+    // diverges from what a real Meta call actually does.
+    try { return JSON.parse(trimmed.replace(/'/g, '"')); } catch { throw graphErrors.invalidParam(`Invalid JSON parameter: ${trimmed.slice(0, 60)}`); }
+  }
 }
 
 function parseList(value: unknown): string[] {
