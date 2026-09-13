@@ -2,10 +2,11 @@ import { EvaluationDenied } from '../../services/evaluationPolicy';
 import * as metaSimulatorModule from '../../services/sandbox/metaSimulator';
 
 /**
- * ENG-1908: `installSandboxMetaInterceptorAtBoot` is the one call server.ts makes at boot to
- * wire the interceptor to real policy/dataset stores. Without it the interceptor module is
- * fully built but never installed — every Graph call from a sandbox account would try to
- * reach the real graph.facebook.com with a sentinel token instead of being simulated.
+ * ENG-1908/ENG-1909: `installSandboxMetaInterceptorAtBoot` is the one call server.ts makes at
+ * boot to wire the interceptor to real policy/dataset/overlay stores. Without it the
+ * interceptor module is fully built but never installed — every Graph call from a sandbox
+ * account would try to reach the real graph.facebook.com with a sentinel token instead of
+ * being simulated.
  */
 const requireActiveEvaluation = jest.fn();
 jest.mock('../../services/evaluationPolicy', () => ({
@@ -16,6 +17,12 @@ jest.mock('../../services/evaluationPolicy', () => ({
 const loadDataset = jest.fn();
 jest.mock('../../services/sandbox/sandboxDatasetStore', () => ({
   getSandboxDatasetStore: () => ({ loadDataset }),
+}));
+
+const load = jest.fn();
+const mutate = jest.fn();
+jest.mock('../../services/sandbox/sandboxOverlayStore', () => ({
+  getSandboxOverlayStore: () => ({ load, mutate }),
 }));
 
 const installMetaSandboxInterceptor = jest.fn();
@@ -78,8 +85,20 @@ describe('the wired MetaSimulatorDeps', () => {
     expect(loadDataset).toHaveBeenCalledWith('agentweb-2026q2', 1);
   });
 
-  it('loadOverlay always returns the empty overlay (phase 3 has not shipped a real one yet)', async () => {
+  it('loadOverlay delegates to the sandbox overlay store (ENG-1909)', async () => {
     const { EMPTY_OVERLAY } = require('../../services/sandbox/types');
+    load.mockResolvedValue(EMPTY_OVERLAY);
     await expect(install().loadOverlay('eval_x')).resolves.toBe(EMPTY_OVERLAY);
+    expect(load).toHaveBeenCalledWith('eval_x');
+  });
+
+  it('mutateOverlay delegates to the sandbox overlay store, forwarding the mutate fn and audit (ENG-1909)', async () => {
+    const { EMPTY_OVERLAY } = require('../../services/sandbox/types');
+    mutate.mockResolvedValue(EMPTY_OVERLAY);
+    const fn = (current: import('../../services/sandbox/types').SandboxOverlay) => current;
+    const audit = { action: 'sandbox.create' };
+    const deps = install();
+    await expect(deps.mutateOverlay!('eval_x', fn, audit)).resolves.toBe(EMPTY_OVERLAY);
+    expect(mutate).toHaveBeenCalledWith('eval_x', fn, audit);
   });
 });

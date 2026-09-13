@@ -315,7 +315,7 @@ class Reader {
     if (ads.has(id)) return { kind: 'ad', obj: ads.get(id) };
     if (creatives.has(id)) return { kind: 'creative', obj: creatives.get(id) };
     const pixel = this.dataset.pixels.find((p) => p.id === id); if (pixel) return { kind: 'pixel', obj: pixel };
-    const audience = this.dataset.customAudiences.find((a) => a.id === id); if (audience) return { kind: 'audience', obj: audience };
+    const audience = this.objects.customAudiences.get(id); if (audience) return { kind: 'audience', obj: audience };
     const page = this.dataset.pages.find((p) => p.id === id); if (page) return { kind: 'page', obj: page };
     if (id === this.views.business.id) return { kind: 'business', obj: null };
     if (hasInsightsReport(id, this.ctx.now)) return { kind: 'report', obj: null };

@@ -252,6 +252,8 @@ export interface SandboxOverlay {
   ads: Record<string, SandboxAd>;
   adcreatives: Record<string, SandboxCreative>;
   adimages: Record<string, SandboxAdImage>;
+  /** Phase 3 (ENG-1909): candidate-created custom audiences, merged the same way as every other object type. */
+  customAudiences: Record<string, SandboxCustomAudience>;
   deletedIds: string[];
   /** Simulated review windows: ad id → ISO time the ad leaves PENDING_REVIEW. */
   reviewUntil: Record<string, string>;
@@ -259,5 +261,5 @@ export interface SandboxOverlay {
 }
 
 export const EMPTY_OVERLAY: SandboxOverlay = Object.freeze({
-  revision: 0, nextId: 1, campaigns: {}, adsets: {}, ads: {}, adcreatives: {}, adimages: {}, deletedIds: [], reviewUntil: {}, capiEvents: [],
+  revision: 0, nextId: 1, campaigns: {}, adsets: {}, ads: {}, adcreatives: {}, adimages: {}, customAudiences: {}, deletedIds: [], reviewUntil: {}, capiEvents: [],
 }) as SandboxOverlay;

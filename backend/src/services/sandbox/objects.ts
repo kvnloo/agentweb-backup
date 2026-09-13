@@ -1,11 +1,11 @@
 import type {
-  SandboxAd, SandboxAdImage, SandboxAdSet, SandboxCampaign, SandboxCreative, SandboxDataset, SandboxOverlay,
+  SandboxAd, SandboxAdImage, SandboxAdSet, SandboxCampaign, SandboxCreative, SandboxCustomAudience, SandboxDataset, SandboxOverlay,
 } from './types';
 
 /**
  * The account's object graph as the simulator sees it: the frozen dataset with the phase-3
  * overlay merged on top (created/updated objects shadow by id, deleted ids disappear) and
- * `effective_status` recomputed the way Meta derives it (paused parents cascade).
+ * effective_status recomputed the way Meta derives it (paused parents cascade).
  */
 export interface ResolvedObjects {
   campaigns: Map<string, SandboxCampaign>;
@@ -14,6 +14,8 @@ export interface ResolvedObjects {
   creatives: Map<string, SandboxCreative>;
   /** Keyed by image hash. */
   images: Map<string, SandboxAdImage>;
+  /** Phase 3 (ENG-1909): candidate-created custom audiences merged over the dataset seeded ones. */
+  customAudiences: Map<string, SandboxCustomAudience>;
   campaignEffectiveStatus(campaign: SandboxCampaign): string;
   adsetEffectiveStatus(adset: SandboxAdSet): string;
   adEffectiveStatus(ad: SandboxAd): string;
@@ -35,6 +37,7 @@ export function resolveObjects(dataset: SandboxDataset, overlay: SandboxOverlay,
   const adsets = merge(dataset.adsets, overlay.adsets, deleted);
   const ads = merge(dataset.ads, overlay.ads, deleted);
   const creatives = merge(dataset.adcreatives, overlay.adcreatives, deleted);
+  const customAudiences = merge(dataset.customAudiences, overlay.customAudiences, deleted);
   const images = new Map<string, SandboxAdImage>();
   for (const image of dataset.adimages) images.set(image.hash, image);
   for (const image of Object.values(overlay.adimages)) images.set(image.hash, image);
@@ -61,7 +64,7 @@ export function resolveObjects(dataset: SandboxDataset, overlay: SandboxOverlay,
     return 'ACTIVE';
   };
 
-  return { campaigns, adsets, ads, creatives, images, campaignEffectiveStatus, adsetEffectiveStatus, adEffectiveStatus };
+  return { campaigns, adsets, ads, creatives, images, customAudiences, campaignEffectiveStatus, adsetEffectiveStatus, adEffectiveStatus };
 }
 
 /** Meta ids sort numerically even though they are strings. */
