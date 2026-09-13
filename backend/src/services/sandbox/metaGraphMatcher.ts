@@ -32,8 +32,6 @@ export function isGraphHost(url: string): boolean {
   try { return GRAPH_HOSTS.has(new URL(url).hostname); } catch { return false; }
 }
 
-class SawSandboxToken extends Error {}
-
 /** Blob parts of a global FormData body, hydrated asynchronously by the interceptor. */
 const pendingFiles = new WeakMap<SimRequest, Array<{ index: number; blob: Blob }>>();
 
@@ -54,23 +52,34 @@ export function classifyGraphRequest(input: GraphRequestInput): GraphClassificat
     const headers = lowerKeys(input.headers);
     const contentType = (input.contentType || headers['content-type'] || '').toLowerCase();
 
-    // 1. Query, 2. Authorization header — available without touching the body.
-    let token = firstToken(query) ?? bearer(headers.authorization);
-    if (token !== undefined) {
-      if (!isSandboxToken(token)) return { kind: 'passthrough' };
-      sawSandbox = true;
-    }
+    // A single request can legally carry more than one token param at once — Meta's own
+    // debug_token call sends a real app access_token alongside the input_token being
+    // inspected. Taking whichever carrier/param is merely PRESENT first (the original
+    // shape here) can pick the real token and short-circuit to passthrough while a
+    // sandbox token sits unexamined in another param — the sentinel then reaches
+    // graph.facebook.com for real, exactly the leak the fail-closed contract above rules
+    // out. So every carrier is scanned for a sandbox token specifically before any
+    // passthrough decision — only when NONE of them is a sandbox token do we pass through.
+    //
+    // 1. Query, 2. Authorization header — available without touching the body, so a
+    // sandbox token found here flips `sawSandbox` BEFORE the body is parsed. That order
+    // matters: parsing an attacker- or bug-malformed body can throw, and once a sandbox
+    // token has been seen anywhere, a thrown parse error must reject (fail closed), not
+    // silently fall through to passthrough because the throw happened before the body's
+    // own tokens could be checked.
+    const headerToken = bearer(headers.authorization);
+    let token = sandboxTokenIn(query, headerToken ? { access_token: headerToken } : undefined);
+    if (token !== undefined) sawSandbox = true;
 
-    // 3. Body — only parsed for Graph hosts, and only for the shapes Meta accepts.
+    // 3. Body — parsed regardless of whether a token was already found in query/header,
+    // because a sandbox token can ALSO ride in the body of a request whose query/header
+    // carries a different, real token (the form-body variant of the same leak).
     const parsed = parseBody(input.body, contentType);
-    if (token === undefined && parsed) {
-      token = firstToken(parsed.form) ?? firstToken(parsed.multipart?.fields) ?? firstToken(parsed.jsonRecord);
-      if (token !== undefined) {
-        if (!isSandboxToken(token)) return { kind: 'passthrough' };
-        sawSandbox = true;
-      }
+    if (token === undefined) {
+      token = sandboxTokenIn(parsed?.form, parsed?.multipart?.fields, parsed?.jsonRecord);
+      if (token !== undefined) sawSandbox = true;
     }
-    if (token === undefined || !sawSandbox) return { kind: 'passthrough' };
+    if (token === undefined) return { kind: 'passthrough' };
 
     const userId = sandboxTokenUserId(token);
     if (!userId) return { kind: 'reject', reason: 'malformed sandbox token' };
@@ -85,7 +94,7 @@ export function classifyGraphRequest(input: GraphRequestInput): GraphClassificat
     if (parsed?.pending?.length) pendingFiles.set(request, parsed.pending);
     return { kind: 'simulate', request };
   } catch (error) {
-    if (sawSandbox || error instanceof SawSandboxToken) return { kind: 'reject', reason: error instanceof Error ? error.message : 'unparseable sandbox request' };
+    if (sawSandbox) return { kind: 'reject', reason: error instanceof Error ? error.message : 'unparseable sandbox request' };
     return { kind: 'passthrough' };
   }
 }
@@ -113,11 +122,22 @@ function bearer(header?: string): string | undefined {
   return match ? match[1] : undefined;
 }
 
-function firstToken(record?: Record<string, unknown>): string | undefined {
-  if (!record) return undefined;
-  for (const key of TOKEN_PARAMS) {
-    const value = record[key];
-    if (typeof value === 'string' && value) return value;
+/**
+ * Scans every candidate carrier — in the order the caller passes them — for a token param
+ * that IS specifically a sandbox sentinel, returning the first one found. A carrier can
+ * legally hold more than one token param (Meta's own `debug_token` call sends a real
+ * `access_token` alongside the `input_token` under test); checking every param on every
+ * carrier for sandbox-ness, rather than stopping at whichever param is merely present
+ * first, is what keeps a sentinel sharing a request with a real token from slipping past
+ * as passthrough (see the call site's comment).
+ */
+function sandboxTokenIn(...records: Array<Record<string, unknown> | undefined>): string | undefined {
+  for (const record of records) {
+    if (!record) continue;
+    for (const key of TOKEN_PARAMS) {
+      const value = record[key];
+      if (typeof value === 'string' && value && isSandboxToken(value)) return value;
+    }
   }
   return undefined;
 }

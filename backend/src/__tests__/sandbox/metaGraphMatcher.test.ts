@@ -109,6 +109,28 @@ describe('token sources', () => {
     expect(simulate(classifyGraphRequest({ url: `https://graph.facebook.com/v25.0/120210000000000001/?access_token=${SBX}`, method: 'PUT' })).method).toBe('POST');
     expect(simulate(classifyGraphRequest({ url: `https://graph.facebook.com/v25.0/120210000000000001/?access_token=${SBX}`, method: 'HEAD' }))).toMatchObject({ method: 'GET', path: '120210000000000001' });
   });
+  it('finds a sandbox token even when a REAL token shares the same carrier or arrives first (CodeRabbit, ENG-1908)', () => {
+    // Meta's own debug_token call sends a real access_token alongside the input_token
+    // under test — access_token is checked before input_token, so a matcher that stops
+    // at the first PRESENT token param (rather than the first SANDBOX one) picks the
+    // real token here and lets the sandbox input_token reach graph.facebook.com for real.
+    const debugToken = simulate(classifyGraphRequest({ url: `https://graph.facebook.com/v25.0/debug_token?access_token=${REAL}&input_token=${SBX}` }));
+    expect(debugToken).toMatchObject({ userId: USER, token: SBX, path: 'debug_token' });
+
+    // A real query token alongside a sandbox Authorization header.
+    const headerCase = simulate(classifyGraphRequest({ url: `https://graph.facebook.com/v25.0/me?access_token=${REAL}`, headers: { Authorization: `Bearer ${SBX}` } }));
+    expect(headerCase).toMatchObject({ userId: USER, token: SBX });
+
+    // A real query token alongside a sandbox token in the form body.
+    const formCase = simulate(classifyGraphRequest({
+      url: `https://graph.facebook.com/v25.0/act_1207000000000001/campaigns?access_token=${REAL}`, method: 'POST',
+      contentType: 'application/x-www-form-urlencoded', body: `name=Proposal&access_token=${SBX}`,
+    }));
+    expect(formCase).toMatchObject({ userId: USER, token: SBX });
+
+    // Both real: still passthrough — the fix must not turn every mixed-token request sandbox.
+    expect(classifyGraphRequest({ url: `https://graph.facebook.com/v25.0/debug_token?access_token=${REAL}&input_token=${REAL}` })).toEqual({ kind: 'passthrough' });
+  });
   it('a malformed body on a sandbox request rejects instead of leaking', () => {
     const r = classifyGraphRequest({ url: 'https://graph.facebook.com/v25.0/act_1/adimages', method: 'POST', contentType: 'multipart/form-data; boundary=zzz', body: { get length() { throw new Error('boom'); } } });
     // No sandbox token was seen, so this is a passthrough (fail open for real traffic) ...
