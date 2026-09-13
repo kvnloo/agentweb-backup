@@ -17,6 +17,7 @@ const mockPut = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue
 const mockGet = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 const mockUpdate = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 const mockDelete = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+const mockTransactWrite = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 
 jest.mock('aws-sdk', () => ({
   __esModule: true,
@@ -28,6 +29,7 @@ jest.mock('aws-sdk', () => ({
         get: mockGet,
         update: mockUpdate,
         delete: mockDelete,
+        transactWrite: mockTransactWrite,
       })),
     },
   },
@@ -232,6 +234,18 @@ describe('DynamoMcpSessionStore', () => {
     });
     const store = new DynamoMcpSessionStore(HOUR_MS);
     // No prior set → not throttled → attempts the update, which "fails" softly.
+    await expect(store.touch('s1')).resolves.toBeUndefined();
+  });
+
+  it('touch swallows a transaction condition failure for an evaluation session', async () => {
+    mockGet.mockReturnValueOnce({ promise: async () => ({ Item: { sessionId: 's1', agentUserId: 'evaluation-user', isInternal: false } }) });
+    mockTransactWrite.mockReturnValueOnce({
+      promise: jest.fn().mockRejectedValue({
+        code: 'TransactionCanceledException',
+        CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }],
+      }),
+    });
+    const store = new DynamoMcpSessionStore(HOUR_MS);
     await expect(store.touch('s1')).resolves.toBeUndefined();
   });
 

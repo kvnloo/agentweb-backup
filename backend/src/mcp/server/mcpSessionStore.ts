@@ -1,4 +1,4 @@
-import { writeWithEvaluationGuard } from '../../services/evaluationPersistence';
+import { isTransactionConditionFailure, writeWithEvaluationGuard } from '../../services/evaluationPersistence';
 /**
  * MCP Session Store — durable, optionally-shared metadata store for MCP
  * Streamable-HTTP sessions.
@@ -190,7 +190,7 @@ export class DynamoMcpSessionStore implements McpSessionStore {
         },
       } });
     } catch (err: any) {
-      if (err?.code === "ConditionalCheckFailedException") return; // gone — fine
+      if (err?.code === "ConditionalCheckFailedException" || isTransactionConditionFailure(err)) return; // gone — fine
       throw err;
     }
   }
