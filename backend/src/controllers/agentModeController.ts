@@ -14904,7 +14904,7 @@ export const agentModeController = {
       await scheduleDb.createSchedule(scheduledChat);
 
       // Increment template usage count
-      await scheduleTemplateDb.incrementUsageCount(templateId);
+      await scheduleTemplateDb.incrementUsageCount(templateId, user.userId);
 
       res.status(201).json({
         scheduleId,

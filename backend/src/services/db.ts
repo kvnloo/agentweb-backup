@@ -1,3 +1,4 @@
+import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
@@ -3486,7 +3487,7 @@ export const scheduleDb = {
         Item: schedule,
       };
 
-      await dynamodb.put(params).promise();
+      await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
       return schedule;
     } catch (error) {
       handleDynamoDbError(error, "createSchedule");
@@ -11402,7 +11403,7 @@ export const scheduleTemplateDb = {
     }
   },
 
-  async incrementUsageCount(templateId: string) {
+  async incrementUsageCount(templateId: string, userId?: string) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
@@ -11415,6 +11416,12 @@ export const scheduleTemplateDb = {
         },
         ReturnValues: 'ALL_NEW' as const,
       };
+      if (isEvaluationUser(userId)) {
+        const { ReturnValues: _returnValues, ...update } = params;
+        await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Update: update });
+        const result = await dynamodb.get({ TableName: params.TableName, Key: params.Key, ConsistentRead: true }).promise();
+        return result.Item;
+      }
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {

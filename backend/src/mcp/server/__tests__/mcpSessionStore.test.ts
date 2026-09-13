@@ -210,6 +210,7 @@ describe('DynamoMcpSessionStore', () => {
   });
 
   it('touch persists after the throttle interval elapses', async () => {
+    mockGet.mockReturnValueOnce({ promise: async () => ({ Item: { sessionId: 's1', isInternal: true } }) });
     const store = new DynamoMcpSessionStore(HOUR_MS);
     await store.set({ sessionId: 's1', isInternal: true });
     mockUpdate.mockClear();
@@ -225,6 +226,7 @@ describe('DynamoMcpSessionStore', () => {
   });
 
   it('touch swallows a ConditionalCheckFailedException (row already gone)', async () => {
+    mockGet.mockReturnValueOnce({ promise: async () => ({ Item: { sessionId: 's1', isInternal: true } }) });
     mockUpdate.mockReturnValueOnce({
       promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
     });
@@ -234,6 +236,7 @@ describe('DynamoMcpSessionStore', () => {
   });
 
   it('touch rethrows unexpected errors (fail loud, not silent)', async () => {
+    mockGet.mockReturnValueOnce({ promise: async () => ({ Item: { sessionId: 's1', isInternal: true } }) });
     mockUpdate.mockReturnValueOnce({
       promise: jest.fn().mockRejectedValue({ code: 'ProvisionedThroughputExceededException' }),
     });

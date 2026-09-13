@@ -1,3 +1,4 @@
+import { writeWithEvaluationGuard } from '../../services/evaluationPersistence';
 /**
  * MCP Session Store — durable, optionally-shared metadata store for MCP
  * Streamable-HTTP sessions.
@@ -54,6 +55,11 @@ export interface McpSessionStore {
   touch(sessionId: string): Promise<void>;
   /** Remove a session record (idempotent). */
   delete(sessionId: string): Promise<void>;
+}
+
+function hasValidSessionOwner(record: AWS.DynamoDB.DocumentClient.AttributeMap, sessionId: string): boolean {
+  return record.sessionId === sessionId && (record.agentUserId === undefined ||
+    (typeof record.agentUserId === 'string' && record.agentUserId.length > 0));
 }
 
 const secondsFromNow = (ms: number) => Math.floor((Date.now() + ms) / 1000);
@@ -135,7 +141,7 @@ export class DynamoMcpSessionStore implements McpSessionStore {
       .get({ TableName: this.tableName, Key: { sessionId } })
       .promise();
     const record = result.Item as McpSessionRecord | undefined;
-    if (!record) return null;
+    if (!record || !hasValidSessionOwner(record, sessionId)) return null;
     if (record.ttl <= Math.floor(Date.now() / 1000)) {
       // Expired (DynamoDB TTL deletion lags up to ~48h) — treat as gone so
       // eviction is consistent across instances.
@@ -155,9 +161,7 @@ export class DynamoMcpSessionStore implements McpSessionStore {
       lastActivity: now,
       ttl: secondsFromNow(this.sessionTtlMs),
     };
-    await this.dynamodb
-      .put({ TableName: this.tableName, Item: record })
-      .promise();
+    await writeWithEvaluationGuard(this.dynamodb, input.agentUserId, TABLE_PREFIX, { Put: { TableName: this.tableName, Item: record } });
     this.lastPersistedTouch.set(input.sessionId, now);
   }
 
@@ -167,20 +171,24 @@ export class DynamoMcpSessionStore implements McpSessionStore {
     if (now - last < TOUCH_PERSIST_INTERVAL_MS) return; // throttle writes
     this.lastPersistedTouch.set(sessionId, now);
     try {
-      await this.dynamodb
-        .update({
-          TableName: this.tableName,
-          Key: { sessionId },
-          // Only refresh a row that still exists — never resurrect a deleted one.
-          ConditionExpression: "attribute_exists(sessionId)",
-          UpdateExpression: "SET lastActivity = :la, #ttl = :ttl",
-          ExpressionAttributeNames: { "#ttl": "ttl" },
-          ExpressionAttributeValues: {
-            ":la": now,
-            ":ttl": secondsFromNow(this.sessionTtlMs),
-          },
-        })
-        .promise();
+      const result = await this.dynamodb.get({ TableName: this.tableName, Key: { sessionId }, ConsistentRead: true }).promise();
+      const record = result.Item;
+      if (!record) return;
+      if (!hasValidSessionOwner(record, sessionId)) throw new Error('Invalid MCP session owner');
+      await writeWithEvaluationGuard(this.dynamodb, record.agentUserId, TABLE_PREFIX, { Update: {
+        TableName: this.tableName,
+        Key: { sessionId },
+        // Only refresh a row that still exists — never resurrect a deleted one.
+        ConditionExpression: 'attribute_exists(sessionId) AND ' + (record.agentUserId === undefined
+          ? 'attribute_not_exists(agentUserId)' : 'agentUserId = :owner'),
+        UpdateExpression: "SET lastActivity = :la, #ttl = :ttl",
+        ExpressionAttributeNames: { "#ttl": "ttl" },
+        ExpressionAttributeValues: {
+          ...(record.agentUserId === undefined ? {} : { ":owner": record.agentUserId }),
+          ":la": now,
+          ":ttl": secondsFromNow(this.sessionTtlMs),
+        },
+      } });
     } catch (err: any) {
       if (err?.code === "ConditionalCheckFailedException") return; // gone — fine
       throw err;
