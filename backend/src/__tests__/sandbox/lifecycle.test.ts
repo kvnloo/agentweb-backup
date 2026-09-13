@@ -39,7 +39,6 @@ function harness() {
   };
   const cleanup = {
     assertQuiescent: jest.fn(async () => { events.push('quiescent'); }),
-    deleteSandboxPrefix: jest.fn(async () => { events.push('s3'); return 2; }),
     preparePurge: jest.fn(async () => async () => { events.push('artifacts'); return { sessions: 1, executions: 1, files: 3 }; }),
   };
   const datasets = { loadDataset: jest.fn(async () => seed) };
@@ -58,14 +57,15 @@ describe('ENG-1910 lifecycle acceptance', () => {
     expect(review.markdown).toContain('Changed');
     expect(review.markdown.indexOf('GET')).toBeLessThan(review.markdown.indexOf('POST'));
   });
-  it('reset removes the S3 prefix before dropping the overlay and restores the exact immutable seed hash', async () => {
+  it('reset clears every piece of candidate content before dropping the overlay and restores the exact immutable seed hash', async () => {
     const h = harness();
     const result = await h.store.reset('admin', policy.userId);
     expect(result.seedSha256).toBe(seedHash);
+    expect(result.cleanup).toEqual({ sessions: 1, executions: 1, files: 3 });
     expect(h.overlay()).toBeNull();
-    expect(h.cleanup.deleteSandboxPrefix).toHaveBeenCalledWith(policy.userId);
-    expect(h.events.indexOf('lock')).toBeLessThan(h.events.indexOf('s3'));
-    expect(h.events.indexOf('s3')).toBeLessThan(h.events.indexOf('overlay'));
+    expect(h.cleanup.preparePurge).toHaveBeenCalledWith(policy.userId);
+    expect(h.events.indexOf('lock')).toBeLessThan(h.events.indexOf('artifacts'));
+    expect(h.events.indexOf('artifacts')).toBeLessThan(h.events.indexOf('overlay'));
     expect(h.record().lifecycleState).toBeUndefined();
     expect(h.datasets.loadDataset).toHaveBeenCalledWith(seed.meta.datasetId, seed.meta.version);
     expect(createHash('sha256').update(JSON.stringify(seed)).digest('hex')).toBe(seedHash);
@@ -86,7 +86,7 @@ describe('ENG-1910 lifecycle acceptance', () => {
     await expect(h.store.review('stranger', policy.userId)).rejects.toThrow();
   });
   it('failed reset stays blocked and retains overlay for safe retry', async () => {
-    const h = harness(); h.cleanup.deleteSandboxPrefix.mockRejectedValueOnce(new Error('S3 unavailable'));
+    const h = harness(); h.cleanup.preparePurge.mockRejectedValueOnce(new Error('S3 unavailable'));
     await expect(h.store.reset('admin', policy.userId)).rejects.toThrow('S3 unavailable');
     expect(h.record().lifecycleState).toBe('resetting');
     expect(h.overlay()).not.toBeNull();
@@ -94,7 +94,7 @@ describe('ENG-1910 lifecycle acceptance', () => {
   it('active work blocks cleanup while the policy remains closed', async () => {
     const h = harness(); h.cleanup.assertQuiescent.mockRejectedValueOnce(new Error('active work'));
     await expect(h.store.reset('admin', policy.userId)).rejects.toThrow('active work');
-    expect(h.cleanup.deleteSandboxPrefix).not.toHaveBeenCalled();
+    expect(h.cleanup.preparePurge).not.toHaveBeenCalled();
     expect(h.record().lifecycleState).toBe('resetting');
   });
 });
