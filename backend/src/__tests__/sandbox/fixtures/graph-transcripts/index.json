@@ -1,0 +1,99 @@
+{
+  "source": "real-account",
+  "recordedAt": "2026-09-13T00:19:30.596Z",
+  "graphVersion": "v25.0",
+  "accountClass": "agentweb-own-ad-account",
+  "sanitization": "ids remapped deterministically, names/urls replaced, tokens and trace ids removed",
+  "fixtures": [
+    {
+      "name": "me-adaccounts",
+      "file": "me-adaccounts.json",
+      "kind": "edge"
+    },
+    {
+      "name": "me-permissions",
+      "file": "me-permissions.json",
+      "kind": "edge"
+    },
+    {
+      "name": "debug-token",
+      "file": "debug-token.json",
+      "kind": "meta"
+    },
+    {
+      "name": "account",
+      "file": "account.json",
+      "kind": "node"
+    },
+    {
+      "name": "campaigns",
+      "file": "campaigns.json",
+      "kind": "edge"
+    },
+    {
+      "name": "adsets",
+      "file": "adsets.json",
+      "kind": "edge"
+    },
+    {
+      "name": "ads",
+      "file": "ads.json",
+      "kind": "edge"
+    },
+    {
+      "name": "adcreatives",
+      "file": "adcreatives.json",
+      "kind": "edge"
+    },
+    {
+      "name": "adspixels",
+      "file": "adspixels.json",
+      "kind": "edge"
+    },
+    {
+      "name": "insights-ad",
+      "file": "insights-ad.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-adset",
+      "file": "insights-adset.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-campaign",
+      "file": "insights-campaign.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-breakdown-age-gender",
+      "file": "insights-breakdown-age-gender.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-breakdown-placement",
+      "file": "insights-breakdown-placement.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-breakdown-device",
+      "file": "insights-breakdown-device.json",
+      "kind": "insights"
+    },
+    {
+      "name": "insights-async-start",
+      "file": "insights-async-start.json",
+      "kind": "report"
+    },
+    {
+      "name": "insights-async-status",
+      "file": "insights-async-status.json",
+      "kind": "report"
+    },
+    {
+      "name": "insights-async-rows",
+      "file": "insights-async-rows.json",
+      "kind": "insights"
+    }
+  ]
+}

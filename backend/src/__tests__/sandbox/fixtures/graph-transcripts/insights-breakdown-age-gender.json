@@ -1,0 +1,158 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/insights",
+    "query": {
+      "level": "campaign",
+      "fields": "impressions,clicks,spend,reach,frequency,campaign_id,actions",
+      "breakdowns": "age,gender",
+      "time_range": "{\"since\":\"2026-08-14\",\"until\":\"2026-09-12\"}",
+      "limit": "500"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "impressions": "15",
+        "clicks": "0",
+        "spend": "1.01",
+        "reach": "15",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "25-34",
+        "gender": "female"
+      },
+      {
+        "impressions": "2",
+        "clicks": "0",
+        "spend": "0.27",
+        "reach": "2",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "25-34",
+        "gender": "male"
+      },
+      {
+        "impressions": "2",
+        "clicks": "0",
+        "spend": "0.02",
+        "reach": "2",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "25-34",
+        "gender": "unknown"
+      },
+      {
+        "impressions": "46",
+        "clicks": "1",
+        "spend": "3.13",
+        "reach": "45",
+        "frequency": "1.022222",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "35-44",
+        "gender": "female"
+      },
+      {
+        "impressions": "11",
+        "clicks": "0",
+        "spend": "0.37",
+        "reach": "11",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "35-44",
+        "gender": "male"
+      },
+      {
+        "impressions": "50",
+        "clicks": "2",
+        "spend": "6.64",
+        "reach": "49",
+        "frequency": "1.020408",
+        "campaign_id": "120000000000000006",
+        "actions": [
+          {
+            "action_type": "link_click",
+            "value": "1"
+          },
+          {
+            "action_type": "post_engagement",
+            "value": "1"
+          },
+          {
+            "action_type": "page_engagement",
+            "value": "1"
+          }
+        ],
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "45-54",
+        "gender": "female"
+      },
+      {
+        "impressions": "11",
+        "clicks": "1",
+        "spend": "0.51",
+        "reach": "10",
+        "frequency": "1.1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "45-54",
+        "gender": "male"
+      },
+      {
+        "impressions": "2",
+        "clicks": "0",
+        "spend": "0",
+        "reach": "1",
+        "frequency": "2",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "45-54",
+        "gender": "unknown"
+      },
+      {
+        "impressions": "3",
+        "clicks": "0",
+        "spend": "0.31",
+        "reach": "3",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "55-64",
+        "gender": "female"
+      },
+      {
+        "impressions": "1",
+        "clicks": "0",
+        "spend": "0.02",
+        "reach": "1",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "age": "55-64",
+        "gender": "male"
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "MAZDZD",
+        "after": "OQZDZD"
+      }
+    }
+  }
+}

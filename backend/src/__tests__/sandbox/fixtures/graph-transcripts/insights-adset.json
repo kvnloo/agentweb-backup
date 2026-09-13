@@ -1,0 +1,67 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/insights",
+    "query": {
+      "level": "adset",
+      "fields": "impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type",
+      "action_breakdowns": "action_type",
+      "action_report_time": "conversion",
+      "action_attribution_windows": "default",
+      "time_range": "{\"since\":\"2026-08-14\",\"until\":\"2026-09-12\"}",
+      "limit": "500"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "impressions": "143",
+        "clicks": "4",
+        "spend": "12.28",
+        "ctr": "2.797203",
+        "cpc": "3.07",
+        "reach": "139",
+        "frequency": "1.028777",
+        "campaign_id": "120000000000000006",
+        "adset_id": "120000000000000013",
+        "actions": [
+          {
+            "action_type": "link_click",
+            "value": "1"
+          },
+          {
+            "action_type": "post_engagement",
+            "value": "1"
+          },
+          {
+            "action_type": "page_engagement",
+            "value": "1"
+          }
+        ],
+        "cost_per_action_type": [
+          {
+            "action_type": "link_click",
+            "value": "12.28"
+          },
+          {
+            "action_type": "post_engagement",
+            "value": "12.28"
+          },
+          {
+            "action_type": "page_engagement",
+            "value": "12.28"
+          }
+        ],
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12"
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "MAZDZD",
+        "after": "MAZDZD"
+      }
+    }
+  }
+}
