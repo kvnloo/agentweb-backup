@@ -47,7 +47,9 @@ describe('sandbox dataset store', () => {
     expect(result.chunkCount).toBe(Math.ceil(json.length / DATASET_CHUNK_CHARS));
     expect(items.get('dataset/fixture-agentweb/1/meta')).toMatchObject({ datasetId: 'fixture-agentweb', version: 1, chunkCount: result.chunkCount,
       account: { account_id: FIXTURE_ACCOUNT_ID, currency: 'USD', name: 'AgentWeb Sandbox', timezone_name: 'UTC' } });
-    for (let n = 0; n < result.chunkCount; n++) expect(items.has(`dataset/fixture-agentweb/1/chunk/${n}`)).toBe(true);
+    const chunkPrefix = items.get('dataset/fixture-agentweb/1/meta').chunkPrefix;
+    expect(chunkPrefix).toMatch(/^dataset\/fixture-agentweb\/1\/attempt\/[0-9a-f-]+\/chunk$/);
+    for (let n = 0; n < result.chunkCount; n++) expect(items.has(`${chunkPrefix}/${n}`)).toBe(true);
     const metaPut = put.mock.calls.find(([p]) => p.Item.evaluationKey === 'dataset/fixture-agentweb/1/meta')![0];
     expect(metaPut.ConditionExpression).toBe('attribute_not_exists(evaluationKey)');
     // Every item stays inside the one approved table.
@@ -71,7 +73,7 @@ describe('sandbox dataset store', () => {
     const { db, items } = fakeDb();
     const store = new SandboxDatasetStore(db);
     await store.putDataset(buildFixtureDataset());
-    const chunk = items.get('dataset/fixture-agentweb/1/chunk/0');
+    const chunk = items.get(`${items.get('dataset/fixture-agentweb/1/meta').chunkPrefix}/0`);
     chunk.data = chunk.data.replace('"AgentWeb Sandbox"', '"Tampered Sandbox"');
     await expect(new SandboxDatasetStore(db).loadDataset('fixture-agentweb', 1)).rejects.toThrow(/integrity/i);
   });
@@ -123,4 +125,94 @@ it('publishes the manifest and privileged import audit in one transaction, faili
   expect(transaction[1].Put.Item).toMatchObject({ actor: 'admin', action: 'load-dataset', outcome: 'published',
     sha256: createHash('sha256').update(JSON.stringify(seed)).digest('hex') });
   expect([...f.items.keys()].some(key => key.endsWith('/meta'))).toBe(false);
+});
+
+it('retries a failed privileged publication with a fresh chunk attempt', async () => {
+  const f = fakeDb();
+  const transactWrite = jest.fn()
+    .mockImplementationOnce(() => ({ promise: async () => { throw new Error('audit unavailable'); } }))
+    .mockImplementationOnce((request: any) => ({ promise: async () => {
+      for (const item of request.TransactItems) f.items.set(item.Put.Item.evaluationKey, item.Put.Item);
+    } }));
+  f.db.transactWrite = transactWrite;
+  const store = new SandboxDatasetStore(f.db);
+  const seed = buildFixtureDataset();
+  await expect(store.putDataset(seed, 'admin')).rejects.toThrow('audit unavailable');
+  await expect(store.putDataset(seed, 'admin')).resolves.toMatchObject({ datasetId: seed.meta.datasetId, version: seed.meta.version });
+  const chunkAttempts = new Set([...f.items.keys()].filter(key => key.includes('/attempt/')).map(key => key.split('/chunk/')[0]));
+  expect(chunkAttempts.size).toBe(2);
+  await expect(store.loadDataset(seed.meta.datasetId, seed.meta.version)).resolves.toEqual(seed);
+});
+
+// Data integrity: partial writes must not poison retries or expose unpublished data.
+it('retries a partial chunk write and publishes only a complete attempt', async () => {
+  const f = fakeDb();
+  const originalPut = f.put.getMockImplementation()!;
+  let chunks = 0;
+  f.put.mockImplementation((request: any) => {
+    if (request.Item.kind === 'dataset_chunk' && ++chunks === 2) {
+      return { promise: async () => { throw new Error('chunk unavailable'); } };
+    }
+    return originalPut(request);
+  });
+  const seed = buildFixtureDataset();
+  seed.meta.approximations = ['x'.repeat(DATASET_CHUNK_CHARS * 2)];
+  const store = new SandboxDatasetStore(f.db);
+  await expect(store.putDataset(seed)).rejects.toThrow('chunk unavailable');
+  expect(await store.loadDatasetSummary(seed.meta.datasetId, 1)).toBeNull();
+  await expect(store.loadDataset(seed.meta.datasetId, 1)).rejects.toThrow(/not found/);
+  await store.putDataset(seed);
+  await expect(store.loadDataset(seed.meta.datasetId, 1)).resolves.toEqual(seed);
+});
+
+it('continues reading immutable versions published with legacy chunk keys', async () => {
+  const f = fakeDb();
+  const seed = buildFixtureDataset();
+  await new SandboxDatasetStore(f.db).putDataset(seed);
+  const meta = f.items.get('dataset/fixture-agentweb/1/meta');
+  for (let n = 0; n < meta.chunkCount; n++) {
+    const oldKey = `${meta.chunkPrefix}/${n}`;
+    f.items.set(`dataset/fixture-agentweb/1/chunk/${n}`, f.items.get(oldKey));
+    f.items.delete(oldKey);
+  }
+  delete meta.chunkPrefix;
+  await expect(new SandboxDatasetStore(f.db).loadDataset(seed.meta.datasetId, 1)).resolves.toEqual(seed);
+});
+
+it.each([null, [], true, '', 'dataset/other/1/attempt/123/chunk'])('rejects a malformed or cross-dataset chunk pointer %p on both read paths', async chunkPrefix => {
+  const f = fakeDb();
+  await new SandboxDatasetStore(f.db).putDataset(buildFixtureDataset());
+  f.items.get('dataset/fixture-agentweb/1/meta').chunkPrefix = chunkPrefix;
+  const store = new SandboxDatasetStore(f.db);
+  await expect(store.loadDatasetSummary('fixture-agentweb', 1)).rejects.toThrow(/integrity/);
+  await expect(store.loadDataset('fixture-agentweb', 1)).rejects.toThrow(/integrity/);
+});
+
+it('concurrent imports publish exactly one complete dataset and its matching audit', async () => {
+  const f = fakeDb();
+  f.db.transactWrite = jest.fn((request: any) => ({ promise: async () => {
+    const puts = request.TransactItems.map((entry: any) => entry.Put);
+    if (puts.some((put: any) => f.items.has(put.Item.evaluationKey))) {
+      throw Object.assign(new Error('publication collision'), { code: 'TransactionCanceledException' });
+    }
+    // All conditions are checked before any transactional write becomes visible.
+    for (const put of puts) {
+      expect(put.ConditionExpression).toBe('attribute_not_exists(evaluationKey)');
+      f.items.set(put.Item.evaluationKey, put.Item);
+    }
+  } }));
+  const first = buildFixtureDataset(), second = buildFixtureDataset();
+  first.meta.approximations = ['a'.repeat(DATASET_CHUNK_CHARS * 2)];
+  second.meta.approximations = ['b'.repeat(DATASET_CHUNK_CHARS * 2)];
+  const results = await Promise.allSettled([
+    new SandboxDatasetStore(f.db).putDataset(first, 'first'),
+    new SandboxDatasetStore(f.db).putDataset(second, 'second'),
+  ]);
+  expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
+  const winner = results[0].status === 'fulfilled' ? first : second;
+  const meta = f.items.get('dataset/fixture-agentweb/1/meta');
+  const audit = f.items.get('dataset/fixture-agentweb/1/audit/import');
+  expect(audit).toMatchObject({ sha256: meta.sha256, actor: winner === first ? 'first' : 'second' });
+  await expect(new SandboxDatasetStore(f.db).loadDataset('fixture-agentweb', 1)).resolves.toEqual(winner);
 });

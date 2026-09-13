@@ -40,7 +40,7 @@ function harness() {
   const cleanup = {
     assertQuiescent: jest.fn(async () => { events.push('quiescent'); }),
     deleteSandboxPrefix: jest.fn(async () => { events.push('s3'); return 2; }),
-    purge: jest.fn(async () => { events.push('artifacts'); return { sessions: 1, executions: 1, files: 3 }; }),
+    preparePurge: jest.fn(async () => async () => { events.push('artifacts'); return { sessions: 1, executions: 1, files: 3 }; }),
   };
   const datasets = { loadDataset: jest.fn(async () => seed) };
   // Added lifecycle dependency seam must exercise the same orchestration as the production adapter.
@@ -74,7 +74,7 @@ describe('ENG-1910 lifecycle acceptance', () => {
     const h = harness();
     const result = await h.store.purge('admin', policy.userId);
     expect(result.status).toBe('revoked');
-    expect(h.cleanup.purge).toHaveBeenCalledWith(policy.userId);
+    expect(h.cleanup.preparePurge).toHaveBeenCalledWith(policy.userId);
     expect(h.events.indexOf('revoke')).toBeLessThan(h.events.indexOf('artifacts'));
     expect(h.record().lifecycleState).toBe('purged');
     const deletes = h.db.transactWrite.mock.calls.flatMap(([p]: any) => p.TransactItems).filter((w: any) => w.Delete);
@@ -99,21 +99,84 @@ describe('ENG-1910 lifecycle acceptance', () => {
   });
 });
 
-it('bounds review scans including empty filtered pages and marks the result truncated', async () => {
+it('returns the complete audit beyond twenty empty filtered pages and the old byte budget', async () => {
   const h = harness(); let pages = 0;
-  h.db.scan.mockImplementation(() => ({ promise: async () => ({ Items: [], LastEvaluatedKey: { evaluationKey: String(++pages) } }) }));
+  const large = { ...h.audit[0], detail: 'x'.repeat(8 * 1024 * 1024) };
+  h.db.scan.mockImplementation(() => ({ promise: async () => {
+    ++pages;
+    return { Items: pages === 21 ? [large] : pages === 22 ? [h.audit[1]] : [],
+      ...(pages < 22 ? { LastEvaluatedKey: { evaluationKey: String(pages) } } : {}) };
+  } }));
   const review = await h.store.review('reviewer', policy.userId);
-  expect(pages).toBe(20);
-  expect(review.truncated).toBe(true);
-  expect(review.markdown).toContain('Audit is truncated');
+  expect(pages).toBe(22);
+  expect(review.timeline.map((a: any) => a.method)).toEqual(['GET', 'POST']);
+  expect(review.truncated).toBe(false);
 });
-it('does not silently complete a purge when the material scan exceeds its budget', async () => {
+
+it('inventories late legacy material before artifact cleanup and retains audit rows', async () => {
   const h = harness(); let pages = 0;
-  h.db.scan.mockImplementation(({ TableName, ExpressionAttributeValues }: any) => ({ promise: async () =>
-    TableName.endsWith('AW-Evaluations') && ExpressionAttributeValues?.[':prefix']
-      ? { Items: [], LastEvaluatedKey: { evaluationKey: String(++pages) } } : { Items: [] } }));
-  await expect(h.store.purge('admin', policy.userId)).rejects.toThrow(/limit/);
-  expect(pages).toBe(20);
-  expect(h.record().lifecycleState).toBe('purging');
+  h.db.scan.mockImplementation(({ TableName, ExclusiveStartKey }: any) => ({ promise: async () => {
+    expect(h.db.delete).not.toHaveBeenCalled();
+    expect(h.events).not.toContain('artifacts');
+    if (!TableName.endsWith('AW-Evaluations')) return { Items: [] };
+    expect(ExclusiveStartKey).toEqual(pages ? { evaluationKey: String(pages) } : undefined);
+    ++pages;
+    return { Items: pages === 22 ? [{ evaluationKey: 'evaluation/eval_candidate/sim', userId: policy.userId }, ...h.audit] : [],
+      ...(pages < 22 ? { LastEvaluatedKey: { evaluationKey: String(pages) } } : {}) };
+  } }));
+  await h.store.purge('admin', policy.userId);
+  expect(pages).toBe(22);
+  expect(h.db.delete.mock.calls.map(([p]: any) => p.Key)).toEqual([{ evaluationKey: 'evaluation/eval_candidate/sim' }]);
+});
+
+it.each(['material', 'credential', 'artifact'])('does not delete anything if the %s inventory fails', async failure => {
+  const h = harness();
+  h.db.scan.mockImplementation(({ TableName, ExclusiveStartKey }: any) => ({ promise: async () => {
+    if (TableName.endsWith('AW-Evaluations')) {
+      if (failure === 'material' && ExclusiveStartKey) throw new Error('inventory unavailable');
+      return { Items: [{ evaluationKey: 'evaluation/eval_candidate/sim' }],
+        ...(failure === 'material' ? { LastEvaluatedKey: { evaluationKey: 'next' } } : {}) };
+    }
+    if (failure === 'credential' && TableName.endsWith('AW-TaskSchedules')) throw new Error('inventory unavailable');
+    if (TableName.endsWith('AW-AgentApiKeys')) return { Items: [{ keyId: 'key', userId: policy.userId }] };
+    return { Items: [] };
+  } }));
+  if (failure === 'artifact') h.cleanup.preparePurge.mockRejectedValueOnce(new Error('inventory unavailable'));
+  await expect(h.store.purge('admin', policy.userId)).rejects.toThrow('inventory unavailable');
   expect(h.db.delete).not.toHaveBeenCalled();
+  expect(h.events).not.toContain('artifacts');
+  expect(h.record().lifecycleState).toBe('purging');
+});
+
+it('revokes credentials beyond twenty empty pages without trusting a lagging GSI', async () => {
+  const h = harness(); let pages = 0;
+  h.db.scan.mockImplementation((params: any) => ({ promise: async () => {
+    expect(params.IndexName).toBeUndefined();
+    expect(params.ConsistentRead).toBe(true);
+    expect(h.db.delete).not.toHaveBeenCalled();
+    if (!params.TableName.endsWith('AW-AgentApiKeys')) return { Items: [] };
+    ++pages;
+    return { Items: pages === 22 ? [{ keyId: 'not-indexed-yet', userId: policy.userId }] : [],
+      ...(pages < 22 ? { LastEvaluatedKey: { keyId: String(pages) } } : {}) };
+  } }));
+  const result = await h.store.revoke('admin', policy.userId);
+  expect(pages).toBe(22);
+  expect(result.cleanup['AW-AgentApiKeys']).toBe(1);
+  expect(h.db.delete).toHaveBeenCalledWith(expect.objectContaining({ Key: { keyId: 'not-indexed-yet' },
+    ConditionExpression: '#owner = :user' }));
+});
+
+it.each(['repeated', 'malformed', 'foreign', 'late-missing'])('fails closed on %s credential inventory before any deletion', async failure => {
+  const h = harness();
+  h.db.scan.mockImplementation(({ TableName, ExclusiveStartKey }: any) => ({ promise: async () => {
+    if (TableName.endsWith('AW-AgentApiKeys')) return { Items: [{ keyId: 'key', userId: policy.userId }] };
+    if (!TableName.endsWith('AW-TaskSchedules')) return { Items: [] };
+    if (failure === 'malformed') return { Items: [true] };
+    if (failure === 'foreign') return { Items: [{ scheduleId: 'other', userId: 'someone-else' }] };
+    if (failure === 'late-missing' && ExclusiveStartKey) throw Object.assign(new Error('late missing'), { code: 'ResourceNotFoundException' });
+    return { Items: [], LastEvaluatedKey: { scheduleId: 'repeat' } };
+  } }));
+  await expect(h.store.revoke('admin', policy.userId)).rejects.toThrow();
+  expect(h.db.delete).not.toHaveBeenCalled();
+  expect(h.record().status).toBe('revoked');
 });

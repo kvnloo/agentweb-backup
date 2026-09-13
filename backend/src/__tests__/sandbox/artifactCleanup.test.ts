@@ -9,7 +9,7 @@ function fixture(rows: Record<string, any[]> = {}) {
     delete: jest.fn((_p: any) => ({ promise: async () => ({}) })),
   };
   const s3 = {
-    listObjectsV2: jest.fn((_p: any) => ({ promise: async () => ({ Contents: [] }) })),
+    listObjectsV2: jest.fn((_p: any) => ({ promise: async () => ({ Contents: [] as Array<{ Key: string }> }) })),
     deleteObjects: jest.fn((_p: any) => ({ promise: async () => ({}) })),
   };
   const deleteGcsPrefix = jest.fn(async () => {});
@@ -61,7 +61,7 @@ describe('sandbox artifact purge acceptance', () => {
   });
   it('keeps ownership records when object deletion partially fails', async () => {
     const f = fixture({ 'AW-Tasks': [{ taskId: 'task1', userId }] });
-    f.s3.listObjectsV2.mockImplementation((() => ({ promise: async () => ({ Contents: [{ Key: 'sandbox/eval_cleanup/file' }] }) })) as any);
+    f.s3.listObjectsV2.mockImplementation(((p: any) => ({ promise: async () => ({ Contents: [{ Key: `${p.Prefix}file` }] }) })) as any);
     f.s3.deleteObjects.mockImplementation((() => ({ promise: async () => ({ Errors: [{ Code: 'AccessDenied' }] }) })) as any);
     await expect(f.cleanup.purge(userId)).rejects.toThrow();
     expect(f.db.delete).not.toHaveBeenCalled();
@@ -108,41 +108,69 @@ describe('sandbox artifact purge acceptance', () => {
   });
 });
 
-it('uses only existing ownership indexes and primary queries, with a keyed settings read', async () => {
+it('uses strong owner-scoped base-table inventories so lagging GSIs cannot hide owned rows', async () => {
   const f = fixture({ 'AW-ChatSessions': [{ sessionId: 's1', userId }], 'AW-Settings': [{ settingName: `templates_${userId}` }] });
+  // An eventual index has no session yet; cleanup must still discover the base row.
+  f.db.query.mockImplementation(() => ({ promise: async () => ({ Items: [] }) }));
   await f.cleanup.purge(userId);
-  expect(f.db.query).toHaveBeenCalledWith(expect.objectContaining({ TableName: 'AW-ChatSessions', IndexName: 'UserIdIndex', KeyConditionExpression: '#owner = :owner' }));
+  expect(f.db.scan).toHaveBeenCalledWith(expect.objectContaining({ TableName: 'AW-ChatSessions', ConsistentRead: true, FilterExpression: '#owner = :owner' }));
+  expect(f.db.delete).toHaveBeenCalledWith(expect.objectContaining({ TableName: 'AW-ChatSessions', Key: { sessionId: 's1' } }));
   expect(f.db.query).toHaveBeenCalledWith(expect.objectContaining({ TableName: 'AW-ChatMessages', ConsistentRead: true }));
-  for (const [p] of f.db.query.mock.calls) if (p.IndexName) expect(p.ConsistentRead).toBeUndefined();
+  for (const [p] of f.db.query.mock.calls) expect(p.IndexName).toBeUndefined();
   expect(f.db.get).toHaveBeenCalledWith({ TableName: 'AW-Settings', Key: { settingName: `templates_${userId}` }, ConsistentRead: true });
-  expect(new Set(f.db.scan.mock.calls.map(([p]) => p.TableName))).toEqual(new Set(['AW-AgentRuns', 'AW-WorkflowExecutions']));
 });
-it('rechecks GSI ownership and active status against the strongly consistent base row', async () => {
-  for (const current of [{ sessionId: 's1', userId: 'other' }, { sessionId: 's1', userId, isProcessing: true }]) {
-    const f = fixture({ 'AW-ChatSessions': [{ sessionId: 's1', userId }] });
-    f.db.get.mockReturnValueOnce({ promise: async () => ({ Item: current }) });
+it('inventories more than the old per-table and overall page caps before deleting', async () => {
+  const f = fixture(); let pages = 0;
+  f.db.scan.mockImplementation((p: any) => ({ promise: async () => {
+    if (p.TableName !== 'AW-AgentRuns') return { Items: [] };
+    if (++pages <= 105) return { Items: [], LastEvaluatedKey: { pk: String(pages) } };
+    return { Items: [{ pk: 'last', userId, status: 'completed' }] };
+  } }));
+  const remove = await f.cleanup.preparePurge(userId);
+  expect(pages).toBe(106);
+  expect(f.db.delete).not.toHaveBeenCalled();
+  expect(f.s3.deleteObjects).not.toHaveBeenCalled();
+  await remove();
+  expect(f.db.delete).toHaveBeenCalledWith(expect.objectContaining({ Key: { pk: 'last' } }));
+});
+it('rejects repeated and malformed database cursors before any deletion', async () => {
+  for (const cursor of [{ pk: 'same' }, {}, [], 'wrong', null]) {
+    const f = fixture();
+    f.db.scan.mockImplementation(() => ({ promise: async () => ({ Items: [], LastEvaluatedKey: cursor }) }) as any);
+    await expect(f.cleanup.purge(userId)).rejects.toThrow('pagination');
+    expect(f.db.delete).not.toHaveBeenCalled();
+    expect(f.s3.listObjectsV2).not.toHaveBeenCalled();
+  }
+});
+it('refuses malformed rows and late inventory failures without deleting earlier artifacts', async () => {
+  for (const lastPage of [async () => ({ Items: [null] }), async () => { throw Object.assign(new Error('table disappeared'), { code: 'ResourceNotFoundException' }); }]) {
+    const f = fixture();
+    f.db.scan.mockReturnValueOnce({ promise: async () => ({ Items: [{ pk: 'first', userId }], LastEvaluatedKey: { pk: 'next' } }) } as any);
+    f.db.scan.mockReturnValueOnce({ promise: lastPage } as any);
     await expect(f.cleanup.purge(userId)).rejects.toThrow();
     expect(f.db.delete).not.toHaveBeenCalled();
-    expect(f.s3.listObjectsV2).not.toHaveBeenCalled();
+    expect(f.s3.deleteObjects).not.toHaveBeenCalled();
   }
 });
-it('fails closed on repeated pagination or scan budget exhaustion before deleting anything', async () => {
-  for (const repeated of [true, false]) {
-    const f = fixture(); let n = 0;
-    f.db.scan.mockImplementation(() => ({ promise: async () => ({ Items: [], LastEvaluatedKey: { pk: String(repeated ? 1 : ++n) } }) }));
-    await expect(f.cleanup.purge(userId)).rejects.toThrow(/pagination|limit/);
-    expect(f.db.scan.mock.calls.length).toBeLessThanOrEqual(20);
-    expect(f.db.delete).not.toHaveBeenCalled();
-    expect(f.s3.listObjectsV2).not.toHaveBeenCalled();
-  }
+it('inventories all S3 prefixes before deleting any objects or ownership records', async () => {
+  const f = fixture({ 'AW-Tasks': [{ taskId: 'task1', userId }] });
+  f.s3.listObjectsV2.mockImplementation(((p: any) => ({ promise: async () => {
+    if (p.Prefix === 'tasks/task1/') throw new Error('late listing failure');
+    return { Contents: [{ Key: `${p.Prefix}file` }] };
+  } })) as any);
+  await expect(f.cleanup.purge(userId)).rejects.toThrow('late listing failure');
+  expect(f.s3.deleteObjects).not.toHaveBeenCalled();
+  expect(f.db.delete).not.toHaveBeenCalled();
+  expect(f.deleteGcsPrefix).not.toHaveBeenCalled();
 });
-it('paginates empty GSI pages and refuses malformed or missing-index responses', async () => {
-  const f = fixture();
-  f.db.query.mockReturnValueOnce({ promise: async () => ({ Items: [], LastEvaluatedKey: { sessionId: 'next' } }) } as any);
-  await f.cleanup.purge(userId);
-  expect(f.db.query.mock.calls[1][0]).toMatchObject({ ExclusiveStartKey: { sessionId: 'next' } });
-  f.db.query.mockReturnValueOnce({ promise: async () => ({ Items: [null] }) } as any);
-  await expect(f.cleanup.purge(userId)).rejects.toThrow(/ownership/);
-  f.db.query.mockImplementationOnce(() => ({ promise: async () => { throw Object.assign(new Error('missing index'), { code: 'ResourceNotFoundException' }); } }));
-  await expect(f.cleanup.purge(userId)).rejects.toThrow('missing index');
+it('refuses a late S3 page failure or pagination cycle without deleting the first page', async () => {
+  for (const cycle of [false, true]) {
+    const f = fixture(); let pages = 0;
+    f.s3.listObjectsV2.mockImplementation(() => ({ promise: async () => {
+      if (!cycle && ++pages === 2) throw new Error('late page failure');
+      return { Contents: [{ Key: `sandbox/${userId}/file` }], IsTruncated: true, NextContinuationToken: 'same' };
+    } }) as any);
+    await expect(f.cleanup.deleteSandboxPrefix(userId)).rejects.toThrow();
+    expect(f.s3.deleteObjects).not.toHaveBeenCalled();
+  }
 });

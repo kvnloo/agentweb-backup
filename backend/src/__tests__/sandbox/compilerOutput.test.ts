@@ -60,3 +60,56 @@ it('rejects oversized sparse files and nonregular files before allocating their 
   expect(() => readDatasetFile(file)).toThrow(/size limit/);
   expect(() => readDatasetFile(packet)).toThrow(/regular/);
 });
+
+it.each(['write', 'close', 'rename'])('preserves the first %s failure through file and directory cleanup failures', stage => {
+  fs.writeFileSync(join(output, 'dataset.json'), 'previous');
+  const primary = new Error(`${stage} failed`), cleanup = new Error('cleanup failed');
+  const close = fs.closeSync;
+  const openedDirectories = new Set<number>(), closedDirectories = new Set<number>();
+  const open = fs.openSync;
+  jest.spyOn(fs, 'openSync').mockImplementation(((file: any, flags: any, mode: any) => {
+    const fd = open(file, flags, mode);
+    if (fs.fstatSync(fd).isDirectory()) openedDirectories.add(fd);
+    return fd;
+  }) as any);
+  if (stage === 'write') jest.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => { throw primary; });
+  if (stage === 'rename') jest.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw primary; });
+  jest.spyOn(fs, 'closeSync').mockImplementation(fd => {
+    const directory = fs.fstatSync(fd).isDirectory();
+    close(fd);
+    if (directory) { closedDirectories.add(fd); throw cleanup; }
+    if (stage !== 'rename') throw stage === 'close' ? primary : cleanup;
+  });
+  jest.spyOn(fs, 'unlinkSync').mockImplementationOnce(() => { throw cleanup; });
+  expect(() => withCompilerOutput(output, packet, put => put('dataset.json', 'replacement'))).toThrow(primary);
+  expect(closedDirectories).toEqual(openedDirectories);
+  jest.restoreAllMocks();
+  expect(fs.readFileSync(join(output, 'dataset.json'), 'utf8')).toBe('previous');
+});
+
+it.each([undefined, null, false, 0, ''])('preserves a falsy primary failure (%s) and never publishes the failed write', primary => {
+  fs.writeFileSync(join(output, 'dataset.json'), 'previous');
+  jest.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => { throw primary; });
+  jest.spyOn(fs, 'unlinkSync').mockImplementationOnce(() => { throw new Error('cleanup failed'); });
+  let caught = false;
+  try { withCompilerOutput(output, packet, put => put('dataset.json', 'replacement')); }
+  catch (error) { caught = true; expect(error).toBe(primary); }
+  expect(caught).toBe(true);
+  expect(fs.readFileSync(join(output, 'dataset.json'), 'utf8')).toBe('previous');
+});
+
+it.each(['unlink', 'directory close'])('surfaces %s cleanup failure when publication succeeded', stage => {
+  const cleanup = new Error(`${stage} failed`);
+  if (stage === 'unlink') jest.spyOn(fs, 'unlinkSync').mockImplementationOnce(() => { throw cleanup; });
+  else {
+    const close = fs.closeSync;
+    jest.spyOn(fs, 'closeSync').mockImplementation(fd => {
+      const directory = fs.fstatSync(fd).isDirectory();
+      close(fd);
+      if (directory) throw cleanup;
+    });
+  }
+  expect(() => withCompilerOutput(output, packet, put => put('dataset.json', 'compiled'))).toThrow(cleanup);
+  jest.restoreAllMocks();
+  expect(fs.readFileSync(join(output, 'dataset.json'), 'utf8')).toBe('compiled');
+});

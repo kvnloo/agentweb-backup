@@ -85,7 +85,7 @@ export interface SandboxLifecycleDeps {
   cleanup: {
     assertQuiescent(userId: string): Promise<void>;
     deleteSandboxPrefix(userId: string): Promise<number>;
-    purge(userId: string): Promise<Record<string, number>>;
+    preparePurge(userId: string): Promise<() => Promise<Record<string, number>>>;
   };
 }
 
@@ -235,36 +235,18 @@ export class EvaluationStore {
 
   async review(actor: string, userId: string) {
     const record = await this.requireReview(actor, userId);
-    const audit: Record<string, unknown>[] = [];
-    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-    let pages = 0, bytes = 0;
-    const seen = new Set<string>();
-    do {
-      const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
-        FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
-        ExpressionAttributeValues: { ':user': userId, ':prefix': `evaluation/${userId}/audit/` },
-        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-      }).promise();
-      if (!Array.isArray(page.Items)) throw new EvaluationDenied();
-      for (const item of page.Items) {
-        if (!item || item.userId !== userId || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) throw new EvaluationDenied();
-        audit.push(item);
-      }
-      bytes += Buffer.byteLength(JSON.stringify(page.Items));
-      cursor = page.LastEvaluatedKey;
-      if (cursor) {
-        const token = JSON.stringify(cursor);
-        if (seen.has(token)) throw new EvaluationDenied();
-        seen.add(token);
-      }
-    } while (cursor && ++pages < 20 && bytes < 8 * 1024 * 1024);
+    const audit = await this.inventory({ TableName: this.table,
+      FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
+      ExpressionAttributeValues: { ':user': userId, ':prefix': `evaluation/${userId}/audit/` },
+    }, item => item.userId === userId && typeof item.evaluationKey === 'string' &&
+      item.evaluationKey.startsWith(`evaluation/${userId}/audit/`));
     const orderedAudit = orderSandboxAudit(audit);
     const overlay = await new SandboxStateStore(this.db).loadOverlay(userId);
     const dataset = record.datasetId && record.datasetVersion
       ? await (await this.lifecycle()).datasets.loadDataset(record.datasetId, record.datasetVersion) : null;
     const result = { userId, status: record.status, audit: orderedAudit,
       timeline: orderedAudit.filter(item => item.action === 'meta'),
-      overlayDiff: dataset ? buildOverlayDiff(dataset, overlay) : [], truncated: !!cursor };
+      overlayDiff: dataset ? buildOverlayDiff(dataset, overlay) : [], truncated: false };
     return { ...result, markdown: renderSandboxReviewMarkdown(result) };
   }
 
@@ -321,30 +303,21 @@ export class EvaluationStore {
     if (record.lifecycleState === 'purged') return { userId, status: 'revoked', cleanup: {} };
     const lease = await this.beginLifecycle(actor, userId, 'purging');
     try {
-      await this.revoke(actor, userId);
+      // Complete every inventory before deleting anything. Primary-table reads also
+      // include newly issued credentials absent from eventually consistent GSIs.
+      const material = await this.inventory({ TableName: this.table,
+        FilterExpression: 'begins_with(evaluationKey, :prefix)',
+        ProjectionExpression: 'evaluationKey, userId',
+        ExpressionAttributeValues: { ':prefix': `evaluation/${userId}/` },
+      }, item => typeof item.evaluationKey === 'string' && item.evaluationKey.startsWith(`evaluation/${userId}/`) &&
+        (item.userId === undefined || item.userId === userId));
+      const materialKeys = material.map(item => item.evaluationKey as string)
+        .filter(key => !key.startsWith(`evaluation/${userId}/audit/`));
+      const deleteCredentials = await this.prepareCredentialCleanup(userId);
       const { cleanup } = await this.lifecycle();
-      const counts = await cleanup.purge(userId);
-      // AW-Evaluations has only the evaluationKey hash key: prefix Query is not
-      // available. Bound the legacy-material scan; never delete from a partial inventory.
-      let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-      let pages = 0;
-      const materialKeys: string[] = [];
-      do {
-        if (++pages > 20) throw new Error('Sandbox material inventory limit exceeded; purge incomplete');
-        const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
-          FilterExpression: 'begins_with(evaluationKey, :prefix)',
-          ExpressionAttributeValues: { ':prefix': `evaluation/${userId}/` },
-          ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-        }).promise();
-        if (!Array.isArray(page.Items)) throw new EvaluationDenied();
-        for (const item of page.Items) {
-          if (!item || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/`) ||
-              (item.userId !== undefined && item.userId !== userId)) throw new EvaluationDenied();
-          if (item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) continue;
-          materialKeys.push(item.evaluationKey);
-        }
-        cursor = page.LastEvaluatedKey;
-      } while (cursor);
+      const deleteArtifacts = await cleanup.preparePurge(userId);
+      await this.revokeWithCleanup(actor, userId, deleteCredentials);
+      const counts = await deleteArtifacts();
       for (const evaluationKey of materialKeys) {
         await this.db.delete({ TableName: this.table, Key: { evaluationKey },
           ConditionExpression: 'attribute_not_exists(userId) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
@@ -375,6 +348,10 @@ export class EvaluationStore {
   }
 
   async revoke(actor: string, userId: string) {
+    return this.revokeWithCleanup(actor, userId);
+  }
+
+  private async revokeWithCleanup(actor: string, userId: string, deleteCredentials?: () => Promise<Record<string, number>>) {
     const record = await this.get(userId);
     if (!record || record.userId !== userId || typeof record.email !== 'string') throw new EvaluationDenied();
     const audit = this.audit(userId, actor, 'revoke', { cleanupStatus: 'pending' });
@@ -400,7 +377,7 @@ export class EvaluationStore {
       await this.db.transactWrite({ TransactItems: [writes[0], writes[2]] }).promise();
     }
     let cleanup: Record<string, number>;
-    try { cleanup = await this.cleanupCredentials(userId); } catch (error) {
+    try { cleanup = await (deleteCredentials ?? await this.prepareCredentialCleanup(userId))(); } catch (error) {
       try { await this.db.transactWrite({ TransactItems: [this.audit(userId, actor, 'revocation-cleanup-failed')] }).promise(); } catch {
         // The original revoke audit is already committed. Keep the cleanup failure.
       }
@@ -411,35 +388,60 @@ export class EvaluationStore {
     return { userId, status: 'revoked', audit: audit.Put.Item, cleanup, cleanupAudit: cleanupAudit.Put.Item };
   }
 
-  private async cleanupCredentials(userId: string) {
-    const counts: Record<string, number> = {};
-    // Primary-table scans avoid stale identity indexes during revocation. Only key + owner
-    // are read for conditional deletion; row keys and credential values are never logged.
+  /** DynamoDB Limit applies before filtering. Exhaust even empty pages; never
+   * treat a budget, malformed page or repeated cursor as a complete inventory. */
+  private async inventory(params: AWS.DynamoDB.DocumentClient.ScanInput,
+    owns: (item: Record<string, unknown>) => boolean, optional = false): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    const seen = new Set<string>();
+    do {
+      let page: AWS.DynamoDB.DocumentClient.ScanOutput;
+      try {
+        page = await this.db.scan({ ...params, ConsistentRead: true, Limit: 100,
+          ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+        }).promise();
+      } catch (error: any) {
+        // Only an absent optional table on the first page means an empty inventory.
+        if (optional && !cursor && error?.code === 'ResourceNotFoundException') return [];
+        throw error;
+      }
+      if (!page || !Array.isArray(page.Items)) throw new EvaluationDenied();
+      for (const item of page.Items) {
+        if (!item || typeof item !== 'object' || Array.isArray(item) || !owns(item)) throw new EvaluationDenied();
+        rows.push(item);
+      }
+      cursor = page.LastEvaluatedKey;
+      if (cursor !== undefined) {
+        if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor) || !Object.keys(cursor).length) throw new EvaluationDenied();
+        const token = JSON.stringify(Object.entries(cursor).sort(([a], [b]) => a.localeCompare(b)));
+        if (seen.has(token)) throw new EvaluationDenied();
+        seen.add(token);
+      }
+    } while (cursor);
+    return rows;
+  }
+
+  private async prepareCredentialCleanup(userId: string): Promise<() => Promise<Record<string, number>>> {
+    // No GSI can provide a complete revocation inventory under index lag. Read
+    // primary tables consistently, projecting only key and owner (never secrets).
+    const inventories: Array<{ table: string; key: string; owner: string; rows: Record<string, unknown>[] }> = [];
     for (const [table, key, owner] of [
       ['AW-AgentApiKeys', 'keyId', 'userId'], ['AW-MCPOAuthTokens', 'tokenHash', 'userId'],
       ['AW-MCPOAuthCodes', 'code', 'userId'], ['AW-MCPSessions', 'sessionId', 'agentUserId'],
       ['AW-TaskSchedules', 'scheduleId', 'userId'],
     ]) {
-      counts[table] = 0;
-      let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-      let pages = 0;
-      do {
-        if (++pages > 20) throw new Error('Sandbox credential cleanup limit exceeded; revocation cleanup incomplete');
-        let page: AWS.DynamoDB.DocumentClient.ScanOutput;
-        try {
-          page = await this.db.scan({ TableName: `${this.prefix}${table}`, ConsistentRead: true, Limit: 100,
-            FilterExpression: '#owner = :user', ProjectionExpression: '#key, #owner',
-            ExpressionAttributeNames: { '#key': key, '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
-            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-          }).promise();
-        } catch (error: any) {
-          // Some environments use only the in-memory MCP store; absent tables hold no grants.
-          if (error?.code === 'ResourceNotFoundException') break;
-          throw error;
-        }
-        if (!Array.isArray(page.Items)) throw new EvaluationDenied();
-        for (const item of page.Items) {
-          if (!item || item[owner] !== userId || typeof item[key] !== 'string') throw new EvaluationDenied();
+      const rows = await this.inventory({ TableName: `${this.prefix}${table}`,
+        FilterExpression: '#owner = :user', ProjectionExpression: '#key, #owner',
+        ExpressionAttributeNames: { '#key': key, '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
+      }, item => item[owner] === userId && typeof item[key] === 'string' && !!item[key], true);
+      inventories.push({ table, key, owner, rows });
+    }
+    return async () => {
+      const counts: Record<string, number> = {};
+      for (const { table, key, owner, rows } of inventories) {
+        counts[table] = 0;
+        for (const item of rows) {
           try {
             await this.db.delete({ TableName: `${this.prefix}${table}`, Key: { [key]: item[key] },
               ConditionExpression: '#owner = :user', ExpressionAttributeNames: { '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
@@ -447,10 +449,9 @@ export class EvaluationStore {
             counts[table]++;
           } catch (error: any) { if (error?.code !== 'ConditionalCheckFailedException') throw error; }
         }
-        cursor = page.LastEvaluatedKey;
-      } while (cursor);
-    }
-    return counts;
+      }
+      return counts;
+    };
   }
 }
 

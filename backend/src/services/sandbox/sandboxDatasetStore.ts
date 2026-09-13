@@ -1,5 +1,5 @@
 import AWS from 'aws-sdk';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { isDay } from './dateShift';
 import type { SandboxAccount, SandboxDataset, SandboxDatasetMeta } from './types';
 
@@ -9,7 +9,7 @@ import type { SandboxAccount, SandboxDataset, SandboxDatasetMeta } from './types
  * (every item conditional on absence) and verified by sha256 on every cold read.
  *
  *   dataset/<datasetId>/<version>/meta      summary: account, meta, counts, sha256, chunkCount
- *   dataset/<datasetId>/<version>/chunk/<n>  JSON slice n of the serialized dataset
+ *   dataset/<datasetId>/<version>/attempt/<uuid>/chunk/<n>  JSON slice n of the serialized dataset
  */
 export const DATASET_CHUNK_CHARS = 100_000; // ≤ 300 KB even if every character is 3 bytes of UTF-8
 const CACHE_MAX = 8;
@@ -35,6 +35,7 @@ export interface DatasetSummary {
   sha256: string;
   bytes: number;
   chunkCount: number;
+  chunkPrefix?: string;
   createdAt: string;
 }
 
@@ -141,14 +142,15 @@ export class SandboxDatasetStore {
     const sha256 = createHash('sha256').update(json).digest('hex');
     const bytes = Buffer.byteLength(json);
     const chunks = chunkString(json, DATASET_CHUNK_CHARS);
+    const chunkPrefix = `${prefix}/attempt/${randomUUID()}/chunk`;
     const createdAt = new Date().toISOString();
     const condition = { ConditionExpression: 'attribute_not_exists(evaluationKey)' };
     try {
       for (let n = 0; n < chunks.length; n++) {
-        await this.db.put({ TableName: this.table, Item: { evaluationKey: `${prefix}/chunk/${n}`, kind: 'dataset_chunk', datasetId, version, chunk: n, data: chunks[n] }, ...condition }).promise();
+        await this.db.put({ TableName: this.table, Item: { evaluationKey: `${chunkPrefix}/${n}`, kind: 'dataset_chunk', datasetId, version, chunk: n, data: chunks[n] }, ...condition }).promise();
       }
       const summary: DatasetSummary = {
-        datasetId, version, meta: dataset.meta, account: dataset.account, sha256, bytes, chunkCount: chunks.length, createdAt,
+        datasetId, version, meta: dataset.meta, account: dataset.account, sha256, bytes, chunkCount: chunks.length, chunkPrefix, createdAt,
         counts: {
           pages: dataset.pages.length, pixels: dataset.pixels.length, customAudiences: dataset.customAudiences.length, campaigns: dataset.campaigns.length,
           adsets: dataset.adsets.length, ads: dataset.ads.length, adcreatives: dataset.adcreatives.length, adimages: dataset.adimages.length,
@@ -175,7 +177,21 @@ export class SandboxDatasetStore {
 
   private async readMeta(prefix: string): Promise<(DatasetSummary & { evaluationKey: string }) | null> {
     const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `${prefix}/meta` }, ConsistentRead: true }).promise();
-    return (result.Item as (DatasetSummary & { evaluationKey: string }) | undefined) ?? null;
+    const item = result.Item;
+    if (item === undefined) return null;
+    // Both summary and full reads cross this boundary. Never follow a stored
+    // chunk pointer into another dataset or accept a malformed chunk count.
+    if (!item || typeof item !== 'object' || Array.isArray(item) || item.evaluationKey !== `${prefix}/meta` ||
+        `dataset/${item.datasetId}/${item.version}` !== prefix ||
+        !Number.isSafeInteger(item.chunkCount) || item.chunkCount < 1 ||
+        !Number.isSafeInteger(item.bytes) || item.bytes < 1 ||
+        typeof item.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(item.sha256) ||
+        (item.chunkPrefix !== undefined && (typeof item.chunkPrefix !== 'string' ||
+          !item.chunkPrefix.startsWith(`${prefix}/attempt/`) ||
+          !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/chunk$/.test(item.chunkPrefix.slice(`${prefix}/attempt/`.length))))) {
+      throw new Error(`Dataset ${prefix} failed integrity check: invalid metadata`);
+    }
+    return item as DatasetSummary & { evaluationKey: string };
   }
 
   async loadDatasetSummary(datasetId: string, version: number): Promise<DatasetSummary | null> {
@@ -193,14 +209,14 @@ export class SandboxDatasetStore {
     if (!meta) throw new SandboxDatasetNotFound(datasetId, version);
     const parts: string[] = [];
     for (let n = 0; n < meta.chunkCount; n++) {
-      const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `${prefix}/chunk/${n}` }, ConsistentRead: true }).promise();
+      const result = await this.db.get({ TableName: this.table, Key: { evaluationKey: `${meta.chunkPrefix ?? `${prefix}/chunk`}/${n}` }, ConsistentRead: true }).promise();
       const data = (result.Item as { data?: unknown } | undefined)?.data;
       if (typeof data !== 'string') throw new Error(`Dataset ${datasetId} v${version} failed integrity check: chunk ${n} missing`);
       parts.push(data);
     }
     const json = parts.join('');
     const sha256 = createHash('sha256').update(json).digest('hex');
-    if (sha256 !== meta.sha256) throw new Error(`Dataset ${datasetId} v${version} failed integrity check: sha256 mismatch`);
+    if (Buffer.byteLength(json) !== meta.bytes || sha256 !== meta.sha256) throw new Error(`Dataset ${datasetId} v${version} failed integrity check: sha256 mismatch`);
     const dataset = JSON.parse(json) as SandboxDataset;
     this.cache.set(prefix, dataset);
     if (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value as string);

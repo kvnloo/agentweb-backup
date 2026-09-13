@@ -25,6 +25,7 @@ export function withCompilerOutput(output: string, packet: string, write: (put: 
     try { mkdirSync(at(fd, name), { mode: 0o700 }); } catch (error: any) { if (error.code !== 'EEXIST') throw error; }
     return pin(at(fd, name));
   };
+  let failure: { error: unknown } | undefined;
   try {
     let directory = pin(parse(destination).root);
     for (const component of destination.slice(parse(destination).root.length).split(sep).filter(Boolean)) directory = child(directory, component);
@@ -41,13 +42,19 @@ export function withCompilerOutput(output: string, packet: string, write: (put: 
       } catch (error: any) { if (error.code !== 'ENOENT') throw error; }
       const temporary = at(parent, `.compile-${randomUUID()}`);
       const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try {
-        try { writeFileSync(fd, bytes); } finally { closeSync(fd); }
-        renameSync(temporary, target);
-      } finally {
-        try { unlinkSync(temporary); } catch (error: any) { if (error.code !== 'ENOENT') throw error; }
-      }
+      let fileFailure: { error: unknown } | undefined;
+      try { writeFileSync(fd, bytes); } catch (error) { fileFailure = { error }; }
+      try { closeSync(fd); } catch (error) { fileFailure ??= { error }; }
+      if (!fileFailure) { try { renameSync(temporary, target); } catch (error) { fileFailure = { error }; } }
+      try { unlinkSync(temporary); } catch (error: any) { if (error?.code !== 'ENOENT') fileFailure ??= { error }; }
+      if (fileFailure) throw fileFailure.error;
     };
     write(put);
-  } finally { for (const fd of descriptors.reverse()) closeSync(fd); }
+  } catch (error) { failure = { error }; }
+  finally {
+    for (const fd of descriptors.reverse()) {
+      try { closeSync(fd); } catch (error) { failure ??= { error }; }
+    }
+  }
+  if (failure) throw failure.error;
 }
