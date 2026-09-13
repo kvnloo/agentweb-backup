@@ -41,7 +41,7 @@ export interface DatasetSummary {
 
 export interface PutDatasetResult { datasetId: string; version: number; bytes: number; sha256: string; chunkCount: number }
 
-type Db = Pick<AWS.DynamoDB.DocumentClient, 'get' | 'put' | 'transactWrite'>;
+type Db = Pick<AWS.DynamoDB.DocumentClient, 'get' | 'put' | 'transactWrite' | 'scan'>;
 
 export function validateDataset(dataset: SandboxDataset): void {
   const fail = (message: string): never => { throw new SandboxDatasetInvalid(message); };
@@ -199,6 +199,35 @@ export class SandboxDatasetStore {
     if (!item) return null;
     const { evaluationKey: _key, ...summary } = item;
     return summary as DatasetSummary;
+  }
+
+  /**
+   * Every published dataset's metadata (never chunks), for an admin "pick a dataset" list —
+   * not gated on the strict integrity checks readMeta() enforces for loadDataset()'s chunk
+   * pointer, since a listing is a visibility feature, not a security gate: one malformed row
+   * should never take the whole picker down. Newest first.
+   */
+  async listDatasets(): Promise<DatasetSummary[]> {
+    const summaries: DatasetSummary[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const page = await this.db.scan({
+        TableName: this.table,
+        FilterExpression: '#kind = :kind',
+        ExpressionAttributeNames: { '#kind': 'kind' },
+        ExpressionAttributeValues: { ':kind': 'dataset' },
+        ConsistentRead: true,
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      }).promise();
+      for (const item of page.Items ?? []) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        const { evaluationKey: _key, kind: _kind, ...rest } = item as Record<string, unknown>;
+        if (typeof rest.datasetId !== 'string' || !Number.isSafeInteger(rest.version) || typeof rest.createdAt !== 'string') continue;
+        summaries.push(rest as unknown as DatasetSummary);
+      }
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+    return summaries.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   async loadDataset(datasetId: string, version: number): Promise<SandboxDataset> {

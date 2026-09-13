@@ -15,7 +15,15 @@ function fakeDb() {
     items.set(params.Item.evaluationKey, params.Item); return {};
   } }));
   const get = jest.fn((params: any) => ({ promise: async () => ({ Item: items.get(params.Key.evaluationKey) }) }));
-  return { db: { put, get } as any, items, put, get };
+  // One page per call, two items at a time, so listDatasets()'s pagination loop is exercised for real.
+  const scan = jest.fn((params: any) => ({ promise: async () => {
+    const all = [...items.values()].filter((item) => params.FilterExpression !== '#kind = :kind' || item.kind === params.ExpressionAttributeValues[':kind']);
+    const startIndex = params.ExclusiveStartKey ? all.findIndex((item) => item.evaluationKey === params.ExclusiveStartKey.evaluationKey) + 1 : 0;
+    const page = all.slice(startIndex, startIndex + 2);
+    const last = startIndex + 2 < all.length ? page[page.length - 1] : undefined;
+    return { Items: page, ...(last ? { LastEvaluatedKey: { evaluationKey: last.evaluationKey } } : {}) };
+  } }));
+  return { db: { put, get, scan } as any, items, put, get, scan };
 }
 
 describe('sandbox dataset store', () => {
@@ -215,4 +223,47 @@ it('concurrent imports publish exactly one complete dataset and its matching aud
   const audit = f.items.get('dataset/fixture-agentweb/1/audit/import');
   expect(audit).toMatchObject({ sha256: meta.sha256, actor: winner === first ? 'first' : 'second' });
   await expect(new SandboxDatasetStore(f.db).loadDataset('fixture-agentweb', 1)).resolves.toEqual(winner);
+});
+
+describe('listDatasets (admin dataset picker)', () => {
+  it('lists every published dataset, newest first, paginating across scan pages', async () => {
+    const { db } = fakeDb();
+    const store = new SandboxDatasetStore(db);
+    for (let v = 1; v <= 5; v++) {
+      const d = buildFixtureDataset();
+      d.meta.version = v;
+      d.meta.datasetId = `case-${v}`;
+      await store.putDataset(d);
+    }
+    const summaries = await store.listDatasets();
+    expect(summaries).toHaveLength(5);
+    expect(summaries.map(s => s.datasetId)).toEqual(['case-5', 'case-4', 'case-3', 'case-2', 'case-1']);
+    expect(summaries[0]).toMatchObject({ version: 5, account: { name: 'AgentWeb Sandbox' } });
+    expect(summaries.every(s => s.chunkCount >= 1 && typeof s.sha256 === 'string')).toBe(true);
+  });
+
+  it('returns an empty list rather than throwing when nothing is published yet', async () => {
+    const { db } = fakeDb();
+    await expect(new SandboxDatasetStore(db).listDatasets()).resolves.toEqual([]);
+  });
+
+  it('skips a malformed row instead of failing the whole listing', async () => {
+    const { db, items } = fakeDb();
+    const store = new SandboxDatasetStore(db);
+    await store.putDataset(buildFixtureDataset());
+    items.set('dataset/broken/1/meta', { evaluationKey: 'dataset/broken/1/meta', kind: 'dataset', datasetId: 'broken' /* missing version/createdAt */ });
+    const summaries = await store.listDatasets();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].datasetId).toBe('fixture-agentweb');
+  });
+
+  it('never includes chunk rows, only the dataset kind', async () => {
+    const { db } = fakeDb();
+    const store = new SandboxDatasetStore(db);
+    const big = buildFixtureDataset();
+    big.meta.approximations = ['x'.repeat(DATASET_CHUNK_CHARS * 2)]; // forces multiple chunk rows
+    await store.putDataset(big);
+    const summaries = await store.listDatasets();
+    expect(summaries).toHaveLength(1);
+  });
 });

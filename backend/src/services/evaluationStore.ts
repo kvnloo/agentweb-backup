@@ -112,10 +112,7 @@ export class EvaluationStore {
   }
 
   /** Normalizes legacy ENG-1870 rows (budget, materials, artifacts, toy simulation) into the policy shape. */
-  async get(userId: string): Promise<EvaluationRecord | null> {
-    const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
-    if (!result.Item) return null;
-    const item = result.Item as Record<string, unknown>;
+  private normalize(userId: string, item: Record<string, unknown>): EvaluationRecord {
     if (item.userId !== userId) throw new EvaluationDenied();
     const persistedDeniedToolClasses = Array.isArray(item.deniedToolClasses)
       ? item.deniedToolClasses.filter((c): c is string => typeof c === 'string' && SANDBOX_TOOL_CLASS_NAMES.includes(c))
@@ -141,6 +138,50 @@ export class EvaluationStore {
       record.lifecycleState = item.lifecycleState as EvaluationRecord['lifecycleState'];
     }
     return record;
+  }
+
+  async get(userId: string): Promise<EvaluationRecord | null> {
+    const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
+    if (!result.Item) return null;
+    return this.normalize(userId, result.Item as Record<string, unknown>);
+  }
+
+  /**
+   * Every provisioned sandbox principal's policy record — root rows only, never audit/dataset/
+   * overlay rows. Admin-only and low-cardinality by design (the same shape
+   * SandboxArtifactCleanup already scans for cleanup), so a full table scan is the right tool
+   * here, not a new index. Unlike get() — which fails closed on a malformed row because it
+   * gates access — this is a visibility feature: one bad row must never take the whole admin
+   * list down, so it is skipped (and logged) instead of thrown. Sorted by email for a stable list.
+   */
+  async listAll(): Promise<EvaluationRecord[]> {
+    const rows: EvaluationRecord[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const page = await this.db.scan({
+        TableName: this.table,
+        FilterExpression: 'attribute_exists(email)',
+        ConsistentRead: true,
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      }).promise();
+      for (const item of page.Items ?? []) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        const userId = record.userId;
+        if (typeof userId !== 'string' || record.evaluationKey !== `evaluation/${userId}`) continue; // not a root record
+        // A non-string email would otherwise reach the final rows.sort(...localeCompare...) below and
+        // throw for the WHOLE list, not just this row — check it here, before normalize(), so it is
+        // skipped-and-logged like any other malformed row instead of crashing every admin's request.
+        if (typeof record.email !== 'string' || !record.email) {
+          console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}: email is not a non-empty string`);
+          continue;
+        }
+        try { rows.push(this.normalize(userId, record)); }
+        catch (error) { console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}:`, error instanceof Error ? error.message : error); }
+      }
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+    return rows.sort((a, b) => a.email.localeCompare(b.email));
   }
 
   private audit(userId: string, actor: string, action: string, details: Record<string, unknown> = {}) {
