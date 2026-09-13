@@ -1,0 +1,22 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001",
+    "query": {
+      "fields": "account_id,name,currency,timezone_name,account_status,business"
+    }
+  },
+  "status": 200,
+  "body": {
+    "account_id": "120000000000001",
+    "name": "Object 2",
+    "currency": "USD",
+    "timezone_name": "America/Los_Angeles",
+    "account_status": 1,
+    "business": {
+      "id": "1200000000000003",
+      "name": "Object 3"
+    },
+    "id": "act_120000000000001"
+  }
+}

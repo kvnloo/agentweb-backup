@@ -1,0 +1,2382 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/adcreatives",
+    "query": {
+      "fields": "id,name,status,body,title,image_url,thumbnail_url,object_type,link_url,object_story_spec,url_tags",
+      "limit": "100"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "12000000000000084",
+        "name": "Object 175",
+        "status": "ACTIVE",
+        "body": "Primary text 176",
+        "title": "Headline 177",
+        "image_url": "https://example.invalid/asset/65.jpg",
+        "thumbnail_url": "https://example.invalid/asset/66.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 178",
+            "name": "Object 179",
+            "description": "Object 180",
+            "image_hash": "0964ba361f540c00697728b87dd1c6c2",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "12000000000000085",
+        "name": "Object 181",
+        "status": "ACTIVE",
+        "body": "Primary text 182",
+        "title": "Headline 183",
+        "image_url": "https://example.invalid/asset/67.jpg",
+        "thumbnail_url": "https://example.invalid/asset/68.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 184",
+            "name": "Object 185",
+            "description": "Object 186",
+            "image_hash": "4c00a35ecaba3718c129b75d389757ab",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "12000000000000086",
+        "name": "Object 187",
+        "status": "ACTIVE",
+        "body": "Primary text 188",
+        "title": "Headline 189",
+        "image_url": "https://example.invalid/asset/69.jpg",
+        "thumbnail_url": "https://example.invalid/asset/70.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 190",
+            "name": "Object 191",
+            "description": "Object 192",
+            "image_hash": "1a508f70318d5945d08ea9a51eadfd61",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "12000000000000087",
+        "name": "Object 193",
+        "status": "ACTIVE",
+        "body": "Primary text 194",
+        "title": "Headline 195",
+        "image_url": "https://example.invalid/asset/71.jpg",
+        "thumbnail_url": "https://example.invalid/asset/72.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 196",
+            "name": "Object 197",
+            "description": "Object 198",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "12000000000000088",
+        "name": "Object 199",
+        "status": "ACTIVE",
+        "body": "Primary text 200",
+        "title": "Headline 201",
+        "image_url": "https://example.invalid/asset/73.jpg",
+        "thumbnail_url": "https://example.invalid/asset/74.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 202",
+            "name": "Object 203",
+            "description": "Object 204",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000089",
+        "name": "Object 205",
+        "status": "ACTIVE",
+        "body": "Primary text 206",
+        "title": "Headline 207",
+        "image_url": "https://example.invalid/asset/75.jpg",
+        "thumbnail_url": "https://example.invalid/asset/76.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/test-destination-update",
+            "message": "Primary text 208",
+            "name": "Object 209",
+            "caption": "https://example.invalid/test-destination-update",
+            "image_hash": "ceeb367e62b363cfedfe3102c4a14a50",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/test-destination-update"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000083",
+        "name": "Object 210",
+        "status": "ACTIVE",
+        "title": "Headline 211",
+        "image_url": "https://example.invalid/asset/77.jpg",
+        "thumbnail_url": "https://example.invalid/asset/78.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "image_hash": "ff5aa609673d3564e81b1d0c2565bd5c",
+            "call_to_action": {
+              "type": "LEARN_MORE"
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000090",
+        "name": "Object 212",
+        "status": "ACTIVE",
+        "body": "Primary text 213",
+        "title": "Headline 214",
+        "thumbnail_url": "https://example.invalid/asset/79.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "120000000000091",
+            "title": "Headline 215",
+            "message": "Primary text 216",
+            "image_url": "https://example.invalid/asset/80.jpg",
+            "image_hash": "6fa4679d8ab099e02d84e9a38e58558d"
+          }
+        }
+      },
+      {
+        "id": "1200000000000053",
+        "name": "Object 217",
+        "status": "ACTIVE",
+        "body": "Primary text 218",
+        "title": "Headline 219",
+        "image_url": "https://example.invalid/asset/81.jpg",
+        "thumbnail_url": "https://example.invalid/asset/82.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/book",
+            "message": "Primary text 220",
+            "name": "Object 221",
+            "caption": "https://example.invalid/book",
+            "image_hash": "ae643cd5d46fc738647df2d31fe992a1",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/book"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000092",
+        "name": "Object 222",
+        "status": "ACTIVE",
+        "title": "Headline 223",
+        "thumbnail_url": "https://example.invalid/asset/83.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "1200000000000093",
+            "title": "Headline 224",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            },
+            "image_url": "https://example.invalid/asset/84.jpg",
+            "image_hash": "6fa4679d8ab099e02d84e9a38e58558d"
+          }
+        }
+      },
+      {
+        "id": "1200000000000094",
+        "name": "Object 225",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/85.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000095",
+        "name": "Object 226",
+        "status": "ACTIVE",
+        "body": "Primary text 227",
+        "title": "Headline 228",
+        "image_url": "https://example.invalid/asset/86.jpg",
+        "thumbnail_url": "https://example.invalid/asset/87.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 229",
+            "name": "Object 230",
+            "description": "Object 231",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000043",
+        "name": "Object 232",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/88.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000096",
+        "name": "Object 233",
+        "status": "ACTIVE",
+        "body": "Primary text 234",
+        "title": "Headline 235",
+        "image_url": "https://example.invalid/asset/89.jpg",
+        "thumbnail_url": "https://example.invalid/asset/90.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 236",
+            "name": "Object 237",
+            "description": "Object 238",
+            "image_hash": "e3a5814ec4fc4c6f0fbb173125244de9",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000097",
+        "name": "Object 239",
+        "status": "ACTIVE",
+        "body": "Primary text 240",
+        "title": "Headline 241",
+        "image_url": "https://example.invalid/asset/91.jpg",
+        "thumbnail_url": "https://example.invalid/asset/92.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 242",
+            "name": "Object 243",
+            "image_hash": "a1faf725d6e8f424fa720ba56e9ae496",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000098",
+        "name": "Object 244",
+        "status": "ACTIVE",
+        "body": "Primary text 245",
+        "title": "Headline 246",
+        "image_url": "https://example.invalid/asset/93.jpg",
+        "thumbnail_url": "https://example.invalid/asset/94.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 247",
+            "name": "Object 248",
+            "description": "Object 249",
+            "image_hash": "ac32ad5f7d741cbe149c0754f1003891",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000099",
+        "name": "Object 250",
+        "status": "ACTIVE",
+        "body": "Primary text 251",
+        "title": "Headline 252",
+        "image_url": "https://example.invalid/asset/95.jpg",
+        "thumbnail_url": "https://example.invalid/asset/96.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 253",
+            "name": "Object 254",
+            "description": "Object 255",
+            "image_hash": "348d33e2d7ccb216dad77fc2a2f5f451",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000100",
+        "name": "Object 256",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/97.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000101",
+        "name": "Object 257",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/98.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022"
+        }
+      },
+      {
+        "id": "1200000000000102",
+        "name": "Object 258",
+        "status": "ACTIVE",
+        "body": "Primary text 259",
+        "title": "Headline 260",
+        "image_url": "https://example.invalid/asset/99.jpg",
+        "thumbnail_url": "https://example.invalid/asset/100.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 261",
+            "name": "Object 262",
+            "description": "Object 263",
+            "image_hash": "82bf17a532844f0397616b54030225e3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000103",
+        "name": "Object 264",
+        "status": "ACTIVE",
+        "body": "Primary text 265",
+        "title": "Headline 266",
+        "image_url": "https://example.invalid/asset/101.jpg",
+        "thumbnail_url": "https://example.invalid/asset/102.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 267",
+            "name": "Object 268",
+            "description": "Object 269",
+            "image_hash": "b8d52b1df20c366be07c3899a29bdde4",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000104",
+        "name": "Object 270",
+        "status": "ACTIVE",
+        "body": "Primary text 271",
+        "title": "Headline 272",
+        "image_url": "https://example.invalid/asset/103.jpg",
+        "thumbnail_url": "https://example.invalid/asset/104.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 273",
+            "name": "Object 274",
+            "description": "Object 275",
+            "image_hash": "48fea13142c0d3814819c0269d5c5e27",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000105",
+        "name": "Object 276",
+        "status": "ACTIVE",
+        "body": "Primary text 277",
+        "title": "Headline 278",
+        "image_url": "https://example.invalid/asset/105.jpg",
+        "thumbnail_url": "https://example.invalid/asset/106.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 279",
+            "name": "Object 280",
+            "description": "Object 281",
+            "image_hash": "1a508f70318d5945d08ea9a51eadfd61",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000106",
+        "name": "Object 282",
+        "status": "ACTIVE",
+        "body": "Primary text 283",
+        "title": "Headline 284",
+        "image_url": "https://example.invalid/asset/107.jpg",
+        "thumbnail_url": "https://example.invalid/asset/108.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 285",
+            "name": "Object 286",
+            "description": "Object 287",
+            "image_hash": "ae5f51d4b1a7c05e7542929738bb7641",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000107",
+        "name": "Object 288",
+        "status": "ACTIVE",
+        "body": "Primary text 289",
+        "title": "Headline 290",
+        "image_url": "https://example.invalid/asset/109.jpg",
+        "thumbnail_url": "https://example.invalid/asset/110.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 291",
+            "name": "Object 292",
+            "description": "Object 293",
+            "image_hash": "2a7dfc2cf8bef2fe9b5f0ec941b47917",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000108",
+        "name": "Object 294",
+        "status": "ACTIVE",
+        "body": "Primary text 295",
+        "title": "Headline 296",
+        "image_url": "https://example.invalid/asset/111.jpg",
+        "thumbnail_url": "https://example.invalid/asset/112.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 297",
+            "name": "Object 298",
+            "description": "Object 299",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000109",
+        "name": "Object 300",
+        "status": "ACTIVE",
+        "body": "Primary text 301",
+        "title": "Headline 302",
+        "image_url": "https://example.invalid/asset/113.jpg",
+        "thumbnail_url": "https://example.invalid/asset/114.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 303",
+            "name": "Object 304",
+            "description": "Object 305",
+            "image_hash": "1a508f70318d5945d08ea9a51eadfd61",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000077",
+        "name": "Object 306",
+        "status": "ACTIVE",
+        "body": "Primary text 307",
+        "title": "Headline 308",
+        "image_url": "https://example.invalid/asset/115.jpg",
+        "thumbnail_url": "https://example.invalid/asset/116.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 309",
+            "name": "Object 310",
+            "caption": "https://example.invalid/",
+            "image_hash": "588c5813c11b72b808be705ff14c048a",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000110",
+        "name": "Object 311",
+        "status": "ACTIVE",
+        "body": "Primary text 312",
+        "title": "Headline 313",
+        "image_url": "https://example.invalid/asset/117.jpg",
+        "thumbnail_url": "https://example.invalid/asset/118.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 314",
+            "name": "Object 315",
+            "description": "Object 316",
+            "image_hash": "0dc7e8bead906089ce4f16a56a5554fb",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000111",
+        "name": "Object 317",
+        "status": "ACTIVE",
+        "body": "Primary text 318",
+        "title": "Headline 319",
+        "image_url": "https://example.invalid/asset/119.jpg",
+        "thumbnail_url": "https://example.invalid/asset/120.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 320",
+            "name": "Object 321",
+            "description": "Object 322",
+            "image_hash": "461f64fe0fdc5e2d30d7d31e9b53ead3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000112",
+        "name": "Object 323",
+        "status": "ACTIVE",
+        "body": "Primary text 324",
+        "title": "Headline 325",
+        "image_url": "https://example.invalid/asset/121.jpg",
+        "thumbnail_url": "https://example.invalid/asset/122.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 326",
+            "name": "Object 327",
+            "description": "Object 328",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000113",
+        "name": "Object 329",
+        "status": "ACTIVE",
+        "body": "Primary text 330",
+        "title": "Headline 331",
+        "thumbnail_url": "https://example.invalid/asset/123.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "120000000000114",
+            "title": "Headline 332",
+            "message": "Primary text 333",
+            "image_url": "https://example.invalid/asset/124.jpg",
+            "image_hash": "6fa4679d8ab099e02d84e9a38e58558d"
+          }
+        }
+      },
+      {
+        "id": "1200000000000071",
+        "name": "Object 334",
+        "status": "ACTIVE",
+        "body": "Primary text 335",
+        "title": "Headline 336",
+        "image_url": "https://example.invalid/asset/125.jpg",
+        "thumbnail_url": "https://example.invalid/asset/126.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 337",
+            "name": "Object 338",
+            "caption": "https://example.invalid/",
+            "image_hash": "48c1f88020a7fd34274913f40fe7e1b0",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000115",
+        "name": "Object 339",
+        "status": "ACTIVE",
+        "body": "Primary text 340",
+        "title": "Headline 341",
+        "thumbnail_url": "https://example.invalid/asset/127.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "1200000000000116",
+            "title": "Headline 342",
+            "message": "Primary text 343",
+            "image_url": "https://example.invalid/asset/128.jpg",
+            "image_hash": "6fa4679d8ab099e02d84e9a38e58558d"
+          }
+        }
+      },
+      {
+        "id": "1200000000000117",
+        "name": "Object 344",
+        "status": "ACTIVE",
+        "body": "Primary text 345",
+        "title": "Headline 346",
+        "image_url": "https://example.invalid/asset/129.jpg",
+        "thumbnail_url": "https://example.invalid/asset/130.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 347",
+            "name": "Object 348",
+            "description": "Object 349",
+            "image_hash": "9a59311ef91cc3d6d55fbac70ad8d131",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000118",
+        "name": "Object 350",
+        "status": "ACTIVE",
+        "body": "Primary text 351",
+        "title": "Headline 352",
+        "thumbnail_url": "https://example.invalid/asset/131.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 353",
+            "caption": "https://example.invalid/",
+            "child_attachments": [
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "18d37dbc202d33a4495642778a9b2b32",
+                "name": "Object 354"
+              },
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "855e2a107add08ac1b44dd027ba1bc12",
+                "name": "Object 355"
+              }
+            ],
+            "multi_share_end_card": true,
+            "multi_share_optimized": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000119",
+        "name": "Object 356",
+        "status": "ACTIVE",
+        "body": "Primary text 357",
+        "title": "Headline 358",
+        "image_url": "https://example.invalid/asset/132.jpg",
+        "thumbnail_url": "https://example.invalid/asset/133.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 359",
+            "name": "Object 360",
+            "caption": "https://example.invalid/",
+            "image_hash": "595aedbb0c8283aa50313ab177dc696e",
+            "picture": "https://example.invalid/asset/134.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000120",
+        "name": "Object 361",
+        "status": "ACTIVE",
+        "body": "Primary text 362",
+        "title": "Headline 363",
+        "image_url": "https://example.invalid/asset/135.jpg",
+        "thumbnail_url": "https://example.invalid/asset/136.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 364",
+            "name": "Object 365",
+            "description": "Object 366",
+            "image_hash": "77864ad14eb8dcead521916a04780c70",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000121",
+        "name": "Object 367",
+        "status": "ACTIVE",
+        "body": "Primary text 368",
+        "title": "Headline 369",
+        "image_url": "https://example.invalid/asset/137.jpg",
+        "thumbnail_url": "https://example.invalid/asset/138.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 370",
+            "name": "Object 371",
+            "caption": "https://example.invalid/",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000122",
+        "name": "Object 372",
+        "status": "ACTIVE",
+        "body": "Primary text 373",
+        "title": "Headline 374",
+        "image_url": "https://example.invalid/asset/139.jpg",
+        "thumbnail_url": "https://example.invalid/asset/140.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 375",
+            "name": "Object 376",
+            "caption": "https://example.invalid/",
+            "image_hash": "389df3ade481d24037cf7c9784a93a5f",
+            "picture": "https://example.invalid/asset/141.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000123",
+        "name": "Object 377",
+        "status": "ACTIVE",
+        "title": "Headline 378",
+        "thumbnail_url": "https://example.invalid/asset/142.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "lead_gen_form_id": "1200000000000124"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000125",
+        "name": "Object 379",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/143.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022"
+        }
+      },
+      {
+        "id": "1200000000000126",
+        "name": "Object 380",
+        "status": "ACTIVE",
+        "body": "Primary text 381",
+        "title": "Headline 382",
+        "image_url": "https://example.invalid/asset/144.jpg",
+        "thumbnail_url": "https://example.invalid/asset/145.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 383",
+            "name": "Object 384",
+            "description": "Object 385",
+            "image_hash": "dfd76f98606eff91d198131a04903851",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000127",
+        "name": "Object 386",
+        "status": "ACTIVE",
+        "body": "Primary text 387",
+        "title": "Headline 388",
+        "image_url": "https://example.invalid/asset/146.jpg",
+        "thumbnail_url": "https://example.invalid/asset/147.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 389",
+            "name": "Object 390",
+            "description": "Object 391",
+            "image_hash": "82bf17a532844f0397616b54030225e3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000128",
+        "name": "Object 392",
+        "status": "ACTIVE",
+        "body": "Primary text 393",
+        "title": "Headline 394",
+        "image_url": "https://example.invalid/asset/148.jpg",
+        "thumbnail_url": "https://example.invalid/asset/149.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 395",
+            "name": "Object 396",
+            "description": "Object 397",
+            "image_hash": "2a7dfc2cf8bef2fe9b5f0ec941b47917",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000129",
+        "name": "Object 398",
+        "status": "ACTIVE",
+        "body": "Primary text 399",
+        "title": "Headline 400",
+        "thumbnail_url": "https://example.invalid/asset/150.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "120000000000130",
+            "title": "Headline 401",
+            "message": "Primary text 402",
+            "image_url": "https://example.invalid/asset/151.jpg",
+            "image_hash": "af295cc5fc956b410177aa8a92f5d189"
+          }
+        }
+      },
+      {
+        "id": "1200000000000131",
+        "name": "Object 403",
+        "status": "ACTIVE",
+        "body": "Primary text 404",
+        "title": "Headline 405",
+        "image_url": "https://example.invalid/asset/152.jpg",
+        "thumbnail_url": "https://example.invalid/asset/153.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 406",
+            "name": "Object 407",
+            "description": "Object 408",
+            "image_hash": "ef35788eb08b45bac2eb400324a11f34",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000132",
+        "name": "Object 409",
+        "status": "ACTIVE",
+        "body": "Primary text 410",
+        "title": "Headline 411",
+        "image_url": "https://example.invalid/asset/154.jpg",
+        "thumbnail_url": "https://example.invalid/asset/155.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 412",
+            "name": "Object 413",
+            "description": "Object 414",
+            "image_hash": "dfd76f98606eff91d198131a04903851",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000133",
+        "name": "Object 415",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/156.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022"
+        }
+      },
+      {
+        "id": "1200000000000134",
+        "name": "Object 416",
+        "status": "ACTIVE",
+        "body": "Primary text 417",
+        "title": "Headline 418",
+        "image_url": "https://example.invalid/asset/157.jpg",
+        "thumbnail_url": "https://example.invalid/asset/158.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 419",
+            "name": "Object 420",
+            "description": "Object 421",
+            "image_hash": "ae5f51d4b1a7c05e7542929738bb7641",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000081",
+        "name": "Object 422",
+        "status": "ACTIVE",
+        "body": "Primary text 423",
+        "title": "Headline 424",
+        "image_url": "https://example.invalid/asset/159.jpg",
+        "thumbnail_url": "https://example.invalid/asset/160.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 425",
+            "name": "Object 426",
+            "caption": "https://example.invalid/",
+            "image_hash": "260e224d44e0d9bbe3a001befa358141",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000135",
+        "name": "Object 427",
+        "status": "ACTIVE",
+        "body": "Primary text 428",
+        "title": "Headline 429",
+        "image_url": "https://example.invalid/asset/161.jpg",
+        "thumbnail_url": "https://example.invalid/asset/162.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 430",
+            "name": "Object 431",
+            "description": "Object 432",
+            "image_hash": "348d33e2d7ccb216dad77fc2a2f5f451",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000026",
+        "name": "Object 433",
+        "status": "ACTIVE",
+        "body": "Primary text 434",
+        "title": "Headline 435",
+        "image_url": "https://example.invalid/asset/163.jpg",
+        "thumbnail_url": "https://example.invalid/asset/164.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/first-ai-dollar",
+            "message": "Primary text 436",
+            "name": "Object 437",
+            "caption": "https://example.invalid/first-ai-dollar",
+            "image_hash": "f2991bc3a2515bcd20964ab3ce60ca5d",
+            "picture": "https://example.invalid/asset/165.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000136",
+        "name": "Object 438",
+        "status": "ACTIVE",
+        "body": "Primary text 439",
+        "title": "Headline 440",
+        "image_url": "https://example.invalid/asset/166.jpg",
+        "thumbnail_url": "https://example.invalid/asset/167.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 441",
+            "name": "Object 442",
+            "description": "Object 443",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000137",
+        "name": "Object 444",
+        "status": "ACTIVE",
+        "body": "Primary text 445",
+        "title": "Headline 446",
+        "image_url": "https://example.invalid/asset/168.jpg",
+        "thumbnail_url": "https://example.invalid/asset/169.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 447",
+            "name": "Object 448",
+            "caption": "https://example.invalid/",
+            "image_hash": "14232b94f2d0e5277390465a9d149e39"
+          }
+        }
+      },
+      {
+        "id": "1200000000000138",
+        "name": "Object 449",
+        "status": "ACTIVE",
+        "body": "Primary text 450",
+        "title": "Headline 451",
+        "image_url": "https://example.invalid/asset/170.jpg",
+        "thumbnail_url": "https://example.invalid/asset/171.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 452",
+            "name": "Object 453",
+            "description": "Object 454",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000139",
+        "name": "Object 455",
+        "status": "ACTIVE",
+        "body": "Primary text 456",
+        "title": "Headline 457",
+        "image_url": "https://example.invalid/asset/172.jpg",
+        "thumbnail_url": "https://example.invalid/asset/173.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 458",
+            "name": "Object 459",
+            "description": "Object 460",
+            "image_hash": "82bf17a532844f0397616b54030225e3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000021",
+        "name": "Object 461",
+        "status": "ACTIVE",
+        "body": "Primary text 462",
+        "title": "Headline 463",
+        "image_url": "https://example.invalid/asset/174.jpg",
+        "thumbnail_url": "https://example.invalid/asset/175.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/cut-ai-cost",
+            "message": "Primary text 464",
+            "name": "Object 465",
+            "caption": "https://example.invalid/cut-ai-cost",
+            "image_hash": "e0c6599a281f721f70ac8747314a9112",
+            "picture": "https://example.invalid/asset/176.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000045",
+        "name": "Object 466",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/177.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000047",
+        "name": "Object 467",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/178.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000055",
+        "name": "Object 468",
+        "status": "ACTIVE",
+        "body": "Primary text 469",
+        "title": "Headline 470",
+        "image_url": "https://example.invalid/asset/179.jpg",
+        "thumbnail_url": "https://example.invalid/asset/180.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/book",
+            "message": "Primary text 471",
+            "name": "Object 472",
+            "caption": "https://example.invalid/book",
+            "image_hash": "74c86a92a96cf92197af6c75cb473883",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/book"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000140",
+        "name": "Object 473",
+        "status": "ACTIVE",
+        "body": "Primary text 474",
+        "title": "Headline 475",
+        "image_url": "https://example.invalid/asset/181.jpg",
+        "thumbnail_url": "https://example.invalid/asset/182.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 476",
+            "name": "Object 477",
+            "caption": "https://example.invalid/",
+            "image_hash": "247410d7fa5891f61e4976278a12d89a",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000141",
+        "name": "Object 478",
+        "status": "ACTIVE",
+        "body": "Primary text 479",
+        "title": "Headline 480",
+        "image_url": "https://example.invalid/asset/183.jpg",
+        "thumbnail_url": "https://example.invalid/asset/184.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 481",
+            "name": "Object 482",
+            "description": "Object 483",
+            "image_hash": "461f64fe0fdc5e2d30d7d31e9b53ead3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000024",
+        "name": "Object 484",
+        "status": "ACTIVE",
+        "body": "Primary text 485",
+        "title": "Headline 486",
+        "image_url": "https://example.invalid/asset/185.jpg",
+        "thumbnail_url": "https://example.invalid/asset/186.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/first-ai-dollar",
+            "message": "Primary text 487",
+            "name": "Object 488",
+            "caption": "https://example.invalid/first-ai-dollar",
+            "image_hash": "f2f0c8cd9768295a07b6b286befc4359",
+            "picture": "https://example.invalid/asset/187.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000142",
+        "name": "Object 489",
+        "status": "ACTIVE",
+        "body": "Primary text 490",
+        "title": "Headline 491",
+        "image_url": "https://example.invalid/asset/188.jpg",
+        "thumbnail_url": "https://example.invalid/asset/189.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 492",
+            "name": "Object 493",
+            "description": "Object 494",
+            "image_hash": "2a7dfc2cf8bef2fe9b5f0ec941b47917",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000143",
+        "name": "Object 495",
+        "status": "ACTIVE",
+        "body": "Primary text 496",
+        "title": "Headline 497",
+        "image_url": "https://example.invalid/asset/190.jpg",
+        "thumbnail_url": "https://example.invalid/asset/191.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 498",
+            "name": "Object 499",
+            "description": "Object 500",
+            "image_hash": "9453297f8267ab048e4bef7754a33b5a",
+            "call_to_action": {
+              "type": "GET_QUOTE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000144",
+        "name": "Object 501",
+        "status": "ACTIVE",
+        "body": "Primary text 502",
+        "title": "Headline 503",
+        "image_url": "https://example.invalid/asset/192.jpg",
+        "thumbnail_url": "https://example.invalid/asset/193.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 504",
+            "name": "Object 505",
+            "description": "Object 506",
+            "image_hash": "26804b1d0006aa61515bfe8baa07bd5f",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000145",
+        "name": "Object 507",
+        "status": "ACTIVE",
+        "body": "Primary text 508",
+        "title": "Headline 509",
+        "image_url": "https://example.invalid/asset/194.jpg",
+        "thumbnail_url": "https://example.invalid/asset/195.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 510",
+            "name": "Object 511",
+            "description": "Object 512",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000146",
+        "name": "Object 513",
+        "status": "ACTIVE",
+        "body": "Primary text 514",
+        "title": "Headline 515",
+        "image_url": "https://example.invalid/asset/196.jpg",
+        "thumbnail_url": "https://example.invalid/asset/197.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 516",
+            "name": "Object 517",
+            "description": "Object 518",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000147",
+        "name": "Object 519",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/198.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022"
+        }
+      },
+      {
+        "id": "1200000000000069",
+        "name": "Object 520",
+        "status": "ACTIVE",
+        "title": "Headline 521",
+        "image_url": "https://example.invalid/asset/199.jpg",
+        "thumbnail_url": "https://example.invalid/asset/200.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "image_hash": "ff5aa609673d3564e81b1d0c2565bd5c",
+            "call_to_action": {
+              "type": "LEARN_MORE"
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000038",
+        "name": "Object 522",
+        "status": "ACTIVE",
+        "thumbnail_url": "https://example.invalid/asset/201.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039"
+        }
+      },
+      {
+        "id": "1200000000000148",
+        "name": "Object 523",
+        "status": "ACTIVE",
+        "body": "Primary text 524",
+        "title": "Headline 525",
+        "image_url": "https://example.invalid/asset/202.jpg",
+        "thumbnail_url": "https://example.invalid/asset/203.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 526",
+            "name": "Object 527",
+            "description": "Object 528",
+            "image_hash": "81fc5bf673c42beddb7e2abe4e138898",
+            "call_to_action": {
+              "type": "GET_QUOTE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000149",
+        "name": "Object 529",
+        "status": "ACTIVE",
+        "body": "Primary text 530",
+        "title": "Headline 531",
+        "image_url": "https://example.invalid/asset/204.jpg",
+        "thumbnail_url": "https://example.invalid/asset/205.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 532",
+            "name": "Object 533",
+            "caption": "https://example.invalid/",
+            "image_hash": "247410d7fa5891f61e4976278a12d89a",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000150",
+        "name": "Object 534",
+        "status": "ACTIVE",
+        "body": "Primary text 535",
+        "title": "Headline 536",
+        "image_url": "https://example.invalid/asset/206.jpg",
+        "thumbnail_url": "https://example.invalid/asset/207.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 537",
+            "name": "Object 538",
+            "description": "Object 539",
+            "image_hash": "4c00a35ecaba3718c129b75d389757ab",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000151",
+        "name": "Object 540",
+        "status": "ACTIVE",
+        "body": "Primary text 541",
+        "title": "Headline 542",
+        "image_url": "https://example.invalid/asset/208.jpg",
+        "thumbnail_url": "https://example.invalid/asset/209.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 543",
+            "name": "Object 544",
+            "description": "Object 545",
+            "image_hash": "0dc7e8bead906089ce4f16a56a5554fb",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000075",
+        "name": "Object 546",
+        "status": "ACTIVE",
+        "body": "Primary text 547",
+        "title": "Headline 548",
+        "image_url": "https://example.invalid/asset/210.jpg",
+        "thumbnail_url": "https://example.invalid/asset/211.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 549",
+            "name": "Object 550",
+            "caption": "https://example.invalid/",
+            "image_hash": "1095d9f7d8aa1ff058d1d8e4d87f3ee6",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000152",
+        "name": "Object 551",
+        "status": "ACTIVE",
+        "body": "Primary text 552",
+        "title": "Headline 553",
+        "image_url": "https://example.invalid/asset/212.jpg",
+        "thumbnail_url": "https://example.invalid/asset/213.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 554",
+            "name": "Object 555",
+            "image_hash": "9fd64b51889267ae425ec7238e67b7cd",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000153",
+        "name": "Object 556",
+        "status": "ACTIVE",
+        "body": "Primary text 557",
+        "title": "Headline 558",
+        "image_url": "https://example.invalid/asset/214.jpg",
+        "thumbnail_url": "https://example.invalid/asset/215.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 559",
+            "name": "Object 560",
+            "image_hash": "a1faf725d6e8f424fa720ba56e9ae496",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000079",
+        "name": "Object 561",
+        "status": "ACTIVE",
+        "body": "Primary text 562",
+        "title": "Headline 563",
+        "image_url": "https://example.invalid/asset/216.jpg",
+        "thumbnail_url": "https://example.invalid/asset/217.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 564",
+            "name": "Object 565",
+            "caption": "https://example.invalid/",
+            "image_hash": "c607d66463bccbbe81f8bcce3fb5b38a",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000154",
+        "name": "Object 566",
+        "status": "ACTIVE",
+        "body": "Primary text 567",
+        "title": "Headline 568",
+        "image_url": "https://example.invalid/asset/218.jpg",
+        "thumbnail_url": "https://example.invalid/asset/219.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 569",
+            "name": "Object 570",
+            "description": "Object 571",
+            "image_hash": "2ddb6ac53415e536c71a21f89a00ae02",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000155",
+        "name": "Object 572",
+        "status": "ACTIVE",
+        "title": "Headline 573",
+        "thumbnail_url": "https://example.invalid/asset/220.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "caption": "https://example.invalid/",
+            "child_attachments": [
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "c132e0b477c50c7b969beb5f9d3f41cc"
+              },
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "d06dab5939ecc1dabab737566d6d9f7e"
+              }
+            ],
+            "multi_share_end_card": true,
+            "multi_share_optimized": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000156",
+        "name": "Object 574",
+        "status": "ACTIVE",
+        "body": "Primary text 575",
+        "title": "Headline 576",
+        "image_url": "https://example.invalid/asset/221.jpg",
+        "thumbnail_url": "https://example.invalid/asset/222.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 577",
+            "name": "Object 578",
+            "description": "Object 579",
+            "image_hash": "1d5ca4742e275622fbe95a038a9735f3"
+          }
+        }
+      },
+      {
+        "id": "1200000000000157",
+        "name": "Object 580",
+        "status": "ACTIVE",
+        "body": "Primary text 581",
+        "title": "Headline 582",
+        "image_url": "https://example.invalid/asset/223.jpg",
+        "thumbnail_url": "https://example.invalid/asset/224.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 583",
+            "name": "Object 584",
+            "image_hash": "a1faf725d6e8f424fa720ba56e9ae496",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000158",
+        "name": "Object 585",
+        "status": "ACTIVE",
+        "body": "Primary text 586",
+        "title": "Headline 587",
+        "image_url": "https://example.invalid/asset/225.jpg",
+        "thumbnail_url": "https://example.invalid/asset/226.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 588",
+            "name": "Object 589",
+            "description": "Object 590",
+            "image_hash": "b8d52b1df20c366be07c3899a29bdde4",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000159",
+        "name": "Object 591",
+        "status": "ACTIVE",
+        "title": "Headline 592",
+        "thumbnail_url": "https://example.invalid/asset/227.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "caption": "https://example.invalid/",
+            "child_attachments": [
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "7c1a0ee4ecd063f6a5d8f57b68e0356f"
+              },
+              {
+                "link": "https://example.invalid/",
+                "image_hash": "d06dab5939ecc1dabab737566d6d9f7e"
+              }
+            ],
+            "multi_share_end_card": true,
+            "multi_share_optimized": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000160",
+        "name": "Object 593",
+        "status": "ACTIVE",
+        "body": "Primary text 594",
+        "title": "Headline 595",
+        "image_url": "https://example.invalid/asset/228.jpg",
+        "thumbnail_url": "https://example.invalid/asset/229.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 596",
+            "name": "Object 597",
+            "description": "Object 598",
+            "image_hash": "e3895d9f9085bb03aae57290c285ac68",
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000161",
+        "name": "Object 599",
+        "status": "ACTIVE",
+        "body": "Primary text 600",
+        "title": "Headline 601",
+        "image_url": "https://example.invalid/asset/230.jpg",
+        "thumbnail_url": "https://example.invalid/asset/231.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 602",
+            "name": "Object 603",
+            "description": "Object 604",
+            "image_hash": "becd8084112345737027d660c5f69ad3",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000162",
+        "name": "Object 605",
+        "status": "ACTIVE",
+        "body": "Primary text 606",
+        "title": "Headline 607",
+        "image_url": "https://example.invalid/asset/232.jpg",
+        "thumbnail_url": "https://example.invalid/asset/233.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 608",
+            "name": "Object 609",
+            "description": "Object 610",
+            "image_hash": "f981706c28f786944a8bf238307aaa2b",
+            "call_to_action": {
+              "type": "GET_QUOTE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000163",
+        "name": "Object 611",
+        "status": "ACTIVE",
+        "body": "Primary text 612",
+        "title": "Headline 613",
+        "image_url": "https://example.invalid/asset/234.jpg",
+        "thumbnail_url": "https://example.invalid/asset/235.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 614",
+            "name": "Object 615",
+            "description": "Object 616",
+            "image_hash": "77864ad14eb8dcead521916a04780c70",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000036",
+        "name": "Object 617",
+        "status": "ACTIVE",
+        "body": "Primary text 618",
+        "title": "Headline 619",
+        "image_url": "https://example.invalid/asset/236.jpg",
+        "thumbnail_url": "https://example.invalid/asset/237.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/cut-ai-cost",
+            "message": "Primary text 620",
+            "name": "Object 621",
+            "caption": "https://example.invalid/cut-ai-cost",
+            "image_hash": "d7030379a243e475cd4651d13f936ffb",
+            "picture": "https://example.invalid/asset/238.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000164",
+        "name": "Object 622",
+        "status": "ACTIVE",
+        "body": "Primary text 623",
+        "title": "Headline 624",
+        "image_url": "https://example.invalid/asset/239.jpg",
+        "thumbnail_url": "https://example.invalid/asset/240.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 625",
+            "name": "Object 626",
+            "description": "Object 627",
+            "image_hash": "17d634da91302985441986362df347ff",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000165",
+        "name": "Object 628",
+        "status": "ACTIVE",
+        "body": "Primary text 629",
+        "title": "Headline 630",
+        "thumbnail_url": "https://example.invalid/asset/241.jpg",
+        "object_type": "VIDEO",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "video_data": {
+            "video_id": "1200000000000166",
+            "title": "Headline 631",
+            "message": "Primary text 632",
+            "image_url": "https://example.invalid/asset/242.jpg",
+            "image_hash": "caf9f76a6c208ff66a211b861c68d619"
+          }
+        }
+      },
+      {
+        "id": "1200000000000028",
+        "name": "Object 633",
+        "status": "ACTIVE",
+        "body": "Primary text 634",
+        "title": "Headline 635",
+        "image_url": "https://example.invalid/asset/243.jpg",
+        "thumbnail_url": "https://example.invalid/asset/244.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/first-ai-dollar",
+            "message": "Primary text 636",
+            "name": "Object 637",
+            "caption": "https://example.invalid/first-ai-dollar",
+            "image_hash": "f490a27d9983f501924d8b17a97abc96",
+            "picture": "https://example.invalid/asset/245.jpg"
+          }
+        }
+      },
+      {
+        "id": "1200000000000167",
+        "name": "Object 638",
+        "status": "ACTIVE",
+        "body": "Primary text 639",
+        "title": "Headline 640",
+        "image_url": "https://example.invalid/asset/246.jpg",
+        "thumbnail_url": "https://example.invalid/asset/247.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 641",
+            "name": "Object 642",
+            "description": "Object 643",
+            "image_hash": "4dd16c82f007f5621f21e55972112d59",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000168",
+        "name": "Object 644",
+        "status": "ACTIVE",
+        "body": "Primary text 645",
+        "title": "Headline 646",
+        "image_url": "https://example.invalid/asset/248.jpg",
+        "thumbnail_url": "https://example.invalid/asset/249.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "instagram_user_id": "12000000000000039",
+          "link_data": {
+            "link": "https://example.invalid/start",
+            "message": "Primary text 647",
+            "name": "Object 648",
+            "description": "Object 649",
+            "image_hash": "fa46c79dcdfa37c86e4c0a4c863e61d6",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/start"
+              }
+            },
+            "use_flexible_image_aspect_ratio": true
+          }
+        }
+      },
+      {
+        "id": "1200000000000169",
+        "name": "Object 650",
+        "status": "ACTIVE",
+        "body": "Primary text 651",
+        "title": "Headline 652",
+        "image_url": "https://example.invalid/asset/250.jpg",
+        "thumbnail_url": "https://example.invalid/asset/251.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 653",
+            "name": "Object 654",
+            "description": "Object 655",
+            "image_hash": "685d5b6e16f13f48655deac203c42a88",
+            "call_to_action": {
+              "type": "GET_QUOTE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000170",
+        "name": "Object 656",
+        "status": "ACTIVE",
+        "body": "Primary text 657",
+        "title": "Headline 658",
+        "image_url": "https://example.invalid/asset/252.jpg",
+        "thumbnail_url": "https://example.invalid/asset/253.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 659",
+            "name": "Object 660",
+            "description": "Object 661",
+            "image_hash": "dce64de94bd7958fff738b344010b698",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000171",
+        "name": "Object 662",
+        "status": "ACTIVE",
+        "body": "Primary text 663",
+        "title": "Headline 664",
+        "image_url": "https://example.invalid/asset/254.jpg",
+        "thumbnail_url": "https://example.invalid/asset/255.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 665",
+            "name": "Object 666",
+            "image_hash": "a1faf725d6e8f424fa720ba56e9ae496",
+            "call_to_action": {
+              "type": "SIGN_UP",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "1200000000000057",
+        "name": "Object 667",
+        "status": "ACTIVE",
+        "body": "Primary text 668",
+        "title": "Headline 669",
+        "image_url": "https://example.invalid/asset/256.jpg",
+        "thumbnail_url": "https://example.invalid/asset/257.jpg",
+        "object_type": "SHARE",
+        "object_story_spec": {
+          "page_id": "120000000000022",
+          "link_data": {
+            "link": "https://example.invalid/",
+            "message": "Primary text 670",
+            "name": "Object 671",
+            "caption": "https://example.invalid/",
+            "image_hash": "c607d66463bccbbe81f8bcce3fb5b38a",
+            "call_to_action": {
+              "type": "LEARN_MORE",
+              "value": {
+                "link": "https://example.invalid/"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "MjgxNTE0MDc4MTExMjk4MTIZD",
+        "after": "MTMwMjkxODg5MTcyMjA5NwZDZD"
+      },
+      "next": "https://example.invalid/v25.0/act_922903076601160/adcreatives"
+    }
+  }
+}
