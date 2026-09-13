@@ -5,6 +5,8 @@
 
 import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
+import { installSandboxMetaInterceptorAtBoot } from '../services/sandbox/bootstrap';
+import { shouldBootstrapBackgroundJobs } from '../utils/instanceState';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
 // isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
@@ -47,7 +49,30 @@ async function ensureInitialized() {
 
   // Start initialization
   console.log('[Worker-DEBUG] Starting AgentModeService initialization...');
-  initializationPromise = agentModeService.initialize();
+  initializationPromise = (async () => {
+    // ENG-1912: this worker is a SEPARATE forked process (child_process.fork in
+    // generateMarketingResponseWorkerService.ts) with its own V8 isolate and its own
+    // globalThis — server.ts's installSandboxMetaInterceptorAtBoot() call in the main
+    // process's listen() callback never runs here, so this process's fetch/axios/https
+    // were never patched. Found live in production: a sandbox principal's
+    // call_meta_ads_insights_api tool call (which runs inside this worker, per the
+    // "[Worker]"-prefixed AgentMode tool logs) reached the REAL graph.facebook.com with
+    // its sentinel token and got Meta's own real "Bad signature" OAuthException back —
+    // exactly the invariant ("zero requests leave the process for graph.facebook.com")
+    // this interceptor exists to hold. Unlike server.ts's own install call (which logs
+    // and continues, because the main process has plenty of other jobs an interceptor
+    // failure shouldn't take down), a failed install HERE must fail the whole worker:
+    // this process's only job is exactly the tool calls the interceptor has to guard,
+    // so continuing without it silently recreates the leak this fix exists to close.
+    // Skip under the Jest test-boot path, since this worker module is imported directly
+    // by generateMarketingResponseWorker.argOrder.test.ts / .errorStatus.test.ts and
+    // metaInterceptor.test.ts owns the module-level singleton's install/uninstall itself.
+    if (shouldBootstrapBackgroundJobs()) {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[Worker] Sandbox Meta interceptor installed');
+    }
+    await agentModeService.initialize();
+  })();
   await initializationPromise;
   initialized = true;
   console.log('[Worker-DEBUG] AgentModeService initialized (MCP servers loaded)');
