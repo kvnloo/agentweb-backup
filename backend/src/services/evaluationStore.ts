@@ -84,7 +84,6 @@ export interface SandboxLifecycleDeps {
   datasets: { loadDataset(datasetId: string, version: number): Promise<SandboxDataset> };
   cleanup: {
     assertQuiescent(userId: string): Promise<void>;
-    deleteSandboxPrefix(userId: string): Promise<number>;
     preparePurge(userId: string): Promise<() => Promise<Record<string, number>>>;
   };
 }
@@ -315,6 +314,15 @@ export class EvaluationStore {
     ] }).promise(); } catch { /* fail closed */ }
   }
 
+  /**
+   * Restores a sandbox account to a pristine, reusable state: the dataset overlay
+   * returns to the exact immutable seed, and every piece of candidate-produced content
+   * (chat sessions/messages, tasks, work plans, generated files) is cleared via the same
+   * cleanup engine purge() uses — minus purge()'s account-deletion step, so the account
+   * itself, its credentials, and its policy/audit trail all survive. This is the one-click
+   * "make it fresh for the next run" admin action; purge() is for permanently disposing
+   * of the account instead.
+   */
   async reset(actor: string, userId: string) {
     const record = await this.get(userId);
     if (!record?.datasetId || !record.datasetVersion || record.lifecycleState === 'purged') throw new EvaluationDenied();
@@ -324,7 +332,7 @@ export class EvaluationStore {
     const lease = await this.beginLifecycle(actor, userId, 'resetting');
     try {
       await cleanup.assertQuiescent(userId);
-      const deletedObjects = await cleanup.deleteSandboxPrefix(userId);
+      const cleanupCounts = await (await cleanup.preparePurge(userId))();
       // The immutable seed never needs rewriting. Removing sim makes the next read load it exactly.
       await this.db.transactWrite({ TransactItems: [
         { Delete: { TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/sim` } } },
@@ -332,9 +340,9 @@ export class EvaluationStore {
           UpdateExpression: 'REMOVE lifecycleState, lifecycleLease, lifecycleLeaseUntil',
           ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
           ExpressionAttributeValues: { ':user': userId, ':lease': lease },
-        } }, this.audit(userId, actor, 'reset', { seedSha256, deletedObjects }),
+        } }, this.audit(userId, actor, 'reset', { seedSha256, cleanup: cleanupCounts }),
       ] }).promise();
-      return { userId, seedSha256, deletedObjects };
+      return { userId, seedSha256, cleanup: cleanupCounts };
     } catch (error) { await this.failLifecycle(actor, userId, lease, 'reset'); throw error; }
   }
 

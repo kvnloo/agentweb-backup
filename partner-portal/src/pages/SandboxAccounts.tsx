@@ -402,7 +402,7 @@ export default function SandboxAccounts() {
         <DialogTitle>Reset this account?</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            {confirmReset?.email} will be restored to its exact original seed. Anything created inside it is discarded.
+            {confirmReset?.email} will be restored to its exact original seed — chats, generated files, and everything else the account holder created are cleared. The account, its login, and its access period are untouched.
           </DialogContentText>
         </DialogContent>
         <DialogActions>
