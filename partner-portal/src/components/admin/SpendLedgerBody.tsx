@@ -105,13 +105,21 @@ export interface PauseExplanation {
   topProviders: SpendSlice[];
 }
 
-/** How much of the month's LLM spend the ledger holds (ENG-1934). */
+/**
+ * How much of the month's LLM spend the ledger holds (ENG-1934). Mirrors
+ * spendReconciliation.LlmLedgerCoverage: measured against the aggregate rail,
+ * so a kill-switch gap or a fallback write shows up as `partial`.
+ */
 export interface LlmLedgerCoverage {
   /** Whether the backend's kill switch currently lets LLM events through. */
   recording: boolean;
   /** YYYY-MM-DD, the day LLM events began reaching the ledger. */
   startedOn: string;
   month: "none" | "partial" | "full";
+  ledgerLlmMicroUsd: number;
+  aggregateLlmMicroUsd: number | null;
+  /** LLM spend missing from the ledger; null when it could not be measured. */
+  missingLlmMicroUsd: number | null;
 }
 
 /** The GET /api/admin/users/:billingUserId/spend/breakdown payload. */
@@ -179,14 +187,23 @@ export function committedPercent(projection: MonthlyProjection): number | null {
  * defect: a vendor-only total against a cap sized for LLM spend reads as "0% of
  * the allowance used" for an account that has used most of it.
  *
- * `partial` for the month LLM recording began: the figures are shown, but the
- * qualifier sits IN the figure's own caption. ENG-1874 found that a footnote
- * under a confident number is not read.
+ * `partial` when the backend measured LLM spend missing from the ledger (the
+ * days before recording began, a kill-switch gap, a fallback write) or could
+ * not measure it: the figures are shown, but the qualifier sits IN the
+ * figure's own caption. ENG-1874 found that a footnote under a confident
+ * number is not read.
  */
 export function allowanceComparison(data: Pick<SpendLedgerPayload, "llmLedger">): "withheld" | "partial" | "full" {
   const coverage = data.llmLedger;
   if (!coverage || coverage.month === "none") return "withheld";
   return coverage.month;
+}
+
+/** The partial-coverage qualifier, stating the gap when it was measured. */
+export function partialCoverageCaption(coverage: LlmLedgerCoverage): string {
+  return coverage.missingLlmMicroUsd == null
+    ? "Unverified: LLM spend in this total could not be checked"
+    : `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
 }
 
 /** `2026-09-14` → `Sep 14`. */
@@ -415,15 +432,18 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                 <Typography variant="caption" color="text.secondary" component="div">
                   {pct == null ? "not applicable" : `${pct.toFixed(1)}% of allowance committed`}
                 </Typography>
-                {/* In the figure's own caption, not a footnote (ENG-1874). */}
-                {comparison === "partial" && pct != null && (
+                {/* In the figure's own caption, not a footnote (ENG-1874) — and
+                    whenever coverage is partial, not only when a percentage is
+                    shown: an uncapped tier's settled total is just as incomplete
+                    (CodeRabbit, PR #2904). */}
+                {comparison === "partial" && (
                   <Typography
                     variant="caption"
                     color="warning.main"
                     component="div"
                     data-testid="spend-ledger-partial-coverage"
                   >
-                    Understated: LLM spend counted from {shortDay(data.llmLedger!.startedOn)} only
+                    {partialCoverageCaption(data.llmLedger!)}
                   </Typography>
                 )}
               </Box>
