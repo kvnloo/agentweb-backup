@@ -347,8 +347,17 @@ export const usageRecordDb = {
    */
   async incrementUsageWithChargeEvent(
     inc: UsageRecordIncrement,
-    chargeEvent: LlmChargeAuditEvent
+    chargeEvent: LlmChargeAuditEvent,
+    /**
+     * ENG-1934: the same group's spend events — one per priced portion —
+     * written as further items of the same transaction, so the ledger can
+     * never hold an engine charge the aggregate lacks, or the reverse. Omitted
+     * (kill switch off, or an unpriced group), the transaction is exactly the
+     * two items it was.
+     */
+    spendEvents: SpendEvent[] = []
   ): Promise<"applied" | "duplicate" | "conflict"> {
+    spendEvents.forEach(validateSpendEvent);
     const ledgerParams = buildIncrementUsageUpdate(inc);
     const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
       Update: { TableName: TABLE_NAME, ...ledgerParams },
@@ -362,18 +371,39 @@ export const usageRecordDb = {
       },
     };
 
+    const transactItems = [
+      ledgerItem,
+      chargeItem,
+      ...spendEvents.map(
+        (event): AWS.DynamoDB.DocumentClient.TransactWriteItem => ({
+          Put: {
+            TableName: SPEND_EVENTS_TABLE,
+            Item: event,
+            ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
+          },
+        }),
+      ),
+    ];
+
     try {
       await getDocumentClient()
-        .transactWrite({ TransactItems: [ledgerItem, chargeItem] })
+        .transactWrite({ TransactItems: transactItems })
         .promise();
       return "applied";
     } catch (error: any) {
       // Same classification as db.ts's applyMonthlyChargeAtomic: a
       // TransactWriteItems condition failure surfaces as
       // TransactionCanceledException with a per-item CancellationReasons
-      // array (index order matches TransactItems: 0 = ledger, 1 = charge),
-      // not the single-item ConditionalCheckFailedException recordLlmChargeEvent
-      // catches on its own standalone put.
+      // array (index order matches TransactItems: 0 = ledger, 1 = charge,
+      // 2+ = spend events when present), not the single-item
+      // ConditionalCheckFailedException recordLlmChargeEvent catches on its
+      // own standalone put.
+      //
+      // "duplicate" stays keyed on the CHARGE event alone. The spend events
+      // derive their ids from it and were only ever written in this same
+      // transaction, so a genuine retry fails every condition together. A spend-event-only
+      // failure has no legitimate cause; it falls through to a throw, and the
+      // route's fallback writes the usage rather than silently skipping it.
       const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
       if (error?.code === "TransactionConflictException") return "conflict";
       if (error?.code === "TransactionCanceledException" && reasons) {

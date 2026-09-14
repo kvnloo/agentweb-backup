@@ -28,6 +28,7 @@
  */
 import { SpendEvent } from "./spendEventDb";
 import { UsageRecordRow, isVendorEntry } from "./usageRecordDb";
+import { LLM_SPEND_LEDGER_STARTED_ON, isLlmDualWriteEnabled, isLlmSpendEvent } from "./spendLedgerDualWrite";
 
 /**
  * §8: "Drift above one cent or the vendor-specific threshold alerts."
@@ -35,8 +36,20 @@ import { UsageRecordRow, isVendorEntry } from "./usageRecordDb";
  */
 export const DRIFT_TOLERANCE_MICRO_USD = 10_000;
 
-/** One vendor's slice of one day, on both rails. */
+/**
+ * The provider slot every LLM group is reported under (ENG-1934).
+ *
+ * LLM groups are keyed on (date, model) rather than (date, provider, model):
+ * aggregate rows written before ENG-693 carry no provider, and a model id is
+ * already unique across providers, so keying on provider too would split one
+ * model's spend into a matched half and a spurious unmirrored half.
+ */
+export const LLM_GROUP_PROVIDER = "llm";
+
+/** One vendor's — or one LLM model's — slice of one day, on both rails. */
 export interface FidelityGroup {
+  /** Which rail the group belongs to; each has its own mirror start day. */
+  rail: "vendor" | "llm";
   date: string;
   provider: string;
   operation: string;
@@ -124,6 +137,32 @@ export interface FidelityOptions {
    * counted as a failure, and full days before it are dropped entirely.
    */
   mirrorStartedAt?: string;
+  /**
+   * ENG-1934: when LLM events began reaching the ledger, as an ISO instant.
+   *
+   * Absent, LLM spend is left out on BOTH sides — events and aggregate rows —
+   * exactly as before LLM events existed. Present, LLM groups are assessed
+   * from this day on, with the same pre-mirror and changeover-day rules the
+   * vendor rail uses. Separate from `mirrorStartedAt` because the two rails
+   * started months apart.
+   */
+  llmMirrorStartedAt?: string;
+}
+
+/**
+ * An LLM aggregate row the ledger is not supposed to hold.
+ *
+ * An unpriced model writes an aggregate row but never a spend event (the
+ * ledger forbids a missing rate as a silent $0). Counting those rows would
+ * report every unknown model as unmirrored spend that was never spend.
+ *
+ * Trusts the row's own label and nothing else. Inferring "unpriced" from a $0
+ * cost would discard a legitimately allocated $0 call — which DOES have an
+ * event — and turn it into an orphan (CodeRabbit, PR #2904). The engine path
+ * that used to mislabel unknown models `allocated` now labels them correctly.
+ */
+function isUnpricedLlmRow(row: UsageRecordRow): boolean {
+  return row.costSource === "unpriced";
 }
 
 export function reconcileVendorFidelity(
@@ -132,13 +171,20 @@ export function reconcileVendorFidelity(
   options: FidelityOptions = {},
 ): FidelityReport {
   const mirrorStartDay = options.mirrorStartedAt?.slice(0, 10);
+  const llmStartDay = options.llmMirrorStartedAt?.slice(0, 10);
   const groups = new Map<string, FidelityGroup>();
 
-  const groupFor = (date: string, provider: string, operation: string): FidelityGroup => {
-    const key = keyOf(date, provider, operation);
+  const groupFor = (
+    date: string,
+    provider: string,
+    operation: string,
+    rail: FidelityGroup["rail"] = "vendor",
+  ): FidelityGroup => {
+    const key = `${rail} ${keyOf(date, provider, operation)}`;
     let group = groups.get(key);
     if (!group) {
       group = {
+        rail,
         date,
         provider,
         operation,
@@ -156,16 +202,26 @@ export function reconcileVendorFidelity(
 
   for (const event of events) {
     if (event.lifecycle !== "settled") continue;
-    const group = groupFor(event.occurredAt.slice(0, 10), event.provider, event.operation);
+    const llm = isLlmSpendEvent(event);
+    if (llm && !llmStartDay) continue;
+    const group = llm
+      ? groupFor(event.occurredAt.slice(0, 10), LLM_GROUP_PROVIDER, event.operation, "llm")
+      : groupFor(event.occurredAt.slice(0, 10), event.provider, event.operation);
     group.ledgerMicroUsd += event.costMicroUsd;
     group.ledgerEventCount += 1;
   }
 
   for (const row of liveRows) {
-    // LLM rows are token-priced and were never mirrored. Including them would
-    // manufacture drift equal to the entire LLM bill — that comparison is the
-    // OTHER check, below.
-    if (!isVendorEntry(row)) continue;
+    // LLM rows are compared only once the LLM mirror exists (ENG-1934).
+    // Before it, including them would manufacture drift equal to the entire
+    // LLM bill — that comparison is the OTHER check, below.
+    if (!isVendorEntry(row)) {
+      if (!llmStartDay || isUnpricedLlmRow(row)) continue;
+      const group = groupFor(row.date, LLM_GROUP_PROVIDER, row.model, "llm");
+      group.liveMicroUsd += row.costMicroUsd;
+      group.liveCallCount += row.callCount;
+      continue;
+    }
     const parsed = splitVendorModel(row.model);
     // Trust the row's own provider attribute over the parsed model slot: the
     // slot is a naming convention, the attribute is the data.
@@ -186,12 +242,13 @@ export function reconcileVendorFidelity(
     group.driftMicroUsd = group.ledgerMicroUsd - group.liveMicroUsd;
     group.ok = Math.abs(group.driftMicroUsd) <= DRIFT_TOLERANCE_MICRO_USD;
 
-    if (mirrorStartDay && group.date < mirrorStartDay) {
+    const startDay = group.rail === "llm" ? llmStartDay : mirrorStartDay;
+    if (startDay && group.date < startDay) {
       // Entirely before the mirror existed. Not a finding.
       preMirrorGroups.push(group);
       continue;
     }
-    if (mirrorStartDay && group.date === mirrorStartDay) {
+    if (startDay && group.date === startDay) {
       // The changeover day. Its live row spans both sides of the deploy and the
       // daily aggregate cannot be split, so a shortfall here is expected.
       partialGroups.push(group);
@@ -243,13 +300,22 @@ export function reconcileVendorFidelity(
 export function selectReconcilableSubjects(
   events: readonly SpendEvent[],
   liveRows: readonly UsageRecordRow[],
+  /**
+   * ENG-1934: once LLM events are on the ledger, LLM activity makes a subject
+   * reconcilable too — otherwise a subject whose every LLM ledger write failed
+   * would be filed under "LLM only, nothing to reconcile" and never examined,
+   * the same blind spot the vendor rule above closes.
+   */
+  options: { includeLlm?: boolean } = {},
 ): { reconcilable: string[]; llmOnly: string[] } {
-  const reconcilable = new Set<string>(events.map((e) => e.billingUserId).filter(Boolean));
+  const reconcilable = new Set<string>(
+    events.filter((e) => options.includeLlm || !isLlmSpendEvent(e)).map((e) => e.billingUserId).filter(Boolean),
+  );
   const llmOnly = new Set<string>();
 
   for (const row of liveRows) {
     if (!row.billingUserId) continue;
-    if (isVendorEntry(row)) reconcilable.add(row.billingUserId);
+    if (isVendorEntry(row) || (options.includeLlm && !isUnpricedLlmRow(row))) reconcilable.add(row.billingUserId);
     else llmOnly.add(row.billingUserId);
   }
   for (const id of reconcilable) llmOnly.delete(id);
@@ -354,5 +420,80 @@ export function reconcileMonth(
     fidelity,
     divergence: measureBasisDivergence(myRows, fidelity),
     readyForCutoverEvidence: fidelity.ok && fidelity.assessedGroupCount > 0,
+  };
+}
+
+/** How much of a billing month's LLM spend the ledger actually holds (ENG-1934). */
+export interface LlmLedgerCoverage {
+  /** Whether the kill switch currently lets LLM events through. */
+  recording: boolean;
+  startedOn: string;
+  /**
+   * `none`: the month ended before LLM events existed — vendor spend only.
+   * `partial`: the two rails disagree by more than the §8 tolerance in either
+   * direction, or that could not be measured.
+   * `full`: the ledger holds the month's LLM spend, within tolerance.
+   */
+  month: "none" | "partial" | "full";
+  ledgerLlmMicroUsd: number;
+  /** null when the month predates LLM events, or the aggregate read failed. */
+  aggregateLlmMicroUsd: number | null;
+  /** How much LLM spend the ledger is missing; null when not measured. */
+  missingLlmMicroUsd: number | null;
+  /**
+   * How much MORE LLM spend the ledger holds than the aggregate rail — a
+   * duplicate or orphan event overstating the total. null when not measured.
+   */
+  excessLlmMicroUsd: number | null;
+}
+
+/**
+ * Measure, rather than assume, how complete a month's LLM ledger is.
+ *
+ * Deriving "full" from the start date and the kill switch would call a month
+ * complete after the switch was off for a week, or after an outage whose
+ * writes fell back to the aggregate alone (CodeRabbit, PR #2904). Every such
+ * gap has the same signature — LLM cost on the aggregate rail with no event
+ * behind it — so comparing the two rails catches all of them, including the
+ * portion of the start month before recording began, without persisting any
+ * gap state.
+ *
+ * Both rails dedupe and attribute identically since ENG-1934, so a
+ * difference within the §8 tolerance is rounding, and anything larger is
+ * spend the allowance comparison cannot see.
+ */
+export function measureLlmLedgerCoverage(
+  billingMonth: string,
+  events: readonly SpendEvent[],
+  aggregateRows: readonly UsageRecordRow[] | null,
+): LlmLedgerCoverage {
+  const ledgerLlmMicroUsd = events
+    .filter((e) => e.billingMonth === billingMonth && e.lifecycle === "settled" && isLlmSpendEvent(e))
+    .reduce((sum, e) => sum + e.costMicroUsd, 0);
+  const base = { recording: isLlmDualWriteEnabled(), startedOn: LLM_SPEND_LEDGER_STARTED_ON, ledgerLlmMicroUsd };
+
+  if (billingMonth < LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)) {
+    return { ...base, month: "none", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null, excessLlmMicroUsd: null };
+  }
+  if (!aggregateRows) {
+    // Unmeasured is not complete.
+    return { ...base, month: "partial", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null, excessLlmMicroUsd: null };
+  }
+
+  const aggregateLlmMicroUsd = aggregateRows
+    .filter((r) => r.date.slice(0, 7) === billingMonth && !isVendorEntry(r) && !isUnpricedLlmRow(r))
+    .reduce((sum, r) => sum + r.costMicroUsd, 0);
+  const missingLlmMicroUsd = Math.max(0, aggregateLlmMicroUsd - ledgerLlmMicroUsd);
+  const excessLlmMicroUsd = Math.max(0, ledgerLlmMicroUsd - aggregateLlmMicroUsd);
+
+  return {
+    ...base,
+    // Either direction: a ledger that holds MORE than the aggregate is
+    // overstating spend, and that is no more "full" than a shortfall is
+    // (CodeRabbit, PR #2904).
+    month: Math.max(missingLlmMicroUsd, excessLlmMicroUsd) > DRIFT_TOLERANCE_MICRO_USD ? "partial" : "full",
+    aggregateLlmMicroUsd,
+    missingLlmMicroUsd,
+    excessLlmMicroUsd,
   };
 }
