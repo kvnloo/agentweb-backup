@@ -1930,6 +1930,9 @@ const createSpendEventsTable = async () => {
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
+    // Immutable no-TTL money ledger: guard against an accidental delete
+    // (matches ensureCriticalTables.ts).
+    DeletionProtectionEnabled: true,
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
