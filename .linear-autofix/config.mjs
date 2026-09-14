@@ -119,12 +119,14 @@ export const config = {
                                    // customer + partner + headless Chromium + 4GB tsc, saturated the 32GB box and
                                    // stalled sshd (PAM/fork-exec taking 55s+ — same signature as the 2026-07-02
                                    // OOM stall). 0 = unlimited bypasses this safety entirely — keep a small cap.
-  maxConcurrent: 1,                // NON-forced bugs fixed in parallel per poll cycle. ONE pipeline already fans
+  maxConcurrent: 3,                // NON-forced bugs fixed in parallel per poll cycle. ONE pipeline already fans
                                    // out hard (parallel reviewers, 4GB tsc check, preview builds, verify browser);
                                    // 2 concurrent bugs OOM-stalled the OLD 16GB t3.xlarge on 2026-07-02 (load 57,
-                                   // sshd unresponsive). The runner is now a t3.2xlarge (8 vCPU / 32GB), so 2–3 is
-                                   // survivable — but normal picking is gated to `maxPicksPerCycle` (1/cycle)
-                                   // anyway, so this mostly bounds the crash-recovery/backfill path.
+                                   // sshd unresponsive). The runner is now a t3.2xlarge (8 vCPU / 32GB) and has
+                                   // safely run 3 concurrent FORCED bugs since 2026-07-21 (see maxForcedConcurrent
+                                   // above) — raised to match on 2026-09-14 (Harsha). `maxPicksPerCycle` (1/cycle)
+                                   // still throttles how fast NEW bugs enter the pipeline regardless of this cap;
+                                   // watch load/OOM after this ships before considering raising that too.
   staleInProgressHours: 6,         // an issue autofix STARTED (recorded in state.json) still In Progress
                                    // this long with no final outcome = a crashed run; poll.mjs resets it for
                                    // ONE retry, then flags it for a human. Issues moved to In Progress by
