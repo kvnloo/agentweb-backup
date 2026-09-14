@@ -28,6 +28,8 @@
  */
 import { SpendEvent } from "./spendEventDb";
 import { UsageRecordRow, isVendorEntry } from "./usageRecordDb";
+import { isLlmSpendEvent } from "./spendLedgerDualWrite";
+import { getModelPrice } from "../utils/llmPricing";
 
 /**
  * §8: "Drift above one cent or the vendor-specific threshold alerts."
@@ -35,8 +37,20 @@ import { UsageRecordRow, isVendorEntry } from "./usageRecordDb";
  */
 export const DRIFT_TOLERANCE_MICRO_USD = 10_000;
 
-/** One vendor's slice of one day, on both rails. */
+/**
+ * The provider slot every LLM group is reported under (ENG-1934).
+ *
+ * LLM groups are keyed on (date, model) rather than (date, provider, model):
+ * aggregate rows written before ENG-693 carry no provider, and a model id is
+ * already unique across providers, so keying on provider too would split one
+ * model's spend into a matched half and a spurious unmirrored half.
+ */
+export const LLM_GROUP_PROVIDER = "llm";
+
+/** One vendor's — or one LLM model's — slice of one day, on both rails. */
 export interface FidelityGroup {
+  /** Which rail the group belongs to; each has its own mirror start day. */
+  rail: "vendor" | "llm";
   date: string;
   provider: string;
   operation: string;
@@ -124,6 +138,29 @@ export interface FidelityOptions {
    * counted as a failure, and full days before it are dropped entirely.
    */
   mirrorStartedAt?: string;
+  /**
+   * ENG-1934: when LLM events began reaching the ledger, as an ISO instant.
+   *
+   * Absent, LLM spend is left out on BOTH sides — events and aggregate rows —
+   * exactly as before LLM events existed. Present, LLM groups are assessed
+   * from this day on, with the same pre-mirror and changeover-day rules the
+   * vendor rail uses. Separate from `mirrorStartedAt` because the two rails
+   * started months apart.
+   */
+  llmMirrorStartedAt?: string;
+}
+
+/**
+ * An LLM aggregate row the ledger is not supposed to hold.
+ *
+ * An unpriced model writes an aggregate row but never a spend event (the
+ * ledger forbids a missing rate as a silent $0). Counting those rows would
+ * report every unknown model as unmirrored spend that was never spend. The
+ * agent-engine path stamps its rows `allocated` even when the model is
+ * unknown, so a $0 row for a model the book cannot price is excluded too.
+ */
+function isUnpricedLlmRow(row: UsageRecordRow): boolean {
+  return row.costSource === "unpriced" || (row.costMicroUsd === 0 && getModelPrice(row.model) === null);
 }
 
 export function reconcileVendorFidelity(
@@ -132,13 +169,20 @@ export function reconcileVendorFidelity(
   options: FidelityOptions = {},
 ): FidelityReport {
   const mirrorStartDay = options.mirrorStartedAt?.slice(0, 10);
+  const llmStartDay = options.llmMirrorStartedAt?.slice(0, 10);
   const groups = new Map<string, FidelityGroup>();
 
-  const groupFor = (date: string, provider: string, operation: string): FidelityGroup => {
-    const key = keyOf(date, provider, operation);
+  const groupFor = (
+    date: string,
+    provider: string,
+    operation: string,
+    rail: FidelityGroup["rail"] = "vendor",
+  ): FidelityGroup => {
+    const key = `${rail} ${keyOf(date, provider, operation)}`;
     let group = groups.get(key);
     if (!group) {
       group = {
+        rail,
         date,
         provider,
         operation,
@@ -156,16 +200,26 @@ export function reconcileVendorFidelity(
 
   for (const event of events) {
     if (event.lifecycle !== "settled") continue;
-    const group = groupFor(event.occurredAt.slice(0, 10), event.provider, event.operation);
+    const llm = isLlmSpendEvent(event);
+    if (llm && !llmStartDay) continue;
+    const group = llm
+      ? groupFor(event.occurredAt.slice(0, 10), LLM_GROUP_PROVIDER, event.operation, "llm")
+      : groupFor(event.occurredAt.slice(0, 10), event.provider, event.operation);
     group.ledgerMicroUsd += event.costMicroUsd;
     group.ledgerEventCount += 1;
   }
 
   for (const row of liveRows) {
-    // LLM rows are token-priced and were never mirrored. Including them would
-    // manufacture drift equal to the entire LLM bill — that comparison is the
-    // OTHER check, below.
-    if (!isVendorEntry(row)) continue;
+    // LLM rows are compared only once the LLM mirror exists (ENG-1934).
+    // Before it, including them would manufacture drift equal to the entire
+    // LLM bill — that comparison is the OTHER check, below.
+    if (!isVendorEntry(row)) {
+      if (!llmStartDay || isUnpricedLlmRow(row)) continue;
+      const group = groupFor(row.date, LLM_GROUP_PROVIDER, row.model, "llm");
+      group.liveMicroUsd += row.costMicroUsd;
+      group.liveCallCount += row.callCount;
+      continue;
+    }
     const parsed = splitVendorModel(row.model);
     // Trust the row's own provider attribute over the parsed model slot: the
     // slot is a naming convention, the attribute is the data.
@@ -186,12 +240,13 @@ export function reconcileVendorFidelity(
     group.driftMicroUsd = group.ledgerMicroUsd - group.liveMicroUsd;
     group.ok = Math.abs(group.driftMicroUsd) <= DRIFT_TOLERANCE_MICRO_USD;
 
-    if (mirrorStartDay && group.date < mirrorStartDay) {
+    const startDay = group.rail === "llm" ? llmStartDay : mirrorStartDay;
+    if (startDay && group.date < startDay) {
       // Entirely before the mirror existed. Not a finding.
       preMirrorGroups.push(group);
       continue;
     }
-    if (mirrorStartDay && group.date === mirrorStartDay) {
+    if (startDay && group.date === startDay) {
       // The changeover day. Its live row spans both sides of the deploy and the
       // daily aggregate cannot be split, so a shortfall here is expected.
       partialGroups.push(group);
@@ -243,13 +298,22 @@ export function reconcileVendorFidelity(
 export function selectReconcilableSubjects(
   events: readonly SpendEvent[],
   liveRows: readonly UsageRecordRow[],
+  /**
+   * ENG-1934: once LLM events are on the ledger, LLM activity makes a subject
+   * reconcilable too — otherwise a subject whose every LLM ledger write failed
+   * would be filed under "LLM only, nothing to reconcile" and never examined,
+   * the same blind spot the vendor rule above closes.
+   */
+  options: { includeLlm?: boolean } = {},
 ): { reconcilable: string[]; llmOnly: string[] } {
-  const reconcilable = new Set<string>(events.map((e) => e.billingUserId).filter(Boolean));
+  const reconcilable = new Set<string>(
+    events.filter((e) => options.includeLlm || !isLlmSpendEvent(e)).map((e) => e.billingUserId).filter(Boolean),
+  );
   const llmOnly = new Set<string>();
 
   for (const row of liveRows) {
     if (!row.billingUserId) continue;
-    if (isVendorEntry(row)) reconcilable.add(row.billingUserId);
+    if (isVendorEntry(row) || (options.includeLlm && !isUnpricedLlmRow(row))) reconcilable.add(row.billingUserId);
     else llmOnly.add(row.billingUserId);
   }
   for (const id of reconcilable) llmOnly.delete(id);
