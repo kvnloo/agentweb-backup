@@ -10,6 +10,8 @@ import { S3 } from 'aws-sdk';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
+import { recordVendorUsage } from '../services/usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
 import { canViewItem, canEditItem } from '../services/orgShareService';
 
 const s3 = new S3();
@@ -1291,6 +1293,24 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
     const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
+    // ENG-698: a Placid URL-API fetch that returns is a billed render. Metered
+    // here, on the success path only (axios throws on non-2xx), so a failed
+    // fetch books nothing -- the same rule apollo/enrich.so use. Rate read from
+    // the card, never embedded. Bills the task owner; the acting caller may be
+    // an admin, hence onBehalfOf.
+    const placidOwner = task.userId;
+    void recordVendorUsage({
+      userId,
+      billingUserId: placidOwner,
+      ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
+      provider: 'placid',
+      operation: 'image_render',
+      feature: 'ad_image',
+      unit: 'render',
+      quantity: 1,
+      costSource: 'allocated',
+      costUsd: computeAllocatedCost('placid', 'image_render', 1),
+    });
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
