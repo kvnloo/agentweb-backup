@@ -276,7 +276,11 @@ describe('Placid render metering (ENG-698)', () => {
     expect(ctx.billingUserId).toBe('customer-1');
     // The admin is still recorded as who did it — both are kept (ENG-666 #2).
     expect(ctx.userId).toBe('admin-1');
-    expect(ctx.onBehalfOf).toBe('customer-1');
+    // onBehalfOf holds the ACTING user, matching every existing writer:
+    // spendChargingService sets it to actingUserId, and v0Service to the actor.
+    // (An earlier revision of this PR set it to the owner, which contradicted
+    // that convention; #2900's implementation had it right.)
+    expect(ctx.onBehalfOf).toBe('admin-1');
   });
 
   it('sets no onBehalfOf when the owner renders their own task', async () => {
