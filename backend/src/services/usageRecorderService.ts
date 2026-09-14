@@ -358,7 +358,9 @@ async function writeLlmUsageWithSpendEvent(
     });
     flushDroppedWriteAlerts();
   } catch (error) {
-    await usageRecordDb.incrementUsage(increment);
+    // Counted BEFORE the fallback: if the aggregate write fails too, the
+    // rejection escapes to recordUsage's console-only catch, and the loss would
+    // otherwise never reach the dropped-write monitor (CodeRabbit, PR #2904).
     recordDroppedWrite({
       provider: event.provider,
       operation: event.operation,
@@ -366,6 +368,7 @@ async function writeLlmUsageWithSpendEvent(
       billingUserId: event.billingUserId,
       reason: error instanceof Error ? error.message : String(error),
     });
+    await usageRecordDb.incrementUsage(increment);
   }
 }
 
