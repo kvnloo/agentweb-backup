@@ -25,7 +25,7 @@ import {
   resetDroppedWriteState,
   setDroppedWriteAlertSink,
 } from '../services/usageWriteFailureMonitor';
-import { LLM_PRICE_BOOK_PROVENANCE } from '../utils/llmPricing';
+import { LLM_PRICE_BOOK_PROVENANCE, videoClipCount, videoGenerationCostUsd } from '../utils/llmPricing';
 import { validateSpendEvent } from '../services/spendEventDb';
 
 const mockTxn = usageRecordDb.incrementUsageWithSpendEvent as jest.Mock;
@@ -155,6 +155,25 @@ describe('recordUsage → spend ledger (ENG-1934)', () => {
       );
 
       expect(eventOf()).toMatchObject({ unit: 'llm_generation', quantity: 1, costMicroUsd: 40_000 });
+    });
+
+    it('a multi-clip video records the clip count its cost was multiplied by', async () => {
+      await recordUsage(
+        ctx({
+          model: 'veo-3.1-generate-preview',
+          provider: 'google',
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUsdOverride: videoGenerationCostUsd('veo-3.1-generate-preview', 16),
+          costProvenance: LLM_PRICE_BOOK_PROVENANCE,
+          generationCount: videoClipCount(16),
+        }),
+      );
+
+      expect(videoClipCount(16)).toBe(2);
+      expect(eventOf()).toMatchObject({ unit: 'llm_generation', quantity: 2 });
     });
 
     it('a per-generation model with NO override still writes nothing on either rail (ENG-1691 unchanged)', async () => {

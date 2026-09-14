@@ -133,7 +133,8 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
   });
 
   it("AC4: a group the ENGINE priced is attributed to the engine — on the event and on the fallback write", async () => {
-    mockTxn.mockResolvedValueOnce("conflict");
+    // A conflict the retries cannot settle, so the fallback runs.
+    mockTxn.mockResolvedValue("conflict");
 
     await post({ records: [record({ costUsdOverride: 0.5 })], reportId: "r-1" });
 
