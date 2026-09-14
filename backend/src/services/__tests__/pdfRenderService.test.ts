@@ -319,7 +319,7 @@ describe("renderHtmlToPdf — SSRF guard on url-sourced renders (ENG-1867)", () 
     expect(mockAssertPublicHostname).not.toHaveBeenCalled();
   });
 
-  it("enables request interception and registers a navigation-request handler for a url source", async () => {
+  it("enables request interception and registers a request handler for a url source", async () => {
     const { puppeteer, captured } = makeFakePuppeteer(800, 600);
 
     await renderHtmlToPdf({ url: "https://example.com/deck.html" }, puppeteer);
@@ -339,8 +339,6 @@ describe("renderHtmlToPdf — SSRF guard on url-sourced renders (ENG-1867)", () 
     const abort = jest.fn();
     const continueReq = jest.fn();
     captured.requestHandler!({
-      isNavigationRequest: () => true,
-      frame: () => captured.mainFrame,
       url: () => "http://169.254.169.254/",
       abort,
       continue: continueReq,
@@ -360,8 +358,6 @@ describe("renderHtmlToPdf — SSRF guard on url-sourced renders (ENG-1867)", () 
     const abort = jest.fn();
     const continueReq = jest.fn();
     captured.requestHandler!({
-      isNavigationRequest: () => true,
-      frame: () => captured.mainFrame,
       url: () => "https://example.com/deck.html",
       abort,
       continue: continueReq,
@@ -373,31 +369,38 @@ describe("renderHtmlToPdf — SSRF guard on url-sourced renders (ENG-1867)", () 
     expect(abort).not.toHaveBeenCalled();
   });
 
-  it("passes through non-navigation (subresource) and other-frame requests without re-validating", async () => {
+  it("passes through non-HTTP(S) requests (data:/blob:/about:) without validating — they never leave the browser", async () => {
     const { puppeteer, captured } = makeFakePuppeteer(800, 600);
     await renderHtmlToPdf({ url: "https://example.com/deck.html" }, puppeteer);
     mockAssertPublicHostname.mockClear();
 
-    const subresourceContinue = jest.fn();
+    const dataContinue = jest.fn();
     captured.requestHandler!({
-      isNavigationRequest: () => false,
-      frame: () => captured.mainFrame,
-      url: () => "https://example.com/style.css",
+      url: () => "data:image/png;base64,iVBORw0KGgo=",
       abort: jest.fn(),
-      continue: subresourceContinue,
+      continue: dataContinue,
     });
 
-    const iframeContinue = jest.fn();
-    captured.requestHandler!({
-      isNavigationRequest: () => true,
-      frame: () => ({ name: "iframe" }),
-      url: () => "https://example.com/embedded.html",
-      abort: jest.fn(),
-      continue: iframeContinue,
-    });
-
-    expect(subresourceContinue).toHaveBeenCalled();
-    expect(iframeContinue).toHaveBeenCalled();
+    expect(dataContinue).toHaveBeenCalled();
     expect(mockAssertPublicHostname).not.toHaveBeenCalled();
+  });
+
+  it("re-validates and aborts an https subresource/iframe request that resolves to a blocked host — not just the top-level navigation (ENG-1867 gap: an <iframe src=\"http://169.254.169.254/...\"> or a page's own fetch() previously passed through unchecked)", async () => {
+    const { puppeteer, captured } = makeFakePuppeteer(800, 600);
+    await renderHtmlToPdf({ url: "https://example.com/deck.html" }, puppeteer);
+
+    mockAssertPublicHostname.mockRejectedValueOnce(new SsrfBlockedError());
+    const abort = jest.fn();
+    const continueReq = jest.fn();
+    captured.requestHandler!({
+      url: () => "http://169.254.169.254/latest/meta-data/",
+      abort,
+      continue: continueReq,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(abort).toHaveBeenCalledWith("blockedbyclient");
+    expect(continueReq).not.toHaveBeenCalled();
   });
 });
