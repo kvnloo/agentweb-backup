@@ -43,6 +43,15 @@ const ENGINE_COST_PROVENANCE = "caller:agent-engine";
 
 const router = express.Router();
 
+/** ENG-1934: one (pricing source, provider) slice of a charge group. */
+interface PricedPortion {
+  source: "book" | "engine";
+  provider: string;
+  tokens: number;
+  calls: number;
+  costUsd: number;
+}
+
 /** Hard cap on batch size — one task run produces far fewer records. */
 const MAX_RECORDS_PER_BATCH = 500;
 /** Keep a full batch's summed micro-USD cost within JavaScript's safe integer range. */
@@ -199,16 +208,16 @@ router.post(
           // First non-empty provider wins -- matches the ledger row's own
           // if_not_exists(provider) semantic (first writer sticks).
           provider: string;
-          // ENG-1934: subtotals by WHO PRICED each record. One group can mix
-          // records the engine priced (costUsdOverride) with records this
-          // backend's book priced, and — for a model the book does not know —
-          // records nobody priced. A spend event carries exactly one rate
-          // provenance, so each priced portion becomes its own event and the
-          // unpriced portion becomes none (CodeRabbit, PR #2904). Book cost is
-          // derived as total minus engine, so the events always sum to the
-          // aggregate row exactly.
-          engineCostUsd: number; engineTokens: number; engineCalls: number;
-          bookTokens: number; bookCalls: number;
+          // ENG-1934: subtotals by WHO PRICED each record and WHICH PROVIDER
+          // served it. One group (user, model, feature) can mix records the
+          // engine priced (costUsdOverride) with records this backend's book
+          // priced, can span providers, and — for a model the book does not
+          // know — can hold records nobody priced. A spend event carries one
+          // provenance and one provider, so each (pricing, provider) portion
+          // becomes its own event and the unpriced records become none
+          // (CodeRabbit, PR #2904). Insertion order is the records' order, so
+          // a resubmitted batch rebuilds the same portions and ids.
+          pricedPortions: Map<string, PricedPortion>;
         }
       >();
 
@@ -281,8 +290,7 @@ router.post(
               userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0,
               recordFingerprints: [], inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
               provider: recordProvider,
-              engineCostUsd: 0, engineTokens: 0, engineCalls: 0,
-              bookTokens: 0, bookCalls: 0,
+              pricedPortions: new Map<string, PricedPortion>(),
             };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
@@ -295,15 +303,30 @@ router.post(
               cacheWriteTokens
             ) / 1e6
           );
-          const recordTokens =
-            record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
-          if (costUsdOverride != null) {
-            entry.engineCostUsd += costUsdOverride;
-            entry.engineTokens += recordTokens;
-            entry.engineCalls += 1;
-          } else if (isPerGenerationPriced(record.model!) || getModelPrice(record.model!) !== null) {
-            entry.bookTokens += recordTokens;
-            entry.bookCalls += 1;
+          const source: PricedPortion["source"] | null =
+            costUsdOverride != null
+              ? "engine"
+              : isPerGenerationPriced(record.model!) || getModelPrice(record.model!) !== null
+              ? "book"
+              : null;
+          if (source) {
+            const portionKey = `${source}\u0001${recordProvider}`;
+            const portion =
+              entry.pricedPortions.get(portionKey) ||
+              { source, provider: recordProvider, tokens: 0, calls: 0, costUsd: 0 };
+            portion.tokens +=
+              record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
+            portion.calls += 1;
+            portion.costUsd += costUsdOverride ?? (
+              computeCostMicroUsd(
+                record.model!,
+                record.inputTokens!,
+                record.outputTokens!,
+                cacheReadTokens,
+                cacheWriteTokens
+              ) / 1e6
+            );
+            entry.pricedPortions.set(portionKey, portion);
           }
           entry.calls += 1;
           entry.inputTokens += record.inputTokens!;
@@ -436,26 +459,32 @@ router.post(
           // ENG-1934: the group's spend events ride the same transaction, keyed
           // off its charge event's id, so a retried batch no-ops every item
           // together. One event per priced portion — see the subtotals above.
-          const engineMicroUsd = Math.min(costMicroUsd, Math.max(0, Math.round(entry.engineCostUsd * 1_000_000)));
-          const portions = [
-            {
-              calls: entry.bookCalls, tokens: entry.bookTokens, costMicroUsd: costMicroUsd - engineMicroUsd,
-              rateProvenance: LLM_PRICE_BOOK_PROVENANCE, callId: eventId,
-            },
-            {
-              calls: entry.engineCalls, tokens: entry.engineTokens, costMicroUsd: engineMicroUsd,
-              rateProvenance: ENGINE_COST_PROVENANCE, callId: `${eventId}#engine`,
-            },
-          ];
+          const portions = [...entry.pricedPortions.values()].map((portion) => ({
+            ...portion,
+            costMicroUsd: Math.max(0, Math.round(portion.costUsd * 1_000_000)),
+            rateProvenance: portion.source === "engine" ? ENGINE_COST_PROVENANCE : LLM_PRICE_BOOK_PROVENANCE,
+            // The group's own provider keeps the plain ids; another provider's
+            // portion is suffixed with it. Deterministic, and distinct per portion.
+            callId:
+              (portion.source === "engine" ? `${eventId}#engine` : eventId) +
+              (portion.provider === entry.provider ? "" : `@${portion.provider}`),
+          }));
+          // Rounding each portion separately can leave the events a micro-dollar
+          // off the aggregate row. Settle the residual on the largest portion so
+          // the ledger sums EXACTLY to the aggregate (unpriced records add $0).
+          if (portions.length) {
+            const residual = costMicroUsd - portions.reduce((sum, p) => sum + p.costMicroUsd, 0);
+            const largest = portions.reduce((a, b) => (b.costMicroUsd > a.costMicroUsd ? b : a));
+            largest.costMicroUsd = Math.max(0, largest.costMicroUsd + residual);
+          }
           const spendEvents = isLlmDualWriteEnabled()
             ? portions
-                .filter((portion) => portion.calls > 0)
                 .map((portion) =>
                   buildLlmSpendEvent(
                     {
                       actingUserId: entry.userId,
                       billingUserId,
-                      provider: entry.provider,
+                      provider: portion.provider,
                       model: entry.model,
                       feature: entry.feature,
                       totalTokens: portion.tokens,
@@ -493,7 +522,7 @@ router.post(
                   billingUserId,
                   // ENG-700 semantics, previously skipped on this path: a group in
                   // which nobody priced anything is "unpriced", not a confirmed $0.
-                  costSource: entry.bookCalls + entry.engineCalls > 0 ? "allocated" : "unpriced",
+                  costSource: entry.pricedPortions.size > 0 ? "allocated" : "unpriced",
                   provider: entry.provider,
                   calls: entry.calls,
                 },
