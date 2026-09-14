@@ -50,11 +50,17 @@ beforeEach(() => {
   jest.spyOn(service as any, 'updateMetaAdsAd').mockResolvedValue({ success: true, message: 'ad updated' });
 });
 
+// Routes through extractMinimalToolResult, exactly like the real iteration loop
+// (toolDispatch.ts) does before a result ever reaches buildMetaWriteManifestQuestion —
+// NOT the raw callMetaMarketingApi return. Skipping the minimizer here is exactly how
+// the live env1 bug (metaWriteManifestDigest silently dropped) stayed invisible to
+// every test in this file despite them all passing.
 async function previewAd(adId: string) {
-  return service.callMetaMarketingApi(
+  const raw = await service.callMetaMarketingApi(
     'user-1', 'AD' as any, 'UPDATE', ACCOUNT, 'campaign-1', 'adset-1', adId,
     { status: 'ACTIVE' }, SESSION_ID,
   );
+  return (service as any).extractMinimalToolResult(raw, 'call_meta_marketing_api');
 }
 
 describe('ENG-1635 manifest producer — Phoenix 12-prompt regression', () => {
@@ -142,6 +148,28 @@ describe('ENG-1635 manifest producer — Phoenix 12-prompt regression', () => {
       { status: 'success', result: { awaitingUserConfirmation: true, metaWriteManifestDigest: 'digest-1', confirmationDetail: 'x' } },
     ]);
     expect(result).toBeNull();
+  });
+
+  it('extractMinimalToolResult (the loop-seam minimizer) preserves metaWriteManifestDigest on a halt — found live on env1, not by any handler-level test', () => {
+    // The minimizer between callMetaMarketingApi's return and the loop seam discards
+    // any field it doesn't explicitly name (same class of bug as ENG-1526's dropped
+    // approval tokens, a few lines above this one in the real file). A handler-level
+    // test that calls callMetaMarketingApi directly — like every other test in this
+    // suite — never exercises this function at all, which is exactly how the field
+    // went missing in production while every unit test stayed green.
+    const raw = {
+      success: true,
+      requiresConfirmation: true,
+      awaitingUserConfirmation: true,
+      summary: 'Create ad set X.',
+      confirmationPrompt: 'Approve?',
+      confirmationDetail: 'Create ad set X.',
+      target: { entity_type: 'AD_SET', action: 'CREATE' },
+      metaWriteManifestDigest: 'abc123digest',
+    };
+    const minimized = (service as any).extractMinimalToolResult(raw, 'call_meta_marketing_api');
+    expect(minimized.metaWriteManifestDigest).toBe('abc123digest');
+    expect(minimized.awaitingUserConfirmation).toBe(true);
   });
 
   it('falls back to null when nothing halted this iteration', () => {

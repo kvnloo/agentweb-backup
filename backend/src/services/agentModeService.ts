@@ -6914,6 +6914,16 @@ export class AgentModeService {
           ? { tracking_override_token: result.tracking_override_token } : {}),
         ...(result.conversion_action_removal_token
           ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
+        // ENG-1635: same class of bug as the two tokens above (ENG-1526/ENG-1322) — this
+        // minimizer discards anything it doesn't name, and buildMetaWriteManifestQuestion
+        // (the loop seam, right after this) reads metaWriteManifestDigest off the SAME
+        // halted result to decide whether every item in this iteration is a Meta write.
+        // Without this, every batch silently falls back to the old per-item prompt —
+        // found live on env1, not by a handler-level test (same discovery gap the
+        // comment above describes: handler tests call the dispatcher directly and never
+        // reach this function).
+        ...(result.metaWriteManifestDigest
+          ? { metaWriteManifestDigest: result.metaWriteManifestDigest } : {}),
       };
       // ENG-396: also preserve the structured AskUserQuestion payload so the chat
       // card can render its options and the frontend can post back a structured
