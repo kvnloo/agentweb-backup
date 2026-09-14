@@ -392,6 +392,7 @@ export const METERED_VENDOR_PROVIDERS = [
   "google_cse",
   "apollo",
   "enrich.so",
+  "enigma",
   "remotion",
   "elevenlabs",
   "2captcha",
