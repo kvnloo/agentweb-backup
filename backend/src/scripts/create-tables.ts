@@ -2627,6 +2627,7 @@ const main = async () => {
     await createOnboardingLoopRunsTable();
     await createPromptSignalsTable();
     await createEvaluationsTable();
+    await createAccountCapabilityRequirementsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3243,6 +3244,38 @@ const createV0UsageTable = async () => {
     ],
     KeySchema: [
       { AttributeName: 'idempotencyKey', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Account Capability Requirements table (ENG-1541 remainder — persisted per-account
+// capability tracking so the renewal-integration-health cron remembers state across runs
+// instead of re-deriving everything from scratch, and so a human correction can suppress a
+// specific occurrence without silencing the mechanism permanently). Only ever created for
+// users whose paid-ads intent is or was true; a user who has never needed the capability
+// never gets a row. No GSI — nothing queries across users by capability today.
+const createAccountCapabilityRequirementsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AccountCapabilityRequirements`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'capability', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'capability', KeyType: 'RANGE' },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };
