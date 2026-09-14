@@ -71,7 +71,8 @@ describe('ensureCriticalTables', () => {
       await ensureCriticalTables(client as any);
       expect(updated).toContain('AW-SpendEvents');
       const call = client.updateTable.mock.calls.find((c: any) => c[0].TableName === 'AW-SpendEvents');
-      expect(call[0].DeletionProtectionEnabled).toBe(true);
+      expect(call).toBeDefined();
+      expect(call![0].DeletionProtectionEnabled).toBe(true);
     });
 
     it('does NOT write when protection is already on — describe-first, no churn', async () => {
