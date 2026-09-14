@@ -1263,10 +1263,17 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
  * design (ENG-703 AC2), and a metering failure must never stop the caller
  * getting its image (AC6).
  */
-function meterPlacidRender(userId: string, templateUuid: string): void {
+function meterPlacidRender(actingUserId: string, ownerUserId: string, templateUuid: string): void {
   try {
     void recordVendorUsage({
-      userId,
+      // The requester and the payer are not always the same person: an admin may
+      // render a task owned by a customer (see the access check in the caller).
+      // Billing the requester would charge the admin's own account for the
+      // customer's render. ENG-666's rule is to record BOTH — the acting user,
+      // and the owner who is accountable for it (CodeRabbit, PR #2901).
+      userId: actingUserId,
+      billingUserId: ownerUserId,
+      ...(actingUserId !== ownerUserId ? { onBehalfOf: ownerUserId } : {}),
       provider: 'placid',
       operation: 'image_render',
       feature: `placid:template:${templateUuid}`,
@@ -1338,7 +1345,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
     const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
-    meterPlacidRender(userId, tplUuid);
+    meterPlacidRender(userId, task.userId, tplUuid);
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
