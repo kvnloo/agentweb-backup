@@ -152,12 +152,19 @@ export interface ChatMessage {
 
 // ENG-1635: what happened when one manifest-granted Meta write actually executed.
 // `appliedObjectId` is only ever set for a CREATE (the new object's id) — an
-// UPDATE/DELETE's success is proven by the reconciliation pass's read-back
-// against the manifest's declared target, not by an id this record could carry.
+// UPDATE/DELETE has no new object to name. `readBackVerified`/`readBackMismatches`
+// carry whatever the underlying write handler already checked (today: AD_SET
+// CREATE's own post-write read-back — see manageMetaAdsAdSets); other actions
+// simply won't have them, which the reconciliation summary states rather than
+// invents. `message` is the dispatch result's own human-readable line, kept
+// verbatim so reconciliation can quote real evidence instead of re-deriving text.
 export interface MetaWriteManifestOutcome {
   status: 'applied' | 'failed';
   error?: string;
+  message?: string;
   appliedObjectId?: string;
+  readBackVerified?: boolean;
+  readBackMismatches?: unknown[];
   appliedAt: string;
 }
 

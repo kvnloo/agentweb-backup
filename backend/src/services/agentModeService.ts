@@ -25,7 +25,7 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
-import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase, MetaWriteManifestOutcome } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -21245,26 +21245,88 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     })();
 
     // ENG-1635: this write executed under a manifest grant (not a plain confirm=true
-    // replay) — record its outcome against the exact digest the user approved, so the
-    // reconciliation pass (once every digest in the manifest has an outcome) can read
-    // these back and emit one unified result instead of leaving N scattered pass/fail
-    // tool messages with no summary, which is what a manifest-granted batch produced
-    // before this. A recording failure must never mask the real dispatch result —
-    // log and continue rather than throwing over a successful write.
+    // replay) — record its outcome against the exact digest the user approved, then
+    // check whether every digest in ITS manifest now has an outcome. If so, this was
+    // the LAST outstanding write in the batch: attach the aggregated result to this
+    // response so the model reports ONE unified outcome instead of leaving N scattered
+    // pass/fail tool messages with no summary, which is what a manifest-granted batch
+    // produced before this. A recording/reconciliation failure must never mask the
+    // real dispatch result — log and continue rather than throwing over a write that
+    // itself succeeded or failed on its own terms.
     if (manifestGranted && grantedManifestDigest && sessionId) {
       try {
         await chatbotDb.recordMetaWriteManifestOutcome(sessionId, grantedManifestDigest, {
           status: dispatchResult?.success ? 'applied' : 'failed',
           error: dispatchResult?.success ? undefined : ((dispatchResult as any)?.error || dispatchResult?.message),
+          message: typeof dispatchResult?.message === 'string' ? dispatchResult.message : undefined,
           appliedObjectId: AgentModeService.extractDispatchedObjectId(dispatchResult),
+          readBackVerified: typeof (dispatchResult as any)?.readBackVerified === 'boolean'
+            ? (dispatchResult as any).readBackVerified
+            : undefined,
+          readBackMismatches: Array.isArray((dispatchResult as any)?.readBackMismatches)
+            ? (dispatchResult as any).readBackMismatches
+            : undefined,
           appliedAt: new Date().toISOString(),
         });
+        const manifestReconciliation = await this.reconcileMetaWriteManifestIfComplete(sessionId, grantedManifestDigest);
+        if (manifestReconciliation) {
+          return { ...dispatchResult, manifestReconciliation };
+        }
       } catch (recordError) {
-        console.error('AgentMode: failed to record manifest write outcome (write itself succeeded/failed independently):', recordError);
+        console.error('AgentMode: failed to record/reconcile manifest write outcome (write itself succeeded/failed independently):', recordError);
       }
     }
 
     return dispatchResult;
+  }
+
+  /**
+   * ENG-1635: once every digest belonging to `digest`'s own manifest has a recorded
+   * outcome (metaWriteManifestOutcomes), aggregate them into ONE result: fully_applied
+   * (every write succeeded), partially_applied (naming every exact failure), or
+   * unapplied (every write failed). Returns null while that manifest still has
+   * outstanding writes — the caller (right after recording each write's outcome) is
+   * naturally invoked exactly once more per write, so this fires exactly once, on
+   * whichever write happens to be the LAST to complete (order-independent — Meta calls
+   * can finish out of order). Scoped to the ONE manifest `digest` belongs to, never
+   * "any complete manifest on this session," so an unrelated later manifest's writes
+   * never trigger a stale/wrong reconciliation.
+   */
+  private async reconcileMetaWriteManifestIfComplete(
+    sessionId: string,
+    digest: string,
+  ): Promise<{
+    manifestStatus: 'fully_applied' | 'partially_applied' | 'unapplied';
+    items: Array<{ digest: string } & MetaWriteManifestOutcome>;
+  } | null> {
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) return null;
+    const candidates: PendingUserQuestion[] = [];
+    if (session.pendingUserQuestion?.kind === 'meta_write_manifest') {
+      candidates.push(session.pendingUserQuestion);
+    }
+    if (session.answeredQuestions) {
+      for (const q of Object.values(session.answeredQuestions)) {
+        if (q.kind === 'meta_write_manifest') candidates.push(q);
+      }
+    }
+    const outcomes = session.metaWriteManifestOutcomes || {};
+    for (const q of candidates) {
+      const approveOption = q.options.find((o) => o.id === 'approve');
+      const manifestDigests: unknown = approveOption?.payload?.digests;
+      if (!Array.isArray(manifestDigests) || !manifestDigests.includes(digest)) continue;
+      const allRecorded = manifestDigests.every((d: string) => outcomes[d]);
+      if (!allRecorded) return null; // this write's manifest still has outstanding items
+      const items = manifestDigests.map((d: string) => ({ digest: d, ...(outcomes[d] as MetaWriteManifestOutcome) }));
+      const failedCount = items.filter((i) => i.status === 'failed').length;
+      const manifestStatus: 'fully_applied' | 'partially_applied' | 'unapplied' =
+        failedCount === 0 ? 'fully_applied' : failedCount === items.length ? 'unapplied' : 'partially_applied';
+      return { manifestStatus, items };
+    }
+    // digest didn't match any manifest candidate on this session — shouldn't happen
+    // if manifestGranted was true (that grant came from one of these same candidates
+    // moments earlier), but degrade to "nothing to reconcile" rather than throwing.
+    return null;
   }
 
   /**
