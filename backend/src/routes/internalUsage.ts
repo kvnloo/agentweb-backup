@@ -34,6 +34,11 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../services/usageRecorderService";
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { buildLlmSpendEvent, isLlmDualWriteEnabled } from "../services/spendLedgerDualWrite";
+import { getModelPrice, isPerGenerationPriced, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+
+/** ENG-1934: rate provenance for a dollar figure the agent engine computed itself. */
+const ENGINE_COST_PROVENANCE = "caller:agent-engine";
 
 const router = express.Router();
 
@@ -193,6 +198,13 @@ router.post(
           // First non-empty provider wins -- matches the ledger row's own
           // if_not_exists(provider) semantic (first writer sticks).
           provider: string;
+          // ENG-1934: whether any record in the group arrived with the
+          // ENGINE's own dollar figure, and whether any token-priced record
+          // hit a model the price book does not know. The first decides the
+          // spend event's rate provenance; the second keeps a missing rate
+          // off the spend ledger as a silent $0.
+          engineCosted: boolean;
+          unpriced: boolean;
         }
       >();
 
@@ -265,6 +277,8 @@ router.post(
               userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0,
               recordFingerprints: [], inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
               provider: recordProvider,
+              engineCosted: false,
+              unpriced: false,
             };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
@@ -277,6 +291,10 @@ router.post(
               cacheWriteTokens
             ) / 1e6
           );
+          if (costUsdOverride != null) entry.engineCosted = true;
+          else if (!isPerGenerationPriced(record.model!) && getModelPrice(record.model!) === null) {
+            entry.unpriced = true;
+          }
           entry.calls += 1;
           entry.inputTokens += record.inputTokens!;
           entry.outputTokens += record.outputTokens!;
@@ -323,7 +341,11 @@ router.post(
             cacheReadTokens,
             cacheWriteTokens,
             costUsdOverride,
+            // ENG-1934: an engine-supplied amount was priced by the engine, not
+            // by this backend's book — say so on the spend event.
+            ...(costUsdOverride != null ? { costProvenance: ENGINE_COST_PROVENANCE } : {}),
             date: requestDate,
+            occurredAt: requestReceivedAt.toISOString(),
           },
         });
         accepted++;
@@ -401,6 +423,30 @@ router.post(
           const eventId = eventIdByChargeKey.get(chargeKey)!;
           const billingUserId = billingUserIdByActor.get(entry.userId) || entry.userId;
           const costMicroUsd = Math.max(0, Math.round(entry.cost * 1_000_000));
+          // ENG-1934: the group's spend event rides the same transaction, under
+          // the same id as its charge event, so a retried batch no-ops all three
+          // items together.
+          const built = isLlmDualWriteEnabled()
+            ? buildLlmSpendEvent(
+                {
+                  actingUserId: entry.userId,
+                  billingUserId,
+                  provider: entry.provider,
+                  model: entry.model,
+                  feature: entry.feature,
+                  totalTokens: entry.tokens,
+                  perGeneration: isPerGenerationPriced(entry.model),
+                  costMicroUsd,
+                  // A group mixing a known and an unknown model cannot exist
+                  // (the group key includes the model), so one flag is exact.
+                  costSource: entry.unpriced && !entry.engineCosted ? "unpriced" : "allocated",
+                  rateProvenance: entry.engineCosted ? ENGINE_COST_PROVENANCE : LLM_PRICE_BOOK_PROVENANCE,
+                  callId: eventId,
+                },
+                requestReceivedAt.toISOString(),
+              )
+            : null;
+          const spendEvent = built && "event" in built ? built.event : undefined;
           try {
             const outcome = await usageRecordDb.incrementUsageWithChargeEvent(
               {
@@ -428,7 +474,10 @@ router.post(
                 model: entry.model,
                 feature: entry.feature,
                 calls: entry.calls,
-              }
+              },
+              // Passed only when there is one: with the kill switch off the
+              // call is exactly the two-item transaction it always was.
+              ...(spendEvent ? [spendEvent] : [])
             );
             chargeOutcomeByKey.set(chargeKey, outcome);
           } catch (err) {
