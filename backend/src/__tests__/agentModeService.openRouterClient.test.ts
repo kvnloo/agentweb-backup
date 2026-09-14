@@ -541,6 +541,52 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  it('ENG-1831: refuses tools for a tool-less model before sending, instead of a routing 404', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn();
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const tools = [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }];
+
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { tools } as any,
+    )).rejects.toThrow(/sonar-deep-research' cannot receive tools/);
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-pro-search',
+      [{ role: 'user', content: 'Research' }],
+      { webSearch: true } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    // A tool-capable primary with a tool-less fallback: the fallback gets the same tools.
+    await expect(service.callLLM(
+      'anthropic.claude-opus-5',
+      [{ role: 'user', content: 'Research' }],
+      { tools, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('ENG-1831: keeps temperature for the tool-less Sonar deep-research chain', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { temperature: 0.2, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request.temperature).toBe(0.2);
+    expect(request).not.toHaveProperty('tools');
+    expect(request).not.toHaveProperty('tool_choice');
+  });
+
   it('rejects an unregistered fallback before sending a gateway request', async () => {
     const service = new AgentModeService();
     const create = jest.fn();
