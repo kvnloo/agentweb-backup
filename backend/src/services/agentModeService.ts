@@ -56,6 +56,11 @@ import {
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
 import {
+  assertOpenRouterToolsSupported,
+  openRouterIgnoredProviders,
+  selectOpenRouterSamplingParams,
+} from './agentMode/openRouterRequestParams';
+import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
@@ -990,6 +995,12 @@ interface LLMModelConfig extends GatewayReasoningConfig {
    * Claude Fable 5 and both `:batch` variants support it.
    */
   supportsToolChoice?: boolean;
+  /**
+   * False when no OpenRouter endpoint for the model lists `tools` (ENG-1831:
+   * the Perplexity Sonar research models). Defaults to TRUE. callLLM refuses a
+   * request carrying tools for such a model rather than letting OpenRouter 404.
+   */
+  supportsTools?: boolean;
   /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
   isLive?: boolean;
   /**
@@ -2621,8 +2632,9 @@ export class AgentModeService {
     'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 1, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-4o Mini, non-reasoning (AA estimate)' },
     // Workload-specific research agent. It is intentionally callable only from
     // DeepResearchService, not exposed as a general chat-picker model.
-    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
-    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
+    // ENG-1831: no OpenRouter endpoint for either Sonar model lists `tools` (or `tool_choice`).
+    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, supportsTools: false, internalOnly: true },
+    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, supportsTools: false, internalOnly: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -3021,7 +3033,8 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
-    if (upstreamModel.startsWith('google/gemini-')) {
+    const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
+    if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
       // a legacy Standard API key hitting Google's Sept 2026 Standard-key
       // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
@@ -3041,7 +3054,7 @@ export class AgentModeService {
       // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
-      params.provider.ignore = ['Google'];
+      params.provider.ignore = ignoredProviders;
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
@@ -3105,35 +3118,35 @@ export class AgentModeService {
     const requestTools = webSearch
       ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
       : normalizedCallerTools;
+    // ENG-1831: every chain member receives the same parameter set, and
+    // require_parameters makes one unsupported field unroutable (ENG-199 404).
+    const paramChain = [
+      { modelId: model, upstreamModel, capabilities: this.llmModels[model] },
+      ...(fallbackModels ?? []).map((fallbackModel) => {
+        const normalizedFallback = this.normalizeModelId(fallbackModel);
+        return {
+          modelId: normalizedFallback,
+          upstreamModel: resolveOpenRouterUpstreamModelId(normalizedFallback),
+          capabilities: this.llmModels[normalizedFallback],
+        };
+      }),
+    ];
+    assertOpenRouterToolsSupported(paramChain, requestTools.length);
     if (requestTools.length > 0) {
       params.tools = requestTools;
     }
-    // A server-only tool is selected by OpenRouter. Preserve the historical
-    // `auto` default only for caller-supplied function tools.
-    //
-    // ENG-199: gated on `supportsToolChoice` because a model whose OpenRouter
-    // entry omits `tool_choice` cannot be routed AT ALL when we send it — the
-    // gateway answers `404 No endpoints found that can handle the requested
-    // parameters` rather than ignoring the field. Agent mode always supplies
-    // caller tools, so for such a model every turn failed. Defaults to true, so
-    // this changes nothing for the rest of the registry.
-    if (callerTools.length > 0 && this.llmModels[model].supportsToolChoice !== false) {
-      params.tool_choice = tool_choice || 'auto';
-    }
+    Object.assign(params, selectOpenRouterSamplingParams({
+      upstreamModel,
+      capabilities: this.llmModels[model],
+      fallbacks: paramChain.slice(1),
+      hasCallerTools: callerTools.length > 0,
+      toolChoice: tool_choice,
+      temperature,
+    }));
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
       params.max_tokens = max_completion_tokens;
-    }
-
-    // OpenRouter's metadata marks GPT-5.x temperature unsupported.
-    const gatewaySupportsTemperature = !upstreamModel.startsWith('openai/gpt-5.');
-    if (
-      this.llmModels[model].supportsTemperature &&
-      gatewaySupportsTemperature &&
-      temperature !== null
-    ) {
-      params.temperature = temperature;
     }
 
     const reasoningEffort = resolveGatewayReasoningEffort(
