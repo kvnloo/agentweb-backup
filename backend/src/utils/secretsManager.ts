@@ -996,6 +996,48 @@ export async function getElevenLabsApiKey(): Promise<string> {
 }
 
 /**
+ * Resolve the Placid private API token (ENG-698).
+ *
+ * Reads `prod/AgentWeb/Placid` (or `dev/…`) first. Harsha created the prod
+ * secret on 2026-09-11 (ENG-1598) by migrating the token that had lived in the
+ * Elastic Beanstalk environment, and described it as holding "a non-empty
+ * `PLACID_PRIVATE_TOKEN` value". That phrasing fits both a JSON object keyed by
+ * that name and a bare token string, and the secret itself is not readable from
+ * here, so BOTH shapes are accepted rather than guessing one and breaking
+ * production on the other.
+ *
+ * Falls back to `process.env.PLACID_PRIVATE_TOKEN` when the secret is absent or
+ * unusable — which is the normal case in development, where no
+ * `dev/AgentWeb/Placid` exists. The fallback is logged, not silent: the point of
+ * ENG-698's migration is that production stops depending on the environment
+ * variable, and a quiet fallback would let it keep doing so unnoticed.
+ *
+ * Returns null when neither source yields a token.
+ */
+export async function getPlacidPrivateToken(): Promise<string | null> {
+  const secretName = process.env.NODE_ENV === 'production'
+    ? 'prod/AgentWeb/Placid'
+    : 'dev/AgentWeb/Placid';
+
+  try {
+    const raw = (await getSecret(secretName)).trim();
+    let token = raw;
+    if (raw.startsWith('{')) {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const value = parsed.PLACID_PRIVATE_TOKEN ?? parsed.privateToken ?? parsed.token;
+      token = typeof value === 'string' ? value.trim() : '';
+    }
+    if (token) return token;
+    console.warn(`[Placid] ${secretName} exists but holds no usable token; falling back to environment`);
+  } catch (err: any) {
+    console.warn(`[Placid] ${secretName} unavailable (${err?.message || err}); falling back to environment`);
+  }
+
+  const fromEnv = process.env.PLACID_PRIVATE_TOKEN?.trim();
+  return fromEnv || null;
+}
+
+/**
  * Get the platform-wide Foreplay API key from AWS Secrets Manager.
  * Stored as a plain string at dev/AgentWeb/Foreplay or prod/AgentWeb/Foreplay.
  * Returns null (non-throwing) if the secret does not exist — callers treat this as

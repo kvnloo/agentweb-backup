@@ -11,6 +11,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { canViewItem, canEditItem } from '../services/orgShareService';
+import { getPlacidPrivateToken } from '../utils/secretsManager';
 
 const s3 = new S3();
 
@@ -1186,13 +1187,16 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    // ENG-698: read from Secrets Manager (prod/AgentWeb/Placid), falling back to
+    // the environment only where the secret does not exist. Not metered: minting
+    // an editor access token is not a Placid render and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
     const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid;
     if (!templateUuid) {
       return res.status(400).json({ message: 'template_uuid is required' });
     }
     if (!privateToken) {
-      return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+      return res.status(500).json({ message: 'Placid private token is not configured' });
     }
 
     // Allow optional overrides via query/body if needed later
@@ -1362,8 +1366,10 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
-    if (!privateToken) return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+    // ENG-698: Secrets Manager first, environment fallback. Not metered: listing
+    // templates is a catalogue read, not a render, and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
+    if (!privateToken) return res.status(500).json({ message: 'Placid private token is not configured' });
 
     const { page, per_page, collection_id } = req.query as {
       page?: string;
