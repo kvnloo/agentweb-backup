@@ -124,7 +124,7 @@ describe("computeAllocatedCost", () => {
       // Pinned deliberately. A rate edit that does not bump this leaves two
       // different prices sharing one version, and a historical spend event can
       // no longer be re-derived from the card that produced it.
-      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-09-02");
+      expect(VENDOR_RATE_CARD_VERSION).toBe("2026-09-14");
     });
   });
 
