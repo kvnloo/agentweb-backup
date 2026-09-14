@@ -13,6 +13,7 @@
 
 import {
   MAX_RETURNED_INVITATIONS,
+  SENT_AT_PRECISION_NOTE,
   getSentInvitationsView,
 } from '../services/agentMode/linkedInSentInvitationsView';
 
@@ -244,5 +245,47 @@ describe('a paginated page length is not the backlog size', () => {
     expect(view.totalPendingIsLowerBound).toBeUndefined();
     expect(view.notice).toContain('3 pending invitations read live');
     expect(view.notice).not.toContain('At least');
+  });
+});
+
+/**
+ * ENG-1718 follow-up, found in production 2026-09-14. TFA Connect's scheduled runs
+ * of 09-11 and 09-13 read ~50 identical sent_at values and reported "an unexplained
+ * ~50-invite burst sent within ~16 seconds" to the customer, twice. The timestamp,
+ * 2026-09-05T17:17:37Z, was exactly six days before the run's own list call:
+ * Unipile resolves LinkedIn's "Sent 6 days ago" label at request time.
+ */
+describe('sent_at is labelled approximate wherever rows are returned', () => {
+  // What a real page looks like: one relative label, one timestamp for all of them.
+  const sameLabel = Array.from({ length: 5 }, (_, i) => liveItem(`burst-${i}`, '2026-09-05T17:17:37.000Z'));
+
+  it('live rows carry the flag, and the notice says identical timestamps are not a burst', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({
+      object: 'InvitationList', items: sameLabel, cursor: null,
+    }));
+
+    expect(view.source).toBe('live');
+    expect(view.sentAtIsApproximate).toBe(true);
+    expect(view.notice).toContain(SENT_AT_PRECISION_NOTE);
+    expect(view.notice).toMatch(/NOT a burst/);
+  });
+
+  it('cached rows carry the flag too — the ledger stores the same estimates', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(
+      { object: 'InvitationList', items: [], cursor: null },
+      [cachedRow('x', '2026-09-04T21:17:36.000Z'), cachedRow('y', '2026-09-04T21:17:36.000Z')],
+    ));
+
+    expect(view.source).toBe('cache');
+    expect(view.sentAtIsApproximate).toBe(true);
+    expect(view.notice).toContain(SENT_AT_PRECISION_NOTE);
+  });
+
+  it('is absent when there are no rows to misread', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({ object: 'InvitationList', items: [], cursor: null }));
+
+    expect(view.source).toBe('none');
+    expect(view).not.toHaveProperty('sentAtIsApproximate');
+    expect(view.notice).not.toContain(SENT_AT_PRECISION_NOTE);
   });
 });
