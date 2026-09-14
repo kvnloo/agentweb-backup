@@ -95,17 +95,53 @@ describe('thresholds come from the live policy, never a constant', () => {
   });
 });
 
-describe('vendor spend is never presented as all-in', () => {
-  it('keeps vendor separate from LLM and flags coverage as partial', async () => {
+describe('all-in cost (AC3) — coverage is now complete', () => {
+  // The prior invariant ("coverage partial, so never sum an all-in") no longer
+  // applies: as of 2026-09-14 every paid vendor writes to the ledger, so the
+  // all-in figure is honest. The enduring invariant is that all-in still
+  // SEPARATES its parts rather than presenting one opaque number.
+  it('sums an honest all-in and keeps the parts separable', async () => {
     mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000), vendorRow('u1', 2_000_000)]);
     mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
     const r = await buildUnitEconomicsReport('2026-09');
     expect(r.rows[0].llmCostUsd).toBe(10);
     expect(r.rows[0].vendorCostUsd).toBe(2);
-    expect(r.rows[0].vendorCoverage).toBe('partial');
-    // No summed all-in field exists to be mistaken for one.
-    expect(r.rows[0]).not.toHaveProperty('allInCostUsd');
-    expect(r.vendorCoverageNote).toMatch(/not an all-in figure/i);
+    expect(r.rows[0].vendorCoverage).toBe('complete');
+    // The all-in is the sum, and the parts remain individually readable.
+    expect(r.rows[0].allInCostUsd).toBe(12);
+    expect(r.rows[0].llmCostUsd + r.rows[0].vendorCostUsd).toBe(r.rows[0].allInCostUsd);
+    expect(r.vendorCoverageNote).toMatch(/complete/i);
+  });
+
+  it('per-account infrastructure is $0 — shared overhead is not per-account attributable', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000), vendorRow('u1', 2_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].infrastructureUsd).toBe(0);
+  });
+
+  it('measures admitted-work overrun against the effective cap', async () => {
+    // Pro cap is $200; $250 of LLM spend admitted before the boundary => $50 overrun.
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 250_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(50);
+  });
+
+  it('reports $0 overrun for an account within its cap', async () => {
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 10_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Pro' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(0);
+  });
+
+  it('reports $0 overrun for an uncapped tier — it cannot overrun a cap it does not have', async () => {
+    mockGetSubscriptionTypeConfig.mockResolvedValue({}); // no llmUsagePolicy
+    mockScanByDateRange.mockResolvedValue([llmRow('u1', 999_000_000)]);
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', email: 'a@x.com', subscriptionType: 'Unpriced' }]);
+    const r = await buildUnitEconomicsReport('2026-09');
+    expect(r.rows[0].admittedWorkOverrunUsd).toBe(0);
+    expect(r.rows[0].allInCostUsd).toBe(999);
   });
 });
 
