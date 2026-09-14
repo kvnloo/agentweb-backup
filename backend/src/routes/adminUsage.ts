@@ -31,7 +31,7 @@ import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../se
 import { projectMonth } from "../services/spendProjection";
 import { LLM_SPEND_LEDGER_STARTED_ON } from "../services/spendLedgerDualWrite";
 import { measureLlmLedgerCoverage } from "../services/spendReconciliation";
-import { usageRecordDb } from "../services/usageRecordDb";
+import { UsageRecordRow, usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { orgDb, userDb } from "../services/db";
@@ -54,6 +54,9 @@ const router = express.Router();
  * ledger, which the coverage check reports as drift — `partial`, never a false
  * `full`.
  */
+/** Aggregate-partition queries run at once by the coverage read. */
+export const AGGREGATE_READ_CONCURRENCY = 8;
+
 async function readAggregateRowsForBillingSubject(
   billingUserId: string,
   month: string,
@@ -65,12 +68,22 @@ async function readAggregateRowsForBillingSubject(
     for (const member of await orgDb.getOrgMembers(owner.orgId)) actors.add(member.userId);
   }
 
-  const perActor = await Promise.all(
-    [...actors].map((actor) => usageRecordDb.queryByUserDateRange(actor, `${month}-01`, `${month}-31`)),
-  );
+  // Bounded fan-out: a large org must not burst one query per member at once
+  // (CodeRabbit, PR #2904). Batches keep an admin read from contributing to
+  // throttling on the table every LLM call writes to.
+  const rows: UsageRecordRow[] = [];
+  const queue = [...actors];
+  for (let i = 0; i < queue.length; i += AGGREGATE_READ_CONCURRENCY) {
+    const batch = await Promise.all(
+      queue
+        .slice(i, i + AGGREGATE_READ_CONCURRENCY)
+        .map((actor) => usageRecordDb.queryByUserDateRange(actor, `${month}-01`, `${month}-31`)),
+    );
+    rows.push(...batch.flat());
+  }
   // A member's partition also holds rows billed to someone else (their own
   // subscription, or before they pooled), so keep only this subject's.
-  return perActor.flat().filter((row) => row.billingUserId === billingUserId);
+  return rows.filter((row) => row.billingUserId === billingUserId);
 }
 
 /**
