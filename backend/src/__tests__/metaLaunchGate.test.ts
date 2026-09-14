@@ -952,3 +952,26 @@ describe('named-ad lookup falls back to the account before blocking (ENG-941)', 
     expect(mockListAds).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * ENG-1909: `runMetaTrackingGate` used to call `preflightMetaTrackingGate` with a hardcoded
+ * `{}` third argument, so a caller had no way to override the destination fetch — the field
+ * did not exist on `MetaGateDeps` at all. A sandbox account needs exactly that override (see
+ * services/sandboxTrackingPreflight.ts), so the field was added and threaded through. This
+ * proves the threading itself: not passing `fetchHtml` is byte-for-byte the old hardcoded
+ * `{}` (real accounts unaffected), and passing one reaches the preflight call unchanged.
+ */
+describe('fetchHtml threading (ENG-1909)', () => {
+  it('omitting deps.fetchHtml passes {} through — the exact call a real account always made', async () => {
+    await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1');
+    expect(mockPreflight).toHaveBeenCalledTimes(1);
+    expect(mockPreflight.mock.calls[0][2]).toEqual({ fetchHtml: undefined });
+  });
+
+  it('a caller-supplied fetchHtml reaches preflightMetaTrackingGate unchanged', async () => {
+    const fetchHtml = jest.fn(async () => '<html></html>');
+    await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1', { fetchHtml });
+    expect(mockPreflight).toHaveBeenCalledTimes(1);
+    expect(mockPreflight.mock.calls[0][2]).toEqual({ fetchHtml });
+  });
+});

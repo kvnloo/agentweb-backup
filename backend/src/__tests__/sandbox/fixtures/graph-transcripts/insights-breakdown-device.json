@@ -1,0 +1,71 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/insights",
+    "query": {
+      "level": "campaign",
+      "fields": "impressions,clicks,spend,reach,frequency,campaign_id,actions",
+      "breakdowns": "impression_device",
+      "time_range": "{\"since\":\"2026-08-14\",\"until\":\"2026-09-12\"}",
+      "limit": "500"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "impressions": "28",
+        "clicks": "2",
+        "spend": "4.69",
+        "reach": "27",
+        "frequency": "1.037037",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "impression_device": "android_smartphone"
+      },
+      {
+        "impressions": "9",
+        "clicks": "0",
+        "spend": "0.63",
+        "reach": "9",
+        "frequency": "1",
+        "campaign_id": "120000000000000006",
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "impression_device": "desktop"
+      },
+      {
+        "impressions": "106",
+        "clicks": "2",
+        "spend": "6.96",
+        "reach": "103",
+        "frequency": "1.029126",
+        "campaign_id": "120000000000000006",
+        "actions": [
+          {
+            "action_type": "link_click",
+            "value": "1"
+          },
+          {
+            "action_type": "post_engagement",
+            "value": "1"
+          },
+          {
+            "action_type": "page_engagement",
+            "value": "1"
+          }
+        ],
+        "date_start": "2026-08-14",
+        "date_stop": "2026-09-12",
+        "impression_device": "iphone"
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci0xOQ==",
+        "after": "c2FuaXRpemVkLWN1cnNvci0yMA=="
+      }
+    }
+  }
+}

@@ -5,6 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { getElevenLabsApiKey } from '../utils/secretsManager';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { recordVendorUsage } from './usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 // Remotion ships its own ffmpeg binary — use it so we don't need a system install
 const FFMPEG_BIN = path.join(
@@ -47,6 +49,44 @@ async function getApiKey(): Promise<string> {
  * Generate voiceover audio from a script using ElevenLabs TTS.
  * Returns an S3 URL to the generated MP3 file.
  */
+/**
+ * Record one synthesis against the requesting user (ENG-1878, split from ENG-698).
+ *
+ * Wrapped in try/catch, and that is load-bearing rather than defensive habit:
+ * `computeAllocatedCost` THROWS on an unpriced unit by design (ENG-703 AC2), so
+ * calling it inline would let a rate-card key rename break every voiceover.
+ * AC5 says a metering failure must never stop the caller getting its audio, and
+ * an unpriced unit is a metering failure. It still fails loud — into the log —
+ * it just does not fail the user's request.
+ *
+ * `model_id` at the call site is hardcoded `eleven_turbo_v2_5`, so the
+ * Flash/Turbo rate applies unconditionally. If a caller ever chooses the model,
+ * this key must move with it or the cost silently halves against multilingual.
+ *
+ * Quantity is characters priced per 1,000, sent as a fraction rather than
+ * rounded up, so a 200-character clip is not billed as a whole unit.
+ */
+function meterElevenLabsCall(characterCount: number, userId: string): void {
+  try {
+    const units = characterCount / 1000;
+    void recordVendorUsage({
+      userId,
+      provider: 'elevenlabs',
+      operation: 'characters_flash_turbo',
+      feature: 'voiceover',
+      unit: '1k_characters',
+      quantity: units,
+      costSource: 'allocated',
+      costUsd: computeAllocatedCost('elevenlabs', 'characters_flash_turbo', units),
+    });
+  } catch (error) {
+    console.error(
+      'VoiceoverService: failed to meter ElevenLabs usage (call still served):',
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
 export async function generateVoiceover(
   script: string,
   filename: string,
@@ -109,6 +149,21 @@ export async function generateVoiceover(
 
     const audioBuffer = Buffer.from(response.data as ArrayBuffer);
     console.log(`VoiceoverService: Generated ${audioBuffer.length} bytes of audio`);
+
+    // ENG-1878 (split from ENG-698). Metered AFTER the response, because
+    // ElevenLabs bills for synthesis it performed — a request that never
+    // returned audio was not billed, and recording it would inflate the figure.
+    //
+    // `model_id` above is hardcoded to `eleven_turbo_v2_5`, so the Flash/Turbo
+    // rate applies unconditionally. If a caller ever gets to choose the model,
+    // this key has to move with it or the cost silently halves against the
+    // multilingual rate.
+    //
+    // Quantity is characters, priced per 1,000 — sent as a fraction rather than
+    // rounded up, so a 200-character clip is not billed as a full unit.
+    // Fire-and-forget: a metering failure must never cost the caller its audio
+    // (AC5).
+    meterElevenLabsCall(script.length, userId);
 
     const uploadResult = await uploadFileToS3(audioBuffer, filename, userId, 'audio/mpeg');
     if (!uploadResult.success || !uploadResult.url) {

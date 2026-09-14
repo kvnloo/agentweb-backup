@@ -541,6 +541,52 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  it('ENG-1831: refuses tools for a tool-less model before sending, instead of a routing 404', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn();
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const tools = [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }];
+
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { tools } as any,
+    )).rejects.toThrow(/sonar-deep-research' cannot receive tools/);
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-pro-search',
+      [{ role: 'user', content: 'Research' }],
+      { webSearch: true } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    // A tool-capable primary with a tool-less fallback: the fallback gets the same tools.
+    await expect(service.callLLM(
+      'anthropic.claude-opus-5',
+      [{ role: 'user', content: 'Research' }],
+      { tools, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    )).rejects.toThrow(/sonar-pro-search' cannot receive tools/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('ENG-1831: keeps temperature for the tool-less Sonar deep-research chain', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { temperature: 0.2, fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request.temperature).toBe(0.2);
+    expect(request).not.toHaveProperty('tools');
+    expect(request).not.toHaveProperty('tool_choice');
+  });
+
   it('rejects an unregistered fallback before sending a gateway request', async () => {
     const service = new AgentModeService();
     const create = jest.fn();
@@ -986,6 +1032,88 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledTimes(1);
     expect(sleep).toHaveBeenCalledWith(1500);
+  });
+
+  // ENG-1681: hit the same customer session 8 times over 9 days across 4
+  // distinct error signatures, with no fix ever landing despite being routed
+  // to `autofix` on day one. Two of the four signatures ("invalid json
+  // response body ... Unexpected end of JSON input" and the downstream
+  // "Cannot read properties of undefined (reading '0')" this produces when
+  // callLLM's caller does `response.choices[0].message` unguarded) are
+  // one-off provider glitches where a fresh request usually just works —
+  // callLLM had no retry for either case before this fix.
+  describe('retries a malformed/empty OpenRouter response (ENG-1681)', () => {
+    it('retries when the response has no choices array, then succeeds', async () => {
+      const service = new AgentModeService();
+      const goodResponse = { choices: [{ message: { role: 'assistant', content: 'hi' } }], usage: {} };
+      const create = jest.fn()
+        .mockResolvedValueOnce({ usage: {} }) // no `choices` key at all
+        .mockResolvedValueOnce(goodResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(goodResponse);
+    });
+
+    it('exhausts retries and throws a clear, greppable error when choices never appears', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      await expect(service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]))
+        .rejects.toThrow(/MALFORMED_OPENROUTER_RESPONSE/);
+
+      // Non-scheduled caller: same 2-attempt cap as the existing 429 retry.
+      expect(create).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries when the SDK throws on a truncated/invalid JSON body, then succeeds', async () => {
+      const service = new AgentModeService();
+      const goodResponse = { choices: [{ message: { role: 'assistant', content: 'hi' } }], usage: {} };
+      const parseError = new Error(
+        'invalid json response body at https://openrouter.ai/api/v1/chat/completions reason: Unexpected end of JSON input',
+      );
+      const create = jest.fn()
+        .mockRejectedValueOnce(parseError)
+        .mockResolvedValueOnce(goodResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+      jest.spyOn(service as any, 'sleep').mockResolvedValue(undefined);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(result).toEqual(goodResponse);
+    });
+
+    // Pins the invariant the fix above depends on: an empty-but-present
+    // `choices: []` is a different, already-handled case elsewhere in this
+    // function (and is exactly the shape dozens of other tests in this file
+    // mock as their default response) — it must NOT be treated as malformed,
+    // or every one of those tests would start retrying and this fix would
+    // have silently widened its own blast radius.
+    it('does NOT retry a genuinely empty (but present) choices array', async () => {
+      const service = new AgentModeService();
+      const emptyChoicesResponse = { choices: [], usage: {} };
+      const create = jest.fn().mockResolvedValue(emptyChoicesResponse);
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      const result = await service.callLLM('gpt-5.5', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(emptyChoicesResponse);
+    });
   });
 
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as

@@ -69,7 +69,7 @@ export async function runOutreachScheduleAutoCreate(params: {
         return match ? String(match.scheduleId) : null;
       },
       createSchedule: (schedule) => scheduleDb.createSchedule(schedule as any),
-      countTemplateUse: (templateId) => scheduleTemplateDb.incrementUsageCount(templateId),
+      countTemplateUse: (templateId) => scheduleTemplateDb.incrementUsageCount(templateId, params.userId),
     },
   });
 }

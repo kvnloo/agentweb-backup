@@ -270,16 +270,6 @@ export function providerHasDedupCaveat(provider: string): boolean {
   return provider === TWITTER_PROVIDER_KEY || provider === "all";
 }
 
-/**
- * ElevenLabs, 2captcha and Placid have rates but no metering adapter yet
- * (ENG-698, blocked on the ENG-1598 Placid credential), so an all-vendor total
- * omits them. Say so rather than letting the figure read as complete.
- *
- * DELETE this and its usage when ENG-698 ships.
- */
-export function providerTotalIsUndercount(provider: string): boolean {
-  return provider === "all";
-}
 
 /** Format a Date as local YYYY-MM-DD (no UTC shift — matches what the user picks). */
 function formatDateInput(date: Date): string {
@@ -332,6 +322,9 @@ const PROVIDER_LABELS: Record<string, string> = {
   apollo: "Apollo",
   "enrich.so": "enrich.so",
   remotion: "Remotion Lambda",
+  elevenlabs: "ElevenLabs",
+  "2captcha": "2captcha",
+  placid: "Placid",
 };
 
 /** An unknown key falls through unchanged — a new vendor is listed by its raw
@@ -768,12 +761,6 @@ export default function UsageCostByUserTab() {
         )}
       </Alert>
 
-      {providerTotalIsUndercount(provider) && (
-        <Alert severity="warning" sx={{ mb: 2 }} data-testid="undercount-caveat">
-          ElevenLabs, 2captcha and Placid are not metered yet (ENG-698), so an all-vendor total is
-          an <strong>undercount</strong>.
-        </Alert>
-      )}
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>

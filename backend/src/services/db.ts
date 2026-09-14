@@ -1,3 +1,4 @@
+import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
@@ -14,6 +15,7 @@ import type { OrgRole } from "./orgAuthz";
 import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
+import { isEvaluationUser } from "./evaluationPolicy";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -1349,7 +1351,13 @@ export class UserDB {
     return counts;
   }
 
-  async getAllUsers(hideBotLike = false): Promise<UserWithCounts[]> {
+  /**
+   * ENG-1907: sandbox (eval_) principals are excluded by default. Every fleet sweep,
+   * cron, and admin listing enumerates through here, so this one filter is what keeps
+   * a take-home or pilot account out of CRM sync, onboarding nudges, Meta crons, and
+   * revenue listings. Only the sandbox lifecycle itself passes `includeSandbox`.
+   */
+  async getAllUsers(hideBotLike = false, options?: { includeSandbox?: boolean }): Promise<UserWithCounts[]> {
     try {
       const allItems: User[] = [];
       let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
@@ -1377,6 +1385,7 @@ export class UserDB {
       const users = allItems.filter(
         (u) =>
           !u.userId.startsWith("deleted_") &&
+          (options?.includeSandbox === true || !isEvaluationUser(u.userId)) &&
           (!hideBotLike || !UserDB.isBotLikeEmail(u.email))
       );
       if (users.length === 0) return [];
@@ -3478,7 +3487,7 @@ export const scheduleDb = {
         Item: schedule,
       };
 
-      await dynamodb.put(params).promise();
+      await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
       return schedule;
     } catch (error) {
       handleDynamoDbError(error, "createSchedule");
@@ -11394,7 +11403,7 @@ export const scheduleTemplateDb = {
     }
   },
 
-  async incrementUsageCount(templateId: string) {
+  async incrementUsageCount(templateId: string, userId?: string) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
@@ -11407,6 +11416,12 @@ export const scheduleTemplateDb = {
         },
         ReturnValues: 'ALL_NEW' as const,
       };
+      if (isEvaluationUser(userId)) {
+        const { ReturnValues: _returnValues, ...update } = params;
+        await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Update: update });
+        const result = await dynamodb.get({ TableName: params.TableName, Key: params.Key, ConsistentRead: true }).promise();
+        return result.Item;
+      }
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {

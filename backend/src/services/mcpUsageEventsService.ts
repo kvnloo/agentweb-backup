@@ -1,3 +1,4 @@
+import { isTransactionConditionFailure, writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from 'aws-sdk';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import type { DynamoAttributeMap, DynamoAttributeValue } from '../loops/core/ports';
@@ -127,15 +128,14 @@ class DynamoMcpUsageEventStore implements McpUsageEventStore {
   });
 
   async put(item: DynamoAttributeMap, options?: { condition?: 'attribute_not_exists' }): Promise<void> {
-    await this.doc
-      .put({
-        TableName: LOOP_EVENTS_TABLE,
-        Item: item as Record<string, unknown>,
-        ...(options?.condition === 'attribute_not_exists'
-          ? { ConditionExpression: 'attribute_not_exists(loopId) AND attribute_not_exists(tsSession)' }
-          : {}),
-      })
-      .promise();
+    const prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+    await writeWithEvaluationGuard(this.doc, typeof item.subjectId === 'string' ? item.subjectId : undefined, prefix, { Put: {
+      TableName: LOOP_EVENTS_TABLE,
+      Item: item as Record<string, unknown>,
+      ...(options?.condition === 'attribute_not_exists'
+        ? { ConditionExpression: 'attribute_not_exists(loopId) AND attribute_not_exists(tsSession)' }
+        : {}),
+    } });
   }
 
   async queryByLoopId(loopId: string): Promise<DynamoAttributeMap[]> {
@@ -289,7 +289,7 @@ export async function recordMcpFirstToolUse(
     await store.put(item, { condition: 'attribute_not_exists' });
     return true;
   } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') return false;
+    if (error?.code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return false;
     throw error;
   }
 }
@@ -467,7 +467,7 @@ async function recordMcpUserEvent(
     await store.put(item, { condition: 'attribute_not_exists' });
     return true;
   } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') return false;
+    if (error?.code === 'ConditionalCheckFailedException' || isTransactionConditionFailure(error)) return false;
     throw error;
   }
 }

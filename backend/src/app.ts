@@ -1,5 +1,4 @@
-import { evaluationPage } from './routes/evaluationPage';
-import { evaluationAdminRoutes, evaluationRoutes } from './routes/evaluation';
+import { evaluationAdminRoutes } from './routes/evaluation';
 import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
 import nodePath from "path";
@@ -81,6 +80,7 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
+import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
@@ -330,8 +330,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
 app.use(evaluationHttpBoundary);
-app.use("/evaluation", evaluationPage);
-app.use("/api/evaluation", evaluationRoutes);
 app.use("/api/admin/evaluations", evaluationAdminRoutes);
 
 // MCP OAuth 2.1 routes. Registered AFTER the CORS middleware and body parsers
@@ -451,6 +449,7 @@ app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes
 app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPagesRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
+app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);

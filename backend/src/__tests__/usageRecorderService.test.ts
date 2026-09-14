@@ -3,7 +3,15 @@
  *
  * ACCEPTANCE CRITERION (Ship 1): usage analytics must never break chat — when
  * the db adapter throws (sync or async), recordUsage resolves without throwing.
+ *
+ * ENG-1934: this suite runs with the LLM spend-ledger kill switch OFF, and is
+ * therefore also the proof of that switch's contract — OFF writes exactly the
+ * aggregate row this suite always asserted, and nothing else. Left ON, the mock
+ * below (which has no transactional method) would route every call through the
+ * ledger-failure fallback and these assertions would pass for the wrong reason.
+ * The ON path is covered in usageRecorderService.llmSpendLedger.test.ts.
  */
+process.env.SPEND_LEDGER_LLM_DUAL_WRITE = 'false';
 
 jest.mock('../services/usageRecordDb', () => ({
   usageRecordDb: {

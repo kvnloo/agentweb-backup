@@ -157,24 +157,6 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
  * meter the module instead.
  */
 const VENDOR_ALLOWLIST: AllowlistEntry[] = [
-  {
-    path: 'services/voiceoverService.ts',
-    vendor: 'ElevenLabs',
-    issue: 'ENG-698',
-    reason: 'Text-to-speech calls are unmetered.',
-  },
-  {
-    path: 'emma/solveRecaptchaTool.ts',
-    vendor: '2captcha',
-    issue: 'ENG-698',
-    reason: 'submit2CaptchaTask solve calls are unmetered.',
-  },
-  {
-    path: 'controllers/tasks.ts',
-    vendor: 'Placid',
-    issue: 'ENG-698',
-    reason: 'Editor-token and rendered-image fetch calls are unmetered.',
-  },
 ];
 
 // ─── Pure scanning logic (unit-tested against fixtures below) ────────────────
@@ -569,10 +551,11 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     // shrink: a slice issue ships metering into the module, which the
     // staleness test above then requires removing the entry for.
     expect(VENDOR_ALLOWLIST.map((e) => `${e.vendor} (${e.path}) — ${e.issue}`).sort()).toEqual([
-      '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
-      'ElevenLabs (services/voiceoverService.ts) — ENG-698',
-      'Placid (controllers/tasks.ts) — ENG-698',
     ]);
+    // Empty since ENG-698 (2026-09-14): every known paid-vendor egress module now
+    // records usage. The staleness and scan tests above still run, so a NEW
+    // unmetered vendor fails the build exactly as before — an empty amnesty list
+    // is the goal state, not a switched-off guard.
   });
 
   /**

@@ -1,0 +1,872 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/ads",
+    "query": {
+      "fields": "id,name,status,effective_status,adset_id,campaign_id,creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}",
+      "effective_status": "[\"ACTIVE\",\"PAUSED\",\"CAMPAIGN_PAUSED\",\"ADSET_PAUSED\",\"PENDING_REVIEW\",\"DISAPPROVED\",\"PREAPPROVED\",\"PENDING_BILLING_INFO\",\"IN_PROCESS\",\"WITH_ISSUES\"]",
+      "limit": "100"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "120000000000000020",
+        "name": "Object 19",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000010",
+        "campaign_id": "120000000000000004",
+        "creative": {
+          "id": "1200000000000021",
+          "name": "Object 20",
+          "body": "Primary text 21",
+          "title": "Headline 22",
+          "image_url": "https://example.invalid/asset/1.jpg",
+          "thumbnail_url": "https://example.invalid/asset/2.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/cut-ai-cost",
+              "message": "Primary text 23",
+              "name": "Object 24",
+              "caption": "https://example.invalid/cut-ai-cost",
+              "image_hash": "ababababababababababababababab22",
+              "picture": "https://example.invalid/asset/3.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000023",
+        "name": "Object 25",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000012",
+        "campaign_id": "120000000000000005",
+        "creative": {
+          "id": "1200000000000024",
+          "name": "Object 26",
+          "body": "Primary text 27",
+          "title": "Headline 28",
+          "image_url": "https://example.invalid/asset/4.jpg",
+          "thumbnail_url": "https://example.invalid/asset/5.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/first-ai-dollar",
+              "message": "Primary text 29",
+              "name": "Object 30",
+              "caption": "https://example.invalid/first-ai-dollar",
+              "image_hash": "ababababababababababababababab25",
+              "picture": "https://example.invalid/asset/6.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000025",
+        "name": "Object 31",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000012",
+        "campaign_id": "120000000000000005",
+        "creative": {
+          "id": "1200000000000026",
+          "name": "Object 32",
+          "body": "Primary text 33",
+          "title": "Headline 34",
+          "image_url": "https://example.invalid/asset/7.jpg",
+          "thumbnail_url": "https://example.invalid/asset/8.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/first-ai-dollar",
+              "message": "Primary text 35",
+              "name": "Object 36",
+              "caption": "https://example.invalid/first-ai-dollar",
+              "image_hash": "ababababababababababababababab20",
+              "picture": "https://example.invalid/asset/9.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000027",
+        "name": "Object 37",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000012",
+        "campaign_id": "120000000000000005",
+        "creative": {
+          "id": "1200000000000028",
+          "name": "Object 38",
+          "body": "Primary text 39",
+          "title": "Headline 40",
+          "image_url": "https://example.invalid/asset/10.jpg",
+          "thumbnail_url": "https://example.invalid/asset/11.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/first-ai-dollar",
+              "message": "Primary text 41",
+              "name": "Object 42",
+              "caption": "https://example.invalid/first-ai-dollar",
+              "image_hash": "ababababababababababababababab36",
+              "picture": "https://example.invalid/asset/12.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000029",
+        "name": "Object 43",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000010",
+        "campaign_id": "120000000000000004",
+        "creative": {
+          "id": "120000000000030",
+          "name": "Object 44",
+          "body": "Primary text 45",
+          "title": "Headline 46",
+          "image_url": "https://example.invalid/asset/13.jpg",
+          "thumbnail_url": "https://example.invalid/asset/14.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/cut-ai-cost",
+              "message": "Primary text 47",
+              "name": "Object 48",
+              "caption": "https://example.invalid/cut-ai-cost",
+              "image_hash": "ababababababababababababababab3b",
+              "picture": "https://example.invalid/asset/15.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000031",
+        "name": "Object 49",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000010",
+        "campaign_id": "120000000000000004",
+        "creative": {
+          "id": "1200000000000032",
+          "name": "Object 50",
+          "body": "Primary text 51",
+          "title": "Headline 52",
+          "image_url": "https://example.invalid/asset/16.jpg",
+          "thumbnail_url": "https://example.invalid/asset/17.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/cut-ai-cost",
+              "message": "Primary text 53",
+              "name": "Object 54",
+              "caption": "https://example.invalid/cut-ai-cost",
+              "image_hash": "ababababababababababababababab3c",
+              "picture": "https://example.invalid/asset/18.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000033",
+        "name": "Object 55",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000012",
+        "campaign_id": "120000000000000005",
+        "creative": {
+          "id": "1200000000000034",
+          "name": "Object 56",
+          "body": "Primary text 57",
+          "title": "Headline 58",
+          "image_url": "https://example.invalid/asset/19.jpg",
+          "thumbnail_url": "https://example.invalid/asset/20.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/first-ai-dollar",
+              "message": "Primary text 59",
+              "name": "Object 60",
+              "caption": "https://example.invalid/first-ai-dollar",
+              "image_hash": "ababababababababababababababab3d",
+              "picture": "https://example.invalid/asset/21.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000035",
+        "name": "Object 61",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000010",
+        "campaign_id": "120000000000000004",
+        "creative": {
+          "id": "1200000000000036",
+          "name": "Object 62",
+          "body": "Primary text 63",
+          "title": "Headline 64",
+          "image_url": "https://example.invalid/asset/22.jpg",
+          "thumbnail_url": "https://example.invalid/asset/23.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/cut-ai-cost",
+              "message": "Primary text 65",
+              "name": "Object 66",
+              "caption": "https://example.invalid/cut-ai-cost",
+              "image_hash": "ababababababababababababababab33",
+              "picture": "https://example.invalid/asset/24.jpg"
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000037",
+        "name": "Object 67",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000038",
+          "name": "Object 68",
+          "thumbnail_url": "https://example.invalid/asset/25.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000040",
+        "name": "Object 69",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000041",
+          "name": "Object 70",
+          "thumbnail_url": "https://example.invalid/asset/26.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000042",
+        "name": "Object 71",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000043",
+          "name": "Object 72",
+          "thumbnail_url": "https://example.invalid/asset/27.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000044",
+        "name": "Object 73",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000045",
+          "name": "Object 74",
+          "thumbnail_url": "https://example.invalid/asset/28.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000046",
+        "name": "Object 75",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000047",
+          "name": "Object 76",
+          "thumbnail_url": "https://example.invalid/asset/29.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000048",
+        "name": "Object 77",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000013",
+        "campaign_id": "120000000000000006",
+        "creative": {
+          "id": "1200000000000049",
+          "name": "Object 78",
+          "thumbnail_url": "https://example.invalid/asset/30.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039"
+          }
+        }
+      },
+      {
+        "id": "120000000000000050",
+        "name": "Object 79",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000014",
+        "campaign_id": "120000000000000007",
+        "creative": {
+          "id": "120000000000051",
+          "name": "Object 80",
+          "body": "Primary text 81",
+          "title": "Headline 82",
+          "image_url": "https://example.invalid/asset/31.jpg",
+          "thumbnail_url": "https://example.invalid/asset/32.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/book",
+              "message": "Primary text 83",
+              "name": "Object 84",
+              "caption": "https://example.invalid/book",
+              "image_hash": "ababababababababababababababab3e",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/book"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000052",
+        "name": "Object 85",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000014",
+        "campaign_id": "120000000000000007",
+        "creative": {
+          "id": "1200000000000053",
+          "name": "Object 86",
+          "body": "Primary text 87",
+          "title": "Headline 88",
+          "image_url": "https://example.invalid/asset/33.jpg",
+          "thumbnail_url": "https://example.invalid/asset/34.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/book",
+              "message": "Primary text 89",
+              "name": "Object 90",
+              "caption": "https://example.invalid/book",
+              "image_hash": "abababababababababababababababa8",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/book"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000054",
+        "name": "Object 91",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000014",
+        "campaign_id": "120000000000000007",
+        "creative": {
+          "id": "1200000000000055",
+          "name": "Object 92",
+          "body": "Primary text 93",
+          "title": "Headline 94",
+          "image_url": "https://example.invalid/asset/35.jpg",
+          "thumbnail_url": "https://example.invalid/asset/36.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/book",
+              "message": "Primary text 95",
+              "name": "Object 96",
+              "caption": "https://example.invalid/book",
+              "image_hash": "ababababababababababababababab23",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/book"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000056",
+        "name": "Object 97",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "1200000000000057",
+          "name": "Object 98",
+          "body": "Primary text 99",
+          "title": "Headline 100",
+          "image_url": "https://example.invalid/asset/37.jpg",
+          "thumbnail_url": "https://example.invalid/asset/38.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 101",
+              "name": "Object 102",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab2b",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000058",
+        "name": "Object 103",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "1200000000000059",
+          "name": "Object 104",
+          "body": "Primary text 105",
+          "title": "Headline 106",
+          "image_url": "https://example.invalid/asset/39.jpg",
+          "thumbnail_url": "https://example.invalid/asset/40.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 107",
+              "name": "Object 108",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab29",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000060",
+        "name": "Object 109",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "1200000000000061",
+          "name": "Object 110",
+          "body": "Primary text 111",
+          "title": "Headline 112",
+          "image_url": "https://example.invalid/asset/41.jpg",
+          "thumbnail_url": "https://example.invalid/asset/42.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 113",
+              "name": "Object 114",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab1f",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000062",
+        "name": "Object 115",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "1200000000000063",
+          "name": "Object 116",
+          "body": "Primary text 117",
+          "title": "Headline 118",
+          "image_url": "https://example.invalid/asset/43.jpg",
+          "thumbnail_url": "https://example.invalid/asset/44.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 119",
+              "name": "Object 120",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab3f",
+              "call_to_action": {
+                "type": "SIGN_UP",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000064",
+        "name": "Object 121",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "120000000000065",
+          "name": "Object 122",
+          "body": "Primary text 123",
+          "title": "Headline 124",
+          "image_url": "https://example.invalid/asset/45.jpg",
+          "thumbnail_url": "https://example.invalid/asset/46.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 125",
+              "name": "Object 126",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab12",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000066",
+        "name": "Object 127",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "120000000000067",
+          "name": "Object 128",
+          "body": "Primary text 129",
+          "title": "Headline 130",
+          "image_url": "https://example.invalid/asset/47.jpg",
+          "thumbnail_url": "https://example.invalid/asset/48.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 131",
+              "name": "Object 132",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab15",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000068",
+        "name": "Object 133",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000018",
+        "campaign_id": "120000000000000008",
+        "creative": {
+          "id": "1200000000000069",
+          "name": "Object 134",
+          "title": "Headline 135",
+          "image_url": "https://example.invalid/asset/49.jpg",
+          "thumbnail_url": "https://example.invalid/asset/50.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "image_hash": "abababababababababababababababa6",
+              "call_to_action": {
+                "type": "LEARN_MORE"
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000070",
+        "name": "Object 136",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000071",
+          "name": "Object 137",
+          "body": "Primary text 138",
+          "title": "Headline 139",
+          "image_url": "https://example.invalid/asset/51.jpg",
+          "thumbnail_url": "https://example.invalid/asset/52.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 140",
+              "name": "Object 141",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab15",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000072",
+        "name": "Object 142",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000073",
+          "name": "Object 143",
+          "body": "Primary text 144",
+          "title": "Headline 145",
+          "image_url": "https://example.invalid/asset/53.jpg",
+          "thumbnail_url": "https://example.invalid/asset/54.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 146",
+              "name": "Object 147",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab3f",
+              "call_to_action": {
+                "type": "SIGN_UP",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000074",
+        "name": "Object 148",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000075",
+          "name": "Object 149",
+          "body": "Primary text 150",
+          "title": "Headline 151",
+          "image_url": "https://example.invalid/asset/55.jpg",
+          "thumbnail_url": "https://example.invalid/asset/56.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 152",
+              "name": "Object 153",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab29",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000076",
+        "name": "Object 154",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000077",
+          "name": "Object 155",
+          "body": "Primary text 156",
+          "title": "Headline 157",
+          "image_url": "https://example.invalid/asset/57.jpg",
+          "thumbnail_url": "https://example.invalid/asset/58.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 158",
+              "name": "Object 159",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab12",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000078",
+        "name": "Object 160",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000079",
+          "name": "Object 161",
+          "body": "Primary text 162",
+          "title": "Headline 163",
+          "image_url": "https://example.invalid/asset/59.jpg",
+          "thumbnail_url": "https://example.invalid/asset/60.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 164",
+              "name": "Object 165",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab2b",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000080",
+        "name": "Object 166",
+        "status": "ACTIVE",
+        "effective_status": "ADSET_PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000081",
+          "name": "Object 167",
+          "body": "Primary text 168",
+          "title": "Headline 169",
+          "image_url": "https://example.invalid/asset/61.jpg",
+          "thumbnail_url": "https://example.invalid/asset/62.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "message": "Primary text 170",
+              "name": "Object 171",
+              "caption": "https://example.invalid/",
+              "image_hash": "ababababababababababababababab1f",
+              "call_to_action": {
+                "type": "LEARN_MORE",
+                "value": {
+                  "link": "https://example.invalid/"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "120000000000000082",
+        "name": "Object 172",
+        "status": "PAUSED",
+        "effective_status": "PAUSED",
+        "adset_id": "120000000000000019",
+        "campaign_id": "120000000000000009",
+        "creative": {
+          "id": "1200000000000083",
+          "name": "Object 173",
+          "title": "Headline 174",
+          "image_url": "https://example.invalid/asset/63.jpg",
+          "thumbnail_url": "https://example.invalid/asset/64.jpg",
+          "object_story_spec": {
+            "page_id": "120000000000022",
+            "instagram_user_id": "12000000000000039",
+            "link_data": {
+              "link": "https://example.invalid/",
+              "image_hash": "abababababababababababababababa6",
+              "call_to_action": {
+                "type": "LEARN_MORE"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci0z",
+        "after": "c2FuaXRpemVkLWN1cnNvci00"
+      }
+    }
+  }
+}
