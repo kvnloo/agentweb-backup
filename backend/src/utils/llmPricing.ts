@@ -14,6 +14,23 @@
  * models to Sonnet pricing, which hides pricing gaps).
  */
 
+/**
+ * Version stamp for every price in this file (ENG-1250 §5: "A price change
+ * creates a new version; historical events retain the rate version used").
+ *
+ * Written onto each LLM spend event this book priced (ENG-1934), so a
+ * historical event can be re-derived from the prices that produced it. Dated
+ * to the last commit that changed a price here.
+ *
+ * **Bump this in the same commit as any price edit.** `llmPricing.test.ts`
+ * pins a fingerprint of the tables to this version, so a price change that
+ * forgets the bump fails the build instead of silently sharing a version.
+ */
+export const LLM_PRICE_BOOK_VERSION = "2026-09-10";
+
+/** The rate provenance a spend event carries when this book priced it. */
+export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
+
 export interface ModelPrice {
   /** USD per 1M input tokens */
   inPerM: number;
