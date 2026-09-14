@@ -120,6 +120,8 @@ export interface LlmLedgerCoverage {
   aggregateLlmMicroUsd: number | null;
   /** LLM spend missing from the ledger; null when it could not be measured. */
   missingLlmMicroUsd: number | null;
+  /** LLM spend the ledger holds beyond the aggregate rail; null when not measured. */
+  excessLlmMicroUsd?: number | null;
 }
 
 /** The GET /api/admin/users/:billingUserId/spend/breakdown payload. */
@@ -199,11 +201,17 @@ export function allowanceComparison(data: Pick<SpendLedgerPayload, "llmLedger">)
   return coverage.month;
 }
 
-/** The partial-coverage qualifier, stating the gap when it was measured. */
+/**
+ * The partial-coverage qualifier, stating the gap when it was measured — in
+ * whichever direction it runs. A shortfall understates spend; an excess (a
+ * duplicate or orphan event) overstates it.
+ */
 export function partialCoverageCaption(coverage: LlmLedgerCoverage): string {
-  return coverage.missingLlmMicroUsd == null
-    ? "Unverified: LLM spend in this total could not be checked"
-    : `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
+  if (coverage.missingLlmMicroUsd == null) return "Unverified: LLM spend in this total could not be checked";
+  if ((coverage.excessLlmMicroUsd ?? 0) > coverage.missingLlmMicroUsd) {
+    return `Overstated: the ledger holds ${usdFromMicro(coverage.excessLlmMicroUsd!)} more LLM spend than usage records`;
+  }
+  return `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
 }
 
 /** `2026-09-14` → `Sep 14`. */
