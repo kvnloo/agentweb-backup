@@ -18,6 +18,7 @@
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { ToolOutputContractError } from '../utils/toolOutputContract';
+import { MISSING_BRAND_LOGO_ERROR } from '../services/agentMode/brandLogo';
 
 function err(message: string, name?: string): Error {
   const e = new Error(message);
@@ -56,6 +57,32 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('gpt-image-2 API failed: quota exceeded for this billing period'))).toBe('quota_exceeded');
     // Genuine per-minute throttling stays rate_limit even though both are 429s.
     expect(classifyToolErrorClass(err('Too Many Requests'))).toBe('rate_limit');
+  });
+
+  // A real OpenAI-SDK APIError (thrown by every OpenRouter call, including a
+  // BYOK upstream that's run out of quota) carries a numeric `.status`, unlike
+  // the plain-message `err()` errors above. classFromStatus(429) must not win
+  // by default over the quota_exceeded message check, or ENG-1661's
+  // OpenRouter retry loop (keyed on 'rate_limit') would blindly retry a
+  // permanent billing stop that can never succeed.
+  it('prefers quota_exceeded over rate_limit for a status-429 error with quota-exhaustion text', () => {
+    const quotaErrorWithStatus = Object.assign(
+      new Error('429 You exceeded your current quota, please check your plan and billing details.'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(quotaErrorWithStatus)).toBe('quota_exceeded');
+
+    // The real ENG-1661 incident shape ("Provider returned error") must stay
+    // rate_limit/retryable even with a numeric .status present.
+    const genuineRateLimitWithStatus = Object.assign(
+      new Error('429 Provider returned error'),
+      { status: 429 }
+    );
+    expect(classifyToolErrorClass(genuineRateLimitWithStatus)).toBe('rate_limit');
+
+    // Sibling statuses are unaffected by the 429-specific message check.
+    const paymentRequiredWithStatus = Object.assign(new Error('402 insufficient credits'), { status: 402 });
+    expect(classifyToolErrorClass(paymentRequiredWithStatus)).toBe('payment_required');
   });
 
   it('classifies argument validation — the LinkedIn outreach cluster', () => {
@@ -432,6 +459,30 @@ describe('rate_limit — AWS SDK v2 DynamoDB throttling (ENG-1626)', () => {
   it('classifies ThrottlingException as rate_limit with no statusCode at all', () => {
     const err = Object.assign(new Error('Throttling'), { code: 'ThrottlingException' });
     expect(classifyToolErrorClass(err)).toBe('rate_limit');
+  });
+});
+
+// ENG-1844: the landing-page generate/duplicate routes' brand-logo 422 reaches the model
+// as `API error (422): No brand logo is saved...` via httpClient.ts's self-call Error.
+// The embedded-status regex requires whitespace/start-of-string before the digits, but
+// "(422)" has "(" immediately before them, so it never matched — this fell all the way to
+// the generic unclassified fallback. httpClient.ts now preserves the route's own
+// `missing_brand_logo` marker on `.code` (separately from the human `.message`), so this
+// must classify by that STRING code, not by the numeric status at all.
+describe('missing_brand_logo — brand-logo content gate (ENG-1844)', () => {
+  it('classifies by the .code marker even though the message embeds "(422)" unmatchably', () => {
+    const err = Object.assign(
+      new Error(
+        'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again — landing pages are never generated with an invented or approximate logo.'
+      ),
+      { code: MISSING_BRAND_LOGO_ERROR }
+    );
+    expect(classifyToolErrorClass(err)).toBe('missing_brand_logo');
+  });
+
+  it('falls back to invalid_args for an ordinary 422 with no .code marker (no regression)', () => {
+    const err = Object.assign(new Error('API error (422): "prompt" is required'), { status: 422 });
+    expect(classifyToolErrorClass(err)).toBe('invalid_args');
   });
 });
 

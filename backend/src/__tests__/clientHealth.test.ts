@@ -82,6 +82,18 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.error).toMatch(/not found/i);
   });
 
+  it('never treats a sandbox principal found by email as a client (ENG-1907)', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, email: 'admin@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'eval_take-home', email: 'candidate@example.invalid', connected_accounts: [] });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([]);
+
+    const result = await assessClientHealth(adminUserId, 'candidate@example.invalid');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not found/i);
+  });
+
   // FAIL test 3: Client has no ad account configured
   it('should report blocked status when client has no ad account', async () => {
     const adminUserId = 'admin-user';
@@ -1246,6 +1258,28 @@ describe('Client Health - listAllClients', () => {
     expect(result.success).toBe(true);
     expect(result.clients).toHaveLength(1);
     expect(result.clients[0].email).toBe('admin@example.com');
+  });
+
+  // ENG-1907: a sandbox take-home account looks like a Pro customer with a Meta
+  // connection; it must not appear in the admin client roster or its health sweep.
+  it('never lists a sandbox (eval_) principal as a client', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      { userId: 'customer-1', email: 'customer@example.com', isAdmin: false },
+      { userId: 'eval_5d5d5d5d-0000-4000-8000-000000000000', email: 'candidate@example.invalid', isAdmin: false },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([]);
+
+    const result = await listAllClients(adminUserId);
+
+    expect(result.success).toBe(true);
+    expect(result.clients.map((c: any) => c.email)).toEqual(['customer@example.com']);
+    expect(getAccountsByUserId).not.toHaveBeenCalledWith(expect.stringMatching(/^eval_/));
   });
 
   // FAIL test 3: Error handling when DB fails

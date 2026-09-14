@@ -22,6 +22,7 @@ const EXPECTED_REGISTERED_ROUTES = [
   '/gtm-ops',
   '/client-health',
   '/agent-runs',
+  '/sandbox-accounts',
   '/prompt-templates',
   '/tasks/create',
   '/tasks/:taskId',
@@ -77,6 +78,7 @@ describe('Partner Portal route catalog', () => {
       ['GTM Tracker', '/gtm-ops'],
       ['Client Health', '/client-health'],
       ['Agent Runs', '/agent-runs'],
+      ['Sandbox Accounts', '/sandbox-accounts'],
       ['Prompt Templates', '/prompt-templates'],
       ['Workflows', '/workflows'],
       ['Config', '/config'],
@@ -91,7 +93,7 @@ describe('Partner Portal route catalog', () => {
       'Templates', 'HTML Templates', 'Prompt Templates', 'Skills', 'Work Plans', 'Schedule Templates',
     ]);
     expect(grouped.operate.map(({ label }) => label)).toEqual([
-      'GTM Tracker', 'Client Health', 'Agent Runs', 'Contractor Accesses', 'Config',
+      'GTM Tracker', 'Client Health', 'Agent Runs', 'Sandbox Accounts', 'Contractor Accesses', 'Config',
     ]);
   });
 

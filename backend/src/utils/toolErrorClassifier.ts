@@ -14,7 +14,7 @@
  *   network | upstream_5xx | policy_blocked | repeated_failure |
  *   tool_unavailable | upstream_rejected | empty_result | invalid_output |
  *   subscription_blocked | truncated_response | read_incomplete | read_bounded |
- *   scope_refused | publisher_refused | skill_install_refused
+ *   scope_refused | publisher_refused | skill_install_refused | missing_brand_logo
  *
  * `skill_install_refused` was added by ENG-1795; see its routing below for why no existing
  * class fit. The three classes before it were added 2026-06-14 after a 7-day production
@@ -43,6 +43,14 @@
  * Unrecognized errors fall back to the legacy name-based class (explicit
  * `.name`, else constructor name) so named custom errors lose nothing.
  */
+
+// ENG-1844 review: this module was previously import-free by convention. A single import
+// of a plain string constant (no transitive weight — brandLogo.ts lazy-loads everything
+// else) is worth the small deviation: the alternative was a second, independently-typed
+// copy of 'missing_brand_logo' in this file, which a future rename of the real constant
+// would silently desync from — classification would revert to the generic fallback with
+// every test still green, since the test would need the same independent literal too.
+import { MISSING_BRAND_LOGO_ERROR } from '../services/agentMode/brandLogo';
 
 const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolBudgetExceededError: 'repeated_failure',
@@ -320,6 +328,20 @@ export function classifyToolErrorClass(error: unknown): string {
       return 'rate_limit';
     }
 
+    // ENG-1844: the landing-page generate/duplicate routes' brand-logo gate reaches this
+    // point via httpClient.ts's self-call Error, which preserves the route's `error` code
+    // on `.code` specifically so it can be matched here instead of the human `message`
+    // text — that message embeds "(422)" with no preceding whitespace, which the
+    // embedded-status regex below does not match, so this was previously falling through
+    // to the generic unclassified 'Error' bucket and reporting as an outage. Matched
+    // against the imported constant (the INPUT marker), not a second independent
+    // literal — the returned class name below stays its own literal on purpose: this
+    // taxonomy is a stable, independently-owned namespace (see file docblock), and
+    // renaming the trigger's source constant must not silently rename the class too.
+    if (stringCodeProp === MISSING_BRAND_LOGO_ERROR) {
+      return 'missing_brand_logo';
+    }
+
     let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;
     // `.code` is where twitter-api-v2's ApiResponseError puts the HTTP status
@@ -333,6 +355,26 @@ export function classifyToolErrorClass(error: unknown): string {
       }
     }
     if (typeof statusProp === 'number') {
+      // A 429 is ambiguous: transient per-minute throttling (rate_limit,
+      // retryable) and a permanent hard-quota/billing stop that providers
+      // ALSO report via 429 (OpenAI/Azure `insufficient_quota` etc.) are
+      // indistinguishable by status code alone. classFromStatus(429)
+      // unconditionally returns 'rate_limit' and would win by default. That
+      // mattered only for telemetry clustering before ENG-1661; now callLLM's
+      // OpenRouter retry loop keys its retry decision on 'rate_limit', so this
+      // ordering would make it blindly retry an error that can never succeed.
+      //
+      // Deliberately narrower than classFromMessage's own quota_exceeded
+      // pattern below: that pattern's bare "quota exceeded" substring also
+      // matches Google Custom Search's genuinely transient per-day quota
+      // message ("Quota exceeded", ENG-1300), which must stay rate_limit and
+      // already relies on classFromStatus(429) winning by default for a
+      // status-shaped error with no more specific phrasing. Match only the
+      // unambiguous OpenAI/Azure hard-stop phrasings here.
+      if (statusProp === 429
+        && /insufficient_quota|exceeded your current quota|check your plan and billing/.test((error.message ?? '').toLowerCase())) {
+        return 'quota_exceeded';
+      }
       const byStatus = classFromStatus(statusProp);
       if (byStatus) return byStatus;
     }

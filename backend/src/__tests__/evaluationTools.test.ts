@@ -2,43 +2,48 @@ import { mcpToolRegistry } from '../mcp/server/registry';
 import { emmaToolRegistry } from '../emma/registry';
 import { evaluationStore } from '../services/evaluationStore';
 import { userDb } from '../services/db';
-import { runEvaluation } from '../services/evaluationService';
 import '../mcp/server/evaluationTools';
 
 jest.mock('../services/evaluationStore', () => ({ evaluationStore: {
-  get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), saveArtifact: jest.fn(), simulate: jest.fn(), review: jest.fn(),
+  get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn(),
 } }));
 jest.mock('../services/db', () => ({ userDb: { getUserByIdConsistent: jest.fn() } }));
-jest.mock('../services/evaluationService', () => ({ runEvaluation: jest.fn() }));
 jest.mock('../utils/scheduledPublishConsentGuard', () => ({
   refuseUnauthorizedScheduledPublish: jest.fn().mockResolvedValue(null),
   attachPublishRevalidation: (_: unknown, context: unknown) => context,
 }));
 
-describe('ENG-1870 Emma-operable lifecycle', () => {
+const provision = { email: 'candidate@example.invalid', displayName: 'Synthetic', password: 'Synthetic-password-123!', expiresAt: Date.now() + 3600000, brandGuidelines: { brandName: 'Synthetic Co' } };
+
+describe('ENG-1907 sandbox lifecycle tool (admin-only)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({ userId: 'admin', isAdmin: true, isActive: true });
-    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', expiresAt: Date.now() + 60000, materials: [] });
+    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', expiresAt: Date.now() + 60000 });
     (evaluationStore.provision as jest.Mock).mockResolvedValue({ userId: 'eval_new', audit: { action: 'provision' } });
     (evaluationStore.revoke as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'revoked', audit: { action: 'revoke' } });
-    (runEvaluation as jest.Mock).mockResolvedValue({ text: 'Synthetic strategy' });
   });
   it.each([['MCP', mcpToolRegistry], ['Emma', emmaToolRegistry]] as const)('%s exposes admin provision and audited revoke', async (_name, registry) => {
-    await registry.execute('evaluation_workspace', { action: 'provision', provision: { displayName: 'Synthetic' } }, { userId: 'admin' });
-    expect(evaluationStore.provision).toHaveBeenCalledWith('admin', { displayName: 'Synthetic' });
+    await registry.execute('evaluation_workspace', { action: 'provision', provision }, { userId: 'admin' });
+    expect(evaluationStore.provision).toHaveBeenCalledWith('admin', provision);
     const result = await registry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin' });
     expect(JSON.parse(result.content[0].text)).toMatchObject({ status: 'revoked', audit: { action: 'revoke' } });
   });
-  it('evaluation analysis runs only for its authenticated identity', async () => {
-    await emmaToolRegistry.execute('evaluation_workspace', { action: 'analyze', prompt: 'Synthetic case' }, { userId: 'eval_test' });
-    expect(runEvaluation).toHaveBeenCalledWith('eval_test', { action: 'analyze', prompt: 'Synthetic case' });
+  it('the tool describes the sandbox lifecycle, not a candidate workspace', () => {
+    const description = mcpToolRegistry.getTool('evaluation_workspace')!.definition.description as string;
+    expect(description.toLowerCase()).toContain('sandbox');
+    expect(description).not.toContain('Simulation complete');
+    expect(mcpToolRegistry.getTool('evaluation_workspace')!.definition.inputSchema.properties.action.enum).toEqual(['provision', 'revoke', 'review']);
   });
-  it.each([{ action: 'provision', provision: {} }, { action: 'revoke', evaluation_user_id: 'other' }, { action: 'analyze', userId: 'other', prompt: 'case' }])('evaluation cannot elevate with %p', async args => {
+  it.each([
+    { action: 'provision', provision }, { action: 'revoke', evaluation_user_id: 'other' }, { action: 'review', evaluation_user_id: 'eval_test' },
+    { action: 'inspect' }, { action: 'simulate', command: { operation: 'query' } }, { action: 'analyze', prompt: 'case' },
+  ])('a sandbox principal is denied %p by the lifecycle class in both registries', async args => {
     await expect(emmaToolRegistry.execute('evaluation_workspace', args, { userId: 'eval_test' })).rejects.toThrow();
+    await expect(mcpToolRegistry.execute('evaluation_workspace', args, { userId: 'eval_test', externalMcp: true })).rejects.toThrow();
     expect(evaluationStore.provision).not.toHaveBeenCalled();
     expect(evaluationStore.revoke).not.toHaveBeenCalled();
-    expect(runEvaluation).not.toHaveBeenCalled();
+    expect(evaluationStore.review).not.toHaveBeenCalled();
   });
   it.each([{ externalMcp: true }, { isInternal: true }])('transport without delegation provenance cannot mutate lifecycle: %p', async flags => {
     await expect(mcpToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin', ...flags })).rejects.toThrow();
@@ -53,25 +58,24 @@ describe('ENG-1870 Emma-operable lifecycle', () => {
     await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'admin', delegateInfo: { isDelegated: true } })).rejects.toThrow();
     expect(evaluationStore.revoke).not.toHaveBeenCalled();
   });
-  it.each([['Emma', emmaToolRegistry], ['MCP', mcpToolRegistry]] as const)('%s runs simulator commands through the evaluation boundary', async (_name, registry) => {
-    (evaluationStore.simulate as jest.Mock).mockResolvedValue({ ok: true, disclosure: 'Simulation complete — not sent to Meta' });
-    const command = { operation: 'create', kind: 'campaign', fields: { name: 'Proposal', objective: 'LEADS' } };
-    const response = await registry.execute('evaluation_workspace', { action: 'simulate', command }, { userId: 'eval_test' });
-    expect(evaluationStore.simulate).toHaveBeenCalledWith('eval_test', command);
-    expect(JSON.parse(response.content[0].text).disclosure).toBe('Simulation complete — not sent to Meta');
-    expect(runEvaluation).not.toHaveBeenCalled();
+  it('a non-admin customer cannot provision or revoke', async () => {
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({ userId: 'customer', isAdmin: false, isActive: true });
+    await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'provision', provision }, { userId: 'customer' })).rejects.toThrow();
+    await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'revoke', evaluation_user_id: 'eval_test' }, { userId: 'customer' })).rejects.toThrow();
+    expect(evaluationStore.provision).not.toHaveBeenCalled();
+    expect(evaluationStore.revoke).not.toHaveBeenCalled();
   });
   it('Emma exposes explicit review access without using an org or production tool', async () => {
-    (evaluationStore.review as jest.Mock).mockResolvedValue({ userId: 'eval_test', audit: [] });
-    await emmaToolRegistry.execute('evaluation_workspace', { action: 'review', evaluation_user_id: 'eval_test' }, { userId: 'admin' });
+    (evaluationStore.review as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', audit: [], truncated: false });
+    const result = await emmaToolRegistry.execute('evaluation_workspace', { action: 'review', evaluation_user_id: 'eval_test' }, { userId: 'admin' });
     expect(evaluationStore.review).toHaveBeenCalledWith('admin', 'eval_test');
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ userId: 'eval_test', audit: [] });
   });
-
-  it('Emma candidate inspect exposes a safe view without review assignments', async () => {
-    (evaluationStore.get as jest.Mock).mockResolvedValue({ userId: 'eval_test', status: 'active', expiresAt: Date.now()+60000, provisionedBy: 'private-admin', reviewerUserIds: ['private-reviewer'], simulation: { seed: [], objects: [] }, materials: [] });
-    const result = await emmaToolRegistry.execute('evaluation_workspace', { action: 'inspect' }, { userId: 'eval_test' });
-    const view = JSON.parse(result.content[0].text);
-    expect(view.reviewerUserIds).toBeUndefined(); expect(view.provisionedBy).toBeUndefined(); expect(view.simulation.seed).toBeUndefined();
+  it('review rejects unknown arguments before reading anything', async () => {
+    await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'review', evaluation_user_id: 'eval_test', artifact_id: 'x' }, { userId: 'admin' })).rejects.toThrow();
+    expect(evaluationStore.review).not.toHaveBeenCalled();
   });
-
+  it('unknown actions are refused', async () => {
+    await expect(emmaToolRegistry.execute('evaluation_workspace', { action: 'reset' }, { userId: 'admin' })).rejects.toThrow();
+  });
 });

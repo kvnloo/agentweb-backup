@@ -261,7 +261,6 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
   if (!data) return null;
 
   const { projection, pause } = data;
-  const pct = committedPercent(projection);
   const openedAMember = !!data.requestedUserId && data.requestedUserId !== data.billingUserId;
   const nothingRecorded = data.eventCount === 0;
 
@@ -293,14 +292,15 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
         </Alert>
       )}
 
-      {pause.paused && (
-        <Alert severity="error" sx={{ mb: 2 }} data-testid="spend-ledger-pause">
-          <Typography variant="body2" fontWeight={600}>
-            This account is paused.
-          </Typography>
-          <Typography variant="body2">{pause.reason}</Typography>
-        </Alert>
-      )}
+      {/* ENG-1874. The pause explanation is WITHHELD, not merely hidden.
+          `explainPause` compares committed spend against the usable allowance,
+          and those two have different bases today: the ledger holds vendor
+          spend only (no LLM row has ever been written to AW-SpendEvents — both
+          writers sit inside recordVendorUsage), while the allowance is the
+          tier's LLM cost cap. A pause claim built on that is not a weaker
+          answer, it is a wrong one, and this screen exists precisely to be
+          trusted about pauses. Restore it with ENG-1250 §6, when LLM rows reach
+          the ledger and the two sides finally describe the same thing. */}
 
       {/* Raw spend, what is committed but unresolved, and what the account may
           actually spend — three figures, never netted into one (ENG-1250 §3). */}
@@ -339,85 +339,35 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
             </Typography>
           </Box>
         </Grid>
-        <Grid item xs={12} md={3}>
-          <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-            <Typography variant="caption" color="text.secondary">
-              Usable allowance
-            </Typography>
-            <Typography variant="h6" data-testid="spend-ledger-allowance" sx={{ fontVariantNumeric: "tabular-nums" }}>
-              {projection.unlimited ? "Uncapped" : usdFromMicro(projection.usableAllowanceMicroUsd)}
-            </Typography>
-            <Typography variant="caption" color="text.secondary">
-              {projection.unlimited ? "no configured cap" : `${usdFromMicro(projection.includedAllowanceMicroUsd)} included`}
-            </Typography>
-          </Box>
-        </Grid>
-        <Grid item xs={12} md={3}>
-          <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-            <Typography variant="caption" color="text.secondary">
-              {projection.overspentMicroUsd > 0 ? "Overspent" : "Remaining"}
-            </Typography>
-            <Typography
-              variant="h6"
-              data-testid="spend-ledger-remaining"
-              sx={{
-                fontVariantNumeric: "tabular-nums",
-                color: projection.overspentMicroUsd > 0 ? "error.main" : undefined,
-              }}
-            >
-              {projection.unlimited
-                ? "—"
-                : projection.overspentMicroUsd > 0
-                ? usdFromMicro(projection.overspentMicroUsd)
-                : usdFromMicro(projection.remainingMicroUsd)}
-            </Typography>
-            <Typography variant="caption" color="text.secondary">
-              {pct == null ? "not applicable" : `${pct.toFixed(1)}% of allowance committed`}
-            </Typography>
-          </Box>
-        </Grid>
       </Grid>
 
-      {/* Adjustments, itemised. They raise what the account MAY spend; they
-          never reduce what it HAS spent, and showing a single net allowance
-          would make those indistinguishable. */}
-      {(projection.purchasedCreditsMicroUsd !== 0 ||
-        projection.adminAdjustmentMicroUsd !== 0 ||
-        projection.migrationAdjustmentMicroUsd !== 0) && (
-        <Box sx={{ mb: 2 }} data-testid="spend-ledger-adjustments">
-          <Typography variant="caption" color="text.secondary">
-            Allowance adjustments (these change what may be spent — never what was spent)
-          </Typography>
-          <Table size="small">
-            <TableBody>
-              {projection.purchasedCreditsMicroUsd !== 0 && (
-                <TableRow>
-                  <TableCell>Purchased credits</TableCell>
-                  <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                    {usdFromMicro(projection.purchasedCreditsMicroUsd)}
-                  </TableCell>
-                </TableRow>
-              )}
-              {projection.adminAdjustmentMicroUsd !== 0 && (
-                <TableRow>
-                  <TableCell>Admin grants and reversals</TableCell>
-                  <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                    {usdFromMicro(projection.adminAdjustmentMicroUsd)}
-                  </TableCell>
-                </TableRow>
-              )}
-              {projection.migrationAdjustmentMicroUsd !== 0 && (
-                <TableRow>
-                  <TableCell>Migration adjustment</TableCell>
-                  <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                    {usdFromMicro(projection.migrationAdjustmentMicroUsd)}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </Box>
-      )}
+      {/* What is NOT shown here, and why — ENG-1874.
+
+          Usable allowance, remaining, and "% of allowance committed" used to
+          sit beside the two figures above. They were removed because the
+          comparison is invalid, not because it is unavailable: the numerator
+          (this ledger) is vendor spend only, and the denominator (the tier's
+          cost cap) is sized for LLM spend too. The result rendered "0.0% of
+          allowance committed" for accounts that had consumed most of that cap.
+
+          Saying nothing would leave an admin to assume the omission is a bug.
+          Saying this costs one line and is true. */}
+      <Alert severity="info" sx={{ mb: 2 }} data-testid="spend-ledger-basis-note">
+        This ledger currently records <strong>vendor spend only</strong> — LLM usage is metered on
+        a separate rail and does not appear here. Allowance and remaining-balance figures are
+        withheld for that reason: comparing this total against a cap that also covers LLM spend
+        would understate how much of the cap is used.
+      </Alert>
+
+      {/* Allowance adjustments (purchased credits, admin grants, migration
+          offset) were rendered here until ENG-1874 and are withheld with the
+          allowance itself: an adjustment shown next to no balance invites the
+          reader to reconstruct the very comparison this change removes.
+
+          The principle they encode survives for whoever restores them — they
+          raise what the account MAY spend and never reduce what it HAS spent
+          (ENG-1250 §3), so a single net figure would make those two
+          indistinguishable. */}
 
       {nothingRecorded ? (
         // "No events" and "$0.00 spent" are different claims and only one of

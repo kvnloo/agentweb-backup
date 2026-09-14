@@ -88,6 +88,26 @@ describe('Admin delegate access endpoint', () => {
     expect(hoursUntilExpiration).toBeLessThan(8.5);
   });
 
+  // ENG-1907 AC5: a sandbox account is a real customer-portal account. Access
+  // Portal opens it through the same callback as everyone else; only the token
+  // scope differs (evaluation), so the auth layer still binds it to the candidate.
+  it('routes an evaluation target through the customer-portal callback with an evaluation-scoped token', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'eval_ryan', email: 'case@example.invalid', roles: ['customer'], delegateTokenEpoch: 2, sessionVersion: 3 } as any);
+    const res = await request(app).post('/api/admin/users/eval_ryan/delegate-access').set('Host', 'evaluation.example.invalid').expect(200);
+    expect(res.body.customerPortalUrl).toBe(`${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/oauth-callback?token=${res.body.delegateToken}`);
+    expect(res.body.customerPortalUrl).not.toContain('/evaluation');
+    expect(jwt.decode(res.body.delegateToken)).toMatchObject({ userId: 'eval_ryan', dte: 2, sv: 3, isAdmin: false, delegateAccess: { scope: 'evaluation', targetUserId: 'eval_ryan' } });
+    expect(res.body.expiresIn).toBe('8h');
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('preserves the existing customer portal callback for non-evaluation users', async () => {
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'customer', email: 'case@example.invalid', roles: ['customer'] } as any);
+    const res = await request(app).post('/api/admin/users/customer/delegate-access').expect(200);
+    expect(res.body.customerPortalUrl).toBe(`${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/oauth-callback?token=${res.body.delegateToken}`);
+    expect((jwt.decode(res.body.delegateToken) as any).delegateAccess.scope).toBeUndefined();
+  });
+
   // A user who has never been delegated to, or predates the field entirely, has
   // no epoch. That must mint 0 rather than undefined, or the claim is absent and
   // the middleware's `?? 0` silently compares nothing.

@@ -68,6 +68,9 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   // ENG-1795: a refused install repeats identically on retry, same as its siblings here.
   'skill_install_refused',
   'scope_refused',
+  // ENG-1844: the brand-logo gate blocks EVERY identical retry until the user uploads
+  // a logo out-of-band — no argument change on this call can satisfy it.
+  'missing_brand_logo',
   // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
   // "an identical retry is known-pointless".
   'read_bounded',
@@ -120,6 +123,12 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
    * here is what turns a refusal into a fabricated answer (ENG-1625).
    */
   subscription_blocked: 'the required skill is not included in the user\'s subscription. Do NOT retry it and do NOT substitute another tool — tell the user plainly that this capability is not on their plan.',
+  // ENG-1844: this is a correctly-working, by-design gate (ENG-326) — not a bug, an
+  // outage, or a platform-availability problem. Do NOT tell the user the service is
+  // unreachable/unavailable and do NOT offer to file a product issue about it — a real
+  // incident produced exactly that framing when this fell through to the generic
+  // unclassified bucket. The reason text above already names the real, one-step fix.
+  missing_brand_logo: 'no brand logo is saved in Brand Guidelines — this is a correctly-working content gate, NOT a service outage, a bug, or a platform-availability problem. Do NOT say the tool/service is unreachable or unavailable, and do NOT offer to file a product issue about it. Do NOT retry this call as-is. Tell the user plainly: upload a logo in Brand Guidelines (brand config), then ask you to generate again.',
   invalid_output: 'the tool ran but produced no usable output. Do NOT repeat the identical call — change the arguments/approach or use a different tool.',
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',

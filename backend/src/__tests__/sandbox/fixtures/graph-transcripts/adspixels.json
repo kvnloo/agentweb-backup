@@ -1,0 +1,27 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/adspixels",
+    "query": {
+      "fields": "id,name,last_fired_time,is_created_by_business",
+      "limit": "100"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "1200000000000011",
+        "name": "Object 672",
+        "last_fired_time": "2026-09-12T23:55:35+0000",
+        "is_created_by_business": true
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci03",
+        "after": "c2FuaXRpemVkLWN1cnNvci04"
+      }
+    }
+  }
+}

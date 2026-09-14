@@ -1,5 +1,7 @@
 import { userDb, crmDb } from "../services/db";
-import { getMetaAccountCredentials } from "../services/metaAccountCredentials";
+import { getMetaAccountCredentials, cleanAccountId } from "../services/metaAccountCredentials";
+import { isMetaAdAccount } from "../services/metaTokenRefresh";
+import { ConnectedAccount } from "../services/connectedAccountsDb";
 import {
   adsMetricsDb,
   buildEntityKey,
@@ -8,13 +10,20 @@ import {
 } from "../services/adsMetricsDb";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 import { promoteAttributionFromCustomFields } from "../types/attribution";
+import { isEvaluationUser } from "../services/evaluationPolicy";
 
-// ENG-916: Haven only, deliberately. Every.io's Meta CAPI gap (ENG-993) means its
-// Meta-reported conversions would read as artificially low/zero even with real leads
-// landing in the CRM — including it here risks misreading a measurement gap as a real
-// performance problem. Add Every.io once ENG-993 ships and is verified the same way
-// Haven was.
-const HAVEN_USER_ID = "a3917669-1c7d-45ed-8ef9-f454de109b6f";
+/**
+ * ENG-993: Every.io's Meta CAPI gap means its Meta-reported conversions read as
+ * artificially low/zero even with real leads landing in the CRM — snapshotting it risks
+ * misreading a measurement gap as a real performance problem. Keyed by ACCOUNT id, not
+ * userId — the exclusion is a property of that ad account's own data, not of any one
+ * `AW-Users` row, and the same account can in principle be reachable from more than one
+ * user record (see the doc comment on `enumerateDistinctMetaAdAccounts` below). Add
+ * Every.io's account back once ENG-993 ships and is verified the same way Haven was.
+ * Resolved via a live, read-only scan of AW-Users on 2026-09-09 — lyndi@every.io's own
+ * account, unshared with any other user.
+ */
+const EXCLUDED_META_ACCOUNT_IDS = new Set<string>(["1358071355944019"]);
 
 const META_API_VERSION = process.env.META_API_VERSION || "v25.0";
 
@@ -261,12 +270,14 @@ export async function snapshotMetaMetricsForDate(
       throw new Error(`[ENG-916] User ${userId} not found`);
     }
 
-  // ⚠ SCOPE LIMIT, deliberate while this card is Haven-only: getMetaAccountCredentials returns
-  // exactly ONE {accountId, accessToken}. A user with two connected ad accounts therefore gets one
-  // snapshotted and NO signal that the others were skipped. One ad account can also sit on several
-  // user records (21 connection rows resolve to 15 distinct ad accounts), so a user-keyed read can
-  // resolve an account whose leads live under a different record. Widening past Haven means
-  // iterating accounts here, not just changing HAVEN_USER_ID.
+  // ⚠ SCOPE LIMIT of this STANDALONE fallback only (no resolvedCredentials passed in) —
+  // getMetaAccountCredentials with no explicit accountId throws if the user has more than
+  // one connected Meta account, rather than picking one. `runMetaMetricsSnapshot` below
+  // does not hit this path at all: it enumerates every distinct account across every user
+  // (`enumerateDistinctMetaAdAccounts`) and always resolves + passes credentials per
+  // account, explicit accountId included. This fallback exists only for a future direct
+  // caller (e.g. a backfill script) that wants "the one account this user has" — it is not
+  // itself account-widened, and doesn't need to be for the cron's own correctness.
     ({ accountId, accessToken } = await getMetaAccountCredentials(user, userId));
   }
 
@@ -506,62 +517,141 @@ export async function snapshotMetaMetricsForDate(
   };
 }
 
+/** One distinct Meta ad account, resolved down to the single user record it will be
+ * snapshotted under. */
+export interface DistinctMetaAdAccount {
+  accountId: string;
+  canonicalUserId: string;
+  canonicalUser: any;
+}
+
 /**
- * Cron entry point — re-pulls and overwrites the last SETTLING_WINDOW_DAYS days
- * (excluding today, which is never complete) every run. Each day is isolated: one
- * day's failure is logged clearly and does not stop the others from running.
+ * Enumerate every distinct Meta ad account reachable from any user's `connected_accounts`,
+ * deduped by cleaned account id. `AdsMetricsSnapshotRow`'s primary key is `entityKey`
+ * (`platform#accountId#campaignId`) + `date` — `userId` is a plain GSI-read attribute, not
+ * part of the key — so writing the same account/date under two different `userId`s is not
+ * duplicated work, it is LOSSY: the second write overwrites the first, and whichever
+ * `userId` was written last silently wins the GSI read every sharing user's
+ * `monitor_lead_volume` call depends on.
+ *
+ * A shared account is real, not hypothetical — confirmed via a live, read-only scan of
+ * `AW-Users` on 2026-09-09: 22 connection rows resolve to 17 distinct accounts, with 3
+ * genuine multi-user shares (AgentWeb's own team account, Argusoft's own team account, and
+ * a real customer, RankAI, whose account is shared across 3 team members). When an account
+ * has more than one connection row, this picks exactly one canonical user deterministically
+ * — earliest `connected_accounts[].created_at` wins. `userDb.getAllUsers()` already filters
+ * out `deleted_`-prefixed (soft-deleted) userIds, so a deleted user's stale connection row
+ * (confirmed real: `dyllan1@rankai.ai`'s row survives under `deleted_...` after their
+ * account was removed) is never even a candidate here — no extra filtering needed.
+ */
+export async function enumerateDistinctMetaAdAccounts(): Promise<DistinctMetaAdAccount[]> {
+  const users = await userDb.getAllUsers();
+  const byAccountId = new Map<string, Array<{ userId: string; user: any; createdAt: string }>>();
+
+  for (const user of users) {
+    // ENG-1907: a sandbox principal's Meta connection is simulated; never snapshot it.
+    // getAllUsers already excludes these — this keeps the cron correct even if a caller opts in.
+    if (isEvaluationUser((user as any).userId)) continue;
+    const raw = (user as any).connected_accounts;
+    const accounts: ConnectedAccount[] = Array.isArray(raw) ? raw : [];
+    for (const account of accounts) {
+      if (!isMetaAdAccount(account)) continue;
+      const accountId = cleanAccountId(account.account_id || (account.config as any)?.ad_account_id || "");
+      if (!accountId) continue;
+      const entry = { userId: (user as any).userId, user, createdAt: account.created_at || "" };
+      const existing = byAccountId.get(accountId);
+      if (existing) existing.push(entry);
+      else byAccountId.set(accountId, [entry]);
+    }
+  }
+
+  const result: DistinctMetaAdAccount[] = [];
+  for (const [accountId, entries] of byAccountId) {
+    // Earliest created_at wins. A missing/empty created_at sorts LAST (treated as
+    // "unknown", never picked over a real timestamp) rather than first.
+    const canonical = entries.reduce((best, cur) => {
+      const bestTime = best.createdAt ? Date.parse(best.createdAt) : Infinity;
+      const curTime = cur.createdAt ? Date.parse(cur.createdAt) : Infinity;
+      return curTime < bestTime ? cur : best;
+    });
+    result.push({ accountId, canonicalUserId: canonical.userId, canonicalUser: canonical.user });
+  }
+  return result;
+}
+
+/**
+ * Cron entry point — for every distinct Meta ad account (see
+ * `enumerateDistinctMetaAdAccounts`), re-pulls and overwrites the last
+ * SETTLING_WINDOW_DAYS days (excluding today, which is never complete) every run. Each
+ * ACCOUNT is isolated (one account's credential/CRM failure does not stop the others), and
+ * within an account each DAY is isolated the same way it always was.
  */
 export async function runMetaMetricsSnapshot(): Promise<void> {
   console.log("[MetaMetricsSnapshotCron] Starting execution...");
 
-  // Resolve credentials once for the whole run. If they cannot be resolved, NO day can succeed,
-  // so fail fast with one clear line rather than repeating the same error once per day.
-  let credentials: ResolvedMetaCredentials;
-  let accountContext: MetaAccountContext;
+  let accounts: DistinctMetaAdAccount[];
   try {
-    const user = await userDb.getUserById(HAVEN_USER_ID);
-    if (!user) {
-      throw new Error(`[ENG-916] User ${HAVEN_USER_ID} not found`);
-    }
-    credentials = await getMetaAccountCredentials(user, HAVEN_USER_ID);
-    accountContext = await fetchMetaAccountContext(credentials.accountId, credentials.accessToken);
+    accounts = (await enumerateDistinctMetaAdAccounts()).filter(
+      (a) => !EXCLUDED_META_ACCOUNT_IDS.has(a.accountId)
+    );
   } catch (error) {
     console.error(
-      "[MetaMetricsSnapshotCron] CRITICAL ERROR resolving Meta credentials/account context — no days attempted:",
+      "[MetaMetricsSnapshotCron] CRITICAL ERROR enumerating Meta ad accounts — no accounts attempted:",
       error
     );
     return;
   }
+  console.log(`[MetaMetricsSnapshotCron] ${accounts.length} distinct Meta ad account(s) to snapshot.`);
 
-  // One walk of every list serves all SETTLING_WINDOW_DAYS days. A failure here is fatal to the
-  // run for the same reason a credential failure is: every day would repeat the identical error.
-  let leadsByDate: Map<string, any[]>;
-  try {
-    leadsByDate = await getLeadsByDateForUser(HAVEN_USER_ID);
-  } catch (error) {
-    console.error(
-      "[MetaMetricsSnapshotCron] CRITICAL ERROR reading CRM leads — no days attempted:",
-      error
-    );
-    return;
-  }
-
-  const today = new Date();
-  for (let daysAgo = 1; daysAgo <= SETTLING_WINDOW_DAYS; daysAgo++) {
-    const target = new Date(today);
-    target.setUTCDate(target.getUTCDate() - daysAgo);
-    const dateStr = toDateStr(target);
-
+  for (const { accountId, canonicalUserId, canonicalUser } of accounts) {
+    // Resolve credentials once per ACCOUNT (not per day, and not once for the whole run —
+    // each account is its own credential/CRM scope). If they cannot be resolved, no day
+    // for THIS account can succeed, so fail fast for this account and continue with the
+    // next rather than repeating the same error once per day, or aborting the whole run.
+    let credentials: ResolvedMetaCredentials;
+    let accountContext: MetaAccountContext;
     try {
-      const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, dateStr, credentials, leadsByDate, accountContext);
-      console.log(
-        `[MetaMetricsSnapshotCron] ${dateStr}: wrote ${result.rowsWritten} campaign rows, ` +
-          `${result.leadCount} attributed leads, ${result.unattributedLeadCount} unattributed`
-      );
+      credentials = await getMetaAccountCredentials(canonicalUser, canonicalUserId, accountId);
+      accountContext = await fetchMetaAccountContext(credentials.accountId, credentials.accessToken);
     } catch (error) {
-      // A missed day is recoverable later (Meta retains historical insights data) —
-      // but only if the miss is visible. Never fail silently.
-      console.error(`[MetaMetricsSnapshotCron] CRITICAL ERROR for ${dateStr}:`, error);
+      console.error(
+        `[MetaMetricsSnapshotCron] CRITICAL ERROR resolving credentials/account context for account ${accountId} (user ${canonicalUserId}) — no days attempted for this account:`,
+        error
+      );
+      continue;
+    }
+
+    // One walk of every list serves all SETTLING_WINDOW_DAYS days for this account's
+    // canonical user. A failure here is fatal to this account for the same reason a
+    // credential failure is, but does not affect any other account.
+    let leadsByDate: Map<string, any[]>;
+    try {
+      leadsByDate = await getLeadsByDateForUser(canonicalUserId);
+    } catch (error) {
+      console.error(
+        `[MetaMetricsSnapshotCron] CRITICAL ERROR reading CRM leads for account ${accountId} (user ${canonicalUserId}) — no days attempted for this account:`,
+        error
+      );
+      continue;
+    }
+
+    const today = new Date();
+    for (let daysAgo = 1; daysAgo <= SETTLING_WINDOW_DAYS; daysAgo++) {
+      const target = new Date(today);
+      target.setUTCDate(target.getUTCDate() - daysAgo);
+      const dateStr = toDateStr(target);
+
+      try {
+        const result = await snapshotMetaMetricsForDate(canonicalUserId, dateStr, credentials, leadsByDate, accountContext);
+        console.log(
+          `[MetaMetricsSnapshotCron] account ${accountId} ${dateStr}: wrote ${result.rowsWritten} campaign rows, ` +
+            `${result.leadCount} attributed leads, ${result.unattributedLeadCount} unattributed`
+        );
+      } catch (error) {
+        // A missed day is recoverable later (Meta retains historical insights data) —
+        // but only if the miss is visible. Never fail silently.
+        console.error(`[MetaMetricsSnapshotCron] CRITICAL ERROR for account ${accountId} ${dateStr}:`, error);
+      }
     }
   }
 

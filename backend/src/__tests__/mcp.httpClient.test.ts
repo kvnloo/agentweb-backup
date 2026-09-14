@@ -85,6 +85,55 @@ describe('httpClient', () => {
       ).rejects.toThrow('API error (403): Forbidden');
     });
 
+    // ENG-1844: a route can emit BOTH a human `message` (used for the thrown Error's
+    // text, unchanged — this must stay human) and a stable machine `error` code. The
+    // code was previously lost entirely once `message` won the `||`. Preserved
+    // separately on `.code` so classifyToolErrorClass can key off the code instead of
+    // the human prose.
+    it('preserves a distinct data.error as .code without changing the thrown message', async () => {
+      const mockResponse = {
+        ok: false,
+        status: 422,
+        headers: { get: () => 'application/json' },
+        json: () =>
+          Promise.resolve({
+            error: 'missing_brand_logo',
+            message: 'No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again.',
+          }),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      let caught: any;
+      try {
+        await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/generate', context: { userId: 'user-123' } });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught.message).toBe(
+        'API error (422): No brand logo is saved in Brand Guidelines. Upload your logo in brand config (Brand Guidelines), then generate again.'
+      );
+      expect(caught.code).toBe('missing_brand_logo');
+    });
+
+    it('does not set .code when data.error and data.message are the same string', async () => {
+      const mockResponse = {
+        ok: false,
+        status: 400,
+        headers: { get: () => 'application/json' },
+        json: () => Promise.resolve({ error: 'Bad request' }),
+      };
+      global.fetch = jest.fn().mockResolvedValue(mockResponse) as any;
+
+      let caught: any;
+      try {
+        await mcpFetch({ method: 'GET', path: '/api/test', context: { userId: 'user-123' } });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught.code).toBeUndefined();
+    });
+
     // ENG-1189: a raw network failure (undici's TypeError('fetch failed') on a self-call,
     // e.g. because the backend process was mid-restart) used to propagate to the LLM as the
     // bare, unactionable string "fetch failed" with no endpoint/method/cause and no retry —

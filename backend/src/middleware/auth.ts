@@ -34,6 +34,7 @@ export interface UserPayload {
   _svc?: boolean;
   // Delegation fields
   delegateAccess?: {
+    scope?: 'evaluation';
     adminUserId: string;
     adminEmail: string;
     targetUserId: string;
@@ -68,15 +69,27 @@ export async function getUserFromToken(req: Request): Promise<{
       getJwtSecret()
     ) as UserPayload;
 
-    // Evaluation users never enter staff delegation or elevated self-call paths.
+    // Evaluation Access Portal delegation stays a candidate principal; generic delegation remains denied.
     if (isEvaluationUser(decoded.userId) || isEvaluationUser(decoded.delegateAccess?.targetUserId) || isEvaluationUser(decoded.delegateAccess?.adminUserId)) {
-      if (decoded._svc || decoded.delegateAccess || decoded.isAdmin || !isEvaluationUser(decoded.userId)) return { user: null };
+      if (decoded._svc || decoded.isAdmin || !isEvaluationUser(decoded.userId)) return { user: null };
+      const delegate = decoded.delegateAccess;
+      if (delegate && (delegate.scope !== 'evaluation' || delegate.targetUserId !== decoded.userId ||
+          delegate.targetEmail !== decoded.email || isEvaluationUser(delegate.adminUserId))) return { user: null };
       const evaluation = await requireActiveEvaluation(decoded.userId);
       if (decoded.email !== evaluation.email) return { user: null };
       const account = await userDb.getUserByEmailConsistent(evaluation.email);
       if (!account || account.userId !== decoded.userId || account.isActive !== true || account.isAdmin || account.orgId ||
           (decoded.sv ?? 0) < (account.sessionVersion ?? 0)) return { user: null };
-      return { user: { userId: account.userId, email: account.email, isAdmin: false, roles: ['customer'] }, decoded };
+      let adminUser;
+      if (delegate) {
+        if (!Number.isSafeInteger(decoded.dte) || !Number.isSafeInteger(decoded.sv) ||
+            decoded.dte !== (account.delegateTokenEpoch ?? 0) || decoded.sv !== (account.sessionVersion ?? 0)) return { user: null };
+        adminUser = await userDb.getUserByIdConsistent(delegate.adminUserId);
+        if (!adminUser || adminUser.userId !== delegate.adminUserId || adminUser.email !== delegate.adminEmail ||
+            adminUser.isAdmin !== true || adminUser.isActive !== true) return { user: null };
+      }
+      return { user: { userId: account.userId, email: account.email, isAdmin: false, roles: ['customer'] }, decoded,
+        ...(adminUser ? { adminUser: { userId: adminUser.userId, email: adminUser.email } } : {}) };
     }
 
     // Handle delegate access tokens

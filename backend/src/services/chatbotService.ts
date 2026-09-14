@@ -19,6 +19,7 @@ import { Storage } from '@google-cloud/storage';
 // export to exist) — dropped rather than carried into the lazy form.
 import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
+import { isEvaluationUser } from './evaluationPolicy';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
@@ -763,9 +764,10 @@ export class ChatbotDB {
       throw error;
     }
 
-    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access.
+    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access
+    // and not sandbox (eval_) principals, whose take-home sessions are not customer engagement (ENG-1907).
     // Fire-and-forget: don't fail session creation if this update fails.
-    if (!delegateInfo?.isDelegated) {
+    if (!delegateInfo?.isDelegated && !isEvaluationUser(userId)) {
       userDb.updateUser(userId, { lastActiveAt: timestamp }).catch((err) => {
         console.error(`Failed to update lastActiveAt for user ${userId}:`, err);
       });
@@ -1278,6 +1280,65 @@ export class ChatbotDB {
       const firstUser = (result.Items || []).find((item: any) => item.message?.role === 'user');
       return firstUser ? (firstUser.message.content as string) || null : null;
     } catch {
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1819: the most recent REAL (not server-injected) user message's content, via a
+   * bounded, reverse-sorted, paginated query — not a full `getChatSession` hydration. Used
+   * by the work-plan auto-continuation stop-check, which needs to know whether the user's
+   * last actual instruction asked to stop, without paying the cost of the full message-table
+   * read/migration `getChatSession` performs (same reasoning as `getSessionPreview` and
+   * `getChatSessionRecord` above). `sessionId`(HASH)+`messageIndex`(RANGE) makes
+   * `ScanIndexForward: false` a direct, correct reverse-index read, not a scan.
+   *
+   * Excludes two known server-authored `role: 'user'` kinds, both INDISTINGUISHABLE from a
+   * real user turn by role alone:
+   *   - `metadata.kind === 'auto-continuation'` — the injected continuation directive itself
+   *     (AUTO_WORK_PLAN_CONTINUATION_MESSAGE); without this, a stale "stop" verdict from an
+   *     earlier round would keep re-triggering forever.
+   *   - `metadata.autoDelegatedAnswer === true` — the runVerifiedChat auto-take breadcrumb
+   *     ("[Full autonomy] Proceed with..."), persisted with no `kind` field at all
+   *     (agentModeController.ts's resolveAwaitingUserQuestion). Missing this would let an
+   *     auto-answered question mask a real earlier "stop" behind it.
+   *
+   * Paginated rather than a single fixed `Limit`: one response turn persists ONE row PER
+   * TOOL CALL (agentModeController.ts's response-message persistence), so a single
+   * tool-call-heavy autocomplete round — exactly this feature's own primary case — can
+   * exhaust a small fixed limit before ever reaching the real user turn underneath it.
+   * Still bounded (MAX_PAGES caps total read cost) rather than the unbounded
+   * getMessagesFromMessagesTable paginate-everything approach.
+   */
+  async getMostRecentRealUserMessage(sessionId: string, consistentRead = false): Promise<{ content: string; timestamp?: string } | null> {
+    const PAGE_SIZE = 25;
+    const MAX_PAGES = 4;
+    try {
+      let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const result = await dynamodb.query({
+          TableName: this.messagesTableName,
+          KeyConditionExpression: 'sessionId = :sessionId',
+          ExpressionAttributeValues: { ':sessionId': sessionId },
+          ScanIndexForward: false,
+          Limit: PAGE_SIZE,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+          ...(consistentRead ? { ConsistentRead: true } : {}),
+        }).promise();
+        const realUser = (result.Items || []).find((item: any) =>
+          item.message?.role === 'user'
+          && item.message?.metadata?.kind !== 'auto-continuation'
+          && item.message?.metadata?.autoDelegatedAnswer !== true
+        );
+        if (realUser?.message?.content) {
+          return { content: realUser.message.content as string, timestamp: realUser.message?.metadata?.timestamp };
+        }
+        lastKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
+        if (!lastKey) break;
+      }
+      return null;
+    } catch (error) {
+      console.error(`ChatbotDB: getMostRecentRealUserMessage failed for session ${sessionId}:`, error);
       return null;
     }
   }

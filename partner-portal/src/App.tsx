@@ -37,6 +37,7 @@ import WorkPlans from './pages/WorkPlans';
 import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import AgentRunsInspector from './pages/AgentRunsInspector';
+import SandboxAccounts from './pages/SandboxAccounts';
 import PromptTemplates from './pages/PromptTemplates';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
@@ -152,6 +153,14 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <ClientHealth />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="sandbox-accounts"
+                      element={
+                        <AdminRoute>
+                          <SandboxAccounts />
                         </AdminRoute>
                       }
                     />

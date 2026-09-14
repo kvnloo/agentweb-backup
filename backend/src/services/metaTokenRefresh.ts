@@ -22,6 +22,7 @@
 
 import { ConnectedAccount, MetaAdAccountConfig, updateAccountTokens } from './connectedAccountsDb';
 import { metaService } from './metaService';
+import { isSandboxToken } from './sandbox/sentinel';
 
 /**
  * Refresh tokens this many ms before they expire. A token comfortably inside
@@ -83,6 +84,10 @@ export function isMetaAdAccount(account: ConnectedAccount): boolean {
  */
 export function needsMetaRefresh(account: ConnectedAccount, now: number = Date.now()): boolean {
   if (!isMetaAdAccount(account)) return false;
+  // A sandbox connection (ENG-1908) carries a sentinel, not a Meta token. Exchanging it would
+  // send a fake credential to Meta and, on the inevitable failure, mark a working simulated
+  // account as broken. Gate here so the cron and the inline path both skip it.
+  if (isSandboxToken(account.config.access_token)) return false;
   const expiresAt = account.config.token_expires_at;
   if (!expiresAt) return true; // unknown expiry — refresh to be safe
   return expiresAt - now <= META_REFRESH_WINDOW_MS;
