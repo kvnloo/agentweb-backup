@@ -569,6 +569,12 @@ describe('measureLlmLedgerCoverage (ENG-1934)', () => {
     expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: 2_000_000 });
   });
 
+  it('a ledger holding MORE than the aggregate beyond a cent is "partial" too — a duplicate or orphan overstates spend', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent(), anLlmEvent({ eventId: 'dup', costMicroUsd: 2_000_000 })], [anLlmRow()]);
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: 0, excessLlmMicroUsd: 2_000_000 });
+  });
+
   it('an unmeasurable month is "partial", never assumed complete', () => {
     const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent()], null);
 

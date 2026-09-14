@@ -36,12 +36,16 @@ jest.mock('../../services/usageAnalyticsService', () => ({
 // composition rather than a restatement of it.
 jest.mock('../../services/spendEventDb', () => ({ listSpendEvents: jest.fn() }));
 const mockAggregateRows = jest.fn();
+const mockQueryByBillingScan = jest.fn();
 jest.mock('../../services/usageRecordDb', () => ({
   ...jest.requireActual('../../services/usageRecordDb'),
-  usageRecordDb: { queryByBillingUserDateRange: (...a: unknown[]) => mockAggregateRows(...a) },
+  usageRecordDb: {
+    queryByUserDateRange: (...a: unknown[]) => mockAggregateRows(...a),
+    queryByBillingUserDateRange: (...a: unknown[]) => mockQueryByBillingScan(...a),
+  },
 }));
 jest.mock('../../services/tokenUsageService', () => ({ resolveBillingUserId: jest.fn() }));
-jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() } }));
+jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgMembers: jest.fn() } }));
 jest.mock('../../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
 jest.mock('../../services/llmUsageCreditService', () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
 
@@ -54,7 +58,7 @@ import {
 } from '../../services/usageAnalyticsService';
 import { listSpendEvents } from '../../services/spendEventDb';
 import { resolveBillingUserId } from '../../services/tokenUsageService';
-import { userDb } from '../../services/db';
+import { orgDb, userDb } from '../../services/db';
 import { getSubscriptionTypeConfig } from '../../services/subscriptionService';
 import { getLlmUsageCreditAdjustment } from '../../services/llmUsageCreditService';
 
@@ -65,6 +69,7 @@ const mockAuth = authenticateToken as unknown as jest.Mock;
 const mockListSpendEvents = listSpendEvents as jest.Mock;
 const mockResolveBilling = resolveBillingUserId as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockOrgMembers = orgDb.getOrgMembers as jest.Mock;
 const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
 const mockCreditAdjustment = getLlmUsageCreditAdjustment as jest.Mock;
 
@@ -233,19 +238,34 @@ describe('admin usage routes', () => {
         expect(mockAggregateRows).not.toHaveBeenCalled();
       });
 
-      it('reads the SAME billing subject and month, and reports what the ledger is missing', async () => {
-        mockListSpendEvents.mockResolvedValue([llmEvent(1_000_000)]);
-        mockAggregateRows.mockResolvedValue([llmRow('2026-09-04', 3_000_000), llmRow('2026-09-20', 1_000_000)]);
+      it('reads each partition that can hold the subject\'s rows by KEYED query — never a table scan', async () => {
+        mockGetUserById.mockResolvedValue({ userId: 'owner-1', subscriptionType: 'Pro', orgId: 'org-1' });
+        mockOrgMembers.mockResolvedValue([{ userId: 'owner-1' }, { userId: 'member-2' }]);
+        mockListSpendEvents.mockResolvedValue([{ ...llmEvent(1_000_000), actingUserId: 'member-3' }]);
+        mockAggregateRows.mockImplementation(async (actor: string) =>
+          actor === 'member-2'
+            ? [llmRow('2026-09-04', 3_000_000), { ...llmRow('2026-09-05', 7_000_000), billingUserId: 'someone-else' }]
+            : actor === 'member-3'
+              ? [llmRow('2026-09-20', 1_000_000)]
+              : [],
+        );
 
         const res = await request(app).get('/api/admin/users/member-1/spend/breakdown').query({ month: '2026-09' });
 
-        expect(mockAggregateRows).toHaveBeenCalledWith('owner-1', '2026-09-01', '2026-09-31');
-        expect(res.body.llmLedger).toMatchObject({ month: 'partial', missingLlmMicroUsd: 3_000_000 });
+        expect(mockQueryByBillingScan).not.toHaveBeenCalled();
+        // The owner, every current org member, and every acting user the ledger saw.
+        expect(mockAggregateRows.mock.calls.map((c) => c[0]).sort()).toEqual(['member-2', 'member-3', 'owner-1']);
+        expect(mockAggregateRows).toHaveBeenCalledWith('member-2', '2026-09-01', '2026-09-31');
+        // The row billed to someone else in a member's partition is not this subject's spend.
+        expect(res.body.llmLedger).toMatchObject({ month: 'partial', aggregateLlmMicroUsd: 4_000_000, missingLlmMicroUsd: 3_000_000 });
       });
 
       it('is full when the two rails agree', async () => {
         mockListSpendEvents.mockResolvedValue([llmEvent(1_000_000, '2026-10')]);
-        mockAggregateRows.mockResolvedValue([llmRow('2026-10-02', 1_000_000)]);
+        // The acting member's partition holds the row; the owner's is empty.
+        mockAggregateRows.mockImplementation(async (actor: string) =>
+          actor === 'member-1' ? [llmRow('2026-10-02', 1_000_000)] : [],
+        );
 
         const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-10' });
 

@@ -398,6 +398,16 @@ describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
     );
   });
 
+  it("a ledger that holds MORE than the usage records is called overstated, not understated", () => {
+    const over = coverage("partial");
+    over.llmLedger.missingLlmMicroUsd = 0;
+    (over.llmLedger as any).excessLlmMicroUsd = 5_000_000;
+
+    expect(partialCoverageCaption(over.llmLedger)).toBe(
+      "Overstated: the ledger holds $5.00 more LLM spend than usage records",
+    );
+  });
+
   it("an unmeasured month says so rather than claiming a gap or completeness", () => {
     render(<SpendLedgerBody data={payload(coverage("partial", true, null))} />);
 
