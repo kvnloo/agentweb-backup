@@ -15,7 +15,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { updateAccountConfig } from '../services/connectedAccountsDb';
+import { updateAccountConfig, TRANSACTION_CONFLICT_RETRIES } from '../services/connectedAccountsDb';
 import { userDb } from '../services/db';
 
 const metaAccount = () => ({
@@ -191,6 +191,68 @@ describe('updateAccountConfig', () => {
       // The retry saw ['ads_read'] on its own read and correctly narrowed it —
       // not the first read's [], reapplied blind.
       expect(config.granted_scopes).toEqual([]);
+    });
+  });
+
+  /**
+   * ENG-1873. `TransactionConflictException` means another request holds a
+   * DynamoDB transaction on this user item — in production,
+   * `applyMonthlyChargeAtomic`, run for each LLM completion. A tool call executes
+   * as soon as its completion returns, often while that charge is still
+   * committing, so the tool's config write lost the race and failed closed. It
+   * surfaced as a stale-invitation drain that withdrew nothing, three runs in a
+   * row: `TransactionConflictException: Transaction is ongoing for the item`.
+   */
+  describe('in-flight transaction on the same item (ENG-1873)', () => {
+    const txConflict = () =>
+      Object.assign(new Error('Transaction is ongoing for the item'), { code: 'TransactionConflictException' });
+    const casConflict = () =>
+      Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+
+    it('THE BUG: retries instead of failing, and re-reads before re-applying', async () => {
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce(txConflict()).mockResolvedValueOnce(undefined);
+
+      await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: ['ads_read'] });
+
+      expect((userDb.updateUser as jest.Mock).mock.calls).toHaveLength(2);
+      // Fresh read on the retry, never the stale snapshot.
+      expect((userDb.getUserByIdConsistent as jest.Mock).mock.calls).toHaveLength(2);
+      const config = (userDb.updateUser as jest.Mock).mock.calls[1][1].connected_accounts[0].config;
+      expect(config.granted_scopes).toEqual(['ads_read']);
+    });
+
+    it('rethrows the original error once its own retry budget is spent', async () => {
+      (userDb.updateUser as jest.Mock).mockRejectedValue(txConflict());
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] })
+      ).rejects.toMatchObject({ code: 'TransactionConflictException' });
+      // One initial attempt plus the bounded retries — never an unbounded loop.
+      expect((userDb.updateUser as jest.Mock).mock.calls).toHaveLength(TRANSACTION_CONFLICT_RETRIES + 1);
+    });
+
+    it('does not consume the CAS budget — a genuine overwrite still gets its three tries', async () => {
+      (userDb.updateUser as jest.Mock)
+        .mockRejectedValueOnce(txConflict())
+        .mockRejectedValueOnce(txConflict())
+        .mockRejectedValueOnce(casConflict())
+        .mockRejectedValueOnce(casConflict())
+        .mockResolvedValueOnce(undefined);
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] })
+      ).resolves.toBeUndefined();
+      expect((userDb.updateUser as jest.Mock).mock.calls).toHaveLength(5);
+    });
+
+    it('still gives up with ConnectedAccountChanged after three CAS conflicts, however many tx conflicts came first', async () => {
+      (userDb.updateUser as jest.Mock)
+        .mockRejectedValueOnce(txConflict())
+        .mockRejectedValue(casConflict());
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] })
+      ).rejects.toMatchObject({ code: 'ConnectedAccountChanged' });
     });
   });
 
