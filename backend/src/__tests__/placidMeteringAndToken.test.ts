@@ -30,7 +30,7 @@ jest.mock('aws-sdk', () => {
   return { __esModule: true, default: { S3, SecretsManager, DynamoDB }, S3, SecretsManager, DynamoDB };
 });
 
-import { getPlacidPrivateToken } from '../utils/secretsManager';
+import { getPlacidPrivateToken, __resetPlacidTokenCache, PLACID_TOKEN_TTL_MS } from '../utils/secretsManager';
 
 describe('getPlacidPrivateToken (ENG-698)', () => {
   const originalEnv = process.env;
@@ -39,6 +39,9 @@ describe('getPlacidPrivateToken (ENG-698)', () => {
     jest.clearAllMocks();
     process.env = { ...originalEnv };
     delete process.env.PLACID_PRIVATE_TOKEN;
+    // The resolved token is cached at module scope, so without this each test
+    // would silently read the previous test's answer.
+    __resetPlacidTokenCache();
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
   });
@@ -68,6 +71,7 @@ describe('getPlacidPrivateToken (ENG-698)', () => {
     expect(mockGetSecret).toHaveBeenLastCalledWith('prod/AgentWeb/Placid');
 
     process.env.NODE_ENV = 'development';
+    __resetPlacidTokenCache();
     await getPlacidPrivateToken();
     expect(mockGetSecret).toHaveBeenLastCalledWith('dev/AgentWeb/Placid');
   });
@@ -93,6 +97,67 @@ describe('getPlacidPrivateToken (ENG-698)', () => {
     process.env.PLACID_PRIVATE_TOKEN = 'tok-env';
     mockGetSecret.mockResolvedValue({ SecretString: '{"somethingElse":"nope"}' });
     await expect(getPlacidPrivateToken()).resolves.toBe('tok-env');
+  });
+
+  // ── Caching (CodeRabbit, PR #2901) ────────────────────────────────────────
+  // This getter sits on interactive request paths. The env read it replaced
+  // was free; an uncached Secrets Manager call on each page view is not.
+
+  it('reuses a resolved token instead of calling Secrets Manager on every request', async () => {
+    mockGetSecret.mockResolvedValue({ SecretString: 'tok' });
+
+    await getPlacidPrivateToken();
+    await getPlacidPrivateToken();
+    await getPlacidPrivateToken();
+
+    expect(mockGetSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares one lookup between concurrent callers on a cold cache', async () => {
+    let release!: (v: unknown) => void;
+    mockGetSecret.mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = Promise.all([getPlacidPrivateToken(), getPlacidPrivateToken(), getPlacidPrivateToken()]);
+    release({ SecretString: 'tok' });
+
+    await expect(pending).resolves.toEqual(['tok', 'tok', 'tok']);
+    // Without dedup, a cold cache under load fans out into one read per request.
+    expect(mockGetSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it('caches a miss too, so development does not retry a missing secret on every request', async () => {
+    process.env.PLACID_PRIVATE_TOKEN = 'tok-env';
+    mockGetSecret.mockRejectedValue(new Error('ResourceNotFoundException'));
+
+    await getPlacidPrivateToken();
+    await getPlacidPrivateToken();
+
+    expect(mockGetSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks Secrets Manager again once the TTL has passed', async () => {
+    jest.useFakeTimers();
+    try {
+      mockGetSecret.mockResolvedValue({ SecretString: 'tok-1' });
+      await expect(getPlacidPrivateToken()).resolves.toBe('tok-1');
+
+      // A rotated secret must eventually be picked up.
+      mockGetSecret.mockResolvedValue({ SecretString: 'tok-2' });
+      jest.setSystemTime(Date.now() + PLACID_TOKEN_TTL_MS + 1);
+
+      await expect(getPlacidPrivateToken()).resolves.toBe('tok-2');
+      expect(mockGetSecret).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not wedge after a lookup fails — the next call can resolve', async () => {
+    mockGetSecret.mockRejectedValueOnce(new Error('throttled'));
+    await expect(getPlacidPrivateToken()).resolves.toBeNull(); // no env either
+    __resetPlacidTokenCache(); // simulate TTL expiry
+    mockGetSecret.mockResolvedValue({ SecretString: 'tok' });
+    await expect(getPlacidPrivateToken()).resolves.toBe('tok');
   });
 
   it('returns null when neither source has a token', async () => {
@@ -185,6 +250,7 @@ describe('Placid render metering (ENG-698)', () => {
     expect(mockRecordVendorUsage).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'user-3',
+        billingUserId: 'user-3',
         provider: 'placid',
         operation: 'image_render',
         unit: 'render',
@@ -194,6 +260,29 @@ describe('Placid render metering (ENG-698)', () => {
     );
     // $0.095 per image render, from the ENG-703 card.
     expect(mockRecordVendorUsage.mock.calls[0][0].costUsd).toBeCloseTo(0.095, 6);
+  });
+
+  // CodeRabbit, PR #2901. The access check lets an admin render a task that a
+  // customer owns. Billing the requester would charge the ADMIN's own account
+  // for the customer's render.
+  it('bills the task owner, not the admin who rendered it on their behalf', async () => {
+    mockGetTask.mockResolvedValue({ taskId: 'task-1', userId: 'customer-1' });
+    mockGetUser.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+    const r = res();
+    await generateFromTemplateToExecution(renderReq('admin-1'), r);
+
+    expect(r.status).toHaveBeenCalledWith(200);
+    const ctx = mockRecordVendorUsage.mock.calls[0][0];
+    expect(ctx.billingUserId).toBe('customer-1');
+    // The admin is still recorded as who did it — both are kept (ENG-666 #2).
+    expect(ctx.userId).toBe('admin-1');
+    expect(ctx.onBehalfOf).toBe('customer-1');
+  });
+
+  it('sets no onBehalfOf when the owner renders their own task', async () => {
+    const r = res();
+    await generateFromTemplateToExecution(renderReq('user-3'), r);
+    expect(mockRecordVendorUsage.mock.calls[0][0].onBehalfOf).toBeUndefined();
   });
 
   it('does not record when Placid returned no image', async () => {
