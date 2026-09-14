@@ -29,6 +29,7 @@ import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
 import { listSpendEvents } from "../services/spendEventDb";
 import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
 import { projectMonth } from "../services/spendProjection";
+import { describeLlmLedgerCoverage } from "../services/spendLedgerDualWrite";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { userDb } from "../services/db";
@@ -110,6 +111,9 @@ router.get(
         projection,
         // §7: "no admin should need direct DynamoDB inspection to explain a pause"
         pause: explainPause(projection, breakdown),
+        // ENG-1934: whether this month's total includes LLM spend, and from
+        // when. The allowance comparison is only meaningful against it.
+        llmLedger: describeLlmLedgerCoverage(month),
       });
     } catch (error: any) {
       console.error("[adminUsage] spend breakdown failed:", error?.message || error);
