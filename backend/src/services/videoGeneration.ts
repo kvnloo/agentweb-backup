@@ -5,7 +5,7 @@ import { remotionService, RemotionComposeParams } from "./remotionService";
 import { imageService } from "./imageGeneration";
 import { McpClientService } from "../mcp/client/mcpClientService";
 import { meterUserUsage } from "./usageRecorderService";
-import { videoGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+import { videoGenerationCostUsd, videoClipCount, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 interface VideoGenerationResult {
   success: boolean;
@@ -1104,6 +1104,7 @@ export class VideoService {
             outputTokens: 0,
             costUsdOverride: videoGenerationCostUsd(modelToUse, requestedDuration),
             costProvenance: LLM_PRICE_BOOK_PROVENANCE,
+            generationCount: videoClipCount(requestedDuration),
           });
         }
 

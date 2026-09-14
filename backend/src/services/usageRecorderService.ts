@@ -75,6 +75,12 @@ export interface RecordUsageContext {
    */
   costProvenance?: string;
   /**
+   * ENG-1934: how many billed generations `costUsdOverride` covers, for a
+   * per-generation model — a 16s video is two clips at the clip price, and
+   * its spend event must say 2, not 1. Defaults to 1.
+   */
+  generationCount?: number;
+  /**
    * ENG-1251 Greptile P1: YYYY-MM-DD override. A caller that ALSO writes a
    * paired charge event for the same logical usage (internalUsage.ts is the
    * only one today) must compute this ledger row's date from the exact same
@@ -295,6 +301,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
         feature: increment.feature,
         totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
         perGeneration: isPerGenerationPriced(ctx.model),
+        generationCount: ctx.generationCount,
         costMicroUsd,
         costSource,
         rateProvenance:

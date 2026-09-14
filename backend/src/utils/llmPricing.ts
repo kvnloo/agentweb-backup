@@ -389,12 +389,19 @@ export function geminiFlashImageUsage(usage: unknown, hasImage: boolean) {
  */
 export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
   const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
+  return clipPrice * videoClipCount(durationSeconds);
+}
+
+/**
+ * How many billed clips a requested duration is. Shared with the spend ledger
+ * (ENG-1934), so an event's generation quantity is the same number the cost
+ * was multiplied by.
+ */
+export function videoClipCount(durationSeconds?: number): number {
   const VEO_MAX_SECONDS = 8;
-  const clipCount =
-    durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-  return clipPrice * clipCount;
+  return durationSeconds && durationSeconds > VEO_MAX_SECONDS
+    ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+    : 1;
 }
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */
