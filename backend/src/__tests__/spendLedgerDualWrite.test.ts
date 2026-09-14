@@ -10,10 +10,9 @@ jest.mock('../services/spendEventDb', () => ({
 }));
 
 import {
-  LLM_SPEND_LEDGER_STARTED_ON,
   VendorUsageMirrorInput,
+  buildLlmSpendEvent,
   buildShadowEvent,
-  describeLlmLedgerCoverage,
   isDualWriteEnabled,
   isLlmSpendEvent,
   mirrorVendorUsage,
@@ -222,44 +221,30 @@ describe('spendLedgerDualWrite', () => {
 
 // ── ENG-1934: LLM ledger coverage ───────────────────────────────────────────
 
-describe('describeLlmLedgerCoverage (ENG-1934)', () => {
-  const original = process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
-  afterEach(() => {
-    if (original === undefined) delete process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
-    else process.env.SPEND_LEDGER_LLM_DUAL_WRITE = original;
-  });
-
-  const startMonth = LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7);
-  const monthAfter = (() => {
-    const [y, m] = startMonth.split('-').map(Number);
-    return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
-  })();
-
-  it('a month that ended before LLM events existed holds vendor spend only', () => {
-    expect(describeLlmLedgerCoverage('2026-08').month).toBe('none');
-  });
-
-  it('the start month is partial (it did not start on the 1st)', () => {
-    expect(LLM_SPEND_LEDGER_STARTED_ON.endsWith('-01')).toBe(false);
-    expect(describeLlmLedgerCoverage(startMonth).month).toBe('partial');
-  });
-
-  it('every later month is full', () => {
-    expect(describeLlmLedgerCoverage(monthAfter).month).toBe('full');
-  });
-
-  it('reports the kill switch as it is right now', () => {
-    delete process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
-    expect(describeLlmLedgerCoverage(monthAfter).recording).toBe(true);
-    process.env.SPEND_LEDGER_LLM_DUAL_WRITE = 'false';
-    expect(describeLlmLedgerCoverage(monthAfter).recording).toBe(false);
-  });
-
-  it('isLlmSpendEvent recognises only the two LLM units', () => {
+describe('isLlmSpendEvent (ENG-1934)', () => {
+  it('recognises only the two LLM units', () => {
     expect(isLlmSpendEvent({ unit: 'llm_token' })).toBe(true);
     expect(isLlmSpendEvent({ unit: 'llm_generation' })).toBe(true);
     for (const vendorUnit of ['query', 'render', 'solve', '1k_characters', 'token', 'generation']) {
       expect(isLlmSpendEvent({ unit: vendorUnit })).toBe(false);
     }
+  });
+});
+
+describe('buildLlmSpendEvent generation count (ENG-1934)', () => {
+  const input = {
+    actingUserId: 'u', billingUserId: 'o', provider: 'openai', model: 'gpt-image-1', feature: 'f',
+    totalTokens: 0, perGeneration: true, costMicroUsd: 120_000, costSource: 'allocated' as const,
+    rateProvenance: 'caller:agent-engine',
+  };
+
+  it('records how many generations a grouped cost covers', () => {
+    const built = buildLlmSpendEvent({ ...input, generationCount: 3 }, '2026-09-14T10:00:00.000Z');
+    expect('event' in built && built.event).toMatchObject({ unit: 'llm_generation', quantity: 3, costMicroUsd: 120_000 });
+  });
+
+  it('defaults to one generation for a single in-process call', () => {
+    const built = buildLlmSpendEvent(input, '2026-09-14T10:00:00.000Z');
+    expect('event' in built && built.event.quantity).toBe(1);
   });
 });

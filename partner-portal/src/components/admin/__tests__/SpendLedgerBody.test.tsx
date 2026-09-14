@@ -10,6 +10,7 @@ import SpendLedgerBody, {
   shortInstant,
   shortDay,
   allowanceComparison,
+  partialCoverageCaption,
   SpendLedgerPayload,
   MonthlyProjection,
 } from "../SpendLedgerBody";
@@ -343,8 +344,19 @@ describe("SpendLedgerBody", () => {
 // backend that predates ENG-1934 returns — and keep proving that case stays
 // withheld. These cover a backend that reports coverage.
 
-const coverage = (month: "none" | "partial" | "full", recording = true) => ({
-  llmLedger: { recording, startedOn: "2026-09-14", month },
+const coverage = (
+  month: "none" | "partial" | "full",
+  recording = true,
+  missingLlmMicroUsd: number | null = month === "partial" ? 12_340_000 : month === "full" ? 0 : null,
+) => ({
+  llmLedger: {
+    recording,
+    startedOn: "2026-09-14",
+    month,
+    ledgerLlmMicroUsd: 50_000_000,
+    aggregateLlmMicroUsd: missingLlmMicroUsd == null ? null : 50_000_000 + missingLlmMicroUsd,
+    missingLlmMicroUsd,
+  },
 });
 
 describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
@@ -354,6 +366,9 @@ describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
     expect(allowanceComparison(coverage("partial"))).toBe("partial");
     expect(allowanceComparison(coverage("full"))).toBe("full");
     expect(shortDay("2026-09-14")).toBe("Sep 14");
+    expect(partialCoverageCaption(coverage("partial").llmLedger)).toBe(
+      "Understated: $12.34 of LLM spend is not in the ledger",
+    );
   });
 
   it("a fully covered month shows allowance, remaining and percentage, with no understatement warning", () => {
@@ -374,20 +389,26 @@ describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
     expect(screen.getByTestId("spend-ledger-basis-note")).toHaveTextContent("LLM and vendor spend");
   });
 
-  it("the month recording began carries the understatement IN the figure's caption, not a footnote", () => {
+  it("partial coverage states the MEASURED gap IN the figure's caption, not a footnote", () => {
     render(<SpendLedgerBody data={payload(coverage("partial"))} />);
 
     const remaining = screen.getByTestId("spend-ledger-remaining").parentElement!;
     expect(within(remaining).getByTestId("spend-ledger-partial-coverage")).toHaveTextContent(
-      "Understated: LLM spend counted from Sep 14 only",
+      "Understated: $12.34 of LLM spend is not in the ledger",
     );
   });
 
-  it("an uncapped tier gets no understatement caption — there is no percentage to qualify", () => {
+  it("an unmeasured month says so rather than claiming a gap or completeness", () => {
+    render(<SpendLedgerBody data={payload(coverage("partial", true, null))} />);
+
+    expect(screen.getByTestId("spend-ledger-partial-coverage")).toHaveTextContent("Unverified");
+  });
+
+  it("an uncapped tier still gets the caption — its total is just as incomplete (CodeRabbit, PR #2904)", () => {
     render(<SpendLedgerBody data={payload({ ...coverage("partial"), projection: projection({ unlimited: true }) })} />);
 
     expect(screen.getByTestId("spend-ledger-allowance")).toHaveTextContent("Uncapped");
-    expect(screen.queryByTestId("spend-ledger-partial-coverage")).not.toBeInTheDocument();
+    expect(screen.getByTestId("spend-ledger-partial-coverage")).toHaveTextContent("Understated");
   });
 
   it("a month that ended before recording began stays withheld, and says why in terms of that month", () => {

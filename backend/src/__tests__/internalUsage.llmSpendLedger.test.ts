@@ -86,7 +86,9 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
 
     expect(res.status).toBe(202);
     expect(mockTxn).toHaveBeenCalledTimes(1);
-    const [increment, charge, event] = mockTxn.mock.calls[0];
+    const [increment, charge, events] = mockTxn.mock.calls[0];
+    expect(events).toHaveLength(1);
+    const [event] = events;
 
     expect(() => validateSpendEvent(event)).not.toThrow();
     expect(event).toMatchObject({
@@ -106,7 +108,7 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
 
   it("AC2: token quantity is the group's total tokens across both records", async () => {
     await post({ records: [record(), record({ taskId: "t2" })], reportId: "r-1" });
-    const [, charge, event] = mockTxn.mock.calls[0];
+    const [, charge, [event]] = mockTxn.mock.calls[0];
 
     expect(event.unit).toBe("llm_token");
     expect(event.quantity).toBe(2 * (1_000_000 + 2_000 + 300 + 40));
@@ -117,8 +119,8 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
     await post({ records: [record()], reportId: "r-1" });
     await post({ records: [record()], reportId: "r-1" });
 
-    const [, charge1, event1] = mockTxn.mock.calls[0];
-    const [, charge2, event2] = mockTxn.mock.calls[1];
+    const [, charge1, [event1]] = mockTxn.mock.calls[0];
+    const [, charge2, [event2]] = mockTxn.mock.calls[1];
     expect(event1.eventId).toBe(`llm:${charge1.eventId}`);
     expect(event2.eventId).toBe(event1.eventId);
     expect(charge2.eventId).toBe(charge1.eventId);
@@ -127,7 +129,7 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
   it("AC4: a backend-priced group carries the price book's version", async () => {
     await post({ records: [record()], reportId: "r-1" });
 
-    expect(mockTxn.mock.calls[0][2].rateCardVersion).toBe(LLM_PRICE_BOOK_PROVENANCE);
+    expect(mockTxn.mock.calls[0][2][0].rateCardVersion).toBe(LLM_PRICE_BOOK_PROVENANCE);
   });
 
   it("AC4: a group the ENGINE priced is attributed to the engine — on the event and on the fallback write", async () => {
@@ -135,7 +137,7 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
 
     await post({ records: [record({ costUsdOverride: 0.5 })], reportId: "r-1" });
 
-    expect(mockTxn.mock.calls[0][2].rateCardVersion).toBe("caller:agent-engine");
+    expect(mockTxn.mock.calls[0][2].map((e: any) => e.rateCardVersion)).toEqual(["caller:agent-engine"]);
     // The conflict fallback goes through recordUsage, which must say the same.
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ costProvenance: "caller:agent-engine" });
@@ -146,11 +148,58 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
     expect(fallbackCtx.occurredAt).toBe(mockTxn.mock.calls[0][1].occurredAt);
   });
 
-  it("AC5: an unpriced model's group writes aggregate + charge as before, and no spend event", async () => {
+  it("AC5: an unpriced model's group writes aggregate + charge, labels the aggregate unpriced, and writes no spend event", async () => {
     await post({ records: [record({ model: "model-nobody-priced" })], reportId: "r-1" });
 
     expect(mockTxn).toHaveBeenCalledTimes(1);
     expect(mockTxn.mock.calls[0]).toHaveLength(2);
+    // ENG-700 on this path too: nobody priced it, so it is not a confirmed $0.
+    expect(mockTxn.mock.calls[0][0].costSource).toBe("unpriced");
+  });
+
+  it("AC4: a group mixing book- and engine-priced records writes one event per portion, summing to the aggregate", async () => {
+    await post({
+      records: [record(), record({ taskId: "t2", costUsdOverride: 0.25 })],
+      reportId: "r-1",
+    });
+
+    const [increment, charge, events] = mockTxn.mock.calls[0];
+    expect(events.map((e: any) => [e.rateCardVersion, e.eventId])).toEqual([
+      [LLM_PRICE_BOOK_PROVENANCE, `llm:${charge.eventId}`],
+      ["caller:agent-engine", `llm:${charge.eventId}#engine`],
+    ]);
+    expect(events[1].costMicroUsd).toBe(250_000);
+    expect(events[0].costMicroUsd + events[1].costMicroUsd).toBe(increment.costMicroUsd);
+    const perRecordTokens = 1_000_000 + 2_000 + 300 + 40;
+    expect(events.map((e: any) => e.quantity)).toEqual([perRecordTokens, perRecordTokens]);
+  });
+
+  it("AC5: an unknown model mixing engine-priced and unpriced records records ONLY the engine portion", async () => {
+    await post({
+      records: [
+        record({ model: "model-nobody-priced" }),
+        record({ model: "model-nobody-priced", taskId: "t2", costUsdOverride: 0.1 }),
+      ],
+      reportId: "r-1",
+    });
+
+    const [increment, , events] = mockTxn.mock.calls[0];
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ rateCardVersion: "caller:agent-engine", costMicroUsd: 100_000 });
+    expect(events[0].quantity).toBe(1_000_000 + 2_000 + 300 + 40);
+    expect(increment.costSource).toBe("allocated");
+  });
+
+  it("AC2: a batch of image generations records how many there were", async () => {
+    await post({
+      records: [1, 2, 3].map((n) =>
+        record({ model: "gpt-image-1", provider: "openai", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsdOverride: 0.04, taskId: `t${n}` }),
+      ),
+      reportId: "r-1",
+    });
+
+    const [, , [event]] = mockTxn.mock.calls[0];
+    expect(event).toMatchObject({ unit: "llm_generation", quantity: 3, costMicroUsd: 120_000 });
   });
 
   it("AC7: with the kill switch off the transaction is exactly the two items it was", async () => {

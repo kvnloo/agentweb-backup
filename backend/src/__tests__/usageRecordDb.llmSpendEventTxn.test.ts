@@ -1,8 +1,8 @@
 /**
- * ENG-1934 — the engine transaction's optional third item.
+ * ENG-1934 — the engine transaction's spend-event items.
  *
- * `incrementUsageWithChargeEvent` grows from two items to three when a spend
- * event is supplied. The classification of a cancelled transaction is the part
+ * `incrementUsageWithChargeEvent` grows from two items to one more per spend
+ * event supplied (one per priced portion of the group). The classification of a cancelled transaction is the part
  * that can silently lose money: "duplicate" makes the route SKIP the write, so
  * it must only ever mean "this exact charge already landed".
  */
@@ -74,7 +74,7 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
   });
 
   it('writes aggregate, charge event and spend event in ONE transaction', async () => {
-    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, spendEvent)).resolves.toBe('applied');
+    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent])).resolves.toBe('applied');
 
     expect(mockDynamoDB.transactWrite).toHaveBeenCalledTimes(1);
     const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
@@ -86,6 +86,30 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
     });
   });
 
+  it('writes one item per priced portion — engine-priced and book-priced stay separate events', async () => {
+    const engineEvent = { ...spendEvent, eventId: `${spendEvent.eventId}#engine`, rateCardVersion: 'caller:agent-engine' };
+
+    await usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent, engineEvent]);
+
+    const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
+    expect(TransactItems).toHaveLength(4);
+    expect(TransactItems.slice(2).map((i: any) => i.Put.Item.rateCardVersion)).toEqual([
+      'llm-price-book:2026-09-10',
+      'caller:agent-engine',
+    ]);
+  });
+
+  it('a condition failure on ANY spend-event item alone still throws, never "duplicate"', async () => {
+    const engineEvent = { ...spendEvent, eventId: `${spendEvent.eventId}#engine`, rateCardVersion: 'caller:agent-engine' };
+    mockDynamoDB.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(cancelled(['None', 'None', 'None', 'ConditionalCheckFailed'])),
+    });
+
+    await expect(
+      usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent, engineEvent]),
+    ).rejects.toThrow('TransactionCanceled');
+  });
+
   it('without one, the transaction is the same two items as before', async () => {
     await usageRecordDb.incrementUsageWithChargeEvent(increment, charge);
 
@@ -95,7 +119,7 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
   it('rejects a malformed spend event BEFORE writing anything', async () => {
     const bad = { ...spendEvent, rateCardVersion: undefined };
 
-    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, bad)).rejects.toBeInstanceOf(
+    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [bad])).rejects.toBeInstanceOf(
       SpendEventValidationError,
     );
     expect(mockDynamoDB.transactWrite).not.toHaveBeenCalled();
@@ -106,7 +130,7 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
       promise: jest.fn().mockRejectedValue(cancelled(['None', 'ConditionalCheckFailed', 'ConditionalCheckFailed'])),
     });
 
-    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, spendEvent)).resolves.toBe(
+    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent])).resolves.toBe(
       'duplicate',
     );
   });
@@ -118,7 +142,7 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
       promise: jest.fn().mockRejectedValue(cancelled(['None', 'None', 'ConditionalCheckFailed'])),
     });
 
-    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, spendEvent)).rejects.toThrow(
+    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent])).rejects.toThrow(
       'TransactionCanceled',
     );
   });
@@ -128,7 +152,7 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
       promise: jest.fn().mockRejectedValue(cancelled(['None', 'TransactionConflict', 'None'])),
     });
 
-    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, spendEvent)).resolves.toBe(
+    await expect(usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent])).resolves.toBe(
       'conflict',
     );
   });

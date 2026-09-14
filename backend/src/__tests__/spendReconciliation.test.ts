@@ -14,6 +14,7 @@ import {
   reconcileVendorFidelity,
   selectReconcilableSubjects,
   splitVendorModel,
+  measureLlmLedgerCoverage,
 } from '../services/spendReconciliation';
 import { SpendEvent } from '../services/spendEventDb';
 import { UsageRecordRow } from '../services/usageRecordDb';
@@ -485,19 +486,27 @@ describe('LLM fidelity (ENG-1934)', () => {
     expect(report.ok).toBe(true);
   });
 
-  it('an unpriced model\'s aggregate row is not counted as unmirrored spend', () => {
+  it('an aggregate row labelled unpriced is not counted as unmirrored spend', () => {
     const report = reconcileVendorFidelity(
       [],
-      [
-        anLlmRow({ model: 'model-nobody-priced', costSource: 'unpriced', costMicroUsd: 0 }),
-        // The engine path tags unknown models "allocated" at $0.
-        anLlmRow({ model: 'another-unpriced-model', costSource: 'allocated', costMicroUsd: 0 }),
-      ],
+      [anLlmRow({ model: 'model-nobody-priced', costSource: 'unpriced', costMicroUsd: 0 })],
       { llmMirrorStartedAt },
     );
 
     expect(report.unmirroredGroups).toEqual([]);
     expect(report.groupCount).toBe(0);
+  });
+
+  it('trusts an ALLOCATED $0 row for an unknown model — its $0 event is matched, not orphaned (CodeRabbit, PR #2904)', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent({ operation: 'model-nobody-priced', costMicroUsd: 0 })],
+      [anLlmRow({ model: 'model-nobody-priced', costSource: 'allocated', costMicroUsd: 0 })],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.orphanGroups).toEqual([]);
+    expect(report.assessedGroupCount).toBe(1);
+    expect(report.ok).toBe(true);
   });
 
   it('a vendor and an LLM group can never collide into one', () => {
@@ -527,5 +536,57 @@ describe('LLM fidelity (ENG-1934)', () => {
       expect(reconcilable).toEqual(['all-llm-failed']);
       expect(llmOnly).toEqual([]);
     });
+  });
+});
+
+describe('measureLlmLedgerCoverage (ENG-1934)', () => {
+  const original = process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
+  afterEach(() => {
+    if (original === undefined) delete process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
+    else process.env.SPEND_LEDGER_LLM_DUAL_WRITE = original;
+  });
+
+  it('a month that ended before LLM events existed is "none", and is not measured', () => {
+    const c = measureLlmLedgerCoverage('2026-08', [], [anLlmRow({ date: '2026-08-20' })]);
+
+    expect(c).toMatchObject({ month: 'none', aggregateLlmMicroUsd: null, missingLlmMicroUsd: null });
+  });
+
+  it('is "full" when the ledger holds the aggregate rail\'s LLM spend within a cent', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent()], [anLlmRow(), aVendorRow()]);
+
+    // The vendor row is not LLM spend and must not count against coverage.
+    expect(c).toMatchObject({ month: 'full', ledgerLlmMicroUsd: 3_954_436, aggregateLlmMicroUsd: 3_954_436, missingLlmMicroUsd: 0 });
+  });
+
+  it('is "partial" with the missing amount when LLM spend has no events — a switch-off week, a fallback write, or the days before recording began', () => {
+    const c = measureLlmLedgerCoverage(
+      '2026-09',
+      [anLlmEvent()],
+      [anLlmRow(), anLlmRow({ date: '2026-09-02', costMicroUsd: 2_000_000 })],
+    );
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: 2_000_000 });
+  });
+
+  it('an unmeasurable month is "partial", never assumed complete', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent()], null);
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: null });
+  });
+
+  it('ignores vendor events, unsettled events and unpriced rows on either side', () => {
+    const c = measureLlmLedgerCoverage(
+      '2026-09',
+      [anLlmEvent(), anEvent({ costMicroUsd: 9_999_999 }), anLlmEvent({ eventId: 'r', lifecycle: 'reserved' })],
+      [anLlmRow(), anLlmRow({ model: 'x', costSource: 'unpriced', costMicroUsd: 0 })],
+    );
+
+    expect(c).toMatchObject({ month: 'full', ledgerLlmMicroUsd: 3_954_436 });
+  });
+
+  it('reports the kill switch as it is right now', () => {
+    process.env.SPEND_LEDGER_LLM_DUAL_WRITE = 'false';
+    expect(measureLlmLedgerCoverage('2026-10', [], []).recording).toBe(false);
   });
 });
