@@ -7,18 +7,29 @@
  * around them — tier, usage state, the credit ledger, and a reconciliation
  * against the counter the cap actually enforces on.
  *
- * ## What this deliberately does NOT claim
+ * ## All-in cost (AC3)
  *
- * AC3 asks for actual all-in cost against the $7 / $73 / $180 targets, split
- * into LLM, non-LLM vendors, admitted-work overrun and infrastructure. The
- * non-LLM half is not measurable yet: of the vendors ENG-666 covers, only X
- * writes ledger rows today (ENG-694/695/696/698/699 are all Blocked), and v0
- * spend lives in its own `AW-V0Usage` table outside the ledger entirely.
+ * As of 2026-09-14 every paid vendor writes to this ledger: v0, X, You.com,
+ * Google CSE, Apollo, enrich.so, Remotion, ElevenLabs, 2captcha and Placid all
+ * route through `recordVendorUsage` into `AW-UsageRecords`, and the coverage
+ * guard now holds zero allowlisted vendors. So `vendorCostUsd` is COMPLETE, not
+ * a sample, and `allInCostUsd = llmCostUsd + vendorCostUsd` is honest to
+ * compute: the reason it was withheld (a figure silently omitting most of its
+ * inputs) no longer applies.
  *
- * So `vendorCostUsd` is reported as MEASURED-ONLY and every row carries
- * `vendorCoverage: 'partial'`. It is not summed into an all-in figure, because a
- * number that silently omits most of its inputs is worse than an absent one —
- * it would read as the overhead envelope being comfortably met. AC3 stays open.
+ * The all-in figure is separated into its AC3 parts: LLM, non-LLM vendor,
+ * admitted-work overrun (LLM spend past the effective cap, admitted before the
+ * boundary and allowed to finish), and infrastructure. Per-account
+ * infrastructure is deliberately $0: the billing boundary excludes shared
+ * platform overhead from per-account attribution without a reviewed allocation
+ * policy, so allocating it here would be an invention, not a measurement.
+ *
+ * What AC3 still needs from a human: the COGS targets ($7 / $73 / $180 in the
+ * ticket) to compare actual all-in against. Those numbers are stale (the hard
+ * caps moved to $80/$200 on 2026-09-01 and Super Premium never had a row), and
+ * setting the authoritative targets is a business decision (ENG-1688). This
+ * report computes and separates actual all-in cost; the target comparison is
+ * layered on once those numbers exist.
  *
  * The tier targets are likewise NOT hardcoded here. They moved on 2026-09-01
  * (Starter $60 -> $80, Pro $150 -> $200) and Super Premium has never had a row,
@@ -56,9 +67,15 @@ export interface UnitEconomicsRow {
 
   /** Ledger spend on token-priced rows only. */
   llmCostUsd: number;
-  /** Ledger spend on metered per-unit vendor rows. Incomplete — see file header. */
+  /** Ledger spend on metered per-unit vendor rows. Complete — every paid vendor writes here. */
   vendorCostUsd: number;
-  vendorCoverage: 'partial';
+  vendorCoverage: 'complete';
+  /** llmCostUsd + vendorCostUsd — the actual all-in cost (AC3). */
+  allInCostUsd: number;
+  /** LLM spend past the effective cap (admitted-work overrun); $0 when within cap or uncapped. */
+  admittedWorkOverrunUsd: number;
+  /** Shared platform overhead — not per-account attributable, so always $0 here (AC3, honestly). */
+  infrastructureUsd: number;
 
   /** Credit ledger, scoped to this month (a stale month contributes nothing). */
   migrationOffsetUsd: number;
@@ -100,6 +117,8 @@ export interface UnitEconomicsReport {
     tier: string;
     accounts: number;
     llmCostUsd: number;
+    vendorCostUsd: number;
+    allInCostUsd: number;
     purchasedCreditsUsd: number;
     includedThresholdUsd: number | null;
     overThreshold: number;
@@ -197,7 +216,13 @@ export async function buildUnitEconomicsReport(
       usageState: policy ? (policy.enforcementState || 'unknown') : 'unknown',
       llmCostUsd: round(llmCostUsd),
       vendorCostUsd: round(agg.vendorMicro / MICRO),
-      vendorCoverage: 'partial',
+      vendorCoverage: 'complete',
+      allInCostUsd: round(llmCostUsd + agg.vendorMicro / MICRO),
+      // Overrun is measured against the EFFECTIVE cap (threshold + credits +
+      // grants); an uncapped tier cannot overrun, so a null threshold => $0.
+      admittedWorkOverrunUsd:
+        effectiveThresholdUsd === null ? 0 : round(Math.max(0, policyCostUsd - effectiveThresholdUsd)),
+      infrastructureUsd: 0,
       migrationOffsetUsd: round(migrationOffsetUsd),
       purchasedCreditsUsd: round(purchasedCreditsUsd),
       adminGrantedUsd: round(adminGrantedUsd),
@@ -240,6 +265,8 @@ export async function buildUnitEconomicsReport(
       tier,
       accounts: list.length,
       llmCostUsd: round(list.reduce((s, r) => s + r.llmCostUsd, 0)),
+      vendorCostUsd: round(list.reduce((s, r) => s + r.vendorCostUsd, 0)),
+      allInCostUsd: round(list.reduce((s, r) => s + r.allInCostUsd, 0)),
       purchasedCreditsUsd: round(list.reduce((s, r) => s + r.purchasedCreditsUsd, 0)),
       includedThresholdUsd: list[0]?.includedThresholdUsd ?? null,
       overThreshold: list.filter((r) => r.percentUsed !== null && r.percentUsed >= 100).length,
@@ -274,6 +301,6 @@ export async function buildUnitEconomicsReport(
     alerts,
     unreconciled,
     vendorCoverageNote:
-      'vendorCostUsd counts only metered per-unit vendor rows. Most ENG-666 vendors do not write to this ledger yet and v0 spend lives in AW-V0Usage, so this is not an all-in figure and no overhead envelope is derived from it (ENG-1139 AC3 remains open).',
+      'vendorCostUsd is complete: every paid vendor (v0, X, You.com, Google CSE, Apollo, enrich.so, Remotion, ElevenLabs, 2captcha, Placid) writes to AW-UsageRecords. allInCostUsd = LLM + vendor is therefore actual all-in cost. Per-account infrastructure is $0 (shared overhead is not per-account attributable). The remaining AC3 item is the COGS target comparison, which needs the authoritative $7/$73/$180 numbers (ENG-1688).',
   };
 }

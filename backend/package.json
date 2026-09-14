@@ -15,6 +15,7 @@
     "test:twins": "node --max-old-space-size=4096 node_modules/.bin/jest --forceExit --roots=./src/__tests__/twins --testPathIgnorePatterns=/node_modules/",
     "test:twins:setup": "ts-node scripts/twinsSetup.ts",
     "test:twins:teardown": "ts-node scripts/twinsTeardown.ts",
+    "refresh:openrouter-params": "ts-node --transpile-only src/scripts/refreshOpenRouterParamSnapshot.ts",
     "create-tables": "ts-node src/scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
     "test:mcp-race": "ts-node src/scripts/test-mcp-race-condition.ts",

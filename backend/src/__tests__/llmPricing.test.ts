@@ -2,13 +2,12 @@
  * Tests for the shadow-metering price book.
  *
  * The "registry coverage" suite is the CI guard: every model id in
- * agentModeService's llmModels registry MUST have a price entry. It parses the
- * registry out of the source file (rather than importing the 470KB module with
- * its construction side effects) so the guard stays cheap and side-effect free.
+ * the LLM model registry MUST have a price entry. It imports the registry from
+ * agentMode/llmModelRegistry.ts (ENG-1831), which has no runtime dependencies,
+ * so the guard stays cheap and side-effect free.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
   LLM_PRICE_BOOK_VERSION,
@@ -24,19 +23,7 @@ import {
 import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
 
 function parseLlmModelsRegistryKeys(): string[] {
-  const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
-  const src = fs.readFileSync(srcPath, 'utf8');
-  const blockMatch = src.match(
-    /private llmModels: Record<string, LLMModelConfig> = \{([\s\S]*?)\n {2}\};/
-  );
-  if (!blockMatch) {
-    throw new Error('Could not locate the llmModels registry in agentModeService.ts');
-  }
-  const keys = [...blockMatch[1].matchAll(/^\s*'([^']+)':\s*\{/gm)].map((m) => m[1]);
-  if (keys.length === 0) {
-    throw new Error('Parsed zero model ids from the llmModels registry');
-  }
-  return keys;
+  return Object.keys(LLM_MODEL_REGISTRY);
 }
 
 /**

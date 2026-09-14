@@ -1,0 +1,374 @@
+/**
+ * ENG-1831: the LLM model registry — capability metadata for every model
+ * callLLM can serve — moved out of agentModeService.ts so it can be read,
+ * tested and guarded (see openRouterRequestParams.registryGuard.test.ts)
+ * without importing the service, which drags in most of the backend.
+ *
+ * Adding a model: add one entry here, a price in utils/llmPricing.ts, then run
+ * `npm run refresh:openrouter-params` so the OpenRouter guard covers it.
+ */
+import type OpenAI from 'openai';
+import type { GatewayReasoningConfig } from '../../utils/openRouterGatewayContract';
+
+/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
+export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/** Underlying lab a model is from, for picking the right provider icon in the picker. */
+export type ModelProvider =
+  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
+
+// Type for LLM model configuration
+export interface LLMModelConfig extends GatewayReasoningConfig {
+  client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
+  supportsTemperature: boolean;
+  /**
+   * False when the model's OpenRouter entry omits `tool_choice` from
+   * `supported_parameters`. Optional and defaulting to TRUE: every other model in
+   * this registry accepts it, so only the exceptions carry the flag.
+   *
+   * This is the same class of defect as `supportsTemperature`, one parameter
+   * over, and it fails LOUDER: an unsupported `tool_choice` makes OpenRouter's
+   * provider router find no endpoint at all and return
+   * `404 No endpoints found that can handle the requested parameters`, so every
+   * agent-mode turn on that model 500s. Mirror the model page rather than
+   * assuming parity with a sibling — Claude Fable 5.1 omits `tool_choice` while
+   * Claude Fable 5 and both `:batch` variants support it.
+   */
+  supportsToolChoice?: boolean;
+  /**
+   * False when no OpenRouter endpoint for the model lists `tools` (ENG-1831:
+   * the Perplexity Sonar research models). Defaults to TRUE. callLLM refuses a
+   * request carrying tools for such a model rather than letting OpenRouter 404.
+   */
+  supportsTools?: boolean;
+  /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
+  isLive?: boolean;
+  /**
+   * True if the model can be used as the describe_image vision model — i.e. it is
+   * multimodal AND reachable/provisioned in this deployment. Verified empirically
+   * (see getVisionModelOptions). Models that are text/voice-only, return 404 from
+   * their provider, or aren't provisioned on the account are intentionally omitted.
+   */
+  supportsVision?: boolean;
+  /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
+  maxTools?: number;
+  /** True to restrict model to admin users only */
+  adminOnly?: boolean;
+  /** Internal workload model: callable by services but never selectable in the customer picker. */
+  internalOnly?: boolean;
+  /**
+   * Usage/cost tier for the model picker UI. Only used as a fallback when
+   * getModelPrice() has no entry for this model — otherwise the picker's
+   * tier grouping is derived live from the computed cost score (see
+   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
+   */
+  tier?: ModelTier;
+  /** Short, user-facing one-line description shown next to the model name in the picker. */
+  description?: string;
+  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
+  name?: string;
+  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
+  provider?: ModelProvider;
+  /**
+   * True for a superseded version of a model family still kept selectable for
+   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
+   * this flag only affects picker visibility grouping, never generation). The picker
+   * UI tucks these behind a "Show more" row instead of hiding them from new selection
+   * entirely (that's what adminOnly is for).
+   *
+   * Hand-set here for models superseded for reasons other than pure
+   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
+   * ALSO computes legacy live for any model that a same-`family` model
+   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
+   * computation combine with OR, never override each other.
+   */
+  legacy?: boolean;
+  /**
+   * Groups models that are genuinely the same product line across
+   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
+   * Claude Opus release) for automatic same-family dominance detection.
+   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
+   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
+   * product tiers serving different jobs, not generations of the same
+   * model, so they must never share a family or a stronger sibling tier
+   * would wrongly hide a still-useful different-tier model. Omitted
+   * (no family) means this model is never auto-dominated.
+   */
+  family?: string;
+  /**
+   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
+   * entirely when there is insufficient benchmark evidence for this model —
+   * never estimated or invented. Does NOT get lowered merely because a
+   * model is `legacy`; legacy affects picker visibility grouping only, not
+   * how good the model actually is.
+   */
+  qualityScore?: number;
+  /** Methodology/source note for qualityScore — benchmark name, source
+   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
+   *  Index v4.2, snapshot 2026-09-05, max"). Surfaced in the picker's quality tooltip. */
+  qualityScoreSource?: string;
+  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
+  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
+  // so it is computed live rather than duplicated as a second hand-typed
+  // number that can drift from what we actually bill.
+}
+
+export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig>>> = {
+  // ENG-1786: all quality scores use AA Intelligence Index v4.2, snapshot
+  // 2026-09-05 (32-row research table in Linear). Sources name the canonical
+  // AA page variant; benchmark effort need not match the provider runtime default.
+  // Logical model metadata only. `callLLM` resolves every text/tool request
+  // through OpenRouter; no provider client is constructed from this registry.
+  // supportsVision flags below were verified empirically against the describe_image
+  // path (probe against a real image). All GPT-5 deployments handle vision.
+  // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
+  // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
+  // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
+  // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+  // no working deployment possible on any resource). Both were already
+  // legacy:true and the two lowest-quality entries in the gpt5-chat family.
+  // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
+  // to gpt-5.5 (see below) — a paused schedule/session still holding the old
+  // id resolves forward instead of throwing "Invalid model". Do not delete a
+  // registry entry without an alias first; that was exactly the caution the
+  // prior version of this comment existed to enforce.
+  'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4, xhigh' },
+  'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4 Nano, xhigh (AA estimate)' },
+  'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.5, xhigh' },
+  // List gemini models - client will be lazy-loaded
+  // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
+  // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
+  // so picking it was a guaranteed failure. llmPricing.ts already carried the
+  // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
+  // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
+  // Its price entry is intentionally left in place — a rate for a removed model is
+  // harmless, a missing rate for a live one is not.
+  // 2026-08-19: Harsha — "the preview gemini models should be moved to
+  // legacy asap." Static legacy: true (not dominance-derived — "preview"
+  // status isn't something a cost/quality comparison would ever catch on
+  // its own; this is a policy call that preview builds shouldn't be a
+  // default-visible pick regardless of how they benchmark).
+  // resolveGenerationModel/resolveFallbackModel are untouched — an
+  // existing session or schedule pinned to either id is unaffected.
+  // Google accepts at most 128 function declarations per request. This limit
+  // applies whether Gemini is reached directly or through OpenRouter: the
+  // gateway can fail over transports, but it cannot make an invalid upstream
+  // request valid. Fresh Emma sidebar sessions expose the legacy full tool
+  // catalog, so omitting this cap made Gemini fail deterministically with 400.
+  'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 21, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3 Flash Preview, Non-reasoning (AA estimate)' },
+  'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Pro Preview, reasoning' },
+  'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Flash Lite, reasoning' },
+  'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.5 Flash, high' },
+  // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
+  // live against three independent sources (ai.google.dev/deepmind.google/
+  // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
+  // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
+  // of it — 3.6 is deliberately skipped (never added to this registry) since
+  // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
+  // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
+  // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
+  // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
+  // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
+  // Flash is now correctly auto-flagged legacy.
+  // ENG-1713: gemini-3.6-flash (band predecessor, not itself in this registry),
+  // 3.7, and 3.8 all deprecate temperature/top_p/top_k per Google's migration
+  // guide (ai.google.dev/gemini-api/docs/latest-model — "Remove deprecated
+  // sampling parameters" — confirmed live 2026-09-03 for both ids). Google
+  // currently ignores the param on these models (soft no-op) but states a
+  // future generation will hard-400 on it, so this is set ahead of that.
+  'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.7 Flash, high' },
+  'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.8 Flash, high' },
+  // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
+  'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
+  // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
+  // the suffix after the prefix passed straight through as OpenRouter's own model
+  // string, so a new upstream model is one registry line, not new routing code.
+  //
+  // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
+  // (2026-08-17), not guessed:
+  // - supportsTemperature: mirrors each model's `supported_parameters` value.
+  // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
+  //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
+  //   endpoints APIs expose no numeric tool-call limit for any model (checked
+  //   both), so setting a number here would be a guess, not evidence. (The
+  //   128 previously on this line was exactly that guess, copied from the Azure
+  //   convention without verification — removed.)
+  // - supportsVision: deliberately OMITTED even where `architecture.modality`
+  //   reports image/video input — this codebase's own convention for the flag
+  //   (see LLMModelConfig.supportsVision above) requires empirical verification
+  //   against the real describe_image path, which none of these have had yet.
+  //   Metadata-only vision support is not the bar this flag uses elsewhere.
+  // - adminOnly: OMITTED for every OpenRouter entry below (2026-08-19: was
+  //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
+  //   include open source / open router stuff for all users not just
+  //   isadmin". Client construction is the same lazy-loaded OpenRouter path
+  //   already used successfully by gpt-4o-mini above.) This does NOT apply
+  //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
+  //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
+  'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 1, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-4o Mini, non-reasoning (AA estimate)' },
+  // Workload-specific research agent. It is intentionally callable only from
+  // DeepResearchService, not exposed as a general chat-picker model.
+  // ENG-1831: no OpenRouter endpoint for either Sonar model lists `tools` (or `tool_choice`).
+  'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, supportsTools: false, internalOnly: true },
+  'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, supportsTools: false, internalOnly: true },
+  // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
+  // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
+  // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
+  // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
+  // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
+  // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
+  // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
+  // score; Meta shipped Llama 5 in April 2026, making this a full generation
+  // behind), llama-3.1-8b-instruct (older sibling of the same superseded
+  // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
+  // not a coding model — and its pricing tiers up sharply past 32K-token
+  // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+  // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
+  // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
+  // lab/family redundancy, not because it's the top pick in its tier.
+  // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
+  // reused from the third pass).
+  //
+  // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
+  // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
+  // live) — this is a real, currently-unfillable gap, not an oversight.
+  // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01) —
+  // routed through OpenRouter, same convention as every other OpenRouter
+  // entry in this block (id = openrouter/<upstream-provider>/<upstream-model>,
+  // one registry line, no new routing code). This is ENG-199's actual wire-in:
+  // llmPricing.ts had a Fable 5 pricing stub staged since ENG-200 for exactly
+  // this moment, but Fable 5 itself was NEVER added to this llmModels
+  // registry — so there is no existing Fable entry to compare against yet.
+  // Going straight to 5.1 (the current model; Fable 5 is already superseded
+  // as of 2026-09-01) rather than also backfilling the now-superseded 5.
+  // AA Intelligence Index v4.2 (2026-09-05): 57, Adaptive Reasoning,
+  // Max Effort — #1, 3pts above Claude Opus 5 (54). Quality and cost plug into the
+  // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
+  // no dominance action needed today since there's no sibling family member,
+  // but the very next same-family add (e.g. a future Fable 5.2) will
+  // auto-flag whichever one loses on both cost and quality, same as every
+  // other family in this registry.
+  // supportsVision/supportsTemperature per OpenRouter's live model page
+  // (architecture.modality includes image+file input; reasoning-capable).
+  // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
+  // cost caps already exist and apply automatically to every model priced
+  // in llmPricing.ts, this one included.
+  'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsToolChoice: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
+  'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
+  'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
+  // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
+  // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
+  // this benchmark snapshot does not change the OpenRouter id or pricing.
+  'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Flash 0731, Reasoning, Max Effort' },
+  'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 Max, reasoning' },
+  // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
+  // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
+  // models in its size class, roughly matching DeepSeek V4 Pro's quality
+  // (53) at about half the input price. Skipped sibling candidates:
+  // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
+  // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
+  // measured, or AA-flagged deprecated).
+  'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 27B, xhigh' },
+  'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 13, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Mistral Small 4, reasoning' },
+  'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 50, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K3, max' },
+  'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 34, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K2.7 Code, reasoning' },
+  'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 5.2, max' },
+  'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 4.7 Flash, reasoning' },
+  // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
+  // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
+  // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
+  // existing convention for unverified-in-our-stack OpenRouter entries.
+  // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
+  // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
+  // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
+  // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
+  // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
+  // 2026-08-19: NOT in the 'gpt5-chat' family (unlike Terra/5.5/5.4/etc) —
+  // its own description marks it as a distinct specialized/premium
+  // positioning ("Frontier coding and agentic work"), not a generation of
+  // the "Balanced general-purpose model" line the rest of that family
+  // shares verbatim in their description text. Lumping it in wrongly
+  // flagged GPT-5.6 Terra as legacy: Sol's OpenRouter price is currently
+  // on a promotional discount that happens to land it in the same cost
+  // band as Terra, so same-family dominance concluded Terra was
+  // redundant — a coincidence of a volatile promo price, not a real
+  // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
+  // a family with Kimi K2.7-Code (a coding-specialized sibling).
+  'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Sol, max' },
+  'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Terra, max' },
+  'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Luna, max' },
+  // ENG-1769 (2026-09-05): GPT-6 Astra — OpenAI's frontier release of
+  // 2026-09-03, added the day Harsha asked ("is it possible to launch astra
+  // on agentweb now? ... go ahead"). Same one-line OpenRouter convention as
+  // the GPT-5.6 trio above and Fable 5.1 (ENG-199): id =
+  // openrouter/<upstream-provider>/<upstream-model>, no new routing code.
+  // Transport: OpenRouter BYOK → our own Azure resource
+  // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
+  // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
+  // day: response provider "Azure", usage.is_byok true, and an exact
+  // upstream inference cost. AgentMode meters that upstream value for BYOK
+  // calls so OpenRouter's long-context pricing overrides remain accurate.
+  // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
+  // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
+  // Deliberately NO `family`: Astra and Sol are distinct product lines;
+  // sharing a family could auto-retire one after a price move, like the
+  // Terra false-positive documented above. Same treatment as Sol and Kimi K3.
+  // supportsVision: verified EMPIRICALLY 2026-09-05 against the exact shape
+  // describeImage sends (a `data:image/png;base64,…` image_url, ~8 KB PNG)
+  // through this OpenRouter→Azure BYOK path: correct answer, and the same
+  // image via an https URL also correct — the bar LLMModelConfig.supportsVision
+  // sets, not just OpenRouter's architecture metadata (which also lists
+  // file+image+text). Curiosity recorded, not a blocker: a 64x64 two-color
+  // synthetic PNG was misread by Astra ("can't see the image" / wrong
+  // colors) while GPT-5.5 and Sol read it correctly on the same path — real
+  // images are what describe_image sends. supportsTemperature false: a
+  // reasoning model — `temperature` is not in its supported_parameters
+  // (Azure's reasoning-models doc says the same).
+  // maxTools 128: the upstream is Azure OpenAI (live-confirmed above), and
+  // Azure's 128-tool cap is a recorded production failure in this repo, not a
+  // doc claim — ce154d09c / dev.md 2026-04-26: gpt-5.4 returned HTTP 400
+  // "Invalid 'tools': array too long. Expected an array with maximum length
+  // 128, but got an array with length 143" once skills pushed the registry
+  // past 128, which is what introduced maxTools + callLLM's truncation. The
+  // OpenRouter block header omits maxTools because OpenRouter's APIs expose
+  // no limit for ARBITRARY upstreams; that rationale does not apply when the
+  // upstream is known to be Azure. (The GPT-5.6 trio above omit it and have
+  // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
+  // `tier` is the no-price fallback only; the picker derives ultra_premium
+  // live from MODEL_PRICING.
+  // ENG-1788: OpenRouter reasoning.supported_efforts, verified in the issue 2026-09-05.
+  'openrouter/openai/gpt-6-astra': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
+  // List Claude models via AWS Bedrock - client will be lazy-loaded
+  // 2026-08-19: all four below are `legacy` (picker-grouping only, see
+  // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
+  // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
+  // have active schedules touching them the same day this was written), so
+  // NOT deleted and NOT adminOnly — customers can still select them via
+  // "Show more", they're just no longer the default row per tier.
+  'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.5, Non-reasoning' },
+  'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 38, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.6, Adaptive Reasoning, Max Effort' },
+  'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.6, Non-reasoning, High Effort' },
+  // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
+  // temperature is deprecated for this model
+  'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)' },
+  // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
+  // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
+  // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
+  // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
+  // deprecated for this model") — verified against live Bedrock, not assumed.
+  'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 54, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 5, Adaptive Reasoning, Max Effort' },
+  'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 5, Adaptive Reasoning, Max Effort' },
+  // Haiku 4.5 still accepts temperature (also live-verified).
+  'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Haiku 4.5, Non-reasoning' },
+};
+
+/**
+ * A per-instance copy of the registry. AgentModeService instances (and the
+ * tests that swap a model's client or add an entry on one instance) must not
+ * share mutable entries.
+ */
+export function createLlmModelRegistry(): Record<string, LLMModelConfig> {
+  return Object.fromEntries(
+    Object.entries(LLM_MODEL_REGISTRY).map(([modelId, config]) => [modelId, { ...config }]),
+  );
+}
