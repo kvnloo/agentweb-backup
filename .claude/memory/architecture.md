@@ -50,7 +50,7 @@ auth, tasks, agentMode, chatbot, admin, schedules, workflows, gtmPlan, seo, crm,
 ### Adding New Bedrock Claude Model
 1. Look up model ID on Bedrock supported models page
 2. Look up inference profile ID (use `global.*` prefix for cross-region)
-3. Update: `agentModeService.ts` (llmModels + inferenceProfileMap), `utils/llmService.ts` (inference profile chain), tests
+3. Update: `agentMode/llmModelRegistry.ts` (LLM_MODEL_REGISTRY), `utils/bedrockInferenceProfiles.ts` (inference profile map), `utils/llmService.ts` (inference profile chain), tests
 4. Run benchmarks: `npm run benchmark -- --url http://localhost:3001 --model <model-id>`
 
 ## Tool Wiring Chain (critical path)

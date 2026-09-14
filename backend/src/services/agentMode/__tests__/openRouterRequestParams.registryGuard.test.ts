@@ -15,22 +15,8 @@
  *   npm run refresh:openrouter-params
  */
 
-jest.mock('../../db', () => ({
-  agentModeDb: {},
-  userDb: { getUserById: jest.fn() },
-  scheduleDb: {},
-  scheduleTemplateDb: {},
-}));
-
-jest.mock('aws-sdk', () => ({
-  DynamoDB: { DocumentClient: jest.fn(() => ({})) },
-  S3: jest.fn(() => ({})),
-  SecretsManager: jest.fn(() => ({})),
-  config: { update: jest.fn() },
-}));
-
 import snapshot from './fixtures/openRouterSupportedParameters.json';
-import { AgentModeService } from '../../agentModeService';
+import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import {
   GATEWAY_REASONING_EFFORT_OVERRIDES,
   GatewayTaskClass,
@@ -88,9 +74,8 @@ function routingViolation(modelId: string, config: RegistryEntry): string | null
     (missing.length ? `; unsupported everywhere: [${missing.join(', ')}] — set the matching supports* flag` : '');
 }
 
-const registry = Object.entries(
-  (new AgentModeService() as any).llmModels as Record<string, RegistryEntry>,
-).filter(([, config]) => !config.isLive);
+const registry = Object.entries(LLM_MODEL_REGISTRY as Record<string, RegistryEntry>)
+  .filter(([, config]) => !config.isLive);
 
 describe('model registry vs OpenRouter supported_parameters (ENG-1831)', () => {
   it('covers the whole registry', () => {

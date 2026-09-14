@@ -12,43 +12,16 @@
  *
  * Adding a model to the registry is a documented four-file ritual (see CLAUDE.md).
  * This test makes the pricing step of that ritual fail loudly instead of silently,
- * by reading the registry from source rather than importing agentModeService,
- * which drags in most of the backend.
+ * by importing the registry module (agentMode/llmModelRegistry.ts, ENG-1831)
+ * rather than agentModeService, which drags in most of the backend.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { getModelPrice } from '../utils/llmPricing';
 
-const AGENT_MODE_SERVICE = path.join(__dirname, '..', 'services', 'agentModeService.ts');
-
-/** Pull the keys of the `llmModels` registry literal straight out of the source. */
+/** The keys of the LLM model registry. */
 function readRegisteredModels(): string[] {
-  const src = fs.readFileSync(AGENT_MODE_SERVICE, 'utf8');
-  const start = src.indexOf('private llmModels: Record<string, LLMModelConfig> = {');
-  expect(start).toBeGreaterThan(-1);
-
-  // Walk braces from the opening `{` so the block ends exactly where the literal
-  // does — a line-count heuristic would silently drift as models are added.
-  const open = src.indexOf('{', start);
-  let depth = 0;
-  let end = open;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}') {
-      depth--;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
-    }
-  }
-
-  const block = src.slice(open, end);
-  const models: string[] = [];
-  // Keys are quoted at the start of a line: `'model-id': { client: null, ... }`
-  for (const m of block.matchAll(/^\s*'([^']+)'\s*:\s*\{/gm)) models.push(m[1]);
-  return models;
+  return Object.keys(LLM_MODEL_REGISTRY);
 }
 
 describe('every registered chat model has a price', () => {
