@@ -69,8 +69,13 @@ router.post('/evaluate', async (req: Request, res: Response) => {
 router.post('/correct', async (req: Request, res: Response) => {
   const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
   const correctionNote = typeof req.body?.correctionNote === 'string' ? req.body.correctionNote.trim() : undefined;
+  // Upper-bounded at 365: an unbounded value here can overflow into an invalid Date in
+  // setAccountCapabilityCorrection, turning a typo'd request body into an opaque 500 instead
+  // of just falling back to the same sane default an omitted/non-positive value already gets.
   const correctionLifetimeDays =
-    typeof req.body?.correctionLifetimeDays === 'number' && req.body.correctionLifetimeDays > 0
+    typeof req.body?.correctionLifetimeDays === 'number' &&
+    req.body.correctionLifetimeDays > 0 &&
+    req.body.correctionLifetimeDays <= 365
       ? req.body.correctionLifetimeDays
       : 30;
   if (!userId) {
@@ -99,7 +104,7 @@ router.post('/correct', async (req: Request, res: Response) => {
   });
 
   const capability = await getAccountCapabilityRequirement(userId, 'ad_platform_integration');
-  return res.status(200).json({ userId, correctedAt: new Date().toISOString(), capability });
+  return res.status(200).json({ userId, correctedAt: capability?.correctedAt, capability });
 });
 
 export default router;
