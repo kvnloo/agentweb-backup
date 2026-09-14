@@ -143,8 +143,24 @@ export type DrainStopReason =
   | 'completed'
   /** Hit this run's own withdrawal budget; more remain and are still stale. */
   | 'limit_reached'
-  /** The write pacer refused — the account is at its spacing/hourly ceiling. */
+  /**
+   * A pre-write gate refused. NOT necessarily the write pacer: `paceLinkedInWrite`
+   * has three refusal sources, recorded in `pacedGate` (ENG-1873).
+   */
   | 'paced';
+
+/**
+ * Which gate stopped a paced drain. Mirrors `PaceRefusalGate`, plus `'unknown'` for
+ * a `pace` dependency that only returns prose.
+ */
+export type DrainRefusingGate = 'daily_volume' | 'write_pacer' | 'reservation_persistence' | 'unknown';
+
+/** A structured refusal from the `pace` dependency. */
+export interface DrainPaceRefusal {
+  gate: DrainRefusingGate;
+  /** The refusing gate's own text, verbatim. */
+  reason: string;
+}
 
 export interface WithdrawnInvitation {
   invitedUserName: string;
@@ -191,6 +207,16 @@ export interface StaleInvitationDrainResult {
   totalPending: number;
   unwithdrawable: number;
   stopReason: DrainStopReason;
+  /**
+   * When `stopReason` is `'paced'`: which gate refused, and its own words.
+   *
+   * ENG-1873: both used to be discarded. The drain was handed the refusal and threw
+   * it away, then its notice asserted "write-pacing limit" whichever gate had
+   * refused. A drain that withdrew nothing was undiagnosable from its own output,
+   * and the one investigation it had went to the wrong subsystem.
+   */
+  pacedGate?: DrainRefusingGate;
+  pacedReason?: string;
   /** Plain-language summary, always present, safe to relay verbatim. */
   notice: string;
 }
@@ -198,8 +224,12 @@ export interface StaleInvitationDrainResult {
 export interface StaleInvitationDrainDeps {
   /** The account's cached pending invitations. */
   fetchPending: (accountId: string) => Promise<UnipileSentInvitation[]>;
-  /** Reserve one paced write slot. Resolves to a refusal reason, or null to proceed. */
-  pace: (accountId: string) => Promise<string | null>;
+  /**
+   * Reserve one paced write slot. Resolves to null to proceed, or a refusal —
+   * preferably structured so the result can name the gate. A bare string is still
+   * accepted and reported as gate `'unknown'`.
+   */
+  pace: (accountId: string) => Promise<DrainPaceRefusal | string | null>;
   /** Withdraw one invitation via Unipile. */
   cancel: (invitationId: string, accountId: string) => Promise<void>;
   /** Drop the ledger row so the CRM stops showing "invitation pending". */
@@ -219,6 +249,10 @@ export interface StaleInvitationDrainDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+function firstLine(text: string | undefined): string {
+  return (text || '').split('\n').map((line) => line.trim()).find((line) => line.length > 0) || '';
+}
+
 function summarise(r: Omit<StaleInvitationDrainResult, 'notice'>): string {
   const parts: string[] = [];
   parts.push(
@@ -230,10 +264,20 @@ function summarise(r: Omit<StaleInvitationDrainResult, 'notice'>): string {
     parts.push(`${r.failed.length} could not be withdrawn and were left pending.`);
   }
   if (r.stopReason === 'paced') {
+    // Name the gate that actually refused (ENG-1873). Asserting "write-pacing
+    // limit" unconditionally was wrong for two of the three refusal sources.
+    const cause =
+      r.pacedGate === 'daily_volume'
+        ? "the account's daily connection-request limit refused the next withdrawal"
+        : r.pacedGate === 'write_pacer'
+          ? 'the account is at its write-pacing limit'
+          : r.pacedGate === 'reservation_persistence'
+            ? 'the daily safety reservation for the next withdrawal could not be saved, so it was not attempted'
+            : 'a safety check on our side refused the next withdrawal';
+    const detail = firstLine(r.pacedReason);
     parts.push(
-      'Stopped early: this account is at its write-pacing limit, which is a deliberate safety '
-      + 'ceiling on our side, not a LinkedIn rejection. The rest are still pending and the next run '
-      + 'will continue from the oldest.',
+      `Stopped early: ${cause}${detail ? ` (${detail})` : ''}. This is on our side, not a LinkedIn `
+      + 'rejection. The rest are still pending and the next run will continue from the oldest.',
     );
   } else if (r.stopReason === 'limit_reached') {
     parts.push(`Stopped at this run's withdrawal budget; ${r.remainingStale} more are still old enough to withdraw.`);
@@ -287,6 +331,8 @@ export async function withdrawStaleInvitations(params: {
   let stopReason: DrainStopReason =
     selection.totalStale > selection.candidates.length ? 'limit_reached' : 'completed';
   let attempted = 0;
+  let pacedGate: DrainRefusingGate | undefined;
+  let pacedReason: string | undefined;
 
   for (const candidate of selection.candidates) {
     // Ask the pacer BEFORE each write, never in a batch: the hourly ceiling and
@@ -295,6 +341,14 @@ export async function withdrawStaleInvitations(params: {
     const refusal = await deps.pace(accountId);
     if (refusal) {
       stopReason = 'paced';
+      // Keep what refused and why (ENG-1873) — see `pacedGate`.
+      if (typeof refusal === 'string') {
+        pacedGate = 'unknown';
+        pacedReason = refusal;
+      } else {
+        pacedGate = refusal.gate;
+        pacedReason = refusal.reason;
+      }
       break;
     }
     attempted++;
@@ -392,6 +446,7 @@ export async function withdrawStaleInvitations(params: {
     totalPending: selection.totalPending,
     unwithdrawable: selection.unwithdrawable,
     stopReason: attempted === 0 && stopReason === 'completed' ? ('completed' as const) : stopReason,
+    ...(stopReason === 'paced' ? { pacedGate, pacedReason } : {}),
   };
   return { ...base, notice: summarise(base) };
 }
