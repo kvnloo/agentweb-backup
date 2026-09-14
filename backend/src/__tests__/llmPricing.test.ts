@@ -11,6 +11,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   MODEL_PRICING,
+  LLM_PRICE_BOOK_VERSION,
+  LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
   getModelPrice,
@@ -36,6 +38,42 @@ function parseLlmModelsRegistryKeys(): string[] {
   }
   return keys;
 }
+
+/**
+ * ENG-1934: every LLM spend event carries LLM_PRICE_BOOK_VERSION, so a price
+ * edit that forgets to bump it would leave two different prices under one
+ * version and make historical events impossible to re-derive. A fingerprint of
+ * the tables is pinned to the version; changing a price fails this test until
+ * BOTH are updated in the same commit.
+ */
+describe('price book version (ENG-1250 §5, ENG-1934)', () => {
+  const canonical = (value: unknown): string =>
+    value && typeof value === 'object'
+      ? `{${Object.keys(value as object)
+          .sort()
+          .map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`)
+          .join(',')}}`
+      : JSON.stringify(value);
+
+  const fingerprint = () =>
+    require('crypto')
+      .createHash('sha256')
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .digest('hex')
+      .slice(0, 16);
+
+  it('is a dated version string', () => {
+    expect(LLM_PRICE_BOOK_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(LLM_PRICE_BOOK_PROVENANCE).toBe(`llm-price-book:${LLM_PRICE_BOOK_VERSION}`);
+  });
+
+  it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
+    expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
+      version: '2026-09-10',
+      fingerprint: 'a271b4b8838a9308',
+    });
+  });
+});
 
 describe('llmPricing', () => {
   beforeEach(() => {

@@ -202,6 +202,21 @@ describe('admin usage routes', () => {
       expect(res.body.byProvider.map((s: any) => s.key).sort()).toEqual(['apollo', 'twitter']);
     });
 
+    // ENG-1934 AC9: the allowance comparison is only honest beside what the
+    // total covers, so the payload must say.
+    it('reports LLM ledger coverage for the requested month', async () => {
+      mockResolveBilling.mockResolvedValue('owner-1');
+      mockListSpendEvents.mockResolvedValue([]);
+
+      const before = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-08' });
+      const start = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-09' });
+      const after = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-10' });
+
+      expect(before.body.llmLedger).toEqual({ recording: expect.any(Boolean), startedOn: '2026-09-14', month: 'none' });
+      expect(start.body.llmLedger.month).toBe('partial');
+      expect(after.body.llmLedger.month).toBe('full');
+    });
+
     // AC2: committed money must never read as spent money.
     it('reports a reservation separately from settled spend', async () => {
       mockResolveBilling.mockResolvedValue('owner-1');

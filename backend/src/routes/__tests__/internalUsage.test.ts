@@ -48,6 +48,11 @@ jest.mock('../../services/tokenUsageService', () => ({
 // conflict/error fallback -- see internalUsage.charging.test.ts for the
 // atomic function's own coverage and the fallback paths' coverage.
 const mockIncrementUsageWithChargeEvent = jest.fn().mockResolvedValue('applied');
+// ENG-1934: run with the LLM spend-ledger kill switch OFF, which makes every
+// assertion below the proof that OFF leaves this route's transaction exactly the
+// two items (aggregate + charge event) it was. The third item written when the
+// switch is ON is covered in internalUsage.llmSpendLedger.test.ts.
+process.env.SPEND_LEDGER_LLM_DUAL_WRITE = 'false';
 jest.mock('../../services/usageRecordDb', () => ({
   usageRecordDb: {
     incrementUsageWithChargeEvent: (...args: unknown[]) => mockIncrementUsageWithChargeEvent(...args),

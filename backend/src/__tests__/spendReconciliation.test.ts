@@ -403,3 +403,129 @@ describe('reconcileMonth', () => {
     expect(report.readyForCutoverEvidence).toBe(false);
   });
 });
+
+// ── ENG-1934: LLM events on the ledger ──────────────────────────────────────
+
+const anLlmEvent = (over: Partial<SpendEvent> = {}): SpendEvent =>
+  anEvent({
+    eventId: 'llm:msg-1',
+    provider: 'bedrock',
+    operation: 'anthropic.claude-opus-4-8',
+    feature: 'agent_task',
+    unit: 'llm_token',
+    quantity: 1200,
+    costMicroUsd: 3_954_436,
+    rateCardVersion: 'llm-price-book:2026-09-10',
+    ...over,
+  });
+
+describe('LLM fidelity (ENG-1934)', () => {
+  const llmMirrorStartedAt = '2026-09-05T00:00:00.000Z';
+
+  it('without an LLM start, LLM events are ignored — never reported as orphans on the vendor rail', () => {
+    const report = reconcileVendorFidelity([anLlmEvent()], [anLlmRow()]);
+
+    expect(report.orphanGroups).toEqual([]);
+    expect(report.groupCount).toBe(0);
+    expect(report.ok).toBe(true);
+  });
+
+  it('with an LLM start, a matching event and aggregate row reconcile clean', () => {
+    const report = reconcileVendorFidelity([anLlmEvent()], [anLlmRow()], { llmMirrorStartedAt });
+
+    expect(report.assessedGroupCount).toBe(1);
+    expect(report.ok).toBe(true);
+    expect(report.ledgerMicroUsd).toBe(report.liveMicroUsd);
+  });
+
+  it('keys LLM groups on model, not provider — a pre-ENG-693 row with no provider still matches', () => {
+    const report = reconcileVendorFidelity([anLlmEvent({ provider: 'bedrock' })], [anLlmRow({ provider: undefined })], {
+      llmMirrorStartedAt,
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.unmirroredGroups).toEqual([]);
+    expect(report.orphanGroups).toEqual([]);
+  });
+
+  it('an LLM aggregate row with no event after the start is UNMIRRORED — the failure this check exists for', () => {
+    const report = reconcileVendorFidelity([], [anLlmRow()], { llmMirrorStartedAt });
+
+    expect(report.ok).toBe(false);
+    expect(report.unmirroredGroups).toHaveLength(1);
+    expect(report.unmirroredGroups[0]).toMatchObject({ rail: 'llm', provider: 'llm', operation: 'anthropic.claude-opus-4-8' });
+  });
+
+  it('LLM drift beyond a cent is reported per model', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent({ costMicroUsd: 3_954_436 - DRIFT_TOLERANCE_MICRO_USD - 1 })],
+      [anLlmRow()],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.driftingGroups).toHaveLength(1);
+  });
+
+  it('uses the LLM start for LLM groups and the vendor start for vendor groups, independently', () => {
+    const report = reconcileVendorFidelity(
+      [],
+      [anLlmRow({ date: '2026-09-04' }), aVendorRow({ date: '2026-09-04' })],
+      { mirrorStartedAt: '2026-09-01T00:00:00.000Z', llmMirrorStartedAt },
+    );
+
+    // Same day: before the LLM mirror (not a finding), after the vendor mirror (a finding).
+    expect(report.preMirrorGroups.map((g) => g.rail)).toEqual(['llm']);
+    expect(report.unmirroredGroups.map((g) => g.rail)).toEqual(['vendor']);
+  });
+
+  it('the LLM changeover day is partial, not a failure', () => {
+    const report = reconcileVendorFidelity([], [anLlmRow({ date: '2026-09-05' })], { llmMirrorStartedAt });
+
+    expect(report.partialGroups).toHaveLength(1);
+    expect(report.ok).toBe(true);
+  });
+
+  it('an unpriced model\'s aggregate row is not counted as unmirrored spend', () => {
+    const report = reconcileVendorFidelity(
+      [],
+      [
+        anLlmRow({ model: 'model-nobody-priced', costSource: 'unpriced', costMicroUsd: 0 }),
+        // The engine path tags unknown models "allocated" at $0.
+        anLlmRow({ model: 'another-unpriced-model', costSource: 'allocated', costMicroUsd: 0 }),
+      ],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.unmirroredGroups).toEqual([]);
+    expect(report.groupCount).toBe(0);
+  });
+
+  it('a vendor and an LLM group can never collide into one', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent(), anEvent()],
+      [anLlmRow(), aVendorRow()],
+      { mirrorStartedAt: '2026-09-01T00:00:00.000Z', llmMirrorStartedAt },
+    );
+
+    expect(report.groupCount).toBe(2);
+    expect(report.ok).toBe(true);
+  });
+
+  describe('selectReconcilableSubjects with includeLlm', () => {
+    it('without it, an LLM-only subject stays llmOnly even when it has LLM events', () => {
+      const { reconcilable, llmOnly } = selectReconcilableSubjects([anLlmEvent()], [anLlmRow()]);
+
+      expect(reconcilable).toEqual([]);
+      expect(llmOnly).toEqual(['owner-1']);
+    });
+
+    it('with it, LLM activity on the live rail alone makes a subject reconcilable — so a total mirror failure is examined', () => {
+      const { reconcilable, llmOnly } = selectReconcilableSubjects([], [anLlmRow({ billingUserId: 'all-llm-failed' })], {
+        includeLlm: true,
+      });
+
+      expect(reconcilable).toEqual(['all-llm-failed']);
+      expect(llmOnly).toEqual([]);
+    });
+  });
+});
