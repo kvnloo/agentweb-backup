@@ -196,44 +196,13 @@ export function isLlmDualWriteEnabled(): boolean {
 /**
  * The day LLM events began reaching the ledger in production.
  *
- * Two readers need it. The §8 fidelity check must not count days before it as
- * "not mirrored"; and the admin ledger must say that a month which started
- * before it holds only part of that month's LLM spend. Day granularity is
- * deliberate — the aggregate rail it is reconciled against is daily.
+ * The §8 fidelity check must not count days before it as "not mirrored", and
+ * the admin ledger need not measure coverage for a month that ended before it.
+ * Day granularity is deliberate — the aggregate rail it is reconciled against
+ * is daily. Coverage of any later month is MEASURED, never inferred from this
+ * date (see `measureLlmLedgerCoverage`).
  */
 export const LLM_SPEND_LEDGER_STARTED_ON = "2026-09-14";
-
-/** How much of a billing month's LLM spend the ledger can hold. */
-export interface LlmLedgerCoverage {
-  /** Whether the kill switch currently lets LLM events through. */
-  recording: boolean;
-  startedOn: string;
-  /**
-   * `none`: the month ended before LLM events existed — the ledger holds its
-   * vendor spend only. `partial`: the month began before them. `full`: every
-   * day of the month is after the start.
-   */
-  month: "none" | "partial" | "full";
-}
-
-/**
- * Coverage for one `YYYY-MM`, for readers that compare the ledger total with an
- * allowance that also covers LLM spend. Without it that comparison silently
- * understates how much of the allowance a pre-coverage month used (ENG-1874).
- */
-export function describeLlmLedgerCoverage(billingMonth: string): LlmLedgerCoverage {
-  const startMonth = LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7);
-  return {
-    recording: isLlmDualWriteEnabled(),
-    startedOn: LLM_SPEND_LEDGER_STARTED_ON,
-    month:
-      billingMonth < startMonth
-        ? "none"
-        : billingMonth === startMonth && !LLM_SPEND_LEDGER_STARTED_ON.endsWith("-01")
-        ? "partial"
-        : "full",
-  };
-}
 
 /**
  * Units for LLM events. Namespaced so no vendor rate-card unit can ever collide
@@ -261,6 +230,13 @@ export interface LlmSpendEventInput {
   totalTokens: number;
   /** True for image/video models billed per generation rather than per token. */
   perGeneration: boolean;
+  /**
+   * How many generations the cost covers, for a per-generation event. An
+   * engine batch sums several image or video calls into one group; recording
+   * them as 1 would keep their total cost but lose the count (CodeRabbit,
+   * PR #2904). Defaults to 1 — a single in-process call.
+   */
+  generationCount?: number;
   costMicroUsd: number;
   costSource: "allocated" | "unpriced";
   /**
@@ -310,7 +286,9 @@ export function buildLlmSpendEvent(
       operation: input.model || "unknown",
       ...(input.feature ? { feature: input.feature } : {}),
       unit: input.perGeneration ? LLM_GENERATION_UNIT : LLM_TOKEN_UNIT,
-      quantity: input.perGeneration ? 1 : Math.max(0, Math.round(input.totalTokens)),
+      quantity: input.perGeneration
+        ? Math.max(1, Math.round(input.generationCount ?? 1))
+        : Math.max(0, Math.round(input.totalTokens)),
       costMicroUsd: Math.max(0, Math.round(input.costMicroUsd)),
       costSource: "allocated",
       rateCardVersion: input.rateProvenance,
