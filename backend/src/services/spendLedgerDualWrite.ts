@@ -38,6 +38,7 @@
 import { randomUUID } from "crypto";
 import { SpendEvent, recordSpendEvent } from "./spendEventDb";
 import { VENDOR_RATE_CARD_VERSION, VendorRateProvider, getAllocatedRate } from "../utils/vendorRateCard";
+import { LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 /**
  * Kill switch. Defaults ON, unlike the repo's usual opt-in flags.
@@ -164,4 +165,157 @@ export async function mirrorVendorUsage(
     // Returning a status instead of rejecting is the contract callers rely on.
     return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+// ── LLM spend (ENG-1934, ENG-1250 §6) ────────────────────────────────────────
+//
+// The vendor mirror above left the ledger holding vendor spend only, while
+// LLM calls — most of what AgentWeb pays for — reached AW-UsageRecords and
+// stopped. These helpers let both LLM write paths (`recordUsage` and the
+// agent-engine `/internal/usage` batch) put the same call on the ledger, in
+// the same transaction as its aggregate row.
+//
+// Observe-only, like the vendor rail: nothing enforces on these events. The
+// live cap still counts `AW-Users.tokenUsage.totalCost`.
+
+/**
+ * Kill switch for LLM events. Separate from `SPEND_LEDGER_DUAL_WRITE` so the
+ * two rails can be stopped independently: LLM calls are several times the
+ * vendor write rate, and pausing them must not also blind the vendor ledger.
+ *
+ * Defaults ON for the same reason the vendor switch does — the point is to
+ * accumulate a full billing cycle of evidence before any cap is sized, and a
+ * default-off flag discovers weeks later that none exists. Blast radius: a
+ * fire-and-forget write into a PAY_PER_REQUEST table nothing enforces on. Set
+ * SPEND_LEDGER_LLM_DUAL_WRITE=false to restore today's aggregate-only writes.
+ */
+export function isLlmDualWriteEnabled(): boolean {
+  return process.env.SPEND_LEDGER_LLM_DUAL_WRITE !== "false";
+}
+
+/**
+ * The day LLM events began reaching the ledger in production.
+ *
+ * Two readers need it. The §8 fidelity check must not count days before it as
+ * "not mirrored"; and the admin ledger must say that a month which started
+ * before it holds only part of that month's LLM spend. Day granularity is
+ * deliberate — the aggregate rail it is reconciled against is daily.
+ */
+export const LLM_SPEND_LEDGER_STARTED_ON = "2026-09-14";
+
+/** How much of a billing month's LLM spend the ledger can hold. */
+export interface LlmLedgerCoverage {
+  /** Whether the kill switch currently lets LLM events through. */
+  recording: boolean;
+  startedOn: string;
+  /**
+   * `none`: the month ended before LLM events existed — the ledger holds its
+   * vendor spend only. `partial`: the month began before them. `full`: every
+   * day of the month is after the start.
+   */
+  month: "none" | "partial" | "full";
+}
+
+/**
+ * Coverage for one `YYYY-MM`, for readers that compare the ledger total with an
+ * allowance that also covers LLM spend. Without it that comparison silently
+ * understates how much of the allowance a pre-coverage month used (ENG-1874).
+ */
+export function describeLlmLedgerCoverage(billingMonth: string): LlmLedgerCoverage {
+  const startMonth = LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7);
+  return {
+    recording: isLlmDualWriteEnabled(),
+    startedOn: LLM_SPEND_LEDGER_STARTED_ON,
+    month:
+      billingMonth < startMonth
+        ? "none"
+        : billingMonth === startMonth && !LLM_SPEND_LEDGER_STARTED_ON.endsWith("-01")
+        ? "partial"
+        : "full",
+  };
+}
+
+/**
+ * Units for LLM events. Namespaced so no vendor rate-card unit can ever collide
+ * with them — `isLlmSpendEvent` is how every reader tells the two rails apart.
+ */
+export const LLM_TOKEN_UNIT = "llm_token";
+export const LLM_GENERATION_UNIT = "llm_generation";
+
+export function isLlmSpendEvent(event: Pick<SpendEvent, "unit">): boolean {
+  return event.unit === LLM_TOKEN_UNIT || event.unit === LLM_GENERATION_UNIT;
+}
+
+/** What an LLM write path knows once it has priced a call. */
+export interface LlmSpendEventInput {
+  /** Already defaulted to "system" by the caller when unattributed. */
+  actingUserId: string;
+  billingUserId: string;
+  onBehalfOf?: string;
+  sessionId?: string;
+  taskId?: string;
+  provider: string;
+  model: string;
+  feature: string;
+  /** input + output + cache read + cache write. */
+  totalTokens: number;
+  /** True for image/video models billed per generation rather than per token. */
+  perGeneration: boolean;
+  costMicroUsd: number;
+  costSource: "allocated" | "unpriced";
+  /**
+   * Where the dollar figure came from, stamped as the event's rateCardVersion.
+   * `LLM_PRICE_BOOK_PROVENANCE` when this backend priced it; `caller:<who>` when
+   * the amount arrived from outside the book (an OpenRouter-reported cost, the
+   * agent engine). §5 requires one on every allocated event.
+   */
+  rateProvenance: string;
+  /**
+   * A per-call identity the caller already has (a provider response id, the
+   * engine's charge-event id). When absent a fresh id is minted — build the
+   * event ONCE, before any retry, so a retried write reuses it.
+   */
+  callId?: string;
+}
+
+/**
+ * Build the spend event for one priced LLM call, or say why there is none.
+ *
+ * An unpriced model is skipped rather than written as $0, for exactly the
+ * reason `buildShadowEvent` skips an unpriced vendor unit: the ledger's billing
+ * boundary forbids a missing rate becoming a silent $0 charge.
+ */
+export function buildLlmSpendEvent(
+  input: LlmSpendEventInput,
+  occurredAt: string,
+): { event: SpendEvent } | { skip: "unpriced" } {
+  if (input.costSource === "unpriced") return { skip: "unpriced" };
+
+  const references = {
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.taskId ? { taskId: input.taskId } : {}),
+  };
+
+  return {
+    event: {
+      billingUserId: input.billingUserId,
+      // Prefixed so an LLM call id can never collide with a vendor idempotency
+      // key sharing this billing subject's partition.
+      eventId: input.callId ? `llm:${input.callId}` : `gen:${randomUUID()}`,
+      occurredAt,
+      billingMonth: occurredAt.slice(0, 7),
+      actingUserId: input.actingUserId,
+      ...(input.onBehalfOf ? { onBehalfOf: input.onBehalfOf } : {}),
+      provider: input.provider || "unknown",
+      operation: input.model || "unknown",
+      ...(input.feature ? { feature: input.feature } : {}),
+      unit: input.perGeneration ? LLM_GENERATION_UNIT : LLM_TOKEN_UNIT,
+      quantity: input.perGeneration ? 1 : Math.max(0, Math.round(input.totalTokens)),
+      costMicroUsd: Math.max(0, Math.round(input.costMicroUsd)),
+      costSource: "allocated",
+      rateCardVersion: input.rateProvenance,
+      ...(Object.keys(references).length ? { references } : {}),
+      lifecycle: "settled",
+    },
+  };
 }

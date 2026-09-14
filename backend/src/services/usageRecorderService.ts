@@ -11,9 +11,21 @@
  *    tokens are still counted.
  */
 
-import { getModelPrice, cacheWriteCost, CacheWriteByTtl, isPerGenerationPriced } from "../utils/llmPricing";
+import {
+  getModelPrice,
+  cacheWriteCost,
+  CacheWriteByTtl,
+  isPerGenerationPriced,
+  LLM_PRICE_BOOK_PROVENANCE,
+} from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
-import { buildShadowEvent, mirrorVendorUsage } from "./spendLedgerDualWrite";
+import {
+  buildLlmSpendEvent,
+  buildShadowEvent,
+  isLlmDualWriteEnabled,
+  mirrorVendorUsage,
+} from "./spendLedgerDualWrite";
+import type { SpendEvent } from "./spendEventDb";
 import {
   flushDroppedWriteAlerts,
   recordDroppedWrite,
@@ -54,6 +66,15 @@ export interface RecordUsageContext {
    */
   costUsdOverride?: number;
   /**
+   * ENG-1934: where `costUsdOverride` came from, stamped on the spend event as
+   * its rate version. Pass `LLM_PRICE_BOOK_PROVENANCE` when the override was
+   * itself read from llmPricing (image/video generation prices). Omitted, an
+   * override is attributed to `caller:<provider>` — true of a gateway-reported
+   * cost such as OpenRouter's. Ignored without an override: token pricing is
+   * always the price book.
+   */
+  costProvenance?: string;
+  /**
    * ENG-1251 Greptile P1: YYYY-MM-DD override. A caller that ALSO writes a
    * paired charge event for the same logical usage (internalUsage.ts is the
    * only one today) must compute this ledger row's date from the exact same
@@ -66,6 +87,14 @@ export interface RecordUsageContext {
    * every other caller -- defaults to `new Date()` at call time, unchanged.
    */
   date?: string;
+  /**
+   * ENG-1934: the ISO instant for this call's spend event, for the same reason
+   * `date` exists — a caller that fixes `date` from an earlier instant must fix
+   * this from that SAME instant, or the event can land on the next UTC day and
+   * the §8 fidelity check reads one call as drift on two days. Pass it whenever
+   * `date` is passed; omitted, both derive from one clock read.
+   */
+  occurredAt?: string;
 }
 
 /**
@@ -200,7 +229,10 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
 
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
-    const date = ctx.date || new Date().toISOString().slice(0, 10);
+    // One clock read for both rails (ENG-1934): the aggregate's date and the
+    // spend event's instant must never straddle UTC midnight.
+    const occurredAt = ctx.occurredAt || new Date().toISOString();
+    const date = ctx.date || occurredAt.slice(0, 10);
     const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
     const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
     const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
@@ -227,7 +259,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
     const costSource =
       ctx.costUsdOverride != null || !isUnpriced(ctx.model) ? "allocated" : "unpriced";
 
-    await usageRecordDb.incrementUsage({
+    const increment = {
       userId,
       date,
       model: ctx.model || "unknown",
@@ -242,9 +274,91 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
       ...(ctx.provider ? { provider: ctx.provider } : {}),
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-    });
+    } as const;
+
+    if (!isLlmDualWriteEnabled()) {
+      await usageRecordDb.incrementUsage(increment);
+      return;
+    }
+
+    // ENG-1934. Built ONCE, before any retry, so every attempt carries the same
+    // eventId and a replay is a no-op rather than a second event.
+    const built = buildLlmSpendEvent(
+      {
+        actingUserId: userId,
+        billingUserId,
+        onBehalfOf: ctx.onBehalfOf,
+        sessionId: ctx.sessionId,
+        taskId: ctx.taskId,
+        provider: ctx.provider,
+        model: increment.model,
+        feature: increment.feature,
+        totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
+        perGeneration: isPerGenerationPriced(ctx.model),
+        costMicroUsd,
+        costSource,
+        rateProvenance:
+          ctx.costUsdOverride != null
+            ? ctx.costProvenance || `caller:${ctx.provider || "unknown"}`
+            : LLM_PRICE_BOOK_PROVENANCE,
+        callId: ctx.eventId,
+      },
+      occurredAt,
+    );
+
+    if ("skip" in built) {
+      // Unpriced: no event may exist, so the aggregate is written exactly as
+      // before this change.
+      await usageRecordDb.incrementUsage(increment);
+      return;
+    }
+
+    await writeLlmUsageWithSpendEvent(increment, built.event);
   } catch (error) {
     logRecorderFailure(error);
+  }
+}
+
+/**
+ * The aggregate row and its spend event, in one transaction (ENG-1934).
+ *
+ * Mirrors `recordVendorUsageIdempotent` deliberately — the two rails must fail
+ * the same way or the §8 reconciliation measures the difference between two
+ * error policies instead of the difference between two ledgers:
+ *  - "duplicate": this call was already recorded on BOTH rails; nothing to do.
+ *    This is also what makes a retried `recordUsage` add its cost once, which
+ *    matches the enforced cap (`incrementUserTokenUsage` already dedupes on the
+ *    same eventId).
+ *  - a transient conflict is retried; the retry is safe because the event is
+ *    conditional.
+ *  - anything else falls back to the plain aggregate write, so a spend-ledger
+ *    outage never also costs the rail that predates it, and the loss is
+ *    counted and alerted rather than thrown into a fire-and-forget caller.
+ */
+async function writeLlmUsageWithSpendEvent(
+  increment: Parameters<typeof usageRecordDb.incrementUsage>[0],
+  event: SpendEvent,
+): Promise<void> {
+  try {
+    await retryTransientWrite(async () => {
+      const result = await usageRecordDb.incrementUsageWithSpendEvent(increment, event);
+      if (result === "conflict") {
+        throw Object.assign(new Error("transaction conflict on LLM usage"), {
+          code: "TransactionConflictException",
+        });
+      }
+      return result;
+    });
+    flushDroppedWriteAlerts();
+  } catch (error) {
+    await usageRecordDb.incrementUsage(increment);
+    recordDroppedWrite({
+      provider: event.provider,
+      operation: event.operation,
+      costMicroUsd: event.costMicroUsd,
+      billingUserId: event.billingUserId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
