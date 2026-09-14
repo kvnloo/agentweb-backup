@@ -26299,6 +26299,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Decodes the 5 entities `escapeHtml` produces, back to their plain characters. Order
+   * matters: `&amp;` must be decoded LAST, since decoding it first would turn a literal
+   * `&amp;lt;` (an already-escaped `&lt;` that was itself escaped again) into `&lt;`,
+   * silently re-introducing a markup-meaningful character into a plain-text field.
+   */
+  private static unescapeHtml(s: string): string {
+    return s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+  }
+
+  /**
    * Escapes every string leaf of an arbitrarily-nested value while preserving its
    * structure — unlike `String(value)`, which collapses an object/array to
    * "[object Object]" and turns `null`/`undefined` into the literal text "null"/
@@ -32078,17 +32093,40 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // templates across the platform, most never tested against this change, and a
       // reject-on-detect design would turn any of their LLM's occasional imperfect
       // escaping into a customer-visible outage for reasons unrelated to security.
-      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still
-      // a browser-executable tag — an exact-case match would let that trivial
-      // reformatting evade correction entirely. A false correction is possible if a raw
-      // dangerous substring coincidentally already existed in the template's own static
-      // markup, but replacing that one occurrence with its escaped form is a far safer
-      // failure mode than either a silently reopened injection or a hard failure.
-      for (const [rawValue, escapedValue] of rawToEscapedMap) {
+      //
+      // Applied to finalHtml ONLY, never finalSubject — per docs/html-templates.md,
+      // `subject` is a real email subject line (round-4 review finding), never rendered
+      // as HTML, so it has no injection surface to correct in the first place; escaping
+      // it at all just corrupts a real customer-visible field with literal entity text.
+      //
+      // Two more round-4 findings fixed here: (1) longest-value-first ordering — when one
+      // flagged value is a literal substring of another (plausible with real HTML-snippet
+      // data), correcting the shorter one first destroys the exact string the longer one's
+      // pattern needs, silently no-oping its own correction. (2) a replacer FUNCTION, not
+      // a plain string — `String.replace` treats `$&`, `$$`, etc. in a plain replacement
+      // string as special patterns; an escaped value that happens to contain `$` next to
+      // certain characters could reinject the raw matched text, un-doing the very
+      // escaping this loop exists to enforce. A function's return value is used literally,
+      // with no `$`-pattern interpretation.
+      //
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still a
+      // browser-executable tag — an exact-case match would let that trivial reformatting
+      // evade correction entirely. A false correction is possible if a raw dangerous
+      // substring coincidentally already existed in the template's own static markup, but
+      // replacing that one occurrence with its escaped form is a far safer failure mode
+      // than either a silently reopened injection or a hard failure.
+      const correctionsByLengthDesc = [...rawToEscapedMap.entries()].sort(
+        ([a], [b]) => b.length - a.length
+      );
+      for (const [rawValue, escapedValue] of correctionsByLengthDesc) {
         const pattern = new RegExp(AgentModeService.escapeRegExp(rawValue), 'gi');
-        finalHtml = finalHtml.replace(pattern, escapedValue);
-        finalSubject = finalSubject.replace(pattern, escapedValue);
+        finalHtml = finalHtml.replace(pattern, () => escapedValue);
       }
+
+      // finalSubject is plain text (never HTML-rendered), so any HTML entity that leaked
+      // through from the escaped prompt values doesn't protect anything — it just shows
+      // literal "&amp;"/"&#39;" etc. in a real customer's email subject. Decode them back.
+      finalSubject = AgentModeService.unescapeHtml(finalSubject);
 
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
