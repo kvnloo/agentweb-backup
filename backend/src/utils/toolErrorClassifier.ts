@@ -355,6 +355,26 @@ export function classifyToolErrorClass(error: unknown): string {
       }
     }
     if (typeof statusProp === 'number') {
+      // A 429 is ambiguous: transient per-minute throttling (rate_limit,
+      // retryable) and a permanent hard-quota/billing stop that providers
+      // ALSO report via 429 (OpenAI/Azure `insufficient_quota` etc.) are
+      // indistinguishable by status code alone. classFromStatus(429)
+      // unconditionally returns 'rate_limit' and would win by default. That
+      // mattered only for telemetry clustering before ENG-1661; now callLLM's
+      // OpenRouter retry loop keys its retry decision on 'rate_limit', so this
+      // ordering would make it blindly retry an error that can never succeed.
+      //
+      // Deliberately narrower than classFromMessage's own quota_exceeded
+      // pattern below: that pattern's bare "quota exceeded" substring also
+      // matches Google Custom Search's genuinely transient per-day quota
+      // message ("Quota exceeded", ENG-1300), which must stay rate_limit and
+      // already relies on classFromStatus(429) winning by default for a
+      // status-shaped error with no more specific phrasing. Match only the
+      // unambiguous OpenAI/Azure hard-stop phrasings here.
+      if (statusProp === 429
+        && /insufficient_quota|exceeded your current quota|check your plan and billing/.test((error.message ?? '').toLowerCase())) {
+        return 'quota_exceeded';
+      }
       const byStatus = classFromStatus(statusProp);
       if (byStatus) return byStatus;
     }
