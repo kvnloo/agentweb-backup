@@ -35,6 +35,63 @@ describe('ensureCriticalTables', () => {
     expect(created.sort()).toEqual(CRITICAL_TABLE_SPECS.map((s) => s.TableName).sort());
   });
 
+  describe('deletion-protection reconcile on the money ledger', () => {
+    // A mock that models an EXISTING table (createTable -> ResourceInUseException)
+    // plus describe/update, so the already-exists reconcile path is exercised.
+    function existingLedgerDynamo(opts: { protected: boolean; canUpdate?: boolean }) {
+      const updated: string[] = [];
+      const client = {
+        createTable: jest.fn(() => ({
+          promise: async () => {
+            const err: any = new Error('exists');
+            err.code = 'ResourceInUseException';
+            throw err;
+          },
+        })),
+        describeTable: jest.fn((p: any) => ({
+          promise: async () => ({ Table: { TableName: p.TableName, DeletionProtectionEnabled: opts.protected } }),
+        })),
+        updateTable: jest.fn((p: any) => ({
+          promise: async () => {
+            if (opts.canUpdate === false) {
+              const err: any = new Error('denied');
+              err.code = 'AccessDeniedException';
+              throw err;
+            }
+            updated.push(p.TableName);
+            return {};
+          },
+        })),
+      };
+      return { client, updated };
+    }
+
+    it('enables protection on an existing unprotected ledger', async () => {
+      const { client, updated } = existingLedgerDynamo({ protected: false });
+      await ensureCriticalTables(client as any);
+      expect(updated).toContain('AW-SpendEvents');
+      const call = client.updateTable.mock.calls.find((c: any) => c[0].TableName === 'AW-SpendEvents');
+      expect(call[0].DeletionProtectionEnabled).toBe(true);
+    });
+
+    it('does NOT write when protection is already on — describe-first, no churn', async () => {
+      const { client } = existingLedgerDynamo({ protected: true });
+      await ensureCriticalTables(client as any);
+      expect(client.updateTable).not.toHaveBeenCalled();
+    });
+
+    it('never throws when the role lacks UpdateTable — the flag is additive, startup must survive', async () => {
+      const { client } = existingLedgerDynamo({ protected: false, canUpdate: false });
+      await expect(ensureCriticalTables(client as any)).resolves.toBeUndefined();
+    });
+
+    it('only reconciles tables whose spec requests protection', async () => {
+      // AW-SpendEvents is the only critical spec with DeletionProtectionEnabled.
+      const guarded = CRITICAL_TABLE_SPECS.filter((s) => (s as any).DeletionProtectionEnabled);
+      expect(guarded.map((s) => s.TableName)).toEqual(['AW-SpendEvents']);
+    });
+  });
+
   it('is idempotent — swallows ResourceInUseException for existing tables', async () => {
     const allNames = CRITICAL_TABLE_SPECS.map((s) => s.TableName);
     const { client, created } = fakeDynamo(allNames);
@@ -92,6 +149,8 @@ describe('ensureCriticalTables', () => {
     // No TTL was approved, and CreateTable cannot express one anyway — this
     // asserts nobody later adds a TimeToLiveSpecification believing it does.
     expect(Object.keys(se!)).not.toContain('TimeToLiveSpecification');
+    // The money ledger must be delete-protected (spec, and enabled live).
+    expect((se as any).DeletionProtectionEnabled).toBe(true);
   });
 
   it('onboarding metrics spec carries the StepStartedAtIndex GSI', () => {
