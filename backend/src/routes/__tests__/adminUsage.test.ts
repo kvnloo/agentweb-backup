@@ -49,7 +49,7 @@ jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgD
 jest.mock('../../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
 jest.mock('../../services/llmUsageCreditService', () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
 
-import adminUsageRoutes from '../adminUsage';
+import adminUsageRoutes, { AGGREGATE_READ_CONCURRENCY } from '../adminUsage';
 import { authenticateToken } from '../../middleware/auth';
 import {
   getUserUsageByModelDay,
@@ -258,6 +258,27 @@ describe('admin usage routes', () => {
         expect(mockAggregateRows).toHaveBeenCalledWith('member-2', '2026-09-01', '2026-09-31');
         // The row billed to someone else in a member's partition is not this subject's spend.
         expect(res.body.llmLedger).toMatchObject({ month: 'partial', aggregateLlmMicroUsd: 4_000_000, missingLlmMicroUsd: 3_000_000 });
+      });
+
+      it('never runs more than AGGREGATE_READ_CONCURRENCY partition queries at once, and still reads them all', async () => {
+        mockGetUserById.mockResolvedValue({ userId: 'owner-1', subscriptionType: 'Pro', orgId: 'org-1' });
+        mockOrgMembers.mockResolvedValue(Array.from({ length: 30 }, (_, i) => ({ userId: `m-${i}` })));
+        mockListSpendEvents.mockResolvedValue([]);
+        let inFlight = 0;
+        let peak = 0;
+        mockAggregateRows.mockImplementation(async () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await new Promise((r) => setImmediate(r));
+          inFlight -= 1;
+          return [];
+        });
+
+        await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-09' });
+
+        expect(mockAggregateRows).toHaveBeenCalledTimes(31);
+        expect(peak).toBeLessThanOrEqual(AGGREGATE_READ_CONCURRENCY);
+        expect(peak).toBeGreaterThan(1);
       });
 
       it('is full when the two rails agree', async () => {
