@@ -90,6 +90,44 @@ describe('userDb - deleted_ tombstone filtering', () => {
     });
   });
 
+  // ── sandbox principals (ENG-1907) ─────────────────────────────────────────────
+  // Every fleet sweep, cron, and admin listing enumerates through getAllUsers, so
+  // this one filter is what keeps a sandbox account out of CRM sync, onboarding
+  // nudges, Meta crons, and revenue listings. Opt-in only for the sandbox lifecycle.
+
+  describe('getAllUsers() — sandbox principal filtering (ENG-1907)', () => {
+    beforeEach(() => {
+      mockDocClient.scan.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            // Not example.com: isBotLikeEmail treats that domain as a test fixture, which
+            // would make the hideBotLike case below drop the real user for the wrong reason.
+            { userId: 'user-real', email: 'real@acme.io' },
+            { userId: 'eval_1b2c3d4e-0000-4000-8000-000000000000', email: 'candidate@acme.io' },
+          ],
+        }),
+      });
+      mockDocClient.query = jest.fn().mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Count: 0, Items: [] }),
+      });
+    });
+
+    it('excludes eval_ principals by default', async () => {
+      const users = await userDb.getAllUsers();
+      expect(users.map(u => u.userId)).toEqual(['user-real']);
+    });
+
+    it('excludes eval_ principals when bot filtering is on too', async () => {
+      const users = await userDb.getAllUsers(true);
+      expect(users.map(u => u.userId)).toEqual(['user-real']);
+    });
+
+    it('includes eval_ principals only when a caller opts in with includeSandbox', async () => {
+      const users = await userDb.getAllUsers(false, { includeSandbox: true });
+      expect(users.map(u => u.userId).sort()).toEqual(['eval_1b2c3d4e-0000-4000-8000-000000000000', 'user-real']);
+    });
+  });
+
   // ── getUserByEmail ────────────────────────────────────────────────────────────
 
   describe('getUserByEmail()', () => {

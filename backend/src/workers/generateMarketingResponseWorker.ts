@@ -3,8 +3,10 @@
  * This prevents blocking the main event loop during long-running operations
  */
 
-import { AgentModeService } from '../services/agentModeService';
+import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
+import { installSandboxMetaInterceptorAtBoot } from '../services/sandbox/bootstrap';
+import { shouldBootstrapBackgroundJobs } from '../utils/instanceState';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
 // isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
@@ -12,8 +14,22 @@ import { installWorkerShutdownGuards } from './workerShutdownGuards';
 // disconnect. Install before any heavy init so the guards are active immediately.
 installWorkerShutdownGuards();
 
-// Initialize the service
-const agentModeService = new AgentModeService();
+// ENG-1852: use the module's own exported singleton, not a separate `new AgentModeService()`.
+// agentModeService.ts's own module body constructs and exports `agentModeService` as soon as
+// the module loads — which happens the moment this file's import above resolves, regardless
+// of what we do with it. Constructing ANOTHER instance here just meant this worker process
+// carried two live AgentModeService objects: this one (deliberately `.initialize()`'d below)
+// and the module's own singleton, which nothing in this file ever initialized. The vast
+// majority of AgentModeService methods are stateless proxies to external APIs and don't care
+// which instance answers, but a handful of tool handlers in emma/tools.ts and apiTools.ts
+// (install_skills, getUnassociatedToolNames, ...) import that plain singleton directly rather
+// than going through the caller-scoped `context.service`, and DO depend on per-instance state
+// populated only by .initialize() (this.toolRegistry, this.mcpClientService). Whichever of the
+// two objects happened to be constructed calling that particular tool decided whether the call
+// saw the correctly-populated 264-tool registry or a permanently empty one — confirmed live via
+// a captured construction stack trace showing both instances alive in the same worker pid.
+// Using the singleton here means there is only ever one object per process again, matching
+// what emma/tools.ts and apiTools.ts already assume.
 
 // Initialize once when worker starts (not per message)
 let initialized = false;
@@ -33,7 +49,30 @@ async function ensureInitialized() {
 
   // Start initialization
   console.log('[Worker-DEBUG] Starting AgentModeService initialization...');
-  initializationPromise = agentModeService.initialize();
+  initializationPromise = (async () => {
+    // ENG-1912: this worker is a SEPARATE forked process (child_process.fork in
+    // generateMarketingResponseWorkerService.ts) with its own V8 isolate and its own
+    // globalThis — server.ts's installSandboxMetaInterceptorAtBoot() call in the main
+    // process's listen() callback never runs here, so this process's fetch/axios/https
+    // were never patched. Found live in production: a sandbox principal's
+    // call_meta_ads_insights_api tool call (which runs inside this worker, per the
+    // "[Worker]"-prefixed AgentMode tool logs) reached the REAL graph.facebook.com with
+    // its sentinel token and got Meta's own real "Bad signature" OAuthException back —
+    // exactly the invariant ("zero requests leave the process for graph.facebook.com")
+    // this interceptor exists to hold. Unlike server.ts's own install call (which logs
+    // and continues, because the main process has plenty of other jobs an interceptor
+    // failure shouldn't take down), a failed install HERE must fail the whole worker:
+    // this process's only job is exactly the tool calls the interceptor has to guard,
+    // so continuing without it silently recreates the leak this fix exists to close.
+    // Skip under the Jest test-boot path, since this worker module is imported directly
+    // by generateMarketingResponseWorker.argOrder.test.ts / .errorStatus.test.ts and
+    // metaInterceptor.test.ts owns the module-level singleton's install/uninstall itself.
+    if (shouldBootstrapBackgroundJobs()) {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[Worker] Sandbox Meta interceptor installed');
+    }
+    await agentModeService.initialize();
+  })();
   await initializationPromise;
   initialized = true;
   console.log('[Worker-DEBUG] AgentModeService initialized (MCP servers loaded)');

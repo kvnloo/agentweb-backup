@@ -93,6 +93,21 @@ export async function resolveLinkedInAccountForWrite(
   return resolveLinkedInAccountFromList(accounts, accountId);
 }
 
+/**
+ * Which check refused a paced LinkedIn write. `paceLinkedInWrite` has three
+ * independent refusal sources and their messages are prose, so callers that need
+ * to REPORT the cause must key on this rather than on wording (ENG-1873: the
+ * stale-invitation drain collapsed all three into "write-pacing limit", which sent
+ * its only investigation to the wrong subsystem).
+ */
+export type PaceRefusalGate =
+  /** The account's daily connection-request cap (incl. the durable re-check). */
+  | 'daily_volume'
+  /** The hourly ceiling / queue in `reserveWriteSlot`. */
+  | 'write_pacer'
+  /** Both checks passed but the daily reservation could not be written. */
+  | 'reservation_persistence';
+
 export type PaceLinkedInWriteResult =
   | { refusal: null }
   | {
@@ -100,6 +115,7 @@ export type PaceLinkedInWriteResult =
         success: false;
         message: string;
         error: string;
+        gate: PaceRefusalGate;
       };
     };
 
@@ -133,6 +149,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn daily volume limit reached',
+        gate: 'daily_volume',
         error: [
           dailySlot.reason,
           '',
@@ -151,6 +168,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn write actions are being paced',
+        gate: 'write_pacer',
         error: [
           hourlySlot.reason,
           '',
@@ -195,6 +213,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn daily volume reservation could not be secured',
+        gate: 'reservation_persistence',
         error: 'The LinkedIn write was not attempted because its daily safety reservation could not be persisted. Please try again later.',
       },
     };
@@ -205,6 +224,7 @@ export async function paceLinkedInWrite(
       refusal: {
         success: false,
         message: 'LinkedIn daily volume limit reached',
+        gate: 'daily_volume',
         error: [
           durableRefusalReason,
           '',

@@ -75,6 +75,13 @@ describe("reconcileUnregisteredDomains", () => {
     expect(result.reconciled).toBe(0);
   });
 
+  // ENG-1907: a sandbox principal's pages must never trigger a real Vercel registration.
+  it("skips a deployed page owned by a sandbox (eval_) principal", async () => {
+    const result = await reconcileUnregisteredDomains([], [page({ userId: "eval_7f7f7f7f-0000-4000-8000-000000000000" })]);
+    expect(result.reconciled).toBe(0);
+    expect(mockAddCustomDomain).not.toHaveBeenCalled();
+  });
+
   it("skips a page with no customDomainUrl — nothing to register", async () => {
     const result = await reconcileUnregisteredDomains([], [page({ customDomainUrl: undefined })]);
     expect(mockAddCustomDomain).not.toHaveBeenCalled();

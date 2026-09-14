@@ -3,7 +3,8 @@ import { sendAgentModeOncallAlert, __resetAgentModeAlertDedupeForTests } from '.
 // Mock the dependencies
 jest.mock('../../services/chatbotService', () => ({
   chatbotDb: {
-    createOrReuseInteractiveShare: jest.fn()
+    createOrReuseInteractiveShare: jest.fn(),
+    getChatSessionRecord: jest.fn(),
   }
 }));
 
@@ -343,4 +344,94 @@ describe('agentModeAlerts utils', () => {
       expect(suppressed).toBe(false);
     });
   });
+
+  // ENG-1907: a take-home candidate deliberately breaking Emma in a sandbox
+  // account must never page the on-call. Suppression is keyed on the principal
+  // (explicit userId, or the owner of the session the alert is about), not on a
+  // caller-supplied flag — the 30 call sites stay untouched.
+  describe('sandbox principals never page oncall (ENG-1907)', () => {
+    const EVAL_USER = 'eval_9f8e7d6c-0000-4000-8000-000000000000';
+
+    beforeEach(() => {
+      mockedEmailService.sendOncallAlert.mockResolvedValue(undefined);
+      mockedChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('https://share.example.com/x');
+    });
+
+    it('suppresses when the alert names a sandbox userId, without creating a share link', async () => {
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        userId: EVAL_USER,
+        sessionId: 'session-sbx-1',
+      });
+
+      expect(delivered).toBe(false);
+      expect(mockedEmailService.sendOncallAlert).not.toHaveBeenCalled();
+      expect(mockedChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    });
+
+    it('suppresses when only a sessionId is given and that session is owned by a sandbox principal', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-sbx-2', userId: EVAL_USER });
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'boom',
+        sessionId: 'session-sbx-2',
+      });
+
+      expect(delivered).toBe(false);
+      expect(mockedChatbotDb.getChatSessionRecord).toHaveBeenCalledWith('session-sbx-2');
+      expect(mockedEmailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('still delivers for a session owned by a normal customer', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-real', userId: 'customer-1' });
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        sessionId: 'session-real',
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails open — an owner lookup error must not silence a real alert', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        sessionId: 'session-unknown',
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not consume the dedupe window for a suppressed sandbox alert', async () => {
+      const ts = 1_700_000_000_000;
+      const suppressed = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'sandbox',
+        userId: EVAL_USER,
+        dedupeKey: 'context_limit:shared-key',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      });
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'real customer, same key, same window',
+        userId: 'customer-1',
+        dedupeKey: 'context_limit:shared-key',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000,
+      });
+
+      expect(suppressed).toBe(false);
+      expect(delivered).toBe(true);
+    });
+  });
+
 });

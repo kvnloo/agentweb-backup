@@ -30,6 +30,7 @@ import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { ensureFreshMetaAdAccountToken, needsMetaRefresh, isMetaAdAccount } from '../services/metaTokenRefresh';
 import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
 import { reconcilePendingConversionsForUser } from '../services/metaConversionReconcile';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 
 const TAG = '[metaTokenRefreshCron]';
 
@@ -79,6 +80,9 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
   }
 
   for (const user of users) {
+    // ENG-1907: a sandbox principal's Meta token is a sentinel. Refreshing it would hit
+    // Meta's real token exchange and the capability probe would stamp it revoked.
+    if (isEvaluationUser((user as any).userId)) continue;
     summary.scannedUsers++;
     const raw = (user as any).connected_accounts;
     const accounts: ConnectedAccount[] = Array.isArray(raw)

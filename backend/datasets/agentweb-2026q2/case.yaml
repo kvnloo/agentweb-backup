@@ -1,0 +1,8 @@
+# ENG-1910: synthetic product context; packet performance is never imputed.
+datasetId: agentweb-2026q2
+version: 1
+caseId: agentweb-2026q2
+name: AgentWeb Sandbox
+currency: USD
+timezone: America/Los_Angeles
+reviewWindowSeconds: 60

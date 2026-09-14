@@ -575,7 +575,7 @@ describe('Schedule Templates', () => {
       expect(created.type).toBe('scheduled_chat');
 
       // Verify usage count was incremented
-      expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1');
+      expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1', mockUser.userId);
     });
 
     // ENG-1722 (ENG-1609 AC #2): variables alone must be sufficient — no freehand

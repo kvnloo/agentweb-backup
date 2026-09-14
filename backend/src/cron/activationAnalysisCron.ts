@@ -1,5 +1,6 @@
 import { userDb, crmDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 
 const getCrmSyncSettingName = (source: string) => `admin_crm_sync_${source}`;
 const parseCrmSyncSetting = (rawValue?: string | null) => {
@@ -40,7 +41,9 @@ export function getActivationFields(user: any): {
 export async function runActivationAnalysis() {
     console.log("[ActivationCron] Starting execution...");
     try {
-        const allUsers = await userDb.getAllUsers();
+        // ENG-1907: a sandbox principal never finishes brand onboarding by design; it must
+        // not be synced into the internal CRM as a "stuck" customer or nudged.
+        const allUsers = (await userDb.getAllUsers()).filter((u: any) => !isEvaluationUser(u.userId));
         console.log(`[ActivationCron] Found ${allUsers.length} users to analyze`);
 
         // chatSessionCount is already computed by userDb.getAllUsers() via UserIdIndex GSI

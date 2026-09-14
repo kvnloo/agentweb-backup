@@ -52,6 +52,16 @@ describe("createChatSession — lastActiveAt tracking", () => {
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
+  // ENG-1907: a sandbox take-home session is not customer engagement — no DAU/WAU
+  // touch and no CRM engagement event, same as a delegated admin session.
+  it("does NOT update lastActiveAt when the session belongs to a sandbox (eval_) principal", async () => {
+    await chatbotDb.createChatSession("eval_8a8a8a8a-0000-4000-8000-000000000000", undefined, "agent");
+
+    await new Promise(r => setImmediate(r));
+
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+  });
+
   it("still creates session when lastActiveAt update fails (fire-and-forget)", async () => {
     mockUpdateUser.mockRejectedValue(new Error("DynamoDB error"));
 

@@ -9933,6 +9933,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId } = req.body;
 
+      // ENG-1907: no transcript leaves a sandbox account.
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+
       if (!sessionId) {
         return res.status(400).json({ error: 'Session ID is required' });
       }
@@ -10033,6 +10038,11 @@ export const agentModeController = {
       const user = req.user as User;
       const { sessionId, expirationDays: rawExpirationDays } = req.body;
 
+      // ENG-1907: no transcript leaves a sandbox account.
+      if (isEvaluationUser(user?.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
+
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || session.userId !== user.userId) {
@@ -10115,6 +10125,10 @@ export const agentModeController = {
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
         return res.status(404).json({ error: 'Conversation not found' });
+      }
+      // ENG-1907: public reader — refuse on the owner, since no token identifies the caller.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
 
       // Check sharing status
@@ -10259,6 +10273,11 @@ export const agentModeController = {
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+      // ENG-1907: this route is public, so the sandbox boundary never sees an
+      // evaluation token here — refuse on the session owner before any spend.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
       }
       turnStartCalledFunctions = session.calledFunctions || {};
 
@@ -14426,6 +14445,10 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
+      // ENG-1907: public reader — refuse on the owner, since no token identifies the caller.
+      if (isEvaluationUser(session.userId)) {
+        return res.status(403).json({ error: 'Sharing is not available in this sandbox workspace' });
+      }
 
       // Must have view-only or interactive sharing enabled
       const hasViewOnlyShare = session.shareMetadata?.isShared;
@@ -14881,7 +14904,7 @@ export const agentModeController = {
       await scheduleDb.createSchedule(scheduledChat);
 
       // Increment template usage count
-      await scheduleTemplateDb.incrementUsageCount(templateId);
+      await scheduleTemplateDb.incrementUsageCount(templateId, user.userId);
 
       res.status(201).json({
         scheduleId,

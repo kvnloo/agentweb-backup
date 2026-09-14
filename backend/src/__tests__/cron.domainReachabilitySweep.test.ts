@@ -93,6 +93,20 @@ describe("selectDomainsToProbe", () => {
     expect(selectDomainsToProbe(domains, pages).map((d) => d.id)).toEqual(["d1"]);
   });
 
+  // ENG-1907: a sandbox account may generate landing pages; its domains are never probed,
+  // and its deployed pages never bring a host into scope.
+  it("skips a domain owned by a sandbox (eval_) principal even when it backs a deployed page", () => {
+    const domains = [dom("d1", "sbx.agentwebforms.com", { userId: "eval_6e6e6e6e-0000-4000-8000-000000000000" })];
+    const pages = [{ status: "deployed", customDomainUrl: "https://sbx.agentwebforms.com", userId: "eval_6e6e6e6e-0000-4000-8000-000000000000" }];
+    expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
+  });
+
+  it("a deployed page owned by a sandbox principal does not put its host in scope", () => {
+    const domains = [dom("d1", "shared.acme.com")];
+    const pages = [{ status: "deployed", customDomainUrl: "https://shared.acme.com", userId: "eval_6e6e6e6e-0000-4000-8000-000000000000" }];
+    expect(selectDomainsToProbe(domains, pages)).toHaveLength(0);
+  });
+
   it("probes a domain shared by several deployed pages exactly once", () => {
     const domains = [dom("d1", "shared.agentwebforms.com")];
     const pages = [

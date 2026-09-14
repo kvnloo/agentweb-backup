@@ -10,6 +10,7 @@ import {
 } from "../services/adsMetricsDb";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 import { promoteAttributionFromCustomFields } from "../types/attribution";
+import { isEvaluationUser } from "../services/evaluationPolicy";
 
 /**
  * ENG-993: Every.io's Meta CAPI gap means its Meta-reported conversions read as
@@ -548,6 +549,9 @@ export async function enumerateDistinctMetaAdAccounts(): Promise<DistinctMetaAdA
   const byAccountId = new Map<string, Array<{ userId: string; user: any; createdAt: string }>>();
 
   for (const user of users) {
+    // ENG-1907: a sandbox principal's Meta connection is simulated; never snapshot it.
+    // getAllUsers already excludes these — this keeps the cron correct even if a caller opts in.
+    if (isEvaluationUser((user as any).userId)) continue;
     const raw = (user as any).connected_accounts;
     const accounts: ConnectedAccount[] = Array.isArray(raw) ? raw : [];
     for (const account of accounts) {

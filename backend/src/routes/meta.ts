@@ -3,6 +3,8 @@ import { authenticateToken } from "../middleware/auth";
 import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
 import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
+import { sandboxManagementUrl } from "../services/sandboxManagementUrl";
+import { isEvaluationUser } from "../services/evaluationPolicy";
 
 const router = express.Router();
 
@@ -888,8 +890,11 @@ router.post("/create-ad", async (req, res) => {
       throw new Error(`Graph API Error: ${createAdData.error.message} (Code: ${createAdData.error.code})`);
     }
     
-    // Generate ad management URL using Facebook Ads Manager
-    const adManagementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${adAccountId}`;
+    // Generate ad management URL using Facebook Ads Manager — a sandbox account's ad
+    // account is fictional, so it gets a portal-internal link instead (ENG-1909).
+    const adManagementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaignId)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${adAccountId}`;
     console.log("Ad Management URL:", adManagementUrl);
     
     // Record the ad creation in the existing image file in result_files

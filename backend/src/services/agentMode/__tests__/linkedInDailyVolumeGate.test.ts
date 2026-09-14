@@ -166,6 +166,54 @@ describe('paceLinkedInWrite — check ordering and persistence', () => {
   });
 });
 
+// ENG-1873 AC2. `paceLinkedInWrite` refuses from independent sources whose messages
+// are prose. The stale-invitation drain reported every one of them as "write-pacing
+// limit", so a drain that withdrew nothing three times over 14 hours could not say
+// why. Each refusal must now carry a machine-readable gate that callers report.
+describe('paceLinkedInWrite — every refusal names its gate (ENG-1873)', () => {
+  const account = { ownerUserId: 'user-1', configuredDailyInviteCap: 10, dailyVolumeState: undefined, connectedAt: undefined };
+
+  it('daily volume cap -> gate daily_volume', async () => {
+    const exhausted = { invite: { count: 10, windowStartedAt: Date.now() } };
+    const result = await paceLinkedInWrite('send-invite', { ...account, dailyVolumeState: exhausted }, ACCOUNT_ID);
+    expect(result.refusal!.gate).toBe('daily_volume');
+  });
+
+  it('hourly write pacer -> gate write_pacer', async () => {
+    mockReserveWriteSlot.mockResolvedValue({ allowed: false, reason: 'hourly ceiling reached', retryAfterMs: 60_000 });
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+    expect(result.refusal!.gate).toBe('write_pacer');
+  });
+
+  it('durable re-check finding the last slot taken -> gate daily_volume', async () => {
+    mockUpdateAccountConfig.mockImplementationOnce(async (_o: string, _p: string, _a: string, mutation: any) => {
+      mutation({ daily_invite_cap: 10, daily_volume: { invite: { count: 10, windowStartedAt: Date.now() } } });
+    });
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+    expect(result.refusal!.gate).toBe('daily_volume');
+  });
+
+  it('reservation that cannot be persisted -> gate reservation_persistence', async () => {
+    mockUpdateAccountConfig.mockRejectedValueOnce(new Error('boom'));
+    const result = await paceLinkedInWrite('send-invite', account, ACCOUNT_ID);
+    expect(result.refusal!.gate).toBe('reservation_persistence');
+  });
+
+  // The path the drain actually takes. A cancel consumes no invite budget, but it
+  // still passes through the durable daily-volume commit — so a persistence failure
+  // refuses EVERY withdrawal even when both gates allow. That commit was the one
+  // step the original local reproduction never exercised.
+  it('cancel-invitation still commits the reservation, and a persistence failure refuses it as reservation_persistence', async () => {
+    const allowed = await paceLinkedInWrite('cancel-invitation', account, ACCOUNT_ID);
+    expect(allowed.refusal).toBeNull();
+    expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+
+    mockUpdateAccountConfig.mockRejectedValueOnce(new Error('ConditionalCheckFailedException'));
+    const refused = await paceLinkedInWrite('cancel-invitation', account, ACCOUNT_ID);
+    expect(refused.refusal!.gate).toBe('reservation_persistence');
+  });
+});
+
 describe('setDailyInviteCap', () => {
   it('writes the cap through the account OWNER record, not the caller', async () => {
     await setDailyInviteCap({ ownerUserId: 'owner-user-id', configuredDailyInviteCap: undefined, dailyVolumeState: undefined, connectedAt: undefined }, ACCOUNT_ID, 30);

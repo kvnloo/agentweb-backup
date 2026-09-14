@@ -1,4 +1,6 @@
-import { enforceEvaluationTool } from './evaluationPolicy';
+import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
+import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
 import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
@@ -53,6 +55,10 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
+import {
+  assertOpenRouterResponseHasChoices,
+  isMalformedOpenRouterResponseError,
+} from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -443,6 +449,7 @@ import {
   computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
+import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
@@ -552,13 +559,16 @@ export function buildHtmlArtifactFilename(title: string, now: number = Date.now(
  * Keep V0 observability-only: this must not change tool execution, retries,
  * prompts, streaming, or user-facing responses.
  */
-function recordAgentModeToolTelemetry(
+export function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
   toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
   budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
+  userId?: string,
 ): void {
+  // ENG-1907: sandbox runs write no reliability telemetry (see agentMode/sandboxTelemetry.ts).
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
@@ -643,7 +653,7 @@ function recordAgentModeToolTelemetry(
 }
 
 
-function recordAgentModeRunStarted(
+export function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
@@ -652,15 +662,21 @@ function recordAgentModeRunStarted(
   // The traceId is bridged into the recorder's agent_run_started dimensions so
   // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
   startInvokeAgentSpan(runId, info);
+  if (isEvaluationUser(info.userId)) {
+    markSandboxRun(runId);
+    return;
+  }
+  forgetSandboxRun(runId);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   const traceId = getRunTraceId(runId);
   void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
-function recordAgentModeRunCompleted(
+export function recordAgentModeRunCompleted(
   runId: string,
   info: RunTerminalInfo,
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -671,6 +687,7 @@ function recordAgentModeRunCompleted(
     }).verdict,
     responseModel: info.llmModel,
   });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -683,22 +700,25 @@ function recordAgentModeRunCompleted(
  * is the only trace that a truthfulness check was skipped. Best-effort: must
  * never throw into the chat hot path.
  */
-function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+export function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown, userId?: string): void {
   console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
     runId,
     sessionId,
     error: error instanceof Error ? error.message : String(error),
   });
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.claimCheckError(runId, { error, sessionId });
 }
 
-function recordAgentModeRunFailed(
+export function recordAgentModeRunFailed(
   runId: string,
   info: RunTerminalInfo & { error: unknown },
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -1582,9 +1602,36 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
+  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
+  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
+  // no known code path that mutates the registry in between (see the brain node).
+  // The one remaining live hypothesis is that more than one AgentModeService instance
+  // is answering requests inside the same forked worker process (e.g. the per-message
+  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
+  // worker after all). Stamping each instance at construction settles it directly: if
+  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
+  // reads on the same pid, that's a second instance, proven, not inferred.
+  private readonly instanceId = Math.random().toString(36).slice(2, 10);
+
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
+    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
+    // instanceId alone proved a second, empty-registry instance answers requests
+    // inside the same worker process, but every known construction site (module
+    // singleton, the worker's own instance, chatbotService.ts's per-message
+    // throwaway) traces to a call graph that shouldn't reach the worker a second
+    // time. Capturing the actual construction stack settles which site it really
+    // is instead of continuing to reason about it from the outside.
+    // Stack goes inside the same JSON blob (not a second console.log argument) so a
+    // log shipper that splits on newline can't separate it from its pid/instanceId —
+    // a raw multi-line stack string passed alongside would risk exactly that.
+    console.log('[ENG-1852-CTOR]', JSON.stringify({
+      pid: process.pid,
+      instanceId: this.instanceId,
+      uptimeSec: Math.round(process.uptime()),
+      stack: new Error('construction site').stack,
+    }));
   }
 
   public async initialize() {
@@ -3113,7 +3160,12 @@ export class AgentModeService {
     // hard cap, trading one failure mode for a worse one.
     const isRetryableLlmCallError = (error: unknown): boolean => {
       const errorClass = classifyToolErrorClass(error);
-      return errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx';
+      if (errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx') return true;
+      // ENG-1681: see openRouterResponseValidation.ts for the full context —
+      // this covers OpenRouter's malformed/empty-response failure classes,
+      // which are not a rate limit, network blip, or 5xx by
+      // classifyToolErrorClass's general taxonomy.
+      return isMalformedOpenRouterResponseError(error);
     };
 
     // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
@@ -3143,6 +3195,10 @@ export class AgentModeService {
           params,
           { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
         );
+        // ENG-1681: see openRouterResponseValidation.ts — converts a response
+        // with no `choices` array into an explicit, retryable error before it
+        // ever reaches the unguarded `response.choices[0].message` downstream.
+        assertOpenRouterResponseHasChoices(res, model);
         // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
         // impact) -- lets a production incident/verification tie a specific
         // call to the provider it actually landed on without reading
@@ -4884,7 +4940,7 @@ export class AgentModeService {
               recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
                 mediaAssetsProducedThisRun,
                 mediaGenerationDeadlineMs,
-              }),
+              }, userId),
             recordDuplicateSuppression: (entries) =>
               recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
@@ -5096,7 +5152,7 @@ export class AgentModeService {
                 this.requestFinalizeCorrection(finalText, systemNote, llmModel),
               toolResultError,
               mediaGenProducedAsset,
-              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
             },
           });
           finalizeClaimMismatch = guardOutcome.claimMismatch;
@@ -5142,7 +5198,7 @@ export class AgentModeService {
         } catch (guardError) {
           // Guard is advisory — a guard bug must never block delivery. Loud, not
           // silent: recorded as claim_check_error (same contract as judge failure).
-          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError, userId);
         }
       }
 
@@ -5354,7 +5410,7 @@ export class AgentModeService {
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
-      });
+      }, userId);
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
       // the suggested-replies tail work already gets). Bounded, so never hangs.
@@ -5450,7 +5506,7 @@ export class AgentModeService {
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
         llmModel,
         modelAtStart: originalLlmModel,
-      });
+      }, userId);
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
       throw wrappedError;
@@ -6394,6 +6450,7 @@ export class AgentModeService {
     // across all lines confirms (a); differing pids confirms (b).
     console.log('[ENG-1852-DIAG]', JSON.stringify({
       pid: process.pid,
+      instanceId: this.instanceId,
       uptimeSec: Math.round(process.uptime()),
       allToolsCount: allTools.length,
       hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
@@ -17743,9 +17800,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Polling Engine
         let attempts = 0;
         const maxAttempts = 60;
+        // ENG-1908: see sandboxAwarePollDelayMs — a sandbox account's report is
+        // already complete the instant it's created, so it never waits the real delay.
+        const pollDelayMs = sandboxAwarePollDelayMs(accessToken, 10000);
         while (attempts < maxAttempts) {
           attempts++;
-          await new Promise((resolve) => setTimeout(resolve, 10000));
+          await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
           const statusRes = await axios.get(`${baseUrl}/${rid}`, {
             params: { access_token: accessToken },
           });
@@ -21221,13 +21281,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         accountId: gateCreds.accountId,
         resolver: metaService,
       });
+      // ENG-1909: undefined for any real account (byte-for-byte unchanged gate call —
+      // `preflightMetaTrackingGate`'s `deps.fetchHtml ?? defaultFetchHtml` falls back to the
+      // real fetcher); for a sandbox account, answers destination checks from its own frozen
+      // dataset instead of making a real outbound fetch to a fictional/example.invalid URL.
+      const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
       const gate = await runMetaTrackingGate(
         gateCreds,
         gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
-        {},
+        { fetchHtml: sandboxFetchHtml },
         // Activating one ad is judged on that ad's own destination, not its siblings'.
         entity_type === 'AD' ? ad_id : undefined,
         /*
@@ -22182,12 +22247,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        */
       if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
         const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        // ENG-1909: see the comment at the callMetaMarketingApi call site above — undefined
+        // (real fetch, unchanged) for any real account, dataset-backed for a sandbox one.
+        const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
         const gate = await runMetaTrackingGate(
           gateCreds,
           args.campaign_id,
           `${workflow.toUpperCase()}_LAUNCH`,
           args?.override_tracking_check === true,
           args?.session_id,
+          { fetchHtml: sandboxFetchHtml },
         );
         if (!gate.proceed) return gate.blockResult;
       }
@@ -37434,7 +37503,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
                 // resolvedLinkedInAccount is non-null here: this action is in the
                 // ownership gate above, which returns early when it cannot resolve.
-                return paced.refusal ? paced.refusal.error : null;
+                if (!paced.refusal) return null;
+                // ENG-1873: hand back WHICH gate refused, not just its prose, so the
+                // drain result and its notice can say so truthfully.
+                console.log(
+                  `[AgentMode] withdraw-stale-invitations stopped on ${acc}: gate=${paced.refusal.gate} — `
+                  + `${paced.refusal.message}`,
+                );
+                return { gate: paced.refusal.gate, reason: paced.refusal.error };
               },
               cancel: async (invitationId, acc) => {
                 await linkedInOutreachService.cancelInvitation(invitationId, acc);

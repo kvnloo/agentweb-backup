@@ -11,11 +11,14 @@ export {};
 
 const generateMarketingResponse = jest.fn();
 
+// ENG-1852: the worker imports the module's own exported singleton (not a fresh
+// `new AgentModeService()`), so a value-shaped mock is what the real import resolves to.
 jest.mock('../services/agentModeService', () => ({
-  AgentModeService: jest.fn().mockImplementation(() => ({
+  agentModeService: {
     initialize: jest.fn().mockResolvedValue(undefined),
     generateMarketingResponse,
-  })),
+    releaseSessionMcpClients: jest.fn().mockResolvedValue(undefined),
+  },
 }));
 
 jest.mock('../workers/workerShutdownGuards', () => ({

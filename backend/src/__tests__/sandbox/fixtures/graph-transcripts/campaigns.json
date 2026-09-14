@@ -1,0 +1,88 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/campaigns",
+    "query": {
+      "fields": "id,name,status,objective,daily_budget,lifetime_budget,budget_remaining,spend_cap,bid_strategy,start_time,stop_time,effective_status,special_ad_categories",
+      "limit": "100"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "120000000000000004",
+        "name": "Object 4",
+        "status": "PAUSED",
+        "objective": "OUTCOME_LEADS",
+        "budget_remaining": "0",
+        "spend_cap": "100000",
+        "start_time": "2026-08-09T15:32:59-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      },
+      {
+        "id": "120000000000000005",
+        "name": "Object 5",
+        "status": "PAUSED",
+        "objective": "OUTCOME_LEADS",
+        "budget_remaining": "0",
+        "spend_cap": "100000",
+        "start_time": "2026-08-09T15:31:50-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      },
+      {
+        "id": "120000000000000006",
+        "name": "Object 6",
+        "status": "PAUSED",
+        "objective": "OUTCOME_LEADS",
+        "budget_remaining": "0",
+        "spend_cap": "300000",
+        "start_time": "2026-07-22T03:17:05-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      },
+      {
+        "id": "120000000000000007",
+        "name": "Object 7",
+        "status": "PAUSED",
+        "objective": "OUTCOME_TRAFFIC",
+        "budget_remaining": "0",
+        "start_time": "2026-07-10T23:04:14-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      },
+      {
+        "id": "120000000000000008",
+        "name": "Object 8",
+        "status": "PAUSED",
+        "objective": "OUTCOME_LEADS",
+        "daily_budget": "5000",
+        "budget_remaining": "5000",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "start_time": "2026-04-14T23:44:16-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      },
+      {
+        "id": "120000000000000009",
+        "name": "Object 9",
+        "status": "PAUSED",
+        "objective": "OUTCOME_LEADS",
+        "daily_budget": "5000",
+        "budget_remaining": "5000",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "start_time": "2026-04-08T10:30:17-0700",
+        "effective_status": "PAUSED",
+        "special_ad_categories": []
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci05",
+        "after": "c2FuaXRpemVkLWN1cnNvci0xMA=="
+      }
+    }
+  }
+}

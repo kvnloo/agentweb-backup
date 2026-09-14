@@ -1,3 +1,46 @@
+## ENG-1907: sandbox mode phase 1 — the `eval_` principal becomes a real portal account (2026-09-12)
+
+ENG-1870 shipped a separate mini-product for evaluations (server-rendered `/evaluation` page, a
+single-shot Gemini with no tools, a toy simulator, an HTTP allowlist that 403'd every real route).
+Harsha rejected it on sight: the candidate never touched the product. Phase 1 of ENG-1906 keeps the
+lifecycle that was good — `eval_<uuid>` identity, the `AW-Evaluations` policy row, atomic
+provision/revoke/audit, reviewer assignment, the `scope:'evaluation'` delegate token — and
+inverts the boundary: a **denylist** (connector OAuth, MCP OAuth/servers/API keys, Stripe, org,
+Featurebase identity, public share links, session transfer, Clarity replay registration,
+`/api/admin`), socket admission on the same policy check, and **class-based** tool denial
+(`SANDBOX_TOOL_CLASSES` in `evaluationPolicy.ts`) enforced in all three dispatchers. Everything
+unclassified — Meta tools included — reaches its normal handler. No Meta simulation exists yet
+(phase 2/3), so a phase-1 sandbox account simply has no Meta connection.
+
+Assumptions worth knowing when this bites later:
+
+- **`getAllUsers` now excludes `eval_` principals by default** (`{ includeSandbox: true }` opts
+  in). That single filter is what keeps a take-home account out of the activation CRM sync,
+  onboarding nudges, Meta crons, renewal alerts, LLM unit economics and revenue listings. The one
+  caller that opts in is the partner-portal roster (`GET /api/admin/users`) because Access Portal
+  lives there. If a sweep ever bypasses `getAllUsers` (the renewal cron's `scanWithFilter` did),
+  it needs its own `isEvaluationUser` skip — one test per enumerator pins the current set.
+- **Oncall suppression is keyed on identity, never a caller flag.** `sendAgentModeOncallAlert`
+  resolves the session owner when no `userId` is passed, so the 30 call sites are untouched. It
+  fails open: a lookup error still pages for a real customer.
+- **Reliability telemetry skips sandbox runs entirely** (run ids remembered at
+  `recordAgentModeRunStarted`, cleared on the terminal event) because
+  `agentReliabilitySnapshotCron` has no per-user filter and feeds the closure gate's
+  `failedRunRate`/`degradedRunRate`.
+- **`install_skills` is deliberately outside the `connectors` class** even though it matches the
+  `install_` prefix — denying it would strip every non-foundation tool from Emma.
+- **A policy row without `deniedToolClasses` denies every class** (fail closed; this is also what
+  the pre-phase-1 row for the Ryan take-home looks like). The store's `get()` normalizes legacy
+  fields (`materials`, `artifacts`, `simulation`, `remaining`) away instead of throwing.
+- **Provision refuses without the `Sandbox` tier row** (`scripts/ensure-sandbox-tier.ts`,
+  compare-and-set append) because an unknown tier name fails *open* to every page, connector and
+  skill in `subscriptionService`. The AW-Users item is written with `subscriptionType: 'Sandbox'`,
+  seeded `brandGuidelines` (else the portal forces onboarding, which runs real brand extraction),
+  and never `adAccount` — `routes/meta.ts` and Emma's Meta credential resolver would otherwise
+  fall back to AgentWeb's shared production Meta token.
+- Local TDD ran under Node 20 (`/usr/local/bin/node`); the default Node 26 on the Mac cannot load
+  `jsonwebtoken`. Merge evidence is the Atem run.
+
 ## ENG-1624: the "stopped caching the private key" claim describes a bug that never reached `main` (2026-08-31)
 
 A second correction to this same PR's history (see the entry directly below for the

@@ -702,6 +702,32 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
     // Review finding: the tie-break's own edge cases (an exact tie, and every candidate
     // missing created_at) were correct by hand-trace but had no direct test — closing that
     // gap here rather than leaving the correctness unverified.
+    // ENG-1907: a sandbox account carries a simulated Meta connection. Even if the user
+    // listing ever handed one to this cron, it must not resolve its credentials or
+    // write snapshot rows for it — that is how simulation noise would reach AW-AdsMetricsSnapshots.
+    it('never enumerates a sandbox (eval_) principal\'s Meta account', async () => {
+      mockUserDb.getAllUsers.mockResolvedValue([
+        makeSingleAccountUser({ userId: 'user-a', accountId: '111111111111' }),
+        makeSingleAccountUser({ userId: 'eval_2a2a2a2a-0000-4000-8000-000000000000', accountId: '999999999999' }),
+      ] as any);
+      mockGetCreds.mockImplementation(async (_user: any, _userId: any, accountId: any) => ({
+        accountId,
+        accessToken: `tok-${accountId}`,
+        accountName: 'Test',
+      }));
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: async () => makeCampaignInsightsResponse([]),
+      });
+
+      await runMetaMetricsSnapshot();
+
+      expect(mockGetCreds).toHaveBeenCalledTimes(1);
+      expect(mockGetCreds).toHaveBeenCalledWith(expect.anything(), 'user-a', '111111111111');
+      expect(mockGetCreds).not.toHaveBeenCalledWith(expect.anything(), expect.stringMatching(/^eval_/), expect.anything());
+      expect(new Set(writtenRows().map((r: any) => r.accountId))).toEqual(new Set(['111111111111']));
+    });
+
     it('an exact created_at tie still resolves to exactly one canonical user, without crashing', async () => {
       mockUserDb.getAllUsers.mockResolvedValue([
         makeSingleAccountUser({ userId: 'user-x', accountId: 'tied-acct', createdAt: '2026-01-01T00:00:00.000Z' }),
