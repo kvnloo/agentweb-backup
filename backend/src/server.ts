@@ -521,6 +521,17 @@ createTestAccount().then(async () => {
     console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
   }
 
+  // Initialize Enigma card-revenue lookups (ENG-1388). Defensive like Apollo —
+  // without the Secrets Manager key getEnigmaService() stays null and nothing
+  // calls Enigma.
+  try {
+    const { initEnigmaServiceFromEnv } = await import('./services/enigmaServiceFactory');
+    await initEnigmaServiceFromEnv();
+    console.log('Enigma service initialized');
+  } catch (err) {
+    console.warn('Enigma service not initialized — card-revenue lookups disabled:', (err as Error).message);
+  }
+
   // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
   // Unipile /users/{id} backed by AW-EnrichmentRawCache, cacheType='unipile').
   try {
