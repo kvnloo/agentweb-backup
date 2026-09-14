@@ -19,6 +19,7 @@ export const SNAPSHOT_PATH = path.join(
   __dirname, '..', 'services', 'agentMode', '__tests__', 'fixtures', 'openRouterSupportedParameters.json',
 );
 
+/** Fetch one model's endpoints, following OpenRouter aliases, with sorted provider/parameter lists. */
 async function fetchEndpoints(upstreamModel: string) {
   const res = await fetch(`https://openrouter.ai/api/v1/models/${upstreamModel}/endpoints`);
   if (!res.ok) throw new Error(`${upstreamModel}: HTTP ${res.status} ${await res.text()}`);
@@ -34,6 +35,7 @@ async function fetchEndpoints(upstreamModel: string) {
   };
 }
 
+/** Snapshot every non-live registry model's OpenRouter endpoints to SNAPSHOT_PATH. */
 async function main() {
   const registry = (new AgentModeService() as any).llmModels as Record<string, { isLive?: boolean }>;
   const upstreamIds = [...new Set(

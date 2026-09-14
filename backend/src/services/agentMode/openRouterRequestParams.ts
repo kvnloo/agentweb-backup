@@ -38,12 +38,12 @@ export interface OpenRouterParamSelection {
   temperature?: number;
 }
 
+const TEMPERATURE_UNSUPPORTED_UPSTREAM_PREFIXES: readonly string[] = ['openai/gpt-5.'];
+
 /**
  * OpenRouter's metadata marks temperature unsupported for every GPT-5.x model,
  * independent of our registry flag.
  */
-const TEMPERATURE_UNSUPPORTED_UPSTREAM_PREFIXES: readonly string[] = ['openai/gpt-5.'];
-
 export function gatewayAcceptsTemperature(upstreamModel: string): boolean {
   return !TEMPERATURE_UNSUPPORTED_UPSTREAM_PREFIXES.some(prefix => upstreamModel.startsWith(prefix));
 }
