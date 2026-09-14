@@ -34,6 +34,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../services/usageRecorderService";
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { retryTransientWrite } from "../services/usageWriteFailureMonitor";
 import { buildLlmSpendEvent, isLlmDualWriteEnabled } from "../services/spendLedgerDualWrite";
 import { getModelPrice, isPerGenerationPriced, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
@@ -471,44 +472,62 @@ router.post(
                 .flatMap((built) => ("event" in built ? [built.event] : []))
             : [];
           try {
-            const outcome = await usageRecordDb.incrementUsageWithChargeEvent(
-              {
-                userId: entry.userId,
-                date: requestDate,
-                model: entry.model,
-                feature: entry.feature,
-                inputTokens: entry.inputTokens,
-                outputTokens: entry.outputTokens,
-                cacheReadTokens: entry.cacheReadTokens,
-                cacheWriteTokens: entry.cacheWriteTokens,
-                costMicroUsd,
-                billingUserId,
-                // ENG-700 semantics, previously skipped on this path: a group in
-                // which nobody priced anything is "unpriced", not a confirmed $0.
-                costSource: entry.bookCalls + entry.engineCalls > 0 ? "allocated" : "unpriced",
-                provider: entry.provider,
-                calls: entry.calls,
-              },
-              {
-                billingUserId,
-                eventId,
-                occurredAt: requestReceivedAt.toISOString(),
-                actingUserId: entry.userId,
-                tokens: Math.max(0, Math.round(entry.tokens)),
-                costMicroUsd,
-                model: entry.model,
-                feature: entry.feature,
-                calls: entry.calls,
-              },
-              // Passed only when there are any: with the kill switch off, or an
-              // unpriced group, the call is exactly the two-item transaction it
-              // always was.
-              ...(spendEvents.length ? [spendEvents] : [])
-            );
+            // Retry the SAME grouped transaction before falling back
+            // (CodeRabbit, PR #2904). A conflict or throttle can arrive after
+            // DynamoDB committed; replaying the identical items then returns
+            // "duplicate" instead of the per-record fallback writing the
+            // aggregate twice and minting a second, unkeyed spend event. The
+            // fallback below still runs when the retries cannot settle it.
+            const outcome = await retryTransientWrite(async () => {
+              const attempt = await usageRecordDb.incrementUsageWithChargeEvent(
+                {
+                  userId: entry.userId,
+                  date: requestDate,
+                  model: entry.model,
+                  feature: entry.feature,
+                  inputTokens: entry.inputTokens,
+                  outputTokens: entry.outputTokens,
+                  cacheReadTokens: entry.cacheReadTokens,
+                  cacheWriteTokens: entry.cacheWriteTokens,
+                  costMicroUsd,
+                  billingUserId,
+                  // ENG-700 semantics, previously skipped on this path: a group in
+                  // which nobody priced anything is "unpriced", not a confirmed $0.
+                  costSource: entry.bookCalls + entry.engineCalls > 0 ? "allocated" : "unpriced",
+                  provider: entry.provider,
+                  calls: entry.calls,
+                },
+                {
+                  billingUserId,
+                  eventId,
+                  occurredAt: requestReceivedAt.toISOString(),
+                  actingUserId: entry.userId,
+                  tokens: Math.max(0, Math.round(entry.tokens)),
+                  costMicroUsd,
+                  model: entry.model,
+                  feature: entry.feature,
+                  calls: entry.calls,
+                },
+                // Passed only when there are any: with the kill switch off, or an
+                // unpriced group, the call is exactly the two-item transaction it
+                // always was.
+                ...(spendEvents.length ? [spendEvents] : [])
+              );
+              if (attempt === "conflict") {
+                throw Object.assign(new Error("transaction conflict on engine usage"), {
+                  code: "TransactionConflictException",
+                });
+              }
+              return attempt;
+            });
             chargeOutcomeByKey.set(chargeKey, outcome);
-          } catch (err) {
-            console.error(`[internalUsage] atomic ledger+charge write failed for eventId=${eventId}:`, err);
-            chargeOutcomeByKey.set(chargeKey, "error");
+          } catch (err: any) {
+            if (err?.code === "TransactionConflictException") {
+              chargeOutcomeByKey.set(chargeKey, "conflict");
+            } else {
+              console.error(`[internalUsage] atomic ledger+charge write failed for eventId=${eventId}:`, err);
+              chargeOutcomeByKey.set(chargeKey, "error");
+            }
           }
         })
       );
