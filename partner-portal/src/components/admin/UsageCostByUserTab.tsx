@@ -270,21 +270,6 @@ export function providerHasDedupCaveat(provider: string): boolean {
   return provider === TWITTER_PROVIDER_KEY || provider === "all";
 }
 
-/**
- * Placid has a rate but no metering adapter yet, so an all-vendor total omits
- * it. Say so rather than letting the figure read as complete.
- *
- * ElevenLabs and 2captcha were named here too until ENG-1878 metered them. That
- * is the failure mode this caveat invites: a warning naming vendors that ARE
- * measured tells an admin their usage is absent when it is present, which is a
- * worse error than the undercount it exists to disclose.
- *
- * DELETE this and its usage when ENG-698 lands Placid (blocked on the ENG-1598
- * credential) — and re-read this comment before editing the vendor list again.
- */
-export function providerTotalIsUndercount(provider: string): boolean {
-  return provider === "all";
-}
 
 /** Format a Date as local YYYY-MM-DD (no UTC shift — matches what the user picks). */
 function formatDateInput(date: Date): string {
@@ -339,6 +324,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   remotion: "Remotion Lambda",
   elevenlabs: "ElevenLabs",
   "2captcha": "2captcha",
+  placid: "Placid",
 };
 
 /** An unknown key falls through unchanged — a new vendor is listed by its raw
@@ -775,12 +761,6 @@ export default function UsageCostByUserTab() {
         )}
       </Alert>
 
-      {providerTotalIsUndercount(provider) && (
-        <Alert severity="warning" sx={{ mb: 2 }} data-testid="undercount-caveat">
-          Placid is not metered yet (ENG-698), so an all-vendor total is an{" "}
-          <strong>undercount</strong>.
-        </Alert>
-      )}
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>

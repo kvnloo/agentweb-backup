@@ -12,6 +12,8 @@ import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { canViewItem, canEditItem } from '../services/orgShareService';
 import { getPlacidPrivateToken } from '../utils/secretsManager';
+import { recordVendorUsage } from '../services/usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 const s3 = new S3();
 
@@ -1240,6 +1242,47 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
   }
 };
 
+/**
+ * Record one Placid image render against the requesting user (ENG-698, AC3).
+ *
+ * This is the ONLY billable Placid call in the codebase, and it is not one of
+ * the two call sites ENG-698 originally named. Of the three Placid calls:
+ *
+ *   getPlacidEditorToken   mints an editor JWT        no rate, not metered
+ *   listPlacidTemplates    catalogue read             no rate, not metered
+ *   this render            URL API image generation   image_render, metered
+ *
+ * Metered after the vendor returns the image and BEFORE the S3 upload, so a
+ * storage failure cannot lose a call Placid has already charged for.
+ *
+ * Placid's URL API serves a repeat of an identical parameterised URL from its
+ * cache. We record every successful response, so — like X — this allocated
+ * total is an UPPER BOUND on what Placid bills, never a measured charge (AC7).
+ *
+ * try/catch is load-bearing: computeAllocatedCost throws on an unpriced unit by
+ * design (ENG-703 AC2), and a metering failure must never stop the caller
+ * getting its image (AC6).
+ */
+function meterPlacidRender(userId: string, templateUuid: string): void {
+  try {
+    void recordVendorUsage({
+      userId,
+      provider: 'placid',
+      operation: 'image_render',
+      feature: `placid:template:${templateUuid}`,
+      unit: 'render',
+      quantity: 1,
+      costSource: 'allocated',
+      costUsd: computeAllocatedCost('placid', 'image_render', 1),
+    });
+  } catch (error) {
+    console.error(
+      '[Placid] failed to meter render (image still served):',
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
 export const generateFromTemplateToExecution = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -1295,6 +1338,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
     const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
+    meterPlacidRender(userId, tplUuid);
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
