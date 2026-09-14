@@ -175,6 +175,22 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
     expect(events.map((e: any) => e.quantity)).toEqual([perRecordTokens, perRecordTokens]);
   });
 
+  it("AC1: one group served by two providers writes one event per provider, each under its own id, summing to the aggregate", async () => {
+    await post({
+      records: [record({ provider: "bedrock" }), record({ provider: "vertex", taskId: "t2", outputTokens: 7 })],
+      reportId: "r-1",
+    });
+
+    const [increment, charge, events] = mockTxn.mock.calls[0];
+    expect(events.map((e: any) => [e.provider, e.eventId])).toEqual([
+      ["bedrock", `llm:${charge.eventId}`],
+      ["vertex", `llm:${charge.eventId}@vertex`],
+    ]);
+    expect(new Set(events.map((e: any) => e.eventId)).size).toBe(2);
+    expect(events.reduce((sum: number, e: any) => sum + e.costMicroUsd, 0)).toBe(increment.costMicroUsd);
+    expect(events[1].quantity).toBe(1_000_000 + 7 + 300 + 40);
+  });
+
   it("AC5: an unknown model mixing engine-priced and unpriced records records ONLY the engine portion", async () => {
     await post({
       records: [

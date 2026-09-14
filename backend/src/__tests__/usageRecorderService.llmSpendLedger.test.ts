@@ -266,11 +266,13 @@ describe('recordUsage → spend ledger (ENG-1934)', () => {
       expect(getDroppedWriteTotals()).toMatchObject({ count: 1, lostMicroUsd: eventOf().costMicroUsd });
     });
 
-    it('still resolves when the fallback write fails too', async () => {
+    it('still resolves when the fallback write fails too — and the loss is still counted', async () => {
       mockTxn.mockRejectedValue(new Error('ledger down'));
       mockPlain.mockRejectedValue(new Error('aggregate down'));
 
       await expect(recordUsage(ctx())).resolves.toBeUndefined();
+      // Recorded before the fallback, so a double failure cannot skip the monitor.
+      expect(getDroppedWriteTotals().count).toBe(1);
     });
   });
 
