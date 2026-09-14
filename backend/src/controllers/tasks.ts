@@ -1302,19 +1302,32 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     // fetch books nothing -- the same rule apollo/enrich.so use. Rate read from
     // the card, never embedded. Bills the task owner; the acting caller may be
     // an admin, hence onBehalfOf.
+    //
+    // try/catch (ENG-698 AC6: a metering failure never prevents a render being
+    // returned). recordVendorUsage itself never throws, but computeAllocatedCost
+    // is evaluated as an argument, synchronously, BEFORE that call — and it
+    // throws on an unpriced unit by design (ENG-703 AC2). Without the guard, a
+    // rate-card key rename would 500 every render.
     const placidOwner = task.userId;
-    void recordVendorUsage({
-      userId,
-      billingUserId: placidOwner,
-      ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
-      provider: 'placid',
-      operation: 'image_render',
-      feature: 'ad_image',
-      unit: 'render',
-      quantity: 1,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('placid', 'image_render', 1),
-    });
+    try {
+      void recordVendorUsage({
+        userId,
+        billingUserId: placidOwner,
+        ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
+        provider: 'placid',
+        operation: 'image_render',
+        feature: 'ad_image',
+        unit: 'render',
+        quantity: 1,
+        costSource: 'allocated',
+        costUsd: computeAllocatedCost('placid', 'image_render', 1),
+      });
+    } catch (meterErr) {
+      console.error(
+        '[Placid] failed to meter render (image still served):',
+        meterErr instanceof Error ? meterErr.message : meterErr,
+      );
+    }
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
