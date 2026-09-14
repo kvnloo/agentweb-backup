@@ -38,6 +38,7 @@
 import { randomUUID } from "crypto";
 import { SpendEvent, recordSpendEvent } from "./spendEventDb";
 import { VENDOR_RATE_CARD_VERSION, VendorRateProvider, getAllocatedRate } from "../utils/vendorRateCard";
+import { LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 /**
  * Kill switch. Defaults ON, unlike the repo's usual opt-in flags.
@@ -164,4 +165,163 @@ export async function mirrorVendorUsage(
     // Returning a status instead of rejecting is the contract callers rely on.
     return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+// ── LLM spend (ENG-1934, ENG-1250 §6) ────────────────────────────────────────
+//
+// The vendor mirror above left the ledger holding vendor spend only, while
+// LLM calls — most of what AgentWeb pays for — reached AW-UsageRecords and
+// stopped. These helpers let both LLM write paths (`recordUsage` and the
+// agent-engine `/internal/usage` batch) put the same call on the ledger, in
+// the same transaction as its aggregate row.
+//
+// Observe-only, like the vendor rail: nothing enforces on these events. The
+// live cap still counts `AW-Users.tokenUsage.totalCost`.
+
+/**
+ * Kill switch for LLM events. Separate from `SPEND_LEDGER_DUAL_WRITE` so the
+ * two rails can be stopped independently: LLM calls are several times the
+ * vendor write rate, and pausing them must not also blind the vendor ledger.
+ *
+ * Defaults ON for the same reason the vendor switch does — the point is to
+ * accumulate a full billing cycle of evidence before any cap is sized, and a
+ * default-off flag discovers weeks later that none exists. Blast radius: a
+ * fire-and-forget write into a PAY_PER_REQUEST table nothing enforces on. Set
+ * SPEND_LEDGER_LLM_DUAL_WRITE=false to restore today's aggregate-only writes.
+ */
+export function isLlmDualWriteEnabled(): boolean {
+  return process.env.SPEND_LEDGER_LLM_DUAL_WRITE !== "false";
+}
+
+/**
+ * The day LLM events began reaching the ledger in production.
+ *
+ * The §8 fidelity check must not count days before it as "not mirrored", and
+ * the admin ledger need not measure coverage for a month that ended before it.
+ * Day granularity is deliberate — the aggregate rail it is reconciled against
+ * is daily. Coverage of any later month is MEASURED, never inferred from this
+ * date (see `measureLlmLedgerCoverage`).
+ */
+export const LLM_SPEND_LEDGER_STARTED_ON = "2026-09-14";
+
+/**
+ * Units for LLM events. Namespaced so no vendor rate-card unit can ever collide
+ * with them — `isLlmSpendEvent` is how every reader tells the two rails apart.
+ */
+export const LLM_TOKEN_UNIT = "llm_token";
+export const LLM_GENERATION_UNIT = "llm_generation";
+
+export function isLlmSpendEvent(event: Pick<SpendEvent, "unit">): boolean {
+  return event.unit === LLM_TOKEN_UNIT || event.unit === LLM_GENERATION_UNIT;
+}
+
+/** What an LLM write path knows once it has priced a call. */
+export interface LlmSpendEventInput {
+  /** Already defaulted to "system" by the caller when unattributed. */
+  actingUserId: string;
+  billingUserId: string;
+  onBehalfOf?: string;
+  sessionId?: string;
+  taskId?: string;
+  provider: string;
+  model: string;
+  feature: string;
+  /** input + output + cache read + cache write. */
+  totalTokens: number;
+  /** True for image/video models billed per generation rather than per token. */
+  perGeneration: boolean;
+  /**
+   * How many generations the cost covers, for a per-generation event. An
+   * engine batch sums several image or video calls into one group; recording
+   * them as 1 would keep their total cost but lose the count (CodeRabbit,
+   * PR #2904). Defaults to 1 — a single in-process call.
+   */
+  generationCount?: number;
+  costMicroUsd: number;
+  costSource: "allocated" | "unpriced";
+  /**
+   * Where the dollar figure came from, stamped as the event's rateCardVersion.
+   * `LLM_PRICE_BOOK_PROVENANCE` when this backend priced it; `caller:<who>` when
+   * the amount arrived from outside the book (an OpenRouter-reported cost, the
+   * agent engine). §5 requires one on every allocated event.
+   */
+  rateProvenance: string;
+  /**
+   * A per-call identity the caller already has (a provider response id, the
+   * engine's charge-event id). When absent a fresh id is minted — build the
+   * event ONCE, before any retry, so a retried write reuses it.
+   */
+  callId?: string;
+}
+
+/**
+ * Build the spend event for one priced LLM call, or say why there is none.
+ *
+ * An unpriced model is skipped rather than written as $0, for exactly the
+ * reason `buildShadowEvent` skips an unpriced vendor unit: the ledger's billing
+ * boundary forbids a missing rate becoming a silent $0 charge.
+ */
+export function buildLlmSpendEvent(
+  input: LlmSpendEventInput,
+  occurredAt: string,
+): { event: SpendEvent } | { skip: "unpriced" } {
+  if (input.costSource === "unpriced") return { skip: "unpriced" };
+
+  const references = {
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.taskId ? { taskId: input.taskId } : {}),
+  };
+
+  return {
+    event: {
+      billingUserId: input.billingUserId,
+      // Prefixed so an LLM call id can never collide with a vendor idempotency
+      // key sharing this billing subject's partition.
+      eventId: input.callId ? `llm:${input.callId}` : `gen:${randomUUID()}`,
+      occurredAt,
+      billingMonth: occurredAt.slice(0, 7),
+      actingUserId: input.actingUserId,
+      ...(input.onBehalfOf ? { onBehalfOf: input.onBehalfOf } : {}),
+      provider: input.provider || "unknown",
+      operation: input.model || "unknown",
+      ...(input.feature ? { feature: input.feature } : {}),
+      unit: input.perGeneration ? LLM_GENERATION_UNIT : LLM_TOKEN_UNIT,
+      quantity: input.perGeneration
+        ? Math.max(1, Math.round(input.generationCount ?? 1))
+        : Math.max(0, Math.round(input.totalTokens)),
+      costMicroUsd: Math.max(0, Math.round(input.costMicroUsd)),
+      costSource: "allocated",
+      rateCardVersion: input.rateProvenance,
+      ...(Object.keys(references).length ? { references } : {}),
+      lifecycle: "settled",
+    },
+  };
+}
+
+/**
+ * Split an integer micro-dollar total across parts in proportion to their
+ * exact costs, so the parts ALWAYS sum to the total (largest-remainder).
+ *
+ * Rounding each part on its own drifts from a total rounded once: four parts
+ * of 0.51 micro-dollars round to 4 while their total rounds to 2 (CodeRabbit,
+ * PR #2904). No part is negative. With no positive weight, the total goes to
+ * the first part.
+ */
+export function allocateMicroUsd(totalMicroUsd: number, weights: readonly number[]): number[] {
+  if (weights.length === 0) return [];
+  const total = Math.max(0, Math.round(totalMicroUsd));
+  const clean = weights.map((w) => (Number.isFinite(w) && w > 0 ? w : 0));
+  const sum = clean.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return clean.map((_, i) => (i === 0 ? total : 0));
+
+  const raw = clean.map((w) => (total * w) / sum);
+  const shares = raw.map(Math.floor);
+  let remaining = total - shares.reduce((a, b) => a + b, 0);
+  const byRemainder = raw
+    .map((value, i) => ({ i, frac: value - Math.floor(value) }))
+    .sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let k = 0; remaining > 0; k = (k + 1) % byRemainder.length, remaining--) {
+    shares[byRemainder[k].i] += 1;
+  }
+  return shares;
 }

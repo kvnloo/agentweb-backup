@@ -76,7 +76,34 @@ export interface SentInvitationsView {
   notice: string;
   /** True when the live read failed or came back in a shape the SDK could not validate. */
   liveUnavailable?: boolean;
+  /**
+   * Present (true) whenever `items` is non-empty: every `sent_at` is an estimate.
+   * See SENT_AT_PRECISION_NOTE.
+   */
+  sentAtIsApproximate?: true;
 }
+
+/**
+ * ENG-1718 follow-up — `sent_at` is not a send time, and must not read as one.
+ *
+ * LinkedIn exposes only a relative age ("Sent 3 days ago", "Sent 2 months ago").
+ * Unipile converts that label to an absolute `parsed_datetime` at REQUEST time, so
+ * every invitation sharing a label gets the identical timestamp, to the second
+ * (see the ENG-875 drift test in linkedInConnectionSync.inviteWriteAmplification).
+ * Our ledger stores the first value it observed, or the sync time itself when
+ * Unipile omitted the field.
+ *
+ * Found in production, 2026-09-14: TFA Connect's scheduled runs of 09-11 and 09-13
+ * read ~50 identical `sent_at` values and told the customer, twice, about an
+ * "unexplained ~50-invite burst sent within ~16 seconds". The "burst" was
+ * 2026-09-05T17:17:37Z — exactly six days before the run's own 17:17:36Z list
+ * call. Its 681-row ledger held only 39 distinct `sentAt` values.
+ */
+export const SENT_AT_PRECISION_NOTE =
+  'sent_at values are APPROXIMATE: LinkedIn only reports relative ages ("3 days ago", "2 months ago"), '
+  + 'so many invitations share an identical timestamp. That is NOT a burst of sends and must not be '
+  + 'reported as an anomaly; for older invitations the real send date can be weeks off. Use sent_at only '
+  + 'to rank invitations by rough age.';
 
 /**
  * Cap on rows returned in one call. The original trim existed because full
@@ -204,6 +231,7 @@ export async function getSentInvitationsView(
         ...(morePages ? { totalPendingIsLowerBound: true } : {}),
         source: 'live',
         cursor: live.cursor ?? null,
+        sentAtIsApproximate: true,
         notice:
           `${morePages ? 'At least ' : ''}${items.length} pending invitation${items.length === 1 ? '' : 's'} `
           + `read live from LinkedIn`
@@ -211,7 +239,7 @@ export async function getSentInvitationsView(
           + (morePages
             ? ' More pages remain, so the real backlog is larger than this number — pass the cursor to read on.'
             : '')
-          + ' Each carries sent_at, so the stale ones can be identified by age.',
+          + ` ${SENT_AT_PRECISION_NOTE}`,
       };
     }
   }
@@ -241,10 +269,12 @@ export async function getSentInvitationsView(
       totalPending: items.length,
       source: 'cache',
       ...(liveUnavailable ? { liveUnavailable: true } : {}),
+      sentAtIsApproximate: true,
       notice:
         `${preamble} (last synced by the connection cron, typically within ~10 minutes). `
         + `${items.length} pending invitation${items.length === 1 ? '' : 's'}`
-        + `${items.length > MAX_RETURNED_INVITATIONS ? `, showing the ${MAX_RETURNED_INVITATIONS} oldest` : ''}, oldest first.`,
+        + `${items.length > MAX_RETURNED_INVITATIONS ? `, showing the ${MAX_RETURNED_INVITATIONS} oldest` : ''}, oldest first. `
+        + SENT_AT_PRECISION_NOTE,
     };
   }
 

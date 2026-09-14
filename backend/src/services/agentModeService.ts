@@ -26103,7 +26103,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   private static escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Decodes the 5 entities `escapeHtml` produces, back to their plain characters. Order
+   * matters: `&amp;` must be decoded LAST, since decoding it first would turn a literal
+   * `&amp;lt;` (an already-escaped `&lt;` that was itself escaped again) into `&lt;`,
+   * silently re-introducing a markup-meaningful character into a plain-text field.
+   */
+  private static unescapeHtml(s: string): string {
+    return s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+  }
+
+  /**
+   * Escapes every string leaf of an arbitrarily-nested value while preserving its
+   * structure — unlike `String(value)`, which collapses an object/array to
+   * "[object Object]" and turns `null`/`undefined` into the literal text "null"/
+   * "undefined". Needed because caller-supplied template variable values are not
+   * contractually flat strings (existing callers pass array-of-object items), and
+   * this feeds `JSON.stringify` afterward, which already renders `null`/numbers/
+   * booleans correctly on its own — only string leaves need escaping.
+   */
+  private static deepEscapeHtmlValues(value: any): any {
+    if (typeof value === 'string') return AgentModeService.escapeHtml(value);
+    if (Array.isArray(value)) return value.map((v) => AgentModeService.deepEscapeHtmlValues(v));
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, AgentModeService.deepEscapeHtmlValues(v)])
+      );
+    }
+    return value;
+  }
+
+  /** Escapes every regex metacharacter so a value can be used as a literal match. */
+  private static escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>`,
+   * mapped to its escaped form — so the LLM's OUTPUT can be corrected if it decoded
+   * either back to raw HTML. Escaping the PROMPT proves nothing about the RESPONSE:
+   * substitution is LLM-driven, not a deterministic string-replace, so nothing
+   * guarantees the model reproduces an escaped entity as-is rather than "cleaning up"
+   * what looks like a stray HTML entity mid-generation.
+   *
+   * Deliberately narrower than the 5-character escape set (& < > " ') applied on the way
+   * IN: `<`/`>` can construct a genuinely new element regardless of surrounding markup,
+   * so a raw one resurfacing is unambiguously dangerous. `&`, `"`, and `'` alone cannot —
+   * they only matter for breaking out of an ALREADY-quoted attribute using that exact
+   * quote character, a narrower, template-structure-dependent risk the live template
+   * doesn't even have today (text-node placeholders only). Including them here caused a
+   * real false-positive class: an ordinary apostrophe in a real name ("O'Brien's Q3")
+   * could trip this check if that short substring coincidentally reappeared anywhere
+   * else in the output, failing a legitimate report for no real security benefit.
+   */
+  private static collectRawToEscapedMap(value: any, out: Map<string, string>): void {
+    if (typeof value === 'string') {
+      if (/[<>]/.test(value)) out.set(value, AgentModeService.escapeHtml(value));
+    } else if (Array.isArray(value)) {
+      value.forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    } else if (value !== null && typeof value === 'object') {
+      Object.values(value).forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    }
   }
 
   /** Convert inline markdown to HTML string. */
@@ -31711,6 +31779,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-1877: variable values come from campaign names, CRM data, and other
+      // caller-supplied strings — none of it trusted HTML. The LLM is instructed below
+      // to copy values through verbatim ("EXACT REPLACEMENT"), so an unescaped `<script>`
+      // or `<img onerror=...>` in a value reaches the rendered report unchanged. Escaping
+      // here (not on the LLM's output afterward) is the only point where "this came from
+      // a value" and "this is the template's own static markup" are still distinguishable
+      // — post-hoc sanitizing final_html can't tell the two apart.
+      const escapedVariableValuesObj = Object.fromEntries(
+        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.deepEscapeHtmlValues(value)])
+      );
+      const escapedArrayVariableValuesObj = Object.fromEntries(
+        Object.entries(arrayVariableValuesObj).map(([key, values]) => [
+          key,
+          AgentModeService.deepEscapeHtmlValues(values),
+        ])
+      );
+
+      // Raw (pre-escape) values that actually contained a dangerous character, mapped to
+      // their escaped form — used to CORRECT the LLM's OUTPUT below if it resurfaces.
+      // Escaping the prompt only proves the request was safe; it does not prove the
+      // model didn't decode an entity back to raw HTML.
+      const rawToEscapedMap = new Map<string, string>();
+      AgentModeService.collectRawToEscapedMap(variableValuesObj, rawToEscapedMap);
+      AgentModeService.collectRawToEscapedMap(arrayVariableValuesObj, rawToEscapedMap);
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -31721,10 +31814,10 @@ TEMPLATE SUBJECT:
 ${template.subject}
 
 VARIABLE VALUES:
-${JSON.stringify(variableValuesObj, null, 2)}
+${JSON.stringify(escapedVariableValuesObj, null, 2)}
 
 ARRAY VARIABLE VALUES:
-${JSON.stringify(arrayVariableValuesObj, null, 2)}
+${JSON.stringify(escapedArrayVariableValuesObj, null, 2)}
 
 CRITICAL INSTRUCTIONS:
 1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
@@ -31806,8 +31899,52 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
-      const finalHtml = substitutionData.final_html;
-      const finalSubject = substitutionData.final_subject;
+      let finalHtml = substitutionData.final_html;
+      let finalSubject = substitutionData.final_subject;
+
+      // ENG-1877: correct the output if the model reproduced a value's RAW, unescaped
+      // form instead of the escaped one we sent it — escaping the prompt only proves the
+      // REQUEST was safe, not that the model preserved it through generation. Auto-
+      // correcting (rather than rejecting outright) means a model that imperfectly
+      // handles escaping on some OTHER template degrades to "silently corrected", not
+      // "report generation hard-fails" — this function is shared by ~35 existing
+      // templates across the platform, most never tested against this change, and a
+      // reject-on-detect design would turn any of their LLM's occasional imperfect
+      // escaping into a customer-visible outage for reasons unrelated to security.
+      //
+      // Applied to finalHtml ONLY, never finalSubject — per docs/html-templates.md,
+      // `subject` is a real email subject line (round-4 review finding), never rendered
+      // as HTML, so it has no injection surface to correct in the first place; escaping
+      // it at all just corrupts a real customer-visible field with literal entity text.
+      //
+      // Two more round-4 findings fixed here: (1) longest-value-first ordering — when one
+      // flagged value is a literal substring of another (plausible with real HTML-snippet
+      // data), correcting the shorter one first destroys the exact string the longer one's
+      // pattern needs, silently no-oping its own correction. (2) a replacer FUNCTION, not
+      // a plain string — `String.replace` treats `$&`, `$$`, etc. in a plain replacement
+      // string as special patterns; an escaped value that happens to contain `$` next to
+      // certain characters could reinject the raw matched text, un-doing the very
+      // escaping this loop exists to enforce. A function's return value is used literally,
+      // with no `$`-pattern interpretation.
+      //
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still a
+      // browser-executable tag — an exact-case match would let that trivial reformatting
+      // evade correction entirely. A false correction is possible if a raw dangerous
+      // substring coincidentally already existed in the template's own static markup, but
+      // replacing that one occurrence with its escaped form is a far safer failure mode
+      // than either a silently reopened injection or a hard failure.
+      const correctionsByLengthDesc = [...rawToEscapedMap.entries()].sort(
+        ([a], [b]) => b.length - a.length
+      );
+      for (const [rawValue, escapedValue] of correctionsByLengthDesc) {
+        const pattern = new RegExp(AgentModeService.escapeRegExp(rawValue), 'gi');
+        finalHtml = finalHtml.replace(pattern, () => escapedValue);
+      }
+
+      // finalSubject is plain text (never HTML-rendered), so any HTML entity that leaked
+      // through from the escaped prompt values doesn't protect anything — it just shows
+      // literal "&amp;"/"&#39;" etc. in a real customer's email subject. Decode them back.
+      finalSubject = AgentModeService.unescapeHtml(finalSubject);
 
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];

@@ -11,8 +11,11 @@ jest.mock('../services/spendEventDb', () => ({
 
 import {
   VendorUsageMirrorInput,
+  allocateMicroUsd,
+  buildLlmSpendEvent,
   buildShadowEvent,
   isDualWriteEnabled,
+  isLlmSpendEvent,
   mirrorVendorUsage,
   resolveRateProvenance,
 } from '../services/spendLedgerDualWrite';
@@ -214,5 +217,69 @@ describe('spendLedgerDualWrite', () => {
 
       await expect(mirrorVendorUsage(anInput(), AT)).resolves.toMatchObject({ status: 'failed' });
     });
+  });
+});
+
+// ── ENG-1934: LLM ledger coverage ───────────────────────────────────────────
+
+describe('isLlmSpendEvent (ENG-1934)', () => {
+  it('recognises only the two LLM units', () => {
+    expect(isLlmSpendEvent({ unit: 'llm_token' })).toBe(true);
+    expect(isLlmSpendEvent({ unit: 'llm_generation' })).toBe(true);
+    for (const vendorUnit of ['query', 'render', 'solve', '1k_characters', 'token', 'generation']) {
+      expect(isLlmSpendEvent({ unit: vendorUnit })).toBe(false);
+    }
+  });
+});
+
+describe('buildLlmSpendEvent generation count (ENG-1934)', () => {
+  const input = {
+    actingUserId: 'u', billingUserId: 'o', provider: 'openai', model: 'gpt-image-1', feature: 'f',
+    totalTokens: 0, perGeneration: true, costMicroUsd: 120_000, costSource: 'allocated' as const,
+    rateProvenance: 'caller:agent-engine',
+  };
+
+  it('records how many generations a grouped cost covers', () => {
+    const built = buildLlmSpendEvent({ ...input, generationCount: 3 }, '2026-09-14T10:00:00.000Z');
+    expect('event' in built && built.event).toMatchObject({ unit: 'llm_generation', quantity: 3, costMicroUsd: 120_000 });
+  });
+
+  it('defaults to one generation for a single in-process call', () => {
+    const built = buildLlmSpendEvent(input, '2026-09-14T10:00:00.000Z');
+    expect('event' in built && built.event.quantity).toBe(1);
+  });
+});
+
+describe('allocateMicroUsd (ENG-1934)', () => {
+  const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+
+  it('four parts of 0.51 micro-dollars sum to the total of 2, not 4 (CodeRabbit, PR #2904)', () => {
+    const shares = allocateMicroUsd(2, [0.51, 0.51, 0.51, 0.51]);
+    expect(sum(shares)).toBe(2);
+    expect(shares.every((x) => x >= 0)).toBe(true);
+  });
+
+  it('always sums exactly to the total and never goes negative, across awkward splits', () => {
+    const cases: Array<[number, number[]]> = [
+      [10, [1, 1, 1]],
+      [1, [0.3, 0.3, 0.4]],
+      [1_000_003, [0.1234567, 0.8765433]],
+      [7, [5, 0, 2]],
+      [0, [1, 2, 3]],
+    ];
+    for (const [total, weights] of cases) {
+      const shares = allocateMicroUsd(total, weights);
+      expect(sum(shares)).toBe(total);
+      expect(shares.every((x) => Number.isInteger(x) && x >= 0)).toBe(true);
+    }
+  });
+
+  it('splits in proportion to the parts', () => {
+    expect(allocateMicroUsd(1_000_000, [3, 1])).toEqual([750_000, 250_000]);
+  });
+
+  it('gives the whole total to the first part when no weight is positive', () => {
+    expect(allocateMicroUsd(5, [0, 0])).toEqual([5, 0]);
+    expect(allocateMicroUsd(5, [])).toEqual([]);
   });
 });
