@@ -996,6 +996,23 @@ export async function getElevenLabsApiKey(): Promise<string> {
 }
 
 /**
+ * How long a resolved Placid token is reused before Secrets Manager is asked
+ * again. The token is a long-lived API credential, not a session token, so
+ * freshness is measured in rotations, not seconds; five minutes bounds how long
+ * a rotated secret takes to be picked up.
+ */
+export const PLACID_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+let placidTokenCache: { value: string | null; expiresAt: number } | null = null;
+let placidTokenInFlight: Promise<string | null> | null = null;
+
+/** Test hook: forget any cached or in-flight Placid token lookup. */
+export function __resetPlacidTokenCache(): void {
+  placidTokenCache = null;
+  placidTokenInFlight = null;
+}
+
+/**
  * Resolve the Placid private API token (ENG-698).
  *
  * Reads `prod/AgentWeb/Placid` (or `dev/…`) first. Harsha created the prod
@@ -1014,7 +1031,7 @@ export async function getElevenLabsApiKey(): Promise<string> {
  *
  * Returns null when neither source yields a token.
  */
-export async function getPlacidPrivateToken(): Promise<string | null> {
+async function resolvePlacidPrivateToken(): Promise<string | null> {
   const secretName = process.env.NODE_ENV === 'production'
     ? 'prod/AgentWeb/Placid'
     : 'dev/AgentWeb/Placid';
@@ -1035,6 +1052,35 @@ export async function getPlacidPrivateToken(): Promise<string | null> {
 
   const fromEnv = process.env.PLACID_PRIVATE_TOKEN?.trim();
   return fromEnv || null;
+}
+
+export async function getPlacidPrivateToken(): Promise<string | null> {
+  // Cached, because this sits on interactive request paths — every editor-token
+  // mint and every template-list load. The environment read it replaced was
+  // free; an uncached Secrets Manager call on each is a network round trip and
+  // a per-call AWS charge on every page view (CodeRabbit, PR #2901).
+  //
+  // Misses are cached too, deliberately. In development no dev/AgentWeb/Placid
+  // exists, and caching only successes would re-attempt — and re-log — that
+  // failed lookup on every single request.
+  const now = Date.now();
+  if (placidTokenCache && placidTokenCache.expiresAt > now) {
+    return placidTokenCache.value;
+  }
+
+  // Concurrent callers share one lookup. Without this a cold cache under load
+  // fans out into as many Secrets Manager reads as there are waiting requests.
+  if (!placidTokenInFlight) {
+    placidTokenInFlight = resolvePlacidPrivateToken()
+      .then((value) => {
+        placidTokenCache = { value, expiresAt: Date.now() + PLACID_TOKEN_TTL_MS };
+        return value;
+      })
+      .finally(() => {
+        placidTokenInFlight = null;
+      });
+  }
+  return placidTokenInFlight;
 }
 
 /**
