@@ -348,6 +348,119 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(uploadedHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     });
 
+    // Round-4 review finding: `subject` (docs/html-templates.md) is a real email subject
+    // line, never HTML-rendered — escaping it doesn't protect anything, it just shows
+    // literal "&amp;"/"&#39;" text in a real customer's inbox. The subject must come back
+    // as plain, decoded text even when the LLM faithfully echoes the escaped values it
+    // was given.
+    it('should decode HTML entities in final_subject — it is plain text, never rendered', async () => {
+      const clientName = 'O\'Brien & Sons "Premium"';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1>Report</h1></body></html>',
+              // Simulates the LLM faithfully copying the escaped value into the subject,
+              // exactly as it's instructed to do for the HTML body.
+              final_subject: 'Report for O&#39;Brien &amp; Sons &quot;Premium&quot;'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: clientName, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.final_subject).toBe('Report for O\'Brien & Sons "Premium"');
+      expect(result.final_subject).not.toContain('&amp;');
+      expect(result.final_subject).not.toContain('&#39;');
+      expect(result.final_subject).not.toContain('&quot;');
+    });
+
+    // Round-4 review finding, verified by direct execution in the review itself: passing
+    // the escaped value as a plain string (not a function) to String.replace lets a `$`
+    // adjacent to certain characters trigger JS's special replacement-pattern syntax
+    // (e.g. `$&` re-inserts the matched text), silently RE-introducing the raw value the
+    // correction was supposed to remove — the "fix" reopening the exact injection it exists
+    // to close.
+    it('should not reinject raw content via $-pattern replacement-string interpretation', async () => {
+      const maliciousTitle = '<b>Price$&Info</b>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: `<html><body><h1>${maliciousTitle}</h1></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<b>Price');
+      expect(uploadedHtml).not.toContain('</b>');
+      expect(uploadedHtml).toContain('&lt;b&gt;Price$&amp;Info&lt;/b&gt;');
+    });
+
+    // Round-4 review finding, verified by direct execution: when one flagged raw value is
+    // a literal substring of another (plausible with real HTML-snippet-shaped data),
+    // correcting the shorter one first destroys the exact string the longer one's pattern
+    // needs to match, silently no-oping the longer one's own correction.
+    it('should correct both values when one raw value is a substring of another', async () => {
+      const shortValue = '<b>Alpha</b>';
+      const longValue = '<div><b>Alpha</b></div>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // The model leaked both raw forms — the short one standalone (title) and
+              // the long one containing it (content).
+              final_html: `<html><body><h1>${shortValue}</h1><p>${longValue}</p></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: shortValue, content: longValue },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<b>Alpha</b>');
+      expect(uploadedHtml).not.toContain('<div>');
+      expect(uploadedHtml).toContain('&lt;b&gt;Alpha&lt;/b&gt;');
+      expect(uploadedHtml).toContain('&lt;div&gt;&lt;b&gt;Alpha&lt;/b&gt;&lt;/div&gt;');
+    });
+
     // Round-3 review finding: including '/&/" in the output-verification check made an
     // ordinary apostrophe in a real name ("O'Brien's Q3") a false-positive trigger if that
     // short substring coincidentally reappeared anywhere else in the LLM's output — failing
