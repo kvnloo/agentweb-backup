@@ -29,7 +29,9 @@ import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
 import { listSpendEvents } from "../services/spendEventDb";
 import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
 import { projectMonth } from "../services/spendProjection";
-import { describeLlmLedgerCoverage } from "../services/spendLedgerDualWrite";
+import { LLM_SPEND_LEDGER_STARTED_ON } from "../services/spendLedgerDualWrite";
+import { measureLlmLedgerCoverage } from "../services/spendReconciliation";
+import { usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { userDb } from "../services/db";
@@ -101,6 +103,19 @@ router.get(
       // explained — the opposite of what this endpoint exists for.
       const projection = projectMonth(billingUserId, month, events, allowance, allowance.policy as any);
 
+      // ENG-1934: the aggregate rail for the same subject and month, read only
+      // when the month can hold LLM events at all. A failed read degrades the
+      // coverage to "partial" rather than failing the breakdown.
+      const aggregateRows =
+        month >= LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)
+          ? await usageRecordDb
+              .queryByBillingUserDateRange(billingUserId, `${month}-01`, `${month}-31`)
+              .catch((error: any) => {
+                console.error("[adminUsage] LLM coverage read failed:", error?.message || error);
+                return null;
+              })
+          : null;
+
       return res.json({
         ...breakdown,
         // Echoed so the UI can say WHOSE ledger this is when the two differ —
@@ -111,9 +126,10 @@ router.get(
         projection,
         // §7: "no admin should need direct DynamoDB inspection to explain a pause"
         pause: explainPause(projection, breakdown),
-        // ENG-1934: whether this month's total includes LLM spend, and from
-        // when. The allowance comparison is only meaningful against it.
-        llmLedger: describeLlmLedgerCoverage(month),
+        // ENG-1934: how much of this month's LLM spend the total includes,
+        // measured against the aggregate rail. The allowance comparison is only
+        // meaningful beside it.
+        llmLedger: measureLlmLedgerCoverage(month, events, aggregateRows),
       });
     } catch (error: any) {
       console.error("[adminUsage] spend breakdown failed:", error?.message || error);

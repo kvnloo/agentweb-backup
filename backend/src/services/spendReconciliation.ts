@@ -28,8 +28,7 @@
  */
 import { SpendEvent } from "./spendEventDb";
 import { UsageRecordRow, isVendorEntry } from "./usageRecordDb";
-import { isLlmSpendEvent } from "./spendLedgerDualWrite";
-import { getModelPrice } from "../utils/llmPricing";
+import { LLM_SPEND_LEDGER_STARTED_ON, isLlmDualWriteEnabled, isLlmSpendEvent } from "./spendLedgerDualWrite";
 
 /**
  * §8: "Drift above one cent or the vendor-specific threshold alerts."
@@ -155,12 +154,15 @@ export interface FidelityOptions {
  *
  * An unpriced model writes an aggregate row but never a spend event (the
  * ledger forbids a missing rate as a silent $0). Counting those rows would
- * report every unknown model as unmirrored spend that was never spend. The
- * agent-engine path stamps its rows `allocated` even when the model is
- * unknown, so a $0 row for a model the book cannot price is excluded too.
+ * report every unknown model as unmirrored spend that was never spend.
+ *
+ * Trusts the row's own label and nothing else. Inferring "unpriced" from a $0
+ * cost would discard a legitimately allocated $0 call — which DOES have an
+ * event — and turn it into an orphan (CodeRabbit, PR #2904). The engine path
+ * that used to mislabel unknown models `allocated` now labels them correctly.
  */
 function isUnpricedLlmRow(row: UsageRecordRow): boolean {
-  return row.costSource === "unpriced" || (row.costMicroUsd === 0 && getModelPrice(row.model) === null);
+  return row.costSource === "unpriced";
 }
 
 export function reconcileVendorFidelity(
@@ -418,5 +420,70 @@ export function reconcileMonth(
     fidelity,
     divergence: measureBasisDivergence(myRows, fidelity),
     readyForCutoverEvidence: fidelity.ok && fidelity.assessedGroupCount > 0,
+  };
+}
+
+/** How much of a billing month's LLM spend the ledger actually holds (ENG-1934). */
+export interface LlmLedgerCoverage {
+  /** Whether the kill switch currently lets LLM events through. */
+  recording: boolean;
+  startedOn: string;
+  /**
+   * `none`: the month ended before LLM events existed — vendor spend only.
+   * `partial`: LLM spend on the aggregate rail is missing from the ledger by
+   * more than the §8 tolerance, or that could not be measured.
+   * `full`: the ledger holds the month's LLM spend, within tolerance.
+   */
+  month: "none" | "partial" | "full";
+  ledgerLlmMicroUsd: number;
+  /** null when the month predates LLM events, or the aggregate read failed. */
+  aggregateLlmMicroUsd: number | null;
+  /** How much LLM spend the ledger is missing; null when not measured. */
+  missingLlmMicroUsd: number | null;
+}
+
+/**
+ * Measure, rather than assume, how complete a month's LLM ledger is.
+ *
+ * Deriving "full" from the start date and the kill switch would call a month
+ * complete after the switch was off for a week, or after an outage whose
+ * writes fell back to the aggregate alone (CodeRabbit, PR #2904). Every such
+ * gap has the same signature — LLM cost on the aggregate rail with no event
+ * behind it — so comparing the two rails catches all of them, including the
+ * portion of the start month before recording began, without persisting any
+ * gap state.
+ *
+ * Both rails dedupe and attribute identically since ENG-1934, so a
+ * difference within the §8 tolerance is rounding, and anything larger is
+ * spend the allowance comparison cannot see.
+ */
+export function measureLlmLedgerCoverage(
+  billingMonth: string,
+  events: readonly SpendEvent[],
+  aggregateRows: readonly UsageRecordRow[] | null,
+): LlmLedgerCoverage {
+  const ledgerLlmMicroUsd = events
+    .filter((e) => e.billingMonth === billingMonth && e.lifecycle === "settled" && isLlmSpendEvent(e))
+    .reduce((sum, e) => sum + e.costMicroUsd, 0);
+  const base = { recording: isLlmDualWriteEnabled(), startedOn: LLM_SPEND_LEDGER_STARTED_ON, ledgerLlmMicroUsd };
+
+  if (billingMonth < LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)) {
+    return { ...base, month: "none", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null };
+  }
+  if (!aggregateRows) {
+    // Unmeasured is not complete.
+    return { ...base, month: "partial", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null };
+  }
+
+  const aggregateLlmMicroUsd = aggregateRows
+    .filter((r) => r.date.slice(0, 7) === billingMonth && !isVendorEntry(r) && !isUnpricedLlmRow(r))
+    .reduce((sum, r) => sum + r.costMicroUsd, 0);
+  const missingLlmMicroUsd = Math.max(0, aggregateLlmMicroUsd - ledgerLlmMicroUsd);
+
+  return {
+    ...base,
+    month: missingLlmMicroUsd > DRIFT_TOLERANCE_MICRO_USD ? "partial" : "full",
+    aggregateLlmMicroUsd,
+    missingLlmMicroUsd,
   };
 }
