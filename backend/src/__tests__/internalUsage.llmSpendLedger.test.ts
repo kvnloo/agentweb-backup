@@ -42,7 +42,7 @@ jest.mock("../services/usageRecordDb", () => ({
   },
 }));
 
-import internalUsageRoutes from "../routes/internalUsage";
+import internalUsageRoutes, { MAX_SPEND_EVENTS_PER_GROUP } from "../routes/internalUsage";
 import { validateSpendEvent } from "../services/spendEventDb";
 import { LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
@@ -189,6 +189,38 @@ describe("POST /api/internal/usage → spend ledger (ENG-1934)", () => {
     expect(new Set(events.map((e: any) => e.eventId)).size).toBe(2);
     expect(events.reduce((sum: number, e: any) => sum + e.costMicroUsd, 0)).toBe(increment.costMicroUsd);
     expect(events[1].quantity).toBe(1_000_000 + 7 + 300 + 40);
+  });
+
+  it("an image record the engine did not price is unpriced — no $0 'allocated' price-book event (CodeRabbit, PR #2904)", async () => {
+    await post({
+      records: [record({ model: "gpt-image-1", provider: "openai", inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })],
+      reportId: "r-1",
+    });
+
+    expect(mockTxn.mock.calls[0]).toHaveLength(2);
+    expect(mockTxn.mock.calls[0][0].costSource).toBe("unpriced");
+  });
+
+  it("a group naming more providers than one transaction can hold collapses to one event per pricing source, still atomic and exact", async () => {
+    const providers = Array.from({ length: MAX_SPEND_EVENTS_PER_GROUP + 5 }, (_, i) => `p${i}`);
+    await post({
+      records: [
+        ...providers.map((provider, i) => record({ provider, taskId: `b${i}`, outputTokens: i })),
+        ...providers.map((provider, i) => record({ provider, taskId: `e${i}`, costUsdOverride: 0.01 })),
+      ],
+      reportId: "r-1",
+    });
+
+    expect(mockTxn).toHaveBeenCalledTimes(1);
+    const [increment, charge, events] = mockTxn.mock.calls[0];
+    // 2 (aggregate + charge) + events stays far inside DynamoDB's 100-action limit.
+    expect(events).toHaveLength(2);
+    expect(events.map((e: any) => [e.provider, e.rateCardVersion, e.eventId])).toEqual([
+      ["mixed", LLM_PRICE_BOOK_PROVENANCE, `llm:${charge.eventId}@mixed`],
+      ["mixed", "caller:agent-engine", `llm:${charge.eventId}#engine@mixed`],
+    ]);
+    expect(events.reduce((sum: number, e: any) => sum + e.costMicroUsd, 0)).toBe(increment.costMicroUsd);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
   it("AC5: an unknown model mixing engine-priced and unpriced records records ONLY the engine portion", async () => {
