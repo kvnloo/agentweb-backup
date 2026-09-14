@@ -376,11 +376,8 @@ function isVendorNamespacedModel(model: string | undefined): boolean {
  * and therefore the providers an admin can meaningfully select (ENG-1837).
  *
  * Deliberately NOT derived from `vendorRateCard`'s `VendorRateProvider`. That
- * card prices elevenlabs, 2captcha and placid, which are priced but NOT yet
- * metered (ENG-698, blocked on the ENG-1598 Placid credential). Offering them
- * would render a permanently empty view, and "no rows" reads as "this vendor
- * costs nothing" rather than "we do not measure this vendor yet" — the same
- * silent-zero failure ENG-693 AC4 exists to prevent.
+ * card can price vendors before their adapters ship; offering an unmetered
+ * provider would make an empty view read as zero cost.
  *
  * Add a key here in the same commit that adds its adapter; the coverage guard
  * (__tests__/vendorMeteringCoverageGuard.test.ts) asserts the two agree.
@@ -395,6 +392,7 @@ export const METERED_VENDOR_PROVIDERS = [
   "remotion",
   "elevenlabs",
   "2captcha",
+  "placid",
 ] as const;
 
 /** Non-vendor scopes the aggregation accepts alongside a vendor key. */

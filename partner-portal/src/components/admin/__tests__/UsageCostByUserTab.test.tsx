@@ -15,7 +15,6 @@ import UsageCostByUserTab, {
   userRowForProvider,
   rankedUserRows,
   providerHasDedupCaveat,
-  providerTotalIsUndercount,
   providerLabel,
   breakdownColumnLabel,
   unattributedUserLabel,
@@ -225,11 +224,6 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerHasDedupCaveat("llm")).toBe(false);
   });
 
-  it("marks only the all-vendor total as an undercount while ENG-698 is open", () => {
-    expect(providerTotalIsUndercount("all")).toBe(true);
-    expect(providerTotalIsUndercount("twitter")).toBe(false);
-  });
-
   it("labels every metered vendor, and passes an unknown key through unchanged", () => {
     expect(providerLabel("all")).toBe("All providers");
     expect(providerLabel("llm")).toBe("LLM (tokens)");
@@ -240,6 +234,7 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerLabel("apollo")).toBe("Apollo");
     expect(providerLabel("enrich.so")).toBe("enrich.so");
     expect(providerLabel("remotion")).toBe("Remotion Lambda");
+    expect(providerLabel("placid")).toBe("Placid");
     // A vendor whose adapter shipped before anyone added a label is still listed.
     expect(providerLabel("brandnew")).toBe("brandnew");
   });
@@ -414,25 +409,11 @@ describe("UsageCostByUserTab rendering", () => {
     expect(screen.getByTestId("allocated-caveat")).not.toHaveTextContent("upper bound");
   });
 
-  it("warns that an all-vendor total is an undercount while ENG-698 is open", async () => {
+  it("removes the obsolete Placid undercount warning once metering ships", async () => {
     routeAxios();
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
-
-    // Default is "all". A figure that silently omits ElevenLabs, 2captcha and
-    // Placid would read as the vendor envelope being comfortably met.
-    const caveat = screen.getByTestId("undercount-caveat");
-    expect(caveat).toHaveTextContent("undercount");
-    // Names only what is genuinely unmetered. ENG-1878 metered ElevenLabs and
-    // 2captcha; leaving them here would tell an admin their usage is absent
-    // when it is present — a worse error than the undercount being disclosed
-    // (CodeRabbit, PR #2864).
-    expect(caveat).toHaveTextContent("Placid");
-    expect(caveat).not.toHaveTextContent("ElevenLabs");
-    expect(caveat).not.toHaveTextContent("2captcha");
-
-    await selectProvider("X (Twitter)");
-    await waitFor(() => expect(screen.queryByTestId("undercount-caveat")).not.toBeInTheDocument());
+    expect(screen.queryByTestId("undercount-caveat")).not.toBeInTheDocument();
   });
 
   it("uses the complete aggregation totals, not the capped top-users slice", async () => {

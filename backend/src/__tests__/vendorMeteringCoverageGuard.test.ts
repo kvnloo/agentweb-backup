@@ -156,14 +156,7 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
  * issue tracking the fix. Do not delete an entry to make the build green —
  * meter the module instead.
  */
-const VENDOR_ALLOWLIST: AllowlistEntry[] = [
-  {
-    path: 'controllers/tasks.ts',
-    vendor: 'Placid',
-    issue: 'ENG-698',
-    reason: 'Editor-token and rendered-image fetch calls are unmetered.',
-  },
-];
+const VENDOR_ALLOWLIST: AllowlistEntry[] = [];
 
 // ─── Pure scanning logic (unit-tested against fixtures below) ────────────────
 
@@ -557,7 +550,6 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     // shrink: a slice issue ships metering into the module, which the
     // staleness test above then requires removing the entry for.
     expect(VENDOR_ALLOWLIST.map((e) => `${e.vendor} (${e.path}) — ${e.issue}`).sort()).toEqual([
-      'Placid (controllers/tasks.ts) — ENG-698',
     ]);
   });
 

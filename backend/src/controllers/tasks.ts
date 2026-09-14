@@ -11,6 +11,9 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { canViewItem, canEditItem } from '../services/orgShareService';
+import { getSecret } from '../utils/secretsManager';
+import { recordVendorUsage } from '../services/usageRecorderService';
+import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 const s3 = new S3();
 
@@ -1181,16 +1184,47 @@ export const uploadFileToExecution = async (req: AuthRequest, res: Response) => 
 }; 
 
 
+/** Shared-wallet allocation, not a measured vendor charge. Control calls cost
+ * zero; record every attempted egress, including calls whose response fails. */
+function meterPlacidCall(userId: string, operation: 'editor_token' | 'image_render' | 'list_templates'): void {
+  const logFailure = (error: unknown) => console.error('Failed to meter Placid usage:', error);
+  let costUsd = 0;
+  if (operation === 'image_render') {
+    try {
+      costUsd = computeAllocatedCost('placid', 'image_render', 1);
+    } catch (error) {
+      logFailure(error);
+    }
+  }
+  try {
+    void recordVendorUsage({
+      userId,
+      provider: 'placid',
+      operation,
+      feature: 'tasks',
+      unit: operation === 'image_render' ? 'render' : 'request',
+      quantity: 1,
+      costSource: 'allocated',
+      costUsd,
+    }).catch(logFailure);
+  } catch (error) {
+    // Rate-card or synchronous recorder failures must not prevent a render.
+    logFailure(error);
+  }
+}
+
 export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
     const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid;
     if (!templateUuid) {
       return res.status(400).json({ message: 'template_uuid is required' });
     }
+    const privateToken = (await getSecret(
+      process.env.NODE_ENV === 'production' ? 'prod/AgentWeb/Placid' : 'dev/AgentWeb/Placid'
+    )).trim();
     if (!privateToken) {
       return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
     }
@@ -1213,6 +1247,7 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
       },
     } as any;
 
+    meterPlacidCall(userId, 'editor_token');
     const resp = await axios.post<{ access_token?: string }>(
       'https://api.placid.app/api/editor/accesstokens',
       payload,
@@ -1290,6 +1325,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     }
     const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
+    meterPlacidCall(userId, 'image_render');
     const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
@@ -1362,7 +1398,9 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    const privateToken = (await getSecret(
+      process.env.NODE_ENV === 'production' ? 'prod/AgentWeb/Placid' : 'dev/AgentWeb/Placid'
+    )).trim();
     if (!privateToken) return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
 
     const { page, per_page, collection_id } = req.query as {
@@ -1376,6 +1414,7 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     if (per_page) params.per_page = per_page;
     if (collection_id) params.collection_id = collection_id;
 
+    meterPlacidCall(userId, 'list_templates');
     const resp = await axios.get('https://api.placid.app/api/rest/templates', {
       headers: { Authorization: `Bearer ${privateToken}` },
       params,

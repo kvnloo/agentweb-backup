@@ -404,6 +404,7 @@ describe('usageAnalyticsService', () => {
         'elevenlabs',
         'enrich.so',
         'google_cse',
+        'placid',
         'remotion',
         'twitter',
         'v0',
@@ -492,7 +493,7 @@ describe('usageAnalyticsService', () => {
       // contributes, not what the registry guarantees.
       expect(agg.availableProviders).toEqual([
         'all', 'llm', '2captcha', 'apollo', 'elevenlabs', 'enrich.so', 'google_cse',
-        'remotion', 'twitter', 'v0', 'you.com',
+        'placid', 'remotion', 'twitter', 'v0', 'you.com',
       ]);
     });
 
@@ -815,6 +816,7 @@ describe('usageAnalyticsService', () => {
           'elevenlabs',
           'enrich.so',
           'google_cse',
+          'placid',
           'remotion',
           'twitter',
           'v0',
