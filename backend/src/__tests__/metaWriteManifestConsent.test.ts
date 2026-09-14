@@ -37,6 +37,7 @@ jest.mock('../services/chatbotService', () => {
       ...actual.chatbotDb,
       getChatSession: jest.fn(),
       claimMetaWriteManifestDigest: jest.fn(),
+      recordMetaWriteManifestOutcome: jest.fn(),
     },
   };
 });
@@ -121,6 +122,44 @@ describe('ENG-1642 manifest consent', () => {
     expect(res.awaitingUserConfirmation).toBeUndefined();
     expect(chatbotDb.claimMetaWriteManifestDigest).toHaveBeenCalledWith(SESSION_ID, digest);
     expect((service as any).updateMetaAdsAd).toHaveBeenCalled();
+  });
+
+  it('ENG-1635 AC7: a granted write records its outcome against the approved digest', async () => {
+    const digest = digestForCall(call.params);
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: SESSION_ID,
+      pendingUserQuestion: manifestQuestion([digest]),
+    });
+    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
+    (chatbotDb.recordMetaWriteManifestOutcome as jest.Mock).mockResolvedValue(undefined);
+
+    await invoke();
+
+    expect(chatbotDb.recordMetaWriteManifestOutcome).toHaveBeenCalledWith(
+      SESSION_ID,
+      digest,
+      expect.objectContaining({ status: 'applied' }),
+    );
+  });
+
+  it('ENG-1635 AC8: a granted write that FAILS still returns the real failure, and records it — never masked as applied', async () => {
+    const digest = digestForCall(call.params);
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: SESSION_ID,
+      pendingUserQuestion: manifestQuestion([digest]),
+    });
+    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
+    (chatbotDb.recordMetaWriteManifestOutcome as jest.Mock).mockResolvedValue(undefined);
+    (service as any).updateMetaAdsAd = jest.fn().mockResolvedValue({ success: false, error: 'Invalid parameter' });
+
+    const res: any = await invoke();
+
+    expect(res.success).toBe(false);
+    expect(chatbotDb.recordMetaWriteManifestOutcome).toHaveBeenCalledWith(
+      SESSION_ID,
+      digest,
+      expect.objectContaining({ status: 'failed', error: 'Invalid parameter' }),
+    );
   });
 
   it('AC2: a call not in the grant (different param) still halts and confirms', async () => {

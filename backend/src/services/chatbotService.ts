@@ -150,6 +150,17 @@ export interface ChatMessage {
   };
 }
 
+// ENG-1635: what happened when one manifest-granted Meta write actually executed.
+// `appliedObjectId` is only ever set for a CREATE (the new object's id) — an
+// UPDATE/DELETE's success is proven by the reconciliation pass's read-back
+// against the manifest's declared target, not by an id this record could carry.
+export interface MetaWriteManifestOutcome {
+  status: 'applied' | 'failed';
+  error?: string;
+  appliedObjectId?: string;
+  appliedAt: string;
+}
+
 // Interface for chat sessions
 export interface ChatSession {
   sessionId: string;
@@ -266,6 +277,13 @@ export interface ChatSession {
   // again without a fresh confirmation. Map value is the consumption
   // timestamp (kept, not just a boolean, purely for audit/debugging).
   consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-1635: what actually happened when a manifest-granted write (see
+  // consumedMetaWriteManifestDigests above) executed — keyed by the same digest.
+  // Populated once, right after dispatch, by recordMetaWriteManifestOutcome. The
+  // reconciliation pass reads this once every digest in a manifest has an entry
+  // here, to read back the real Meta state and emit one unified result instead of
+  // N scattered pass/fail tool messages.
+  metaWriteManifestOutcomes?: Record<string, MetaWriteManifestOutcome>;
   // ENG-397: the structured, typed workflow run in flight for this session
   // (if any). Each mutating step's checkpoint (entity IDs + verified
   // end-state) is persisted here so a killed-and-restarted session resumes
@@ -3326,6 +3344,70 @@ export class ChatbotDB {
     } catch (error: any) {
       if (error?.code === 'ConditionalCheckFailedException') return false;
       console.error('Error claiming Meta write manifest digest (retry):', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635: record what actually happened when a manifest-granted Meta write
+   * executed, keyed by the same digest `claimMetaWriteManifestDigest` claimed.
+   * The claim already guarantees at-most-once dispatch for that digest, so this
+   * write doesn't need a race guard of its own — only that the session still
+   * exists (mirrors `claimMetaWriteManifestDigest`'s `attribute_exists(sessionId)`
+   * guard, for the identical reason: a session deleted mid-execution must not
+   * silently upsert a partial row via DynamoDB's create-on-conditional-update
+   * behavior). The reconciliation pass reads this map once every digest in a
+   * manifest has an entry, to emit ONE result instead of N scattered messages.
+   */
+  async recordMetaWriteManifestOutcome(
+    sessionId: string,
+    digest: string,
+    outcome: MetaWriteManifestOutcome,
+  ): Promise<void> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET metaWriteManifestOutcomes.#digest = :outcome',
+          ConditionExpression: 'attribute_exists(sessionId)',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':outcome': outcome },
+        })
+        .promise();
+    } catch (error: any) {
+      // Same two real DynamoDB failure modes as claimMetaWriteManifestDigest: the
+      // session row is gone (nothing to record against — not this call's problem
+      // to recreate), or the top-level map attribute doesn't exist yet on this
+      // session (first outcome ever recorded for it) and needs one-time init.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression: 'SET metaWriteManifestOutcomes = if_not_exists(metaWriteManifestOutcomes, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return;
+          throw initError;
+        }
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: 'SET metaWriteManifestOutcomes.#digest = :outcome',
+            ExpressionAttributeNames: { '#digest': digest },
+            ExpressionAttributeValues: { ':outcome': outcome },
+          })
+          .promise();
+        return;
+      }
+      console.error('Error recording Meta write manifest outcome:', error);
       throw error;
     }
   }

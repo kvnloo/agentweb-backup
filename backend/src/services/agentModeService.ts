@@ -116,6 +116,7 @@ import {
   renderQuestionPrompt,
   verifyExplicitStatement,
   type AskUserQuestionOption,
+  type PendingUserQuestion,
 } from './agentMode/core/askUserQuestion';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
@@ -4693,6 +4694,39 @@ export class AgentModeService {
         const iterationResults = toolCalls
           .slice(toolCallsLengthBeforeIteration)
           .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        // ENG-1635: when this iteration halted on ≥2 Meta writes and nothing else,
+        // wrap them in ONE meta_write_manifest question instead of the plain text
+        // batch below — one typed affirmative then grants every listed write
+        // (claimMetaWriteManifestGrant) rather than requiring N separate replies.
+        // Falls back to the unchanged plain-prompt path below on any null: no
+        // sessionId, a non-Meta-write mixed into the batch, fewer than 2 items, or
+        // losing the (expected-rare) race to post the session's one live question.
+        const manifestQuestion = sessionId ? this.buildMetaWriteManifestQuestion(iterationResults) : null;
+        if (manifestQuestion) {
+          const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId as string, manifestQuestion, {
+            failIfAwaitingExists: true,
+          });
+          if (posted) {
+            const manifestPrompt = renderQuestionPrompt(manifestQuestion);
+            content = manifestPrompt;
+            (messages as any[]).push({
+              role: 'assistant',
+              content: manifestPrompt,
+              llm: llmModel,
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
+            });
+            if (onProgress) {
+              runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            }
+            break;
+          }
+          // posted === null: lost the one-live-question race (something else in this
+          // session claimed the slot between the manifest build and this write) — fall
+          // through to the plain per-item prompt below rather than silently dropping
+          // the halt or retrying, exactly like collectConfirmationPrompt already would
+          // have handled these same items.
+        }
+
         const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
         if (confirmationPrompt) {
           content = confirmationPrompt;
@@ -20062,6 +20096,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1635: best-effort extraction of the Meta object id a write's dispatch
+   * result carries, for the manifest outcome record. A CREATE echoes the new
+   * object nested under its entity-shaped key (`campaign.id` / `adSet.id` /
+   * `ad.id` / `creative.id` / `audience.id`); an UPDATE/DELETE typically has no
+   * such nested object at all (just a message) — undefined in that case is
+   * correct, not a bug, since there's nothing new to name.
+   */
+  private static extractDispatchedObjectId(result: any): string | undefined {
+    if (!result || typeof result !== 'object') return undefined;
+    for (const key of ['campaign', 'adSet', 'ad', 'creative', 'audience']) {
+      const id = result[key]?.id;
+      if (typeof id === 'string' && id) return id;
+    }
+    return undefined;
+  }
+
+  /**
    * ENG-1635: resolve the account id a write will ACTUALLY execute against —
    * mirroring buildMetaWriteConfirmation's own resolution (see its comment
    * above `scopeAccountId`) — and compute this call's manifest digest against
@@ -20105,10 +20156,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   /**
    * ENG-1642: check whether this exact Meta write is authorized by an
    * answered `meta_write_manifest` question in the session, and if so claim
-   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
-   * call — a digest not in any manifest, an unanswered/non-human-attributed
-   * manifest, or a digest already consumed all return false, which falls
-   * through to the normal confirmation halt.
+   * it (at-most-once). `granted` is true only when a fresh claim succeeds
+   * THIS call — a digest not in any manifest, an unanswered/non-human-
+   * attributed manifest, or a digest already consumed all return false,
+   * which falls through to the normal confirmation halt. `digest` is always
+   * returned (even on a false grant) so a caller that DOES grant can record
+   * this write's execution outcome (ENG-1635) against the exact digest the
+   * user approved, without re-resolving credentials a third time.
    */
   private async claimMetaWriteManifestGrant(
     userId: string,
@@ -20120,7 +20174,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any,
-  ): Promise<boolean> {
+  ): Promise<{ granted: boolean; digest: string }> {
     const digest = await this.resolveMetaWriteManifestDigest(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
@@ -20142,7 +20196,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
-    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest };
     for (const manifestQuestion of manifestCandidates) {
       const gate = checkQuestionGate(manifestQuestion);
       if (!gate.allowed) continue;
@@ -20151,9 +20205,96 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // call must be one of them, not merely "some manifest was answered".
       const grantedDigests: unknown = (gate.payload as any)?.digests;
       if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
-      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+      const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+      return { granted, digest };
     }
-    return false;
+    return { granted: false, digest };
+  }
+
+  /**
+   * ENG-1635: when every `awaitingUserConfirmation` result this iteration is a Meta
+   * write (each carries the `metaWriteManifestDigest` set on the halt above), build
+   * ONE `meta_write_manifest` question covering all of them instead of the plain
+   * per-call text batching below — so a single typed affirmative grants every listed
+   * write via `claimMetaWriteManifestGrant` rather than requiring N separate
+   * `confirm:true` re-calls, one human reply each. Fixes the "12 serial prompts"
+   * defect (ENG-1635) at its root: `collectConfirmationPrompt` already batched the
+   * DISPLAY of N halts into one message, but never authorized more than one write per
+   * answer — each of the N still needed its own individually-gated replay.
+   *
+   * Returns null (falls back to `collectConfirmationPrompt`'s plain prompt, unchanged)
+   * when: the iteration has no halted writes; ANY halted result in the iteration is
+   * NOT a Meta write (e.g. an image-edit confirmation, which carries no digest —
+   * mixing manifest and non-manifest confirmations in one card is out of scope, not
+   * silently dropped); or there's only one item, which already gets a clean one-shot
+   * confirm/replay cycle from the existing per-call halt and gains nothing from a
+   * manifest wrapper.
+   */
+  private buildMetaWriteManifestQuestion(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): PendingUserQuestion | null {
+    const items: Array<{ digest: string; detail: string }> = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (!r || r.awaitingUserConfirmation !== true) continue;
+      if (typeof r.metaWriteManifestDigest !== 'string' || !r.metaWriteManifestDigest) {
+        // A non-Meta-write confirmation is mixed into this batch — bail out entirely
+        // rather than manifest-wrapping only the Meta writes and silently leaving this
+        // one to the old per-item path; a caller seeing null falls back uniformly.
+        return null;
+      }
+      items.push({
+        digest: r.metaWriteManifestDigest,
+        detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
+      });
+    }
+    if (items.length < 2) return null;
+
+    const digests = items.map((i) => i.digest);
+    const question =
+      `Based on your request, here are the ${items.length} changes I'm about to make — ` +
+      `please review each target before I proceed:\n\n` +
+      items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n');
+
+    try {
+      return buildPendingUserQuestion({
+        questionId: uuidv4(),
+        question,
+        kind: 'meta_write_manifest',
+        // Real external writes, not a reversible multiple-choice preference — a
+        // headless/scheduled run must never silently auto-take this the way it can a
+        // plain reversible question. See askUserQuestion.ts's immutable/park docs.
+        immutable: true,
+        // Nothing here is Emma's judgment call to delegate — it's exactly the plan as
+        // built, or it isn't. "Let Emma decide" has no meaning for "should these exact
+        // writes execute."
+        allowEmmaDecide: false,
+        createdAt: new Date().toISOString(),
+        options: [
+          {
+            id: 'approve',
+            label: `Approve all ${items.length}`,
+            consequence: `Authorizes exactly these ${items.length} writes, each executed once.`,
+            recommended: true,
+            why: 'This is the plan as built from your request — nothing else runs.',
+            payload: { digests },
+          },
+          {
+            id: 'reject',
+            label: 'Reject',
+            consequence: 'None of these writes run. Nothing changes on Meta.',
+            payload: {},
+          },
+        ],
+      });
+    } catch (err) {
+      // Should be unreachable (both options are always well-formed above), but a
+      // malformed manifest must fall back to the old per-item prompt, never throw
+      // and silently drop the halt.
+      console.error('AgentMode: buildMetaWriteManifestQuestion failed, falling back to plain prompt:', err);
+      return null;
+    }
   }
 
   /**
@@ -20860,14 +21001,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // never implies `override_tracking_check` (acceptance criterion 5), so
     // the tracking pre-flight below is unaffected either way.
     let manifestGranted = false;
+    // ENG-1635: the digest THIS grant was claimed against, so the eventual
+    // outcome-recording call after dispatch (below) can record against the exact
+    // digest the user approved rather than re-resolving credentials a third time.
+    // Only meaningful when manifestGranted is true; unset on every other path.
+    let grantedManifestDigest: string | undefined;
     if (
       !confirmed &&
       AgentModeService.isMetaWriteAction(entity_type, action) &&
       sessionId
     ) {
-      manifestGranted = await this.claimMetaWriteManifestGrant(
+      const grant = await this.claimMetaWriteManifestGrant(
         userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      manifestGranted = grant.granted;
+      if (grant.granted) grantedManifestDigest = grant.digest;
     }
 
     if (
@@ -20891,6 +21039,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        * belongs on the write-scoping work rather than being assumed away here.
        */
       const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      // ENG-1635: this call's manifest digest, computed once here (against the SAME
+      // resolved account buildMetaWriteConfirmation just used) so the manifest producer
+      // at the loop seam (collectConfirmationPrompt's caller) can batch every halted
+      // write from this iteration into one approval without re-resolving credentials
+      // or re-deriving the digest a second way.
+      const metaWriteManifestDigest = await this.resolveMetaWriteManifestDigest(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
       /*
@@ -20956,7 +21112,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Only issued when an override was actually described in this preview, so it can only
         // ever approve a waiver the user was shown.
         ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
-        target
+        target,
+        // ENG-1635: internal-only correlator for the manifest producer — never part of the
+        // model-facing `message`, so nothing tells the model this exists or invites it to
+        // forge one. Consumed exclusively by collectConfirmationPrompt's caller in the same
+        // process, never serialized to the client.
+        metaWriteManifestDigest
       } as any;
     }
     if ('confirm' in params) {
@@ -21040,41 +21201,70 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
-    switch (entity_type) {
-      case 'CAMPAIGN':
-        // Map master params to specific params if needed, but schema is unified so passing through is safe
-        return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
+    // ENG-1635: wrapped in an IIFE (rather than each case returning directly, as
+    // before) purely so a manifest-granted write's outcome can be recorded against
+    // its digest right after dispatch resolves, in ONE place, without duplicating
+    // the switch or touching every branch. Every case's behavior is unchanged byte
+    // for byte — this only interposes AFTER the result exists and BEFORE it returns.
+    const dispatchResult: MetaApiResult = await (async (): Promise<MetaApiResult> => {
+      switch (entity_type) {
+        case 'CAMPAIGN':
+          // Map master params to specific params if needed, but schema is unified so passing through is safe
+          return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
 
-      case 'AD_SET':
-        // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
-        return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
+        case 'AD_SET':
+          // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
+          return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
-      case 'AD_CREATIVE':
-        // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
-        // dropping it silently — the same threading the AD case below does (ENG-1476).
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
+        case 'AD_CREATIVE':
+          // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+          // dropping it silently — the same threading the AD case below does (ENG-1476).
+          return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
-      case 'AD':
-        // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
-        // gate above and was simply never handed to the AD handler, which is why an
-        // AD LIST scoped to a campaign returned the entire account instead.
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
+        case 'AD':
+          // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+          // gate above and was simply never handed to the AD handler, which is why an
+          // AD LIST scoped to a campaign returned the entire account instead.
+          return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
-      case 'CUSTOM_AUDIENCE':
-        return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
+        case 'CUSTOM_AUDIENCE':
+          return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
-      case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
+        case 'TARGETING':
+          return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
-      case 'PAGE':
-        return this.listMetaPages(userId, account_id);
+        case 'PAGE':
+          return this.listMetaPages(userId, account_id);
 
-      case 'DATASET':
-        return this.manageMetaDatasets(userId, action as any, account_id, params);
+        case 'DATASET':
+          return this.manageMetaDatasets(userId, action as any, account_id, params);
 
-      default:
-        throw new Error(`Invalid entity_type: ${entity_type}`);
+        default:
+          throw new Error(`Invalid entity_type: ${entity_type}`);
+      }
+    })();
+
+    // ENG-1635: this write executed under a manifest grant (not a plain confirm=true
+    // replay) — record its outcome against the exact digest the user approved, so the
+    // reconciliation pass (once every digest in the manifest has an outcome) can read
+    // these back and emit one unified result instead of leaving N scattered pass/fail
+    // tool messages with no summary, which is what a manifest-granted batch produced
+    // before this. A recording failure must never mask the real dispatch result —
+    // log and continue rather than throwing over a successful write.
+    if (manifestGranted && grantedManifestDigest && sessionId) {
+      try {
+        await chatbotDb.recordMetaWriteManifestOutcome(sessionId, grantedManifestDigest, {
+          status: dispatchResult?.success ? 'applied' : 'failed',
+          error: dispatchResult?.success ? undefined : ((dispatchResult as any)?.error || dispatchResult?.message),
+          appliedObjectId: AgentModeService.extractDispatchedObjectId(dispatchResult),
+          appliedAt: new Date().toISOString(),
+        });
+      } catch (recordError) {
+        console.error('AgentMode: failed to record manifest write outcome (write itself succeeded/failed independently):', recordError);
+      }
     }
+
+    return dispatchResult;
   }
 
   /**
