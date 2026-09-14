@@ -8,6 +8,8 @@ import SpendLedgerBody, {
   committedMicroUsd,
   committedPercent,
   shortInstant,
+  shortDay,
+  allowanceComparison,
   SpendLedgerPayload,
   MonthlyProjection,
 } from "../SpendLedgerBody";
@@ -333,5 +335,118 @@ describe("SpendLedgerBody", () => {
   it("states an empty cut instead of rendering an empty table", () => {
     render(<SpendLedgerBody data={payload({ bySession: [] })} />);
     expect(screen.getByTestId("spend-slice-bySession")).toHaveTextContent("Nothing recorded for this cut");
+  });
+});
+
+// ── ENG-1934: LLM spend on the ledger ───────────────────────────────────────
+// The ENG-1874 tests above use a payload with no `llmLedger` — exactly what a
+// backend that predates ENG-1934 returns — and keep proving that case stays
+// withheld. These cover a backend that reports coverage.
+
+const coverage = (month: "none" | "partial" | "full", recording = true) => ({
+  llmLedger: { recording, startedOn: "2026-09-14", month },
+});
+
+describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
+  it("decides the comparison from coverage, withholding whenever LLM spend cannot be in the total", () => {
+    expect(allowanceComparison({})).toBe("withheld");
+    expect(allowanceComparison(coverage("none"))).toBe("withheld");
+    expect(allowanceComparison(coverage("partial"))).toBe("partial");
+    expect(allowanceComparison(coverage("full"))).toBe("full");
+    expect(shortDay("2026-09-14")).toBe("Sep 14");
+  });
+
+  it("a fully covered month shows allowance, remaining and percentage, with no understatement warning", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          billingMonth: "2026-10",
+          ...coverage("full"),
+          projection: projection({ settledMicroUsd: 50_000_000, remainingMicroUsd: 150_000_000 }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-ledger-allowance")).toHaveTextContent("$200.00");
+    expect(screen.getByTestId("spend-ledger-remaining")).toHaveTextContent("$150.00");
+    expect(screen.getByText("25.0% of allowance committed")).toBeInTheDocument();
+    expect(screen.queryByTestId("spend-ledger-partial-coverage")).not.toBeInTheDocument();
+    expect(screen.getByTestId("spend-ledger-basis-note")).toHaveTextContent("LLM and vendor spend");
+  });
+
+  it("the month recording began carries the understatement IN the figure's caption, not a footnote", () => {
+    render(<SpendLedgerBody data={payload(coverage("partial"))} />);
+
+    const remaining = screen.getByTestId("spend-ledger-remaining").parentElement!;
+    expect(within(remaining).getByTestId("spend-ledger-partial-coverage")).toHaveTextContent(
+      "Understated: LLM spend counted from Sep 14 only",
+    );
+  });
+
+  it("an uncapped tier gets no understatement caption — there is no percentage to qualify", () => {
+    render(<SpendLedgerBody data={payload({ ...coverage("partial"), projection: projection({ unlimited: true }) })} />);
+
+    expect(screen.getByTestId("spend-ledger-allowance")).toHaveTextContent("Uncapped");
+    expect(screen.queryByTestId("spend-ledger-partial-coverage")).not.toBeInTheDocument();
+  });
+
+  it("a month that ended before recording began stays withheld, and says why in terms of that month", () => {
+    render(<SpendLedgerBody data={payload({ billingMonth: "2026-08", ...coverage("none") })} />);
+
+    expect(screen.queryByTestId("spend-ledger-allowance")).not.toBeInTheDocument();
+    expect(screen.queryByText(/of allowance committed/)).not.toBeInTheDocument();
+    const note = screen.getByTestId("spend-ledger-basis-note");
+    expect(note).toHaveTextContent("2026-08 ended before LLM spend was recorded here (from Sep 14)");
+    expect(note).toHaveTextContent("withheld");
+  });
+
+  it("restores adjustments beside the allowance they change", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          ...coverage("full"),
+          projection: projection({ purchasedCreditsMicroUsd: 50_000_000, adminAdjustmentMicroUsd: -5_000_000 }),
+        })}
+      />,
+    );
+
+    const adjustments = screen.getByTestId("spend-ledger-adjustments");
+    expect(within(adjustments).getByText("Purchased credits")).toBeInTheDocument();
+    expect(within(adjustments).getByText("-$5.00")).toBeInTheDocument();
+  });
+
+  it("still withholds the pause explanation — the live gate counts LLM only, this total counts both", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          ...coverage("full"),
+          pause: {
+            paused: true,
+            reason: "Committed spend $210.00 reached the cap against a usable allowance of $200.00.",
+            settledMicroUsd: 210_000_000,
+            reservedMicroUsd: 0,
+            usableAllowanceMicroUsd: 200_000_000,
+            overspentMicroUsd: 10_000_000,
+            topProviders: [],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.queryByTestId("spend-ledger-pause")).not.toBeInTheDocument();
+    expect(screen.queryByText(/reached the cap/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("spend-ledger-basis-note")).toHaveTextContent("do not explain a pause");
+  });
+
+  it("warns when the backend has LLM recording switched off", () => {
+    render(<SpendLedgerBody data={payload(coverage("full", false))} />);
+
+    expect(screen.getByTestId("spend-ledger-llm-recording-off")).toHaveTextContent("SPEND_LEDGER_LLM_DUAL_WRITE=false");
+  });
+
+  it("labels the provider cut for both LLM providers and vendors", () => {
+    render(<SpendLedgerBody data={payload(coverage("full"))} />);
+
+    expect(within(screen.getByTestId("spend-slice-byProvider")).getByText("By provider")).toBeInTheDocument();
   });
 });
