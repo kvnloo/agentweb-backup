@@ -37503,7 +37503,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
                 // resolvedLinkedInAccount is non-null here: this action is in the
                 // ownership gate above, which returns early when it cannot resolve.
-                return paced.refusal ? paced.refusal.error : null;
+                if (!paced.refusal) return null;
+                // ENG-1873: hand back WHICH gate refused, not just its prose, so the
+                // drain result and its notice can say so truthfully.
+                console.log(
+                  `[AgentMode] withdraw-stale-invitations stopped on ${acc}: gate=${paced.refusal.gate} — `
+                  + `${paced.refusal.message}`,
+                );
+                return { gate: paced.refusal.gate, reason: paced.refusal.error };
               },
               cancel: async (invitationId, acc) => {
                 await linkedInOutreachService.cancelInvitation(invitationId, acc);

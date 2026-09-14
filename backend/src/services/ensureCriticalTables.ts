@@ -75,6 +75,11 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
+    // The immutable, no-TTL, seven-year money ledger is the one table where an
+    // accidental console/API delete is unrecoverable. Guard it. Purely
+    // additive protection -- it prevents a delete, it cannot orphan, expose or
+    // lose data, so it is the opposite of what the data-plane gate guards.
+    DeletionProtectionEnabled: true,
   },
   {
     TableName: LOOP_EVENTS_TABLE,
@@ -161,12 +166,47 @@ export async function ensureCriticalTables(
     try {
       await dynamo.createTable(spec).promise();
       console.log(`[ensureCriticalTables] created missing table ${spec.TableName}`);
+      // A freshly created table already carries the spec's protection flag, so
+      // only the already-exists path below needs the reconcile.
     } catch (err: any) {
-      if (err?.code === 'ResourceInUseException') continue; // already exists — normal
+      if (err?.code === 'ResourceInUseException') {
+        // Table exists. createTable never updates it, so a spec flag added
+        // AFTER the table was created (e.g. DeletionProtectionEnabled on the
+        // money ledger) would otherwise never reach production. Reconcile it.
+        if (spec.DeletionProtectionEnabled) {
+          await ensureDeletionProtection(dynamo, spec.TableName);
+        }
+        continue;
+      }
       console.error(
         `[ensureCriticalTables] could NOT ensure ${spec.TableName} (telemetry for this loop will be lost until fixed):`,
         err?.message || err,
       );
     }
+  }
+}
+
+/**
+ * Turn on deletion protection for an existing table, idempotently and
+ * fail-safe.
+ *
+ * Describe-first, so a table already protected costs one read and no write —
+ * this runs on every boot and must not churn UpdateTable. Any failure
+ * (including the EB role lacking dynamodb:UpdateTable) is logged and swallowed:
+ * a missing safety flag must never take startup down, and the flag is purely
+ * additive, so the worst case of not applying it is the status quo.
+ */
+async function ensureDeletionProtection(dynamo: AWS.DynamoDB, tableName: string): Promise<void> {
+  try {
+    const described = await dynamo.describeTable({ TableName: tableName }).promise();
+    if (described.Table?.DeletionProtectionEnabled) return; // already on — no write
+    await dynamo.updateTable({ TableName: tableName, DeletionProtectionEnabled: true }).promise();
+    console.log(`[ensureCriticalTables] enabled deletion protection on ${tableName}`);
+  } catch (err: any) {
+    console.error(
+      `[ensureCriticalTables] could NOT enable deletion protection on ${tableName} ` +
+        `(needs dynamodb:UpdateTable; the table is unprotected until this succeeds):`,
+      err?.message || err,
+    );
   }
 }
