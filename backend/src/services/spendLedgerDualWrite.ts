@@ -297,3 +297,31 @@ export function buildLlmSpendEvent(
     },
   };
 }
+
+/**
+ * Split an integer micro-dollar total across parts in proportion to their
+ * exact costs, so the parts ALWAYS sum to the total (largest-remainder).
+ *
+ * Rounding each part on its own drifts from a total rounded once: four parts
+ * of 0.51 micro-dollars round to 4 while their total rounds to 2 (CodeRabbit,
+ * PR #2904). No part is negative. With no positive weight, the total goes to
+ * the first part.
+ */
+export function allocateMicroUsd(totalMicroUsd: number, weights: readonly number[]): number[] {
+  if (weights.length === 0) return [];
+  const total = Math.max(0, Math.round(totalMicroUsd));
+  const clean = weights.map((w) => (Number.isFinite(w) && w > 0 ? w : 0));
+  const sum = clean.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return clean.map((_, i) => (i === 0 ? total : 0));
+
+  const raw = clean.map((w) => (total * w) / sum);
+  const shares = raw.map(Math.floor);
+  let remaining = total - shares.reduce((a, b) => a + b, 0);
+  const byRemainder = raw
+    .map((value, i) => ({ i, frac: value - Math.floor(value) }))
+    .sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let k = 0; remaining > 0; k = (k + 1) % byRemainder.length, remaining--) {
+    shares[byRemainder[k].i] += 1;
+  }
+  return shares;
+}

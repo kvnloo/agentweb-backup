@@ -35,7 +35,7 @@ import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../service
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
 import { usageRecordDb } from "../services/usageRecordDb";
 import { retryTransientWrite } from "../services/usageWriteFailureMonitor";
-import { buildLlmSpendEvent, isLlmDualWriteEnabled } from "../services/spendLedgerDualWrite";
+import { allocateMicroUsd, buildLlmSpendEvent, isLlmDualWriteEnabled } from "../services/spendLedgerDualWrite";
 import { getModelPrice, isPerGenerationPriced, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 /** ENG-1934: rate provenance for a dollar figure the agent engine computed itself. */
@@ -50,6 +50,34 @@ interface PricedPortion {
   tokens: number;
   calls: number;
   costUsd: number;
+}
+
+/**
+ * Most spend events one charge group may add to its transaction.
+ *
+ * DynamoDB allows 100 actions per TransactWriteItems, and the group already
+ * spends two (aggregate + charge event). `provider` arrives from the engine
+ * per record, so a batch can name any number of them. Past this bound the
+ * portions collapse to one per pricing source under provider "mixed", which
+ * keeps the write atomic and idempotent rather than overflowing into the
+ * non-atomic fallback (CodeRabbit, PR #2904). Real groups have one or two.
+ */
+export const MAX_SPEND_EVENTS_PER_GROUP = 10;
+export const MIXED_PROVIDER = "mixed";
+
+function collapsePortionsForTransaction(portions: PricedPortion[]): PricedPortion[] {
+  if (portions.length <= MAX_SPEND_EVENTS_PER_GROUP) return portions;
+  const bySource = new Map<PricedPortion["source"], PricedPortion>();
+  for (const portion of portions) {
+    const merged =
+      bySource.get(portion.source) ||
+      { source: portion.source, provider: MIXED_PROVIDER, tokens: 0, calls: 0, costUsd: 0 };
+    merged.tokens += portion.tokens;
+    merged.calls += portion.calls;
+    merged.costUsd += portion.costUsd;
+    bySource.set(portion.source, merged);
+  }
+  return [...bySource.values()];
 }
 
 /** Hard cap on batch size — one task run produces far fewer records. */
@@ -303,12 +331,13 @@ router.post(
               cacheWriteTokens
             ) / 1e6
           );
+          // "book" only when this route's own pricing produced the cost: a
+          // token-priced model the book knows. An image/video record without
+          // an engine cost is priced at $0 here (computeCostMicroUsd has no
+          // per-generation rate), so it is unpriced, not a confirmed $0
+          // allocation (CodeRabbit, PR #2904).
           const source: PricedPortion["source"] | null =
-            costUsdOverride != null
-              ? "engine"
-              : isPerGenerationPriced(record.model!) || getModelPrice(record.model!) !== null
-              ? "book"
-              : null;
+            costUsdOverride != null ? "engine" : getModelPrice(record.model!) !== null ? "book" : null;
           if (source) {
             const portionKey = `${source}\u0001${recordProvider}`;
             const portion =
@@ -459,9 +488,13 @@ router.post(
           // ENG-1934: the group's spend events ride the same transaction, keyed
           // off its charge event's id, so a retried batch no-ops every item
           // together. One event per priced portion — see the subtotals above.
-          const portions = [...entry.pricedPortions.values()].map((portion) => ({
+          const priced = collapsePortionsForTransaction([...entry.pricedPortions.values()]);
+          // One integer total split across the portions by their exact costs, so
+          // the events sum EXACTLY to the aggregate row whatever the rounding.
+          const shares = allocateMicroUsd(costMicroUsd, priced.map((portion) => portion.costUsd));
+          const portions = priced.map((portion, i) => ({
             ...portion,
-            costMicroUsd: Math.max(0, Math.round(portion.costUsd * 1_000_000)),
+            costMicroUsd: shares[i],
             rateProvenance: portion.source === "engine" ? ENGINE_COST_PROVENANCE : LLM_PRICE_BOOK_PROVENANCE,
             // The group's own provider keeps the plain ids; another provider's
             // portion is suffixed with it. Deterministic, and distinct per portion.
@@ -469,14 +502,6 @@ router.post(
               (portion.source === "engine" ? `${eventId}#engine` : eventId) +
               (portion.provider === entry.provider ? "" : `@${portion.provider}`),
           }));
-          // Rounding each portion separately can leave the events a micro-dollar
-          // off the aggregate row. Settle the residual on the largest portion so
-          // the ledger sums EXACTLY to the aggregate (unpriced records add $0).
-          if (portions.length) {
-            const residual = costMicroUsd - portions.reduce((sum, p) => sum + p.costMicroUsd, 0);
-            const largest = portions.reduce((a, b) => (b.costMicroUsd > a.costMicroUsd ? b : a));
-            largest.costMicroUsd = Math.max(0, largest.costMicroUsd + residual);
-          }
           const spendEvents = isLlmDualWriteEnabled()
             ? portions
                 .map((portion) =>
