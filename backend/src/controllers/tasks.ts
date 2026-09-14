@@ -13,6 +13,7 @@ import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { recordVendorUsage } from '../services/usageRecorderService';
 import { computeAllocatedCost } from '../utils/vendorRateCard';
 import { canViewItem, canEditItem } from '../services/orgShareService';
+import { getPlacidPrivateToken } from '../utils/secretsManager';
 
 const s3 = new S3();
 
@@ -1188,13 +1189,16 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    // ENG-698: read from Secrets Manager (prod/AgentWeb/Placid), falling back to
+    // the environment only where the secret does not exist. Not metered: minting
+    // an editor access token is not a Placid render and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
     const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid;
     if (!templateUuid) {
       return res.status(400).json({ message: 'template_uuid is required' });
     }
     if (!privateToken) {
-      return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+      return res.status(500).json({ message: 'Placid private token is not configured' });
     }
 
     // Allow optional overrides via query/body if needed later
@@ -1298,19 +1302,32 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     // fetch books nothing -- the same rule apollo/enrich.so use. Rate read from
     // the card, never embedded. Bills the task owner; the acting caller may be
     // an admin, hence onBehalfOf.
+    //
+    // try/catch (ENG-698 AC6: a metering failure never prevents a render being
+    // returned). recordVendorUsage itself never throws, but computeAllocatedCost
+    // is evaluated as an argument, synchronously, BEFORE that call — and it
+    // throws on an unpriced unit by design (ENG-703 AC2). Without the guard, a
+    // rate-card key rename would 500 every render.
     const placidOwner = task.userId;
-    void recordVendorUsage({
-      userId,
-      billingUserId: placidOwner,
-      ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
-      provider: 'placid',
-      operation: 'image_render',
-      feature: 'ad_image',
-      unit: 'render',
-      quantity: 1,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('placid', 'image_render', 1),
-    });
+    try {
+      void recordVendorUsage({
+        userId,
+        billingUserId: placidOwner,
+        ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
+        provider: 'placid',
+        operation: 'image_render',
+        feature: 'ad_image',
+        unit: 'render',
+        quantity: 1,
+        costSource: 'allocated',
+        costUsd: computeAllocatedCost('placid', 'image_render', 1),
+      });
+    } catch (meterErr) {
+      console.error(
+        '[Placid] failed to meter render (image still served):',
+        meterErr instanceof Error ? meterErr.message : meterErr,
+      );
+    }
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
@@ -1382,8 +1399,10 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
-    if (!privateToken) return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+    // ENG-698: Secrets Manager first, environment fallback. Not metered: listing
+    // templates is a catalogue read, not a render, and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
+    if (!privateToken) return res.status(500).json({ message: 'Placid private token is not configured' });
 
     const { page, per_page, collection_id } = req.query as {
       page?: string;

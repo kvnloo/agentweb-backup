@@ -455,7 +455,7 @@ import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -6226,6 +6226,16 @@ export class AgentModeService {
     // available" and Emma had to ask them to type out what was on screen (ENG-260).
     'describe_image',
 
+    // PDF export — converts a previously generated HTML file to a PDF. Same
+    // ENG-152/ENG-260 class of bug: this is a basic, universally-useful utility
+    // (there is even a plain HTTP export-pdf endpoint alongside it), not a
+    // gated capability, but it was left in the __other_skills__ catch-all pool.
+    // That pool's membership depends on which OTHER skills happen to be
+    // installed for a given subscription tier, so a fully-entitled account
+    // could still have install_skills(["__other_skills__"]) refused with
+    // "these skills are currently unavailable to install" (ENG-1867).
+    'convert_to_pdf',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -6362,6 +6372,12 @@ export class AgentModeService {
     // happened to be on the `images` page — Emma returned "describe_image not
     // available" and had to ask the user to type out what was on screen (ENG-260).
     'describe_image',
+    // PDF export. Force-merged for the same reason as read_file_content/
+    // describe_image: the prod `foundation_tools` AW-Settings override omits
+    // DEFAULT-only additions, so without this convert_to_pdf falls back to
+    // the __other_skills__ catch-all pool and can be refused as "currently
+    // unavailable to install" even on a fully-entitled account (ENG-1867).
+    'convert_to_pdf',
     // Meeting Intelligence (Fathom). Force-merged because the prod
     // `foundation_tools` AW-Settings override predates these tools and omits
     // them — without force-merging, loadFoundationTools strips them in prod so
@@ -28613,6 +28629,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://')) {
         throw new Error('source_url must be an HTTP or HTTPS URL');
       }
+
+      // SSRF guard: convert_to_pdf is a foundation tool reachable by every
+      // session by default, and renderHtmlToPdf navigates a real browser to
+      // sourceUrl server-side. Without this, a user could point it at an
+      // internal address (e.g. the cloud metadata endpoint) and get the
+      // response rendered back to them as a downloadable PDF. renderHtmlToPdf
+      // also re-validates on every navigation request (including redirect
+      // hops), so this call fails fast for the common case without spinning
+      // up a browser first.
+      await assertPublicHostname(sourceUrl);
 
       // Shared render path: orientation is auto-detected (16:9 decks print
       // landscape) unless the caller forces it, and wide content is scaled to
