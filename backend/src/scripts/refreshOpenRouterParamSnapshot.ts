@@ -12,7 +12,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { AgentModeService } from '../services/agentModeService';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 
 export const SNAPSHOT_PATH = path.join(
@@ -37,9 +37,8 @@ async function fetchEndpoints(upstreamModel: string) {
 
 /** Snapshot every non-live registry model's OpenRouter endpoints to SNAPSHOT_PATH. */
 async function main() {
-  const registry = (new AgentModeService() as any).llmModels as Record<string, { isLive?: boolean }>;
   const upstreamIds = [...new Set(
-    Object.entries(registry)
+    Object.entries(LLM_MODEL_REGISTRY)
       .filter(([, config]) => !config.isLive)
       .map(([modelId]) => resolveOpenRouterUpstreamModelId(modelId)),
   )].sort();
