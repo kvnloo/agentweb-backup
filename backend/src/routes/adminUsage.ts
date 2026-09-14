@@ -34,10 +34,44 @@ import { measureLlmLedgerCoverage } from "../services/spendReconciliation";
 import { usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
-import { userDb } from "../services/db";
+import { orgDb, userDb } from "../services/db";
 import { resolveBillingUserId } from "../services/tokenUsageService";
 
 const router = express.Router();
+
+/**
+ * Every aggregate row billed to `billingUserId` in `month`, by keyed query.
+ *
+ * The aggregate table is partitioned by the ACTING user, so the rows billed to
+ * an org owner live under each member's partition. Rather than scanning the
+ * table for `billingUserId` (CodeRabbit, PR #2904 — scans are not allowed on
+ * a per-request path, and a billingUserId GSI is a data-plane change, ENG-1273),
+ * this queries the partitions that can hold them: the owner, the org's current
+ * members, and every acting user the ledger itself saw this month.
+ *
+ * A former member with aggregate rows but no ledger events is the one actor
+ * this cannot see. That can only make the aggregate side SMALLER than the
+ * ledger, which the coverage check reports as drift — `partial`, never a false
+ * `full`.
+ */
+async function readAggregateRowsForBillingSubject(
+  billingUserId: string,
+  month: string,
+  events: ReadonlyArray<{ actingUserId: string }>,
+) {
+  const actors = new Set<string>([billingUserId, ...events.map((e) => e.actingUserId).filter(Boolean)]);
+  const owner = await userDb.getUserById(billingUserId);
+  if (owner?.orgId) {
+    for (const member of await orgDb.getOrgMembers(owner.orgId)) actors.add(member.userId);
+  }
+
+  const perActor = await Promise.all(
+    [...actors].map((actor) => usageRecordDb.queryByUserDateRange(actor, `${month}-01`, `${month}-31`)),
+  );
+  // A member's partition also holds rows billed to someone else (their own
+  // subscription, or before they pooled), so keep only this subject's.
+  return perActor.flat().filter((row) => row.billingUserId === billingUserId);
+}
 
 /**
  * ENG-1250 §7: the spend breakdown for one billing subject and month, built
@@ -108,12 +142,10 @@ router.get(
       // coverage to "partial" rather than failing the breakdown.
       const aggregateRows =
         month >= LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)
-          ? await usageRecordDb
-              .queryByBillingUserDateRange(billingUserId, `${month}-01`, `${month}-31`)
-              .catch((error: any) => {
-                console.error("[adminUsage] LLM coverage read failed:", error?.message || error);
-                return null;
-              })
+          ? await readAggregateRowsForBillingSubject(billingUserId, month, events).catch((error: any) => {
+              console.error("[adminUsage] LLM coverage read failed:", error?.message || error);
+              return null;
+            })
           : null;
 
       return res.json({

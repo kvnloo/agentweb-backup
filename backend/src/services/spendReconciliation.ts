@@ -430,8 +430,8 @@ export interface LlmLedgerCoverage {
   startedOn: string;
   /**
    * `none`: the month ended before LLM events existed — vendor spend only.
-   * `partial`: LLM spend on the aggregate rail is missing from the ledger by
-   * more than the §8 tolerance, or that could not be measured.
+   * `partial`: the two rails disagree by more than the §8 tolerance in either
+   * direction, or that could not be measured.
    * `full`: the ledger holds the month's LLM spend, within tolerance.
    */
   month: "none" | "partial" | "full";
@@ -440,6 +440,11 @@ export interface LlmLedgerCoverage {
   aggregateLlmMicroUsd: number | null;
   /** How much LLM spend the ledger is missing; null when not measured. */
   missingLlmMicroUsd: number | null;
+  /**
+   * How much MORE LLM spend the ledger holds than the aggregate rail — a
+   * duplicate or orphan event overstating the total. null when not measured.
+   */
+  excessLlmMicroUsd: number | null;
 }
 
 /**
@@ -468,22 +473,27 @@ export function measureLlmLedgerCoverage(
   const base = { recording: isLlmDualWriteEnabled(), startedOn: LLM_SPEND_LEDGER_STARTED_ON, ledgerLlmMicroUsd };
 
   if (billingMonth < LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)) {
-    return { ...base, month: "none", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null };
+    return { ...base, month: "none", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null, excessLlmMicroUsd: null };
   }
   if (!aggregateRows) {
     // Unmeasured is not complete.
-    return { ...base, month: "partial", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null };
+    return { ...base, month: "partial", aggregateLlmMicroUsd: null, missingLlmMicroUsd: null, excessLlmMicroUsd: null };
   }
 
   const aggregateLlmMicroUsd = aggregateRows
     .filter((r) => r.date.slice(0, 7) === billingMonth && !isVendorEntry(r) && !isUnpricedLlmRow(r))
     .reduce((sum, r) => sum + r.costMicroUsd, 0);
   const missingLlmMicroUsd = Math.max(0, aggregateLlmMicroUsd - ledgerLlmMicroUsd);
+  const excessLlmMicroUsd = Math.max(0, ledgerLlmMicroUsd - aggregateLlmMicroUsd);
 
   return {
     ...base,
-    month: missingLlmMicroUsd > DRIFT_TOLERANCE_MICRO_USD ? "partial" : "full",
+    // Either direction: a ledger that holds MORE than the aggregate is
+    // overstating spend, and that is no more "full" than a shortfall is
+    // (CodeRabbit, PR #2904).
+    month: Math.max(missingLlmMicroUsd, excessLlmMicroUsd) > DRIFT_TOLERANCE_MICRO_USD ? "partial" : "full",
     aggregateLlmMicroUsd,
     missingLlmMicroUsd,
+    excessLlmMicroUsd,
   };
 }
