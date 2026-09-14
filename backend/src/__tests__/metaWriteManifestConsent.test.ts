@@ -174,6 +174,46 @@ describe('ENG-1642 manifest consent', () => {
     expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
   });
 
+  it('ENG-1635 AC6: a manifest digest computed against the RESOLVED account still grants a call whose raw account_id argument was omitted', async () => {
+    // The manifest was built (preview time) with the resolved account id baked into the digest —
+    // exactly what buildMetaWriteConfirmation's target.account_id already carries. The replay call
+    // (claim time) omits account_id entirely, the common single-connected-account case. Before the
+    // fix, claimMetaWriteManifestGrant hashed the raw '' argument instead of resolving credentials
+    // first, so this digest would never match and the call would wrongly re-halt.
+    const digest = digestForCall(call.params); // computed against ACCOUNT, the resolved id
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: SESSION_ID,
+      pendingUserQuestion: manifestQuestion([digest]),
+    });
+    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
+
+    const res: any = await service.callMetaMarketingApi(
+      'user-1', call.entity_type as any, call.action, '', CAMPAIGN, AD_SET, AD_ID, call.params, SESSION_ID,
+    );
+
+    expect(res.awaitingUserConfirmation).toBeUndefined();
+    expect(chatbotDb.claimMetaWriteManifestDigest).toHaveBeenCalledWith(SESSION_ID, digest);
+    expect((service as any).updateMetaAdsAd).toHaveBeenCalled();
+  });
+
+  it('ENG-1635 AC6b: two omitted-account_id calls that resolve to DIFFERENT real accounts do not share a digest', async () => {
+    // Guards the other direction of the same bug: the raw argument must never be what collapses
+    // two different real accounts onto the same digest.
+    const digest = digestForCall(call.params); // computed against ACCOUNT
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: SESSION_ID,
+      pendingUserQuestion: manifestQuestion([digest]),
+    });
+    jest.spyOn(service as any, 'getMetaCredentials').mockResolvedValue({ accountId: 'a-different-account', accessToken: 'tok' });
+
+    const res: any = await service.callMetaMarketingApi(
+      'user-1', call.entity_type as any, call.action, '', CAMPAIGN, AD_SET, AD_ID, call.params, SESSION_ID,
+    );
+
+    expect(res.awaitingUserConfirmation).toBe(true);
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+
   it('AC5: a granted call never implies override_tracking_check', async () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({

@@ -20062,6 +20062,47 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1635: resolve the account id a write will ACTUALLY execute against —
+   * mirroring buildMetaWriteConfirmation's own resolution (see its comment
+   * above `scopeAccountId`) — and compute this call's manifest digest against
+   * THAT id, never the raw `account_id` argument.
+   *
+   * A raw argument can be omitted (the common single-connected-account case;
+   * `POST /emma/meta-ads/marketing-api` validates nothing) or vary
+   * cosmetically call to call while resolving to the same real account. Two
+   * calls that both omit/vary the raw argument but resolve to DIFFERENT real
+   * accounts must never hash the same, and a legitimately-identical write
+   * must not hash differently just because its raw argument differs from an
+   * earlier call's — so every manifest digest, at both producer (preview) and
+   * grant (claim) time, has to go through this same resolution. Both current
+   * callers (claimMetaWriteManifestGrant below, and the manifest producer)
+   * share this rather than each resolving credentials their own way.
+   */
+  private async resolveMetaWriteManifestDigest(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<string> {
+    let scopeAccountId: string = account_id ?? '';
+    try {
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId) scopeAccountId = creds.accountId;
+    } catch {
+      // Same degrade-not-block behavior as buildMetaWriteConfirmation: a credential
+      // failure surfaces during actual execution, not here — fall back to the raw
+      // argument rather than letting digest computation itself throw.
+    }
+    return computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id: scopeAccountId, campaign_id, ad_set_id, ad_id, params,
+    });
+  }
+
+  /**
    * ENG-1642: check whether this exact Meta write is authorized by an
    * answered `meta_write_manifest` question in the session, and if so claim
    * it (at-most-once). Returns true only when a fresh claim succeeds THIS
@@ -20070,6 +20111,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * through to the normal confirmation halt.
    */
   private async claimMetaWriteManifestGrant(
+    userId: string,
     sessionId: string,
     entity_type: string,
     action: string,
@@ -20079,9 +20121,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_id: string | undefined,
     params: any,
   ): Promise<boolean> {
-    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
-      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
-    });
+    const digest = await this.resolveMetaWriteManifestDigest(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+    );
     const session = await chatbotDb.getChatSession(sessionId);
     // A session can carry MULTIPLE answered `meta_write_manifest` questions
     // (each roll-off archives the prior one) — a newer manifest must not
@@ -20824,7 +20866,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       sessionId
     ) {
       manifestGranted = await this.claimMetaWriteManifestGrant(
-        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+        userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
     }
 
