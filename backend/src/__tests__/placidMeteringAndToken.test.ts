@@ -233,12 +233,54 @@ describe('Placid render metering (ENG-698)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    mockGetToken.mockResolvedValue('placid-private-token');
     mockGetTask.mockResolvedValue({ taskId: 'task-1', userId: 'user-3' });
     mockGetUser.mockResolvedValue({ userId: 'user-3', isAdmin: false });
     mockGetExecution.mockResolvedValue({ taskId: 'task-1', result_files: [] });
     mockUpdateExecution.mockResolvedValue(undefined);
     mockPutObject.mockResolvedValue({});
     mockAxiosGet.mockResolvedValue({ data: new ArrayBuffer(8), headers: { 'content-type': 'image/png' } });
+  });
+
+  it('signs the exact URL API query with the private project token', async () => {
+    const request = renderReq();
+    request.body.layers = { headline: { text: 'Hello world' } };
+
+    await generateFromTemplateToExecution(request, res());
+
+    const requestedUrl = mockAxiosGet.mock.calls[0][0] as string;
+    const url = new URL(requestedUrl);
+    const signature = url.searchParams.get('s');
+    url.searchParams.delete('s');
+    const unsignedQuery = `&${url.searchParams.toString()}`;
+    const expected = require('crypto')
+      .createHmac('sha256', 'placid-private-token')
+      .update(unsignedQuery)
+      .digest('hex');
+    expect(signature).toBe(expected);
+    expect(requestedUrl.endsWith(`&s=${expected}`)).toBe(true);
+  });
+
+  it('signs renders that have no layer parameters', async () => {
+    await generateFromTemplateToExecution(renderReq(), res());
+
+    const requestedUrl = mockAxiosGet.mock.calls[0][0] as string;
+    const expected = require('crypto')
+      .createHmac('sha256', 'placid-private-token')
+      .update('')
+      .digest('hex');
+    expect(requestedUrl).toBe(`https://api.placid.app/u/tpl-abcdef12?s=${expected}`);
+  });
+
+  it('fails before calling the URL API when no signing token is configured', async () => {
+    mockGetToken.mockResolvedValue(null);
+    const r = res();
+
+    await generateFromTemplateToExecution(renderReq(), r);
+
+    expect(r.status).toHaveBeenCalledWith(500);
+    expect(r.json).toHaveBeenCalledWith({ message: 'Placid private token is not configured' });
+    expect(mockAxiosGet).not.toHaveBeenCalled();
   });
 
   it('records a render against the requesting user, priced as allocated (AC3, AC7)', async () => {

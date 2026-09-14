@@ -1267,6 +1267,14 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const tplUuid = template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
     if (!tplUuid) return res.status(400).json({ message: 'template_uuid is required' });
 
+    // Production restricts the Placid URL API to signed requests. The REST
+    // catalogue and URL renderer belong to the same project, so signing lets
+    // every listed template render without making the templates public.
+    const privateToken = await getPlacidPrivateToken();
+    if (!privateToken) {
+      return res.status(500).json({ message: 'Placid private token is not configured' });
+    }
+
     const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
     const params = new URLSearchParams();
     // Map provided layers -> URL API notation
@@ -1294,7 +1302,12 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     if (source_image_url && !params.has('image[image]')) {
       params.set('image[image]', source_image_url);
     }
-    const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
+    const encodedParams = params.toString();
+    // Placid's signing contract hashes the query string with a leading `&`
+    // when parameters exist, and requires `s` to be the final parameter.
+    const signatureInput = encodedParams ? `&${encodedParams}` : '';
+    const signature = crypto.createHmac('sha256', privateToken).update(signatureInput).digest('hex');
+    const placidImageUrl = `${base}/${tplUuid}?${encodedParams ? `${encodedParams}&` : ''}s=${signature}`;
 
     const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
     // ENG-698: a Placid URL-API fetch that returns is a billed render. Metered
