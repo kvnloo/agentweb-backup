@@ -820,14 +820,24 @@ export class HumanEvalService {
   }
 
   private async getReviewerSlackUserId(reviewer: HumanEvalReviewer): Promise<string | undefined> {
-    const settingName = reviewer === 'fangfang'
-      ? 'human_eval_reviewer_fangfang_slack_user_id'
-      : 'human_eval_reviewer_matt_slack_user_id';
-    const envName = reviewer === 'fangfang'
-      ? 'HUMAN_EVAL_FANGFANG_SLACK_USER_ID'
-      : 'HUMAN_EVAL_MATT_SLACK_USER_ID';
-    const setting = await this.settings.getSetting(settingName);
-    return (setting?.settingValue || process.env[envName])?.trim() || undefined;
+    // ENG-1854: this runs before createCandidate's db.put — same fail-safe reasoning as
+    // slackPostingReasonFor. Unguarded, a transient settings-lookup failure here would throw
+    // out of createCandidate before the record is ever persisted, silently dropping the
+    // candidate the same way the pre-PR bug did. The return type is already optional, so a
+    // plain-text reviewer-name fallback in buildSlackMessage handles the missing-ID case fine.
+    try {
+      const settingName = reviewer === 'fangfang'
+        ? 'human_eval_reviewer_fangfang_slack_user_id'
+        : 'human_eval_reviewer_matt_slack_user_id';
+      const envName = reviewer === 'fangfang'
+        ? 'HUMAN_EVAL_FANGFANG_SLACK_USER_ID'
+        : 'HUMAN_EVAL_MATT_SLACK_USER_ID';
+      const setting = await this.settings.getSetting(settingName);
+      return (setting?.settingValue || process.env[envName])?.trim() || undefined;
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve reviewer Slack user id, continuing without it:', err?.message || err);
+      return undefined;
+    }
   }
 
   private async getCandidateIdForThread(channel: string, threadTs: string): Promise<string | null> {
