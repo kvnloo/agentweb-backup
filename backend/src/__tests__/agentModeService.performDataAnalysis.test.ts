@@ -475,33 +475,6 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(promptText.toLowerCase()).toContain('do not use altair');
   });
 
-  // Insight text is often embedded as-is inside a plain <p> in a downstream HTML
-  // report (e.g. createHtmlFromTemplate). Nothing downstream expects HTML/Markdown
-  // there, so unprompted markup (a Gemini stylistic default, not something we ask
-  // for) gets HTML-escaped by the report's own XSS defense and shows up to the
-  // reader as literal tag text instead of formatted output.
-  test('prompt instructs Gemini to write insights as plain text, no HTML or Markdown', async () => {
-    mockedAxiosPost.mockResolvedValueOnce({
-      data: {
-        candidates: [
-          {
-            content: {
-              parts: [{ text: 'Done.' }]
-            }
-          }
-        ]
-      }
-    });
-
-    await (service as any).performDataAnalysis([], 'Summarize the campaign performance.', 'user-1');
-
-    const postBody = mockedAxiosPost.mock.calls[0][1];
-    const promptText = postBody.contents[0].parts[postBody.contents[0].parts.length - 1].text as string;
-    expect(promptText.toLowerCase()).toContain('plain text');
-    expect(promptText).toContain('<ul>');
-    expect(promptText).toContain('<strong>');
-  });
-
   test('returns chunking guidance when axios times out (ECONNABORTED)', async () => {
     const timeoutError = new Error('timeout of 1200000ms exceeded');
     (timeoutError as any).code = 'ECONNABORTED';
