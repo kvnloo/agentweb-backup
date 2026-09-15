@@ -44,7 +44,7 @@ jest.mock('../../services/usageRecordDb', () => ({
     queryByBillingUserDateRange: (...a: unknown[]) => mockQueryByBillingScan(...a),
   },
 }));
-jest.mock('../../services/tokenUsageService', () => ({ resolveBillingUserId: jest.fn() }));
+jest.mock('../../services/tokenUsageService', () => ({ resolveBillingUserId: jest.fn(), checkTokenUsage: jest.fn() }));
 jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgDb: { getOrgMembers: jest.fn() } }));
 jest.mock('../../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
 jest.mock('../../services/llmUsageCreditService', () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
@@ -57,7 +57,7 @@ import {
   getUserXBreakdown,
 } from '../../services/usageAnalyticsService';
 import { listSpendEvents } from '../../services/spendEventDb';
-import { resolveBillingUserId } from '../../services/tokenUsageService';
+import { checkTokenUsage, resolveBillingUserId } from '../../services/tokenUsageService';
 import { orgDb, userDb } from '../../services/db';
 import { getSubscriptionTypeConfig } from '../../services/subscriptionService';
 import { getLlmUsageCreditAdjustment } from '../../services/llmUsageCreditService';
@@ -68,6 +68,7 @@ const mockXBreakdown = getUserXBreakdown as jest.Mock;
 const mockAuth = authenticateToken as unknown as jest.Mock;
 const mockListSpendEvents = listSpendEvents as jest.Mock;
 const mockResolveBilling = resolveBillingUserId as jest.Mock;
+const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockOrgMembers = orgDb.getOrgMembers as jest.Mock;
 const mockTierConfig = getSubscriptionTypeConfig as jest.Mock;
@@ -124,6 +125,47 @@ describe('admin usage routes', () => {
       });
       mockListSpendEvents.mockResolvedValue([]);
       mockAggregateRows.mockResolvedValue([]);
+      mockCheckTokenUsage.mockResolvedValue({
+        allowed: true, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null,
+        percentUsed: 0, month: '2026-09', costUsed: 12.5, costAllowance: 200, costPercentUsed: 6.25,
+        costEnforced: true, usageMode: 'full_choice', usagePolicyVersion: 'v1', alertThresholds: {},
+      });
+    });
+
+    // ENG-1886: the real pause decision, straight from the enforcer.
+    describe('enforcement state', () => {
+      beforeEach(() => mockResolveBilling.mockResolvedValue('owner-1'));
+
+      it('asks the enforcer about the BILLING subject, and returns its decision re-labelled', async () => {
+        mockCheckTokenUsage.mockResolvedValueOnce({
+          allowed: false, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null,
+          percentUsed: 0, month: '2026-09', costUsed: 204.1, costAllowance: 200, costPercentUsed: 102.05,
+          costEnforced: true, usageMode: 'paused', usagePolicyVersion: 'v1', alertThresholds: {},
+        });
+
+        const res = await request(app).get('/api/admin/users/member-1/spend/breakdown').query({ month: '2026-09' });
+
+        expect(mockCheckTokenUsage).toHaveBeenCalledWith('owner-1');
+        expect(res.body.enforcement).toEqual({
+          available: true, month: '2026-09', paused: true, usageMode: 'paused', gatedBy: 'cost',
+          used: 204.1, limit: 200, percentUsed: 102.05, resetsOn: '2026-10-01', usagePolicyVersion: 'v1',
+        });
+      });
+
+      it('reports a past month as not available rather than inferring a pause', async () => {
+        const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-08' });
+
+        expect(res.body.enforcement).toEqual({ available: false, reason: 'not-current-month', currentMonth: '2026-09' });
+      });
+
+      it('a failed enforcer read degrades to unreadable — the breakdown still returns', async () => {
+        mockCheckTokenUsage.mockRejectedValueOnce(new Error('User not found'));
+
+        const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-09' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.enforcement).toMatchObject({ available: false, reason: 'unreadable' });
+      });
     });
 
     it('400s on a malformed month, before reading the ledger', async () => {

@@ -11,6 +11,8 @@ import SpendLedgerBody, {
   shortDay,
   allowanceComparison,
   partialCoverageCaption,
+  enforcementCounter,
+  EnforcementState,
   SpendLedgerPayload,
   MonthlyProjection,
 } from "../SpendLedgerBody";
@@ -479,5 +481,98 @@ describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
     render(<SpendLedgerBody data={payload(coverage("full"))} />);
 
     expect(within(screen.getByTestId("spend-slice-byProvider")).getByText("By provider")).toBeInTheDocument();
+  });
+});
+
+// ── ENG-1886: the enforcer's own pause decision ─────────────────────────────
+
+describe("SpendLedgerBody enforcement state (ENG-1886)", () => {
+  const live = (over: Partial<Extract<EnforcementState, { available: true }>> = {}): EnforcementState => ({
+    available: true,
+    month: "2026-09",
+    paused: false,
+    usageMode: "full_choice",
+    gatedBy: "cost",
+    used: 187.23,
+    limit: 200,
+    percentUsed: 93.6,
+    resetsOn: "2026-10-01",
+    usagePolicyVersion: "v3",
+    ...over,
+  });
+
+  it("AC1: says plainly when the account is paused now, against which counter and threshold", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live({ paused: true, usageMode: "paused", used: 204.1, percentUsed: 102.1 }) })} />);
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Paused now by the usage cap (mode: paused)");
+    expect(card).toHaveTextContent("Enforcer's counter (LLM cost): $204.10 of $200.00 (102.1%) · resets Oct 1");
+  });
+
+  it("says when the account is not paused", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live() })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Not paused: the usage cap is admitting work");
+  });
+
+  it("AC3: distinguishes the enforcer's counter from the ledger total", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live() })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent(
+      "This is the counter that decides admission (AW-Users), not the ledger total below. The two can differ.",
+    );
+  });
+
+  it("reads a token-gated account in tokens, and an uncapped one as having no cap", () => {
+    expect(enforcementCounter(live({ gatedBy: "tokens", used: 1_200_000, limit: 3_000_000, percentUsed: 40 }) as any)).toBe(
+      "1,200,000 tokens of 3,000,000 tokens (40.0%)",
+    );
+    expect(enforcementCounter(live({ gatedBy: "none", limit: null }) as any)).toBe("no cap configured");
+  });
+
+  it("never claims a pause for a past month", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({ billingMonth: "2026-08", enforcement: { available: false, reason: "not-current-month", currentMonth: "2026-09" } })}
+      />,
+    );
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Pause state is only known for the current month (2026-09)");
+    expect(card).not.toHaveTextContent("Paused now");
+  });
+
+  it("says it could not read the state instead of implying either answer", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: { available: false, reason: "unreadable", message: "x" } })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Could not read whether this account is paused");
+  });
+
+  it("AC4: the shadow ledger pause is still never rendered, even when it says paused", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          enforcement: live({ paused: false }),
+          pause: {
+            paused: true,
+            reason: "Committed spend $210.00 reached the cap against a usable allowance of $200.00.",
+            settledMicroUsd: 210_000_000,
+            reservedMicroUsd: 0,
+            usableAllowanceMicroUsd: 200_000_000,
+            overspentMicroUsd: 10_000_000,
+            topProviders: [],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.queryByText(/reached the cap/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Not paused");
+  });
+
+  it("renders nothing about enforcement for a backend that does not send it", () => {
+    render(<SpendLedgerBody data={payload()} />);
+
+    expect(screen.queryByTestId("spend-ledger-enforcement")).not.toBeInTheDocument();
   });
 });
