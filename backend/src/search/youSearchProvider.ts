@@ -15,7 +15,6 @@ import {
   SearchRequest,
 } from './searchProvider';
 import { recordVendorUsage } from '../services/usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 const DEFAULT_YOU_SEARCH_ENDPOINT = 'https://ydc-index.io/v1/search';
 
@@ -98,8 +97,9 @@ export class YouSearchProvider implements SearchProvider {
       feature: request.purpose || 'agent_research',
       unit: 'query',
       quantity: 1,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('you.com', 'query', 1),
+      // ENG-1929: priced inside the recorder, so a missing rate cannot throw
+      // into the search that follows.
+      rateKey: 'query',
     });
 
     const response = await this.httpClient.post(this.endpoint, body, {
