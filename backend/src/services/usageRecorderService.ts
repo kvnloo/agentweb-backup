@@ -19,6 +19,7 @@ import {
   LLM_PRICE_BOOK_PROVENANCE,
 } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
+import { getAllocatedRate, VendorRateProvider } from "../utils/vendorRateCard";
 import {
   buildLlmSpendEvent,
   buildShadowEvent,
@@ -111,7 +112,7 @@ export interface RecordUsageContext {
  * figure its caller hands it and states, via `costSource`, where that figure came
  * from. Choosing the allocated rate is a pricing decision owned by ENG-703.
  */
-export interface RecordVendorUsageContext {
+interface VendorUsageFields {
   userId?: string;
   billingUserId?: string;
   onBehalfOf?: string;
@@ -124,9 +125,6 @@ export interface RecordVendorUsageContext {
   /** The thing being counted: "render", "query", "character", … */
   unit: string;
   quantity: number;
-  costSource: CostSource;
-  /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
-  costUsd?: number;
   /**
    * ENG-702 AC1: a stable token for THIS vendor call, supplied at the call
    * site. When present, the daily aggregate row and the immutable spend event
@@ -139,6 +137,77 @@ export interface RecordVendorUsageContext {
    * incremental rather than a single flag day across seven adapters.
    */
   idempotencyKey?: string;
+}
+
+/**
+ * How a vendor call's cost is given — exactly one of two shapes.
+ *
+ * **`rateKey` (preferred for anything priced by the vendor rate card).** The
+ * recorder looks the rate up itself, INSIDE its never-throw boundary
+ * (ENG-1929). Computing the cost at the call site instead —
+ * `costUsd: computeAllocatedCost(...)` — evaluates as an argument BEFORE the
+ * fire-and-forget call, so a missing rate threw straight into the vendor
+ * request and failed the user's search or render over a metering config gap.
+ * A missing rate here is recorded `unpriced` and reported loudly; never $0.
+ *
+ * **`costSource` + `costUsd`** for a figure priced elsewhere — X's own pricing
+ * module, or a measured amount. The value must already be computed: the
+ * coverage guard rejects a function call inside `costUsd`.
+ */
+type VendorUsagePricing =
+  | {
+      costSource: CostSource;
+      /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
+      costUsd?: number;
+      rateKey?: never;
+    }
+  | {
+      /** Vendor rate-card key; the recorder prices `quantity` from it. */
+      rateKey: string;
+      costSource?: never;
+      costUsd?: never;
+    };
+
+export type RecordVendorUsageContext = VendorUsageFields & VendorUsagePricing;
+
+/** A vendor call once its cost is settled — what every write path below takes. */
+type ResolvedVendorUsageContext = VendorUsageFields & { costSource: CostSource; costUsd?: number };
+
+/** provider:rateKey pairs already reported as unpriced by this process. */
+const reportedUnpricedRateKeys = new Set<string>();
+
+/**
+ * Settle a vendor call's cost from the rate card, never throwing.
+ *
+ * An unpriced key keeps ENG-703 AC2 — it is never booked as $0 spend: the row
+ * is tagged `unpriced` (the ledger then writes no spend event for it) and a
+ * loud, marker-tagged error is logged once per key per process, the same
+ * shape llmPricing uses for an unknown model. What changed is WHERE it fails:
+ * in the metering, not in the vendor request (ENG-1929).
+ */
+function resolveVendorCost(ctx: RecordVendorUsageContext): ResolvedVendorUsageContext {
+  if (ctx.rateKey == null) return ctx as ResolvedVendorUsageContext;
+
+  const { rateKey, ...fields } = ctx;
+  const rate = getAllocatedRate(ctx.provider as VendorRateProvider, rateKey);
+  if (rate === null) {
+    const key = `${ctx.provider}:${rateKey}`;
+    if (!reportedUnpricedRateKeys.has(key)) {
+      reportedUnpricedRateKeys.add(key);
+      console.error(
+        `[vendorRateCard] UNPRICED vendor unit ${key} — recorded as unpriced, not $0. ` +
+          "Add the rate to vendorRateCard.ts (ENG-703 AC2).",
+      );
+    }
+    return { ...fields, costSource: "unpriced" };
+  }
+  const quantity = Number.isFinite(ctx.quantity) && ctx.quantity > 0 ? ctx.quantity : 0;
+  return { ...fields, costSource: "allocated", costUsd: quantity * rate };
+}
+
+/** Test hook: forget which unpriced keys were already reported. */
+export function __resetUnpricedVendorReportsForTests(): void {
+  reportedUnpricedRateKeys.clear();
 }
 
 /** Log at most one shadow-ledger failure per minute, on its own throttle so a
@@ -393,7 +462,7 @@ async function writeLlmUsageWithSpendEvent(
  * rather than silently discarded" is served by the failure counter and alert,
  * not by throwing into a caller that cannot catch it.
  */
-async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: Date): Promise<void> {
+async function recordVendorUsageIdempotent(ctx: ResolvedVendorUsageContext, now: Date): Promise<void> {
   const userId = ctx.userId || "system";
   const billingUserId = ctx.billingUserId || userId;
 
@@ -464,7 +533,7 @@ async function recordVendorUsageIdempotent(ctx: RecordVendorUsageContext, now: D
 
 /** The daily-aggregate shape for a vendor call, shared by both write paths. */
 function buildVendorIncrement(
-  ctx: RecordVendorUsageContext,
+  ctx: ResolvedVendorUsageContext,
   userId: string,
   billingUserId: string,
   now: Date,
@@ -490,6 +559,15 @@ function buildVendorIncrement(
 export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
   const now = new Date();
 
+  // ENG-1929: pricing happens here, inside the boundary, never at the call site.
+  let resolved: ResolvedVendorUsageContext;
+  try {
+    resolved = resolveVendorCost(ctx);
+  } catch (error) {
+    logRecorderFailure(error);
+    return;
+  }
+
   // ENG-702 AC1 / ENG-1250 §6. EVERY vendor call takes the atomic path now, not
   // only the ones whose call site supplies a token.
   //
@@ -510,12 +588,12 @@ export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<
   // A call-site token still wins where one genuinely exists — v0 supplies the
   // guard's key (ENG-1812), which collapses retries within one reservation.
   // This does not replace that; it raises the floor for everyone else.
-  await recordVendorUsageIdempotent(ctx, now);
+  await recordVendorUsageIdempotent(resolved, now);
 }
 
 /** The pre-ENG-702 behaviour, retained as the fallback used above. */
 async function recordVendorUsageLegacy(
-  ctx: RecordVendorUsageContext,
+  ctx: ResolvedVendorUsageContext,
   now: Date,
   /**
    * False when called as the fallback below, whose own catch already records
