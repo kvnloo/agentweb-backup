@@ -27,15 +27,17 @@ jest.mock('../services/humanEvalService', () => {
 
 jest.mock('../services/autoHumanEvalService', () => ({
   claimArtifactForHumanEval: jest.fn().mockResolvedValue(true),
+  releaseArtifactClaim: jest.fn().mockResolvedValue(undefined),
 }));
 
 import humanEvalRoutes from '../routes/humanEval';
 import { humanEvalService } from '../services/humanEvalService';
-import { claimArtifactForHumanEval } from '../services/autoHumanEvalService';
+import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockListCandidates = humanEvalService.listCandidates as jest.Mock;
 const mockClaimArtifact = claimArtifactForHumanEval as jest.Mock;
+const mockReleaseArtifact = releaseArtifactClaim as jest.Mock;
 
 const app = express();
 app.use(express.json());
@@ -46,6 +48,7 @@ beforeEach(() => {
   mockCreateCandidate.mockResolvedValue({ candidateId: 'candidate-1', category: 'ad' });
   mockListCandidates.mockResolvedValue([]);
   mockClaimArtifact.mockResolvedValue(true);
+  mockReleaseArtifact.mockResolvedValue(undefined);
 });
 
 describe('POST /api/human-eval/candidates', () => {
@@ -115,6 +118,33 @@ describe('POST /api/human-eval/candidates', () => {
     expect(res.status).toBe(200);
     expect(mockClaimArtifact).not.toHaveBeenCalled();
     expect(mockCreateCandidate).toHaveBeenCalled();
+  });
+
+  // Round-3 review finding: the claim used to be won BEFORE createCandidate ran and never
+  // released on failure — a transient createCandidate error would permanently blackhole that
+  // artifact from ever being sent for review again.
+  it('releases the artifact claim when createCandidate fails after the claim was won', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+
+    const res = await request(app).post('/api/human-eval/candidates').send({
+      reviewType: 'creative_image',
+      outputSummary: 'Ad image generated.',
+      artifactUrl: 'https://example.com/flaky-create.png',
+    });
+
+    expect(res.status).toBe(500);
+    expect(mockReleaseArtifact).toHaveBeenCalledWith('https://example.com/flaky-create.png');
+  });
+
+  it('does not attempt to release a claim that was never won when there is no artifactUrl', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+
+    await request(app).post('/api/human-eval/candidates').send({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Enrichment run, no single artifact URL.',
+    });
+
+    expect(mockReleaseArtifact).not.toHaveBeenCalled();
   });
 });
 

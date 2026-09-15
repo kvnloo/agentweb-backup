@@ -8,16 +8,20 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
     setSetting: jest.fn(),
+    claimSetMember: jest.fn(),
+    releaseSetMember: jest.fn(),
   },
 }));
 
-import { enqueueAutoHumanEval, claimArtifactForHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { humanEvalService } from '../services/humanEvalService';
 import { settingsService } from '../services/settingsService';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockGetSetting = settingsService.getSetting as jest.Mock;
 const mockSetSetting = settingsService.setSetting as jest.Mock;
+const mockClaimSetMember = settingsService.claimSetMember as jest.Mock;
+const mockReleaseSetMember = settingsService.releaseSetMember as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -28,6 +32,8 @@ beforeEach(() => {
     reviewType: 'creative_image',
   });
   mockSetSetting.mockResolvedValue(undefined);
+  mockClaimSetMember.mockResolvedValue(true);
+  mockReleaseSetMember.mockResolvedValue(undefined);
 });
 
 describe('enqueueAutoHumanEval', () => {
@@ -118,8 +124,7 @@ describe('enqueueAutoHumanEval', () => {
   it('does not enqueue when the artifact URL was already claimed by a different path', async () => {
     // sourceKey dedup passes (nothing marked yet), but the artifact-claim check finds it
     // already claimed.
-    mockGetSetting.mockImplementation(async (key: string) =>
-      key.startsWith('human_eval_artifact_') ? { settingValue: 'claimed' } : null);
+    mockClaimSetMember.mockResolvedValue(false);
 
     const result = await enqueueAutoHumanEval({
       reviewType: 'creative_image',
@@ -133,43 +138,96 @@ describe('enqueueAutoHumanEval', () => {
     expect(result).toBeNull();
     expect(mockCreateCandidate).not.toHaveBeenCalled();
   });
+
+  // Round-3 review finding: the claim used to be won BEFORE createCandidate ran and never
+  // released on failure — a transient createCandidate error would permanently blackhole that
+  // artifact from ever being sent again, exactly the "silently dropped" failure mode this PR
+  // exists to eliminate. This proves the release actually happens.
+  it('releases the artifact claim when createCandidate fails after the claim was won, so a retry can claim it again', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+
+    const result = await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      userId: 'user-1',
+      artifactUrl: 'https://example.com/flaky-create.png',
+      outputSummary: 'Image generated.',
+      sourceKey: 'image:session-1:flaky-create.png',
+    });
+
+    expect(result).toBeNull();
+    expect(mockReleaseSetMember).toHaveBeenCalledWith(
+      expect.stringMatching(/^human_eval_artifact_claims_\d{4}-\d{2}$/),
+      'https://example.com/flaky-create.png',
+    );
+  });
+
+  it('does not attempt to release a claim that was never won (no artifactUrl given at all)', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+
+    await enqueueAutoHumanEval({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Enrichment run, no single artifact URL.',
+      sourceKey: 'lead-enrichment:run-1',
+    });
+
+    expect(mockReleaseSetMember).not.toHaveBeenCalled();
+  });
 });
 
 describe('claimArtifactForHumanEval', () => {
-  it('claims a not-yet-seen artifact URL and returns true', async () => {
+  it('claims a not-yet-seen artifact URL via an atomic claimSetMember call, and returns true', async () => {
     const claimed = await claimArtifactForHumanEval('https://example.com/new.png');
 
     expect(claimed).toBe(true);
-    expect(mockSetSetting).toHaveBeenCalledWith(
-      expect.stringMatching(/^human_eval_artifact_[a-f0-9]{32}$/),
-      'claimed',
-      expect.stringContaining('https://example.com/new.png'),
-      'auto-human-eval',
+    expect(mockClaimSetMember).toHaveBeenCalledWith(
+      expect.stringMatching(/^human_eval_artifact_claims_\d{4}-\d{2}$/),
+      'https://example.com/new.png',
     );
   });
 
   it('returns false for an artifact URL already claimed', async () => {
-    mockGetSetting.mockResolvedValue({ settingValue: 'claimed' });
+    mockClaimSetMember.mockResolvedValue(false);
 
     const claimed = await claimArtifactForHumanEval('https://example.com/dup.png');
 
     expect(claimed).toBe(false);
-    expect(mockSetSetting).not.toHaveBeenCalled();
   });
 
   it('has nothing to dedupe against when no artifact URL is given, so returns true without touching settings', async () => {
     const claimed = await claimArtifactForHumanEval(undefined);
 
     expect(claimed).toBe(true);
-    expect(mockGetSetting).not.toHaveBeenCalled();
-    expect(mockSetSetting).not.toHaveBeenCalled();
+    expect(mockClaimSetMember).not.toHaveBeenCalled();
   });
 
-  it('fails open (returns true) rather than blocking a real candidate when the settings lookup itself throws', async () => {
-    mockGetSetting.mockRejectedValue(new Error('DynamoDB GetItem transiently failed'));
+  it('fails open (returns true) rather than blocking a real candidate when claimSetMember itself throws', async () => {
+    mockClaimSetMember.mockRejectedValue(new Error('DynamoDB transiently failed'));
 
     const claimed = await claimArtifactForHumanEval('https://example.com/flaky-settings.png');
 
     expect(claimed).toBe(true);
+  });
+});
+
+describe('releaseArtifactClaim', () => {
+  it('releases a previously-claimed artifact URL', async () => {
+    await releaseArtifactClaim('https://example.com/release-me.png');
+
+    expect(mockReleaseSetMember).toHaveBeenCalledWith(
+      expect.stringMatching(/^human_eval_artifact_claims_\d{4}-\d{2}$/),
+      'https://example.com/release-me.png',
+    );
+  });
+
+  it('does nothing when no artifact URL is given', async () => {
+    await releaseArtifactClaim(undefined);
+
+    expect(mockReleaseSetMember).not.toHaveBeenCalled();
+  });
+
+  it('does not throw when the release itself fails (non-fatal, best-effort)', async () => {
+    mockReleaseSetMember.mockRejectedValue(new Error('DynamoDB transiently failed'));
+
+    await expect(releaseArtifactClaim('https://example.com/flaky-release.png')).resolves.toBeUndefined();
   });
 });

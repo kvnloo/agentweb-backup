@@ -15,19 +15,22 @@ jest.mock('../services/humanEvalService', () => ({
 jest.mock('../services/autoHumanEvalService', () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
   claimArtifactForHumanEval: jest.fn().mockResolvedValue(true),
+  releaseArtifactClaim: jest.fn().mockResolvedValue(undefined),
 }));
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
 import { humanEvalService } from '../services/humanEvalService';
-import { claimArtifactForHumanEval } from '../services/autoHumanEvalService';
+import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockClaimArtifact = claimArtifactForHumanEval as jest.Mock;
+const mockReleaseArtifact = releaseArtifactClaim as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockClaimArtifact.mockResolvedValue(true);
+  mockReleaseArtifact.mockResolvedValue(undefined);
   mockCreateCandidate.mockResolvedValue({
     candidateId: 'candidate-1',
     reviewType: 'creative_image',
@@ -91,5 +94,39 @@ describe('enqueue_human_eval', () => {
     expect(mockClaimArtifact).not.toHaveBeenCalled();
     expect(mockCreateCandidate).toHaveBeenCalled();
     expect(result.success).toBe(true);
+  });
+
+  // Round-3 review finding: the claim used to be won BEFORE createCandidate ran, with no
+  // try/catch at all around it here — a failure would leave the artifact permanently claimed
+  // and never sent. Proves the release actually happens and the original error still propagates.
+  it('releases the artifact claim and rethrows when createCandidate fails after the claim was won', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+    const tool = emmaToolRegistry.getTool('enqueue_human_eval')!;
+
+    await expect(tool.execute(
+      {
+        review_type: 'creative_image',
+        output_summary: 'A new ad creative.',
+        artifact_url: 'https://example.com/flaky-create.png',
+      },
+      { userId: 'user-1', sessionId: 'session-1' },
+    )).rejects.toThrow('DynamoDB PutItem transiently failed');
+
+    expect(mockReleaseArtifact).toHaveBeenCalledWith('https://example.com/flaky-create.png');
+  });
+
+  it('does not attempt to release a claim that was never won when there is no artifact_url', async () => {
+    mockCreateCandidate.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+    const tool = emmaToolRegistry.getTool('enqueue_human_eval')!;
+
+    await expect(tool.execute(
+      {
+        review_type: 'lead_enrichment',
+        output_summary: 'Enrichment run, no single artifact URL.',
+      },
+      { userId: 'user-1', sessionId: 'session-1' },
+    )).rejects.toThrow();
+
+    expect(mockReleaseArtifact).not.toHaveBeenCalled();
   });
 });
