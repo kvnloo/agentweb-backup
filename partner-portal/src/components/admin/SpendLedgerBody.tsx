@@ -143,7 +143,30 @@ export interface SpendLedgerPayload {
   pause: PauseExplanation;
   /** Absent from a backend that predates ENG-1934 — read as vendor-only. */
   llmLedger?: LlmLedgerCoverage;
+  /** Absent from a backend that predates ENG-1886. */
+  enforcement?: EnforcementState;
 }
+
+/**
+ * The enforcer's own admission decision (ENG-1886). Mirrors
+ * backend enforcementStateView.EnforcementState — a re-labelling of what
+ * checkTokenUsage returned, never a recomputation.
+ */
+export type EnforcementState =
+  | {
+      available: true;
+      month: string;
+      paused: boolean;
+      usageMode: string | null;
+      gatedBy: "cost" | "tokens" | "none";
+      used: number;
+      limit: number | null;
+      percentUsed: number;
+      resetsOn: string;
+      usagePolicyVersion: string | null;
+    }
+  | { available: false; reason: "not-current-month"; currentMonth: string }
+  | { available: false; reason: "unreadable"; message: string };
 
 // ── Pure helpers, exported for unit tests ────────────────────────────────────
 
@@ -212,6 +235,29 @@ export function partialCoverageCaption(coverage: LlmLedgerCoverage): string {
     return `Overstated: the ledger holds ${usdFromMicro(coverage.excessLlmMicroUsd!)} more LLM spend than usage records`;
   }
   return `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
+}
+
+type LiveEnforcement = Extract<EnforcementState, { available: true }>;
+type PastMonthEnforcement = Extract<EnforcementState, { reason: "not-current-month" }>;
+
+/** Type guards: this project's compiler settings do not narrow the union on `available`. */
+export function isLiveEnforcement(state: EnforcementState): state is LiveEnforcement {
+  return state.available === true;
+}
+function isPastMonthEnforcement(state: EnforcementState): state is PastMonthEnforcement {
+  return state.available === false && (state as PastMonthEnforcement).reason === "not-current-month";
+}
+
+/**
+ * The enforcer's counter in its own unit: dollars when the cost cap gates,
+ * token counts otherwise.
+ */
+export function enforcementCounter(state: LiveEnforcement): string {
+  if (state.gatedBy === "none") return "no cap configured";
+  const fmt = (n: number) =>
+    state.gatedBy === "cost" ? `$${n.toFixed(2)}` : `${Math.round(n).toLocaleString()} tokens`;
+  const limit = state.limit == null ? "no limit" : fmt(state.limit);
+  return `${fmt(state.used)} of ${limit} (${state.percentUsed.toFixed(1)}%)`;
 }
 
 /** `2026-09-14` → `Sep 14`. */
@@ -356,15 +402,57 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
         </Alert>
       )}
 
-      {/* The pause explanation stays WITHHELD (ENG-1874), even now that LLM
-          spend reaches the ledger (ENG-1934).
+      {/* Whether the account is ACTUALLY paused — ENG-1886.
 
-          `explainPause` judges a pause from this ledger's total, which now
-          counts LLM AND vendor spend. The live gate that actually pauses an
-          account still counts LLM spend only (AW-Users.tokenUsage). The two
-          bases differ in the other direction now, so a pause claim built here
-          could name a pause that never happened. Showing whether an account is
-          really paused is ENG-1886. */}
+          This is the enforcer's own decision (checkTokenUsage), re-labelled, not
+          a recomputation. The ledger's `pause` (explainPause) stays withheld: it
+          judges a pause from this ledger's total, which counts LLM and vendor
+          spend, while the live gate counts LLM spend only — a pause claim built
+          there could name a pause that never happened (ENG-1874).
+
+          The card says which counter it read, because that counter
+          (AW-Users.tokenUsage) can differ from the ledger total below
+          (ENG-1247). It reports what the enforcer decided — the customer's
+          actual experience — not what the account spent. */}
+      {data.enforcement && (
+        <Alert
+          severity={isLiveEnforcement(data.enforcement) ? (data.enforcement.paused ? "error" : "success") : "info"}
+          sx={{ mb: 2 }}
+          data-testid="spend-ledger-enforcement"
+        >
+          {isLiveEnforcement(data.enforcement) ? (
+            <>
+              <Typography variant="body2" fontWeight={600}>
+                {/* A pause always wins the heading; an uncapped account must not
+                    read as "the usage cap is admitting work" beside "no cap
+                    configured" (CodeRabbit, PR #2922). */}
+                {data.enforcement.paused
+                  ? "Paused now by the usage cap"
+                  : data.enforcement.gatedBy === "none"
+                  ? "Not paused: no usage cap is configured"
+                  : "Not paused: the usage cap is admitting work"}
+                {data.enforcement.usageMode ? ` (mode: ${data.enforcement.usageMode})` : ""}
+              </Typography>
+              <Typography variant="body2">
+                Enforcer's counter
+                {data.enforcement.gatedBy === "cost" ? " (LLM cost)" : data.enforcement.gatedBy === "tokens" ? " (token count)" : ""}:{" "}
+                {enforcementCounter(data.enforcement)} · resets {shortDay(data.enforcement.resetsOn)}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" component="div">
+                This is the counter that decides admission (AW-Users), not the ledger total below. The two can
+                differ.
+              </Typography>
+            </>
+          ) : isPastMonthEnforcement(data.enforcement) ? (
+            <Typography variant="body2">
+              Pause state is only known for the current month ({data.enforcement.currentMonth}); the enforcer's
+              counter resets monthly.
+            </Typography>
+          ) : (
+            <Typography variant="body2">Could not read whether this account is paused right now.</Typography>
+          )}
+        </Alert>
+      )}
 
       {/* Raw spend, what is committed but unresolved, and what the account may
           actually spend — three figures, never netted into one (ENG-1250 §3). */}
