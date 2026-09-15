@@ -21,6 +21,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
@@ -386,6 +387,7 @@ export async function generateCompetitorStrategyForUser(
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
+  usageContext?: LLMUsageContext,
 ): Promise<CompetitorResult> {
   if (!Array.isArray(personas) || personas.length === 0) {
     throw new Error("competitor strategy needs at least one ICP");
@@ -417,9 +419,12 @@ export async function generateCompetitorStrategyForUser(
     const userPrompt = buildPerIcpUserPrompt(brand, persona, searchCtx);
     // generateJsonRobust adds a retry-on-extract-failure layer so a single
     // prose preamble from the LLM doesn't fail the whole per-ICP loop.
+    // ENG-1858: metered to the onboarding user (was feature "unknown" / "system").
     const raw = await llm.generateJsonRobust<PerIcpLlmResponse>(
       COMPETITOR_STRATEGY_SYSTEM_PROMPT,
       userPrompt,
+      undefined,
+      usageContext ?? { feature: "onboarding_competitors" },
     );
     out.push({
       icp_id: persona.name,
@@ -484,7 +489,9 @@ export async function triggerCompetitorStrategyForUser(
 
   const brand = extractIcpBrandContext(u);
   try {
-    const result = await generateCompetitorStrategyForUser(brand, personas, deps);
+    // ENG-1858: attribute and charge the research to this user.
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_competitors" };
+    const result = await generateCompetitorStrategyForUser(brand, personas, deps, usageContext);
     const current = await userDb.getUserById(userId);
     const patch = competitorReadyPatch((current as any) || {}, result);
     if (!patch) return;

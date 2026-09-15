@@ -1121,6 +1121,91 @@ export interface SupportedModelInfo {
   costScoreSource?: string;
 }
 
+// ─── ENG-1858: billing subject for auxiliary-call metering ───────────────────
+//
+// Auxiliary LLM calls (titles, summaries, judges, diagnostics, vision checks,
+// onboarding, enrichment…) now carry the acting user's `userId`, but not the
+// ENG-1217 billing subject — resolving it at every call site would put two
+// DynamoDB reads, and a new failure mode, in front of each of those calls. It is
+// resolved here instead, at metering time, after the response already exists:
+// fire-and-forget and fail-open, so it can neither delay nor break the LLM call.
+//
+// Only the ledger's descriptive `billingUserId` attribute depends on this: the
+// per-user cap charge (`incrementUserTokenUsage`) resolves the org pool itself.
+// The agent loop already passes `billingUserId`, so its metering takes the
+// synchronous path below exactly as before.
+//
+// 60s cache: a burst of auxiliary calls for one user (title + chips + judges in
+// one turn) resolves once. Staleness is acceptable because the value only labels
+// who paid on the ledger row, org membership changes are rare, and the cap
+// charge — the enforced number — never reads this cache.
+const BILLING_SUBJECT_CACHE_TTL_MS = 60_000;
+const BILLING_SUBJECT_CACHE_MAX_ENTRIES = 1_000;
+const billingSubjectCache = new Map<string, { value: Promise<string>; expiresAt: number }>();
+
+function resolveBillingUserIdCached(userId: string): Promise<string> {
+  const now = Date.now();
+  const hit = billingSubjectCache.get(userId);
+  if (hit && hit.expiresAt > now) return hit.value;
+  if (hit) billingSubjectCache.delete(userId);
+
+  // Lazy for the same reason as the agent loop's resolveBillingSubject:
+  // tokenUsageService pulls in the db -> aws config graph.
+  const { resolveBillingUserId } = require('./tokenUsageService') as typeof import('./tokenUsageService');
+  // Several suites replace tokenUsageService with a partial mock (see
+  // resolveBillingSubject); surface that synchronously so the caller meters as before.
+  if (typeof resolveBillingUserId !== 'function') {
+    throw new Error('tokenUsageService.resolveBillingUserId is unavailable');
+  }
+  // The in-flight promise is cached, so concurrent calls share one lookup.
+  const value = Promise.resolve()
+    .then(() => resolveBillingUserId(userId))
+    .then((billingUserId) => billingUserId || userId);
+  // A failed lookup is never cached: the next call retries instead of pinning
+  // the fallback for a minute.
+  value.catch(() => {
+    if (billingSubjectCache.get(userId)?.value === value) billingSubjectCache.delete(userId);
+  });
+  if (billingSubjectCache.size >= BILLING_SUBJECT_CACHE_MAX_ENTRIES) {
+    // Map iterates in insertion order, so the first key is the oldest entry.
+    const oldest = billingSubjectCache.keys().next().value;
+    if (oldest !== undefined) billingSubjectCache.delete(oldest);
+  }
+  billingSubjectCache.set(userId, { value, expiresAt: now + BILLING_SUBJECT_CACHE_TTL_MS });
+  return value;
+}
+
+/**
+ * Meter an LLM call, filling in the billing subject when the caller supplied a
+ * user but not who pays for them. Never throws and never returns a promise the
+ * caller could await: a context that already has `billingUserId` (the agent
+ * loop) or has no user is metered synchronously and unchanged.
+ */
+function meterWithResolvedBilling(ctx: Parameters<typeof meterUserUsage>[0]): void {
+  if (!ctx.userId || ctx.billingUserId) {
+    meterUserUsage(ctx);
+    return;
+  }
+  const userId = ctx.userId;
+  let billing: Promise<string>;
+  try {
+    billing = resolveBillingUserIdCached(userId);
+  } catch (err) {
+    // The resolver could not even be loaded (e.g. a partially mocked module).
+    // Meter exactly as before this existed rather than lose the row.
+    console.error(`[AgentMode] ENG-1858: billing resolver unavailable for ${userId}; metering without billingUserId:`, err);
+    meterUserUsage(ctx);
+    return;
+  }
+  void billing
+    .catch((err) => {
+      console.error(`[AgentMode] ENG-1858: failed to resolve billing user for ${userId} (${ctx.feature}); billing to the acting user:`, err);
+      return userId;
+    })
+    .then((billingUserId) => meterUserUsage({ ...ctx, billingUserId }))
+    .catch((err) => console.error('[AgentMode] ENG-1858: metering after billing resolution failed:', err));
+}
+
 // Type for LLM call options
 /**
  * Bedrock's default prompt-cache TTL. A prefix re-read inside this window is a
@@ -2885,7 +2970,7 @@ export class AgentModeService {
           const usage: any = (res as any)?.usage;
           if (usage) {
             const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            meterUserUsage({
+            meterWithResolvedBilling({
               userId: usageContext?.userId,
               billingUserId: usageContext?.billingUserId,
               sessionId: usageContext?.sessionId,
@@ -4517,7 +4602,13 @@ export class AgentModeService {
               .filter((m: any) => typeof m.content === 'string')
               .slice(-6);
             try {
-              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              // ENG-1858: reuse the loop's resolved billing subject.
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs, {
+                userId,
+                billingUserId,
+                sessionId,
+                feature: meteringFeature('suggested_replies', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+              });
               if (suggestions && suggestions.length > 0) {
                 // Stamp into the last assistant responseMessage's metadata so it persists
                 // in DynamoDB and survives page refresh. The message index in the persisted
@@ -4817,10 +4908,21 @@ export class AgentModeService {
             finalText: content,
             ledger: finalizeLedger,
             ports: {
+              // ENG-1858: attributed to this run's user/billing subject.
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses),
+                this.judgeFinalizeClaims(text, candidateClasses, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               requestCorrection: ({ finalText, systemNote }) =>
-                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_correction', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               toolResultError,
               mediaGenProducedAsset,
               recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
@@ -9024,7 +9126,7 @@ export class AgentModeService {
    *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
    *   runs on its own dedicated vision model — independent of the chat/default model.
    */
-  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string, usageContext?: LLMUsageContext): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -9175,6 +9277,8 @@ export class AgentModeService {
       // gateway, so AgentWeb never makes a second vision completion itself.
       const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
         max_completion_tokens: 2000,
+        // ENG-1858: vision analysis is the requesting user's work, not "system".
+        usageContext: usageContext ?? { feature: 'describe_image' },
       });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
@@ -15198,7 +15302,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
       let competitorResult: any = { per_icp: [] };
       if (Array.isArray(personas) && personas.length > 0) {
-        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+        // ENG-1858: attribute and charge the regeneration to the requesting user.
+        competitorResult = await generateCompetitorStrategyForUser(
+          brand,
+          personas,
+          deps,
+          { userId, feature: 'onboarding_competitors' },
+        );
       }
 
       const icp = mapIcpResultToMarketStrategy(personas);
@@ -16415,7 +16525,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     }
   }
 
-  async generateSessionTitle(userMessage: string): Promise<string> {
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -16428,7 +16538,12 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
+      ], {
+        response_format: { type: 'json_object' },
+        taskClass: 'interactive_chat',
+        // ENG-1858: attribute to the requesting user, not "system".
+        usageContext: usageContext ?? { feature: 'session_title' },
+      });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -16469,7 +16584,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * to produce a context-aware error message instead of the generic fallback.
    * Returns null if diagnosis fails (caller should use the generic message).
    */
-  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+  async generateDiagnosticMessage(context: DiagnosisContext, usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-971: the truthfulness rules exist because this agent wrote "the system
       // timed out ... so your changes were not saved. Please try your request again"
@@ -16524,6 +16639,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 200,
         temperature: 0.3,
         taskClass: 'nonstandard_consumer',
+        // ENG-1858: the failed run's user pays for explaining its failure.
+        usageContext: usageContext ?? { feature: 'diagnostic_message' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16549,7 +16666,7 @@ TRUTHFULNESS RULES (these override tone):
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[], usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-803: the summary becomes the run's title suffix, so it must describe
       // what the run DID, not what its prose claimed. Previously this saw only the
@@ -16573,6 +16690,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 20,
         temperature: 0.3,
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_summary' },
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16609,7 +16728,7 @@ TRUTHFULNESS RULES (these override tone):
     lastRunStatus: string | null;
     lastRunSummary: string | null;
     consecutiveNoOutputRuns: number;
-  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+  }, usageContext?: LLMUsageContext): Promise<ScheduledRunPreCheckLLMResult | null> {
     try {
       const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
 
@@ -16637,6 +16756,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0,
         response_format: { type: 'json_object' },
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_precheck' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16674,7 +16795,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   async generateSuggestedReplies(
     lastAssistantMessage: string,
-    recentMessages: Array<{ role: string; content: string }>
+    recentMessages: Array<{ role: string; content: string }>,
+    usageContext?: LLMUsageContext,
   ): Promise<string[] | null> {
     const SUGGESTION_TIMEOUT_MS = 5_000;
     try {
@@ -16697,6 +16819,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0.7,
         response_format: { type: 'text' },
         taskClass: 'interactive_chat',
+        // ENG-1858: chips are part of the user's turn.
+        usageContext: usageContext ?? { feature: 'suggested_replies' },
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -16741,6 +16865,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   private async judgeFinalizeClaims(
     finalText: string,
     candidateClasses: readonly ClaimClass[],
+    usageContext?: LLMUsageContext,
   ): Promise<JudgedClaim[]> {
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
@@ -16754,7 +16879,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      max_completion_tokens: 500,
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: the guard audits the user's own reply, so the user's run pays.
+      usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16781,6 +16912,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     finalText: string,
     systemNote: string,
     llmModel: string,
+    usageContext?: LLMUsageContext,
   ): Promise<string> {
     const response = await this.callLLM(llmModel, [
       {
@@ -16790,7 +16922,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: see judgeFinalizeClaims.
+      usageContext: usageContext ?? { feature: 'finalize_guard_correction' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -28967,7 +29104,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
           try {
             const visionCheck = await withTimeoutOrReject(
-              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              // ENG-1858: the check is part of this user's image generation.
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT, { userId, sessionId, feature: 'describe_image' }),
               FABRICATED_METRICS_CHECK_TIMEOUT_MS,
               'generate_image data-fabrication check'
             );
@@ -31855,6 +31993,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           response_format: { type: 'json_object' },
           max_completion_tokens: maxTokens,
           taskClass: 'content_generation',
+          // ENG-1858: the user's template work — attribute it to them, not "system".
+          usageContext: { userId, sessionId, feature: 'html_template' },
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
