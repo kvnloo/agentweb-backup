@@ -385,12 +385,27 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
       expect(materializeRow(updateParams()).lastSessionId).toBe('sess-9');
     });
 
-    it('never writes a negative cost or a fractional quantity', async () => {
-      await recordVendorUsage({ ...v0Ctx, costUsd: -5, quantity: 2.6 });
-      const row = materializeRow(updateParams());
-      expect(row.costMicroUsd).toBe(0);
-      expect(Number.isInteger(row.quantity)).toBe(true);
-      expect(row.quantity).toBe(3);
+    // SUPERSEDES "never writes a negative cost or a fractional quantity". The
+    // integer half assumed every unit was a whole count (renders, queries).
+    // ENG-1878 made ElevenLabs fractional by design (per 1k characters), and
+    // rounding wrote 0 units on the aggregate for every clip under 500
+    // characters, while the spend event for the same call kept 0.024 —
+    // found in production verification, 2026-09-15.
+    it('never writes a negative cost', async () => {
+      await recordVendorUsage({ ...v0Ctx, costUsd: -5 });
+      expect(materializeRow(updateParams()).costMicroUsd).toBe(0);
+    });
+
+    it('keeps a fractional quantity exactly, as the spend event does (ENG-1878)', async () => {
+      await recordVendorUsage({ ...v0Ctx, quantity: 0.024 });
+      expect(materializeRow(updateParams()).quantity).toBe(0.024);
+    });
+
+    it('never writes a negative or non-finite quantity', async () => {
+      await recordVendorUsage({ ...v0Ctx, quantity: -2 });
+      await recordVendorUsage({ ...v0Ctx, quantity: Number.NaN });
+      expect(materializeRow(updateParams(0)).quantity).toBe(0);
+      expect(materializeRow(updateParams(1)).quantity).toBe(0);
     });
   });
 
