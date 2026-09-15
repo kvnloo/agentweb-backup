@@ -99,12 +99,15 @@ export function buildScheduleName(client: ClientTarget): string {
 }
 
 function nextFirstRunTime(): string {
-  // Next occurrence of 09:00 UTC, matching the existing metrics-snapshot cron's own
-  // 09:00 UTC timing (ENG-916), so this fires after that day's fresh snapshot data
-  // is already written rather than racing it. Subsequent runs recur every 7 days
-  // from this anchor (frequency: 'weekly').
+  // The metrics-snapshot cron (ENG-916, server.ts's MetaMetricsSnapshotCron) STARTS
+  // at 09:00 UTC — that's when it begins its sequential per-account Graph API pull,
+  // not when it finishes. Firing this report at the same instant risks reading
+  // mid-refresh data (some accounts already updated, others still on yesterday's
+  // rows) — a real race a reviewer caught, not a hypothetical one. 10:00 UTC gives
+  // a full hour of buffer; cheap to afford on a weekly cadence. Subsequent runs
+  // recur every 7 days from this anchor (frequency: 'weekly').
   const now = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 9, 0, 0));
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 10, 0, 0));
   if (next <= now) {
     next.setUTCDate(next.getUTCDate() + 1);
   }
@@ -131,6 +134,18 @@ export function buildSchedule(client: ClientTarget, ownerId: string = HARSHA_OWN
 }
 
 export async function main() {
+  // db.ts's TABLE_PREFIX treats anything other than the exact string
+  // "development" as production (unset, a typo, "staging" all fall through to
+  // the unprefixed live table) — a real reviewer catch, not hypothetical. This
+  // script deliberately writes real persistent rows, so guard against a mistyped
+  // or unset NODE_ENV silently landing on prod.
+  if (process.env.NODE_ENV !== 'development' && process.env.NODE_ENV !== 'production') {
+    throw new Error(
+      `NODE_ENV must be exactly 'development' or 'production' to run this script (got: ${JSON.stringify(process.env.NODE_ENV)}). ` +
+      `Any other value falls through to the unprefixed production table in db.ts's TABLE_PREFIX logic.`
+    );
+  }
+
   const existing = await scheduleDb.getSchedulesByUserId(HARSHA_OWNER_USER_ID);
   const existingNames = new Set((existing || []).map((s: any) => s.scheduleName));
 
