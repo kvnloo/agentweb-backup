@@ -10756,11 +10756,26 @@ export const orgDb = {
     return org;
   },
 
-  async getOrgById(orgId: string): Promise<Organization | null> {
-    const params = {
+  // `fields` trims the read to just the listed top-level attributes (via
+  // ProjectionExpression) for call sites that only need a few fields off an
+  // otherwise large org record (brandGuidelines, competitors, etc). Omit it
+  // to fetch the full item as before — every existing caller is unaffected.
+  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
     };
+    if (fields && fields.length > 0) {
+      const names: Record<string, string> = {};
+      params.ProjectionExpression = fields
+        .map((f, i) => {
+          const alias = `#p${i}`;
+          names[alias] = f;
+          return alias;
+        })
+        .join(', ');
+      params.ExpressionAttributeNames = names;
+    }
     const result = await dynamodb.get(params).promise();
     return (result.Item as Organization) || null;
   },
