@@ -34,7 +34,16 @@ jest.mock('../../services/usageAnalyticsService', () => ({
 // payload -- was asserted nowhere. Only the true boundaries are mocked below;
 // spendReadModel and spendProjection run for real, so these exercise the
 // composition rather than a restatement of it.
-jest.mock('../../services/spendEventDb', () => ({ listSpendEvents: jest.fn() }));
+jest.mock('../../services/spendEventDb', () => {
+  const listSpendEvents = jest.fn();
+  return {
+    listSpendEvents,
+    // ENG-1841: the route reads through the bounded variant. Delegating to the
+    // same mock keeps every existing test's event fixture in force; a test that
+    // needs the ceiling overrides this.
+    listSpendEventsBounded: jest.fn(async (...args: unknown[]) => ({ events: await listSpendEvents(...args.slice(0, 3)), exceeded: false })),
+  };
+});
 const mockAggregateRows = jest.fn();
 const mockQueryByBillingScan = jest.fn();
 jest.mock('../../services/usageRecordDb', () => ({
@@ -49,14 +58,14 @@ jest.mock('../../services/db', () => ({ userDb: { getUserById: jest.fn() }, orgD
 jest.mock('../../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
 jest.mock('../../services/llmUsageCreditService', () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
 
-import adminUsageRoutes, { AGGREGATE_READ_CONCURRENCY } from '../adminUsage';
+import adminUsageRoutes, { AGGREGATE_READ_CONCURRENCY, SPEND_BREAKDOWN_MAX_EVENTS, SPEND_BREAKDOWN_ROWS_PER_CUT } from '../adminUsage';
 import { authenticateToken } from '../../middleware/auth';
 import {
   getUserUsageByModelDay,
   getUsageComparison,
   getUserXBreakdown,
 } from '../../services/usageAnalyticsService';
-import { listSpendEvents } from '../../services/spendEventDb';
+import { listSpendEvents, listSpendEventsBounded } from '../../services/spendEventDb';
 import { checkTokenUsage, resolveBillingUserId } from '../../services/tokenUsageService';
 import { orgDb, userDb } from '../../services/db';
 import { getSubscriptionTypeConfig } from '../../services/subscriptionService';
@@ -67,6 +76,7 @@ const mockComparison = getUsageComparison as jest.Mock;
 const mockXBreakdown = getUserXBreakdown as jest.Mock;
 const mockAuth = authenticateToken as unknown as jest.Mock;
 const mockListSpendEvents = listSpendEvents as jest.Mock;
+const mockListSpendEventsBounded = listSpendEventsBounded as jest.Mock;
 const mockResolveBilling = resolveBillingUserId as jest.Mock;
 const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
@@ -343,6 +353,42 @@ describe('admin usage routes', () => {
 
         expect(res.status).toBe(200);
         expect(res.body.llmLedger).toMatchObject({ month: 'partial', missingLlmMicroUsd: null });
+      });
+    });
+
+    // ENG-1841: bounded read and bounded rows, exact totals.
+    describe('bounds (ENG-1841)', () => {
+      beforeEach(() => mockResolveBilling.mockResolvedValue('owner-1'));
+
+      it('reads with a ceiling, and answers 422 rather than a truncated total when it is exceeded', async () => {
+        mockListSpendEventsBounded.mockResolvedValueOnce({ events: [spendEvent()], exceeded: true });
+
+        const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-09' });
+
+        expect(mockListSpendEventsBounded).toHaveBeenCalledWith('owner-1', '2026-09-01', '2026-09-31', SPEND_BREAKDOWN_MAX_EVENTS);
+        expect(res.status).toBe(422);
+        expect(res.body).toMatchObject({ code: 'spend_breakdown_too_large', eventLimit: SPEND_BREAKDOWN_MAX_EVENTS });
+        expect(res.body).not.toHaveProperty('settledMicroUsd');
+      });
+
+      it('bounds each detail list but keeps every total over the whole month', async () => {
+        const sessions = SPEND_BREAKDOWN_ROWS_PER_CUT + 7;
+        mockListSpendEvents.mockResolvedValue(
+          Array.from({ length: sessions }, (_, i) =>
+            spendEvent({ eventId: `e${i}`, costMicroUsd: 1_000, references: { sessionId: `s${i}` } }),
+          ),
+        );
+
+        const res = await request(app).get('/api/admin/users/owner-1/spend/breakdown').query({ month: '2026-09' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.settledMicroUsd).toBe(sessions * 1_000);
+        expect(res.body.eventCount).toBe(sessions);
+        expect(res.body.bySession).toHaveLength(SPEND_BREAKDOWN_ROWS_PER_CUT);
+        expect(res.body.omitted.bySession).toEqual({ rows: 7, eventCount: 7, settledMicroUsd: 7_000, reservedMicroUsd: 0 });
+        // Listed + omitted reproduces the total exactly.
+        const listed = res.body.bySession.reduce((t: number, r: any) => t + r.settledMicroUsd, 0);
+        expect(listed + res.body.omitted.bySession.settledMicroUsd).toBe(res.body.settledMicroUsd);
       });
     });
 
