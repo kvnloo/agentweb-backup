@@ -223,3 +223,25 @@ describe('score input validation', () => {
     expect(res.status).toBe(409);
   });
 });
+
+describe('ENG-502 captured client scope', () => {
+  it('filters another client even when both clients own the same platform account', async () => {
+    (mockDb.getRecommendationsForAccount as jest.Mock).mockResolvedValue([
+      { recommendationId: 'mine', context: { clientUserId: 'caller-1' } },
+      { recommendationId: 'theirs', context: { clientUserId: 'other-client' } },
+      { recommendationId: 'legacy' },
+    ]);
+    const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+    expect(res.status).toBe(200);
+    expect(res.body.recommendations.map((r: any) => r.recommendationId)).toEqual(['mine', 'legacy']);
+  });
+  it('refuses an unsupported manual score for a shadow proposal even by an admin', async () => {
+    CALLER_IS_ADMIN = true;
+    (mockDb.getRecommendation as jest.Mock).mockResolvedValue({ status: 'pending', context: { mode: 'shadow' } });
+    const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/rec_1/score`)
+      .send({ adopted: true, actualValue: 5, baselineValue: 4 });
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe('attributed_evaluation_required');
+    expect(mockDb.putScoredRecommendation).not.toHaveBeenCalled();
+  });
+});

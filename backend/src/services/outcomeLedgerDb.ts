@@ -25,6 +25,7 @@ import { paginatedQuery } from '../utils/dynamoPagination';
 import {
   buildOutcomeEntityKey,
   parseOutcomeEntityKey,
+  validateRecommendationContext,
   type Recommendation,
   type OutcomePlatform,
   type PredictedDirection,
@@ -40,6 +41,19 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 const PAGE_SIZE = 200;
 
+/** Capture callers can bound their latency without changing the legacy API's retry policy.
+ * Abort the SDK request, rather than racing a timer and leaving orphaned network work. */
+async function ledgerRequest<T>(request: AWS.Request<T, AWS.AWSError>, timeoutMs?: number): Promise<T> {
+  const timer = timeoutMs === undefined ? undefined : setTimeout(() => request.abort(), timeoutMs);
+  try { return await request.promise(); }
+  finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+function finiteMetric(value: unknown): boolean {
+  // Preserve the legacy numeric-string normalization, but never coerce booleans/arrays.
+  return (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value));
+}
+
 /** Raised when a stored item cannot be trusted. */
 export class OutcomeLedgerCorruptionError extends Error {
   constructor(message: string) {
@@ -48,14 +62,34 @@ export class OutcomeLedgerCorruptionError extends Error {
   }
 }
 
+export class RecommendationExistsError extends Error {}
+
 const PREDICTED_DIRECTIONS: ReadonlyArray<PredictedDirection> = ['increase', 'decrease'];
 const ACTUAL_DIRECTIONS: ReadonlyArray<ActualDirection> = ['increase', 'decrease', 'flat'];
 const VERDICTS: ReadonlyArray<OutcomeVerdict> = ['correct', 'incorrect', 'unscoreable'];
 
 /** Exported for direct unit testing — pure, touches no AWS SDK state. */
 export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.AttributeMap): Recommendation | null {
+  if (!item || typeof item !== 'object') throw new OutcomeLedgerCorruptionError('Invalid ledger item');
+  if (item.context !== undefined) validateRecommendationContext(item.context);
   const parsed = parseOutcomeEntityKey(String(item.entityKey));
   if (!parsed) return null;
+  for (const key of ['recommendationId', 'hypothesis', 'predictedMetric', 'createdBy', 'evaluationDate', 'createdAt']) {
+    if (typeof item[key] !== 'string' || !item[key].trim()) {
+      throw new OutcomeLedgerCorruptionError(`Invalid ledger ${key}`);
+    }
+  }
+  for (const key of ['evaluationDate', 'createdAt', 'scoredAt']) {
+    if (item[key] != null && (typeof item[key] !== 'string' || !Number.isFinite(Date.parse(item[key])))) {
+      throw new OutcomeLedgerCorruptionError(`Invalid ledger ${key}`);
+    }
+  }
+  if (item.adopted != null && typeof item.adopted !== 'boolean') {
+    throw new OutcomeLedgerCorruptionError('Invalid ledger adopted');
+  }
+  if (item.verdictReason != null && typeof item.verdictReason !== 'string') {
+    throw new OutcomeLedgerCorruptionError('Invalid ledger verdictReason');
+  }
 
   if (!PREDICTED_DIRECTIONS.includes(item.predictedDirection)) {
     throw new OutcomeLedgerCorruptionError(
@@ -64,8 +98,7 @@ export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.Attribute
     );
   }
   if (
-    item.predictedMagnitudePct == null ||
-    !Number.isFinite(Number(item.predictedMagnitudePct))
+    !finiteMetric(item.predictedMagnitudePct) || Number(item.predictedMagnitudePct) < 0
   ) {
     throw new OutcomeLedgerCorruptionError(
       `${OUTCOME_LEDGER_TABLE} item '${item.entityKey}'/'${item.recommendationId}' has a non-finite ` +
@@ -93,7 +126,7 @@ export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.Attribute
   // Same finiteness guard as predictedMagnitudePct above: an Infinity written by a caller that
   // skipped the route's own guard (or by any other future writer) would otherwise read back
   // silently rather than being caught here, the one place every reader passes through.
-  if (item.actualMagnitudePct != null && !Number.isFinite(Number(item.actualMagnitudePct))) {
+  if (item.actualMagnitudePct != null && !finiteMetric(item.actualMagnitudePct)) {
     throw new OutcomeLedgerCorruptionError(
       `${OUTCOME_LEDGER_TABLE} item '${item.entityKey}'/'${item.recommendationId}' has a non-finite ` +
         `actualMagnitudePct (${String(item.actualMagnitudePct)})`,
@@ -101,6 +134,7 @@ export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.Attribute
   }
 
   return {
+    ...(item.context === undefined ? {} : { context: item.context }),
     accountId: parsed.accountId,
     platform: parsed.platform,
     recommendationId: String(item.recommendationId),
@@ -125,13 +159,14 @@ export async function getRecommendation(
   platform: OutcomePlatform,
   accountId: string,
   recommendationId: string,
+  timeoutMs?: number,
 ): Promise<Recommendation | null> {
-  const result = await dynamodb
+  const result = await ledgerRequest(dynamodb
     .get({
       TableName: OUTCOME_LEDGER_TABLE,
       Key: { entityKey: buildOutcomeEntityKey(platform, accountId), recommendationId },
-    })
-    .promise();
+      ConsistentRead: true,
+    }), timeoutMs);
 
   return result.Item ? itemToRecommendation(result.Item) : null;
 }
@@ -162,15 +197,17 @@ export async function getRecommendationsForAccount(
  * no legitimate concurrent-writer race to compare-and-swap against here the way
  * `adsThresholdsDb.putThreshold` has to.
  */
-export async function putNewRecommendation(recommendation: Recommendation): Promise<void> {
+export async function putNewRecommendation(recommendation: Recommendation, timeoutMs?: number): Promise<void> {
+  if (recommendation.context !== undefined) validateRecommendationContext(recommendation.context);
   if (recommendation.status !== 'pending') {
     throw new Error('outcomeLedgerDb: putNewRecommendation requires a pending recommendation');
   }
   try {
-    await dynamodb
+    await ledgerRequest(dynamodb
       .put({
         TableName: OUTCOME_LEDGER_TABLE,
         Item: {
+          ...(recommendation.context === undefined ? {} : { context: recommendation.context }),
           entityKey: buildOutcomeEntityKey(recommendation.platform, recommendation.accountId),
           recommendationId: recommendation.recommendationId,
           hypothesis: recommendation.hypothesis,
@@ -183,11 +220,10 @@ export async function putNewRecommendation(recommendation: Recommendation): Prom
           status: 'pending',
         },
         ConditionExpression: 'attribute_not_exists(entityKey)',
-      })
-      .promise();
+      }), timeoutMs);
   } catch (error: any) {
     if (error?.code === 'ConditionalCheckFailedException') {
-      throw new Error(
+      throw new RecommendationExistsError(
         `outcomeLedgerDb: recommendation '${recommendation.recommendationId}' already exists`,
       );
     }
@@ -201,10 +237,12 @@ export async function putNewRecommendation(recommendation: Recommendation): Prom
  * verdict that may already have been read into an accuracy report.
  */
 export async function putScoredRecommendation(recommendation: Recommendation): Promise<void> {
+  if (recommendation.context !== undefined) validateRecommendationContext(recommendation.context);
   if (recommendation.status !== 'scored') {
     throw new Error('outcomeLedgerDb: putScoredRecommendation requires a scored recommendation');
   }
   const item: Record<string, unknown> = {
+    ...(recommendation.context === undefined ? {} : { context: recommendation.context }),
     entityKey: buildOutcomeEntityKey(recommendation.platform, recommendation.accountId),
     recommendationId: recommendation.recommendationId,
     hypothesis: recommendation.hypothesis,

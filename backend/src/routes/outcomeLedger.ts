@@ -68,7 +68,10 @@ router.get('/:platform/:accountId', authenticateToken, async (req: any, res) => 
     const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
     if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
 
-    const recommendations = await getRecommendationsForAccount(owned.platform, owned.accountId);
+    const recommendations = (await getRecommendationsForAccount(owned.platform, owned.accountId))
+      // Shared platform accounts do not grant access to another client's captured rationale.
+      // Legacy rows retain the existing account-owner visibility contract.
+      .filter(r => !r.context || r.context.clientUserId === req.user.userId);
     res.json({ platform: owned.platform, accountId: owned.accountId, recommendations });
   } catch (error: any) {
     console.error('[ENG-1550] read outcome ledger failed:', error);
@@ -131,6 +134,12 @@ router.post('/:platform/:accountId/:recommendationId/score', authenticateToken, 
     if (!existing) return res.status(404).json({ error: 'Recommendation not found' });
     if (existing.status !== 'pending') {
       return res.status(409).json({ error: 'Recommendation has already been scored', reason: 'already_scored' });
+    }
+    // The manual scorer has no attribution/evidence contract and cannot establish ad-level
+    // outcomes from ENG-916's campaign metrics. Keep shadow captures pending until a supported
+    // evaluator exists; do not let a manual numeric pair fabricate a causal verdict.
+    if (existing.context) {
+      return res.status(409).json({ error: 'Shadow recommendation requires attributed evaluation', reason: 'attributed_evaluation_required' });
     }
 
     const { adopted, actualValue, baselineValue } = req.body ?? {};
