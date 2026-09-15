@@ -4982,7 +4982,24 @@ export async function generateChatResponse(
     const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
     const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
     const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
-    const agentModeService = new AgentModeService();
+    // ENG-1852 follow-up: use the module's own exported singleton, not a fresh
+    // instance. A `new AgentModeService()` here ran a full initialize()
+    // (loadFoundationTools + registerTools over ~264 tools + initializeMcp +
+    // ensureBuiltInSkills + downstream singleton bootstrap) on EVERY message this
+    // gate is open for, purely to throw the instance away at end of turn. It was
+    // also the last remaining second construction site in backend/src, which is
+    // the exact shape that made ENG-1852 (two live instances, one with an empty
+    // registry, either able to answer a call) possible in the worker.
+    //
+    // Resolved lazily rather than via the existing top-level `AgentModeService`
+    // value import so the singleton is not constructed as a side effect of this
+    // module loading. Note the class import above is still needed and stays — the
+    // static `AgentModeService.FOUNDATION_TOOLS` read further down uses it.
+    //
+    // initialize() below is now idempotent (see agentModeService.ts), so this is a
+    // cheap no-op once boot init has completed, and correctly awaits boot init if
+    // it is still in flight — server.ts starts it non-blocking.
+    const { agentModeService } = await import('./agentModeService');
     let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
     // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
     // correctly doesn't include this skill" apart from "tool resolution failed".

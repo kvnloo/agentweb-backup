@@ -1550,7 +1550,40 @@ export class AgentModeService {
     }));
   }
 
-  public async initialize() {
+  // ENG-1852 follow-up: initialize() is idempotent and concurrency-safe.
+  //
+  // Two callers need that, and they combine badly without it. server.ts kicks
+  // this off at boot deliberately NON-blocking ("Initialize Agent Mode tools in
+  // background - don't block server startup ... prevents health check timeouts
+  // during deployment"), so a request can land while boot init is still in
+  // flight. chatbotService's widget path then calls it again per message on the
+  // same shared module singleton. Unguarded, the per-message call either re-runs
+  // a full loadFoundationTools()/registerTools()/ensureBuiltInSkills() pass over
+  // shared state on every message, or races boot init and reads a half-populated
+  // registry — which is the same empty-registry symptom ENG-1852 turned out to be.
+  //
+  // The flag is per-INSTANCE, not module-level, so tests that construct their own
+  // AgentModeService in beforeEach still initialize normally.
+  //
+  // On failure the in-flight promise is cleared and `initialized` stays false, so
+  // a later caller retries rather than being permanently wedged by one bad boot.
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+
+  public async initialize(): Promise<void> {
+    if (this.initialized) return;
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = this.runInitialize();
+    try {
+      await this.initializationPromise;
+      this.initialized = true;
+    } finally {
+      this.initializationPromise = null;
+    }
+  }
+
+  private async runInitialize(): Promise<void> {
     await this.loadFoundationTools();
     await this.registerTools();
     if (process.env.IS_MCP_SERVER !== 'true') {
