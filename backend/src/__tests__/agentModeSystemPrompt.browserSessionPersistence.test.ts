@@ -97,4 +97,18 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Be conservative before calling it');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('worse outcome than an occasional missed report');
   });
+
+  // ENG-1953 follow-up: a manually-imported Browser Sessions cookie only exists
+  // because credentialed auto-login already failed for that domain. Without this
+  // guidance, Emma reported a dead session and then offered "save your Login
+  // Credentials" as an equally-weighted fix — a path that was already known not
+  // to work for that domain, wasting a turn before the user got useful direction.
+  it('does not offer saving Login Credentials as an equally-weighted fix after reporting a manually-imported session failed', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      "Don't offer \"save your Login Credentials\" as the recommended fix in the same breath as this report"
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'A domain only ever ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
+    );
+  });
 });
