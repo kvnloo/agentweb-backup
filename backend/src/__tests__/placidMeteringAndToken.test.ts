@@ -31,6 +31,7 @@ jest.mock('aws-sdk', () => {
 });
 
 import { getPlacidPrivateToken, __resetPlacidTokenCache, PLACID_TOKEN_TTL_MS } from '../utils/secretsManager';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('getPlacidPrivateToken (ENG-698)', () => {
   const originalEnv = process.env;
@@ -255,11 +256,12 @@ describe('Placid render metering (ENG-698)', () => {
         operation: 'image_render',
         unit: 'render',
         quantity: 1,
-        costSource: 'allocated',
+        // ENG-1929: priced by the recorder from this key, not at the call site.
+        rateKey: 'image_render',
       }),
     );
     // $0.095 per image render, from the ENG-703 card.
-    expect(mockRecordVendorUsage.mock.calls[0][0].costUsd).toBeCloseTo(0.095, 6);
+    expect(getAllocatedRate('placid', 'image_render')).toBeCloseTo(0.095, 6);
   });
 
   // CodeRabbit, PR #2901. The access check lets an admin render a task that a

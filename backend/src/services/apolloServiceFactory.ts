@@ -28,7 +28,6 @@ import {
 import { crmDb } from './db';
 import { getApolloApiKey, getApolloWebhookSecret } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 // ─── Vendor $ ledger mirroring (ENG-696) ───────────────────────────────────
 //
@@ -48,8 +47,8 @@ function recordApolloLedger(rateKey: string, unit: string, userId: string | unde
     feature: 'crm_enrichment',
     unit,
     quantity: 1,
-    costSource: 'allocated',
-    costUsd: computeAllocatedCost('apollo', rateKey, 1),
+    // ENG-1929: priced inside the recorder — never thrown into the Apollo call.
+    rateKey,
   });
 }
 

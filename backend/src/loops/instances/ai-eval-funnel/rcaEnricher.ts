@@ -231,7 +231,9 @@ async function callRcaModel(systemText: string, userText: string): Promise<strin
     temperature: 0.2,
     max_completion_tokens: 2048,
     timeoutMs: RCA_TIMEOUT_MS,
-    usageContext: { feature: 'other' },
+    // ENG-1858: platform-funded eval RCA — deliberately no userId; named so it
+    // is not mistaken for unattributed customer spend.
+    usageContext: { feature: 'platform:eval_rca' },
     taskClass: 'nonstandard_consumer',
   });
   const text = response.choices?.[0]?.message?.content || '';

@@ -192,7 +192,7 @@ describe('enrichWithRCA', () => {
     expect(lastCallOptions).toEqual(expect.objectContaining({
       max_completion_tokens: 2048,
       timeoutMs: RCA_TIMEOUT_MS,
-      usageContext: { feature: 'other' },
+      usageContext: { feature: 'platform:eval_rca' }, // ENG-1858: platform-funded, no userId
       taskClass: 'nonstandard_consumer',
     }));
   });
