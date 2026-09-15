@@ -51,6 +51,9 @@ import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
 import { computeMetaWriteManifestDigest } from '../services/metaLaunchGate';
 import { getJwtSecret } from '../config/jwt';
+import { advanceIndependentWorkflow } from '../services/agentMode/workflowRunner';
+import type { WorkflowRunState } from '../services/agentMode/core/workflow';
+import { applyDeckAnswers } from '../services/agentMode/core/approvalDeck';
 
 const ACCOUNT = '2041725529929988'; // Vincent Hu's TriCityAI ad account id
 const CAMPAIGN = '120249715770410073';
@@ -204,7 +207,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     expect(result.summary!.items.every((i) => i.status === 'verified')).toBe(true);
   });
 
-  it('a kill-and-restart mid-batch resumes at the next unattempted step and never re-dispatches an already-verified one (gap 3b)', async () => {
+  it('a fully-processed deck refuses a second submission attempt outright (the awaiting-deck guard, NOT the crash-resume path below — see that test for the actual resume guarantee)', async () => {
     let createCalls = 0;
     jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
       createCalls++;
@@ -212,21 +215,102 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
       return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
     }) as any);
 
-    // First "process": submit and let it run to completion normally (no real
-    // crash simulation needed at this layer — the regression this guards is
-    // "does a second pass over the SAME session re-dispatch a verified step,"
-    // which a persisted checkpoint must prevent regardless of why the second
-    // pass happens).
+    // Submit and let it run to completion normally.
     const first = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
     expect(first.outcome).toBe('submitted');
     expect(createCalls).toBe(3);
 
-    // "Restart": the deck is already answered (status stays 'answered'), so a
-    // second submission attempt must be refused outright — the awaiting-deck
-    // guard, not the workflow engine, is what makes this un-replayable.
+    // A second submission attempt against the SAME (already-answered) deck must
+    // be refused — but this is applyDeckAnswers' own status check
+    // ('answered' !== 'awaiting'), not the workflow engine's resume logic. It
+    // proves resubmission is blocked; it says nothing about whether the engine
+    // can resume a run that was genuinely interrupted mid-batch, which is what
+    // gap 3b actually promises — see the next test for that.
     const second = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
     expect(second.outcome).toBe('invalid');
     expect(createCalls).toBe(3); // no new dispatch attempted
+  });
+
+  it('gap 3b, for real: advanceIndependentWorkflow resumes a genuinely interrupted run from a seeded PARTIAL checkpoint, never re-dispatching the step that was already verified before the crash', async () => {
+    // The prior "kill-and-restart" test in this file (renamed above) never
+    // simulated a crash — it only proved a SECOND submitApprovalDeckAnswers
+    // call is refused once the deck is fully answered. That test can pass
+    // even if the engine's actual resume logic were broken, since it never
+    // exercises a partial-checkpoint state at all. This test constructs the
+    // real condition instead: a run that died after step 1 of 3 verified,
+    // then calls advanceIndependentWorkflow directly — the actual resume
+    // primitive a restarted process would use — against that partial state.
+    const createCalls: string[] = [];
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      const params: any = _args[5];
+      createCalls.push(params?.name);
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    // Build the SAME step definitions submitApprovalDeckAnswers would build
+    // for this deck's 3 approved items.
+    const approved = ZIPS.map((zip, i) => ({
+      item: { itemId: `write-${i + 1}`, metaWriteDispatch: writeDispatchFor(zip) },
+    }));
+    const steps = (service as any).buildMetaWriteWorkflowSteps(SESSION_ID, 'user-1', approved);
+    const definition = { workflowId: 'approval-deck-deck-vincent-1', steps };
+
+    // The deck itself was fully answered BEFORE the crash (dispatch only ever
+    // starts once the whole deck is answered — see submitApprovalDeckAnswers)
+    // — bypassing that call here means seeding the ANSWERED deck state
+    // directly too, or every step's independent re-claim (gap 4's per-step
+    // digest re-verification) correctly refuses, since findApprovalDeckAnswerForDigest
+    // requires status === 'answered'.
+    sessionState.pendingApprovalDeck = applyDeckAnswers(
+      answeredDeckFixture(),
+      approveAll(),
+      'user',
+      '2026-09-14T23:59:00.000Z',
+    );
+
+    // Seed the session with a run that already has write-1 checkpointed
+    // 'verified' from BEFORE the simulated crash — bypassing
+    // submitApprovalDeckAnswers'/startWorkflow's normal from-scratch drive
+    // entirely, the same way a fresh process reading the persisted row after
+    // a restart would find it.
+    const priorVerifiedAt = '2026-09-15T00:00:00.000Z';
+    const seededRun: WorkflowRunState = {
+      runId: 'run-1',
+      workflowId: definition.workflowId,
+      status: 'in_progress',
+      checkpoints: [
+        { stepId: 'write-1', status: 'verified', entityIds: {}, verifiedFields: { appliedObjectId: 'id-AS_94041-prior' }, verifiedAt: priorVerifiedAt },
+      ],
+      resolvedParameters: {},
+      version: 1,
+      createdAt: priorVerifiedAt,
+      updatedAt: priorVerifiedAt,
+    };
+    sessionState.workflowRun = seededRun;
+    // write-1's digest was already consumed by the pre-crash attempt — realistic
+    // prior state, though findNextIndependentStep already skips write-1 purely
+    // because it has a checkpoint, independent of this.
+    sessionState.consumedMetaWriteManifestDigests = { [digestFor('94041')]: priorVerifiedAt };
+
+    let outcome = await advanceIndependentWorkflow(SESSION_ID, definition);
+    // step_verified/step_failed both mean "keep going" for this driver — see
+    // advanceIndependentWorkflow's own header.
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed') {
+      outcome = await advanceIndependentWorkflow(SESSION_ID, definition);
+    }
+
+    expect(outcome.kind).toBe('completed');
+    // write-1 was NEVER re-dispatched on resume — only the two genuinely
+    // unattempted steps ran.
+    expect(createCalls.sort()).toEqual(['AS_94043', 'AS_94536']);
+    expect(createCalls).not.toContain('AS_94041');
+    // The final persisted state still carries write-1's ORIGINAL pre-crash
+    // checkpoint, untouched, alongside the two new ones — not a fresh
+    // re-verification that would prove it re-ran.
+    expect(sessionState.workflowRun.checkpoints).toHaveLength(3);
+    const write1Checkpoint = sessionState.workflowRun.checkpoints.find((c: any) => c.stepId === 'write-1');
+    expect(write1Checkpoint.verifiedAt).toBe(priorVerifiedAt);
+    expect(write1Checkpoint.verifiedFields.appliedObjectId).toBe('id-AS_94041-prior');
   });
 
   it('reject-with-correction: approve 2 of 3, reject the third with a correction — only the 2 approved ever get a workflow step, the correction is captured, never auto-applied', async () => {
