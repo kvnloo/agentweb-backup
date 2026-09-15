@@ -5,7 +5,7 @@
  * metering step. See the section comment below for why the billing subject is
  * resolved here, at metering time, rather than at each call site.
  */
-import { meterUserUsage } from '../usageRecorderService';
+import { meterUserUsage, meterUserUsageAsync } from '../usageRecorderService';
 import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // ─── ENG-1858: billing subject for auxiliary-call metering ───────────────────
@@ -89,12 +89,16 @@ export function meterWithResolvedBilling(ctx: Parameters<typeof meterUserUsage>[
       console.error(`[AgentMode] ENG-1858: failed to resolve billing user for ${userId} (${ctx.feature}); billing to the acting user:`, err);
       return userId;
     })
-    .then((billingUserId) => meterUserUsage({ ...ctx, billingUserId }))
+    // meterUserUsageAsync, not meterUserUsage: the tracked promise must settle
+    // only when the usage row AND the cap charge are written, or the drain below
+    // would wait for nothing (CodeRabbit, PR #2926).
+    .then((billingUserId) => meterUserUsageAsync({ ...ctx, billingUserId }))
     .catch((err) => console.error('[AgentMode] ENG-1858: metering after billing resolution failed:', err));
-  // Tracked so a graceful shutdown waits for it (CodeRabbit, PR #2926): the
-  // response has already gone out, and without this a deploy that stops the
+  // Tracked so a graceful shutdown waits for the writes (CodeRabbit, PR #2926):
+  // the response has already gone out, and without this a deploy that stops the
   // process between the response and the resolved write would lose the usage
-  // row. server.ts's runDrain already awaits cronJobRegistry.drain(). Still
-  // never awaited here — the LLM call path does not wait on metering.
+  // row and the cap charge. server.ts's runDrain already awaits
+  // cronJobRegistry.drain(). Still never awaited here — the LLM call path does
+  // not wait on metering.
   void cronJobRegistry.track('deferredLlmMetering', deferred);
 }
