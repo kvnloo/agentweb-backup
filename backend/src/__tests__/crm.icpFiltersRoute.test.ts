@@ -559,6 +559,79 @@ describe('GET /api/crm/icp/filters', () => {
     expect(body.persona.name).toBe('Mid-market RevOps Leaders');
   });
 
+  // ENG-1955 follow-up: a competitors- or businessOverview-only save (from
+  // the Market Strategy page, or Emma's update_market_strategy tool, which
+  // is explicitly told to send only the fields that changed) bumps
+  // marketStrategy's whole-object `updatedAt` without touching `icp` at
+  // all. Since nearly every onboarded user already has a non-empty
+  // marketStrategy.icp (auto-mirrored at onboarding), using `updatedAt`
+  // alone as the "was ICP corrected" signal would silently and permanently
+  // switch such a user off their cached, richer icpResult-derived filters
+  // the next time they edit an unrelated field. `icpUpdatedAt` is bumped
+  // only by a write that actually includes `icp` — this must win over the
+  // noisier `updatedAt` whenever both are present.
+  it('an unrelated marketStrategy save (competitors-only) does NOT trigger the staleness override', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      icpCompletedAt: '2026-09-12T00:25:01.764Z',
+      marketStrategy: {
+        icp: marketIcp(),
+        // Bumped by an unrelated competitors save AFTER icpCompletedAt...
+        updatedAt: '2026-09-13T00:00:00.000Z',
+        // ...but icp itself hasn't been touched since well before onboarding
+        // even completed — icpUpdatedAt must be what the check trusts.
+        icpUpdatedAt: '2026-09-12T00:00:00.000Z',
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    // Must still be the icpResult persona, not the marketStrategy one.
+    expect(body.persona.name).toBe('Mid-market RevOps Leaders');
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    expect((userDb.updateUser as jest.Mock).mock.calls[0][1]).toHaveProperty('icpResult');
+  });
+
+  it('a genuine ICP edit (icpUpdatedAt newer than icpCompletedAt) DOES trigger the override, even if updatedAt is older', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      icpCompletedAt: '2026-09-12T00:25:01.764Z',
+      marketStrategy: {
+        icp: marketIcp(),
+        // Contrived but proves icpUpdatedAt, not updatedAt, drives the
+        // decision: updatedAt here predates icpCompletedAt...
+        updatedAt: '2026-09-12T00:00:00.000Z',
+        // ...but the ICP itself really was edited afterward.
+        icpUpdatedAt: '2026-09-12T00:36:22.746Z',
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+  });
+
+  it('falls back to updatedAt when icpUpdatedAt is absent (records saved before this field existed)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      icpCompletedAt: '2026-09-12T00:25:01.764Z',
+      marketStrategy: {
+        icp: marketIcp(),
+        updatedAt: '2026-09-12T00:36:22.746Z', // no icpUpdatedAt field at all
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+  });
+
   // ENG-1955 follow-up: when the org has no marketStrategy of its own,
   // resolveOrgProfileField falls back to the org OWNER's user record. That
   // record's updatedAt belongs to the owner's timeline, not the calling

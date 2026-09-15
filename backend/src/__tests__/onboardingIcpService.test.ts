@@ -846,6 +846,10 @@ describe("onboardingIcpService", () => {
       const firstWrite = userDb.updateUser.mock.calls[0][1];
       const secondWrite = userDb.updateUser.mock.calls[1][1];
       expect(secondWrite.marketStrategy.updatedAt).toBe(firstWrite.icpCompletedAt);
+      // icpUpdatedAt (ENG-1955 follow-up) must be backdated the same way —
+      // this write genuinely sets `icp`, but it's still a system mirror, not
+      // wall-clock "now", for the same reason updatedAt is backdated above.
+      expect(secondWrite.marketStrategy.icpUpdatedAt).toBe(firstWrite.icpCompletedAt);
     });
 
     it("seeds marketStrategy when User has no prior marketStrategy", async () => {
