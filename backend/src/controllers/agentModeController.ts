@@ -18,6 +18,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
+import type { PendingApprovalDeck } from '../services/agentMode/core/approvalDeck';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
 import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
@@ -7978,6 +7979,11 @@ export async function generateSessionResponse(
   // when reusingDanglingDirective skipped the save). Lets the caller echo a stable id
   // for the user's own optimistic bubble without waiting for a session refetch.
   userMessageIndex?: number;
+  // ENG-1635/1644: the deck built THIS turn, when the tool loop halted on one or
+  // more Meta writes — threaded through from the inner generateAgentResponse call
+  // so the controller can lift it onto the live HTTP response (see that field's
+  // own comment there for why this is needed at all).
+  pendingApprovalDeck?: PendingApprovalDeck;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -8827,6 +8833,11 @@ export const agentModeController = {
     // `turnStartMs` is block-scoped to the try, so it cannot serve the error path.
     let turnStartMsForDiagnosis: number | null = null;
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
+    // ENG-1635/1644: the deck this turn just answered, if any — surfaced on the
+    // live response alongside any brand-new deck the generate loop below might
+    // build, so the optimistic ApprovalDeckCard flips to its locked/answered
+    // view immediately instead of only after a page reload.
+    let answeredApprovalDeck: PendingApprovalDeck | undefined;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, clientId } = req.body;
@@ -8999,13 +9010,14 @@ export const agentModeController = {
         if (!session.pendingApprovalDeck) {
           return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
         }
-        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.answers, 'user');
+        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
         if (result.outcome === 'invalid') {
           return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
         }
         if (result.outcome === 'conflict') {
           return res.status(409).json({ error: 'This approval deck was already answered by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
         }
+        answeredApprovalDeck = result.answeredDeck;
         const rejections = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
@@ -9515,6 +9527,18 @@ export const agentModeController = {
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
+        // ENG-1635/1644: without this, the deck built this turn only reaches the
+        // frontend via a full session refetch — the optimistic assistant bubble has
+        // no way to know a deck exists and falls back to plain text with no buttons
+        // until the user reloads the page (found live-driving on env1).
+        ...(response.pendingApprovalDeck ? { pendingApprovalDeck: response.pendingApprovalDeck } : {}),
+        // Deliberately a SEPARATE field from pendingApprovalDeck above, not merged:
+        // this one only syncs currentSession's copy of a deck THIS turn just
+        // answered so its card flips to the locked view without a reload — it must
+        // never tag the new reply message's own metadata.pendingApprovalDeckId (the
+        // frontend only does that off pendingApprovalDeck above), or the same deck
+        // would match two messages at once and render the card twice.
+        ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,

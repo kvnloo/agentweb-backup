@@ -1302,7 +1302,7 @@ emmaToolRegistry.register({
   name: "launch_targeted_audience_campaign",
   definition: {
     name: "launch_targeted_audience_campaign",
-    description: "Launch a Meta campaign targeted at a Custom Audience sourced from a HubSpot list or a CSV, optionally via a Lookalike built from that seed. Creates or reuses (by name) the Custom Audience, optionally creates a Lookalike from it, and attaches it to a NEW ad set under an existing campaign (kept separate from any broad/control campaign). Two-phase like call_meta_marketing_api writes: call once without confirm to get a preview (awaitingUserConfirmation), show it to the user, then call again with confirm=true to execute. Returns a completion ledger (source, audience, lookalike, campaign/ad set, any failures). Distinct from launch_retargeting_campaign, which requires exclude_audience_id.",
+    description: "Launch a Meta campaign targeted at a Custom Audience sourced from a HubSpot list or a CSV, optionally via a Lookalike built from that seed. Creates or reuses (by name) the Custom Audience, optionally creates a Lookalike from it, and attaches it to a NEW ad set under an existing campaign (kept separate from any broad/control campaign). Two-phase, gated by its own preview token (distinct from call_meta_marketing_api's approval-deck flow): call once without confirm to get a preview (awaitingUserConfirmation) plus a preview_token, show it to the user, then call again with confirm=true and that same preview_token to execute. Returns a completion ledger (source, audience, lookalike, campaign/ad set, any failures). Distinct from launch_retargeting_campaign, which requires exclude_audience_id.",
     inputSchema: {
       type: "object",
       properties: {

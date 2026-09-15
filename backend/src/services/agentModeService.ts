@@ -3197,7 +3197,7 @@ export class AgentModeService {
     // Workplan progression turns must end in persisted structured state rather
     // than a provider-dependent prose question buried at the end of a response.
     requireWorkPlanDisposition: boolean = false,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3734,6 +3734,13 @@ export class AgentModeService {
       let responseMessage: any = null;
       let workPlanDispositionRetries = 0;
       let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
+      // ENG-1635/1644: mirrors workPlanTurnDisposition's hoist-and-return-at-the-end
+      // pattern above. Without this, the deck built at the loop seam below only ever
+      // reaches the frontend via a full session refetch (a page reload) — the
+      // optimistic assistant bubble this turn's POST /generate response drives has no
+      // way to know a deck exists, so it falls back to the plain-text prompt with no
+      // buttons until the user reloads.
+      let pendingApprovalDeck: PendingApprovalDeck | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -4749,6 +4756,7 @@ export class AgentModeService {
             failIfAwaitingExists: true,
           });
           if (posted) {
+            pendingApprovalDeck = approvalDeck;
             const deckPrompt = renderApprovalDeckPrompt(approvalDeck);
             content = deckPrompt;
             (messages as any[]).push({
@@ -5182,7 +5190,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
-        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {})
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
+        ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
     } catch (error: any) {
       // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
@@ -21454,16 +21463,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   async submitApprovalDeckAnswers(
     sessionId: string,
+    expectedDeckId: string,
     inboundAnswers: InboundDeckAnswer[],
     answeredBy: ApprovalDeckAnsweredBy,
   ): Promise<
     | { outcome: 'invalid'; reason: string }
     | { outcome: 'conflict' }
-    | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null }
+    | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
     const session = await chatbotDb.getChatSession(sessionId);
     const deck = session?.pendingApprovalDeck;
     if (!deck) return { outcome: 'invalid', reason: 'No pending approval deck in this session.' };
+    // Stale-card guard, same shape as askUserQuestion.ts's resolveInboundAnswer
+    // check on questionId. itemIds are only deck-scoped by convention
+    // (write-1, write-2, ...) — two different decks with the same item count
+    // collide on itemId, so without this a stale/replayed submission (double-
+    // click before the button disables, browser back+resubmit, a client retry
+    // after the first attempt already succeeded) would silently apply to
+    // whatever deck happens to be pending now instead of the one the user
+    // actually looked at.
+    if (expectedDeckId && expectedDeckId !== deck.deckId) {
+      return {
+        outcome: 'invalid',
+        reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
+      };
+    }
 
     let answered: PendingApprovalDeck;
     try {
@@ -21482,7 +21506,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Every item was rejected — nothing to execute, no workflow needed. `summary:
       // null` here is distinct from an 'unapplied' summary: nothing was ATTEMPTED
       // at all, versus every item being attempted and every one failing.
-      return { outcome: 'submitted', run: null, summary: null };
+      return { outcome: 'submitted', run: null, summary: null, answeredDeck: answered };
     }
 
     const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
@@ -21501,7 +21525,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run') {
       return { outcome: 'conflict' };
     }
-    return { outcome: 'submitted', run: outcome.run, summary: this.summarizeApprovalDeckRun(outcome.run) };
+    return { outcome: 'submitted', run: outcome.run, summary: this.summarizeApprovalDeckRun(outcome.run), answeredDeck: answered };
   }
 
   /**
