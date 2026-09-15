@@ -7958,6 +7958,50 @@ emmaToolRegistry.register({
     const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
     const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
+    // ENG-1945 second follow-up: the `claimed_unavailable_tools` gate above only engages
+    // when the model actually populates that field — a report that describes the SAME
+    // claim only in free-text `description`/`title` bypasses it entirely, which is exactly
+    // how session ff31ccb7 got filed (it named playwright_browser_navigate/snapshot/
+    // evaluate/click by their real tool identifiers, in prose, with zero calls behind any
+    // of them). Close that path by detecting the claim FROM the wording itself: scan for
+    // any of AgentWeb's real, known tool-name identifiers appearing alongside
+    // unavailability language, and treat a match as an IMPLICIT claimed_unavailable_tools
+    // entry, subject to the exact same verification below. Tool names are unambiguous
+    // snake_case identifiers a customer would never type — a real tool name appearing in
+    // this report's own wording is, in practice, always the AGENT's own technical
+    // description of a call it made or is describing, never coincidental prose.
+    const UNAVAILABLE_WORDING = /\b(unavailable|not available|no longer available|not working|isn'?t working|doesn'?t work|didn'?t work|does not work|did not work|not callable|not accessible|not exposed|did not appear|does not appear|remain(?:s|ed)? unavailable|stayed unavailable|is broken|are broken|was broken|were broken|can'?t use|cannot use|unable to use)\b/i;
+    // Lazy + memoized: the published-skills scan is a real DynamoDB read (TTL-cached
+    // service-side, but still I/O), so only pay for it if some issue in this batch
+    // actually uses unavailability wording — the common case (most bug/feature reports)
+    // never needs it. Best-effort: a lookup failure degrades to "detect nothing" rather
+    // than blocking any report — the explicit claimed_unavailable_tools field above
+    // remains the one guaranteed-enforced path regardless of this catalog's health.
+    let knownToolNamesPatternPromise: Promise<RegExp | null> | null = null;
+    const getKnownToolNamesPattern = (): Promise<RegExp | null> => {
+      if (!knownToolNamesPatternPromise) {
+        knownToolNamesPatternPromise = (async () => {
+          try {
+            const knownToolNames = new Set<string>(emmaToolRegistry.getToolNames());
+            const { skillService } = await import('../services/skillService');
+            const publishedSkills = await skillService.getPublishedSkills();
+            for (const skill of publishedSkills) {
+              for (const name of skill.toolNames || []) knownToolNames.add(name);
+            }
+            if (knownToolNames.size === 0) return null;
+            const escaped = Array.from(knownToolNames)
+              .sort((a, b) => b.length - a.length) // longest-first so a prefix name can't shadow a longer match
+              .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            return new RegExp(`\\b(${escaped.join('|')})\\b`, 'g');
+          } catch (e) {
+            console.warn('[report_product_issues] known-tool-name catalog lookup failed (prose-claim detection skipped, report still filed):', e instanceof Error ? e.message : e);
+            return null;
+          }
+        })();
+      }
+      return knownToolNamesPatternPromise;
+    };
+
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
       const issue = typeof rawIssue === 'string' ? JSON.parse(rawIssue) : rawIssue;
@@ -7998,11 +8042,38 @@ emmaToolRegistry.register({
         const claimedUnavailableTools = Array.isArray(issue.claimed_unavailable_tools)
           ? issue.claimed_unavailable_tools.filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
           : [];
-        if (claimedUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+        // Prose-implied claims (see the lazy catalog loader above): real tool identifiers
+        // named in THIS issue's own title/description alongside unavailability wording,
+        // even though claimed_unavailable_tools was left empty. The catalog fetch only
+        // happens (once, memoized for the batch) when this cheap regex test matches —
+        // an ordinary bug/feature report never pays for the DynamoDB read.
+        const impliedTextToScan = `${typeof issue.title === 'string' ? issue.title : ''} ${typeof issue.description === 'string' ? issue.description : ''}`;
+        const impliedUnavailableTools: string[] = [];
+        if (UNAVAILABLE_WORDING.test(impliedTextToScan)) {
+          const knownToolNamesPattern = await getKnownToolNamesPattern();
+          if (knownToolNamesPattern) {
+            knownToolNamesPattern.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            const seen = new Set<string>();
+            while ((match = knownToolNamesPattern.exec(impliedTextToScan))) {
+              if (!seen.has(match[1])) {
+                seen.add(match[1]);
+                impliedUnavailableTools.push(match[1]);
+              }
+            }
+          }
+        }
+        // The combined set this issue is asserting is broken/unavailable, whether stated
+        // explicitly via the field or implied by its own wording — both verified identically.
+        const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
+        if (effectiveUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+          const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
           throw new Error(
-            `Cannot file "${issue.title}": claimed_unavailable_tools (${claimedUnavailableTools.join(', ')}) requires run_id ` +
-            `so the claim can be checked against that run's actual tool-call telemetry. Include the run_id from THIS ` +
-            `session, or drop claimed_unavailable_tools if you are not asserting a specific tool is broken/unavailable.`
+            `Cannot file "${issue.title}": ${viaWording
+              ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
+              : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
+            } — that requires run_id so the claim can be checked against that run's actual tool-call telemetry. Include ` +
+            `the run_id from THIS session, or reword the report so it does not assert a specific tool is broken/unavailable.`
           );
         }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
@@ -8020,11 +8091,11 @@ emmaToolRegistry.register({
             const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
             const run = runs[0];
             if (!run) {
-              if (claimedUnavailableTools.length > 0) {
+              if (effectiveUnavailableTools.length > 0) {
                 throw new Error(
                   `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
-                  `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')}) cannot be verified. Use the exact ` +
-                  `run_id from THIS session's runtime telemetry.`
+                  `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
+                  `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
                 );
               }
             } else {
@@ -8034,20 +8105,22 @@ emmaToolRegistry.register({
               // claim) in this exact run. Checked against EVT_TOOL_INVOKED telemetry, which
               // is recorded independently of anything the model writes — the claim cannot
               // talk its way past this the way it could past a prompt-only instruction.
-              if (claimedUnavailableTools.length > 0) {
+              // Covers BOTH claimed_unavailable_tools and a real tool name the report's own
+              // wording named alongside unavailability language (effectiveUnavailableTools).
+              if (effectiveUnavailableTools.length > 0) {
                 const invokedToolNames = new Set(
                   (run.outcomes || [])
                     .filter((o: any) => o.eventType === 'agent_tool_invoked' && typeof o.toolName === 'string')
                     .map((o: any) => o.toolName as string)
                 );
-                const neverAttempted = claimedUnavailableTools.filter((name: string) => !invokedToolNames.has(name));
+                const neverAttempted = effectiveUnavailableTools.filter((name: string) => !invokedToolNames.has(name));
                 if (neverAttempted.length > 0) {
                   throw new Error(
-                    `Cannot file "${issue.title}": claimed_unavailable_tools names ${neverAttempted.join(', ')}, but run ` +
-                    `${run.runId} never actually called ${neverAttempted.length === 1 ? 'it' : 'them'}. A tool can only ` +
-                    `be reported broken/unavailable after you have actually called it in THIS session and observed the ` +
-                    `failure yourself — call it first, or remove it from claimed_unavailable_tools if you were not ` +
-                    `actually asserting it is broken.`
+                    `Cannot file "${issue.title}": this report asserts ${neverAttempted.join(', ')} ${neverAttempted.length === 1 ? 'is' : 'are'} ` +
+                    `broken/unavailable (via claimed_unavailable_tools and/or its own wording), but run ${run.runId} never ` +
+                    `actually called ${neverAttempted.length === 1 ? 'it' : 'them'}. A tool can only be reported broken/unavailable ` +
+                    `after you have actually called it in THIS session and observed the failure yourself — call it first, or ` +
+                    `reword the report so it does not assert that tool is broken.`
                   );
                 }
               }
@@ -8101,9 +8174,9 @@ emmaToolRegistry.register({
               }
             }
           } catch (e) {
-            // `claimed_unavailable_tools` turns this from best-effort into a hard
-            // requirement — an unverifiable claim must not silently file (see above).
-            if (claimedUnavailableTools.length > 0) throw e;
+            // An explicit OR wording-implied claim turns this from best-effort into a
+            // hard requirement — an unverifiable claim must not silently file (see above).
+            if (effectiveUnavailableTools.length > 0) throw e;
             console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
           }
         }
