@@ -93,15 +93,20 @@ export function buildEnigmaHttpClient(apiKey: string): EnigmaHttpClient {
       }
 
       const body: any = await res.json();
-      const brands: any[] = Array.isArray(body?.data?.search) ? body.data.search : [];
+      const search = body?.data?.search;
       // Values that came back were billed, even alongside GraphQL errors.
-      recordEnigmaLedger(brands, userId);
+      if (Array.isArray(search)) recordEnigmaLedger(search, userId);
 
       if (Array.isArray(body?.errors) && body.errors.length > 0) {
         const message = body.errors.map((e: any) => e?.message).filter(Boolean).join('; ') || 'unknown GraphQL error';
         throw new EnigmaApiError(`Enigma GraphQL error: ${message}`, res.status);
       }
-      return brands;
+      // A missing or non-array `search` is schema drift, not "no brand": throw so
+      // it is never cached as a 30-day not_found.
+      if (!Array.isArray(search)) {
+        throw new EnigmaApiError('Enigma response missing data.search array', res.status);
+      }
+      return search;
     },
   };
 }

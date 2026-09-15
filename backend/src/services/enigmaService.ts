@@ -234,7 +234,14 @@ function brandWebsiteRoots(brand: any): string[] {
   return roots;
 }
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}/;
+/** Exact YYYY-MM-DD that is a real calendar date (2026-02-30 and 2026-99-99 are not). */
+function isCalendarDate(value: unknown): value is string {
+  const m = typeof value === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(value) : null;
+  if (!m) return false;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
 
 function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
   // Platform-attributed rows (platformBrandId set) are a slice of the brand's
@@ -250,9 +257,7 @@ function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
 
   const value = amount.projectedQuantity;
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
-  if (!ISO_DATE.test(String(amount.periodStartDate ?? '')) || !ISO_DATE.test(String(amount.periodEndDate ?? ''))) {
-    return null;
-  }
+  if (!isCalendarDate(amount.periodStartDate) || !isCalendarDate(amount.periodEndDate)) return null;
 
   const yoyNode = nodes.find((n: any) =>
     n.quantityType === 'card_revenue_yoy_growth' && n.periodEndDate === amount.periodEndDate);
@@ -261,8 +266,8 @@ function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
   return {
     amountUsd: value,
     yoyGrowth: typeof yoy === 'number' && Number.isFinite(yoy) && yoy >= 0 ? yoy : null,
-    periodStartDate: String(amount.periodStartDate).slice(0, 10),
-    periodEndDate: String(amount.periodEndDate).slice(0, 10),
+    periodStartDate: amount.periodStartDate,
+    periodEndDate: amount.periodEndDate,
   };
 }
 
@@ -301,7 +306,13 @@ function evaluateSearch(brands: any[], host: string): Omit<EnigmaBrandLookupResu
   const brand = (Array.isArray(brands) ? brands : []).find((b) => typeof b?.id === 'string' && b.id);
   if (!brand) return { status: 'not_found', cardRevenue12m: null };
 
-  const matchedRoot = brandWebsiteRoots(brand).find((root) => isOnHost(host, root));
+  // Same site if either host sits on the other: a lead on shop.acme.com matches
+  // a brand at acme.com, and a lead on acme.com matches a brand whose only
+  // website Enigma reports as shop.acme.com (no domain/TLD split available).
+  // The TLD still has to agree, so acme.io never matches acme.com.
+  // (Not for a site-builder apex: squarespace.com must not match acme.squarespace.com.)
+  const matchedRoot = brandWebsiteRoots(brand).find((root) =>
+    isOnHost(host, root) || (isOnHost(root, host) && !SITE_BUILDER_HOSTS.includes(host)));
   if (!matchedRoot) return { status: 'not_found', cardRevenue12m: null };
 
   const name = brand.names?.edges?.[0]?.node?.name;
@@ -314,8 +325,15 @@ function evaluateSearch(brands: any[], host: string): Omit<EnigmaBrandLookupResu
   };
 }
 
-export function enigmaBrandCacheKey(host: string): { canonicalKey: string; canonicalId: string; sk: string } {
-  const canonicalKey = `enigma:brand:${host}`;
+/**
+ * Cache rows are scoped to the requesting user. Enigma data is licensed to
+ * AgentWeb for internal use, and whether a value bought for one customer may be
+ * reused for another is unconfirmed (ENG-1930) — so one customer's lookup is
+ * never served to another, and each user is billed for their own. Calls with no
+ * user share a platform scope.
+ */
+export function enigmaBrandCacheKey(host: string, userId?: string): { canonicalKey: string; canonicalId: string; sk: string } {
+  const canonicalKey = `enigma:brand:${userId ? `user:${userId}` : 'platform'}:${host}`;
   return { canonicalKey, canonicalId: toCanonicalId(canonicalKey), sk: ENIGMA_SK };
 }
 
@@ -341,7 +359,7 @@ export class EnigmaService {
       return { status: 'skipped', cardRevenue12m: null, fromCache: false, checkedAt };
     }
 
-    const key = enigmaBrandCacheKey(host);
+    const key = enigmaBrandCacheKey(host, opts.userId);
     if (!opts.forceRefresh) {
       const cached = await this.readCache(key.canonicalId, key.sk);
       if (cached && cached.expiresAt > nowSec) {

@@ -52,11 +52,11 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 
 ```ts
 {
-  canonicalId: sha256("enigma:brand:<host>"),
+  canonicalId: sha256("enigma:brand:<user:<userId> | platform>:<host>"),   // per-user scope: no cross-customer reuse (ENG-1930)
   fieldGroup: "enigma:brand_card_revenue#v1",
   cacheType: "enigma",
-  canonicalKey: "enigma:brand:<host>",
-  entityKey: "enigma:brand:<host>",
+  canonicalKey: "enigma:brand:user:<userId>:<host>",
+  entityKey: "enigma:brand:user:<userId>:<host>",
   entityType: "enigma",
   status: "hit" | "not_found",
   rawData: {
@@ -137,6 +137,9 @@ No dedicated tool. Emma reaches Enigma only through `enrich_leads_preview` / `en
 | --- | --- | --- | --- |
 | Social or site-builder URL as input | Enigma matches the platform company (e.g. a facebook.com URL → Meta) | `skips social profile / site-builder subdomain` | Don't pass LinkedIn/Facebook/myshopify hosts |
 | TLD mismatch (`acme.io` vs `acme.com`) | Wrong brand's revenue attached | `treats a brand on a different TLD as not found` | Don't compare on name alone |
+| Malformed HTTP 200 (no `data.search` array) | Schema drift cached as a 30-day not_found | Factory throws `EnigmaApiError`; `treats a malformed HTTP 200 … as a failure` | Don't default a missing `search` to `[]` |
+| Invalid period dates (`2026-02-30`, `2026-99-99`) | Plausible but wrong as-of date stored | Exact `YYYY-MM-DD` + calendar round-trip, else no value | Don't prefix-match or truncate dates |
+| One customer's lookup served to another | Unlicensed reuse; free data for the second customer | Cache key scoped per user | Don't drop the user scope until ENG-1930 confirms reuse |
 | Null card revenue for a small merchant | Value missing | `never fabricates a revenue value` | Don't back-fill from 1m/3m, Apollo or an LLM |
 | Out of credits | Every lookup throws 402 | `does not cache a vendor error` + `[enigma] OUT OF CREDITS` log | Don't turn a 402 into `not_found` |
 | B2B / SaaS company | Null or tiny card revenue | `classifyCardAdoption` skips low-adoption industries (keyword rules; unknown industry still calls) | Don't present card revenue as company size |
