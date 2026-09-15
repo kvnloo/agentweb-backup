@@ -785,7 +785,24 @@ export class HumanEvalService {
     // propagate out of createCandidate — which would skip the caller's own post-persist steps
     // (e.g. autoHumanEvalService's dedupe-key write) and risk a duplicate candidate on retry.
     try {
+      // Round-3 review finding: an explicit 'false' here is meant to be a genuine emergency
+      // stop — checked FIRST and unconditionally, so it isn't silently bypassed by any entry
+      // on the exception list. The exception list's job is to keep specific accounts posting
+      // through the ORDINARY default state, not to survive someone deliberately hitting the
+      // kill switch. Checking exceptions first (as an earlier version of this did) would mean
+      // "a single explicit false is the full rollback lever" stops being true the moment the
+      // exception list is non-empty — currently harmless since it ships empty, but a real
+      // footgun waiting for whenever that changes.
+      const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
+      if (globalToggle?.settingValue === 'false') return false;
+
       if (userId) {
+        // Now that the default is ON (below), this list's practical role has narrowed: it no
+        // longer decides WHETHER a candidate posts (that already happens for everyone unless
+        // the kill switch above fired) — it only selects the concise message FORMAT for
+        // specific accounts, distinct from the ordinary verbose one. Kept for when a real
+        // named-packet flow needs it (see the PR's own note on Haven/Every not currently
+        // routing through this pipeline at all).
         const exceptions = await this.settings.getSetting('human_eval_slack_posting_exception_user_ids');
         const exceptionIds = (exceptions?.settingValue || '')
           .split(',')
@@ -793,15 +810,13 @@ export class HumanEvalService {
           .filter(Boolean);
         if (exceptionIds.includes(userId)) return 'exception';
       }
-      // Default ON: absent, or anything other than an explicit 'false', means posting is
-      // enabled. Flipped from the original default-off (ENG-1854's initial ask) once the two
-      // real noise sources were fixed independently of this toggle — the lead-enrichment
-      // anomaly gate is unconditional, so it stays quiet regardless of this setting; this now
-      // only governs creative_image/landing_page (which always needed a human's eyes) and any
-      // genuine lead-enrichment failures. A single explicit 'false' here is still the full
-      // rollback lever if the noise returns for a reason this session didn't anticipate.
-      const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
-      return globalToggle?.settingValue === 'false' ? false : 'global';
+      // Default ON: absent, or anything other than an explicit 'false' (already handled
+      // above), means posting is enabled. Flipped from the original default-off (ENG-1854's
+      // initial ask) once the two real noise sources were fixed independently of this toggle —
+      // the lead-enrichment anomaly gate is unconditional, so it stays quiet regardless of this
+      // setting; this now only governs creative_image/landing_page (which always needed a
+      // human's eyes) and any genuine lead-enrichment failures.
+      return 'global';
     } catch (err: any) {
       console.warn('[human-eval] failed to resolve Slack posting toggle, defaulting to not posting:', err?.message || err);
       return false;
