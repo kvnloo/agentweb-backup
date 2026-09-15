@@ -356,6 +356,7 @@ async function mirrorCompetitorsToMarketStrategy(
       }>;
       createdAt?: string;
       updatedAt?: string;
+      icpUpdatedAt?: string;
     };
     const merged = {
       businessOverview: existing.businessOverview ?? "",
@@ -363,6 +364,16 @@ async function mirrorCompetitorsToMarketStrategy(
       icp: existing.icp ?? [],
       createdAt: existing.createdAt ?? now,
       updatedAt: now,
+      // This write never touches `icp` — carry icpUpdatedAt through
+      // unchanged (like createdAt above), never bump or drop it. userDb's
+      // updateUser fully replaces the marketStrategy map attribute, so
+      // omitting this field here would silently erase a real ICP edit's
+      // timestamp the next time onboarding's competitor step runs — which
+      // fires for essentially every onboarded user right after ICP
+      // generation — and fall back to this write's wall-clock `updatedAt`,
+      // reintroducing the exact staleness bug icpUpdatedAt exists to
+      // prevent (ENG-1955).
+      icpUpdatedAt: existing.icpUpdatedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
   } catch (err) {
