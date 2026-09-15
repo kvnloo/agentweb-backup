@@ -4719,9 +4719,12 @@ export class AgentModeService {
         // Human-in-the-loop confirmation gate: if a tool in this iteration requested
         // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
         // autonomous loop and hand control back to the user. The model CANNOT self-approve
-        // — only a new user message restarts the turn, after which it re-calls the tool
-        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
-        // class of mistake: the user sees the resolved target and must approve it.
+        // — a Meta write specifically is only ever executed once the user answers an
+        // approval deck directly in the UI (ENG-1635/1644); the model re-calling the tool
+        // with confirm=true does nothing on its own (see buildMetaWriteApprovalDeck /
+        // callMetaMarketingApi's gate). This is the safety net for the wrong-campaign /
+        // wrong-asset class of mistake: the user sees the resolved target and must
+        // approve it.
         // Post-refactor (core/toolDispatch), this iteration's results live on the
         // toolCalls ledger (each entry carries .result = the minimal result, which
         // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
