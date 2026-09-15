@@ -107,7 +107,9 @@ or if no email found:
       { role: 'user', content: prompt },
     ], {
       response_format: { type: 'json_object' },
-      usageContext: { feature: 'other' },
+      // ENG-1858: platform-funded admin-channel parsing — deliberately no userId
+      // (the target user is not known until this call returns).
+      usageContext: { feature: 'platform:slack_admin_intent' },
       taskClass: 'mcp_api',
     });
 
