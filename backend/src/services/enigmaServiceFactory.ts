@@ -26,7 +26,7 @@ import {
 } from './enigmaService';
 import { getEnigmaApiKey } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
-import { computeAllocatedCost, getRecordingUnit } from '../utils/vendorRateCard';
+import { getRecordingUnit } from '../utils/vendorRateCard';
 import { buildSearchBrandBody } from './enigmaGraphql';
 
 const ENIGMA_GRAPHQL_URL = 'https://api.enigma.com/graphql';
@@ -52,8 +52,9 @@ function recordEnigmaLedger(brands: any[] | null | undefined, userId: string | u
       feature: 'crm_enrichment',
       unit: getRecordingUnit('enigma', rateKey) ?? 'fill',
       quantity,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('enigma', rateKey, quantity),
+      // ENG-1929: priced inside the recorder, so a rate-card gap can never throw
+      // into the Enigma request.
+      rateKey,
     });
   }
 }
