@@ -490,6 +490,49 @@ describe('GET /api/crm/icp/filters', () => {
     expect(body.persona.name).toBe('Mid-market RevOps Leaders');
   });
 
+  // ENG-1955: a user manually corrects their ICPs on the Market Strategy
+  // page AFTER onboarding generated (possibly wrong) icpResult personas.
+  // marketStrategy.icp is never mirrored back onto icpResult, so without a
+  // staleness check the route would silently keep serving the outdated
+  // onboarding personas forever. When marketStrategy was saved more
+  // recently than icpResult was last generated, marketStrategy.icp must win.
+  it('marketStrategy.icp wins over icpResult when it was saved after icpResult was last generated', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      icpCompletedAt: '2026-09-12T00:25:01.764Z',
+      marketStrategy: {
+        icp: marketIcp(),
+        updatedAt: '2026-09-12T00:36:22.746Z', // saved AFTER icpCompletedAt
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+    // Corrected personas came from marketStrategy — must not be cached
+    // back onto the stale user.icpResult snapshot.
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('icpResult still wins when marketStrategy.icp predates icpResult generation', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      icpResult: [persona()],
+      icpCompletedAt: '2026-09-12T00:36:22.746Z',
+      marketStrategy: {
+        icp: marketIcp(),
+        updatedAt: '2026-09-12T00:25:01.764Z', // saved BEFORE icpCompletedAt
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('Mid-market RevOps Leaders');
+  });
+
   it('404 when neither icpResult nor any marketStrategy.icp exists', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
     (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org1' }); // org has no marketStrategy
