@@ -16,7 +16,7 @@ import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
-import { enqueueAutoHumanEval, claimArtifactForHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   buildPendingUserQuestion,
@@ -80,23 +80,35 @@ emmaToolRegistry.register({
     // auto-trigger could already have posted this exact artifact (e.g. right after
     // generate_image completes) before Emma also decides to send it herself. Claim the
     // artifact URL first so whichever path gets here first wins, not both.
-    if (args.artifact_url && !(await claimArtifactForHumanEval(args.artifact_url))) {
-      return {
-        success: true,
-        message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
-      };
+    let claimedArtifact = false;
+    if (args.artifact_url) {
+      if (!(await claimArtifactForHumanEval(args.artifact_url))) {
+        return {
+          success: true,
+          message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
+        };
+      }
+      claimedArtifact = true;
     }
 
-    const candidate = await humanEvalService.createCandidate({
-      reviewType: args.review_type as HumanEvalReviewType,
-      outputSummary: args.output_summary,
-      artifactUrl: args.artifact_url,
-      chatUrl: args.chat_url,
-      originalRequest: args.original_request,
-      agentRunId: args.agent_run_id,
-      userId,
-      sessionId,
-    });
+    let candidate;
+    try {
+      candidate = await humanEvalService.createCandidate({
+        reviewType: args.review_type as HumanEvalReviewType,
+        outputSummary: args.output_summary,
+        artifactUrl: args.artifact_url,
+        chatUrl: args.chat_url,
+        originalRequest: args.original_request,
+        agentRunId: args.agent_run_id,
+        userId,
+        sessionId,
+      });
+    } catch (err) {
+      // Release the claim on failure — otherwise a transient createCandidate error
+      // permanently blackholes this artifact from ever being sent for review again.
+      if (claimedArtifact) await releaseArtifactClaim(args.artifact_url);
+      throw err;
+    }
 
     return {
       success: true,
