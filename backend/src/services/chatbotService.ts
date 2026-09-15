@@ -33,6 +33,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 // Load environment variables from .env file
@@ -278,6 +279,13 @@ export interface ChatSession {
   // carries typed values rather than an option selection; the write guard
   // still makes the two mutually exclusive while either is awaiting.
   pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-1635/1644: the compound multi-item approval deck Emma is currently
+  // blocked on (if any) — see agentMode/core/approvalDeck.ts's file header.
+  // A THIRD live human-interrupt slot alongside pendingUserQuestion and
+  // pendingWorkPlanInput; updateSessionApprovalDeck's guard and the other
+  // two updateSession*'s guards cross-check all three so at most one of them
+  // is ever 'awaiting' at once (see the 3-way guard note on each).
+  pendingApprovalDeck?: PendingApprovalDeck;
   // ENG-1642: canonical digests (computeMetaWriteManifestDigest) of manifest-
   // approved Meta writes already executed confirmation-free in this session.
   // A digest present here has been consumed — the SAME write may not execute
@@ -3233,9 +3241,18 @@ export class ChatbotDB {
         };
 
     if (guard) {
+      // ENG-1635/1644, gap 6: this guard used to check only its own field —
+      // verified directly that left a real one-directional hole (a question
+      // could open while a work-plan-input was already awaiting, even though
+      // the reverse was already refused). Cross-checking all three
+      // human-interrupt slots here, not just this one, is what actually
+      // gives "exactly one blocking human-interrupt at a time" rather than
+      // just asserting it.
       params.ConditionExpression =
-        "attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus";
-      params.ExpressionAttributeNames = { "#pStatus": "status" };
+        "(attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus) AND " +
+        "(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#wStatus <> :awaitingStatus) AND " +
+        "(attribute_not_exists(pendingApprovalDeck) OR pendingApprovalDeck.#dStatus <> :awaitingStatus)";
+      params.ExpressionAttributeNames = { "#pStatus": "status", "#wStatus": "status", "#dStatus": "status" };
       params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
     } else if (requireStillAwaiting) {
       params.ConditionExpression =
@@ -3456,8 +3473,10 @@ export class ChatbotDB {
         };
 
     if (guard) {
-      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
-      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      // ENG-1635/1644, gap 6: extended to cross-check pendingApprovalDeck too,
+      // same 3-way pattern as updateSessionAskUserQuestion's guard above.
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus) AND (attribute_not_exists(pendingApprovalDeck) OR pendingApprovalDeck.#deckStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status', '#deckStatus': 'status' };
       params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
     } else if (requireStillAwaiting) {
       params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
@@ -3477,6 +3496,103 @@ export class ChatbotDB {
         return null;
       }
       console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635/1644: persist (or clear) the session's pending approval deck.
+   * Unlike the two guards above, the deck has a 3-state lifecycle
+   * (building -> awaiting -> answered), so its guards compose rather than
+   * branch exclusively — pass any combination that applies to a given call
+   * and the clauses AND together:
+   *  - failIfAwaitingExists: the 3-way cross-slot guard (gap 6) — refuses the
+   *    write while pendingApprovalDeck, pendingUserQuestion, OR
+   *    pendingWorkPlanInput is already 'awaiting'. Used when FINALIZING a
+   *    deck (building -> awaiting) — a deck still 'building' is not yet
+   *    blocking anyone, so plain create/append calls never need this.
+   *  - requireStillBuilding: optimistic-locked on the deck still being
+   *    exactly this deckId and still 'building' — used by append (refuses a
+   *    stale append after the deck was already finalized/cleared) and
+   *    combined with failIfAwaitingExists for finalize (refuses a stale
+   *    finalize of a deck that was already finalized or cleared out from
+   *    under it).
+   *  - requireStillAwaiting: optimistic-locked on the deck still being
+   *    exactly this deckId and still 'awaiting' — used when persisting
+   *    answers or clearing an abandoned deck, same shape as the other two
+   *    updateSession* methods' identically-named option.
+   */
+  async updateSessionApprovalDeck(
+    sessionId: string,
+    pendingApprovalDeck: PendingApprovalDeck | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillBuilding?: string; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const crossSlotGuard = opts?.failIfAwaitingExists === true && pendingApprovalDeck !== null;
+    const requireStillBuilding =
+      typeof opts?.requireStillBuilding === 'string' ? opts.requireStillBuilding : undefined;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+    const anyGuard = crossSlotGuard || requireStillBuilding !== undefined || requireStillAwaiting !== undefined;
+
+    const params: any = pendingApprovalDeck
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingApprovalDeck = :pendingApprovalDeck, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingApprovalDeck': pendingApprovalDeck,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingApprovalDeck',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    const clauses: string[] = [];
+    const names: Record<string, string> = {};
+    const values: Record<string, any> = params.ExpressionAttributeValues || {};
+
+    if (crossSlotGuard) {
+      clauses.push('(attribute_not_exists(pendingApprovalDeck) OR pendingApprovalDeck.#dStatus <> :awaitingStatus)');
+      clauses.push('(attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#qStatus <> :awaitingStatus)');
+      clauses.push('(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#iStatus <> :awaitingStatus)');
+      names['#dStatus'] = 'status';
+      names['#qStatus'] = 'status';
+      names['#iStatus'] = 'status';
+      values[':awaitingStatus'] = 'awaiting';
+    }
+    if (requireStillBuilding) {
+      clauses.push('pendingApprovalDeck.deckId = :requireBuildingDeckId');
+      clauses.push('pendingApprovalDeck.#dStatus = :buildingStatus');
+      names['#dStatus'] = 'status';
+      values[':requireBuildingDeckId'] = requireStillBuilding;
+      values[':buildingStatus'] = 'building';
+    }
+    if (requireStillAwaiting) {
+      clauses.push('pendingApprovalDeck.deckId = :requireAwaitingDeckId');
+      clauses.push('pendingApprovalDeck.#dStatus = :requireAwaitingStatus');
+      names['#dStatus'] = 'status';
+      values[':requireAwaitingDeckId'] = requireStillAwaiting;
+      values[':requireAwaitingStatus'] = 'awaiting';
+    }
+    if (clauses.length > 0) {
+      params.ConditionExpression = clauses.join(' AND ');
+      params.ExpressionAttributeNames = names;
+      params.ExpressionAttributeValues = values;
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if (anyGuard && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session approval deck:', error);
       throw error;
     }
   }
