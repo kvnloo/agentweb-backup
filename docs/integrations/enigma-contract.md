@@ -1,6 +1,6 @@
 # Enigma Contract
 
-Last derived from code: 2026-09-14
+Last derived from code: 2026-09-15 (Phase 2: V3 enrichment wiring)
 
 Owner area: `Argusoft / enrichment (ENG-1388)`
 
@@ -12,14 +12,15 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 - **Card revenue ≠ revenue.** It comes from a panel of about a third of US consumer and small-business card transactions. Enigma says to exclude low card-adoption industries (B2B software, wholesale, manufacturing) and to treat mixed ones as a floor. Always label it "Card revenue (12 mo), as of `periodEndDate`".
 - **Fail closed.** No brand, a brand whose own websites don't match our domain (TLD included), or a null/negative/undated value all mean *no value*. Nothing is guessed or repaired.
 - **Billing is per value returned**, even when we discard the brand. A search with no brand costs $0. The ledger records exactly that (`recordEnigmaLedger`).
-- **Status (2026-09-14): dormant.** The adapter exists, but nothing calls `getEnigmaService()` yet. Waterfall wiring, lead fields and surfaces are ENG-1388 Phase 2+.
+- **Status (2026-09-15): wired into V3 enrichment, off by default.** Calls happen only when `ENIGMA_ENRICHMENT_ENABLED=true`, the user is on `ENIGMA_ENRICHMENT_USER_ALLOWLIST` (empty = nobody), the run is user-initiated (enrich-v3 route or Emma; never the cron) and the run's config explicitly names a card-revenue field. The portal display is not built yet.
 - **Licence:** Enigma's public ToS is internal-use-only and non-sublicensable. Do not show Enigma values to customers, or copy them across tenants, until ENG-1930 confirms the terms.
 
 ## What AgentWeb Uses This For
 
 | Capability | Supported? | Entry point | Notes |
 | --- | --- | --- | --- |
-| Brand lookup by website + card revenue | Yes (dormant) | `getEnigmaService()?.lookupBrandCardRevenue()` | No caller yet |
+| Brand lookup by website + card revenue | Yes | `getEnigmaService()?.lookupBrandCardRevenue()` | Called only through the V3 `company_card_revenue` group |
+| Lead enrichment fields | Yes (flag + allowlist) | V3 waterfall `runCardRevenueTier` | `card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth` |
 | KYB / verify API | No | — | $1.50–2.50/call; not needed |
 | Operating-location / market-rank data | No | — | Location revenue is in-store only |
 | Bulk file enrichment / S3 output | No | — | Candidate for list backfills (Phase 4) |
@@ -36,7 +37,14 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 | Rate card | `backend/src/utils/vendorRateCard.ts` `enigma` | `card_revenue_12m`, `card_revenue_yoy_growth_12m`, `brand_attribute` (placeholder list prices) |
 | Metered providers | `backend/src/services/usageAnalyticsService.ts` `METERED_VENDOR_PROVIDERS` | Must include `enigma` |
 | Cache discriminator | `backend/src/services/db.ts` `putEnrichmentCacheItem` | `cacheType: 'enigma'` |
-| Tests | `backend/src/__tests__/enigmaService.test.ts` | Invariants below |
+| Enrichment policy | `backend/src/services/enigmaCardRevenueEnrichment.ts` | Flag/allowlist gate, industry card-adoption gate, per-run cap, 402/401 circuit breaker, run summary |
+| Field group | `backend/src/services/enrichmentGroups.ts` `company_card_revenue`, `isCardRevenueField` | 30d TTL; exact-name-only fields |
+| Waterfall tier | `backend/src/services/enrichmentGroupWaterfall.ts` `runCardRevenueTier` | Enigma or nothing; returns before Tiers 2–5 |
+| Deps wiring | `backend/src/services/enrichmentV3RealDeps.ts` `buildOrchestratorDeps(userId, { enigma })` | Route and Emma pass `enigma: true`; cron does not |
+| Opt-in guards | `enrichmentConfigService.ts` (default `include:false`, alias/smart-dep stripping), `enrichmentConfigDeps.ts` (LLM cheat sheets), `crmEnrichmentServiceV3.ts` (no injected card deps) | No implicit purchase |
+| Exclusions | `enrichmentSiblingConfigFields.ts` (no cross-tenant copy), `enrichmentCacheService.ts` `splitFieldsByGroup` (no V2 web fill), `cron/crmAutoEnrichmentCron.ts` (`isUnenriched` ignores card fields) | |
+| Daily quota | `enigmaService.ts` `EnigmaQuotaTracker`, `enigmaServiceFactory.ts` `buildEnigmaQuotaTracker` | AW-Configs `system:enigmaUsage`, `ENIGMA_DAILY_LIMIT_PER_USER` (default 300) |
+| Tests | `backend/src/__tests__/enigmaService.test.ts`, `backend/src/__tests__/enigmaCardRevenueEnrichment.test.ts` | Invariants below |
 
 ## Stored Internal Shape
 
@@ -68,7 +76,21 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 }
 ```
 
-No lead fields are written in Phase 1.
+**Lead fields (V3 enrichment)**, all strings in `customFields` (Tier 1 freshness and the writer only understand strings):
+
+```ts
+customFields.card_revenue_12m        = "4250000"      // USD, plain decimal
+customFields.card_revenue_period_end = "2026-05-31"   // not *_date, so the normalizer keeps ISO
+customFields.card_revenue_yoy_growth = "1.32"         // ratio; omitted when Enigma returns null
+enrichmentMetadata[field] = {
+  source: "api", provider: "enigma",
+  confidence: "medium" (period_end: "high"),
+  asOf: "2026-05-31", fromCache, enrichedAt,
+  sourceQuote: "Card spend on US consumer and small-business cards over the 12 months ending … Not total revenue …"
+}
+```
+
+**Daily quota row:** AW-Configs `{ userId, configId: "system:enigmaUsage", date: "YYYY-MM-DD", callCount }`.
 
 ## External Payload Contract
 
@@ -107,7 +129,7 @@ Billing (rate card effective 2026-08-10): per value returned. Brand 12M card rev
 
 ## Agent Tool Contract
 
-None yet. No Emma tool calls Enigma. When one is added it must say "card revenue (12 mo) as of <date>" and never "revenue".
+No dedicated tool. Emma reaches Enigma only through `enrich_leads_preview` / `enrich_leads_execute` / `enrich_lead_custom` when the user explicitly asks for card revenue. The tool descriptions tell her to request the exact field names, never to use them for a generic "revenue" ask, and to always say "card revenue … 12 months to <asOf>", never total revenue (`search_leads` / `get_lead_details` provenance text).
 
 ## Known Failure Modes
 
@@ -117,7 +139,11 @@ None yet. No Emma tool calls Enigma. When one is added it must say "card revenue
 | TLD mismatch (`acme.io` vs `acme.com`) | Wrong brand's revenue attached | `treats a brand on a different TLD as not found` | Don't compare on name alone |
 | Null card revenue for a small merchant | Value missing | `never fabricates a revenue value` | Don't back-fill from 1m/3m, Apollo or an LLM |
 | Out of credits | Every lookup throws 402 | `does not cache a vendor error` + `[enigma] OUT OF CREDITS` log | Don't turn a 402 into `not_found` |
-| B2B / SaaS company | Null or tiny card revenue | Not guarded (industry gating is Phase 2) | Don't present card revenue as company size |
+| B2B / SaaS company | Null or tiny card revenue | `classifyCardAdoption` skips low-adoption industries (keyword rules; unknown industry still calls) | Don't present card revenue as company size |
+| Card field switched on implicitly | Surprise spend on every later run | Default `include:false`; aliases and smart deps onto card fields stripped; LLM cheat sheets exclude the group | Don't add card fields to `CANONICAL_SYNONYMS` or LLM prompts |
+| Web/LLM guess at card revenue | Fabricated value indistinguishable from Enigma | `runCardRevenueTier` returns before Tiers 2–5; V2 `splitFieldsByGroup` drops card fields | Don't let the card group fall through the waterfall |
+| Out of credits mid-run | Every lead calls and fails | Run circuit breaker (`haltedBy`) after the first 402/401 | Don't retry 402/401 per lead |
+| Cross-customer reuse | Licensed data shown to another tenant | Sibling copy skips card fields and any `provider: enigma` value | Don't remove until ENG-1930 confirms reuse is licensed |
 | Values billed but discarded (website mismatch) | Ledger spend with no stored value | `records each billed value` | Don't skip metering on a rejected match |
 
 ## Tests To Check
@@ -138,8 +164,11 @@ None yet. No Emma tool calls Enigma. When one is added it must say "card revenue
 - **No live call has been made.** The query shape comes from Enigma's published schema and examples (checked 2026-09-14), not a real response. Verify with the key (ENG-1931) before any caller ships: the `rank: 0` filter, how `platformBrandId` is populated, whether `id` bills.
 - Rate-card values are **placeholder list prices** pending Harsha's allocation confirmation.
 - Licence scope for customer display and cross-tenant reuse is unknown (ENG-1930).
-- Industry gating (skip low card-adoption NAICS) is not implemented.
-- No per-user daily quota. That's acceptable while there is no caller; decide before Phase 2 wiring.
+- Industry gating uses keyword rules over free-text industry (we have no NAICS); tune with ENG-1933 spike data.
+- Caps (200 lookups/run, 300 calls/user/day) are starting values pending the spike. The per-run cap counts lookups including cache hits (conservative).
+- `enigma_brand_id` is not persisted on leads (design D2 deviation: no consumer needs it; the cache is keyed by host).
+- Portal display ("Card revenue (12 mo)" label, as-of tooltip) is not built; until then the column shows the raw key and value.
+- Customer display and cross-tenant reuse remain gated on ENG-1930; who pays on ENG-1932 H1.
 
 ## Update Checklist
 
