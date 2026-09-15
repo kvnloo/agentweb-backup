@@ -923,24 +923,30 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
   it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
   or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
   The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
-  unconfirmed preview call, show the user the WARNING line that comes back in the summary, and on the confirmed
-  call pass params.tracking_override_token exactly as the preview returned it, alongside params.confirm=true.
-  Adding the override only to the confirmed call, or changing any other argument after the preview, invalidates
-  it — the API returns a fresh preview instead of launching. There is no way to waive the check without the user
-  being shown that it is being waived.
+  unconfirmed preview call and show the user the WARNING line that comes back in the summary. NOTE: the
+  override-waiver replay described elsewhere in this codebase (a second call carrying
+  params.tracking_override_token) is not currently supported for a write routed through the approval-deck
+  flow below — if the user explicitly wants to waive the tracking check, say so plainly rather than promising
+  a mechanism that isn't wired through yet, and flag it for a human rather than guessing a workaround.
 
 ⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
   CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
-  destroy live entities. For these, the API runs a two-phase confirmation:
-    1. Call normally (without params.confirm). The API does NOT execute — it returns requiresConfirmation:true
-       with a "target" object naming the exact campaign + ad set + asset that will be affected.
-    2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
-       content/budget/status changes) and get EXPLICIT approval before proceeding.
-    3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
-    4. When one user directive covers multiple gated writes with no data dependency between them (for example,
-       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message so they confirm
-       as a single round. Split only on a real data dependency, such as creating a creative before an ad can
-       reference its creative_id.
+  destroy live entities. For these, the API halts before ever writing — it does NOT execute on the first call:
+    1. Call normally (without params.confirm — this flag does nothing on its own; see its own parameter
+       description below). The API returns awaitingUserConfirmation:true with a "target" object naming the
+       exact campaign + ad set + asset that will be affected, and adds the write to an approval deck the user
+       answers directly in the UI with real approve/reject controls — not a typed reply you relay for them.
+    2. Do NOT re-call this tool for the SAME write after this halt, with or without params.confirm=true.
+       There is no flag or retry on your end that makes this execute — the only thing that authorizes it is
+       the user's own answer, submitted through the deck UI, which the backend then executes automatically.
+       Treat the halt as the end of your turn for that write. A later turn will tell you the outcome (applied,
+       failed, or rejected) once the user has answered — do not assume success and do not ask the user to
+       confirm again via chat text.
+    3. When one user directive covers multiple gated writes with no data dependency between them (for example,
+       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message — every halted
+       write from that one message is front-loaded into ONE deck the user answers once, instead of one prompt
+       per write. Split only on a real data dependency, such as creating a creative before an ad can reference
+       its creative_id.
   If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
   candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
@@ -1166,7 +1172,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
             // --- Confirmation gate (write actions) ---
-            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD/RETAG_UTM. Omit (or false) on the first call to preview the target." },
+            confirm: { type: "boolean", description: "Does nothing on its own — kept only so existing calls that still set it don't error. A CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD write only ever executes once the user has approved it through the approval-deck UI; this flag cannot authorize a write by itself, and re-calling with it set to true after a halt will NOT make the write execute. See MANDATORY TARGET CONFIRMATION above." },
 
             // --- Common ---
             name: { type: "string", description: "Entity name." },
