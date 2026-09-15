@@ -60,6 +60,11 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 let registryToolNames: string[] = ['fake_tool_a', 'fake_tool_b'];
 jest.mock('../emma/registry', () => ({
   emmaToolRegistry: {
+    // `register` MUST be present. Without it the sixteen real emma modules that step 1
+    // imports crash against the stub ("emmaToolRegistry.register is not a function"),
+    // which silently left step 1 failing — and three tests in this file passed only
+    // because of that accident. Completing the mock is what makes them honest.
+    register: jest.fn(),
     getToolNames: jest.fn(() => registryToolNames),
     getTool: jest.fn((name: string) => ({
       name,
@@ -85,8 +90,15 @@ describe('AgentModeService degraded-init detection (real registerTools path)', (
     service = new AgentModeService();
     // Keep initialize() to the registration path only — the other steps have their
     // own coverage and would reach DynamoDB here.
-    jest.spyOn(service as any, 'initializeMcp').mockResolvedValue(undefined);
-    jest.spyOn(service as any, 'ensureBuiltInSkills').mockResolvedValue(undefined);
+    // These stand in for SUCCESSFUL steps, so they set the same flags the real ones do.
+    // The latch is the conjunction of every step's own outcome; a spy that resolves
+    // without reporting would model a permanently-failing step, not a healthy one.
+    jest.spyOn(service as any, 'initializeMcp').mockImplementation(async () => {
+      (service as any).mcpStepOk = true;
+    });
+    jest.spyOn(service as any, 'ensureBuiltInSkills').mockImplementation(async () => {
+      (service as any).builtInSkillsStepOk = true;
+    });
     jest.spyOn(service as any, 'loadFoundationTools').mockResolvedValue(undefined);
   });
 
@@ -108,8 +120,7 @@ describe('AgentModeService degraded-init detection (real registerTools path)', (
     // the registry is still non-empty, because the built-ins register unconditionally
     // after both try/catch blocks and ToolRegistry.register is a Map.set that cannot
     // throw. `getAllTools().length > 0` therefore could never be false.
-    (AgentModeService as any).toolsRegistered = false;
-    registryToolNames = [];
+    registryToolNames = []; // step 1 produced nothing to copy
 
     await service.initialize();
 
@@ -142,19 +153,76 @@ describe('AgentModeService degraded-init detection (real registerTools path)', (
   it('retries and recovers once registration succeeds again', async () => {
     // The self-healing that the pre-branch per-message instance gave for free, and that
     // a latch on mere completion destroyed.
-    (AgentModeService as any).toolsRegistered = false;
     registryToolNames = [];
     await service.initialize();
     expect((service as any).initialized).toBe(false);
 
-    (AgentModeService as any).toolsRegistered = true; // transient cause clears
-    registryToolNames = ['fake_tool_a'];
+    registryToolNames = ['fake_tool_a']; // transient cause clears
     await service.initialize();
     expect((service as any).initialized).toBe(true);
   });
 
+  it('does not latch on a PARTIAL copy — some tools missing is still degraded', async () => {
+    // getToolNames reports three, but one cannot be resolved. Nothing throws; the loop
+    // simply copies two. A "no exception" signal accepts this; a copied-count does not.
+    const { emmaToolRegistry } = jest.requireMock('../emma/registry') as any;
+    registryToolNames = ['a', 'b', 'c'];
+    emmaToolRegistry.getTool.mockImplementation((name: string) =>
+      name === 'b' ? undefined : {
+        name,
+        definition: { name, description: name, inputSchema: { type: 'object', properties: {} } },
+        execute: jest.fn(),
+        requiresUserAccount: false,
+      });
+
+    await service.initialize();
+
+    expect((service as any).emmaToolsRegistered).toBe(false);
+    expect((service as any).initialized).toBe(false);
+  });
+
+  it('does not latch when MCP initialization failed', async () => {
+    // Registration is fine; MCP is not. initializeMcp swallows its own errors, so the
+    // only way the latch can know is if the step reports its own outcome.
+    (service as any).initializeMcp.mockImplementation(async () => {
+      (service as any).mcpStepOk = false;
+    });
+
+    await service.initialize();
+
+    expect((service as any).emmaToolsRegistered).toBe(true); // registration succeeded
+    expect((service as any).initialized).toBe(false);        // but init is degraded
+  });
+
+  it('does not latch when built-in skill seeding failed', async () => {
+    (service as any).ensureBuiltInSkills.mockImplementation(async () => {
+      (service as any).builtInSkillsStepOk = false;
+    });
+
+    await service.initialize();
+
+    expect((service as any).emmaToolsRegistered).toBe(true);
+    expect((service as any).initialized).toBe(false);
+  });
+
+  it('does not re-bootstrap downstream singletons on every retry', async () => {
+    // initializeDownstreamSingletons is fire-and-forget and NOT idempotent — three of
+    // its five inits replace live singletons unconditionally. The latch's retry path
+    // would otherwise swap them under in-flight tool calls once per failed attempt.
+    const spy = jest
+      .spyOn(service as any, 'initializeDownstreamSingletons')
+      .mockResolvedValue(undefined);
+
+    registryToolNames = [];
+    await service.initialize();
+    await service.initialize();
+    await service.initialize();
+
+    expect((service as any).initialized).toBe(false); // genuinely retried each time
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
   it('does not leak a cleanup interval across the retries the latch enables', async () => {
-    (AgentModeService as any).toolsRegistered = false;
     registryToolNames = [];
     await service.initialize();
     const first = (service as any).fileCacheCleanupInterval;

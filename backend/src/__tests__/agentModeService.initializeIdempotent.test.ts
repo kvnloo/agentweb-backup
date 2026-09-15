@@ -88,7 +88,13 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     runSpy = jest
       .spyOn(service as any, 'runInitialize')
       .mockImplementation(async () => {
+        // Must set EVERY step's flag. The latch is the conjunction of all of them, so a
+        // mock that reports only one models a permanently-degraded init and nothing here
+        // could ever latch. Kept explicit rather than helper-wrapped: if a new step is
+        // added to the latch, this line should fail loudly and be updated deliberately.
         (service as any).emmaToolsRegistered = true;
+        (service as any).mcpStepOk = true;
+        (service as any).builtInSkillsStepOk = true;
       });
   });
 

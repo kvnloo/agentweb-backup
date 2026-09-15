@@ -1576,11 +1576,31 @@ export class AgentModeService {
   // initialized=true with a 4-tool registry.
   //
   // Both halves of registerTools() have to be checked, because they fail independently:
-  // step 1 (seventeen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // step 1 (sixteen side-effect imports that POPULATE emmaToolRegistry) sets the static
   // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
   // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
   // without error — so the flag below alone would latch a degraded init too.
   private emmaToolsRegistered = false;
+  // initializeMcp() and ensureBuiltInSkills() swallow their own errors too, so
+  // registration succeeding says nothing about them. Without these, a transient MCP
+  // or built-in-skill failure latches permanently: MCP tools stay absent or skills
+  // stay stale until a process restart. Each step reports its OWN outcome and the
+  // latch is the conjunction — replacing "infer health from one proxy signal", which
+  // produced this same defect three rounds running.
+  private mcpStepOk = false;
+  private builtInSkillsStepOk = false;
+  // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
+  // its five inits replace live singletons unconditionally. The latch's retry path
+  // would otherwise swap them under in-flight tool calls on every failed attempt.
+  private downstreamSingletonsStarted = false;
+
+  /**
+   * Whether the last initialize() completed with every step reporting success. False
+   * means a degraded init that the next caller will retry — see initialize().
+   */
+  public get isInitialized(): boolean {
+    return this.initialized;
+  }
 
   public async initialize(): Promise<void> {
     // Deliberately before and outside the latch — see the note above.
@@ -1592,12 +1612,18 @@ export class AgentModeService {
     this.initializationPromise = this.runInitialize();
     try {
       await this.initializationPromise;
-      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered && this.toolRegistry.getAllTools().length > 0;
+      this.initialized =
+        AgentModeService.toolsRegistered &&
+        this.emmaToolsRegistered &&
+        this.mcpStepOk &&
+        this.builtInSkillsStepOk &&
+        this.toolRegistry.getAllTools().length > 0;
       if (!this.initialized) {
         console.error(
           'AgentMode: initialize() completed but tool registration did not succeed ' +
           `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
           `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `mcp=${this.mcpStepOk}, builtInSkills=${this.builtInSkillsStepOk}, ` +
           `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
           'treating init as failed so the next caller retries.',
         );
@@ -1609,14 +1635,20 @@ export class AgentModeService {
 
   private async runInitialize(): Promise<void> {
     await this.registerTools();
+
     if (process.env.IS_MCP_SERVER !== 'true') {
+      this.mcpStepOk = false;
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
+      this.mcpStepOk = true; // not applicable in MCP-server mode
     }
 
-    // Ensure built-in skills exist in the database
-    await this.ensureBuiltInSkills();
+    // Skipped once it has succeeded: it re-scans every skill and issues an update per
+    // built-in, which the retry path would otherwise repeat on every failed attempt.
+    if (!this.builtInSkillsStepOk) {
+      await this.ensureBuiltInSkills();
+    }
 
     // Bootstrap downstream service singletons. Server boot also calls these
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
@@ -1627,7 +1659,10 @@ export class AgentModeService {
     // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
-    void this.initializeDownstreamSingletons();
+    if (!this.downstreamSingletonsStarted) {
+      this.downstreamSingletonsStarted = true;
+      void this.initializeDownstreamSingletons();
+    }
 
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
@@ -1707,6 +1742,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
+    this.builtInSkillsStepOk = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1739,6 +1775,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
+      this.builtInSkillsStepOk = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1779,11 +1816,12 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
-    // Idempotent. Before the initialize() latch existed this ran once per instance, so a
-    // second call was impossible. The latch's failure path deliberately re-runs the whole
-    // initialization body on the next caller — which, unguarded, would assign a fresh
-    // interval per retry and orphan the previous one, each retaining `this` through its
-    // closure. That is the same leak shape the per-message-instance bug had.
+    // Idempotent. Nothing previously prevented a second call — origin/main's initialize()
+    // has no guard at all, and earlier on this branch it ran once per widget message on
+    // the shared singleton. Unguarded, each call assigns a fresh interval and orphans the
+    // previous one, every orphan retaining this instance through its closure. That is the
+    // same leak shape as the per-message-instance bug, and the latch's retry path makes
+    // repeat calls routine rather than incidental.
     if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
@@ -1840,6 +1878,9 @@ export class AgentModeService {
           }
         }
       }
+      // A prior instance already brought MCP up and this instance has now copied its
+      // tools — that is a successful outcome for this step, not a skipped one.
+      this.mcpStepOk = true;
       return;
     }
     (AgentModeService as any).mcpInitialized = true;
@@ -1853,9 +1894,11 @@ export class AgentModeService {
         this.toolRegistry.register(tool);
       }
       console.log(`[MCP-DEBUG] Registered ${mcpTools.length} tools from MCP servers`);
+      this.mcpStepOk = true;
     } catch (error) {
       console.error('AgentMode: Error initializing MCP:', error);
       (AgentModeService as any).mcpInitialized = false;
+      this.mcpStepOk = false;
     }
   }
 
@@ -1918,6 +1961,7 @@ export class AgentModeService {
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
+      let copied = 0;
 
       for (const name of toolNames) {
         const toolHandler = emmaToolRegistry.getTool(name);
@@ -1941,9 +1985,21 @@ export class AgentModeService {
             // here is what made the registry guard inert for live sessions.
             requiresUserAccount: toolHandler.requiresUserAccount
           });
+          copied++;
         }
       }
-      this.emmaToolsRegistered = true;
+      // "Didn't throw" is not success. Every statement in this try is non-throwing
+      // (Array.from, Map.get, Map.set), so an empty or unresolvable emmaToolRegistry
+      // copies ZERO tools and completes cleanly — which an earlier version of this
+      // latch accepted, leaving an instance live with only the four built-ins
+      // registered below. That is the ENG-1852 symptom exactly. Require the copy to
+      // be complete and non-empty.
+      this.emmaToolsRegistered = toolNames.length > 0 && copied === toolNames.length;
+      if (!this.emmaToolsRegistered) {
+        console.error(
+          `AgentMode: Emma tool copy incomplete — ${copied}/${toolNames.length} registered.`,
+        );
+      }
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
     }

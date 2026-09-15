@@ -43,9 +43,14 @@ import * as ts from 'typescript';
 const SRC_ROOT = path.join(__dirname, '..');
 
 /** Module specifiers that resolve to services/agentModeService.ts. */
-const AGENT_MODE_SERVICE_MODULE = /(^|\/)agentModeService$/;
+const AGENT_MODE_SERVICE_MODULE = /(^|\/)agentModeService(\.js)?$/;
 
 const CLASS_NAME = 'AgentModeService';
+
+/** True for the string literal 'AgentModeService' in a computed member access. */
+function isClassNameLiteral(node: ts.Expression | undefined): boolean {
+  return !!node && ts.isStringLiteralLike(node) && node.text === CLASS_NAME;
+}
 
 /**
  * Files permitted to construct, mapped to how many constructions are allowed.
@@ -77,6 +82,20 @@ const ALLOWED_CONSTRUCTIONS = new Map<string, number>([
  */
 function moduleSpecifierMatches(node: ts.Expression | undefined): boolean {
   return !!node && ts.isStringLiteralLike(node) && AGENT_MODE_SERVICE_MODULE.test(node.text);
+}
+
+/**
+ * Strip parentheses, `as` casts and `!` so a construction cannot hide behind syntax:
+ * `new (AgentModeService)()`, `class E extends (X as any) {}`.
+ */
+function unwrap(node: ts.Expression): ts.Expression {
+  let n: ts.Expression = node;
+  for (;;) {
+    if (ts.isParenthesizedExpression(n)) { n = n.expression; continue; }
+    if (ts.isAsExpression(n) || ts.isTypeAssertionExpression(n)) { n = n.expression; continue; }
+    if (ts.isNonNullExpression(n)) { n = n.expression; continue; }
+    return n;
+  }
 }
 
 /** `require('./agentModeService')` or `await import('./agentModeService')` / `import(...)`. */
@@ -143,6 +162,9 @@ function collectClassBindings(sourceFile: ts.SourceFile): {
         } else if (named && ts.isNamespaceImport(named)) {
           namespaces.add(named.name.text);
         }
+        // `import mod from './agentModeService'` — with esModuleInterop the default
+        // binding is the module object, so `new mod.AgentModeService()` works.
+        if (clause.name) namespaces.add(clause.name.text);
       }
     }
 
@@ -157,10 +179,17 @@ function collectClassBindings(sourceFile: ts.SourceFile): {
     if (
       ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      isModuleLoadCall(node.right) &&
       ts.isIdentifier(node.left)
     ) {
-      namespaces.add(node.left.text);
+      if (isModuleLoadCall(node.right)) namespaces.add(node.left.text);
+      // C = AgentModeService — the assignment twin of `const C = AgentModeService`,
+      // which was closed last round while this one-token variant was left open.
+      const r = unwrap(node.right);
+      if (ts.isIdentifier(r) && direct.has(r.text)) direct.add(node.left.text);
+      if (
+        ts.isPropertyAccessExpression(r) && r.name.text === CLASS_NAME &&
+        ts.isIdentifier(r.expression) && namespaces.has(r.expression.text)
+      ) direct.add(node.left.text);
     }
 
     // import('./agentModeService').then(m => new m.AgentModeService())
@@ -235,7 +264,7 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
       for (const clause of node.heritageClauses ?? []) {
         if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
         for (const t of clause.types) {
-          const e = t.expression;
+          const e = unwrap(t.expression);
           if (ts.isIdentifier(e) && direct.has(e.text) && node.name?.text !== CLASS_NAME) count++;
           if (
             ts.isPropertyAccessExpression(e) &&
@@ -247,13 +276,36 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
       }
     }
 
+    // Reflect.construct(AgentModeService, []) — a construction that is not a NewExpression.
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'construct' &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'Reflect' &&
+      node.arguments.length > 0
+    ) {
+      const a = unwrap(node.arguments[0] as ts.Expression);
+      if (ts.isIdentifier(a) && direct.has(a.text)) count++;
+      if (ts.isPropertyAccessExpression(a) && a.name.text === CLASS_NAME) count++;
+      if (ts.isElementAccessExpression(a) && isClassNameLiteral(a.argumentExpression)) count++;
+    }
+
     if (ts.isNewExpression(node)) {
-      const target = node.expression;
+      const target = unwrap(node.expression);
       // `new AgentModeService()` / `new Aliased()`
       if (ts.isIdentifier(target) && direct.has(target.text)) count++;
       // `new mod.AgentModeService()` — namespace import of the module. Gated on
       // the namespace binding rather than matching any `.AgentModeService`, so an
       // unrelated module exposing a same-named class is not falsely flagged.
+      // new mod['AgentModeService']() — ElementAccessExpression, not a dot-property.
+      if (ts.isElementAccessExpression(target) && isClassNameLiteral(target.argumentExpression)) {
+        const base = unwrap(target.expression);
+        const viaBinding = ts.isIdentifier(base) && namespaces.has(base.text);
+        const viaInlineLoad = isModuleLoadCall(base);
+        if (viaBinding || viaInlineLoad) count++;
+      }
+
       if (ts.isPropertyAccessExpression(target) && target.name.text === CLASS_NAME) {
         // `new mod.AgentModeService()` where mod is a tracked module binding, or
         // the inline `new (await import('./agentModeService')).AgentModeService()`.
@@ -504,6 +556,75 @@ describe('AgentModeService construction guard — detection behaviour', () => {
       `export const agentModeService = new ${CLASS_NAME}();`,
     ].join('\n');
     expect(() => assertConstructionAllowed('services/agentModeService.ts', src)).not.toThrow();
+  });
+
+  // Six more forms an independent review defeated the previous version with, by
+  // extracting countConstructions and running a battery of idioms against it. Two are
+  // one-token variants of forms the previous round claimed to have closed.
+  it('flags computed member access', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      "const svc = new mod['AgentModeService']();",
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a parenthesized callee', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'const svc = new (AgentModeService)();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags Reflect.construct', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'const svc = Reflect.construct(AgentModeService, []);',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a subclass hidden behind an as-cast', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'class Extended extends (AgentModeService as any) {}',
+      'const svc = new Extended();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags the assignment-form rebind', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'let C: any;',
+      'C = AgentModeService;',
+      'const svc = new C();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags construction via a default import of the module', () => {
+    const src = [
+      "import mod from './agentModeService';",
+      'const svc = new mod.AgentModeService();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a specifier carrying a .js extension', () => {
+    const src = [
+      "const { AgentModeService } = require('./agentModeService.js');",
+      'const svc = new AgentModeService();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
   });
 
   it('flags a namespace-style construction', () => {
