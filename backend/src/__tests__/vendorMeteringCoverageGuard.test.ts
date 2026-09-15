@@ -25,6 +25,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ts from 'typescript';
 
 import { METERED_VENDOR_PROVIDERS } from '../services/usageAnalyticsService';
 
@@ -573,5 +574,94 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     expect(meteredProviderKeysInRepo(loadRealRepoFiles())).toEqual(
       [...METERED_VENDOR_PROVIDERS].sort()
     );
+  });
+});
+
+// ─── ENG-1929: no cost computed inline in a metering call ────────────────────
+
+/**
+ * Every `recordVendorUsage({ ... costUsd: <call> })` where `costUsd` contains a
+ * function call.
+ *
+ * That argument is evaluated BEFORE the fire-and-forget call, so a pricing
+ * function that throws (the rate card threw on a missing rate by design, and
+ * X's pricer still does) propagates into the vendor request and fails the
+ * user's search or render. Pricing belongs inside the recorder, via `rateKey`,
+ * or in a value computed beforehand within its own guard. A plain value —
+ * literal, identifier, property access, arithmetic on those — cannot throw
+ * and is allowed.
+ *
+ * AST rather than regex, for the same reasons sdkConstructionGuard gives:
+ * comments, strings and formatting cannot fool it.
+ */
+function findInlineCostComputations(files: ReadonlyMap<string, string>): string[] {
+  const found: string[] = [];
+  for (const [rel, content] of files) {
+    if (!content.includes('recordVendorUsage')) continue;
+    const sourceFile = ts.createSourceFile(rel, content, ts.ScriptTarget.Latest, true);
+    const containsCall = (node: ts.Node): boolean =>
+      ts.isCallExpression(node) || ts.isNewExpression(node) || ts.forEachChild(node, containsCall) === true;
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'recordVendorUsage' &&
+        node.arguments[0] &&
+        ts.isObjectLiteralExpression(node.arguments[0])
+      ) {
+        for (const prop of node.arguments[0].properties) {
+          if (
+            ts.isPropertyAssignment(prop) &&
+            ts.isIdentifier(prop.name) &&
+            prop.name.text === 'costUsd' &&
+            containsCall(prop.initializer)
+          ) {
+            const { line } = sourceFile.getLineAndCharacterOfPosition(prop.getStart());
+            found.push(`${rel}:${line + 1}`);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+  return found.sort();
+}
+
+describe('no cost computed inline in a metering call (ENG-1929)', () => {
+  const fixture = (content: string) => new Map([['services/newVendor.ts', content]]);
+
+  it('flags a pricing call evaluated as the costUsd argument', () => {
+    expect(
+      findInlineCostComputations(
+        fixture("void recordVendorUsage({ provider: 'x', costSource: 'allocated', costUsd: priceIt('x', 1) });"),
+      ),
+    ).toEqual(['services/newVendor.ts:1']);
+  });
+
+  it('flags a call nested inside an expression', () => {
+    expect(
+      findInlineCostComputations(fixture("recordVendorUsage({ costUsd: 2 * lookupRate('x') });")),
+    ).toHaveLength(1);
+  });
+
+  it('allows rateKey, and a costUsd that is already a value', () => {
+    expect(
+      findInlineCostComputations(
+        fixture(
+          [
+            "void recordVendorUsage({ provider: 'x', rateKey: 'query', quantity: 1 });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: cost.costUsd });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: rate * quantity });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: 0 });",
+            '// recordVendorUsage({ costUsd: computeAllocatedCost() }) in a comment',
+          ].join('\n'),
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  it('backend/src has no inline cost computation in any recordVendorUsage call', () => {
+    expect(findInlineCostComputations(loadRealRepoFiles())).toEqual([]);
   });
 });

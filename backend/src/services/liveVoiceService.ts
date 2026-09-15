@@ -27,6 +27,7 @@ import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 import { meterUserUsage } from './usageRecorderService';
+import type { LLMUsageContext } from '../utils/llmService';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
@@ -782,6 +783,7 @@ async function summarizeToolResult(
   toolResult: Record<string, unknown>,
   seen: Set<string>,
   out: LiveArtifact[],
+  usageContext?: LLMUsageContext,
 ): Promise<string | undefined> {
   const resultJson = JSON.stringify(toolResult).slice(0, 3000);
   const argsJson = JSON.stringify(toolArgs).slice(0, 500);
@@ -809,7 +811,13 @@ Tool result: ${resultJson}`;
       agentModeService.callLLM(
         ARTIFACT_EXTRACT_MODEL,
         [{ role: 'user', content: prompt }],
-        { max_completion_tokens: 600, temperature: 0, taskClass: 'interactive_chat' },
+        {
+          max_completion_tokens: 600,
+          temperature: 0,
+          taskClass: 'interactive_chat',
+          // ENG-1858: part of the live session user's turn, not "system".
+          usageContext: usageContext ?? { feature: 'live_voice_tool_summary' },
+        },
       ),
       LIVE_TOOL_SUMMARY_TIMEOUT_MS,
       `Live tool summary for ${toolName}`,
@@ -1136,7 +1144,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           const resultObj = typeof result === 'object' && result !== null
             ? result as Record<string, unknown>
             : { result: text };
-          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts);
+          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts, {
+            userId: entry.userId,
+            sessionId,
+            feature: 'live_voice_tool_summary',
+          });
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
           entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, result, narrative });
