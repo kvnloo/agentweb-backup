@@ -28,15 +28,16 @@ import { getEnigmaApiKey } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
 import { computeAllocatedCost, getRecordingUnit } from '../utils/vendorRateCard';
 
-const ENIGMA_GRAPHQL_URL = 'https://api.enigma.com/graphql';
+export const ENIGMA_GRAPHQL_URL = 'https://api.enigma.com/graphql';
 const REQUEST_TIMEOUT_MS = 30_000;
-const MATCH_THRESHOLD = 0.8;
+export const MATCH_THRESHOLD = 0.8;
 
 // One brand, its first name, its websites (to confirm the match against our
 // domain) and the latest 12-month card revenue + YoY growth. Every field
 // requested here that Enigma bills for must be counted by
-// countEnigmaBilledFills, or the ledger under-reports spend.
-const SEARCH_BRAND_QUERY = `
+// countEnigmaBilledFills, or the ledger under-reports spend. Exported (with the
+// conditions below) so evaluation scripts run the exact production query.
+export const SEARCH_BRAND_QUERY = `
 query SearchBrandCardRevenue($searchInput: SearchInput!, $cardTransactionConditions: ConnectionConditions!) {
   search(searchInput: $searchInput) {
     ... on Brand {
@@ -50,7 +51,7 @@ query SearchBrandCardRevenue($searchInput: SearchInput!, $cardTransactionConditi
   }
 }`;
 
-const CARD_TRANSACTION_CONDITIONS = {
+export const CARD_TRANSACTION_CONDITIONS = {
   filter: {
     AND: [
       { EQ: ['period', '12m'] },
