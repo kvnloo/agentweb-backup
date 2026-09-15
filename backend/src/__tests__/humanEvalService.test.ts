@@ -816,7 +816,7 @@ describe('HumanEvalService', () => {
       expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated despite a Slack failure.');
     });
 
-    it('still posts for a userId on the exception list even when the global toggle is off', async () => {
+    it('still posts for a userId on the exception list even when the global toggle is off, using a concise message', async () => {
       const { service, slack, settings } = makeHarness();
       settings.delete('human_eval_slack_posting_enabled');
       settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
@@ -825,11 +825,58 @@ describe('HumanEvalService', () => {
         reviewType: 'creative_image',
         outputSummary: 'Haven creative for review.',
         userId: 'user-haven',
+        artifactUrl: 'https://example.com/haven-creative.png',
       });
 
       expect(slack.postSlackMessage).toHaveBeenCalledWith('C_EVAL', expect.any(String));
       expect(candidate.slackChannel).toBe('C_EVAL');
       expect(candidate.slackMessageTs).toBe('1780000000.123456');
+
+      // ENG-1854 item 6: exception posts are a deliberately different, concise shape —
+      // one line, one mention, one link — not the full multi-field dump every other
+      // candidate gets. Assert the actual posted text, not just that posting happened.
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toBe('<@U_MATT> — new review ready: <https://example.com/haven-creative.png>');
+      expect(postedMessage).not.toContain('*Human eval:');
+      expect(postedMessage).not.toContain('Reply in this thread');
+    });
+
+    it('uses the full multi-field message for a normal global-toggle post, not the concise exception format', async () => {
+      const { service, slack } = makeHarness();
+
+      await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Ordinary candidate.',
+        userId: 'user-not-excepted',
+      });
+
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toContain('*Human eval:');
+      expect(postedMessage).toContain('Reply in this thread');
+      expect(postedMessage).not.toBe('<@U_MATT> — new review ready.');
+    });
+
+    it('defaults to not posting (fail-safe), not throwing, when the settings lookup itself throws — the candidate is already persisted by this point', async () => {
+      const { service, slack, settingsService, settings, items } = makeHarness();
+      // Target only the toggle lookup by name — an unscoped mockRejectedValueOnce would
+      // instead hit getReviewerSlackUserId's own getSetting call, which runs earlier and
+      // ISN'T guarded, throwing before persistence and disproving the very thing this test
+      // exists to check.
+      settingsService.getSetting.mockImplementation(async (name: string) => {
+        if (name === 'human_eval_slack_posting_enabled') {
+          throw new Error('DynamoDB GetItem transiently failed');
+        }
+        const settingValue = settings.get(name);
+        return settingValue ? { settingValue } : null;
+      });
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Persists even if the toggle lookup itself fails.',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Persists even if the toggle lookup itself fails.');
     });
 
     it('does not post for a userId NOT on the exception list when the global toggle is off', async () => {
