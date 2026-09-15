@@ -11,7 +11,7 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 
-import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval } from '../services/autoHumanEvalService';
 import { humanEvalService } from '../services/humanEvalService';
 import { settingsService } from '../services/settingsService';
 
@@ -110,5 +110,66 @@ describe('enqueueAutoHumanEval', () => {
     expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({
       category: undefined,
     }));
+  });
+
+  // ENG-1854: cross-path dedup — the sourceKey dedup above only catches THIS function
+  // re-firing on its own retries. It does nothing when a manual Emma tool call (which
+  // bypasses enqueueAutoHumanEval entirely) posts the same artifact separately.
+  it('does not enqueue when the artifact URL was already claimed by a different path', async () => {
+    // sourceKey dedup passes (nothing marked yet), but the artifact-claim check finds it
+    // already claimed.
+    mockGetSetting.mockImplementation(async (key: string) =>
+      key.startsWith('human_eval_artifact_') ? { settingValue: 'claimed' } : null);
+
+    const result = await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      userId: 'user-1',
+      sessionId: 'session-1',
+      artifactUrl: 'https://example.com/already-claimed.png',
+      outputSummary: 'Image generated.',
+      sourceKey: 'image:session-1:already-claimed.png',
+    });
+
+    expect(result).toBeNull();
+    expect(mockCreateCandidate).not.toHaveBeenCalled();
+  });
+});
+
+describe('claimArtifactForHumanEval', () => {
+  it('claims a not-yet-seen artifact URL and returns true', async () => {
+    const claimed = await claimArtifactForHumanEval('https://example.com/new.png');
+
+    expect(claimed).toBe(true);
+    expect(mockSetSetting).toHaveBeenCalledWith(
+      expect.stringMatching(/^human_eval_artifact_[a-f0-9]{32}$/),
+      'claimed',
+      expect.stringContaining('https://example.com/new.png'),
+      'auto-human-eval',
+    );
+  });
+
+  it('returns false for an artifact URL already claimed', async () => {
+    mockGetSetting.mockResolvedValue({ settingValue: 'claimed' });
+
+    const claimed = await claimArtifactForHumanEval('https://example.com/dup.png');
+
+    expect(claimed).toBe(false);
+    expect(mockSetSetting).not.toHaveBeenCalled();
+  });
+
+  it('has nothing to dedupe against when no artifact URL is given, so returns true without touching settings', async () => {
+    const claimed = await claimArtifactForHumanEval(undefined);
+
+    expect(claimed).toBe(true);
+    expect(mockGetSetting).not.toHaveBeenCalled();
+    expect(mockSetSetting).not.toHaveBeenCalled();
+  });
+
+  it('fails open (returns true) rather than blocking a real candidate when the settings lookup itself throws', async () => {
+    mockGetSetting.mockRejectedValue(new Error('DynamoDB GetItem transiently failed'));
+
+    const claimed = await claimArtifactForHumanEval('https://example.com/flaky-settings.png');
+
+    expect(claimed).toBe(true);
   });
 });
