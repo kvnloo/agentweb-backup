@@ -7,7 +7,6 @@ import {
   SearchRequest,
 } from './searchProvider';
 import { recordVendorUsage } from '../services/usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 interface GoogleSearchCredentials {
   apiKey: string;
@@ -45,8 +44,9 @@ export class GoogleSearchProvider implements SearchProvider {
       feature: request.purpose || 'agent_research',
       unit: 'query',
       quantity: 1,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('google_cse', 'query', 1),
+      // ENG-1929: priced inside the recorder, so a missing rate cannot throw
+      // into the search that follows.
+      rateKey: 'query',
     });
     const response = await customsearch.cse.list({
       auth: credentials.apiKey,

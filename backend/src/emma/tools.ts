@@ -2864,7 +2864,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2874,11 +2874,11 @@ emmaToolRegistry.register({
         },
         variable_values_json: {
           type: 'string',
-          description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
+          description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Values are inserted as literal plain text — no HTML tags or Markdown formatting. Example: {"title": "Hello", "company_name": "Acme Corp"}'
         },
         array_variable_values_json: {
           type: 'string',
-          description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
+          description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. Each string is inserted as literal plain text — no HTML tags or Markdown formatting. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
         }
       },
       required: ['template_id', 'variable_values_json', 'array_variable_values_json']
@@ -4864,12 +4864,17 @@ emmaToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any, _context?: any) => {
+  execute: async (args: any, context?: any) => {
     // Intentionally pass no model: describe_image always uses the configured
     // agent_mode_default_model (resolved inside describeImage), not the chat's
     // selected model. (`args.llmModel` was never populated — the schema doesn't
     // expose it and the registry doesn't merge context into args.)
-    return await agentModeService.describeImage(undefined, args.image_url, args.prompt);
+    // ENG-1858: meter the vision call to the calling user instead of "system".
+    return await agentModeService.describeImage(undefined, args.image_url, args.prompt, {
+      userId: context?.userId || context?.agentUserId,
+      sessionId: context?.sessionId,
+      feature: 'describe_image',
+    });
   }
 });
 

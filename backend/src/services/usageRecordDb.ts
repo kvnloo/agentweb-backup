@@ -209,7 +209,13 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
   const addClauses: string[] = [];
   if (isUnitEntry) {
     names["#quantity"] = "quantity";
-    values[":qty"] = Math.max(0, Math.round(inc.quantity || 0));
+    // Fractional on purpose, never rounded (ENG-1878). ElevenLabs bills per
+    // 1,000 characters and records a 24-character clip as 0.024 units; rounding
+    // wrote 0 for every clip under 500 characters, so the aggregate lost the
+    // usage its own spend event kept. DynamoDB numbers are exact decimals, so
+    // ADD accumulates these without float drift. Still never negative or NaN.
+    const quantity = Number(inc.quantity);
+    values[":qty"] = Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
     addClauses.push("#quantity :qty");
   } else {
     Object.assign(values, {

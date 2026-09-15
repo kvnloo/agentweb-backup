@@ -36,6 +36,8 @@ import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } f
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
+import { meteringFeature } from '../services/llmUsageAttributionService';
+import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
@@ -1505,7 +1507,7 @@ Answer "no" for everything else, including ordinary requests, questions, correct
 
 Reply with ONLY one word: yes or no.`;
 
-async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> {
+async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLMUsageContext): Promise<boolean> {
   try {
     const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
     if (!recent?.content) return false;
@@ -1523,7 +1525,13 @@ async function userExplicitlyRequestedStop(sessionId: string): Promise<boolean> 
       // empty-string parse then (correctly, but unintentionally) treated as "no". 500 leaves
       // headroom for a reasoning trace ahead of the one-word answer; cost scales with tokens
       // actually generated, not this ceiling.
-      { temperature: 0, max_completion_tokens: 500, taskClass: 'scheduled_background' }
+      {
+        temperature: 0,
+        max_completion_tokens: 500,
+        taskClass: 'scheduled_background',
+        // ENG-1858: judging the user's own continuation — attribute it to them.
+        usageContext: usageContext ?? { feature: 'stop_request_judge' },
+      }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
@@ -1675,7 +1683,15 @@ async function scheduleAutoWorkPlanContinuation(
   // fresh on every round (this function re-reads session state each time it's called), so a
   // user who says "stop" mid-chain is caught on the very next round automatically. Checked
   // only here, on the rare already-decided-to-continue path — not on every ordinary turn.
-  if (await userExplicitlyRequestedStop(sessionId)) {
+  if (await userExplicitlyRequestedStop(
+    sessionId,
+    // ENG-1858: the continuation bills this user, so its stop judge does too.
+    {
+      userId,
+      sessionId,
+      feature: meteringFeature('stop_request_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+    },
+  )) {
     console.log(
       `AgentMode: work-plan auto-continuation for session ${sessionId} suppressed — user's ` +
       `most recent message explicitly asked to stop.`
@@ -2013,7 +2029,13 @@ async function getDiagnosticErrorMessage(
     // "75 of 97 leads" is left whole by the N-of-M rule above, which never rewrites
     // an N-of-M construction.
     const foundedCounts = importTotals?.known ? [importTotals.landed] : [];
-    const message = await agentModeService.generateDiagnosticMessage(context);
+    // ENG-1858: bill the diagnosis to the session owner (the account the failed turn
+    // was billed to), not "system".
+    const message = await agentModeService.generateDiagnosticMessage(context, {
+      userId: session?.userId,
+      sessionId,
+      feature: meteringFeature('diagnostic_message', session?.sessionType, extractScheduleId(session?.pageIdentifier)),
+    });
     return {
       // ENG-1173: three passes, in this order and for this reason.
       //   1. strip — every entity quantity goes, EXCEPT one the run's own tool
@@ -3543,7 +3565,7 @@ Answer "no" when the message actually DELIVERS the result (a report, analysis, o
 
 Reply with ONLY one word: yes or no.`;
 
-export async function scheduledTurnDefersToUser(content: string): Promise<boolean> {
+export async function scheduledTurnDefersToUser(content: string, usageContext?: LLMUsageContext): Promise<boolean> {
   if (!content || typeof content !== 'string') return false;
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
@@ -3565,7 +3587,13 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
         // The closing of the message is where a halt lives; cap input for cost.
         { role: 'user', content: judgeableContent.slice(-2500) },
       ],
-      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
+      {
+        temperature: 0,
+        max_completion_tokens: 3,
+        taskClass: 'scheduled_background',
+        // ENG-1858: part of the run owner's verified chat, not "system".
+        usageContext: usageContext ?? { feature: 'scheduled_continuation_judge' },
+      }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('confirmation judge timed out')), CONFIRMATION_JUDGE_TIMEOUT_MS)
@@ -3621,7 +3649,7 @@ export async function classifyScheduledContinuationAsync(response: {
   truncatedByStepBudget?: boolean;
   truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
-}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
+}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>, usageContext?: LLMUsageContext): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
@@ -3634,7 +3662,7 @@ export async function classifyScheduledContinuationAsync(response: {
   // ENG-803: same withhold exemption as the sync classifier above — and it must be
   // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
   // that is deliberately shaped like a deferral.
-  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content)) return 'confirmation';
+  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content, usageContext)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -3885,6 +3913,9 @@ async function runVerifiedChatInner(
   // Tracks how many completion-gate continuation turns we've already spent, so a
   // model that keeps admitting "not finished" can't loop indefinitely.
   let completionGateContinuationsUsed = 0;
+
+  // ENG-1858: the completion-gate judge is part of this user's run.
+  const continuationJudgeUsageContext: LLMUsageContext = { userId, sessionId, feature: 'scheduled_continuation_judge' };
   
   // Ensure attachments is always an array
   const attachmentsArray = Array.isArray(attachments) ? attachments : [];
@@ -4309,7 +4340,7 @@ async function runVerifiedChatInner(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        }, publishAuthorized);
+        }, publishAuthorized, continuationJudgeUsageContext);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -4871,7 +4902,7 @@ async function runVerifiedChatInner(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          }, publishAuthorized)
+          }, publishAuthorized, continuationJudgeUsageContext)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -6180,6 +6211,10 @@ export async function runScheduledChat(
             lastRunStatus: lastRun?.status ?? null,
             lastRunSummary: (lastRun?.summary || lastRun?.actualResponse || null) as string | null,
             consecutiveNoOutputRuns: countTrailingNoActionableOutputRuns(priorRunResults),
+          }, {
+            // ENG-1858: the gate runs on the schedule owner's behalf. No session exists yet.
+            userId,
+            feature: meteringFeature('scheduled_run_precheck', 'scheduled', schedule.scheduleId),
           });
         } catch (preCheckError) {
           // evaluateScheduledRunPreCheck is itself fail-open (never throws), but an
@@ -6589,7 +6624,12 @@ export async function runScheduledChat(
         .filter(toolCallSucceeded)
         .map((call: any) => call?.name)
         .filter(Boolean);
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);
+      // ENG-1858: part of the schedule owner's run — attribute and charge it.
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames, {
+        userId,
+        sessionId,
+        feature: meteringFeature('scheduled_run_summary', 'scheduled', schedule.scheduleId),
+      });
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;
@@ -8161,7 +8201,12 @@ export async function generateSessionResponse(
   // If this is the first message, generate session title (skip for scheduled sessions which already have a title)
   if (isFirstMessage && session.sessionType !== 'scheduled') {
     try {
-      const title = await agentModeService.generateSessionTitle(userMessage);
+      // ENG-1858: the title is part of this user's first turn — attribute and charge it.
+      const title = await agentModeService.generateSessionTitle(userMessage, {
+        userId,
+        sessionId,
+        feature: meteringFeature('session_title', session.sessionType, extractScheduleId(session.pageIdentifier)),
+      });
       await chatbotDb.updateSessionTitle(sessionId, title);
     } catch (error) {
       console.error('AgentMode: Failed to update session title:', error);
