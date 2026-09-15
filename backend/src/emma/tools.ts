@@ -7892,7 +7892,12 @@ emmaToolRegistry.register({
               },
               run_id: {
                 type: 'string',
-                description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
+                description: 'AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure. REQUIRED whenever claimed_unavailable_tools is set.'
+              },
+              claimed_unavailable_tools: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Exact tool name(s) this report asserts are broken, unavailable, or not working (e.g. ["playwright_browser_navigate"]). Set this whenever the bug claims a SPECIFIC tool does not work. run_id is then REQUIRED: the server verifies each named tool was actually called in that run\'s telemetry before filing — a tool you never called in this session cannot be reported as broken, no matter how the description is worded. Call the tool and observe the real failure first; do not infer unavailability from a different tool\'s error or from not having tried yet. Leave this empty for reports that are not about a specific tool failing (general output-quality complaints, missing product capabilities — use type: feature_request for those).'
               },
               type: {
                 type: 'string',
@@ -7979,7 +7984,27 @@ emmaToolRegistry.register({
         // Server-side run-dossier enrichment: the reporter passes a run_id and
         // the server pulls the telemetry it already has. Best-effort — a
         // failed lookup must never block the report.
+        //
+        // EXCEPT for `claimed_unavailable_tools` (ENG-1945 follow-up): that field is an
+        // evidence-backed claim, not prose, and it exists specifically because prose could
+        // not be trusted — session ff31ccb7 filed "navigation and extraction tools remain
+        // unavailable" without ever having called playwright_browser_navigate/snapshot/
+        // evaluate/click, and the model proved itself wrong on its very next real attempt.
+        // Once a report asserts a SPECIFIC tool is broken via this field, "best-effort" no
+        // longer applies to verifying it: an unverifiable claim (lookup failed, run not
+        // found) must be REJECTED, same as a claim the telemetry contradicts, or this
+        // channel would be exactly as trustable as the free-text prose it replaces.
         let description: string = issue.description;
+        const claimedUnavailableTools = Array.isArray(issue.claimed_unavailable_tools)
+          ? issue.claimed_unavailable_tools.filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
+          : [];
+        if (claimedUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+          throw new Error(
+            `Cannot file "${issue.title}": claimed_unavailable_tools (${claimedUnavailableTools.join(', ')}) requires run_id ` +
+            `so the claim can be checked against that run's actual tool-call telemetry. Include the run_id from THIS ` +
+            `session, or drop claimed_unavailable_tools if you are not asserting a specific tool is broken/unavailable.`
+          );
+        }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
         // report (an internal reviewer surfacing a telemetry/satisfaction-report pattern from a
         // customer's session). When it does, THAT user — not the reviewer — is the affected
@@ -7994,7 +8019,39 @@ emmaToolRegistry.register({
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
             const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
             const run = runs[0];
-            if (run) {
+            if (!run) {
+              if (claimedUnavailableTools.length > 0) {
+                throw new Error(
+                  `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
+                  `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')}) cannot be verified. Use the exact ` +
+                  `run_id from THIS session's runtime telemetry.`
+                );
+              }
+            } else {
+              // The hard gate: a tool can only be REPORTED broken/unavailable if it was
+              // actually invoked (any outcome — success, failure, or deferral all count as
+              // "attempted"; only a tool with ZERO invocations this run is an unverified
+              // claim) in this exact run. Checked against EVT_TOOL_INVOKED telemetry, which
+              // is recorded independently of anything the model writes — the claim cannot
+              // talk its way past this the way it could past a prompt-only instruction.
+              if (claimedUnavailableTools.length > 0) {
+                const invokedToolNames = new Set(
+                  (run.outcomes || [])
+                    .filter((o: any) => o.eventType === 'agent_tool_invoked' && typeof o.toolName === 'string')
+                    .map((o: any) => o.toolName as string)
+                );
+                const neverAttempted = claimedUnavailableTools.filter((name: string) => !invokedToolNames.has(name));
+                if (neverAttempted.length > 0) {
+                  throw new Error(
+                    `Cannot file "${issue.title}": claimed_unavailable_tools names ${neverAttempted.join(', ')}, but run ` +
+                    `${run.runId} never actually called ${neverAttempted.length === 1 ? 'it' : 'them'}. A tool can only ` +
+                    `be reported broken/unavailable after you have actually called it in THIS session and observed the ` +
+                    `failure yourself — call it first, or remove it from claimed_unavailable_tools if you were not ` +
+                    `actually asserting it is broken.`
+                  );
+                }
+              }
+
               const failures = (run.outcomes || [])
                 .filter((o: any) => o.eventType === 'agent_tool_failed')
                 .slice(0, 10)
@@ -8002,6 +8059,17 @@ emmaToolRegistry.register({
                   const argsPart = o.failedArgsJson ? `\n  args: ${o.failedArgsJson}` : '';
                   return `- ${o.toolName || 'unknown'} [${o.errorClass || 'Error'}]: ${o.errorMessage || ''}${argsPart}`;
                 });
+              // Ground truth for whoever triages this (ENG-1945 follow-up): the tools this
+              // run ACTUALLY invoked, attached whenever a run_id is present — even for
+              // reports that never populate claimed_unavailable_tools. A model can still
+              // describe unavailability in free-text `description` without using the
+              // structured field above, which the hard gate can't see; this makes the
+              // mismatch visible to a human/triage pipeline reading the filed report either way.
+              const invokedNames = Array.from(new Set(
+                (run.outcomes || [])
+                  .filter((o: any) => o.eventType === 'agent_tool_invoked' && typeof o.toolName === 'string')
+                  .map((o: any) => o.toolName as string)
+              )).sort();
               description += [
                 '',
                 '',
@@ -8009,6 +8077,7 @@ emmaToolRegistry.register({
                 `AgentRun dossier (auto-attached from run_id ${run.runId}):`,
                 `- verdict: ${(run as any).verdict || 'n/a'}  |  tool calls: ${(run as any).toolCalls ?? 'n/a'}  |  failed: ${(run as any).failedToolCalls ?? 'n/a'}`,
                 ...(run.sessionId ? [`- session: ${run.sessionId}`] : []),
+                `- tools actually invoked this run: ${invokedNames.length > 0 ? invokedNames.join(', ') : 'none'}`,
                 ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
               ].join('\n');
               issueContext['AgentRun ID'] = run.runId;
@@ -8032,6 +8101,9 @@ emmaToolRegistry.register({
               }
             }
           } catch (e) {
+            // `claimed_unavailable_tools` turns this from best-effort into a hard
+            // requirement — an unverifiable claim must not silently file (see above).
+            if (claimedUnavailableTools.length > 0) throw e;
             console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
           }
         }
