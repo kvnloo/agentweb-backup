@@ -110,12 +110,17 @@ describe('AgentMode core loop — install_skills same-batch tool gate (ENG-1945)
   });
 
   it('a tool unlocked by install_skills succeeds when requested in the SAME batch as the install', async () => {
-    // ENG-1945 (review follow-up): install_skills now genuinely executes TWICE per
-    // batch — the eager Phase-1 head start (now itself routed through the gateway)
-    // and the authoritative Phase-2 gateway call. The harness's `executeTool` mock
-    // is keyed only by tool name, so `toolCallSequence` (populated solely from the
-    // Phase-2 ledger entry) can't see this — spy on `executeTool` directly to lock
-    // in the intended invocation count.
+    // ENG-1945 (root-cause follow-up): install_skills executes exactly ONCE per
+    // batch — the eager Phase-1 head start IS the tool's only real execution (routed
+    // through the gateway, after contract validation/policy so it never mutates
+    // session state ahead of a call Phase 1 goes on to preflight-reject); Phase 2
+    // replays that cached outcome rather than re-running the tool. A second,
+    // independent execution isn't just redundant, it double-records failures against
+    // the gateway's per-run breaker and silently halves install_skills' retry budget
+    // (see toolDispatch.test.ts's breaker-budget regression test). The harness's
+    // `executeTool` mock is keyed only by tool name, so `toolCallSequence` (populated
+    // solely from the Phase-2 ledger entry) can't see this — spy on `executeTool`
+    // directly to lock in the intended invocation count.
     const executeToolSpy = jest.spyOn(service as any, 'executeTool');
 
     const snapshot = await runScenario(service, {
@@ -150,7 +155,7 @@ describe('AgentMode core loop — install_skills same-batch tool gate (ENG-1945)
     ]);
 
     const installSkillsCalls = executeToolSpy.mock.calls.filter(([, toolName]) => toolName === 'install_skills');
-    expect(installSkillsCalls).toHaveLength(2);
+    expect(installSkillsCalls).toHaveLength(1);
   });
 
   it('a sibling gated tool stays blocked when install_skills rejects an unresolvable skill id in the same batch', async () => {
