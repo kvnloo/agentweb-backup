@@ -8829,7 +8829,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, clientId } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, clientId } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -8984,6 +8984,36 @@ export const agentModeController = {
           }
           throw err;
         }
+      }
+
+      // ENG-1635/1644: a full approval-deck submission. Unlike questionAnswer/
+      // workPlanInputAnswer, this doesn't just persist an answer for the model to
+      // read later — submitApprovalDeckAnswers actually dispatches every approved
+      // write (step-per-write, independent-step engine) SYNCHRONOUSLY before this
+      // request returns, so by the time Emma sees this turn the writes have
+      // already run. The outcome (and gap 4: any REJECT — <correction> free text)
+      // is injected the same way workPlanInputAnswer's structured values are —
+      // appended to userMessage — so Emma reacts to what actually happened
+      // instead of assuming success or asking the user to confirm again.
+      if (deckAnswer) {
+        if (!session.pendingApprovalDeck) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.answers, 'user');
+        if (result.outcome === 'invalid') {
+          return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
+        }
+        if (result.outcome === 'conflict') {
+          return res.status(409).json({ error: 'This approval deck was already answered by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const rejections = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
+        userMessage = `${userMessage}\n\n[Approval deck outcome: ${JSON.stringify({
+          status: result.summary?.status ?? 'nothing_approved',
+          items: result.summary?.items ?? [],
+          ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
+        })}]`;
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
