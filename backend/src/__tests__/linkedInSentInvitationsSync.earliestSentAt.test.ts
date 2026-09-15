@@ -3,10 +3,10 @@
  *
  * LinkedIn reports only relative ages; Unipile resolves "Sent 3 months ago" at
  * request time, so every observation lands at or after the real send. The old
- * rule kept the FIRST observation, which froze wrong rows forever. Production,
- * 2026-09-14: 450 of TFA Connect's 681 rows carried their first sync time as
- * sentAt, so invitations from March–May looked 4–19 days old and the stale
- * invitation drain (ENG-1719) could not see them.
+ * rule kept the FIRST observation, which froze wrong rows forever: on large
+ * production backlogs most rows carried their first sync time as sentAt, so
+ * months-old invitations looked days old and the stale-invitation drain
+ * (ENG-1719) could not see them.
  */
 
 import {
@@ -18,11 +18,11 @@ import type { UnipileSentInvitation } from '../services/unipileSentInvitationsDb
 const NOW = '2026-09-15T12:00:00.000Z';
 
 const row = (overrides: Partial<UnipileSentInvitation> = {}): UnipileSentInvitation => ({
-  accountId: 'ofGscnIrR5qZYZ00ovNsTQ',
-  invitedUserPublicId: 'kai-luo',
-  publicProfileUrl: 'https://www.linkedin.com/in/kai-luo/',
+  accountId: 'acct-test',
+  invitedUserPublicId: 'person-test',
+  publicProfileUrl: 'https://www.linkedin.com/in/person-test/',
   invitationId: 'inv-1',
-  invitedUserName: 'Kai Luo',
+  invitedUserName: 'Test Person',
   invitationText: '',
   sentAt: '2026-09-10T00:53:49.000Z',
   syncedAt: '2026-09-10T00:53:49.000Z',
@@ -66,10 +66,30 @@ describe('resolveLedgerSentAt', () => {
       .toBe('2026-09-14T09:00:00.000Z');
   });
 
-  it('a send-path row with no invitationId yet is still the same invitation', () => {
-    const cached = row({ invitationId: '', sentAt: '2026-09-15T11:58:02.114Z' });
-    expect(resolveLedgerSentAt(cached, { id: 'inv-1', parsed_datetime: '2026-09-15T11:59:40.000Z' }, NOW))
-      .toBe('2026-09-15T11:58:02.114Z');
+  it('an id-less cached row never makes a NEW invitation look older (CodeRabbit, PR #2916)', () => {
+    // A stale id-less row for this person survives; they are re-invited today.
+    // Inheriting March would let the drain withdraw a same-day invitation.
+    const cached = row({ invitationId: '', sentAt: '2026-03-01T00:00:00.000Z' });
+    const sentAt = resolveLedgerSentAt(cached, { id: 'inv-new', parsed_datetime: '2026-09-15T11:59:40.000Z' }, NOW);
+
+    expect(sentAt).toBe('2026-09-15T11:59:40.000Z');
+    // The id change forces the rewrite, so the corrected date is actually stored.
+    expect(sentInvitationChanged(cached, { ...cached, invitationId: 'inv-new', sentAt })).toBe(true);
+  });
+
+  it('identity unknown and no provider value: carries the cached date forward (ENG-787 stability)', () => {
+    expect(resolveLedgerSentAt(row({ invitationId: '' }), { id: 'inv-1' }, NOW)).toBe('2026-09-10T00:53:49.000Z');
+    expect(resolveLedgerSentAt(row(), { parsed_datetime: undefined }, NOW)).toBe('2026-09-10T00:53:49.000Z');
+  });
+
+  it('identity unknown from the provider side (no item id) uses the provider value, not an older cached one', () => {
+    const cached = row({ sentAt: '2026-03-01T00:00:00.000Z' });
+    expect(resolveLedgerSentAt(cached, { parsed_datetime: '2026-09-14T00:00:00.000Z' }, NOW)).toBe('2026-09-14T00:00:00.000Z');
+  });
+
+  it('a different invitationId with no provider value starts at now, not at the old date', () => {
+    const cached = row({ invitationId: 'inv-old', sentAt: '2026-03-01T00:00:00.000Z' });
+    expect(resolveLedgerSentAt(cached, { id: 'inv-new' }, NOW)).toBe(NOW);
   });
 
   it('ignores an unparseable or future provider value instead of trusting it', () => {

@@ -31,12 +31,14 @@ export function sentInvitationChanged(
 /** Tolerated clock skew before a provider timestamp counts as "in the future". */
 const FUTURE_SKEW_MS = 5 * 60 * 1000;
 
+/** Epoch ms of an ISO timestamp, or null when it is missing, unparseable, or in the future. */
 function validPastMs(value: unknown, nowMs: number): number | null {
   if (typeof value !== 'string' || value.trim() === '') return null;
   const ms = Date.parse(value);
   return Number.isNaN(ms) || ms > nowMs + FUTURE_SKEW_MS ? null : ms;
 }
 
+/** True when `candidate` parses and is strictly earlier than `cached` (or `cached` does not parse). */
 function isEarlierTimestamp(candidate: string | undefined, cached: string | undefined): boolean {
   const candidateMs = typeof candidate === 'string' ? Date.parse(candidate) : NaN;
   const cachedMs = typeof cached === 'string' ? Date.parse(cached) : NaN;
@@ -54,16 +56,22 @@ function isEarlierTimestamp(candidate: string | undefined, cached: string | unde
  * earliest one seen is the tightest estimate. Keeping the FIRST value instead
  * (the pre-ENG-1938 rule) froze two kinds of wrong row forever:
  *   - a row first seen while Unipile omitted `parsed_datetime`, stamped with the
- *     sync time — 450 of TFA Connect's 681 rows on 2026-09-14, which made invites
- *     from March–May look 4–19 days old to the stale-invitation drain;
+ *     sync time — on large production backlogs most rows looked this way, so
+ *     months-old invitations looked days old to the stale-invitation drain;
  *   - a row first seen at a coarse bucket ("1 week ago") that later rolled over
  *     to an earlier one ("1 month ago").
  *
  * Properties the callers rely on:
  *   - Never moves later, so request-time drift causes no rewrite (ENG-875) and a
  *     send-path row keeps the exact instant it was stamped with.
- *   - A different `invitationId` is a NEW invitation to the same person (re-invite
- *     after a withdrawal/acceptance), so the old row's date is discarded.
+ *   - The earliest-wins rule applies only when BOTH ids are present and equal. A
+ *     cached date must never make a DIFFERENT invitation look older than it is —
+ *     that is the direction that gets a fresh re-invite withdrawn prematurely
+ *     (CodeRabbit on PR #2916). So:
+ *       · different ids → a new invitation: provider value, else now;
+ *       · either id missing → identity unknown: the provider value when there is
+ *         one (never older than this invitation's real send), otherwise the cached
+ *         value carried forward so sentAt does not re-stamp every sync (ENG-787).
  *   - An unparseable or future provider value is ignored rather than trusted.
  */
 export function resolveLedgerSentAt(
@@ -72,20 +80,20 @@ export function resolveLedgerSentAt(
   now: string,
 ): string {
   const nowMs = Date.parse(now);
-  const sameInvitation = !cached
-    || !cached.invitationId
-    || typeof item.id !== 'string'
-    || !item.id
-    || cached.invitationId === item.id;
-  const cachedSentAt = sameInvitation ? cached?.sentAt : undefined;
-  const cachedMs = validPastMs(cachedSentAt, nowMs);
   const parsedMs = validPastMs(item.parsed_datetime, nowMs);
+  const parsed = parsedMs !== null ? (item.parsed_datetime as string) : null;
+  const cachedId = typeof cached?.invitationId === 'string' ? cached.invitationId : '';
+  const itemId = typeof item.id === 'string' ? item.id : '';
 
-  if (parsedMs !== null && (cachedMs === null || parsedMs < cachedMs)) {
-    return item.parsed_datetime as string;
+  if (cachedId && itemId && cachedId !== itemId) return parsed ?? now;
+
+  const cachedMs = validPastMs(cached?.sentAt, nowMs);
+  if (cachedId && itemId) {
+    if (parsedMs !== null && (cachedMs === null || parsedMs < cachedMs)) return parsed as string;
+    return cachedMs !== null ? (cached!.sentAt as string) : now;
   }
-  if (cachedMs !== null) return cachedSentAt as string;
-  return now;
+  if (parsed !== null) return parsed;
+  return cachedMs !== null ? (cached!.sentAt as string) : now;
 }
 
 export interface SyncSentInvitationsOptions {

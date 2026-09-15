@@ -106,8 +106,9 @@ describe('syncSentInvitationsForAccount', () => {
     it('keeps the cached value when parsed_datetime is LATER — an earlier estimate is never overwritten (ENG-1938)', async () => {
       // Pre-ENG-1938 this test asserted the opposite ("prefers parsed_datetime"),
       // which moved sentAt later whenever any other field forced a rewrite.
+      // Same invitation (matching id): only then may an earlier cached date stand.
       mockGetAllSentInvitationsByAccount.mockResolvedValue([
-        { invitedUserPublicId: 'jane-doe', sentAt: '2020-01-01T00:00:00.000Z' },
+        { invitedUserPublicId: 'jane-doe', invitationId: 'inv-jane-doe', sentAt: '2020-01-01T00:00:00.000Z' },
       ]);
       mockListSentInvitations.mockResolvedValue({ items: [invitation('jane-doe')], cursor: undefined });
 
