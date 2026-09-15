@@ -120,6 +120,29 @@ describe('EnigmaService.lookupBrandCardRevenue', () => {
     });
   });
 
+  it('matches a brand whose only website is a subdomain of the lead domain, but never a site-builder apex', async () => {
+    const subdomainOnly = [brand({ websites: [{ website: 'https://shop.acme.com', domain: '', topLevelDomain: '' }] })];
+    const { svc } = service(jest.fn().mockResolvedValue(subdomainOnly));
+    expect((await svc.lookupBrandCardRevenue({ website: 'acme.com' })).status).toBe('found');
+
+    const hostedShop = [brand({ websites: [{ website: 'https://acme.squarespace.com', domain: '', topLevelDomain: '' }] })];
+    const { svc: svc2 } = service(jest.fn().mockResolvedValue(hostedShop));
+    expect((await svc2.lookupBrandCardRevenue({ website: 'squarespace.com' })).status).toBe('not_found');
+  });
+
+  it('never serves one user\'s cached lookup to another user', async () => {
+    const search = jest.fn().mockResolvedValue([brand()]);
+    const { svc } = service(search);
+
+    await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'user-a' });
+    const otherUser = await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'user-b' });
+    const sameUser = await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'user-a' });
+
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(otherUser.fromCache).toBe(false);
+    expect(sameUser.fromCache).toBe(true);
+  });
+
   it('treats a brand on a different TLD as not found and discards its values', async () => {
     const search = jest.fn().mockResolvedValue([
       brand({ websites: [{ website: 'https://acme.com', domain: 'acme', topLevelDomain: 'com' }] }),
@@ -138,6 +161,9 @@ describe('EnigmaService.lookupBrandCardRevenue', () => {
     ['negative amount', [txn('card_revenue_amount', -5)]],
     ['missing period end date', [txn('card_revenue_amount', 1000, { periodEndDate: null })]],
     ['platform-attributed slice only', [txn('card_revenue_amount', 1000, { platformBrandId: 'uber-eats' })]],
+    ['impossible period end date', [txn('card_revenue_amount', 1000, { periodEndDate: '2026-02-30' })]],
+    ['out-of-range period date', [txn('card_revenue_amount', 1000, { periodStartDate: '2026-99-99' })]],
+    ['date with trailing junk', [txn('card_revenue_amount', 1000, { periodEndDate: '2026-05-31-invalid' })]],
   ])('never fabricates a revenue value (%s)', async (_label, txns) => {
     const search = jest.fn().mockResolvedValue([brand({ txns })]);
     const { svc } = service(search);
@@ -271,6 +297,18 @@ describe('buildEnigmaHttpClient', () => {
     const err = await buildEnigmaHttpClient('k').searchBrand({ website: 'popupbagels.com' }).catch((e) => e);
     expect(err).toBeInstanceOf(ErrorType);
     if (status === 429) expect((err as EnigmaRateLimitedError).retryAfterSec).toBe(30);
+    expect(mockRecordVendorUsage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing data', {}],
+    ['null search', { data: { search: null } }],
+    ['non-array search', { data: { search: { id: 'b1' } } }],
+  ])('treats a malformed HTTP 200 (%s) as a failure, never an empty result', async (_label, body) => {
+    respond(200, body);
+
+    await expect(buildEnigmaHttpClient('k').searchBrand({ website: 'popupbagels.com' }))
+      .rejects.toThrow('Enigma response missing data.search array');
     expect(mockRecordVendorUsage).not.toHaveBeenCalled();
   });
 
