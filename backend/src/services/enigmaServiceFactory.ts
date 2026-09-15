@@ -27,39 +27,10 @@ import {
 import { getEnigmaApiKey } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
 import { computeAllocatedCost, getRecordingUnit } from '../utils/vendorRateCard';
+import { buildSearchBrandBody } from './enigmaGraphql';
 
-export const ENIGMA_GRAPHQL_URL = 'https://api.enigma.com/graphql';
+const ENIGMA_GRAPHQL_URL = 'https://api.enigma.com/graphql';
 const REQUEST_TIMEOUT_MS = 30_000;
-export const MATCH_THRESHOLD = 0.8;
-
-// One brand, its first name, its websites (to confirm the match against our
-// domain) and the latest 12-month card revenue + YoY growth. Every field
-// requested here that Enigma bills for must be counted by
-// countEnigmaBilledFills, or the ledger under-reports spend. Exported (with the
-// conditions below) so evaluation scripts run the exact production query.
-export const SEARCH_BRAND_QUERY = `
-query SearchBrandCardRevenue($searchInput: SearchInput!, $cardTransactionConditions: ConnectionConditions!) {
-  search(searchInput: $searchInput) {
-    ... on Brand {
-      id
-      names(first: 1) { edges { node { name } } }
-      websites(first: 5) { edges { node { website domain topLevelDomain } } }
-      cardTransactions(first: 4, conditions: $cardTransactionConditions) {
-        edges { node { quantityType period projectedQuantity periodStartDate periodEndDate platformBrandId } }
-      }
-    }
-  }
-}`;
-
-export const CARD_TRANSACTION_CONDITIONS = {
-  filter: {
-    AND: [
-      { EQ: ['period', '12m'] },
-      { EQ: ['rank', 0] },
-      { IN: ['quantityType', ['card_revenue_amount', 'card_revenue_yoy_growth']] },
-    ],
-  },
-};
 
 // ─── Vendor $ ledger mirroring ──────────────────────────────────────────────
 //
@@ -95,21 +66,10 @@ function parseRetryAfter(header: string | null): number | undefined {
 export function buildEnigmaHttpClient(apiKey: string): EnigmaHttpClient {
   return {
     async searchBrand(request, userId) {
-      const searchInput = {
-        entityType: 'BRAND',
-        website: request.website,
-        ...(request.name ? { name: request.name } : {}),
-        matchThreshold: MATCH_THRESHOLD,
-        conditions: { limit: 1 },
-      };
-
       const res = await fetch(ENIGMA_GRAPHQL_URL, {
         method: 'POST',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          query: SEARCH_BRAND_QUERY,
-          variables: { searchInput, cardTransactionConditions: CARD_TRANSACTION_CONDITIONS },
-        }),
+        body: buildSearchBrandBody(request),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
 
