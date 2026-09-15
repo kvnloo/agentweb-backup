@@ -52,10 +52,73 @@ codex mcp login emma
 codex mcp list
 ```
 
-**API-Key Fallback:**
-1. Log in at `https://start.agentweb.pro`
-2. Navigate to Settings > API Keys
-3. Generate an MCP access token (starts with `aw_`)
+**Choose an authentication path:**
+- **Interactive, human-supervised clients** (Claude.ai, Claude Desktop, or Claude Code with a human present): use the OAuth browser-consent flow above. The client must be able to open a browser and keep its local OAuth callback listener available until consent completes.
+- **Headless, background, or CI clients:** register and create an API key with the REST API as shown below. This path does not open a browser or require a local OAuth callback.
+- **Existing AgentWeb accounts:** create or revoke keys in [Settings > API Keys](https://app.agentweb.pro/settings/api-keys).
+
+**Headless registration → API key → MCP:**
+
+Registration requires a company email address (personal-email providers are rejected) and a password of at least 12 characters.
+
+```http
+POST https://api.agentweb.pro/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "agent@example-company.com",
+  "password": "YOUR_12+_CHAR_PASSWORD"
+}
+```
+
+A successful registration returns HTTP 201 with this shape:
+
+```json
+{
+  "token": "JWT_TOKEN",
+  "metaEventId": "EVENT_UUID",
+  "user": {
+    "userId": "USER_UUID",
+    "email": "agent@example-company.com",
+    "isAdmin": false,
+    "roles": ["customer"],
+    "isOAuthUser": false,
+    "createdAt": "ISO_8601_TIMESTAMP"
+  }
+}
+```
+
+Use the returned JWT once to create an API key. `keyName` is required; the other request fields are optional.
+
+```http
+POST https://api.agentweb.pro/api/v1/agent/api-keys
+Authorization: Bearer JWT_TOKEN
+Content-Type: application/json
+
+{
+  "keyName": "Headless MCP client"
+}
+```
+
+A successful key creation returns HTTP 201. Save `rawKey` when it is returned; later key-list responses expose only `maskedKey`.
+
+```json
+{
+  "rawKey": "aw_YOUR_KEY",
+  "key": {
+    "keyId": "KEY_UUID",
+    "maskedKey": "aw_...LAST6",
+    "userId": "USER_UUID",
+    "keyName": "Headless MCP client",
+    "scopes": ["tools:read", "tools:execute"],
+    "rateLimitPerMin": 60,
+    "createdAt": "ISO_8601_TIMESTAMP",
+    "status": "active"
+  }
+}
+```
+
+Send that key as `Authorization: Bearer aw_YOUR_KEY` on requests to `https://api.agentweb.pro/mcp`.
 
 **Manual MCP Client Configuration:**
 ```json
