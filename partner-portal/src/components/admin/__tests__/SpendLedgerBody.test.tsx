@@ -515,6 +515,14 @@ describe("SpendLedgerBody enforcement state (ENG-1886)", () => {
     expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Not paused: the usage cap is admitting work");
   });
 
+  it("an uncapped account says no cap is configured, not that a cap is admitting work (CodeRabbit, PR #2922)", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live({ gatedBy: "none", limit: null }) })} />);
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Not paused: no usage cap is configured");
+    expect(card).not.toHaveTextContent("the usage cap is admitting work");
+  });
+
   it("AC3: distinguishes the enforcer's counter from the ledger total", () => {
     render(<SpendLedgerBody data={payload({ enforcement: live() })} />);
 

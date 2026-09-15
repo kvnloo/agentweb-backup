@@ -423,8 +423,13 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
           {isLiveEnforcement(data.enforcement) ? (
             <>
               <Typography variant="body2" fontWeight={600}>
+                {/* A pause always wins the heading; an uncapped account must not
+                    read as "the usage cap is admitting work" beside "no cap
+                    configured" (CodeRabbit, PR #2922). */}
                 {data.enforcement.paused
                   ? "Paused now by the usage cap"
+                  : data.enforcement.gatedBy === "none"
+                  ? "Not paused: no usage cap is configured"
                   : "Not paused: the usage cap is admitting work"}
                 {data.enforcement.usageMode ? ` (mode: ${data.enforcement.usageMode})` : ""}
               </Typography>
