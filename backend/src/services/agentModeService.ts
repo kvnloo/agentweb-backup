@@ -6578,6 +6578,19 @@ export class AgentModeService {
         installedSkills: installedNames
       };
 
+      /*
+       * ENG-1945: the actual tool names this call just unlocked, resolved the same way
+       * `rejectedToolNames` already is below. toolDispatch's same-batch preview call
+       * (a model very commonly asks for a tool in the SAME response it installs the
+       * skill that gates it) reads this field to fold the newly-allowed names into
+       * `allowedToolNames` before the rest of that batch is gated — without it, that
+       * sibling call has no way to learn what this install just granted.
+       */
+      const installedToolNames = Array.from(
+        new Set(validSkillIds.flatMap((id) => availableById.get(id)?.toolNames || [])),
+      );
+      if (installedToolNames.length > 0) result.installedToolNames = installedToolNames;
+
       if (rejectedSkillIds.length > 0) {
         /*
          * ENG-1795. This path returns `success: true` — something DID install — so

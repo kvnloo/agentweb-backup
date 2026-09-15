@@ -756,6 +756,38 @@ export async function executePreparedTools(
 
       if (toolCall.function.name === 'install_skills') {
         skillsUpdated = true;
+
+        /*
+         * ENG-1945: a model very commonly emits install_skills AND a tool that skill
+         * gates in the SAME batch ("install the browser skill, then navigate"). The
+         * authoritative execution below (Phase 2) runs install_skills, but only AFTER
+         * this whole Phase-1 loop finishes gating every call in the batch against
+         * `allowedToolNames` — so the sibling navigate/snapshot/etc. call, appearing
+         * later in this same array, was rejected as "not available" a beat before the
+         * install it depends on actually took effect. installSkills' `addAssociatedSkills`
+         * write is an idempotent Set union, so running it once, eagerly, here (ahead of
+         * its normal Phase 2 execution) is safe — it does not double-charge or
+         * double-mutate anything Phase 2 re-running it a moment later can't already
+         * tolerate. Best-effort: any real failure (unentitled/invalid skill) still
+         * surfaces normally through the authoritative Phase 2 call below.
+         */
+        try {
+          const eagerResult = await ports.executePreparedAgentTool({
+            llmModel,
+            toolName: 'install_skills',
+            functionArgs,
+            userId,
+            sessionId,
+            mockMode,
+            isDelegatedAccess,
+          });
+          if (Array.isArray(eagerResult?.installedToolNames)) {
+            eagerResult.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
+          }
+        } catch {
+          // Best-effort head start only — Phase 2 below remains the authoritative
+          // execution and reports any real error.
+        }
       }
 
       const initialPolicyDecision = ports.evaluateAgentToolPolicy({
