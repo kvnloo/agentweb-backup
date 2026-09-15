@@ -382,7 +382,12 @@ describe('listSpendEventsBounded (ENG-1841)', () => {
       }),
   });
 
-  beforeEach(() => jest.clearAllMocks());
+  // mockReset, not just clearAllMocks: a test that stops paging early leaves
+  // queued pages behind, and a later test must not receive them.
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDynamoDB.query.mockReset();
+  });
 
   it('pages to the end and reports not exceeded when the range fits', async () => {
     mockDynamoDB.query.mockReturnValueOnce(page(3, 0, false)).mockReturnValueOnce(page(2, 3, true));
