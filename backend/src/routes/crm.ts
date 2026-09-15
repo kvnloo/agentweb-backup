@@ -2279,17 +2279,31 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
     // Prefer icpResult (it has the cache); otherwise fall back to the
     // marketStrategy.icp store, converting to the icpResult shape with the
     // same mapping Emma's brand-build mirror uses.
+    //
+    // marketStrategy.icp edits are never mirrored back onto icpResult (see
+    // the "we deliberately do NOT write back" note below), so if the user
+    // corrects their ICPs on the Market Strategy page after onboarding, a
+    // plain "icpResult wins when non-empty" rule would serve the stale
+    // onboarding personas forever (ENG-1955). Resolve marketStrategy once
+    // up front and use it whenever it was saved more recently than
+    // icpResult was last generated.
+    let marketStrategy: any = user?.marketStrategy;
+    if (user?.orgId) {
+      const org: any = await orgDb.getOrgById(user.orgId);
+      if (org) {
+        marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+      }
+    }
+    const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    const marketStrategyIsNewer =
+      marketIcp.length > 0 &&
+      !!marketStrategy?.updatedAt &&
+      !!user?.icpCompletedAt &&
+      new Date(marketStrategy.updatedAt).getTime() > new Date(user.icpCompletedAt).getTime();
+
     let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     let fromMarketStrategy = false;
-    if (personas.length === 0) {
-      let marketStrategy: any = user?.marketStrategy;
-      if (user?.orgId) {
-        const org: any = await orgDb.getOrgById(user.orgId);
-        if (org) {
-          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
-        }
-      }
-      const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    if (personas.length === 0 || marketStrategyIsNewer) {
       if (marketIcp.length > 0) {
         const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
         personas = mapMarketIcpToResult(marketIcp);
