@@ -36,6 +36,8 @@ const mockTxn = usageRecordDb.incrementUsageWithSpendEvent as jest.Mock;
 const mockPlain = usageRecordDb.incrementUsage as jest.Mock;
 const mockMirror = mirrorVendorUsage as jest.Mock;
 
+// Cast: RecordVendorUsageContext is a union (rateKey XOR costSource, ENG-1929),
+// and Partial<> of a union spreads into combinations the union forbids.
 const ctx = (over: Partial<RecordVendorUsageContext> = {}): RecordVendorUsageContext => ({
   userId: 'user-1',
   billingUserId: 'owner-1',
@@ -47,7 +49,7 @@ const ctx = (over: Partial<RecordVendorUsageContext> = {}): RecordVendorUsageCon
   costSource: 'allocated',
   costUsd: 0.0125,
   ...over,
-});
+}) as RecordVendorUsageContext;
 
 describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
   beforeEach(() => {
