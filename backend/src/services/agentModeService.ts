@@ -118,6 +118,7 @@ import {
   type AskUserQuestionOption,
   type PendingUserQuestion,
 } from './agentMode/core/askUserQuestion';
+import { findApprovalDeckAnswerForDigest } from './agentMode/core/approvalDeck';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -20189,36 +20190,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     const session = await chatbotDb.getChatSession(sessionId);
-    // A session can carry MULTIPLE answered `meta_write_manifest` questions
-    // (each roll-off archives the prior one) — a newer manifest must not
-    // hide an EARLIER manifest that still authorizes this call's digest, so
-    // scan every candidate of this kind rather than taking only the single
-    // match `findQuestionByKind` would return.
-    const manifestCandidates: any[] = [];
-    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
-      manifestCandidates.push(session.pendingUserQuestion);
-    }
-    if (session?.answeredQuestions) {
-      for (const q of Object.values(session.answeredQuestions)) {
-        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
-      }
-    }
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
     if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest };
-    for (const manifestQuestion of manifestCandidates) {
-      const gate = checkQuestionGate(manifestQuestion);
-      if (!gate.allowed) continue;
-      // The card's approve-option payload carries the digests it authorizes
-      // (see the `meta_write_manifest` card producer) — the digest for THIS
-      // call must be one of them, not merely "some manifest was answered".
-      const grantedDigests: unknown = (gate.payload as any)?.digests;
-      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
-      const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
-      return { granted, digest };
-    }
-    return { granted: false, digest };
+    // ENG-1635/1644 gap 5 (plan's Migration note): sourced from the answered
+    // approval deck now, not a `meta_write_manifest`-kind AskUserQuestion —
+    // see approvalDeck.ts's findApprovalDeckAnswerForDigest header. This is
+    // the ONLY path a Meta write may be granted through; `params.confirm`
+    // alone is never sufficient (see the gate below, which no longer reads
+    // it at all before calling this).
+    const outcome = findApprovalDeckAnswerForDigest(session?.pendingApprovalDeck, digest);
+    if (!outcome.granted) return { granted: false, digest };
+    const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    return { granted, digest };
   }
 
   /**
@@ -20972,11 +20957,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     // Target-confirmation guardrail for mutating actions (publish/change/delete).
-    // The agent must echo the resolved target back to the user and re-call with
-    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
-    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
-    // gate-only flag and is stripped before dispatch so it never reaches Meta.
-    const confirmed = params.confirm === true;
+    // ENG-1635/1644 gap 5: `params.confirm` used to be read here into a
+    // `confirmed` boolean that could independently satisfy the halt below —
+    // that was the bypass (see the gate's own comment further down). The flag
+    // is no longer read as a trust signal at all; it is still stripped before
+    // dispatch below (`'confirm' in params`) purely so it never leaks to Meta
+    // as a literal field, not because it still means anything to this gate.
     /*
      * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
      * the confirmed execution are two separate calls with separately supplied params, so a
@@ -21001,15 +20987,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
 
-    // ENG-1642: an approved deployment manifest authorizes its exact writes
-    // without re-confirmation. `confirmed` from the model-controlled `confirm`
-    // flag is never itself trustworthy (that's the whole reason the gate
-    // below exists) — but a call whose canonical digest appears in a
-    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
-    // already been consumed in this session, may execute once without the
-    // halt. Deliberately narrower than the tracking-override mechanism: this
-    // never implies `override_tracking_check` (acceptance criterion 5), so
-    // the tracking pre-flight below is unaffected either way.
+    // ENG-1635/1644 gap 5 (critical, code-verified fix — see the reviewed plan):
+    // an approved deck authorizes its exact writes without re-confirmation, and
+    // this is now the ONLY path a Meta write may proceed through. `confirmed`
+    // (params.confirm, model-controlled) used to be OR'd alongside this grant
+    // check — `!confirmed && !manifestGranted` meant confirmed=true ALONE, with
+    // no grant at all, skipped the halt below. That is the exact failure mode
+    // of the 2026-07-19 RankAI incident (see askUserQuestion.ts's header),
+    // reproduced by this gate itself: a model could call this tool with
+    // confirm:true on a first, never-previewed call and the write would
+    // execute with no human ever asked. The grant check below now runs
+    // unconditionally for every Meta write action (not gated on `!confirmed`),
+    // and `confirmed` no longer appears in the halt condition at all — see
+    // below. `params.confirm` is now fully inert as a trust signal; it is not
+    // read anywhere in this function anymore (only stripped before dispatch,
+    // see above, so it never leaks to Meta as a literal field).
     let manifestGranted = false;
     // ENG-1635: the digest THIS grant was claimed against, so the eventual
     // outcome-recording call after dispatch (below) can record against the exact
@@ -21017,7 +21009,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Only meaningful when manifestGranted is true; unset on every other path.
     let grantedManifestDigest: string | undefined;
     if (
-      !confirmed &&
       AgentModeService.isMetaWriteAction(entity_type, action) &&
       sessionId
     ) {
@@ -21030,7 +21021,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (
       AgentModeService.isMetaWriteAction(entity_type, action) &&
-      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+      (!manifestGranted || (overrideClaimed && !overrideApproved))
     ) {
       /*
        * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
@@ -21110,10 +21101,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           `(for example, a different campaign, ad set, or asset).`,
         // Per-item body (no intro/footer) used when several writes are batched in one turn.
         confirmationDetail: summary,
-        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
-          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+        message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset). ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          `Do NOT re-call call_meta_marketing_api with params.confirm=true — that flag no longer grants ` +
+          `anything on its own (ENG-1635/1644). This write is now included in the pending approval review ` +
+          `presented to the user automatically; take no further action that depends on it until they submit ` +
+          `their answer.` +
           (overrideClaimed
             ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
               `WARNING above and approve it explicitly; the replay must additionally carry ` +
