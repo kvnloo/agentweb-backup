@@ -785,9 +785,23 @@ describe('HumanEvalService', () => {
   });
 
   describe('Slack posting toggle (ENG-1854)', () => {
-    it('persists the candidate even when Slack posting is disabled — never a silent drop', async () => {
-      const { service, slack, items, settings } = makeHarness();
+    it('posts by default when the toggle setting is absent entirely — ENG-1854 defaults to ON once the real noise sources (lead-enrichment volume, cross-path duplicates) were fixed independently of this toggle', async () => {
+      const { service, slack, settings } = makeHarness();
       settings.delete('human_eval_slack_posting_enabled');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated, no toggle setting configured at all.',
+        userId: 'user-no-exception',
+      });
+
+      expect(slack.postSlackMessage).toHaveBeenCalled();
+      expect(candidate.slackChannel).toBe('C_EVAL');
+    });
+
+    it('persists the candidate even when Slack posting is explicitly disabled — never a silent drop', async () => {
+      const { service, slack, items, settings } = makeHarness();
+      settings.set('human_eval_slack_posting_enabled', 'false');
 
       const candidate = await service.createCandidate({
         reviewType: 'creative_image',
@@ -816,9 +830,9 @@ describe('HumanEvalService', () => {
       expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated despite a Slack failure.');
     });
 
-    it('still posts for a userId on the exception list even when the global toggle is off, using a concise message', async () => {
+    it('still posts for a userId on the exception list even when the global toggle is explicitly off, using a concise message', async () => {
       const { service, slack, settings } = makeHarness();
-      settings.delete('human_eval_slack_posting_enabled');
+      settings.set('human_eval_slack_posting_enabled', 'false');
       settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
 
       const candidate = await service.createCandidate({
@@ -902,9 +916,9 @@ describe('HumanEvalService', () => {
       expect(postedMessage).toContain('Reviewer: Matt');
     });
 
-    it('does not post for a userId NOT on the exception list when the global toggle is off', async () => {
+    it('does not post for a userId NOT on the exception list when the global toggle is explicitly off', async () => {
       const { service, slack, settings } = makeHarness();
-      settings.delete('human_eval_slack_posting_enabled');
+      settings.set('human_eval_slack_posting_enabled', 'false');
       settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
 
       const candidate = await service.createCandidate({
