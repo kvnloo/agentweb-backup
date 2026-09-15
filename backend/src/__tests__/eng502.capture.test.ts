@@ -30,9 +30,11 @@ function fixture(userId = 'client-a', accountId = '123') {
   ] } }] });
 }
 beforeEach(() => {
+  jest.useFakeTimers({ now: new Date('2026-09-15T12:00:00.000Z') });
   mockRows.clear(); jest.clearAllMocks(); fixture();
   delete process.env.ADS_LEARNING_MODE;
 });
+afterEach(() => jest.useRealTimers());
 it('automatically persists a complete shadow recommendation from a real fatigue assessment', async () => {
   const result = await assessClientHealth('admin', 'client-a@example.com', true);
   expect(result.success).toBe(true);
