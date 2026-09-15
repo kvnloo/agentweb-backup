@@ -39,6 +39,7 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 import { generateVoiceover } from '../services/voiceoverService';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('ElevenLabs ledger metering (ENG-1878)', () => {
   beforeEach(() => {
@@ -68,9 +69,11 @@ describe('ElevenLabs ledger metering (ENG-1878)', () => {
 
     const ctx = mockRecordVendorUsage.mock.calls[0][0];
     expect(ctx.operation).toBe('characters_flash_turbo');
-    expect(ctx.costSource).toBe('allocated');
-    // $0.125 per 1k characters, one unit.
-    expect(ctx.costUsd).toBeCloseTo(0.125, 6);
+    // ENG-1929: the recorder prices quantity x this key's rate.
+    expect(ctx.rateKey).toBe('characters_flash_turbo');
+    expect(ctx.quantity).toBe(1);
+    // $0.125 per 1k characters.
+    expect(getAllocatedRate('elevenlabs', ctx.rateKey)).toBeCloseTo(0.125, 6);
   });
 
   it('does not record when the vendor call never returned audio (AC4 applies to reached calls)', async () => {
@@ -146,11 +149,11 @@ describe('2captcha ledger metering (ENG-1878)', () => {
         operation: 'solve',
         unit: 'solve',
         quantity: 1,
-        costSource: 'allocated',
+        rateKey: 'solve',
         feature: 'captcha:solved',
       }),
     );
-    expect(mockRecordVendorUsage.mock.calls[0][0].costUsd).toBeCloseTo(0.00725, 8);
+    expect(getAllocatedRate('2captcha', 'solve')).toBeCloseTo(0.00725, 8);
   });
 
   it('does NOT record a submission the vendor rejected — never accepted, never billed', async () => {

@@ -8,7 +8,6 @@ import { get2CaptchaApiKey } from '../utils/secretsManager';
 const SITE_KEY_PROBE_TIMEOUT_MS = 8000;
 
 import { recordVendorUsage } from '../services/usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -64,9 +63,9 @@ function extractMcpText(result: any): string {
  * Fire-and-forget: metering must never cost the caller its solve (AC5).
  */
 function record2CaptchaSolve(userId: string | undefined, outcome: 'solved' | 'timeout'): void {
-  // try/catch for the same reason as the ElevenLabs meter: computeAllocatedCost
-  // throws on an unpriced unit by design (ENG-703 AC2), and AC5 forbids a
-  // metering failure costing the caller its solve. Loud in the log, not to the user.
+  // Priced by rateKey inside the recorder (ENG-1929): an unpriced unit is logged
+  // loudly and recorded unpriced, never thrown into the solve (AC5). The
+  // try/catch is a last line of defence against any synchronous throw.
   try {
     void recordVendorUsage({
       userId,
@@ -75,8 +74,7 @@ function record2CaptchaSolve(userId: string | undefined, outcome: 'solved' | 'ti
       feature: `captcha:${outcome}`,
       unit: 'solve',
       quantity: 1,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('2captcha', 'solve', 1),
+      rateKey: 'solve',
     });
   } catch (error) {
     console.error(

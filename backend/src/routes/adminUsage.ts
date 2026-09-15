@@ -35,7 +35,8 @@ import { UsageRecordRow, usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { orgDb, userDb } from "../services/db";
-import { resolveBillingUserId } from "../services/tokenUsageService";
+import { checkTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
+import { describeEnforcement } from "../services/enforcementStateView";
 
 const router = express.Router();
 
@@ -169,8 +170,19 @@ router.get(
         requestedUserId,
         allowance,
         projection,
-        // §7: "no admin should need direct DynamoDB inspection to explain a pause"
+        // SHADOW (spendProjection): the ledger's hypothetical pause, which
+        // nothing enforces. Not rendered as a pause (ENG-1874) — `enforcement`
+        // below is the real decision.
         pause: explainPause(projection, breakdown),
+        // ENG-1886: whether the account is ACTUALLY paused — the enforcer's own
+        // result, not a recomputation. Current month only; a failed read is
+        // reported as unreadable rather than failing the breakdown.
+        enforcement: await checkTokenUsage(billingUserId)
+          .then((status) => describeEnforcement(status, month))
+          .catch((error: any) => {
+            console.error("[adminUsage] enforcement state read failed:", error?.message || error);
+            return { available: false as const, reason: "unreadable" as const, message: "Could not read the enforcer's state" };
+          }),
         // ENG-1934: how much of this month's LLM spend the total includes,
         // measured against the aggregate rail. The allowance comparison is only
         // meaningful beside it.

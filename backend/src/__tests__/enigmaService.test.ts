@@ -38,6 +38,7 @@ import {
   type EnigmaHttpClient,
 } from '../services/enigmaService';
 import { buildEnigmaHttpClient } from '../services/enigmaServiceFactory';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -231,13 +232,17 @@ describe('buildEnigmaHttpClient', () => {
 
     const byOp = Object.fromEntries(mockRecordVendorUsage.mock.calls.map(([ctx]) => [ctx.operation, ctx]));
     expect(mockRecordVendorUsage).toHaveBeenCalledTimes(3);
-    expect(byOp.card_revenue_12m).toMatchObject({ provider: 'enigma', userId: 'user-1', quantity: 1, unit: 'fill', costSource: 'allocated' });
-    expect(byOp.card_revenue_12m.costUsd).toBeCloseTo(0.1, 6);
-    expect(byOp.card_revenue_yoy_growth_12m).toMatchObject({ quantity: 1 });
-    expect(byOp.card_revenue_yoy_growth_12m.costUsd).toBeCloseTo(0.1, 6);
+    // ENG-1929: the recorder prices quantity × card rate from rateKey; the
+    // adapter must name a priced key and the billed quantity, never a cost.
+    const priced = (ctx: any) => getAllocatedRate('enigma', ctx.rateKey)! * ctx.quantity;
+    expect(byOp.card_revenue_12m).toMatchObject({ provider: 'enigma', userId: 'user-1', rateKey: 'card_revenue_12m', quantity: 1, unit: 'fill' });
+    expect(byOp.card_revenue_12m.costUsd).toBeUndefined();
+    expect(priced(byOp.card_revenue_12m)).toBeCloseTo(0.1, 6);
+    expect(byOp.card_revenue_yoy_growth_12m).toMatchObject({ rateKey: 'card_revenue_yoy_growth_12m', quantity: 1 });
+    expect(priced(byOp.card_revenue_yoy_growth_12m)).toBeCloseTo(0.1, 6);
     // one name + one website
-    expect(byOp.brand_attribute).toMatchObject({ quantity: 2 });
-    expect(byOp.brand_attribute.costUsd).toBeCloseTo(0.04, 6);
+    expect(byOp.brand_attribute).toMatchObject({ rateKey: 'brand_attribute', quantity: 2 });
+    expect(priced(byOp.brand_attribute)).toBeCloseTo(0.04, 6);
   });
 
   it('records nothing when the search returns no brand (Enigma bills $0)', async () => {
