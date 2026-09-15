@@ -21,9 +21,12 @@
  * has no `planId` field, so the target plan is identified by exact title match
  * inside the message text, not a structured reference.
  *
- * WHY DAILY. Matches the "here's what happened while you were away" framing and
- * gives a fresh accuracy/cost data point every day during the short monitoring
- * window, rather than waiting a week between samples.
+ * WHY WEEKLY. This report is a rolling 30-day window — day-to-day content barely
+ * shifts, so daily runs would mostly regenerate near-identical reports: little new
+ * signal on accuracy, and real LLM/API cost spent on redundant output. The
+ * monitoring window itself is a month or a few weeks (not a few days), so weekly
+ * still yields 4+ genuinely-spaced real samples across it, which is what "compute
+ * cost per report" and "judge accuracy over time" actually need.
  *
  * CLIENT LIST — real accounts with real Meta ad spend in the last 30 days, ranked
  * by spend, confirmed live against `AW-AdsMetricsSnapshots` on 2026-09-15 (4 other
@@ -95,10 +98,11 @@ export function buildScheduleName(client: ClientTarget): string {
   return `${PLAN_TITLE} — ${client.name} (Phase B)`;
 }
 
-function nextDailyRunTime(): string {
+function nextFirstRunTime(): string {
   // Next occurrence of 09:00 UTC, matching the existing metrics-snapshot cron's own
   // 09:00 UTC timing (ENG-916), so this fires after that day's fresh snapshot data
-  // is already written rather than racing it.
+  // is already written rather than racing it. Subsequent runs recur every 7 days
+  // from this anchor (frequency: 'weekly').
   const now = new Date();
   const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 9, 0, 0));
   if (next <= now) {
@@ -113,8 +117,8 @@ export function buildSchedule(client: ClientTarget, ownerId: string = HARSHA_OWN
     scheduleId: uuidv4(),
     taskId: 'global',
     userId: ownerId,
-    frequency: 'daily',
-    nextRunTime: nextDailyRunTime(),
+    frequency: 'weekly',
+    nextRunTime: nextFirstRunTime(),
     status: 'active',
     createdAt: now,
     updatedAt: now,
