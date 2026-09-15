@@ -131,7 +131,9 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
  * Callers pass the configured key unchanged (for example,
  * `landing_page_generation`, not its human recording unit `generation`).
  * Returns null for an unknown provider or rate key — callers must not default a
- * missing rate to $0 or any other value (see computeAllocatedCost).
+ * missing rate to $0 or any other value. Metering resolves it inside
+ * `recordVendorUsage` from a `rateKey`, recording an unpriced key as `unpriced`
+ * (ENG-703 AC2, ENG-1929).
  */
 export function getAllocatedRate(
   provider: VendorRateProvider,
@@ -163,25 +165,4 @@ export function getRecordingUnit(
   const providerCard = RATE_CARD[provider];
   if (!Object.prototype.hasOwnProperty.call(providerCard, rateKey)) return null;
   return providerCard[rateKey].recordingUnit;
-}
-
-/**
- * Allocated USD cost for `quantity` units of a vendor/unit pair.
- *
- * @throws if the provider/unit has no rate entry — an unpriced unit must fail
- *         loudly rather than silently book $0 (ENG-703 AC2).
- */
-export function computeAllocatedCost(
-  provider: VendorRateProvider,
-  rateKey: string,
-  quantity: number
-): number {
-  const rate = getAllocatedRate(provider, rateKey);
-  if (rate === null) {
-    throw new Error(
-      `No allocated rate for vendor "${provider}" rate key "${rateKey}" — add it to vendorRateCard.ts before metering this call`
-    );
-  }
-  const safeQuantity = Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
-  return safeQuantity * rate;
 }

@@ -7,7 +7,6 @@
 
 import {
   getAllocatedRate,
-  computeAllocatedCost,
   VendorRateProvider,
   VENDOR_RATE_CARD_VERSION,
   getRecordingUnit,
@@ -85,36 +84,11 @@ describe("getAllocatedRate", () => {
   });
 });
 
-describe("computeAllocatedCost", () => {
-  it("throws loudly for an unpriced unit instead of booking $0 (AC2)", () => {
-    expect(() => computeAllocatedCost("v0", "not-a-real-unit", 1)).toThrow(
-      /no allocated rate/i
-    );
-  });
-
-  it("throws loudly for an unknown provider", () => {
-    expect(() =>
-      computeAllocatedCost("not-a-vendor" as VendorRateProvider, "generate", 1)
-    ).toThrow(/no allocated rate/i);
-  });
-
-  it("computes quantity * rate for a priced unit", () => {
-    const cost = computeAllocatedCost("apollo", "email_reveal", 4);
-    expect(cost).toBeCloseTo(0.198, 6);
-  });
-
-  it("clamps a negative quantity to 0 (never a negative charge)", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", -3)).toBe(0);
-  });
-
-  it("returns 0 for a zero quantity", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", 0)).toBe(0);
-  });
-
-  it("treats a non-finite quantity as 0", () => {
-    expect(computeAllocatedCost("v0", "landing_page_generation", Number.NaN)).toBe(0);
-  });
-
+// computeAllocatedCost was removed by ENG-1929: pricing now happens inside
+// recordVendorUsage from a rateKey, so an unpriced unit can no longer throw into
+// a vendor request. Its AC2 cases (unpriced is loud, never $0; quantity clamps)
+// moved to usageRecorderService.vendorRateKey.test.ts.
+describe("vendor rate card", () => {
   describe("rate-card version (ENG-1250 §5)", () => {
     it("is a dated version string", () => {
       expect(VENDOR_RATE_CARD_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
