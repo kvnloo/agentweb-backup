@@ -3,6 +3,7 @@ const recordVendorUsage = jest.fn();
 jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage }));
 
 import { YouSearchProvider } from '../search/youSearchProvider';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('YouSearchProvider', () => {
   const originalEnv = { ...process.env };
@@ -22,8 +23,10 @@ describe('YouSearchProvider', () => {
 
     expect(recordVendorUsage).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'user-1', provider: 'you.com', operation: 'query', unit: 'query',
-      quantity: 1, costSource: 'allocated', feature: 'agent_research', costUsd: 0.0125,
+      quantity: 1, rateKey: 'query', feature: 'agent_research',
     }));
+    // ENG-1929: priced by the recorder from the card, $0.0125 per query.
+    expect(getAllocatedRate('you.com', 'query')).toBe(0.0125);
   });
 
   it('posts a You.com Search request with the expected endpoint, auth header, and JSON body', async () => {

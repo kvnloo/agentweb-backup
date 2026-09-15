@@ -9,6 +9,7 @@ jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage }));
 
 import { google } from 'googleapis';
 import { extractPublishedDate, GoogleSearchProvider } from '../search/googleSearchProvider';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('GoogleSearchProvider', () => {
   afterEach(() => {
@@ -74,8 +75,10 @@ describe('GoogleSearchProvider', () => {
 
     expect(recordVendorUsage).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'user-1', provider: 'google_cse', operation: 'query', unit: 'query',
-      quantity: 1, costSource: 'allocated', feature: 'crm_enrichment', costUsd: 0.0125,
+      quantity: 1, rateKey: 'query', feature: 'crm_enrichment',
     }));
+    // ENG-1929: priced by the recorder from the card, $0.0125 per query.
+    expect(getAllocatedRate('google_cse', 'query')).toBe(0.0125);
   });
 
   it('extracts published dates from supported Google metadata fields', () => {

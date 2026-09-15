@@ -11,7 +11,6 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { recordVendorUsage } from '../services/usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 import { canViewItem, canEditItem } from '../services/orgShareService';
 import { getPlacidPrivateToken } from '../utils/secretsManager';
 
@@ -1303,11 +1302,9 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     // the card, never embedded. Bills the task owner; the acting caller may be
     // an admin, hence onBehalfOf.
     //
-    // try/catch (ENG-698 AC6: a metering failure never prevents a render being
-    // returned). recordVendorUsage itself never throws, but computeAllocatedCost
-    // is evaluated as an argument, synchronously, BEFORE that call — and it
-    // throws on an unpriced unit by design (ENG-703 AC2). Without the guard, a
-    // rate-card key rename would 500 every render.
+    // Priced by rateKey inside the recorder (ENG-1929), so a rate-card key
+    // rename is recorded unpriced and logged, not thrown into the render
+    // (ENG-698 AC6). The try/catch stays as a last line of defence.
     const placidOwner = task.userId;
     try {
       void recordVendorUsage({
@@ -1319,8 +1316,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
         feature: 'ad_image',
         unit: 'render',
         quantity: 1,
-        costSource: 'allocated',
-        costUsd: computeAllocatedCost('placid', 'image_render', 1),
+        rateKey: 'image_render',
       });
     } catch (meterErr) {
       console.error(
