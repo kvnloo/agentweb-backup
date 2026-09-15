@@ -35,11 +35,16 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   })),
 }));
 
+// The registry reports one tool by default. initialize() latches on a NON-EMPTY
+// registry rather than on "runInitialize didn't throw" (it provably cannot throw),
+// so a mock that always returns [] would model a permanently-failing init, not a
+// healthy one.
+let registryTools: Array<{ name: string }> = [{ name: 'some_tool' }];
 jest.mock('../mcp/client/toolRegistry', () => ({
   ToolRegistry: jest.fn().mockImplementation(() => ({
     register: jest.fn(),
     unregister: jest.fn(),
-    getAllTools: jest.fn().mockReturnValue([]),
+    getAllTools: jest.fn(() => registryTools),
     getTool: jest.fn(),
     getToolDefinitions: jest.fn().mockReturnValue([]),
   })),
@@ -51,12 +56,9 @@ jest.mock('../mcp/client/toolRegistry', () => ({
  * widget path calls it per message on the same module singleton. These tests pin
  * the guard that makes that safe.
  *
- * Mutation-verified against the pre-fix code (initialize() with no guard, body
- * inline instead of in runInitialize): 'runs the work only once' and 'collapses
- * concurrent callers' both FAIL there — 2 calls and 3 calls respectively — and
- * 'retries after a failed attempt' passes both before and after, so it pins the
- * retry path rather than the guard. Kept deliberately: it is the regression that
- * a naive `initialized = true` in a non-finally path would introduce.
+ * Every test here is mutation-verified against the code it guards — see the
+ * individual cases. The degraded-init and foundation-tools cases each pin a real
+ * regression that an earlier version of this branch actually shipped.
  */
 describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () => {
   let service: AgentModeService;
@@ -64,6 +66,7 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
 
   beforeEach(() => {
     jest.clearAllMocks();
+    registryTools = [{ name: 'some_tool' }];
     service = new AgentModeService();
     // Spy on the private worker so these tests assert the guard itself, not any
     // particular side effect of the initialization body.
@@ -81,10 +84,14 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
   });
 
   it('collapses concurrent callers onto a single in-flight initialization', async () => {
+    // The deferred is built UP FRONT, not inside mockImplementation. initialize()
+    // awaits loadFoundationTools() before it ever reaches runInitialize, so a
+    // `release` assigned inside the mock is still unassigned when the test calls
+    // it — the promise never settles and the test times out. Caught exactly that
+    // way while adding the foundation-tools hoist.
     let release: () => void = () => {};
-    runSpy.mockImplementation(
-      () => new Promise<void>((resolve) => { release = () => resolve(); })
-    );
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    runSpy.mockImplementation(() => gate);
 
     const a = service.initialize();
     const b = service.initialize();
@@ -99,17 +106,47 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     expect(runSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('retries after a failed attempt instead of staying permanently wedged', async () => {
-    runSpy.mockRejectedValueOnce(new Error('boot init failed'));
+  it('does NOT latch a silently-degraded init, and retries it (ENG-1852 regression)', async () => {
+    // The reachable failure mode, and the one that matters. Every step of
+    // runInitialize() catches and logs its own errors — loadFoundationTools, both
+    // halves of registerTools, initializeMcp, ensureBuiltInSkills — so a real boot
+    // failure does NOT reject; it returns normally having registered nothing.
+    //
+    // An earlier version of this suite asserted the retry path by making
+    // runInitialize itself reject. That is not reachable in production, so it
+    // pinned a safety property the code did not actually have: `initialized`
+    // latched on a degraded init and every later call became a permanent no-op,
+    // turning an intermittent "0 tools" into an unrecoverable one for the whole
+    // process lifetime. Before this branch, the per-message fresh instance re-ran
+    // registration and self-healed. This test pins that self-healing.
+    registryTools = []; // registration silently produced nothing
 
-    await expect(service.initialize()).rejects.toThrow('boot init failed');
+    await expect(service.initialize()).resolves.toBeUndefined(); // no throw, as in prod
+    expect((service as any).initialized).toBe(false);
 
-    // A failed boot must not leave the service believing it is initialized, nor
-    // hand every later caller the same rejected promise forever.
-    runSpy.mockResolvedValue(undefined);
-    await expect(service.initialize()).resolves.toBeUndefined();
+    registryTools = [{ name: 'some_tool' }]; // transient cause clears
+    await service.initialize();
 
-    expect(runSpy).toHaveBeenCalledTimes(2);
+    expect((service as any).initialized).toBe(true);
+    expect(runSpy).toHaveBeenCalledTimes(2); // genuinely retried, not wedged
+  });
+
+  it('re-reads foundation tools on EVERY call, outside the latch (F3 regression)', async () => {
+    const loadSpy = jest
+      .spyOn(service as any, 'loadFoundationTools')
+      .mockResolvedValue(undefined);
+
+    await service.initialize();
+    await service.initialize();
+    await service.initialize();
+
+    // loadFoundationTools writes the process-global static FOUNDATION_TOOLS, which
+    // the admin PUT /foundation-tools route mutates per-process. Latching it would
+    // mean an added foundation tool never reaches a process until restart — the
+    // ENG-280/ENG-404 "tool not available" class. The expensive registration pass
+    // is still guarded.
+    expect(loadSpy).toHaveBeenCalledTimes(3);
+    expect(runSpy).toHaveBeenCalledTimes(1);
   });
 
   it('does not share initialization state between instances', async () => {

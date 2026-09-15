@@ -22,7 +22,7 @@ import { taskDb, userDb } from '../services/db';
 import { isEvaluationUser } from './evaluationPolicy';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { AgentModeService } from './agentModeService';
+import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
 import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
@@ -4984,22 +4984,30 @@ export async function generateChatResponse(
     const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
     // ENG-1852 follow-up: use the module's own exported singleton, not a fresh
     // instance. A `new AgentModeService()` here ran a full initialize()
-    // (loadFoundationTools + registerTools over ~264 tools + initializeMcp +
-    // ensureBuiltInSkills + downstream singleton bootstrap) on EVERY message this
-    // gate is open for, purely to throw the instance away at end of turn. It was
-    // also the last remaining second construction site in backend/src, which is
-    // the exact shape that made ENG-1852 (two live instances, one with an empty
-    // registry, either able to answer a call) possible in the worker.
+    // (registerTools over ~264 tools + initializeMcp + ensureBuiltInSkills +
+    // downstream singleton bootstrap) on EVERY message this gate is open for,
+    // purely to throw the instance away at end of turn — and, because
+    // startFileCacheCleanup() sets an un-unref'd interval whose closure retains
+    // `this`, each discarded instance stayed reachable for the process lifetime.
+    // It was also the last remaining second construction site in backend/src,
+    // which is the exact shape that made ENG-1852 (two live instances, one with an
+    // empty registry, either able to answer a call) possible in the worker.
     //
-    // Resolved lazily rather than via the existing top-level `AgentModeService`
-    // value import so the singleton is not constructed as a side effect of this
-    // module loading. Note the class import above is still needed and stays — the
-    // static `AgentModeService.FOUNDATION_TOOLS` read further down uses it.
+    // Imported at top level, not lazily. An earlier version of this change used
+    // `await import('./agentModeService')` on the claim that it avoided
+    // constructing the singleton as a side effect of loading this module. That
+    // claim was false: line 25's `AgentModeService` class import is a VALUE import
+    // of the same module, so the module body — including its
+    // `export const agentModeService = new AgentModeService()` — already runs at
+    // load. The compiled output confirms it (`require("./agentModeService")` at
+    // top level). The lazy form bought nothing and cost a dynamic require per
+    // message. The existing circular edge with agentModeService.ts is unchanged
+    // and safe: compiled CJS resolves the binding at USE time, long after both
+    // modules finish loading.
     //
-    // initialize() below is now idempotent (see agentModeService.ts), so this is a
-    // cheap no-op once boot init has completed, and correctly awaits boot init if
-    // it is still in flight — server.ts starts it non-blocking.
-    const { agentModeService } = await import('./agentModeService');
+    // initialize() is idempotent for the expensive registration pass and still
+    // re-reads foundation tools on every call — see agentModeService.ts.
+    const agentModeService = agentModeServiceSingleton;
     let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
     // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
     // correctly doesn't include this skill" apart from "tool resolution failed".
