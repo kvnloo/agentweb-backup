@@ -25,6 +25,8 @@ import {
   findGatedParameterKeys,
   findOutputParameterNameCollisions,
   findConflictingGatedParameterKeys,
+  findNextIndependentStep,
+  recordIndependentStepOutcome,
 } from './core/workflow';
 
 export async function startWorkflow(
@@ -208,6 +210,120 @@ export async function advanceWorkflow(sessionId: string, definition: WorkflowDef
     entityIds,
     verification.verifiedFields,
     at(),
+  );
+  const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, successRun, { requireVersion: run.version });
+  if (!persisted?.workflowRun) return { kind: 'conflict', run };
+  return { kind: persisted.workflowRun.status === 'completed' ? 'completed' : 'step_verified', run: persisted.workflowRun };
+}
+
+export type AdvanceIndependentOutcome =
+  | { kind: 'no_active_run' }
+  | { kind: 'step_verified'; run: WorkflowRunState }
+  | { kind: 'step_failed'; run: WorkflowRunState }
+  | { kind: 'completed'; run: WorkflowRunState }
+  // Optimistic-lock loss — caller must re-read and retry rather than trust `run`.
+  | { kind: 'conflict'; run: WorkflowRunState };
+
+/**
+ * Advance the session's active workflow run by exactly one step, using
+ * findNextIndependentStep/recordIndependentStepOutcome (workflow.ts's own
+ * file header explains why these differ from findNextStep/recordStepSuccess/
+ * recordStepFailure above) — for N steps with no dependency on each other
+ * (ENG-1635/1644's approved Meta writes), where one step failing must never
+ * prevent an independent sibling from being attempted.
+ *
+ * UNLIKE advanceWorkflow, `step_failed` here does NOT mean "stop calling
+ * this" — it means "this one step failed, the run is not done yet." The
+ * driving loop (agentModeService.ts's deck-answer handler) must keep calling
+ * this until it sees `completed` (or `no_active_run`/`conflict`), treating
+ * `step_verified` and `step_failed` identically as "keep going." Mirrors
+ * advanceWorkflow's re-read-fresh-first discipline for the same reason.
+ */
+export async function advanceIndependentWorkflow(
+  sessionId: string,
+  definition: WorkflowDefinition,
+): Promise<AdvanceIndependentOutcome> {
+  const session = await chatbotDb.getChatSession(sessionId);
+  const run = session?.workflowRun;
+  if (!run) return { kind: 'no_active_run' };
+
+  const step = findNextIndependentStep(definition, run);
+  if (!step) return { kind: 'completed', run };
+
+  const resolution = resolveStepParameters(step, run, session?.pendingUserQuestion, session?.answeredQuestions);
+  const at = () => new Date().toISOString();
+  if (resolution.blocked) {
+    // An independent Meta-write step declares no requiredParameters (its
+    // dispatch args are already fully resolved on the approved deck item),
+    // so this should be unreachable in practice — but a step that DOES
+    // declare one and finds it unresolved has no dependency-chain concept
+    // to "block" against here (no blocked_on_parameter status exists for
+    // this driver), so the same-terminal-as-a-failure treatment keeps this
+    // step from being retried forever rather than leaving the run stuck.
+    const failedRun = recordIndependentStepOutcome(
+      definition, run, step, { status: 'failed', discrepancy: { error: resolution.block.reason } }, at(),
+    );
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  const executionInput = { ...resolution.resolvedParameters, ...collectEntityIdsFromCheckpoints(run) };
+
+  let executeResult: Record<string, unknown>;
+  try {
+    executeResult = await step.execute(executionInput);
+  } catch (err: any) {
+    const failedRun = recordIndependentStepOutcome(
+      definition, run, step, { status: 'failed', discrepancy: { error: err?.message || 'execute failed' } }, at(),
+    );
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  const invalidOutputs = step.outputs.filter((k) => {
+    const value = executeResult[k];
+    if (value === undefined || value === null) return true;
+    if (typeof value === 'number') return !Number.isFinite(value);
+    if (typeof value === 'string') return value.trim() === '';
+    return true;
+  });
+  if (invalidOutputs.length > 0) {
+    const failedRun = recordIndependentStepOutcome(
+      definition,
+      run,
+      step,
+      { status: 'failed', discrepancy: { error: `execute() did not return a valid value for declared output(s): ${invalidOutputs.join(', ')}` } },
+      at(),
+    );
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  let verification: Awaited<ReturnType<typeof step.verify>>;
+  try {
+    verification = await step.verify(executeResult, executionInput);
+  } catch (err: any) {
+    const failedRun = recordIndependentStepOutcome(
+      definition, run, step, { status: 'failed', discrepancy: { error: err?.message || 'verify failed' } }, at(),
+    );
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+  if (!verification.verified) {
+    const discrepancy = 'mismatches' in verification ? verification.mismatches : { error: verification.error };
+    const failedRun = recordIndependentStepOutcome(definition, run, step, { status: 'failed', discrepancy }, at());
+    const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, failedRun, { requireVersion: run.version });
+    if (!persisted?.workflowRun) return { kind: 'conflict', run };
+    return { kind: 'step_failed', run: persisted.workflowRun };
+  }
+
+  const entityIds = Object.fromEntries(step.outputs.map((k) => [k, String(executeResult[k])]));
+  const successRun = recordIndependentStepOutcome(
+    definition, run, step, { status: 'verified', entityIds, verifiedFields: verification.verifiedFields }, at(),
   );
   const persisted = await chatbotDb.updateSessionWorkflowRun(sessionId, successRun, { requireVersion: run.version });
   if (!persisted?.workflowRun) return { kind: 'conflict', run };

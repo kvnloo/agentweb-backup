@@ -63,6 +63,20 @@ export interface ApprovalDeckItem {
    *  under. An 'approve' answer on this item is what a write's grant check
    *  (findApprovalDeckAnswerForDigest) looks for. */
   metaWriteManifestDigest?: string;
+  /** Present iff this item IS a Meta write preview — the exact parameters
+   *  needed to dispatch this write later, without the model ever re-calling
+   *  the tool (ENG-1635/1644 Round 3 consequence #3/#1). Always present
+   *  together with metaWriteManifestDigest; step-per-write dispatch reads
+   *  this off each approved item to build its WorkflowStepDefinition. */
+  metaWriteDispatch?: {
+    entity_type: string;
+    action: string;
+    account_id: string;
+    campaign_id?: string;
+    ad_set_id?: string;
+    ad_id?: string;
+    params: unknown;
+  };
 }
 
 export interface ApprovalDeckAnswer {
@@ -122,6 +136,12 @@ function validateItemShape(item: ApprovalDeckItem, existingIds: ReadonlySet<stri
       throw new ApprovalDeckError(
         `Item ${item.itemId} carries a metaWriteManifestDigest — it uses the fixed approve/reject ` +
           `verdict vocabulary and must not also declare options`,
+      );
+    }
+    if (!item.metaWriteDispatch) {
+      throw new ApprovalDeckError(
+        `Item ${item.itemId} carries a metaWriteManifestDigest but no metaWriteDispatch — ` +
+          `step-per-write dispatch would have nothing to execute once this item is approved`,
       );
     }
     return;

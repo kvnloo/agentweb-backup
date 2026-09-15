@@ -123,9 +123,16 @@ import {
   appendApprovalDeckItem,
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
+  applyDeckAnswers,
+  approvedWriteItems,
   renderApprovalDeckPrompt,
   type PendingApprovalDeck,
+  type ApprovalDeckItem,
+  type ApprovalDeckAnsweredBy,
+  type InboundDeckAnswer,
 } from './agentMode/core/approvalDeck';
+import { type WorkflowStepDefinition, type WorkflowStepVerification, type WorkflowRunState } from './agentMode/core/workflow';
+import { startWorkflow, advanceIndependentWorkflow } from './agentMode/workflowRunner';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -6937,6 +6944,15 @@ export class AgentModeService {
         // reach this function).
         ...(result.metaWriteManifestDigest
           ? { metaWriteManifestDigest: result.metaWriteManifestDigest } : {}),
+        // ENG-1635/1644 Round 3: same class of bug as the fields above — this minimizer
+        // discards anything it doesn't name, and buildMetaWriteApprovalDeck (the loop
+        // seam, right after this) needs metaWriteDispatch on the SAME halted result to
+        // later let a workflow step execute the approved write without the model ever
+        // re-calling this tool. Named here explicitly so it doesn't get silently dropped
+        // the same way metaWriteManifestDigest itself was, undetected by 20 passing
+        // tests, until live-driving on env1 caught it.
+        ...(result.metaWriteDispatch
+          ? { metaWriteDispatch: result.metaWriteDispatch } : {}),
       };
       // ENG-396: also preserve the structured AskUserQuestion payload so the chat
       // card can render its options and the frontend can post back a structured
@@ -20246,21 +20262,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private buildMetaWriteApprovalDeck(
     toolResults: Array<{ status: 'success' | 'error'; result?: any }>
   ): PendingApprovalDeck | null {
-    const items: Array<{ digest: string; detail: string }> = [];
+    const items: Array<{ digest: string; detail: string; dispatch: any }> = [];
     for (const tr of toolResults) {
       if (tr.status !== 'success') continue;
       const r: any = tr.result;
       if (!r || r.awaitingUserConfirmation !== true) continue;
-      if (typeof r.metaWriteManifestDigest !== 'string' || !r.metaWriteManifestDigest) {
+      if (typeof r.metaWriteManifestDigest !== 'string' || !r.metaWriteManifestDigest || !r.metaWriteDispatch) {
         // A non-Meta-write confirmation is mixed into this batch — bail out entirely
         // rather than deck-wrapping only the Meta writes and silently leaving this one
         // to the old per-item path; a caller seeing null falls back uniformly for the
-        // WHOLE iteration.
+        // WHOLE iteration. Missing metaWriteDispatch alongside a real digest would be
+        // an internal bug (the halt always sets both together) — never reachable in
+        // practice, but treated the same as "not a Meta write" rather than assumed.
         return null;
       }
       items.push({
         digest: r.metaWriteManifestDigest,
         detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
+        dispatch: r.metaWriteDispatch,
       });
     }
     if (items.length === 0) return null;
@@ -20273,6 +20292,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           kind: 'meta_write',
           question: item.detail,
           metaWriteManifestDigest: item.digest,
+          metaWriteDispatch: item.dispatch,
         });
       });
       return finalizeApprovalDeck(deck, new Date().toISOString());
@@ -21114,14 +21134,99 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // model-facing `message`, so nothing tells the model this exists or invites it to
         // forge one. Consumed exclusively by collectConfirmationPrompt's caller in the same
         // process, never serialized to the client.
-        metaWriteManifestDigest
+        metaWriteManifestDigest,
+        // ENG-1635/1644 Round 3 consequence #3: the dispatch parameters needed to
+        // execute this exact write LATER, without the model ever re-calling this tool
+        // — a workflow step (built from an approved deck item) reads this to call
+        // dispatchAuthorizedMetaWrite directly. Deliberately the RAW account_id (the
+        // same variable both claimMetaWriteManifestGrant's call above and
+        // metaWriteManifestDigest's own computation used) rather than target.account_id
+        // — resolveMetaWriteManifestDigest resolves credentials internally itself, so
+        // re-deriving the digest from these exact fields at claim time (execute() calls
+        // claimMetaWriteManifestGrant before dispatching) must start from the SAME input
+        // that produced the digest being matched, not a value resolveMetaWriteManifestDigest
+        // was never given and has no proven-idempotent relationship to. Internal-only,
+        // same as the digest above — never part of the model-facing `message`.
+        metaWriteDispatch: { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params },
       } as any;
     }
-    if ('confirm' in params) {
+    // ENG-1635/1644 Round 3 consequence #3: everything past this point (strip the
+    // gate-only flags, run the ENG-941 tracking pre-flight, dispatch to the
+    // entity-specific write method) is shared with a workflow step's execute()
+    // dispatching an approved deck item directly — see dispatchAuthorizedMetaWrite's
+    // own header for why that reuses this exact method rather than re-deriving it.
+    const dispatchResult: MetaApiResult = await this.dispatchAuthorizedMetaWrite(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, overrideApproved, sessionId,
+    );
+
+    // ENG-1635: this write executed under a manifest grant (not a plain confirm=true
+    // replay) — record its outcome against the exact digest the user approved, then
+    // check whether every digest in ITS manifest now has an outcome. If so, this was
+    // the LAST outstanding write in the batch: attach the aggregated result to this
+    // response so the model reports ONE unified outcome instead of leaving N scattered
+    // pass/fail tool messages with no summary, which is what a manifest-granted batch
+    // produced before this. A recording/reconciliation failure must never mask the
+    // real dispatch result — log and continue rather than throwing over a write that
+    // itself succeeded or failed on its own terms.
+    if (manifestGranted && grantedManifestDigest && sessionId) {
+      try {
+        await chatbotDb.recordMetaWriteManifestOutcome(sessionId, grantedManifestDigest, {
+          status: dispatchResult?.success ? 'applied' : 'failed',
+          error: dispatchResult?.success ? undefined : ((dispatchResult as any)?.error || dispatchResult?.message),
+          message: typeof dispatchResult?.message === 'string' ? dispatchResult.message : undefined,
+          appliedObjectId: AgentModeService.extractDispatchedObjectId(dispatchResult),
+          readBackVerified: typeof (dispatchResult as any)?.readBackVerified === 'boolean'
+            ? (dispatchResult as any).readBackVerified
+            : undefined,
+          readBackMismatches: Array.isArray((dispatchResult as any)?.readBackMismatches)
+            ? (dispatchResult as any).readBackMismatches
+            : undefined,
+          appliedAt: new Date().toISOString(),
+        });
+        const manifestReconciliation = await this.reconcileMetaWriteManifestIfComplete(sessionId, grantedManifestDigest);
+        if (manifestReconciliation) {
+          return { ...dispatchResult, manifestReconciliation };
+        }
+      } catch (recordError) {
+        console.error('AgentMode: failed to record/reconcile manifest write outcome (write itself succeeded/failed independently):', recordError);
+      }
+    }
+
+    return dispatchResult;
+  }
+
+  /**
+   * Already-authorized Meta write dispatch — everything that happens AFTER a write has
+   * cleared its gate. Strips the gate-only flags (confirm, tracking_override_token,
+   * override_tracking_check — none of these are real Meta fields and none may reach the
+   * Graph API), runs the ENG-941 deterministic tracking pre-flight, then dispatches to
+   * the entity-specific write method. Extracted verbatim (byte-for-byte behavior,
+   * ENG-1635/1644 Round 3 consequence #3) from callMetaMarketingApi's own post-gate body
+   * so a workflow step's execute() for an approved deck item can call this SAME logic
+   * directly instead of re-invoking callMetaMarketingApi itself — re-entering that gate
+   * would need its own fresh manifestGranted, sourced from the same digest gap 4's
+   * per-step digest-match check already claimed/consumed, which fails by construction
+   * (an at-most-once claim cannot be claimed twice). This method performs NO
+   * authorization of its own — every caller MUST have already established it (the
+   * gate above, for a model-driven call; a claimed digest match, for a workflow step).
+   */
+  private async dispatchAuthorizedMetaWrite(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+    overrideApproved: boolean,
+    sessionId: string | undefined,
+  ): Promise<MetaApiResult> {
+    if (params && typeof params === 'object' && 'confirm' in params) {
       params = { ...params };
       delete params.confirm;
     }
-    if ('tracking_override_token' in params) {
+    if (params && typeof params === 'object' && 'tracking_override_token' in params) {
       params = { ...params };
       delete (params as any).tracking_override_token;
     }
@@ -21139,13 +21244,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
      * only override path — no portal control — and it is recorded on the run record.
      *
-     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
-     * so it only runs on a confirmed call. The two ask different questions — that gate
-     * asks "did a human intend this?", this one asks "can it report a conversion?" —
-     * and doing the network checks on an unconfirmed preview would waste them.
+     * Order matters and is deliberate: this sits AFTER the caller's own confirmation
+     * gate, so it only runs on an authorized call. The two ask different questions —
+     * that gate asks "did a human intend this?", this one asks "can it report a
+     * conversion?" — and doing the network checks on an unconfirmed preview would
+     * waste them.
      */
-    // Reaching here with an override means it survived the binding check above, so it is one
-    // the user was shown and approved — never one the model added to the replay.
+    // Reaching here with an override means it survived the binding check the caller
+    // already did, so it is one the user was shown and approved — never one the model
+    // added to the replay.
     const overrideTrackingCheck = overrideApproved;
     if (params && typeof params === 'object' && 'override_tracking_check' in params) {
       params = { ...params };
@@ -21199,11 +21306,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     // ENG-1635: wrapped in an IIFE (rather than each case returning directly, as
-    // before) purely so a manifest-granted write's outcome can be recorded against
-    // its digest right after dispatch resolves, in ONE place, without duplicating
-    // the switch or touching every branch. Every case's behavior is unchanged byte
-    // for byte — this only interposes AFTER the result exists and BEFORE it returns.
-    const dispatchResult: MetaApiResult = await (async (): Promise<MetaApiResult> => {
+    // before) purely so an authorized write's outcome can be recorded right after
+    // dispatch resolves, in ONE place, without duplicating the switch or touching
+    // every branch. Every case's behavior is unchanged byte for byte from the
+    // original callMetaMarketingApi body — this only interposes AFTER the result
+    // exists and BEFORE it returns.
+    return (async (): Promise<MetaApiResult> => {
       switch (entity_type) {
         case 'CAMPAIGN':
           // Map master params to specific params if needed, but schema is unified so passing through is safe
@@ -21240,41 +21348,154 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error(`Invalid entity_type: ${entity_type}`);
       }
     })();
+  }
 
-    // ENG-1635: this write executed under a manifest grant (not a plain confirm=true
-    // replay) — record its outcome against the exact digest the user approved, then
-    // check whether every digest in ITS manifest now has an outcome. If so, this was
-    // the LAST outstanding write in the batch: attach the aggregated result to this
-    // response so the model reports ONE unified outcome instead of leaving N scattered
-    // pass/fail tool messages with no summary, which is what a manifest-granted batch
-    // produced before this. A recording/reconciliation failure must never mask the
-    // real dispatch result — log and continue rather than throwing over a write that
-    // itself succeeded or failed on its own terms.
-    if (manifestGranted && grantedManifestDigest && sessionId) {
-      try {
-        await chatbotDb.recordMetaWriteManifestOutcome(sessionId, grantedManifestDigest, {
-          status: dispatchResult?.success ? 'applied' : 'failed',
-          error: dispatchResult?.success ? undefined : ((dispatchResult as any)?.error || dispatchResult?.message),
-          message: typeof dispatchResult?.message === 'string' ? dispatchResult.message : undefined,
-          appliedObjectId: AgentModeService.extractDispatchedObjectId(dispatchResult),
-          readBackVerified: typeof (dispatchResult as any)?.readBackVerified === 'boolean'
-            ? (dispatchResult as any).readBackVerified
-            : undefined,
-          readBackMismatches: Array.isArray((dispatchResult as any)?.readBackMismatches)
-            ? (dispatchResult as any).readBackMismatches
-            : undefined,
-          appliedAt: new Date().toISOString(),
-        });
-        const manifestReconciliation = await this.reconcileMetaWriteManifestIfComplete(sessionId, grantedManifestDigest);
-        if (manifestReconciliation) {
-          return { ...dispatchResult, manifestReconciliation };
-        }
-      } catch (recordError) {
-        console.error('AgentMode: failed to record/reconcile manifest write outcome (write itself succeeded/failed independently):', recordError);
-      }
+  /**
+   * ENG-1635/1644 Round 3 consequence #3: build ONE WorkflowStepDefinition per
+   * approved deck write item. execute() dispatches directly via
+   * dispatchAuthorizedMetaWrite — it does NOT re-invoke callMetaMarketingApi
+   * (see that method's own header: re-entering its gate would need a fresh
+   * manifestGranted sourced from the same digest this step is about to claim,
+   * and an at-most-once claim cannot be claimed twice). Instead it
+   * independently re-claims the digest via claimMetaWriteManifestGrant right
+   * before dispatching — gap 4's per-step digest re-verification — so a step
+   * can only ever execute the exact write this deck answer approved, and only
+   * once: a step is called at most once (crash-restart skips any step that
+   * already has a checkpoint, per findNextIndependentStep), and even a
+   * hypothetical second attempt would find the digest already consumed and
+   * refuse rather than double-dispatch.
+   *
+   * overrideApproved is always `false` here — Phase A does not carry a
+   * tracking-override waiver through the deck path (no UI/mechanism exists
+   * yet for the user to approve one as part of a deck item); the ENG-941
+   * pre-flight runs for real rather than silently honoring a stale
+   * override_tracking_check flag from the original halted call.
+   */
+  private buildMetaWriteWorkflowSteps(
+    sessionId: string,
+    userId: string,
+    approved: Array<{ item: ApprovalDeckItem }>,
+  ): WorkflowStepDefinition[] {
+    return approved.map(({ item }) => {
+      const dispatch = item.metaWriteDispatch!;
+      return {
+        id: item.itemId,
+        inputs: [],
+        outputs: [],
+        requiredParameters: [],
+        execute: async (): Promise<Record<string, unknown>> => {
+          const grant = await this.claimMetaWriteManifestGrant(
+            userId, sessionId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+          );
+          if (!grant.granted) {
+            throw new Error(
+              'This write is no longer authorized — its approval was not found or was already consumed.',
+            );
+          }
+          const dispatchResult = await this.dispatchAuthorizedMetaWrite(
+            userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            false, sessionId,
+          );
+          return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
+        },
+        verify: async (executeResult): Promise<WorkflowStepVerification> => {
+          const result = executeResult.dispatchResult as MetaApiResult | undefined;
+          if (!result || result.success !== true) {
+            return { verified: false, error: result?.error || result?.message || 'Meta write failed' };
+          }
+          // Reuses whatever read-back mismatch detection the underlying write
+          // method already performs (Phase 1's existing resolver — today,
+          // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
+          // uniform contract across every entity_type/action). A write method
+          // with no built-in read-back has nothing further to check here
+          // beyond its own reported success, which is what the check above
+          // already gates on.
+          if (
+            result.readBackVerified === true &&
+            Array.isArray(result.readBackMismatches) &&
+            result.readBackMismatches.length > 0
+          ) {
+            return {
+              verified: false,
+              mismatches: result.readBackMismatches.map((m: any) => ({
+                parameter: m.parameter, requested: m.requested, applied: m.applied,
+              })),
+            };
+          }
+          return {
+            verified: true,
+            verifiedFields: {
+              appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+              ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
+            },
+          };
+        },
+      };
+    });
+  }
+
+  /**
+   * ENG-1635/1644: resolve a full submission of deck answers, and — for every
+   * item the user approved — drive it to completion via the independent-step
+   * workflow engine before returning. This is what actually executes a deck's
+   * approved writes; the model never re-calls call_meta_marketing_api for
+   * them (see the halt's rewritten model-facing message, gap 5 Round 3
+   * consequence #2).
+   *
+   * Re-reads the session fresh (never trusts an in-memory snapshot), so a
+   * concurrent submission or a session that has moved on loses cleanly rather
+   * than corrupting either the answer or the run.
+   */
+  async submitApprovalDeckAnswers(
+    sessionId: string,
+    inboundAnswers: InboundDeckAnswer[],
+    answeredBy: ApprovalDeckAnsweredBy,
+  ): Promise<
+    | { outcome: 'invalid'; reason: string }
+    | { outcome: 'conflict' }
+    | { outcome: 'submitted'; run: WorkflowRunState | null }
+  > {
+    const session = await chatbotDb.getChatSession(sessionId);
+    const deck = session?.pendingApprovalDeck;
+    if (!deck) return { outcome: 'invalid', reason: 'No pending approval deck in this session.' };
+
+    let answered: PendingApprovalDeck;
+    try {
+      answered = applyDeckAnswers(deck, inboundAnswers, answeredBy, new Date().toISOString());
+    } catch (err: any) {
+      return { outcome: 'invalid', reason: err?.message || 'Invalid deck submission.' };
     }
 
-    return dispatchResult;
+    const persisted = await chatbotDb.updateSessionApprovalDeck(sessionId, answered, {
+      requireStillAwaiting: deck.deckId,
+    });
+    if (!persisted) return { outcome: 'conflict' };
+
+    const approved = approvedWriteItems(answered);
+    if (approved.length === 0) {
+      // Every item was rejected — nothing to execute, no workflow needed.
+      return { outcome: 'submitted', run: null };
+    }
+
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
+    const definition = { workflowId: `approval-deck-${deck.deckId}`, steps };
+
+    const started = await startWorkflow(sessionId, definition, undefined).catch(() => null);
+    if (!started) return { outcome: 'conflict' };
+
+    let outcome = await advanceIndependentWorkflow(sessionId, definition);
+    // Keep advancing until every step has been attempted — step_verified/
+    // step_failed both mean "keep going" here, UNLIKE the sequential engine's
+    // advanceWorkflow (see advanceIndependentWorkflow's own header).
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed') {
+      outcome = await advanceIndependentWorkflow(sessionId, definition);
+    }
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run') {
+      return { outcome: 'conflict' };
+    }
+    return { outcome: 'submitted', run: outcome.run };
   }
 
   /**
