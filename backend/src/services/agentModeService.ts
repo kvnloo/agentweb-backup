@@ -1518,36 +1518,9 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
-  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
-  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
-  // no known code path that mutates the registry in between (see the brain node).
-  // The one remaining live hypothesis is that more than one AgentModeService instance
-  // is answering requests inside the same forked worker process (e.g. the per-message
-  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
-  // worker after all). Stamping each instance at construction settles it directly: if
-  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
-  // reads on the same pid, that's a second instance, proven, not inferred.
-  private readonly instanceId = Math.random().toString(36).slice(2, 10);
-
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
-    // instanceId alone proved a second, empty-registry instance answers requests
-    // inside the same worker process, but every known construction site (module
-    // singleton, the worker's own instance, chatbotService.ts's per-message
-    // throwaway) traces to a call graph that shouldn't reach the worker a second
-    // time. Capturing the actual construction stack settles which site it really
-    // is instead of continuing to reason about it from the outside.
-    // Stack goes inside the same JSON blob (not a second console.log argument) so a
-    // log shipper that splits on newline can't separate it from its pid/instanceId —
-    // a raw multi-line stack string passed alongside would risk exactly that.
-    console.log('[ENG-1852-CTOR]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      stack: new Error('construction site').stack,
-    }));
   }
 
   // ENG-1852 follow-up: initialize() is idempotent and concurrency-safe.
@@ -6154,31 +6127,6 @@ export class AgentModeService {
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
-    // across 5 calls within a single 6-second window of ONE user turn, all bearing
-    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
-    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
-    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
-    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
-    // this.toolRegistry is somehow being read as empty intermittently (no code path
-    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
-    // pure/synchronous, and registerTools() is called exactly once in this file), or
-    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
-    // restart/still draining, a new one still initializing) and both happen to log
-    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
-    // across all lines confirms (a); differing pids confirms (b).
-    console.log('[ENG-1852-DIAG]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      allToolsCount: allTools.length,
-      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
-      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
-      associatedToolNamesCount: associatedToolNames.size,
-      excludedToolsCount: excludedTools.size,
-      publishedSkillsCount: publishedSkills.length,
-    }));
 
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
