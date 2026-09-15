@@ -266,12 +266,17 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
         for (const t of clause.types) {
           const e = unwrap(t.expression);
           if (ts.isIdentifier(e) && direct.has(e.text) && node.name?.text !== CLASS_NAME) count++;
-          if (
-            ts.isPropertyAccessExpression(e) &&
-            e.name.text === CLASS_NAME &&
-            ts.isIdentifier(e.expression) &&
-            namespaces.has(e.expression.text)
-          ) count++;
+          if (ts.isPropertyAccessExpression(e) && e.name.text === CLASS_NAME) {
+            const b = unwrap(e.expression);
+            if (ts.isIdentifier(b) && namespaces.has(b.text)) count++;
+            else if (isModuleLoadCall(b)) count++;
+          }
+          // `class E extends mod['AgentModeService'] {}` — the extends clause had no
+          // computed-member case at all, though `new` gained one.
+          if (ts.isElementAccessExpression(e) && isClassNameLiteral(e.argumentExpression)) {
+            const b = unwrap(e.expression);
+            if ((ts.isIdentifier(b) && namespaces.has(b.text)) || isModuleLoadCall(b)) count++;
+          }
         }
       }
     }
@@ -287,7 +292,12 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
     ) {
       const a = unwrap(node.arguments[0] as ts.Expression);
       if (ts.isIdentifier(a) && direct.has(a.text)) count++;
-      if (ts.isPropertyAccessExpression(a) && a.name.text === CLASS_NAME) count++;
+      // Gated on the base resolving to THIS module, matching the NewExpression branch —
+      // ungated, an unrelated module exporting a same-named class was falsely flagged.
+      if (ts.isPropertyAccessExpression(a) && a.name.text === CLASS_NAME) {
+        const b = unwrap(a.expression);
+        if ((ts.isIdentifier(b) && namespaces.has(b.text)) || isModuleLoadCall(b)) count++;
+      }
       if (ts.isElementAccessExpression(a) && isClassNameLiteral(a.argumentExpression)) count++;
     }
 
@@ -309,7 +319,9 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
       if (ts.isPropertyAccessExpression(target) && target.name.text === CLASS_NAME) {
         // `new mod.AgentModeService()` where mod is a tracked module binding, or
         // the inline `new (await import('./agentModeService')).AgentModeService()`.
-        const base = target.expression;
+        // unwrap() here too: `new (mod).X()` and `new (mod as any).X()` were slipping
+        // through because only the callee and the ElementAccess base were unwrapped.
+        const base = unwrap(target.expression);
         const viaBinding = ts.isIdentifier(base) && namespaces.has(base.text);
         const viaInlineLoad = isModuleLoadCall(base) ||
           (ts.isParenthesizedExpression(base) && isModuleLoadCall(base.expression));
@@ -625,6 +637,35 @@ describe('AgentModeService construction guard — detection behaviour', () => {
       'void svc;',
     ].join('\n');
     expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags construction off a parenthesized or cast module object', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'const a = new (mod).AgentModeService();',
+      'const b = new (mod as any).AgentModeService();',
+      'void a; void b;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService 2 time/);
+  });
+
+  it('flags a subclass off a parenthesized or computed module member', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'class A extends (mod).AgentModeService {}',
+      "class B extends mod['AgentModeService'] {}",
+      'void new A(); void new B();',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('does not flag a same-named class from an unrelated module via Reflect', () => {
+    const src = [
+      "import * as other from './someOtherLib';",
+      'const svc = Reflect.construct(other.AgentModeService, []);',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).not.toThrow();
   });
 
   it('flags a namespace-style construction', () => {

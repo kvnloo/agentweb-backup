@@ -1581,14 +1581,29 @@ export class AgentModeService {
   // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
   // without error — so the flag below alone would latch a degraded init too.
   private emmaToolsRegistered = false;
-  // initializeMcp() and ensureBuiltInSkills() swallow their own errors too, so
-  // registration succeeding says nothing about them. Without these, a transient MCP
-  // or built-in-skill failure latches permanently: MCP tools stay absent or skills
-  // stay stale until a process restart. Each step reports its OWN outcome and the
-  // latch is the conjunction — replacing "infer health from one proxy signal", which
-  // produced this same defect three rounds running.
-  private mcpStepOk = false;
-  private builtInSkillsStepOk = false;
+  // Not a latch signal — only prevents the retry path from re-scanning every skill and
+  // re-updating each built-in on every failed attempt.
+  private builtInSkillsSeeded = false;
+  // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
+  // that could never report failure:
+  //
+  //   initializeMcp() — McpClientService.initialize() is structurally incapable of
+  //   rejecting (its whole body is inside try/catch, per-server failures are swallowed
+  //   deeper still in safeConnectToServer, and the config read has its own catch). A flag
+  //   set on its success path is therefore constant true. A tool-count check would be
+  //   wrong too: this deployment's only non-internal MCP server carries secret
+  //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
+  //   There is no signal here to gate on, and shipping one that always reads true is
+  //   worse than none — it reads as coverage.
+  //
+  //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
+  //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
+  //   row failing welcome-message validation) silently reverted this whole optimization
+  //   to per-message registration PLUS a full skills-table scan per chat message,
+  //   surfaced only by one console.error per message.
+  //
+  // The latch gates on what ENG-1852 was actually about: whether this instance's tool
+  // registry is usable.
   // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
   // its five inits replace live singletons unconditionally. The latch's retry path
   // would otherwise swap them under in-flight tool calls on every failed attempt.
@@ -1615,15 +1630,12 @@ export class AgentModeService {
       this.initialized =
         AgentModeService.toolsRegistered &&
         this.emmaToolsRegistered &&
-        this.mcpStepOk &&
-        this.builtInSkillsStepOk &&
         this.toolRegistry.getAllTools().length > 0;
       if (!this.initialized) {
         console.error(
           'AgentMode: initialize() completed but tool registration did not succeed ' +
           `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
           `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
-          `mcp=${this.mcpStepOk}, builtInSkills=${this.builtInSkillsStepOk}, ` +
           `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
           'treating init as failed so the next caller retries.',
         );
@@ -1637,16 +1649,15 @@ export class AgentModeService {
     await this.registerTools();
 
     if (process.env.IS_MCP_SERVER !== 'true') {
-      this.mcpStepOk = false;
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
-      this.mcpStepOk = true; // not applicable in MCP-server mode
     }
 
     // Skipped once it has succeeded: it re-scans every skill and issues an update per
     // built-in, which the retry path would otherwise repeat on every failed attempt.
-    if (!this.builtInSkillsStepOk) {
+    // Its outcome does NOT gate the latch — see the note on the fields above.
+    if (!this.builtInSkillsSeeded) {
       await this.ensureBuiltInSkills();
     }
 
@@ -1654,9 +1665,11 @@ export class AgentModeService {
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
     // (generateMarketingResponseWorker) doesn't run that path — so any tool
     // that resolves a singleton via getEnrichSoService / getUnipile*Service
-    // would throw "service not initialized" inside the worker. Each init is
-    // idempotent and wrapped in try/catch so a single failure (e.g. missing
-    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // would throw "service not initialized" inside the worker. Each is wrapped in
+    // try/catch so a single failure (e.g. a missing enrich.so secret in dev) doesn't
+    // block the rest — but they are NOT all idempotent: initEnrichSoService,
+    // initApolloService and initUnipileSearchParamService each replace their singleton
+    // unconditionally, which is why the guard below runs this once. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
     if (!this.downstreamSingletonsStarted) {
@@ -1742,7 +1755,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
-    this.builtInSkillsStepOk = false;
+    this.builtInSkillsSeeded = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1775,7 +1788,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
-      this.builtInSkillsStepOk = true;
+      this.builtInSkillsSeeded = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1816,12 +1829,12 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
-    // Idempotent. Nothing previously prevented a second call — origin/main's initialize()
-    // has no guard at all, and earlier on this branch it ran once per widget message on
-    // the shared singleton. Unguarded, each call assigns a fresh interval and orphans the
-    // previous one, every orphan retaining this instance through its closure. That is the
-    // same leak shape as the per-message-instance bug, and the latch's retry path makes
-    // repeat calls routine rather than incidental.
+    // Idempotent. On origin/main a fresh instance per widget message meant each call
+    // started an interval on an object that then leaked — the bug this branch fixes. On
+    // the shared singleton a repeat call is no longer hypothetical: the latch's retry
+    // path runs the whole initialization body again whenever init was degraded, and
+    // unguarded each pass would assign a new interval and orphan the previous one, every
+    // orphan retaining this instance through its closure.
     if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
@@ -1878,9 +1891,6 @@ export class AgentModeService {
           }
         }
       }
-      // A prior instance already brought MCP up and this instance has now copied its
-      // tools — that is a successful outcome for this step, not a skipped one.
-      this.mcpStepOk = true;
       return;
     }
     (AgentModeService as any).mcpInitialized = true;
@@ -1894,11 +1904,9 @@ export class AgentModeService {
         this.toolRegistry.register(tool);
       }
       console.log(`[MCP-DEBUG] Registered ${mcpTools.length} tools from MCP servers`);
-      this.mcpStepOk = true;
     } catch (error) {
       console.error('AgentMode: Error initializing MCP:', error);
       (AgentModeService as any).mcpInitialized = false;
-      this.mcpStepOk = false;
     }
   }
 
@@ -1961,7 +1969,6 @@ export class AgentModeService {
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
-      let copied = 0;
 
       for (const name of toolNames) {
         const toolHandler = emmaToolRegistry.getTool(name);
@@ -1985,7 +1992,6 @@ export class AgentModeService {
             // here is what made the registry guard inert for live sessions.
             requiresUserAccount: toolHandler.requiresUserAccount
           });
-          copied++;
         }
       }
       // "Didn't throw" is not success. Every statement in this try is non-throwing
@@ -1994,10 +2000,16 @@ export class AgentModeService {
       // latch accepted, leaving an instance live with only the four built-ins
       // registered below. That is the ENG-1852 symptom exactly. Require the copy to
       // be complete and non-empty.
-      this.emmaToolsRegistered = toolNames.length > 0 && copied === toolNames.length;
+      // `copied === toolNames.length` was here and is deliberately gone: against the real
+      // McpToolRegistry (a synchronous Map — getToolNames() is Array.from(keys),
+      // getTool() is Map.get) it can never be false, and a condition that cannot fail is
+      // the exact thing three prior rounds shipped by accident. `toolNames.length > 0` is
+      // the term that does real work: it catches an emmaToolRegistry that was never
+      // populated, which is the ENG-1852 state.
+      this.emmaToolsRegistered = toolNames.length > 0;
       if (!this.emmaToolsRegistered) {
         console.error(
-          `AgentMode: Emma tool copy incomplete — ${copied}/${toolNames.length} registered.`,
+          'AgentMode: emmaToolRegistry was empty — no Emma tools copied into this instance.',
         );
       }
     } catch (error) {

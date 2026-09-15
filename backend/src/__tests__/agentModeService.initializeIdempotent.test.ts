@@ -79,22 +79,14 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     // Spy on the private worker so these tests assert the guard itself, not any
     // particular side effect of the initialization body.
     // The mock stands in for a SUCCESSFUL runInitialize, so it must set the same signals
-    // a real one would. The latch deliberately keys on real registration outcome
-    // (AgentModeService.toolsRegistered + emmaToolsRegistered), not on "the promise
-    // resolved" — see agentModeService.degradedInit.test.ts, which drives the real
-    // registerTools() path. Without this the mock models a permanently-failing init and
-    // nothing here could ever latch.
     (AgentModeService as any).toolsRegistered = true;
     runSpy = jest
       .spyOn(service as any, 'runInitialize')
       .mockImplementation(async () => {
-        // Must set EVERY step's flag. The latch is the conjunction of all of them, so a
-        // mock that reports only one models a permanently-degraded init and nothing here
-        // could ever latch. Kept explicit rather than helper-wrapped: if a new step is
-        // added to the latch, this line should fail loudly and be updated deliberately.
+        // Models a successful registration. This file covers CONTROL FLOW only — see
+        // agentModeService.degradedInit.test.ts for the latch's signal, which is driven
+        // through the real registerTools() path rather than assigned by the test.
         (service as any).emmaToolsRegistered = true;
-        (service as any).mcpStepOk = true;
-        (service as any).builtInSkillsStepOk = true;
       });
   });
 

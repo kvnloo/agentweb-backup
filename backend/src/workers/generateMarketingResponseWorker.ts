@@ -74,8 +74,18 @@ async function ensureInitialized() {
     await agentModeService.initialize();
   })();
   await initializationPromise;
-  initialized = true;
-  console.log('[Worker-DEBUG] AgentModeService initialized (MCP servers loaded)');
+  // Latch on the service's OWN verdict, not on "the promise resolved". initialize()
+  // resolves even when initialization degraded — every step inside it swallows its own
+  // errors — so marking this worker initialized on mere resolution makes a degraded init
+  // permanent here, and the retry path the service provides never runs. This process is
+  // exactly where ENG-1852 manifested, so it is the last place that should latch blind.
+  initialized = agentModeService.isInitialized;
+  initializationPromise = null;
+  if (initialized) {
+    console.log('[Worker-DEBUG] AgentModeService initialized (MCP servers loaded)');
+  } else {
+    console.error('[Worker] AgentModeService initialization DEGRADED — next message retries.');
+  }
 }
 
 // Initialize immediately when worker starts, then send ready signal
