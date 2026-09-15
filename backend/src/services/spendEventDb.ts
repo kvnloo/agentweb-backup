@@ -390,3 +390,51 @@ export async function listSpendEvents(
 export function sumSettledMicroUsd(events: readonly SpendEvent[]): number {
   return events.reduce((total, e) => (e.lifecycle === "settled" ? total + e.costMicroUsd : total), 0);
 }
+
+/** The outcome of a read that refuses to run past a ceiling (ENG-1841). */
+export interface BoundedSpendEventRead {
+  events: SpendEvent[];
+  /**
+   * True when the subject has MORE than `maxEvents` events in the range. The
+   * events are then incomplete, and nothing may be summed from them — a
+   * truncated aggregate is a wrong aggregate.
+   */
+  exceeded: boolean;
+}
+
+/**
+ * `listSpendEvents` for an interactive reader: stops paging once it holds more
+ * than `maxEvents`, and says so.
+ *
+ * `listSpendEvents` itself keeps paging to exhaustion, deliberately — the §8
+ * reconciliation must see every event. This variant bounds the admin read so a
+ * very large subject-month costs a fixed amount of work and returns an explicit
+ * "too large" answer instead of silently understating every total.
+ */
+export async function listSpendEventsBounded(
+  billingUserId: string,
+  start: string,
+  end: string,
+  maxEvents: number,
+): Promise<BoundedSpendEventRead> {
+  const items: SpendEvent[] = [];
+  let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+  do {
+    const result = await db()
+      .query({
+        TableName: SPEND_EVENTS_TABLE,
+        IndexName: SPEND_EVENTS_OCCURRED_AT_INDEX,
+        KeyConditionExpression: "billingUserId = :user AND occurredAt BETWEEN :start AND :end",
+        ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
+        ScanIndexForward: false,
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      })
+      .promise();
+    items.push(...((result.Items || []) as SpendEvent[]));
+    if (items.length > maxEvents) return { events: items, exceeded: true };
+    lastKey = result.LastEvaluatedKey;
+  } while (lastKey);
+
+  return { events: items, exceeded: false };
+}
