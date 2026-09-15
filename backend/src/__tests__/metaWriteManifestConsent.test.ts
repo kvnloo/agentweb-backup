@@ -1,10 +1,12 @@
 /**
- * ENG-1642 — manifest consent: an approved deployment manifest authorizes its
- * exact Meta writes without re-confirmation.
+ * ENG-1642/1635/1644 — manifest consent: an approved approval deck authorizes
+ * its exact Meta writes without re-confirmation.
  *
  * Exercises callMetaMarketingApi's unconfirmed-write path against a mocked
- * chatbotDb session so the manifest-grant seam (claimMetaWriteManifestGrant)
- * is proven end to end, matching the metaLaunchGateWiring.test.ts pattern.
+ * chatbotDb session so the manifest-grant seam (claimMetaWriteManifestGrant,
+ * now sourced from session.pendingApprovalDeck — ENG-1635/1644 gap 5's
+ * Migration note) is proven end to end, matching the metaLaunchGateWiring.test.ts
+ * pattern.
  */
 
 /*
@@ -37,7 +39,6 @@ jest.mock('../services/chatbotService', () => {
       ...actual.chatbotDb,
       getChatSession: jest.fn(),
       claimMetaWriteManifestDigest: jest.fn(),
-      recordMetaWriteManifestOutcome: jest.fn(),
     },
   };
 });
@@ -67,29 +68,30 @@ function digestForCall(params: Record<string, any>) {
   return computeMetaWriteManifestDigest(getJwtSecret(), { ...call, params });
 }
 
-function manifestQuestion(digests: string[], overrides: Partial<Record<string, any>> = {}) {
+// ENG-1635/1644 gap 5's Migration note: claimMetaWriteManifestGrant's SOURCE
+// moved from a pendingUserQuestion(kind='meta_write_manifest') to
+// session.pendingApprovalDeck.answers — this fixture replaces the old
+// manifestQuestion() helper.
+function approvedDeck(digests: string[]) {
+  const at = new Date().toISOString();
   return {
-    questionId: 'q-manifest-1',
-    question: 'Approve deployment manifest?',
-    kind: 'meta_write_manifest',
-    immutable: false,
-    allowEmmaDecide: false,
-    status: 'answered',
-    createdAt: new Date().toISOString(),
-    options: [
-      {
-        id: 'approve',
-        label: 'Approve',
-        consequence: 'Authorizes the listed writes.',
-        recommended: true,
-        why: 'Reviewed manifest.',
-        payload: { digests },
-      },
-      { id: 'reject', label: 'Reject', consequence: 'No writes authorized.', payload: {} },
-    ],
-    recommendedOptionId: 'approve',
-    answer: { optionId: 'approve', delegated: false, answeredBy: 'user', at: new Date().toISOString() },
-    ...overrides,
+    deckId: 'deck-1',
+    status: 'answered' as const,
+    createdAt: at,
+    finalizedAt: at,
+    items: digests.map((digest, i) => ({
+      itemId: `write-${i + 1}`,
+      kind: 'meta_write',
+      question: 'Approve this write?',
+      metaWriteManifestDigest: digest,
+      metaWriteDispatch: { ...call },
+    })),
+    answers: digests.map((digest, i) => ({
+      itemId: `write-${i + 1}`,
+      verdict: 'approve' as const,
+      answeredBy: 'user' as const,
+      at,
+    })),
   };
 }
 
@@ -108,12 +110,12 @@ async function invoke(params: Record<string, any> = call.params) {
   );
 }
 
-describe('ENG-1642 manifest consent', () => {
+describe('ENG-1642/1635/1644 manifest consent', () => {
   it('AC1: a granted digest executes without a confirmation halt', async () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
     (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
 
@@ -124,49 +126,18 @@ describe('ENG-1642 manifest consent', () => {
     expect((service as any).updateMetaAdsAd).toHaveBeenCalled();
   });
 
-  it('ENG-1635 AC7: a granted write records its outcome against the approved digest', async () => {
-    const digest = digestForCall(call.params);
-    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-      sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
-    });
-    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
-    (chatbotDb.recordMetaWriteManifestOutcome as jest.Mock).mockResolvedValue(undefined);
-
-    await invoke();
-
-    expect(chatbotDb.recordMetaWriteManifestOutcome).toHaveBeenCalledWith(
-      SESSION_ID,
-      digest,
-      expect.objectContaining({ status: 'applied' }),
-    );
-  });
-
-  it('ENG-1635 AC8: a granted write that FAILS still returns the real failure, and records it — never masked as applied', async () => {
-    const digest = digestForCall(call.params);
-    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-      sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
-    });
-    (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
-    (chatbotDb.recordMetaWriteManifestOutcome as jest.Mock).mockResolvedValue(undefined);
-    (service as any).updateMetaAdsAd = jest.fn().mockResolvedValue({ success: false, error: 'Invalid parameter' });
-
-    const res: any = await invoke();
-
-    expect(res.success).toBe(false);
-    expect(chatbotDb.recordMetaWriteManifestOutcome).toHaveBeenCalledWith(
-      SESSION_ID,
-      digest,
-      expect.objectContaining({ status: 'failed', error: 'Invalid parameter' }),
-    );
-  });
+  // ENG-1635 AC7/AC8 (outcome recording against a manifest-granted call) are
+  // retired: dispatch through callMetaMarketingApi's manifestGranted branch
+  // no longer records an outcome anywhere (see the Migration note at that
+  // call site) — the normal path is submitApprovalDeckAnswers's step-per-write
+  // dispatch, whose outcome lives in the workflow run's checkpoints and is
+  // covered by metaWriteManifestReconciliation.test.ts instead.
 
   it('AC2: a call not in the grant (different param) still halts and confirms', async () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
 
     const res: any = await invoke({ status: 'PAUSED' });
@@ -180,7 +151,7 @@ describe('ENG-1642 manifest consent', () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
       consumedMetaWriteManifestDigests: { [digest]: new Date().toISOString() },
     });
 
@@ -194,7 +165,7 @@ describe('ENG-1642 manifest consent', () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
     (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(false);
 
@@ -204,13 +175,48 @@ describe('ENG-1642 manifest consent', () => {
     expect((service as any).updateMetaAdsAd).not.toHaveBeenCalled();
   });
 
-  it('AC4: a manifest card answered by nothing (unanswered/no card) grants nothing', async () => {
+  it('AC4: no pending approval deck at all grants nothing', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: SESSION_ID });
 
     const res: any = await invoke();
 
     expect(res.awaitingUserConfirmation).toBe(true);
     expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+
+  it('AC4b: a deck that has NOT been answered yet (still "awaiting") grants nothing', async () => {
+    const digest = digestForCall(call.params);
+    const deck = approvedDeck([digest]);
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: SESSION_ID,
+      pendingApprovalDeck: { ...deck, status: 'awaiting', answers: undefined },
+    });
+
+    const res: any = await invoke();
+
+    expect(res.awaitingUserConfirmation).toBe(true);
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+
+  it('AC4c: a deck item the user REJECTED grants nothing', async () => {
+    const digest = digestForCall(call.params);
+    const deck = approvedDeck([digest]);
+    (deck.answers as any) = [{ itemId: 'write-1', verdict: 'reject', answeredBy: 'user', at: new Date().toISOString() }];
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: SESSION_ID, pendingApprovalDeck: deck });
+
+    const res: any = await invoke();
+
+    expect(res.awaitingUserConfirmation).toBe(true);
+    expect(chatbotDb.claimMetaWriteManifestDigest).not.toHaveBeenCalled();
+  });
+
+  it('gap 5: params.confirm=true with no grant at all still halts — the raw flag is never independently sufficient', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: SESSION_ID });
+
+    const res: any = await invoke({ ...call.params, confirm: true });
+
+    expect(res.awaitingUserConfirmation).toBe(true);
+    expect((service as any).updateMetaAdsAd).not.toHaveBeenCalled();
   });
 
   it('ENG-1635 AC6: a manifest digest computed against the RESOLVED account still grants a call whose raw account_id argument was omitted', async () => {
@@ -222,7 +228,7 @@ describe('ENG-1642 manifest consent', () => {
     const digest = digestForCall(call.params); // computed against ACCOUNT, the resolved id
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
     (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
 
@@ -241,7 +247,7 @@ describe('ENG-1642 manifest consent', () => {
     const digest = digestForCall(call.params); // computed against ACCOUNT
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
     jest.spyOn(service as any, 'getMetaCredentials').mockResolvedValue({ accountId: 'a-different-account', accessToken: 'tok' });
 
@@ -257,7 +263,7 @@ describe('ENG-1642 manifest consent', () => {
     const digest = digestForCall(call.params);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: SESSION_ID,
-      pendingUserQuestion: manifestQuestion([digest]),
+      pendingApprovalDeck: approvedDeck([digest]),
     });
     (chatbotDb.claimMetaWriteManifestDigest as jest.Mock).mockResolvedValue(true);
 

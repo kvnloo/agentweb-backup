@@ -109,6 +109,13 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     service = new AgentModeService();
     jest.clearAllMocks();
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+    // sufficient to pass the write-confirmation gate — a real grant is
+    // required. This file is about param validation/error enrichment, not
+    // the grant mechanism itself (that's metaWriteManifestConsent.test.ts),
+    // so stub the grant true by default; the two tests that specifically
+    // exercise the gate's own confirm=true behavior override this locally.
+    jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
   });
 
   // ==================== Pre-validation via callMetaMarketingApi ====================
@@ -374,10 +381,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.target.ad_set).toContain('Maintenance Ad Set');
     });
 
-    it('executes AD CREATE when confirm=true and strips the flag before dispatch', async () => {
+    it('a granted AD CREATE executes and strips confirm before dispatch — confirm itself grants nothing (gap 5)', async () => {
+      // ENG-1635/1644 gap 5: confirm=true is included here to prove it is
+      // stripped and inert, NOT because it is what authorizes this call —
+      // the top-level beforeEach's claimMetaWriteManifestGrant stub is what
+      // actually grants it. See the next test for confirm=true with no grant.
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        // ENG-1635/1644 gap 5: the grant check only runs at all when a
+        // sessionId is present (no session -> always halt, fail-closed) — a
+        // stubbed-granted spy that's never reached still halts.
+        sessionId: 'session-1',
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });
@@ -388,6 +403,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       // confirm must never leak into the params passed to metaService.
       const paramsArg = (metaService.createAd as jest.Mock).mock.calls[0][2];
       expect(paramsArg.confirm).toBeUndefined();
+    });
+
+    it('gap 5: confirm=true with NO grant still halts — the raw flag is never independently sufficient', async () => {
+      jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: false, digest: 'stub-digest' });
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // with a session present, this genuinely exercises the false-grant path, not just "no session halts"
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
     });
 
     it('blocks a VALID AD UPDATE without confirm and does not call metaService.updateAd', async () => {
@@ -703,10 +732,11 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
     });
 
-    it('does NOT set awaitingUserConfirmation when confirm=true (gate bypassed, executes)', async () => {
+    it('does NOT set awaitingUserConfirmation on a GRANTED write (gap 5: confirm=true itself grants nothing — the top-level beforeEach stub does)', async () => {
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // gap 5: the grant check only runs at all with a sessionId present
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });

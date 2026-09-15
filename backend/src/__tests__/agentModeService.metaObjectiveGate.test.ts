@@ -67,6 +67,11 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
     (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue({});
     (chatbotDb.createChatSession as jest.Mock).mockResolvedValue({ sessionId: 'auto-created-session' });
     (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', name: 'Test' });
+    // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+    // sufficient to pass the write-confirmation gate downstream of the
+    // objective gate this file actually tests — stub the grant true so a
+    // resolved objective can reach dispatch the same way it always could.
+    jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
   });
 
   const validParams = (extra: any = {}) => ({
