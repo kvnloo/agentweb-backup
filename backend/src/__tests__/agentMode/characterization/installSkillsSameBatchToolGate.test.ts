@@ -16,7 +16,7 @@
  */
 
 import { AgentModeService } from '../../../services/agentModeService';
-import { runScenario, installStandardMockDeps } from './harness';
+import { runScenario, runScenarioWithResult, installStandardMockDeps } from './harness';
 
 jest.mock('openai');
 jest.mock('../../../services/settingsService');
@@ -110,6 +110,14 @@ describe('AgentMode core loop — install_skills same-batch tool gate (ENG-1945)
   });
 
   it('a tool unlocked by install_skills succeeds when requested in the SAME batch as the install', async () => {
+    // ENG-1945 (review follow-up): install_skills now genuinely executes TWICE per
+    // batch — the eager Phase-1 head start (now itself routed through the gateway)
+    // and the authoritative Phase-2 gateway call. The harness's `executeTool` mock
+    // is keyed only by tool name, so `toolCallSequence` (populated solely from the
+    // Phase-2 ledger entry) can't see this — spy on `executeTool` directly to lock
+    // in the intended invocation count.
+    const executeToolSpy = jest.spyOn(service as any, 'executeTool');
+
     const snapshot = await runScenario(service, {
       message: 'Install the browser skill and pull the Luma guest list.',
       transcript: [
@@ -140,5 +148,42 @@ describe('AgentMode core loop — install_skills same-batch tool gate (ENG-1945)
       { name: 'install_skills', arguments: { skillIds: ['browser-skill'] }, outcome: 'success' },
       { name: 'playwright_browser_navigate', arguments: { url: 'https://luma.com/guests' }, outcome: 'success' },
     ]);
+
+    const installSkillsCalls = executeToolSpy.mock.calls.filter(([, toolName]) => toolName === 'install_skills');
+    expect(installSkillsCalls).toHaveLength(2);
+  });
+
+  it('a sibling gated tool stays blocked when install_skills rejects an unresolvable skill id in the same batch', async () => {
+    const { snapshot, result } = await runScenarioWithResult(service, {
+      message: 'Install the browser skill and pull the Luma guest list.',
+      transcript: [
+        {
+          tool_calls: [
+            { id: 'i1', name: 'install_skills', arguments: '{"skillIds":["no-such-skill"]}' },
+            { id: 'n1', name: 'playwright_browser_navigate', arguments: '{"url":"https://luma.com/guests"}' },
+          ],
+        },
+        { content: 'Could not install the requested skill, so navigation did not run.' },
+      ],
+      toolResults: {
+        install_skills: {
+          result: {
+            success: false,
+            message: 'Could not resolve these skill IDs to any known skill: no-such-skill.',
+          },
+        },
+      },
+    });
+
+    // The sibling's preflight rejection is appended to the ledger synchronously during
+    // Phase 1 (before install_skills' own Phase-2 gateway result lands), so it precedes
+    // install_skills here even though the model emitted install_skills first.
+    expect(snapshot.toolCallSequence).toEqual([
+      { name: 'playwright_browser_navigate', arguments: { url: 'https://luma.com/guests' }, outcome: 'error' },
+      { name: 'install_skills', arguments: { skillIds: ['no-such-skill'] }, outcome: 'error' },
+    ]);
+    expect(String(result.toolCalls[0].error)).toContain(
+      'is not available. You must install the required skill first using install_skills.',
+    );
   });
 });
