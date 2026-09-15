@@ -7,6 +7,10 @@ function makeHarness() {
   settings.set('human_eval_slack_channel', 'C_EVAL');
   settings.set('human_eval_reviewer_matt_slack_user_id', 'U_MATT');
   settings.set('human_eval_reviewer_fangfang_slack_user_id', 'U_FANGFANG');
+  // ENG-1854: posting is off by default now — every existing test in this file predates
+  // that change and asserts on a real Slack post happening, so opt this shared harness in.
+  // Tests for the new disabled-by-default/exception-list behavior override this explicitly.
+  settings.set('human_eval_slack_posting_enabled', 'true');
 
   const db = {
     put: jest.fn((params: any) => ({
@@ -24,10 +28,16 @@ function makeHarness() {
       promise: async () => {
         const item = items.get(params.Key.candidateId);
         if (!item) return;
-        const feedback = params.ExpressionAttributeValues[':feedback'];
-        item.feedback = [...(item.feedback || []), ...feedback];
-        item.status = params.ExpressionAttributeValues[':status'];
-        item.updatedAt = params.ExpressionAttributeValues[':updatedAt'];
+        const values = params.ExpressionAttributeValues || {};
+        // ENG-1854: this mock now backs two distinct update shapes — appendFeedback's
+        // feedback-append, and createCandidate's post-hoc slackChannel/slackMessageTs set.
+        if (':feedback' in values) {
+          item.feedback = [...(item.feedback || []), ...values[':feedback']];
+          item.status = values[':status'];
+          item.updatedAt = values[':updatedAt'];
+        }
+        if (':c' in values) item.slackChannel = values[':c'];
+        if (':t' in values) item.slackMessageTs = values[':t'];
         items.set(item.candidateId, item);
       },
     })),
@@ -425,8 +435,8 @@ describe('HumanEvalService', () => {
     });
 
     const handled = await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000001.000001',
       slackUserId: 'U_MATT',
       text: 'Hero is clear, but mobile hierarchy fails and CTA is too low.',
@@ -478,8 +488,8 @@ describe('HumanEvalService', () => {
     slack.postSlackMessage.mockClear();
 
     const handled = await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000002.000001',
       slackUserId: 'U_HARSHA',
       text: 'Looks good, but make it a modal on login instead.',
@@ -529,8 +539,8 @@ describe('HumanEvalService', () => {
     slack.postSlackMessage.mockClear();
 
     await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000003.000001',
       slackUserId: 'U_FANGFANG',
       text: 'Too dark, brighten the background.',
@@ -772,5 +782,69 @@ describe('HumanEvalService', () => {
 
     expect(handled).toBe(false);
     expect(chatbot.addMessageToSession).not.toHaveBeenCalled();
+  });
+
+  describe('Slack posting toggle (ENG-1854)', () => {
+    it('persists the candidate even when Slack posting is disabled — never a silent drop', async () => {
+      const { service, slack, items, settings } = makeHarness();
+      settings.delete('human_eval_slack_posting_enabled');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated.',
+        userId: 'user-no-exception',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+      expect(candidate.slackMessageTs).toBeUndefined();
+      expect(items.get(candidate.candidateId)).toBeDefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated.');
+    });
+
+    it('persists the candidate even when the Slack post itself throws', async () => {
+      const { service, slack, items } = makeHarness();
+      slack.postSlackMessage.mockRejectedValueOnce(new Error('Slack channel is not configured'));
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated despite a Slack failure.',
+      });
+
+      expect(candidate.slackChannel).toBeUndefined();
+      expect(candidate.slackMessageTs).toBeUndefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated despite a Slack failure.');
+    });
+
+    it('still posts for a userId on the exception list even when the global toggle is off', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.delete('human_eval_slack_posting_enabled');
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Haven creative for review.',
+        userId: 'user-haven',
+      });
+
+      expect(slack.postSlackMessage).toHaveBeenCalledWith('C_EVAL', expect.any(String));
+      expect(candidate.slackChannel).toBe('C_EVAL');
+      expect(candidate.slackMessageTs).toBe('1780000000.123456');
+    });
+
+    it('does not post for a userId NOT on the exception list when the global toggle is off', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.delete('human_eval_slack_posting_enabled');
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Some other customer entirely.',
+        userId: 'user-someone-else',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+    });
   });
 });
