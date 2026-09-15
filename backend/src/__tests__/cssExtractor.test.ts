@@ -253,6 +253,8 @@ const mockPage = {
   setUserAgent: jest.fn(),
   setCacheEnabled: jest.fn(),
   setExtraHTTPHeaders: jest.fn(),
+  setRequestInterception: jest.fn(),
+  on: jest.fn(),
   emulateMediaFeatures: jest.fn(),
   goto: jest.fn(),
   reload: jest.fn(),
@@ -279,6 +281,24 @@ jest.mock('../utils/browserUtils', () => ({
 // Mock axios for JSDOM fallback path
 jest.mock('axios');
 
+// Mock the shared SSRF guard so fixture hostnames (example.com, etc.) don't
+// depend on real DNS resolution in CI/sandboxes with no network access.
+// Still blocks the same localhost/private-IP literals the guard blocks for
+// real, so the 'URL validation' SSRF tests below exercise real behavior.
+jest.mock('../utils/ssrfGuard', () => ({
+  resolvePinnedPublicAddress: jest.fn().mockImplementation(async (rawUrl: string) => {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0') {
+      throw new Error('URL resolves to a private/internal address');
+    }
+    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/.test(hostname)) {
+      throw new Error('URL resolves to a private/internal address');
+    }
+    return { hostname, address: '93.184.216.34', family: 4 };
+  }),
+}));
+
 import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, modernColorToHex, averageBackgroundLightness, isDistinctDarkTheme, DesignTokens } from '../services/cssExtractor';
 
 const { findChromeExecutable } = require('../utils/browserUtils');
@@ -296,15 +316,15 @@ describe('cssExtractor', () => {
     });
 
     it('should throw on SSRF localhost', async () => {
-      await expect(extractCSSFromURL('http://localhost:3000')).rejects.toThrow('Cannot fetch from localhost');
+      await expect(extractCSSFromURL('http://localhost:3000')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on SSRF private IP ranges', async () => {
-      await expect(extractCSSFromURL('http://192.168.1.1')).rejects.toThrow('Cannot fetch from private IP ranges');
+      await expect(extractCSSFromURL('http://192.168.1.1')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on SSRF 10.x.x.x private IP', async () => {
-      await expect(extractCSSFromURL('http://10.0.0.1')).rejects.toThrow('Cannot fetch from private IP ranges');
+      await expect(extractCSSFromURL('http://10.0.0.1')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on non-HTTP protocol', async () => {

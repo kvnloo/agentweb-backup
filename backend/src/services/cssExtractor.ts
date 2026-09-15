@@ -2,6 +2,36 @@ import { JSDOM } from 'jsdom';
 import Color from 'color';
 import axios from 'axios';
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from '../utils/browserUtils';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+
+// This now runs on every onboarding signup (ENG-328), not just occasional Emma
+// tool calls — cap concurrent Chrome launches so a burst of signups can't stack
+// up browsers competing with cssExtractor.ts's fellow headless-Chrome consumers
+// (linkedInService.ts, pdfRenderService.ts, landingPageSmokeTest.ts) for the same
+// prod-box CPU/memory budget. Extra calls queue (FIFO) rather than run in parallel.
+let maxConcurrentCssExtractions = 2;
+let activeCssExtractions = 0;
+const cssExtractionQueue: Array<() => void> = [];
+
+/** Override max concurrency (for testing). */
+export function setCssExtractorConcurrency(max: number) {
+  maxConcurrentCssExtractions = max;
+}
+
+async function acquireCssExtractionSlot(): Promise<void> {
+  if (activeCssExtractions < maxConcurrentCssExtractions) {
+    activeCssExtractions++;
+    return;
+  }
+  await new Promise<void>((resolve) => cssExtractionQueue.push(resolve));
+  activeCssExtractions++;
+}
+
+function releaseCssExtractionSlot(): void {
+  activeCssExtractions--;
+  const next = cssExtractionQueue.shift();
+  if (next) next();
+}
 
 // Type definitions
 export interface BrandIdentity {
@@ -116,29 +146,82 @@ interface ExtractionOptions {
   includeExternalStylesheets?: boolean;
 }
 
+const CSS_EXTRACTOR_MAX_REDIRECTS = 5;
+
 /**
- * Fetch the current HTML for an already-validated URL.
- *
- * This transport boundary is exported so the real-network freshness contract
- * can be tested against a portable loopback fixture without weakening or
- * bypassing `validateURL`. Callers outside this module must validate untrusted
- * URLs before invoking it.
+ * SSRF-safe text fetch: re-validates (DNS-pins via ssrfGuard's
+ * resolvePinnedPublicAddress) the destination on EVERY redirect hop, not just
+ * the first request — a public-looking URL that redirects to a private/
+ * metadata address is blocked at the hop that reveals it, not waved through
+ * after a single upfront check. The axios connection is pinned to the
+ * resolved address (via the `lookup` override) so a second, unpinned DNS
+ * lookup at connect-time can't be rebound to a private IP between validation
+ * and fetch (see ssrfGuard.ts's resolvePinnedPublicAddress doc comment).
  */
-export async function fetchFreshHtmlFromValidatedUrl(validatedUrl: string): Promise<string> {
-  const response = await axios.get(validatedUrl, {
-    timeout: 30000,
-    headers: {
-      'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
-      // Brand-build must scrape the CURRENT site — never a stale/CDN copy.
-      'Cache-Control': 'no-cache',
-      Pragma: 'no-cache',
-    },
-    responseType: 'text',
-  });
-  return String(response.data);
+async function fetchTextSSRFSafe(
+  startUrl: string,
+  timeoutMs: number,
+  headers: Record<string, string>,
+  resolvePinned: typeof resolvePinnedPublicAddress = resolvePinnedPublicAddress
+): Promise<string> {
+  let url = startUrl;
+  for (let hop = 0; hop <= CSS_EXTRACTOR_MAX_REDIRECTS; hop++) {
+    const pinned = await resolvePinned(url);
+    const response = await axios.get(url, {
+      timeout: timeoutMs,
+      headers,
+      responseType: 'text',
+      maxRedirects: 0,
+      validateStatus: (s: number) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, pinned.address, pinned.family);
+      },
+    } as any);
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers?.location;
+      if (!location) throw new Error(`Redirect ${response.status} with no Location header`);
+      const next = new URL(String(location), url);
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new Error(`Refusing to follow non-http(s) redirect to ${next.protocol}`);
+      }
+      url = next.toString();
+      continue;
+    }
+
+    return String(response.data);
+  }
+  throw new Error(`Too many redirects (>${CSS_EXTRACTOR_MAX_REDIRECTS})`);
 }
 
-// Security: URL validation
+/**
+ * Fetch the current HTML for a URL, SSRF-safely (see fetchTextSSRFSafe).
+ *
+ * This transport boundary is exported so the real-network freshness contract
+ * can be tested against a portable loopback fixture: pass a `resolvePinned`
+ * override (mirroring ssrfGuard.ts's own RedirectFetchDeps injection point)
+ * so a test's local fixture server doesn't have to fight real SSRF/DNS
+ * validation. Production callers omit it and get the real guard.
+ */
+export async function fetchFreshHtmlFromValidatedUrl(
+  validatedUrl: string,
+  resolvePinned: typeof resolvePinnedPublicAddress = resolvePinnedPublicAddress
+): Promise<string> {
+  return fetchTextSSRFSafe(validatedUrl, 30000, {
+    'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
+    // Brand-build must scrape the CURRENT site — never a stale/CDN copy.
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  }, resolvePinned);
+}
+
+// Cheap, sync format/protocol check. Real SSRF protection (DNS-pinned,
+// redirect-safe) happens at each actual network fetch below — a single
+// upfront hostname/IP-literal check here cannot protect against a later
+// redirect to a private/metadata address, which is exactly the gap this
+// module used to have (page.goto()/axios both followed redirects with zero
+// re-validation).
 function validateURL(urlString: string): URL {
   let url: URL;
 
@@ -148,20 +231,8 @@ function validateURL(urlString: string): URL {
     throw new Error('Invalid URL format');
   }
 
-  // Only allow HTTP and HTTPS
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error('URL must be HTTP or HTTPS');
-  }
-
-  // Prevent SSRF: Block localhost
-  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '0.0.0.0') {
-    throw new Error('Cannot fetch from localhost');
-  }
-
-  // Prevent SSRF: Block private IP ranges
-  const privateIPRegex = /^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
-  if (privateIPRegex.test(url.hostname)) {
-    throw new Error('Cannot fetch from private IP ranges');
   }
 
   return url;
@@ -535,7 +606,21 @@ async function extractWithPuppeteer(
     throw new Error('No Chrome executable found');
   }
 
-  const browser = await puppeteer.default.launch({
+  await acquireCssExtractionSlot();
+  try {
+    return await extractWithPuppeteerBrowser(urlString, url, executablePath, puppeteer.default);
+  } finally {
+    releaseCssExtractionSlot();
+  }
+}
+
+async function extractWithPuppeteerBrowser(
+  urlString: string,
+  url: URL,
+  executablePath: string,
+  puppeteer: typeof import('puppeteer-core').default
+): Promise<ExtractedCSS> {
+  const browser = await puppeteer.launch({
     executablePath,
     headless: true,
     args: PUPPETEER_LAUNCH_ARGS,
@@ -554,6 +639,27 @@ async function extractWithPuppeteer(
     await page.setExtraHTTPHeaders({
       'Cache-Control': 'no-cache',
       Pragma: 'no-cache',
+    });
+
+    // Re-validate on every navigation Chrome performs (the initial load AND
+    // every redirect hop it follows) — page.goto() otherwise follows redirects
+    // with zero re-validation, letting a public-looking URL that 302s to a
+    // private/metadata address sail through untouched.
+    await page.setRequestInterception(true);
+    interface InterceptableRequest {
+      isNavigationRequest(): boolean;
+      url(): string;
+      continue(): void;
+      abort(reason?: string): void;
+    }
+    page.on('request', (req: InterceptableRequest) => {
+      if (!req.isNavigationRequest()) {
+        req.continue();
+        return;
+      }
+      resolvePinnedPublicAddress(req.url())
+        .then(() => req.continue())
+        .catch(() => req.abort('blockedbyclient'));
     });
 
     await page.goto(url.toString(), {
@@ -874,15 +980,13 @@ async function extractWithJSDOM(
         const stylesheetURL = new URL(href, url);
         validateURL(stylesheetURL.toString());
 
-        const response = await axios.get(stylesheetURL.toString(), {
-          timeout: 10000,
-          headers: { 'User-Agent': 'AgentWeb-CSS-Extractor/1.0' },
-          responseType: 'text',
+        const content = await fetchTextSSRFSafe(stylesheetURL.toString(), 10000, {
+          'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
         });
 
         stylesheets.push({
           source: stylesheetURL.toString(),
-          content: String(response.data),
+          content,
           parsed: null,
         });
         fetchedCount++;
@@ -909,13 +1013,19 @@ export async function extractCSSFromURL(
   urlString: string,
   options: ExtractionOptions = {}
 ): Promise<ExtractedCSS> {
-  // Validate URL
+  // Validate URL format/protocol.
   const url = validateURL(urlString);
 
-  // If HTML is provided (test mode), use JSDOM path directly
+  // If HTML is provided (test mode), use JSDOM path directly — no network
+  // fetch happens, so no SSRF check is needed.
   if (options.html) {
     return extractWithJSDOM(urlString, url, options.html, options);
   }
+
+  // Fail fast on an already-known-private/metadata destination before paying
+  // for a Chrome launch. Redirect hops are re-validated later, at each actual
+  // fetch (Puppeteer's request interception, fetchTextSSRFSafe).
+  await resolvePinnedPublicAddress(urlString);
 
   // Try puppeteer first (real browser), fall back to JSDOM
   try {
