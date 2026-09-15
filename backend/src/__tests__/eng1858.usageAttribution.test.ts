@@ -20,10 +20,21 @@ jest.mock('../services/tokenUsageService', () => ({
   resolveBillingUserId: jest.fn(),
 }));
 
-jest.mock('../services/usageRecorderService', () => ({
-  ...jest.requireActual('../services/usageRecorderService'),
-  meterUserUsage: jest.fn(),
-}));
+let mockAsyncWrite: () => Promise<void> = () => Promise.resolve();
+jest.mock('../services/usageRecorderService', () => {
+  const meterUserUsage = jest.fn();
+  return {
+    ...jest.requireActual('../services/usageRecorderService'),
+    meterUserUsage,
+    // The deferred path awaits the writes (PR #2926). Record the call on the
+    // same mock so every assertion reads one call log, and let a test hold the
+    // write open.
+    meterUserUsageAsync: jest.fn((ctx: unknown) => {
+      meterUserUsage(ctx);
+      return mockAsyncWrite();
+    }),
+  };
+});
 
 import { AgentModeService, agentModeService } from '../services/agentModeService';
 import { resolveBillingUserId } from '../services/tokenUsageService';
@@ -123,20 +134,26 @@ describe('callLLM metering resolves the billing subject', () => {
     expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({ userId: member, billingUserId: ORG_ROOT }));
   });
 
-  it('is tracked for graceful shutdown until the deferred write settles (CodeRabbit, PR #2926)', async () => {
+  it('is tracked for graceful shutdown until the usage writes themselves settle (CodeRabbit, PR #2926)', async () => {
     const member = freshMember();
-    let release!: (v: string) => void;
-    mockResolveBilling.mockImplementationOnce(() => new Promise<string>((resolve) => { release = resolve; }));
+    let releaseWrite!: () => void;
+    mockAsyncWrite = () => new Promise<void>((resolve) => { releaseWrite = resolve; });
+    try {
+      await call({ userId: member, feature: 'session_title' });
+      await flush();
 
-    await call({ userId: member, feature: 'session_title' });
+      // Billing is resolved and metering has STARTED, but the writes are still
+      // in flight: runDrain (which awaits cronJobRegistry.drain()) must keep
+      // waiting — settling on "started" would let the process exit mid-write.
+      expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({ userId: member, billingUserId: ORG_ROOT }));
+      expect(cronJobRegistry.snapshot().deferredLlmMetering).toBe(1);
 
-    // runDrain awaits cronJobRegistry.drain(), so an in-flight metering write
-    // holds shutdown open instead of being lost with the process.
-    expect(cronJobRegistry.snapshot().deferredLlmMetering).toBe(1);
-    release(ORG_ROOT);
-    await flush();
-    expect(cronJobRegistry.snapshot().deferredLlmMetering).toBeUndefined();
-    expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({ userId: member, billingUserId: ORG_ROOT }));
+      releaseWrite();
+      await flush();
+      expect(cronJobRegistry.snapshot().deferredLlmMetering).toBeUndefined();
+    } finally {
+      mockAsyncWrite = () => Promise.resolve();
+    }
   });
 
   it('fails open: a resolution error still meters with billingUserId = userId and never rejects callLLM', async () => {
