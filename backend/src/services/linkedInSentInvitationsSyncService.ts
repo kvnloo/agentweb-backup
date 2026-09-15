@@ -11,7 +11,9 @@ const TAG = '[linkedInConnectionSync]';
 
 /**
  * True when a freshly-read invitation differs from its cached row in any way a
- * consumer can observe. Volatile timestamps are deliberately excluded.
+ * consumer can observe. `syncedAt` is excluded, and `sentAt` counts only when it
+ * moved EARLIER: `resolveLedgerSentAt` never moves it later, so the per-request
+ * drift of `parsed_datetime` (ENG-875) still produces no write.
  */
 export function sentInvitationChanged(
   cached: UnipileSentInvitation,
@@ -21,8 +23,69 @@ export function sentInvitationChanged(
     cached.publicProfileUrl !== candidate.publicProfileUrl ||
     cached.invitationId !== candidate.invitationId ||
     cached.invitedUserName !== candidate.invitedUserName ||
-    cached.invitationText !== candidate.invitationText
+    cached.invitationText !== candidate.invitationText ||
+    isEarlierTimestamp(candidate.sentAt, cached.sentAt)
   );
+}
+
+/** Tolerated clock skew before a provider timestamp counts as "in the future". */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+function validPastMs(value: unknown, nowMs: number): number | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) || ms > nowMs + FUTURE_SKEW_MS ? null : ms;
+}
+
+function isEarlierTimestamp(candidate: string | undefined, cached: string | undefined): boolean {
+  const candidateMs = typeof candidate === 'string' ? Date.parse(candidate) : NaN;
+  const cachedMs = typeof cached === 'string' ? Date.parse(cached) : NaN;
+  if (Number.isNaN(candidateMs)) return false;
+  return Number.isNaN(cachedMs) || candidateMs < cachedMs;
+}
+
+/**
+ * ENG-1938: the `sentAt` to store for a pending invitation — the EARLIEST
+ * estimate ever observed for this invitation, not the first one.
+ *
+ * LinkedIn exposes only a relative age ("Sent 3 months ago") and Unipile resolves
+ * it to an absolute `parsed_datetime` at request time. That label is a floor on
+ * the real age, so every resolution lands at or after the real send, and the
+ * earliest one seen is the tightest estimate. Keeping the FIRST value instead
+ * (the pre-ENG-1938 rule) froze two kinds of wrong row forever:
+ *   - a row first seen while Unipile omitted `parsed_datetime`, stamped with the
+ *     sync time — 450 of TFA Connect's 681 rows on 2026-09-14, which made invites
+ *     from March–May look 4–19 days old to the stale-invitation drain;
+ *   - a row first seen at a coarse bucket ("1 week ago") that later rolled over
+ *     to an earlier one ("1 month ago").
+ *
+ * Properties the callers rely on:
+ *   - Never moves later, so request-time drift causes no rewrite (ENG-875) and a
+ *     send-path row keeps the exact instant it was stamped with.
+ *   - A different `invitationId` is a NEW invitation to the same person (re-invite
+ *     after a withdrawal/acceptance), so the old row's date is discarded.
+ *   - An unparseable or future provider value is ignored rather than trusted.
+ */
+export function resolveLedgerSentAt(
+  cached: Pick<UnipileSentInvitation, 'sentAt' | 'invitationId'> | undefined,
+  item: { parsed_datetime?: unknown; id?: unknown },
+  now: string,
+): string {
+  const nowMs = Date.parse(now);
+  const sameInvitation = !cached
+    || !cached.invitationId
+    || typeof item.id !== 'string'
+    || !item.id
+    || cached.invitationId === item.id;
+  const cachedSentAt = sameInvitation ? cached?.sentAt : undefined;
+  const cachedMs = validPastMs(cachedSentAt, nowMs);
+  const parsedMs = validPastMs(item.parsed_datetime, nowMs);
+
+  if (parsedMs !== null && (cachedMs === null || parsedMs < cachedMs)) {
+    return item.parsed_datetime as string;
+  }
+  if (cachedMs !== null) return cachedSentAt as string;
+  return now;
 }
 
 export interface SyncSentInvitationsOptions {
@@ -69,9 +132,9 @@ export async function syncSentInvitationsForAccount(
   let stoppedEarly = false;
   let consecutiveKnownPages = 0;
 
-  // Unipile occasionally omits parsed_datetime. Carry the first-observed value
-  // forward instead of moving sentAt on every sync. Keep the whole cached row so
-  // unchanged invitations can skip their DynamoDB write (ENG-875).
+  // sentAt keeps the EARLIEST estimate observed (resolveLedgerSentAt, ENG-1938),
+  // so request-time drift never moves it. Keep the whole cached row so unchanged
+  // invitations can skip their DynamoDB write (ENG-875).
   const cachedByPublicId = new Map<string, UnipileSentInvitation>();
   let cachePreloaded = false;
   try {
@@ -113,7 +176,7 @@ export async function syncSentInvitationsForAccount(
         invitationId: item.id ?? '',
         invitedUserName: item.invited_user ?? '',
         invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? cached?.sentAt ?? now,
+        sentAt: resolveLedgerSentAt(cached, item, now),
         syncedAt: now,
       };
 
