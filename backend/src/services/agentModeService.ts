@@ -118,7 +118,14 @@ import {
   type AskUserQuestionOption,
   type PendingUserQuestion,
 } from './agentMode/core/askUserQuestion';
-import { findApprovalDeckAnswerForDigest } from './agentMode/core/approvalDeck';
+import {
+  createApprovalDeck,
+  appendApprovalDeckItem,
+  finalizeApprovalDeck,
+  findApprovalDeckAnswerForDigest,
+  renderApprovalDeckPrompt,
+  type PendingApprovalDeck,
+} from './agentMode/core/approvalDeck';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -4695,24 +4702,29 @@ export class AgentModeService {
         const iterationResults = toolCalls
           .slice(toolCallsLengthBeforeIteration)
           .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
-        // ENG-1635: when this iteration halted on ≥2 Meta writes and nothing else,
-        // wrap them in ONE meta_write_manifest question instead of the plain text
-        // batch below — one typed affirmative then grants every listed write
-        // (claimMetaWriteManifestGrant) rather than requiring N separate replies.
-        // Falls back to the unchanged plain-prompt path below on any null: no
-        // sessionId, a non-Meta-write mixed into the batch, fewer than 2 items, or
-        // losing the (expected-rare) race to post the session's one live question.
-        const manifestQuestion = sessionId ? this.buildMetaWriteManifestQuestion(iterationResults) : null;
-        if (manifestQuestion) {
-          const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId as string, manifestQuestion, {
+        // ENG-1635/1644 gap 5 (Round-3 consequence #1): when this iteration halted on
+        // ANY Meta write(s) and nothing else — one write or several — wrap them in ONE
+        // approval deck instead of the plain text batch below. One submission then
+        // grants every listed write (claimMetaWriteManifestGrant, now sourced from this
+        // deck) rather than requiring N separate confirm=true replays. Fires on a SINGLE
+        // write too: once gap 5 closed confirm=true as an independent bypass, there is
+        // no other path left for a solo write to ever proceed, so it can no longer be
+        // left on a separate unhardened path alongside this one. Falls back to the
+        // unchanged plain-prompt path below on any null: no sessionId, a non-Meta-write
+        // confirmation mixed into the batch (out of scope for this ticket — see
+        // buildMetaWriteApprovalDeck), or losing the (expected-rare) race to post the
+        // session's one live human-interrupt slot.
+        const approvalDeck = sessionId ? this.buildMetaWriteApprovalDeck(iterationResults) : null;
+        if (approvalDeck) {
+          const posted = await chatbotDb.updateSessionApprovalDeck(sessionId as string, approvalDeck, {
             failIfAwaitingExists: true,
           });
           if (posted) {
-            const manifestPrompt = renderQuestionPrompt(manifestQuestion);
-            content = manifestPrompt;
+            const deckPrompt = renderApprovalDeckPrompt(approvalDeck);
+            content = deckPrompt;
             (messages as any[]).push({
               role: 'assistant',
-              content: manifestPrompt,
+              content: deckPrompt,
               llm: llmModel,
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
             });
@@ -4721,8 +4733,8 @@ export class AgentModeService {
             }
             break;
           }
-          // posted === null: lost the one-live-question race (something else in this
-          // session claimed the slot between the manifest build and this write) — fall
+          // posted === null: lost the one-live-slot race (something else in this
+          // session claimed the slot between the deck build and this write) — fall
           // through to the plain per-item prompt below rather than silently dropping
           // the halt or retrying, exactly like collectConfirmationPrompt already would
           // have handled these same items.
@@ -20208,26 +20220,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   /**
    * ENG-1635: when every `awaitingUserConfirmation` result this iteration is a Meta
-   * write (each carries the `metaWriteManifestDigest` set on the halt above), build
-   * ONE `meta_write_manifest` question covering all of them instead of the plain
-   * per-call text batching below — so a single typed affirmative grants every listed
-   * write via `claimMetaWriteManifestGrant` rather than requiring N separate
-   * `confirm:true` re-calls, one human reply each. Fixes the "12 serial prompts"
-   * defect (ENG-1635) at its root: `collectConfirmationPrompt` already batched the
-   * DISPLAY of N halts into one message, but never authorized more than one write per
-   * answer — each of the N still needed its own individually-gated replay.
+   * write (each carries the `metaWriteManifestDigest` set on the halt above), build ONE
+   * approval deck covering all of them instead of the plain per-call text batching
+   * below — so a single submission grants every listed write via
+   * `claimMetaWriteManifestGrant` (now sourced from this deck, gap 5) rather than
+   * requiring N separate `confirm:true` re-calls, one human reply each. Fixes the
+   * "12 serial prompts" defect (ENG-1635) at its root: `collectConfirmationPrompt`
+   * already batched the DISPLAY of N halts into one message, but never authorized more
+   * than one write per answer — each of the N still needed its own individually-gated
+   * replay.
+   *
+   * Fires on a SINGLE halted write too (deck of size 1) — gap 5's fix (ENG-1635/1644
+   * Round 3) made confirm=true permanently inert as an independent path, so a lone
+   * write has no path forward EXCEPT this one; a separate single-write text path can
+   * no longer coexist with this one without dead-ending every solo write.
    *
    * Returns null (falls back to `collectConfirmationPrompt`'s plain prompt, unchanged)
-   * when: the iteration has no halted writes; ANY halted result in the iteration is
-   * NOT a Meta write (e.g. an image-edit confirmation, which carries no digest —
-   * mixing manifest and non-manifest confirmations in one card is out of scope, not
-   * silently dropped); or there's only one item, which already gets a clean one-shot
-   * confirm/replay cycle from the existing per-call halt and gains nothing from a
-   * manifest wrapper.
+   * when: the iteration has no halted writes, or ANY halted result in the iteration is
+   * NOT a Meta write (e.g. an image-edit confirmation, which carries no digest and
+   * whose own confirm=true gate is unhardened and out of scope for this ticket — mixing
+   * it into a deck item would either need its own grant mechanism this ticket never
+   * built, or would silently downgrade its protection to "was in an approved deck," a
+   * guarantee this ticket never verified for that tool).
    */
-  private buildMetaWriteManifestQuestion(
+  private buildMetaWriteApprovalDeck(
     toolResults: Array<{ status: 'success' | 'error'; result?: any }>
-  ): PendingUserQuestion | null {
+  ): PendingApprovalDeck | null {
     const items: Array<{ digest: string; detail: string }> = [];
     for (const tr of toolResults) {
       if (tr.status !== 'success') continue;
@@ -20235,8 +20253,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!r || r.awaitingUserConfirmation !== true) continue;
       if (typeof r.metaWriteManifestDigest !== 'string' || !r.metaWriteManifestDigest) {
         // A non-Meta-write confirmation is mixed into this batch — bail out entirely
-        // rather than manifest-wrapping only the Meta writes and silently leaving this
-        // one to the old per-item path; a caller seeing null falls back uniformly.
+        // rather than deck-wrapping only the Meta writes and silently leaving this one
+        // to the old per-item path; a caller seeing null falls back uniformly for the
+        // WHOLE iteration.
         return null;
       }
       items.push({
@@ -20244,50 +20263,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
       });
     }
-    if (items.length < 2) return null;
-
-    const digests = items.map((i) => i.digest);
-    const question =
-      `Based on your request, here are the ${items.length} changes I'm about to make — ` +
-      `please review each target before I proceed:\n\n` +
-      items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n');
+    if (items.length === 0) return null;
 
     try {
-      return buildPendingUserQuestion({
-        questionId: uuidv4(),
-        question,
-        kind: 'meta_write_manifest',
-        // Real external writes, not a reversible multiple-choice preference — a
-        // headless/scheduled run must never silently auto-take this the way it can a
-        // plain reversible question. See askUserQuestion.ts's immutable/park docs.
-        immutable: true,
-        // Nothing here is Emma's judgment call to delegate — it's exactly the plan as
-        // built, or it isn't. "Let Emma decide" has no meaning for "should these exact
-        // writes execute."
-        allowEmmaDecide: false,
-        createdAt: new Date().toISOString(),
-        options: [
-          {
-            id: 'approve',
-            label: `Approve all ${items.length}`,
-            consequence: `Authorizes exactly these ${items.length} writes, each executed once.`,
-            recommended: true,
-            why: 'This is the plan as built from your request — nothing else runs.',
-            payload: { digests },
-          },
-          {
-            id: 'reject',
-            label: 'Reject',
-            consequence: 'None of these writes run. Nothing changes on Meta.',
-            payload: {},
-          },
-        ],
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      items.forEach((item, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `write-${i + 1}`,
+          kind: 'meta_write',
+          question: item.detail,
+          metaWriteManifestDigest: item.digest,
+        });
       });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
     } catch (err) {
-      // Should be unreachable (both options are always well-formed above), but a
-      // malformed manifest must fall back to the old per-item prompt, never throw
-      // and silently drop the halt.
-      console.error('AgentMode: buildMetaWriteManifestQuestion failed, falling back to plain prompt:', err);
+      // Should be unreachable (every item built above is well-formed), but a
+      // malformed deck must fall back to the old per-item prompt, never throw and
+      // silently drop the halt.
+      console.error('AgentMode: buildMetaWriteApprovalDeck failed, falling back to plain prompt:', err);
       return null;
     }
   }
