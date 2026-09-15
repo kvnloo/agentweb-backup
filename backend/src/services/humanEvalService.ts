@@ -793,8 +793,15 @@ export class HumanEvalService {
           .filter(Boolean);
         if (exceptionIds.includes(userId)) return 'exception';
       }
+      // Default ON: absent, or anything other than an explicit 'false', means posting is
+      // enabled. Flipped from the original default-off (ENG-1854's initial ask) once the two
+      // real noise sources were fixed independently of this toggle — the lead-enrichment
+      // anomaly gate is unconditional, so it stays quiet regardless of this setting; this now
+      // only governs creative_image/landing_page (which always needed a human's eyes) and any
+      // genuine lead-enrichment failures. A single explicit 'false' here is still the full
+      // rollback lever if the noise returns for a reason this session didn't anticipate.
       const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
-      return globalToggle?.settingValue === 'true' ? 'global' : false;
+      return globalToggle?.settingValue === 'false' ? false : 'global';
     } catch (err: any) {
       console.warn('[human-eval] failed to resolve Slack posting toggle, defaulting to not posting:', err?.message || err);
       return false;
