@@ -533,6 +533,44 @@ describe('GET /api/crm/icp/filters', () => {
     expect(body.persona.name).toBe('Mid-market RevOps Leaders');
   });
 
+  // ENG-1955 follow-up: when the org has no marketStrategy of its own,
+  // resolveOrgProfileField falls back to the org OWNER's user record. That
+  // record's updatedAt belongs to the owner's timeline, not the calling
+  // member's — comparing it against the caller's own icpCompletedAt would
+  // pit two unrelated users' clocks against each other and could
+  // incorrectly override a perfectly fresh icpResult with the owner's
+  // (possibly much older or newer, but unrelated) marketStrategy.icp.
+  it('does not apply the staleness override when marketStrategy came from the org OWNER fallback', async () => {
+    (userDb.getUserById as jest.Mock).mockImplementation((id: string) => {
+      if (id === 'u1') {
+        return Promise.resolve({
+          userId: 'u1',
+          orgId: 'org1',
+          icpResult: [persona()],
+          icpCompletedAt: '2026-09-12T00:36:22.746Z',
+        });
+      }
+      if (id === 'owner1') {
+        return Promise.resolve({
+          userId: 'owner1',
+          // Newer than the caller's icpCompletedAt, but it's the OWNER's
+          // marketStrategy — an unrelated timeline.
+          marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:40:00.000Z' },
+        });
+      }
+      return Promise.resolve(null);
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org1', ownerUserId: 'owner1' }); // no org-level marketStrategy
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    // icpResult must still win — the owner-fallback marketStrategy is not
+    // eligible to override it.
+    expect(body.persona.name).toBe('Mid-market RevOps Leaders');
+  });
+
   it('404 when neither icpResult nor any marketStrategy.icp exists', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
     (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org1' }); // org has no marketStrategy
