@@ -7,6 +7,7 @@ import {
   HumanEvalReviewType,
   HumanEvalStatus,
 } from '../services/humanEvalService';
+import { claimArtifactForHumanEval } from '../services/autoHumanEvalService';
 
 const HUMAN_EVAL_STATUSES: readonly HumanEvalStatus[] = ['pending', 'reviewed'];
 const HUMAN_EVAL_REVIEW_TYPES: readonly HumanEvalReviewType[] = ['creative_image', 'landing_page', 'lead_enrichment'];
@@ -31,6 +32,16 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
 
     if (!reviewType || !outputSummary) {
       res.status(400).json({ error: 'reviewType and outputSummary are required' });
+      return;
+    }
+
+    // ENG-1854: this route calls createCandidate directly, same as the manual Emma tool did —
+    // same cross-path duplicate risk if the given artifactUrl was already auto-posted.
+    if (typeof artifactUrl === 'string' && artifactUrl && !(await claimArtifactForHumanEval(artifactUrl))) {
+      res.json({
+        success: true,
+        message: 'This output was already sent for human eval — not creating a duplicate.',
+      });
       return;
     }
 
