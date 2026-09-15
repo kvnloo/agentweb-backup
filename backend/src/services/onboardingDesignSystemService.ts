@@ -73,30 +73,31 @@ export interface DesignSystemBuildDeps {
 }
 
 /**
- * Lazy-loaded default deps. cssExtractor pulls JSDOM and agentModeService is
- * enormous (473KB) — required from inside the function so importing this
- * module doesn't pull either at module-load time. Tests inject fakes and
- * never trigger this path.
+ * Lazy-loaded default deps, each requiring its module only when ACTUALLY
+ * INVOKED — not when merely referenced. cssExtractor pulls JSDOM and
+ * agentModeService is enormous (473KB, and pulls ESM deps Jest's default
+ * transform can't parse); a caller that supplies every dep as a test fake
+ * (as every unit test here does) must never trigger either require(), even
+ * transitively, or the module load itself throws before the fake is ever
+ * used.
  */
-function defaultDeps(): Required<
-  Pick<
-    DesignSystemBuildDeps,
-    "extractCSSFromURL" | "analyzeDesignTokens" | "inferBrandTokens" | "fetchHtml" | "updateKnowledgeBaseFile"
-  >
-> {
+const defaultExtractCSSFromURL: ExtractCSSFromURLFn = (...args) =>
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const cssExtractor = require("./cssExtractor");
+  require("./cssExtractor").extractCSSFromURL(...args);
+const defaultAnalyzeDesignTokens: AnalyzeDesignTokensFn = (...args) =>
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require("./cssExtractor").analyzeDesignTokens(...args);
+const defaultInferBrandTokens: InferBrandTokensFn = (...args) =>
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require("./cssExtractor").inferBrandTokens(...args);
+const defaultFetchHtml: FetchHtmlFn = (...args) =>
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require("./cssExtractor").fetchFreshHtmlFromValidatedUrl(...args);
+const defaultUpdateKnowledgeBaseFile: UpdateKnowledgeBaseFileFn = (...args) => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { agentModeService } = require("./agentModeService");
-  return {
-    extractCSSFromURL: cssExtractor.extractCSSFromURL,
-    analyzeDesignTokens: cssExtractor.analyzeDesignTokens,
-    inferBrandTokens: cssExtractor.inferBrandTokens,
-    fetchHtml: cssExtractor.fetchFreshHtmlFromValidatedUrl,
-    updateKnowledgeBaseFile: (taskId, fileName, content, mode, userId, sessionId) =>
-      agentModeService.updateKnowledgeBaseFile(taskId, fileName, content, mode, userId, sessionId),
-  };
-}
+  return agentModeService.updateKnowledgeBaseFile(...args);
+};
 
 /** Same precedence onboardingBrandBuildService.pickCompanyUrl uses. */
 function pickCompanyUrl(user: any): string | null {
@@ -476,10 +477,11 @@ export async function triggerDesignSystemBuildForUser(
 ): Promise<void> {
   const now = deps.now ?? (() => new Date());
   const timeoutMs = deps.timeoutMs ?? DESIGN_SYSTEM_TIMEOUT_MS;
-  const { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, fetchHtml, updateKnowledgeBaseFile } = {
-    ...defaultDeps(),
-    ...deps,
-  };
+  const extractCSSFromURL = deps.extractCSSFromURL ?? defaultExtractCSSFromURL;
+  const analyzeDesignTokens = deps.analyzeDesignTokens ?? defaultAnalyzeDesignTokens;
+  const inferBrandTokens = deps.inferBrandTokens ?? defaultInferBrandTokens;
+  const fetchHtml = deps.fetchHtml ?? defaultFetchHtml;
+  const updateKnowledgeBaseFile = deps.updateKnowledgeBaseFile ?? defaultUpdateKnowledgeBaseFile;
 
   const user = await userDb.getUserById(userId);
   if (!user) return;
