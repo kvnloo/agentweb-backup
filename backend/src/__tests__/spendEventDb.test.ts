@@ -34,6 +34,7 @@ import {
   getSpendEvent,
   transitionSpendEvent,
   listSpendEvents,
+  listSpendEventsBounded,
   sumSettledMicroUsd,
   validateSpendEvent,
   isLegalLifecycleTransition,
@@ -368,5 +369,47 @@ describe('spendEventDb', () => {
       expect(mockDynamoDB.get.mock.calls[0][0].Key).toEqual({ billingUserId: 'owner-1', eventId: 'evt-1' });
       expect(found?.eventId).toBe('evt-1');
     });
+  });
+});
+
+// ── ENG-1841: the bounded read ──────────────────────────────────────────────
+describe('listSpendEventsBounded (ENG-1841)', () => {
+  const page = (n: number, from: number, last: boolean) => ({
+    promise: () =>
+      Promise.resolve({
+        Items: Array.from({ length: n }, (_, i) => ({ eventId: `e${from + i}` })),
+        ...(last ? {} : { LastEvaluatedKey: { k: from + n } }),
+      }),
+  });
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('pages to the end and reports not exceeded when the range fits', async () => {
+    mockDynamoDB.query.mockReturnValueOnce(page(3, 0, false)).mockReturnValueOnce(page(2, 3, true));
+
+    const { events, exceeded } = await listSpendEventsBounded('owner-1', '2026-09-01', '2026-09-31', 10);
+
+    expect(exceeded).toBe(false);
+    expect(events).toHaveLength(5);
+    expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops paging as soon as it holds more than the ceiling, and says so', async () => {
+    mockDynamoDB.query
+      .mockReturnValueOnce(page(6, 0, false))
+      .mockReturnValueOnce(page(6, 6, false))
+      .mockReturnValueOnce(page(6, 12, true));
+
+    const { exceeded } = await listSpendEventsBounded('owner-1', '2026-09-01', '2026-09-31', 10);
+
+    expect(exceeded).toBe(true);
+    // Bounded work: the third page is never requested.
+    expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+  });
+
+  it('an exactly-at-ceiling range is not exceeded', async () => {
+    mockDynamoDB.query.mockReturnValueOnce(page(10, 0, true));
+
+    await expect(listSpendEventsBounded('owner-1', '2026-09-01', '2026-09-31', 10)).resolves.toMatchObject({ exceeded: false });
   });
 });
