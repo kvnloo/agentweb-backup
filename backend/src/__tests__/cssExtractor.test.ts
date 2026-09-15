@@ -655,6 +655,75 @@ describe('cssExtractor', () => {
       );
     });
 
+    it('pins Chrome DNS resolution for the target hostname via --host-resolver-rules (ENG-328: closes the rebinding TOCTOU between our validation lookup and Chrome\'s own connect-time lookup)', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const pMock = require('puppeteer-core');
+      const launchArgs = pMock.default.launch.mock.calls[0][0].args;
+      expect(launchArgs).toContain('--host-resolver-rules=MAP example.com 93.184.216.34');
+    });
+
+    it('validates every request, not just navigation — a subresource pointed at a private address is aborted (ENG-328: closes the SSRF bypass where only page.goto was checked)', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const requestHandlerCall = mockPage.on.mock.calls.find(([event]) => event === 'request');
+      expect(requestHandlerCall).toBeDefined();
+      const requestHandler = requestHandlerCall![1];
+
+      // Simulate a subresource request (isNavigationRequest: false) the scraped
+      // page's own script triggers against an internal address.
+      const abort = jest.fn();
+      const continueReq = jest.fn();
+      requestHandler({
+        isNavigationRequest: () => false,
+        url: () => 'http://10.0.0.5/internal-secret',
+        continue: continueReq,
+        abort,
+      });
+      await new Promise(setImmediate);
+
+      expect(abort).toHaveBeenCalled();
+      expect(continueReq).not.toHaveBeenCalled();
+    });
+
+    it('lets non-network schemes (data:) through without an SSRF check', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const requestHandlerCall = mockPage.on.mock.calls.find(([event]) => event === 'request');
+      const requestHandler = requestHandlerCall![1];
+
+      const abort = jest.fn();
+      const continueReq = jest.fn();
+      requestHandler({
+        isNavigationRequest: () => false,
+        url: () => 'data:image/png;base64,iVBORw0KGgo=',
+        continue: continueReq,
+        abort,
+      });
+      await new Promise(setImmediate);
+
+      expect(continueReq).toHaveBeenCalled();
+      expect(abort).not.toHaveBeenCalled();
+    });
+
     it('captures BOTH renders for a site with a dark variant (ENG-285: rankai.ai)', async () => {
       // ENG-285: headless Chrome reports prefers-color-scheme: light, so a site
       // whose real design is dark was only ever read in its near-white LIGHT

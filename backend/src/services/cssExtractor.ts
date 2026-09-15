@@ -597,7 +597,8 @@ function extractBrandIdentityFromDocument(
 async function extractWithPuppeteer(
   urlString: string,
   url: URL,
-  _options: ExtractionOptions
+  _options: ExtractionOptions,
+  pinned: { hostname: string; address: string; family: number }
 ): Promise<ExtractedCSS> {
   const puppeteer = await import('puppeteer-core');
   const executablePath = findChromeExecutable();
@@ -608,7 +609,7 @@ async function extractWithPuppeteer(
 
   await acquireCssExtractionSlot();
   try {
-    return await extractWithPuppeteerBrowser(urlString, url, executablePath, puppeteer.default);
+    return await extractWithPuppeteerBrowser(urlString, url, executablePath, puppeteer.default, pinned);
   } finally {
     releaseCssExtractionSlot();
   }
@@ -618,12 +619,22 @@ async function extractWithPuppeteerBrowser(
   urlString: string,
   url: URL,
   executablePath: string,
-  puppeteer: typeof import('puppeteer-core').default
+  puppeteer: typeof import('puppeteer-core').default,
+  pinned: { hostname: string; address: string; family: number }
 ): Promise<ExtractedCSS> {
+  // Pin Chrome's own DNS resolution for the target hostname to the address we
+  // already validated as public (resolvePinnedPublicAddress, called by our
+  // caller). Without this, the interception handler below validates a URL and
+  // then calls req.continue() — Chrome does a SEPARATE DNS lookup to actually
+  // connect, so a DNS-rebinding attacker can return a public IP for our check
+  // and a private one moments later for Chrome's real connection (Greptile
+  // finding, ENG-328). --host-resolver-rules forces every Chrome-internal
+  // lookup for this hostname to the exact address we validated.
+  const hostResolverRule = `--host-resolver-rules=MAP ${pinned.hostname} ${pinned.address}`;
   const browser = await puppeteer.launch({
     executablePath,
     headless: true,
-    args: PUPPETEER_LAUNCH_ARGS,
+    args: [...PUPPETEER_LAUNCH_ARGS, hostResolverRule],
   });
 
   try {
@@ -641,10 +652,12 @@ async function extractWithPuppeteerBrowser(
       Pragma: 'no-cache',
     });
 
-    // Re-validate on every navigation Chrome performs (the initial load AND
-    // every redirect hop it follows) — page.goto() otherwise follows redirects
-    // with zero re-validation, letting a public-looking URL that 302s to a
-    // private/metadata address sail through untouched.
+    // Re-validate EVERY request the page makes — not just navigation/redirect
+    // hops, but every subresource (images, XHR/fetch, iframes) the scraped
+    // page's own script can trigger. A page that only had its top-level
+    // navigation checked could still SSRF us via `<img src="http://169.254.169.254/...">`
+    // or an in-page fetch() (Greptile finding, ENG-328). data:/blob:/about:
+    // schemes never touch the network, so they pass through unchecked.
     await page.setRequestInterception(true);
     interface InterceptableRequest {
       isNavigationRequest(): boolean;
@@ -653,11 +666,19 @@ async function extractWithPuppeteerBrowser(
       abort(reason?: string): void;
     }
     page.on('request', (req: InterceptableRequest) => {
-      if (!req.isNavigationRequest()) {
+      const reqUrl = req.url();
+      let scheme: string;
+      try {
+        scheme = new URL(reqUrl).protocol;
+      } catch {
+        req.abort('blockedbyclient');
+        return;
+      }
+      if (scheme !== 'http:' && scheme !== 'https:') {
         req.continue();
         return;
       }
-      resolvePinnedPublicAddress(req.url())
+      resolvePinnedPublicAddress(reqUrl)
         .then(() => req.continue())
         .catch(() => req.abort('blockedbyclient'));
     });
@@ -1023,13 +1044,16 @@ export async function extractCSSFromURL(
   }
 
   // Fail fast on an already-known-private/metadata destination before paying
-  // for a Chrome launch. Redirect hops are re-validated later, at each actual
-  // fetch (Puppeteer's request interception, fetchTextSSRFSafe).
-  await resolvePinnedPublicAddress(urlString);
+  // for a Chrome launch. Its resolved address is reused to pin Chrome's own
+  // DNS resolution for this hostname (extractWithPuppeteerBrowser), closing
+  // the DNS-rebinding gap a second, separate lookup would otherwise reopen.
+  // Redirect hops and every subresource are re-validated later, at each
+  // actual fetch (Puppeteer's request interception, fetchTextSSRFSafe).
+  const pinned = await resolvePinnedPublicAddress(urlString);
 
   // Try puppeteer first (real browser), fall back to JSDOM
   try {
-    return await extractWithPuppeteer(urlString, url, options);
+    return await extractWithPuppeteer(urlString, url, options, pinned);
   } catch (error) {
     console.warn('Puppeteer extraction failed, falling back to JSDOM:', error);
     return extractWithJSDOM(urlString, url, undefined, options);
