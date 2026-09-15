@@ -145,6 +145,20 @@ export interface SpendLedgerPayload {
   llmLedger?: LlmLedgerCoverage;
   /** Absent from a backend that predates ENG-1886. */
   enforcement?: EnforcementState;
+  /**
+   * ENG-1841: detail rows the server left out of each bounded cut. Totals are
+   * always over the whole month; this only says how many rows are not listed.
+   * Absent from a backend that predates the bound.
+   */
+  omitted?: Partial<Record<"byProvider" | "byFeature" | "byMember" | "bySession" | "inFlight", OmittedRows>>;
+}
+
+/** Mirrors backend spendReadModel.OmittedRows. */
+export interface OmittedRows {
+  rows: number;
+  eventCount: number;
+  settledMicroUsd: number;
+  reservedMicroUsd: number;
 }
 
 /**
@@ -296,11 +310,14 @@ const SLICE_TITLES: Record<string, { title: string; caption: string }> = {
  */
 export const MAX_ROWS_PER_CUT = 25;
 
-const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) => {
+const SliceTable: React.FC<{ id: string; rows: SpendSlice[]; omitted?: OmittedRows }> = ({ id, rows, omitted }) => {
   const meta = SLICE_TITLES[id];
   const max = Math.max(...rows.map((r) => r.settledMicroUsd + r.reservedMicroUsd), 0);
   const shown = rows.slice(0, MAX_ROWS_PER_CUT);
-  const hidden = rows.length - shown.length;
+  // Rows the server already left out (ENG-1841) are just as unlisted as rows
+  // cut here, so both count toward "of N" and "more not shown".
+  const totalRows = rows.length + (omitted?.rows ?? 0);
+  const hidden = totalRows - shown.length;
 
   return (
     <Box sx={{ mb: 2 }} data-testid={`spend-slice-${id}`}>
@@ -357,7 +374,7 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
       )}
       {hidden > 0 && (
         <Typography variant="caption" color="text.secondary" data-testid={`spend-slice-${id}-more`}>
-          Showing the {MAX_ROWS_PER_CUT} largest of {rows.length.toLocaleString()} — {hidden.toLocaleString()} more
+          Showing the {shown.length.toLocaleString()} largest of {totalRows.toLocaleString()} — {hidden.toLocaleString()} more
           not shown, but included in every total above.
         </Typography>
       )}
@@ -672,21 +689,21 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                   ))}
                 </TableBody>
               </Table>
-              {data.inFlight.length > MAX_ROWS_PER_CUT && (
+              {data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) > MAX_ROWS_PER_CUT && (
                 <Typography variant="caption" color="text.secondary" data-testid="spend-ledger-inflight-more">
-                  Showing the {MAX_ROWS_PER_CUT} most recent of{" "}
-                  {data.inFlight.length.toLocaleString()} open reservations —{" "}
-                  {(data.inFlight.length - MAX_ROWS_PER_CUT).toLocaleString()} more not shown, but the
+                  Showing the {Math.min(MAX_ROWS_PER_CUT, data.inFlight.length).toLocaleString()} most recent of{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0)).toLocaleString()} open reservations —{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) - Math.min(MAX_ROWS_PER_CUT, data.inFlight.length)).toLocaleString()} more not shown, but the
                   in-flight total above counts all of them.
                 </Typography>
               )}
             </Box>
           )}
 
-          <SliceTable id="byProvider" rows={data.byProvider} />
-          <SliceTable id="byFeature" rows={data.byFeature} />
-          <SliceTable id="byMember" rows={data.byMember} />
-          <SliceTable id="bySession" rows={data.bySession} />
+          <SliceTable id="byProvider" rows={data.byProvider} omitted={data.omitted?.byProvider} />
+          <SliceTable id="byFeature" rows={data.byFeature} omitted={data.omitted?.byFeature} />
+          <SliceTable id="byMember" rows={data.byMember} omitted={data.omitted?.byMember} />
+          <SliceTable id="bySession" rows={data.bySession} omitted={data.omitted?.bySession} />
 
           {data.daily.length > 0 && (
             <Box data-testid="spend-ledger-daily">
