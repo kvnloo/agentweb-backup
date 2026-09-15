@@ -2288,14 +2288,24 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
     // up front and use it whenever it was saved more recently than
     // icpResult was last generated.
     let marketStrategy: any = user?.marketStrategy;
+    // True when resolveOrgProfileField had to fall back to the org OWNER's
+    // user record (org has no marketStrategy of its own and the caller isn't
+    // the owner). That fallback's updatedAt belongs to the owner's timeline,
+    // not the calling member's — comparing it against the caller's own
+    // icpCompletedAt would pit two unrelated users' clocks against each
+    // other, so the staleness override below must not apply (ENG-1955).
+    let marketStrategyFromOwnerFallback = false;
     if (user?.orgId) {
       const org: any = await orgDb.getOrgById(user.orgId);
       if (org) {
         marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        marketStrategyFromOwnerFallback =
+          !org.marketStrategy && !!org.ownerUserId && org.ownerUserId !== user.userId;
       }
     }
     const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
     const marketStrategyIsNewer =
+      !marketStrategyFromOwnerFallback &&
       marketIcp.length > 0 &&
       !!marketStrategy?.updatedAt &&
       !!user?.icpCompletedAt &&
