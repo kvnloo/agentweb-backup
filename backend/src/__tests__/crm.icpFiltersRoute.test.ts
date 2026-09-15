@@ -50,7 +50,7 @@ jest.mock('../services/db', () => ({
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
   userDb: { getUserById: jest.fn(), updateUser: jest.fn() },
-  orgDb: { getOrgById: jest.fn() },
+  orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() },
   dealDb: {},
 }));
 
@@ -146,6 +146,7 @@ describe('GET /api/crm/icp/filters', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', icpResult: [persona()] });
     (userDb.updateUser as jest.Mock).mockResolvedValue(undefined);
     (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
+    (orgDb.updateOrg as jest.Mock).mockResolvedValue(undefined);
     (extractIcpFiltersWithLlm as jest.Mock).mockResolvedValue(llmVariants());
   });
 
@@ -448,7 +449,7 @@ describe('GET /api/crm/icp/filters', () => {
     mockReq.query = { icpIndex: '1' };
     await handler!(mockReq, mockRes);
 
-    expect(orgDb.getOrgById).toHaveBeenCalledWith('org1');
+    expect(orgDb.getOrgById).toHaveBeenCalledWith('org1', expect.arrayContaining(['marketStrategy']));
     expect(mockRes.status).toHaveBeenCalledWith(200);
     const body = (mockRes.json as jest.Mock).mock.calls[0][0];
     expect(body.persona.name).toBe('ICP 2 — The Shopify Agency Operator');
@@ -512,8 +513,33 @@ describe('GET /api/crm/icp/filters', () => {
     const body = (mockRes.json as jest.Mock).mock.calls[0][0];
     expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
     // Corrected personas came from marketStrategy — must not be cached
-    // back onto the stale user.icpResult snapshot.
-    expect(userDb.updateUser).not.toHaveBeenCalled();
+    // back onto the stale user.icpResult snapshot...
+    expect(
+      (userDb.updateUser as jest.Mock).mock.calls.every(([, patch]: [string, any]) => !('icpResult' in patch)),
+    ).toBe(true);
+    // ...but SHOULD be cached onto the solo user's own marketStrategy, so
+    // repeat clicks don't keep re-running the LLM (ENG-1955 follow-up).
+    expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    const [userId, patch] = (userDb.updateUser as jest.Mock).mock.calls[0];
+    expect(userId).toBe('u1');
+    expect(patch.marketStrategy.icp[0].extractedFilters).toEqual({
+      cacheKey: personaCacheKey({
+        name: 'ICP 1 — The Margin-Squeezed DTC Founder',
+        pain: 'Bootstrapped DTC brand bleeding margin on blanket discounts.',
+        desire: 'Convert shoppers with outcome-tied incentives.',
+        objection: '',
+        meta_targeting_brief: 'Founder/CEO — owns all tool decisions',
+      }),
+      cacheVersion: ICP_FILTER_CACHE_VERSION,
+      variants: llmVariants(),
+      generatedAt: expect.any(String),
+    });
+    // The cache write must NOT bump updatedAt — that would make this
+    // system write indistinguishable from a genuine future user edit,
+    // exactly the failure mode the mirror-write backdating fix addresses.
+    expect(patch.marketStrategy.updatedAt).toBe('2026-09-12T00:36:22.746Z');
+    // Untouched entries survive the merge.
+    expect(patch.marketStrategy.icp[1].title).toBe('ICP 2 — The Shopify Agency Operator');
   });
 
   it('icpResult still wins when marketStrategy.icp predates icpResult generation', async () => {
@@ -589,17 +615,20 @@ describe('GET /api/crm/icp/filters', () => {
     expect(mockRes.status).toHaveBeenCalledWith(404);
   });
 
-  it('does NOT write back to user.icpResult when personas came from marketStrategy', async () => {
+  it('does NOT write back to user.icpResult when personas came from marketStrategy, and instead caches onto the ORG record', async () => {
     // Materializing org/marketStrategy personas onto user.icpResult would
-    // make the user record shadow later org edits, so the fallback path
-    // re-runs the LLM each click instead of caching onto the user.
+    // make the user record shadow later org edits, so this path never
+    // touches user.icpResult. It DOES cache onto the org's own
+    // marketStrategy though (ENG-1955 follow-up), since that's the actual
+    // source of truth here and every org member benefits from the cache,
+    // not just whoever clicked first.
     (userDb.getUserById as jest.Mock).mockResolvedValue({
       userId: 'u1',
       orgId: 'org1',
     });
     (orgDb.getOrgById as jest.Mock).mockResolvedValue({
       orgId: 'org1',
-      marketStrategy: { icp: marketIcp() },
+      marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' },
     });
     mockReq.query = { icpIndex: '0' };
     await handler!(mockReq, mockRes);
@@ -607,5 +636,93 @@ describe('GET /api/crm/icp/filters', () => {
     expect(extractIcpFiltersWithLlm).toHaveBeenCalledTimes(1);
     expect(userDb.updateUser).not.toHaveBeenCalled();
     expect(mockRes.status).toHaveBeenCalledWith(200);
+
+    expect(orgDb.updateOrg).toHaveBeenCalledTimes(1);
+    const [orgId, patch] = (orgDb.updateOrg as jest.Mock).mock.calls[0];
+    expect(orgId).toBe('org1');
+    expect(patch.marketStrategy.icp[0].extractedFilters.variants).toEqual(llmVariants());
+    expect(patch.marketStrategy.icp[0].extractedFilters.cacheVersion).toBe(ICP_FILTER_CACHE_VERSION);
+    // Must not bump updatedAt — same rationale as the solo-user cache write.
+    expect(patch.marketStrategy.updatedAt).toBe('2026-09-12T00:36:22.746Z');
+  });
+
+  it('does not cache when marketStrategy came from the org OWNER fallback (write target would be a different user)', async () => {
+    (userDb.getUserById as jest.Mock).mockImplementation((id: string) => {
+      if (id === 'u1') return Promise.resolve({ userId: 'u1', orgId: 'org1' });
+      if (id === 'owner1') {
+        return Promise.resolve({
+          userId: 'owner1',
+          marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:40:00.000Z' },
+        });
+      }
+      return Promise.resolve(null);
+    });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: 'org1', ownerUserId: 'owner1' });
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    expect(extractIcpFiltersWithLlm).toHaveBeenCalledTimes(1);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  // Same concurrency guard as the icpResult path, applied to the org write:
+  // if another org member edits the ICP while this request's LLM call is
+  // in flight, the stale result we just computed must not be persisted.
+  it('skips the org cache write when marketStrategy.icp changed during the LLM call', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    (orgDb.getOrgById as jest.Mock)
+      .mockResolvedValueOnce({ orgId: 'org1', marketStrategy: { icp: marketIcp() } })
+      .mockResolvedValueOnce({
+        orgId: 'org1',
+        marketStrategy: {
+          icp: [{ ...marketIcp()[0], description: 'EDITED BY ANOTHER MEMBER MID-FLIGHT' }, marketIcp()[1]],
+        },
+      });
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    expect(orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  // Round-trip through the REAL mapMarketIcpToResult (not mocked in this
+  // file) to prove the cache actually gets picked up on the next request,
+  // not just written in the right shape.
+  it('a cached marketStrategy extractedFilters entry is served as a cache hit on the next request', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: 'u1',
+      marketStrategy: {
+        icp: [
+          {
+            ...marketIcp()[0],
+            extractedFilters: {
+              cacheKey: personaCacheKey({
+                name: 'ICP 1 — The Margin-Squeezed DTC Founder',
+                pain: 'Bootstrapped DTC brand bleeding margin on blanket discounts.',
+                desire: 'Convert shoppers with outcome-tied incentives.',
+                objection: '',
+                meta_targeting_brief: 'Founder/CEO — owns all tool decisions',
+              }),
+              cacheVersion: ICP_FILTER_CACHE_VERSION,
+              variants: llmVariants(),
+              generatedAt: '2026-09-12T00:36:22.746Z',
+            },
+          },
+          marketIcp()[1],
+        ],
+      },
+    });
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(extractIcpFiltersWithLlm).not.toHaveBeenCalled();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.cached).toBe(true);
+    expect(body.variants).toEqual(llmVariants());
   });
 });
