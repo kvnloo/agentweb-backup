@@ -17,19 +17,24 @@ describe('create_html_from_template tool description — plain-text variable val
 
   test('top-level description instructs plain text, forbids HTML tags and Markdown', () => {
     const description = definition!.description as string;
-    expect(description.toLowerCase()).toContain('plain');
-    expect(description).toContain('<ul>');
-    expect(description).toContain('<strong>');
-    expect(description).toContain('**bold**');
+    // Assert the prohibition as one contiguous phrase binding "do NOT" directly to
+    // the tag/syntax examples — a plain substring check on 'plain'/'<ul>'/'**bold**'
+    // alone would still pass even if someone reworded this to ALLOW markup (e.g.
+    // "you may format values with HTML tags like <ul>"), silently losing the one
+    // guarantee ENG-1880 depends on.
+    expect(description).toContain(
+      'do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**'
+    );
+    expect(description.toLowerCase()).toContain('plain sentences only');
   });
 
-  test('variable_values_json parameter description repeats the plain-text instruction', () => {
+  test('variable_values_json parameter description repeats the plain-text instruction as a prohibition', () => {
     const paramDescription = definition!.inputSchema.properties.variable_values_json.description as string;
-    expect(paramDescription.toLowerCase()).toContain('literal plain text');
+    expect(paramDescription).toContain('inserted as literal plain text — no HTML tags or Markdown formatting');
   });
 
-  test('array_variable_values_json parameter description repeats the plain-text instruction', () => {
+  test('array_variable_values_json parameter description repeats the plain-text instruction as a prohibition', () => {
     const paramDescription = definition!.inputSchema.properties.array_variable_values_json.description as string;
-    expect(paramDescription.toLowerCase()).toContain('literal plain text');
+    expect(paramDescription).toContain('inserted as literal plain text — no HTML tags or Markdown formatting');
   });
 });
