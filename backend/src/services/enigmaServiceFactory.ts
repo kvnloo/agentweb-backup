@@ -10,12 +10,14 @@
  * leave the service uninitialised, and getEnigmaService() returns null.
  */
 
+import AWS from 'aws-sdk';
 import { crmDb } from './db';
 import { CrmEnrichmentService } from './crmEnrichmentService';
 import {
   EnigmaApiError,
   EnigmaAuthError,
   EnigmaCreditsExhaustedError,
+  EnigmaQuotaExceededError,
   EnigmaRateLimitedError,
   EnigmaService,
   countEnigmaBilledFills,
@@ -23,6 +25,7 @@ import {
   type EnigmaBilledFillKey,
   type EnigmaCacheStore,
   type EnigmaHttpClient,
+  type EnigmaQuotaTracker,
 } from './enigmaService';
 import { getEnigmaApiKey } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
@@ -115,11 +118,76 @@ function buildCacheStore(): EnigmaCacheStore {
   };
 }
 
+// ─── Per-user daily cap (AW-Configs, same row pattern as Apollo/enrich.so) ────
+
+const CONFIGS_TABLE = `${process.env.NODE_ENV === 'production' ? '' : 'Dev-'}AW-Configs`;
+const ENIGMA_USAGE_CONFIG_ID = 'system:enigmaUsage';
+const DEFAULT_DAILY_LIMIT_PER_USER = 300;
+
+function dailyLimitFromEnv(): number {
+  const n = Number(process.env.ENIGMA_DAILY_LIMIT_PER_USER);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DAILY_LIMIT_PER_USER;
+}
+
+export function buildEnigmaQuotaTracker(
+  dynamodb: Pick<AWS.DynamoDB.DocumentClient, 'get' | 'update' | 'put'>,
+  limit: number = dailyLimitFromEnv(),
+  now: () => Date = () => new Date(),
+): EnigmaQuotaTracker {
+  const key = (userId: string) => ({ userId, configId: ENIGMA_USAGE_CONFIG_ID });
+  const today = () => now().toISOString().slice(0, 10);
+
+  return {
+    async checkQuota(userId) {
+      const r = await dynamodb.get({ TableName: CONFIGS_TABLE, Key: key(userId) }).promise();
+      const count = r.Item?.date === today() ? Number(r.Item.callCount ?? 0) : 0;
+      if (count >= limit) throw new EnigmaQuotaExceededError(limit);
+    },
+    // Check-then-record is not atomic: concurrent leads can overshoot by up to
+    // the run's concurrency, the same trade-off apolloService.ts documents.
+    async recordUsage(userId) {
+      const day = today();
+      try {
+        await dynamodb.update({
+          TableName: CONFIGS_TABLE,
+          Key: key(userId),
+          UpdateExpression: 'ADD callCount :one',
+          ConditionExpression: '#date = :today',
+          ExpressionAttributeNames: { '#date': 'date' },
+          ExpressionAttributeValues: { ':one': 1, ':today': day },
+        }).promise();
+      } catch (err: any) {
+        if (err.code !== 'ConditionalCheckFailedException') throw err;
+        // First call of the day (or no row yet): start a fresh counter. If a
+        // concurrent writer already did, fall back to a plain ADD.
+        try {
+          await dynamodb.put({
+            TableName: CONFIGS_TABLE,
+            Item: { ...key(userId), date: day, callCount: 1 },
+            ConditionExpression: 'attribute_not_exists(userId) OR #date <> :today',
+            ExpressionAttributeNames: { '#date': 'date' },
+            ExpressionAttributeValues: { ':today': day },
+          }).promise();
+        } catch (putErr: any) {
+          if (putErr.code !== 'ConditionalCheckFailedException') throw putErr;
+          await dynamodb.update({
+            TableName: CONFIGS_TABLE,
+            Key: key(userId),
+            UpdateExpression: 'ADD callCount :one',
+            ExpressionAttributeValues: { ':one': 1 },
+          }).promise();
+        }
+      }
+    },
+  };
+}
+
 export async function initEnigmaServiceFromEnv(): Promise<void> {
   const apiKey = await getEnigmaApiKey();
   initEnigmaService(new EnigmaService({
     http: buildEnigmaHttpClient(apiKey),
     store: buildCacheStore(),
     isPersonalDomain: (host) => CrmEnrichmentService.isPersonalDomain(host),
+    quota: buildEnigmaQuotaTracker(new AWS.DynamoDB.DocumentClient()),
   }));
 }

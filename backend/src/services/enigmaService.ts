@@ -101,7 +101,22 @@ export class EnigmaRateLimitedError extends EnigmaApiError {
   }
 }
 
+/** Per-user daily Enigma lookup cap reached — raised before any HTTP call. */
+export class EnigmaQuotaExceededError extends Error {
+  constructor(readonly limit: number) {
+    super(`Enigma daily lookup limit reached (${limit}/day)`);
+    this.name = 'EnigmaQuotaExceededError';
+  }
+}
+
 // ─── Injected dependencies ───────────────────────────────────────────────────
+
+/** Per-user daily call counter. Only calls that reach Enigma count; cache hits are free. */
+export interface EnigmaQuotaTracker {
+  /** Throws EnigmaQuotaExceededError when the user is at the limit. */
+  checkQuota(userId: string): Promise<void>;
+  recordUsage(userId: string): Promise<void>;
+}
 
 export interface EnigmaSearchRequest {
   website: string;
@@ -150,6 +165,8 @@ export interface EnigmaServiceDeps {
    * import the enrichment service graph.
    */
   isPersonalDomain?: (host: string) => boolean;
+  /** Enforced only for calls that carry a userId. */
+  quota?: EnigmaQuotaTracker;
   now?: () => Date;
 }
 
@@ -332,8 +349,15 @@ export class EnigmaService {
       }
     }
 
+    const { quota } = this.deps;
+    if (quota && opts.userId) await quota.checkQuota(opts.userId);
+
     const name = input.companyName?.trim();
     const brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
+    if (quota && opts.userId) {
+      await quota.recordUsage(opts.userId).catch((err) =>
+        console.warn(`[enigma] quota record failed: ${(err as Error).message}`));
+    }
     const result = evaluateSearch(brands, host);
 
     await this.writeCache({
