@@ -1,0 +1,300 @@
+/**
+ * ENG-1945 second follow-up. Session ff31ccb7 filed a bug via report_product_issues
+ * claiming playwright_browser_navigate/snapshot/evaluate/click were "unavailable"
+ * without ever having called any of them — it inferred that from an unrelated
+ * playwright_browser_handle_dialog error, then proved itself wrong on the very
+ * next real attempt. A prompt-only instruction cannot GUARANTEE this never
+ * recurs, so `claimed_unavailable_tools` makes the claim itself verifiable: the
+ * server checks it against the run's own EVT_TOOL_INVOKED telemetry (recorded
+ * independently of anything the model writes) and refuses to file an unverified
+ * claim at all, rather than merely being told not to make one.
+ */
+
+jest.mock('../services/intakeService', () => ({
+  fileUserIssue: jest.fn(async () => ({
+    pageId: '7',
+    trackerUrl: 'https://fb/t/7',
+    userUrl: 'https://fb/t/7',
+    canonicalUrl: 'https://linear.app/emmabyaw/issue/ENG-1',
+    deduped: false,
+    tracker: 'Featurebase',
+  })),
+}));
+jest.mock('../services/resendService', () => ({
+  resendService: { sendEmail: jest.fn(async () => ({ id: 'em-1' })) },
+}));
+jest.mock('../services/settingsService', () => ({
+  settingsService: { getJsonArraySetting: jest.fn(async () => ['founders@agentweb.pro']) },
+}));
+jest.mock('../services/db', () => {
+  const actual = jest.requireActual('../services/db');
+  return {
+    ...actual,
+    userDb: { getUserById: jest.fn() },
+  };
+});
+jest.mock('../services/agentRunInspectorService', () => {
+  const actual = jest.requireActual('../services/agentRunInspectorService');
+  return { ...actual, fetchAgentRunSummaries: jest.fn() };
+});
+
+import '../emma/tools';
+import { emmaToolRegistry } from '../emma/registry';
+import { fileUserIssue } from '../services/intakeService';
+import { fetchAgentRunSummaries } from '../services/agentRunInspectorService';
+import { userDb } from '../services/db';
+
+const tool = () => emmaToolRegistry.getTool('report_product_issues')!;
+const lastFileCall = () => (fileUserIssue as jest.Mock).mock.calls.at(-1)![0];
+
+const CALLER = { userId: 'user-1', email: 'john@agentweb.pro', displayName: 'John' };
+
+const outcome = (eventType: string, toolName: string) => ({ eventType, toolName });
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  (userDb.getUserById as jest.Mock).mockImplementation(async (id: string) =>
+    id === CALLER.userId ? CALLER : undefined,
+  );
+});
+
+describe('report_product_issues — claimed_unavailable_tools deterministic gate (ENG-1945 follow-up)', () => {
+  it('rejects the exact prod-incident shape: claiming a tool is unavailable that this run never invoked at all', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-ff31',
+        sessionId: 'sess-ff31',
+        userId: CALLER.userId,
+        verdict: 'degraded',
+        toolCalls: 2,
+        failedToolCalls: 0,
+        // Only handle_dialog and resize were ever called — navigate never was,
+        // matching the real session's shape.
+        outcomes: [
+          outcome('agent_tool_invoked', 'playwright_browser_handle_dialog'),
+          outcome('agent_tool_failed', 'playwright_browser_handle_dialog'),
+          outcome('agent_tool_invoked', 'playwright_browser_resize'),
+          outcome('agent_tool_succeeded', 'playwright_browser_resize'),
+        ],
+      }],
+      scannedEvents: 4,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Browser skill installs but navigation tools remain unavailable',
+        description: 'Navigation and extraction tools did not appear after install_skills.',
+        run_id: 'run-ff31',
+        claimed_unavailable_tools: ['playwright_browser_navigate', 'playwright_browser_snapshot'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fileUserIssue).not.toHaveBeenCalled();
+    expect(result.results[0]).toMatchObject({ success: false });
+    expect(result.results[0].error).toContain('playwright_browser_navigate');
+    expect(result.results[0].error).toContain('playwright_browser_snapshot');
+    expect(result.results[0].error).toMatch(/never actually called/);
+  });
+
+  it('allows the claim when the named tool genuinely was invoked and failed this run', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-real-fail',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'failed',
+        toolCalls: 1,
+        failedToolCalls: 1,
+        outcomes: [
+          outcome('agent_tool_invoked', 'playwright_browser_navigate'),
+          outcome('agent_tool_failed', 'playwright_browser_navigate'),
+        ],
+      }],
+      scannedEvents: 2,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Navigate genuinely fails',
+        description: 'Called navigate, it errored.',
+        run_id: 'run-real-fail',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(result.results[0]).toMatchObject({ success: true });
+  });
+
+  it('a call that only SUCCEEDED still counts as "attempted" — the gate is about having tried it, not about it having failed', async () => {
+    // Deliberately unusual but must not throw: claiming unavailability for a tool
+    // that actually succeeded is not what this gate checks (that's a quality/
+    // truthfulness call for a human, not a "never attempted" fact the server can
+    // assert). The gate's only job is refusing an UNVERIFIABLE (never-called) claim.
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-succeeded',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'ok',
+        toolCalls: 1,
+        failedToolCalls: 0,
+        outcomes: [
+          outcome('agent_tool_invoked', 'playwright_browser_navigate'),
+          outcome('agent_tool_succeeded', 'playwright_browser_navigate'),
+        ],
+      }],
+      scannedEvents: 2,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Navigate claimed unavailable despite succeeding',
+        description: 'Model claims it is broken.',
+        run_id: 'run-succeeded',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(result.results[0]).toMatchObject({ success: true });
+  });
+
+  it('requires run_id whenever claimed_unavailable_tools is set — rejects without ever hitting telemetry', async () => {
+    const result = await tool().execute({
+      issues: [{
+        title: 'Tool unavailable, no run_id',
+        description: 'Claiming unavailability with no evidence trail.',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fetchAgentRunSummaries).not.toHaveBeenCalled();
+    expect(fileUserIssue).not.toHaveBeenCalled();
+    expect(result.results[0]).toMatchObject({ success: false });
+    expect(result.results[0].error).toContain('requires run_id');
+  });
+
+  it('rejects when run_id does not resolve to a known run — an unverifiable claim must not silently file', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({ runs: [], scannedEvents: 0, truncated: false });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Bad run_id',
+        description: 'Claiming unavailability against a bogus run_id.',
+        run_id: 'does-not-exist',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fileUserIssue).not.toHaveBeenCalled();
+    expect(result.results[0]).toMatchObject({ success: false });
+    expect(result.results[0].error).toMatch(/does not resolve to a known run/);
+  });
+
+  it('rejects when the telemetry lookup itself throws — a lookup failure must not fall back to filing an unverified claim', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockRejectedValue(new Error('telemetry store unavailable'));
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Telemetry lookup fails',
+        description: 'Claiming unavailability while the verification lookup itself errors.',
+        run_id: 'run-x',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId });
+
+    expect(fileUserIssue).not.toHaveBeenCalled();
+    expect(result.results[0]).toMatchObject({ success: false, error: 'telemetry store unavailable' });
+  });
+
+  it('a bug report with NO claimed_unavailable_tools is completely unaffected — existing best-effort behavior preserved', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockRejectedValue(new Error('telemetry store unavailable'));
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Ordinary bug, no tool-unavailability claim',
+        description: 'The output was garbled.',
+        run_id: 'run-x',
+      }],
+    }, { userId: CALLER.userId });
+
+    // Unchanged pre-existing behavior: a dossier-enrichment failure is best-effort
+    // and must never block an ordinary report.
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(result.results[0]).toMatchObject({ success: true });
+  });
+
+  it('attaches ground-truth "tools actually invoked" to the filed description whenever run_id is present, even without a structured claim', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-ground-truth',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'degraded',
+        toolCalls: 1,
+        failedToolCalls: 0,
+        outcomes: [
+          outcome('agent_tool_invoked', 'playwright_browser_resize'),
+          outcome('agent_tool_succeeded', 'playwright_browser_resize'),
+        ],
+      }],
+      scannedEvents: 2,
+      truncated: false,
+    });
+
+    // Free-text-only claim (the exact bypass the prompt now warns against) — no
+    // claimed_unavailable_tools, so the hard gate never engages, but a human
+    // reading the filed report must still be able to see the mismatch.
+    await tool().execute({
+      issues: [{
+        title: 'Navigation tools unavailable',
+        description: 'Navigation and extraction tools remained unavailable after install.',
+        run_id: 'run-ground-truth',
+      }],
+    }, { userId: CALLER.userId });
+
+    const call = lastFileCall();
+    expect(call.description).toContain('tools actually invoked this run: playwright_browser_resize');
+  });
+
+  it('mixed batch: one issue with a bad claim is rejected, a sibling ordinary issue in the same call still files', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-mixed',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'degraded',
+        toolCalls: 0,
+        failedToolCalls: 0,
+        outcomes: [],
+      }],
+      scannedEvents: 0,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [
+        {
+          title: 'Bad claim',
+          description: 'Claims navigate is broken, never called it.',
+          run_id: 'run-mixed',
+          claimed_unavailable_tools: ['playwright_browser_navigate'],
+        },
+        {
+          title: 'Unrelated feature request',
+          description: 'I wish there was a dark mode.',
+          type: 'feature_request',
+        },
+      ],
+    }, { userId: CALLER.userId });
+
+    expect(result.results).toHaveLength(2);
+    expect(result.results[0]).toMatchObject({ title: 'Bad claim', success: false });
+    expect(result.results[1]).toMatchObject({ title: 'Unrelated feature request', success: true });
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+  });
+});

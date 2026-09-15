@@ -58,3 +58,31 @@ describe('Agent Mode system prompt — no tool-unavailable claim without an actu
     expect(ruleIndex).toBeLessThan(nextSectionIndex);
   });
 });
+
+/**
+ * ENG-1945 second follow-up — the prompt-only rule above cannot GUARANTEE
+ * compliance, only instruct it. `claimed_unavailable_tools` (report_product_issues'
+ * schema, emma/tools.ts) is the deterministic backstop: the server checks it
+ * against the run's own EVT_TOOL_INVOKED telemetry and rejects an unverified
+ * claim, independent of anything the model writes. That backstop only engages
+ * if the model actually populates the field, so the prompt must point at it
+ * explicitly wherever it tells the model to make an unavailability claim.
+ */
+describe('Agent Mode system prompt — points the model at the deterministic claimed_unavailable_tools gate', () => {
+  it('tells the model to set claimed_unavailable_tools + run_id instead of only describing it in prose', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('ALWAYS set `claimed_unavailable_tools`');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('do not only describe it in prose');
+  });
+
+  it('accurately describes what the server does: REJECTS the structured claim, but a prose-only claim still files', () => {
+    // This must stay truthful about the tool's actual behavior — claiming the server
+    // rejects EVERY unavailability claim (including prose-only ones) would itself be
+    // exactly the kind of overclaim this whole rule exists to ban.
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('REJECTS the filing');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('does NOT go through this check and will still file');
+  });
+
+  it('reinforces the field at the report_product_issues bug-filing call site', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Set `claimed_unavailable_tools: ["X"]` and `run_id`');
+  });
+});
