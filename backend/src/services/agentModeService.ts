@@ -1562,6 +1562,25 @@ export class AgentModeService {
   // AgentModeService in beforeEach still initialize normally.
   private initialized = false;
   private initializationPromise: Promise<void> | null = null;
+  // Set true only when registerTools()'s emmaToolRegistry copy actually completes.
+  //
+  // A registry-size check alone is NOT a success signal, and an earlier version of this
+  // latch that used one was a tautology. registerTools() registers four built-ins
+  // (search_tool_response, read_tool_response, notify_session, wait_seconds)
+  // UNCONDITIONALLY, after both of its try/catch blocks, and ToolRegistry.register is a
+  // Map.set that cannot throw — so getAllTools().length > 0 is always true no matter how
+  // badly registration went. initializeMcp() then adds more afterwards. Confirmed twice:
+  // by fault injection on test-env-1 (the size check latched a fully degraded init, with
+  // "Error registering tools to instance" logged one line earlier) and by an independent
+  // review that ran registerTools() with an empty emmaToolRegistry and observed
+  // initialized=true with a 4-tool registry.
+  //
+  // Both halves of registerTools() have to be checked, because they fail independently:
+  // step 1 (seventeen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
+  // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
+  // without error — so the flag below alone would latch a degraded init too.
+  private emmaToolsRegistered = false;
 
   public async initialize(): Promise<void> {
     // Deliberately before and outside the latch — see the note above.
@@ -1573,10 +1592,13 @@ export class AgentModeService {
     this.initializationPromise = this.runInitialize();
     try {
       await this.initializationPromise;
-      this.initialized = this.toolRegistry.getAllTools().length > 0;
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered && this.toolRegistry.getAllTools().length > 0;
       if (!this.initialized) {
         console.error(
-          'AgentMode: initialize() completed but the tool registry is empty — ' +
+          'AgentMode: initialize() completed but tool registration did not succeed ' +
+          `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
+          `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
           'treating init as failed so the next caller retries.',
         );
       }
@@ -1757,6 +1779,12 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
+    // Idempotent. Before the initialize() latch existed this ran once per instance, so a
+    // second call was impossible. The latch's failure path deliberately re-runs the whole
+    // initialization body on the next caller — which, unguarded, would assign a fresh
+    // interval per retry and orphan the previous one, each retaining `this` through its
+    // closure. That is the same leak shape the per-message-instance bug had.
+    if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
     }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
@@ -1886,6 +1914,7 @@ export class AgentModeService {
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
+    this.emmaToolsRegistered = false;
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
@@ -1914,6 +1943,7 @@ export class AgentModeService {
           });
         }
       }
+      this.emmaToolsRegistered = true;
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
     }

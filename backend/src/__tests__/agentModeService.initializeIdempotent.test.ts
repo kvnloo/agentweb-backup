@@ -56,9 +56,17 @@ jest.mock('../mcp/client/toolRegistry', () => ({
  * widget path calls it per message on the same module singleton. These tests pin
  * the guard that makes that safe.
  *
- * Every test here is mutation-verified against the code it guards — see the
- * individual cases. The degraded-init and foundation-tools cases each pin a real
- * regression that an earlier version of this branch actually shipped.
+ * SCOPE: this file pins initialize()'s CONTROL FLOW — that the expensive body runs
+ * once, that concurrent callers collapse onto one in-flight run, that the flag is
+ * per-instance, and that foundation tools are re-read on every call. It mocks
+ * runInitialize and ToolRegistry to do that, which means it cannot say anything about
+ * the latch's SIGNAL.
+ *
+ * The signal is pinned separately, against the real registerTools() path, in
+ * agentModeService.degradedInit.test.ts. That split is deliberate: an earlier version of
+ * this file tried to cover both, and its fully-mocked registry let it assert a degraded
+ * state the real code cannot produce — so it passed while the latch it "verified" was a
+ * tautology. Mocked control-flow tests and real-path signal tests are different jobs.
  */
 describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () => {
   let service: AgentModeService;
@@ -70,9 +78,18 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     service = new AgentModeService();
     // Spy on the private worker so these tests assert the guard itself, not any
     // particular side effect of the initialization body.
+    // The mock stands in for a SUCCESSFUL runInitialize, so it must set the same signals
+    // a real one would. The latch deliberately keys on real registration outcome
+    // (AgentModeService.toolsRegistered + emmaToolsRegistered), not on "the promise
+    // resolved" — see agentModeService.degradedInit.test.ts, which drives the real
+    // registerTools() path. Without this the mock models a permanently-failing init and
+    // nothing here could ever latch.
+    (AgentModeService as any).toolsRegistered = true;
     runSpy = jest
       .spyOn(service as any, 'runInitialize')
-      .mockResolvedValue(undefined);
+      .mockImplementation(async () => {
+        (service as any).emmaToolsRegistered = true;
+      });
   });
 
   it('runs the work only once across repeated sequential calls', async () => {
@@ -104,31 +121,6 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     // running when a chat message arrives and calls initialize() again. The
     // second caller must await the first, not start a parallel registration pass.
     expect(runSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('does NOT latch a silently-degraded init, and retries it (ENG-1852 regression)', async () => {
-    // The reachable failure mode, and the one that matters. Every step of
-    // runInitialize() catches and logs its own errors — loadFoundationTools, both
-    // halves of registerTools, initializeMcp, ensureBuiltInSkills — so a real boot
-    // failure does NOT reject; it returns normally having registered nothing.
-    //
-    // An earlier version of this suite asserted the retry path by making
-    // runInitialize itself reject. That is not reachable in production, so it
-    // pinned a safety property the code did not actually have: `initialized`
-    // latched on a degraded init and every later call became a permanent no-op,
-    // turning an intermittent "0 tools" into an unrecoverable one for the whole
-    // process lifetime. Before this branch, the per-message fresh instance re-ran
-    // registration and self-healed. This test pins that self-healing.
-    registryTools = []; // registration silently produced nothing
-
-    await expect(service.initialize()).resolves.toBeUndefined(); // no throw, as in prod
-    expect((service as any).initialized).toBe(false);
-
-    registryTools = [{ name: 'some_tool' }]; // transient cause clears
-    await service.initialize();
-
-    expect((service as any).initialized).toBe(true);
-    expect(runSpy).toHaveBeenCalledTimes(2); // genuinely retried, not wedged
   });
 
   it('re-reads foundation tools on EVERY call, outside the latch (F3 regression)', async () => {

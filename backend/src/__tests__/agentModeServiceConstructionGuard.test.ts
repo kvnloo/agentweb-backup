@@ -23,11 +23,13 @@
  * treat a green build as saying nothing about this guard.
  *
  * Why AST and not grep. All three were measured against real source, not assumed:
- *   - 184 occurrences of `new AgentModeService(` live in test files, which
+ *   - 317 occurrences of `new AgentModeService(` live in test files, which
  *     legitimately construct their own instances in beforeEach.
- *   - Two of the three non-test occurrences are COMMENTS — including
- *     generateMarketingResponseWorker.ts's note recording the ENG-1852 fix
- *     itself, so a grep guard reports the fix as the violation.
+ *   - Most non-test occurrences of the spelling are COMMENTS, not code — including
+ *     generateMarketingResponseWorker.ts's note recording the ENG-1852 fix itself, and
+ *     two in chatbotService.ts. A grep guard reports the fix as the violation. (Counts
+ *     here are scoped to src/__tests__ and drift as tests are added — they are context
+ *     for WHY this is AST-based, not an invariant. Do not treat them as pinned.)
  *   - An aliased `import { AgentModeService as X }` then `new X()` is invisible
  *     to a literal-name grep.
  * Parsing sidesteps all three, the same reasoning sdkConstructionGuard.test.ts
@@ -151,6 +153,61 @@ function collectClassBindings(sourceFile: ts.SourceFile): {
       addFromBindingPattern(node.name);
     }
 
+    // mod = require('./agentModeService')  — assignment, not declaration
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      isModuleLoadCall(node.right) &&
+      ts.isIdentifier(node.left)
+    ) {
+      namespaces.add(node.left.text);
+    }
+
+    // import('./agentModeService').then(m => new m.AgentModeService())
+    // A live idiom in this repo — server.ts loads ensureCriticalTables and
+    // mcpOAuthRefreshService exactly this way — and the callback parameter is a module
+    // object that a declaration-only walk never sees.
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'then' &&
+      isModuleLoadCall(node.expression.expression) &&
+      node.arguments.length > 0
+    ) {
+      const cb = node.arguments[0];
+      if (ts.isArrowFunction(cb) || ts.isFunctionExpression(cb)) {
+        const param = cb.parameters[0];
+        if (param) {
+          if (ts.isIdentifier(param.name)) namespaces.add(param.name.text);
+          else addFromBindingPattern(param.name);
+        }
+      }
+    }
+
+    // const Alias = AgentModeService  — a plain rebind of an already-tracked name.
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isIdentifier(node.initializer) &&
+      direct.has(node.initializer.text)
+    ) {
+      direct.add(node.name.text);
+    }
+
+    // const Alias = mod.AgentModeService  — namespace member pulled into a local.
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isPropertyAccessExpression(node.initializer) &&
+      node.initializer.name.text === CLASS_NAME &&
+      ts.isIdentifier(node.initializer.expression) &&
+      namespaces.has(node.initializer.expression.text)
+    ) {
+      direct.add(node.name.text);
+    }
+
     ts.forEachChild(node, visit);
   };
 
@@ -172,6 +229,24 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
 
   let count = 0;
   const visit = (node: ts.Node): void => {
+    // class Ext extends AgentModeService {}  — a subclass gets its OWN toolRegistry, which
+    // is the same two-live-objects shape ENG-1852 was. Counted as a construction site.
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      for (const clause of node.heritageClauses ?? []) {
+        if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+        for (const t of clause.types) {
+          const e = t.expression;
+          if (ts.isIdentifier(e) && direct.has(e.text) && node.name?.text !== CLASS_NAME) count++;
+          if (
+            ts.isPropertyAccessExpression(e) &&
+            e.name.text === CLASS_NAME &&
+            ts.isIdentifier(e.expression) &&
+            namespaces.has(e.expression.text)
+          ) count++;
+        }
+      }
+    }
+
     if (ts.isNewExpression(node)) {
       const target = node.expression;
       // `new AgentModeService()` / `new Aliased()`
@@ -214,16 +289,23 @@ function listSourceFiles(dir: string, acc: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      // Tests construct their own instances in beforeEach — 184 occurrences,
+      // Tests construct their own instances in beforeEach — 317 occurrences,
       // all legitimate and all isolated to a single suite.
       // __tests__/__mocks__ construct their own instances freely and legitimately.
-      // scripts/ are one-shot CLI entry points in their own short-lived process,
-      // where a second instance costs nothing and shares no state with the server.
+      //
+      // src/scripts is deliberately NOT excluded. An earlier version excluded it on the
+      // premise that scripts are one-shot CLI entry points in their own short-lived
+      // process — which is false for at least one of them:
+      // services/agentMode/outreachScheduleAutoCreateWiring.ts does
+      // `import('../../scripts/seed-eng1609-linkedin-outreach-template')`, loading a
+      // require.main-guarded script as a library INTO the long-lived server process.
+      // Excluding 87 files on a premise that is wrong for any of them is not worth the
+      // hole; nothing under src/scripts constructs the class today, so including them
+      // costs nothing.
       if (
         entry.name === '__tests__' ||
         entry.name === '__mocks__' ||
-        entry.name === 'node_modules' ||
-        (dir === SRC_ROOT && entry.name === 'scripts')
+        entry.name === 'node_modules'
       ) continue;
       listSourceFiles(full, acc);
     } else if (
@@ -361,6 +443,67 @@ describe('AgentModeService construction guard — detection behaviour', () => {
       '}',
     ].join('\n');
     expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  // Every form below walked straight past an earlier version of this guard. A second
+  // review defeated it by extracting countConstructions and running these standalone.
+  it('flags construction inside a dynamic-import .then() callback', () => {
+    // server.ts uses exactly this idiom for ensureCriticalTables and
+    // mcpOAuthRefreshService, so the callback parameter is a live module-object binding.
+    const src = [
+      "import('./agentModeService').then(m => { const s = new m.AgentModeService(); void s; });",
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a subclass, which gets its own registry', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'class Extended extends AgentModeService {}',
+      'const svc = new Extended();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a plain rebind of the class', () => {
+    const src = [
+      "import { AgentModeService } from './agentModeService';",
+      'const Cls = AgentModeService;',
+      'const svc = new Cls();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags a namespace member pulled into a local', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'const Cls = mod.AgentModeService;',
+      'const svc = new Cls();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags the assignment form of require', () => {
+    const src = [
+      'let mod: any;',
+      "mod = require('./agentModeService');",
+      'const svc = new mod.AgentModeService();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('does not flag the class declaring itself', () => {
+    // agentModeService.ts declares `export class AgentModeService` and then constructs it
+    // once. The declaration must not be mistaken for a subclass of itself.
+    const src = [
+      `export class ${CLASS_NAME} { }`,
+      `export const agentModeService = new ${CLASS_NAME}();`,
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/agentModeService.ts', src)).not.toThrow();
   });
 
   it('flags a namespace-style construction', () => {
