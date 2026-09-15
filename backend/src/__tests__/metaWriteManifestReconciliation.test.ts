@@ -161,7 +161,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
       return { success: true, message: `Ad set "${params?.name}" created successfully`, adSet: { id: `id-${params?.name}` }, readBackVerified: true };
     }) as any);
 
-    const result = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
 
     expect(result.outcome).toBe('submitted');
     if (result.outcome !== 'submitted') throw new Error('unreachable');
@@ -185,7 +185,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
   it('all writes failing reconciles to unapplied, not partially_applied', async () => {
     jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: false, error: 'Invalid parameter' });
 
-    const result = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
 
     expect(result.outcome).toBe('submitted');
     if (result.outcome !== 'submitted') throw new Error('unreachable');
@@ -199,7 +199,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
       return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
     }) as any);
 
-    const result = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
 
     expect(result.outcome).toBe('submitted');
     if (result.outcome !== 'submitted') throw new Error('unreachable');
@@ -216,7 +216,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     }) as any);
 
     // Submit and let it run to completion normally.
-    const first = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
+    const first = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
     expect(first.outcome).toBe('submitted');
     expect(createCalls).toBe(3);
 
@@ -226,9 +226,40 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     // proves resubmission is blocked; it says nothing about whether the engine
     // can resume a run that was genuinely interrupted mid-batch, which is what
     // gap 3b actually promises — see the next test for that.
-    const second = await service.submitApprovalDeckAnswers(SESSION_ID, approveAll(), 'user');
+    const second = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
     expect(second.outcome).toBe('invalid');
     expect(createCalls).toBe(3); // no new dispatch attempted
+  });
+
+  it('stale-deckId guard: a submission naming a deckId that does not match the currently pending deck is refused outright, never dispatched — same shape as AskUserQuestion\'s questionId guard', async () => {
+    // Whole-system review finding (2026-09-16): itemIds are only deck-scoped by
+    // convention (write-1, write-2, ...) — two different decks with the same
+    // item count collide on itemId. Without this guard, a stale/replayed
+    // submission (double-click before the button disables, browser
+    // back+resubmit, a client retry after the first attempt already
+    // succeeded) that arrives AFTER the session has moved on to a different
+    // pending deck would silently apply the user's old verdicts to that new,
+    // never-reviewed deck's items instead of being refused.
+    let createCalls = 0;
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      createCalls++;
+      const params: any = _args[5];
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-some-other-deck', approveAll(), 'user');
+
+    expect(result.outcome).toBe('invalid');
+    if (result.outcome !== 'invalid') throw new Error('unreachable');
+    expect(result.reason).toContain('deck-some-other-deck');
+    expect(result.reason).toContain('deck-vincent-1');
+    expect(createCalls).toBe(0); // never dispatched against the wrong deck
+
+    // The real, currently-pending deck can still be answered normally after —
+    // the guard rejected the mismatched attempt, it didn't corrupt session state.
+    const retry = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
+    expect(retry.outcome).toBe('submitted');
+    expect(createCalls).toBe(3);
   });
 
   it('gap 3b, for real: advanceIndependentWorkflow resumes a genuinely interrupted run from a seeded PARTIAL checkpoint, never re-dispatching the step that was already verified before the crash', async () => {
@@ -326,7 +357,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
       { itemId: 'write-2', verdict: 'reject', freeText: 'Wrong optimization goal — use LINK_CLICKS instead.' },
       { itemId: 'write-3', verdict: 'approve' },
     ];
-    const result = await service.submitApprovalDeckAnswers(SESSION_ID, answers, 'user');
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', answers, 'user');
 
     expect(result.outcome).toBe('submitted');
     if (result.outcome !== 'submitted') throw new Error('unreachable');

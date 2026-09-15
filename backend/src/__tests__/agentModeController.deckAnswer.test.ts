@@ -207,7 +207,7 @@ describe('generateResponse — approval-deck answer channel (ENG-1635/1644)', ()
     );
 
     expect(res.statusCode).toBe(200);
-    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, answers, 'user');
+    expect(mockAgentModeService.submitApprovalDeckAnswers).toHaveBeenCalledWith(sessionId, 'deck-1', answers, 'user');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
     const workerArgs = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
     expect(workerArgs.messageContent).toContain('Approval deck outcome');
