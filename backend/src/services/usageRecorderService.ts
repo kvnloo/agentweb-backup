@@ -689,11 +689,25 @@ async function recordVendorUsageLegacy(
  * only blocks when ENFORCE_COST_CAP is enabled (observe-only by default).
  */
 export function meterUserUsage(ctx: RecordUsageContext): void {
+  void meterUserUsageAsync(ctx);
+}
+
+/**
+ * `meterUserUsage`, awaitable: resolves once BOTH writes — the usage row and the
+ * cap charge — have settled (ENG-1858). Never rejects; each write keeps its own
+ * fail-open handling. Use it where something must wait for the metering to be
+ * durable, such as registering it with the graceful-shutdown drain; hot paths
+ * keep calling `meterUserUsage` and never wait.
+ */
+export async function meterUserUsageAsync(ctx: RecordUsageContext): Promise<void> {
   // Shadow analytics — records under "system" when userId is absent.
-  void recordUsage(ctx);
+  const recorded = recordUsage(ctx);
 
   // Enforced per-user cap — only when a real user is attributable.
-  if (!ctx.userId) return;
+  if (!ctx.userId) {
+    await recorded;
+    return;
+  }
 
   const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
   const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
@@ -715,11 +729,14 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
           ctx.cacheWriteByTtl
         ) / 1e6;
 
-  if (totalTokens <= 0 && costUsd <= 0) return;
+  if (totalTokens <= 0 && costUsd <= 0) {
+    await recorded;
+    return;
+  }
 
   // Lazy-required (see import-site note) to keep this module's static load graph light.
   const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
-  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
+  const charged = incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
     eventId: ctx.eventId,
     model: ctx.model,
     provider: ctx.provider,
@@ -731,6 +748,7 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
       err instanceof Error ? err.message : err
     )
   );
+  await Promise.all([recorded, charged]);
 }
 
 /** Test hook: reset the error-log throttle. */
