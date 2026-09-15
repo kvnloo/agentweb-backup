@@ -112,8 +112,10 @@ export interface HumanEvalCandidate {
   outputSummary: string;
   originalRequest?: string;
   action?: HumanEvalAction;
-  slackChannel: string;
-  slackMessageTs: string;
+  /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
+   *  candidate still persists and is reviewable via the queue API either way. */
+  slackChannel?: string;
+  slackMessageTs?: string;
   feedback: HumanEvalFeedback[];
   createdAt: string;
   updatedAt: string;
@@ -341,7 +343,6 @@ export class HumanEvalService {
       throw new Error('outputSummary is required');
     }
 
-    const slackChannel = await this.getEvalChannel();
     const reviewer = this.getReviewerForType(input.reviewType);
     const reviewerSlackUserId = await this.getReviewerSlackUserId(reviewer);
     const candidateId = uuidv4();
@@ -350,17 +351,10 @@ export class HumanEvalService {
     const preparedInput = await this.prepareCandidateInput(input, candidateId);
     const chatUrl = await this.resolveChatUrl(preparedInput);
 
-    const message = this.buildSlackMessage({
-      ...preparedInput,
-      candidateId,
-      reviewer,
-      reviewerSlackUserId,
-      chatUrl,
-      normalizedCategory: category,
-    });
-
-    const posted = await this.slack.postSlackMessage(slackChannel, message);
-
+    // ENG-1854: persistence no longer depends on a Slack post succeeding (or even being
+    // attempted) — a prior version built the Slack message and posted it BEFORE writing to
+    // DynamoDB, so a Slack outage or an unconfigured channel silently dropped the candidate
+    // entirely, not just the notification. Write the record first, unconditionally.
     const candidate: HumanEvalCandidate = {
       candidateId,
       reviewType: input.reviewType,
@@ -376,8 +370,6 @@ export class HumanEvalService {
       outputSummary: preparedInput.outputSummary.trim(),
       originalRequest: preparedInput.originalRequest?.trim() || undefined,
       action: preparedInput.action,
-      slackChannel: posted.channel || slackChannel,
-      slackMessageTs: posted.ts,
       feedback: [],
       createdAt: now,
       updatedAt: now,
@@ -389,12 +381,41 @@ export class HumanEvalService {
       ConditionExpression: 'attribute_not_exists(candidateId)',
     }).promise();
 
-    await this.settings.setSetting(
-      this.threadMappingKey(candidate.slackChannel, candidate.slackMessageTs),
-      candidate.candidateId,
-      'Slack thread to human eval candidate mapping',
-      'human-eval',
-    );
+    if (await this.isSlackPostingEnabledFor(input.userId)) {
+      try {
+        const slackChannel = await this.getEvalChannel();
+        const message = this.buildSlackMessage({
+          ...preparedInput,
+          candidateId,
+          reviewer,
+          reviewerSlackUserId,
+          chatUrl,
+          normalizedCategory: category,
+        });
+        const posted = await this.slack.postSlackMessage(slackChannel, message);
+
+        candidate.slackChannel = posted.channel || slackChannel;
+        candidate.slackMessageTs = posted.ts;
+
+        await this.db.update({
+          TableName: HUMAN_EVAL_QUEUE_TABLE,
+          Key: { candidateId },
+          UpdateExpression: 'SET slackChannel = :c, slackMessageTs = :t',
+          ExpressionAttributeValues: { ':c': candidate.slackChannel, ':t': candidate.slackMessageTs },
+        }).promise();
+
+        await this.settings.setSetting(
+          this.threadMappingKey(candidate.slackChannel, candidate.slackMessageTs),
+          candidate.candidateId,
+          'Slack thread to human eval candidate mapping',
+          'human-eval',
+        );
+      } catch (err: any) {
+        // Fail open: the candidate is already persisted and reviewable via the queue API
+        // even if the Slack post itself failed (e.g. channel not configured).
+        console.warn('[human-eval] Slack post failed, candidate persisted without it:', err?.message || err);
+      }
+    }
 
     return candidate;
   }
@@ -734,6 +755,25 @@ export class HumanEvalService {
     }
 
     return channel.trim();
+  }
+
+  /**
+   * ENG-1854: default-off switch for #eval-queue Slack fan-out. The queue itself (creation,
+   * persistence, the admin read API) is unaffected either way — this only gates whether a
+   * given candidate additionally gets posted to Slack. DB-backed (not an env var) so it's
+   * flippable without a redeploy, same reasoning as `getEvalChannel`'s own setting above.
+   */
+  private async isSlackPostingEnabledFor(userId: string | undefined): Promise<boolean> {
+    if (userId) {
+      const exceptions = await this.settings.getSetting('human_eval_slack_posting_exception_user_ids');
+      const exceptionIds = (exceptions?.settingValue || '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean);
+      if (exceptionIds.includes(userId)) return true;
+    }
+    const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
+    return globalToggle?.settingValue === 'true';
   }
 
   private async getReviewerSlackUserId(reviewer: HumanEvalReviewer): Promise<string | undefined> {
