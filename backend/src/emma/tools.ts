@@ -4864,12 +4864,17 @@ emmaToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any, _context?: any) => {
+  execute: async (args: any, context?: any) => {
     // Intentionally pass no model: describe_image always uses the configured
     // agent_mode_default_model (resolved inside describeImage), not the chat's
     // selected model. (`args.llmModel` was never populated — the schema doesn't
     // expose it and the registry doesn't merge context into args.)
-    return await agentModeService.describeImage(undefined, args.image_url, args.prompt);
+    // ENG-1858: meter the vision call to the calling user instead of "system".
+    return await agentModeService.describeImage(undefined, args.image_url, args.prompt, {
+      userId: context?.userId || context?.agentUserId,
+      sessionId: context?.sessionId,
+      feature: 'describe_image',
+    });
   }
 });
 

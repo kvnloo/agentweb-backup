@@ -1104,7 +1104,9 @@ describe('Data-fabrication backstop wiring (ENG-1027)', () => {
     expect(describeImageSpy).toHaveBeenCalledWith(
       undefined,
       'https://example.com/dashboard.png',
-      expect.stringContaining('NUMBERS_FOUND')
+      expect.stringContaining('NUMBERS_FOUND'),
+      // ENG-1858: the check is metered to the generating user, not "system".
+      { userId: 'user123', sessionId: 'session123', feature: 'describe_image' }
     );
   });
 

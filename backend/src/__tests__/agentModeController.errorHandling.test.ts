@@ -1061,7 +1061,9 @@ describe('AgentModeController - Error Handling', () => {
         expect.objectContaining({
           succeededFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
           failedFunctions: { save_memory: 1, coding_agent: 1 },
-        })
+        }),
+        // ENG-1858: the diagnosis is metered to the session owner, not "system".
+        { userId: 'test-user-123', sessionId: 'test-session-123', feature: 'diagnostic_message' }
       );
     });
 
@@ -1096,7 +1098,9 @@ describe('AgentModeController - Error Handling', () => {
       // Nothing was published THIS turn, so there is nothing to correct.
       expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
       expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } })
+        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } }),
+        // ENG-1858: metered to the session owner.
+        { userId: 'test-user-123', sessionId: 'test-session-123', feature: 'diagnostic_message' }
       );
     });
 
