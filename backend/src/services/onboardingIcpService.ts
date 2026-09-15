@@ -380,6 +380,7 @@ async function mirrorIcpsToMarketStrategy(
       }>;
       createdAt?: string;
       updatedAt?: string;
+      icpUpdatedAt?: string;
     };
     const merged = {
       businessOverview: existing.businessOverview ?? "",
@@ -387,6 +388,15 @@ async function mirrorIcpsToMarketStrategy(
       icp: mapIcpResultToMarketStrategy(personas),
       createdAt: existing.createdAt ?? now,
       updatedAt: completedAt,
+      // Tracked separately from `updatedAt` (ENG-1955 follow-up): this write
+      // genuinely touches `icp`, so it's correct for icpUpdatedAt to move —
+      // unlike a competitors/businessOverview-only save elsewhere, which must
+      // NOT look like an ICP correction to the staleness check in
+      // routes/crm.ts. Backdated to `completedAt` for the same reason
+      // `updatedAt` is: this write runs moments after icpCompletedAt is
+      // persisted, so timestamping with wall-clock now() would make it look
+      // newer than the generation it mirrors.
+      icpUpdatedAt: completedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
   } catch (err) {

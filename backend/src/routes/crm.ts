@@ -2311,12 +2311,23 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       }
     }
     const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    // Prefer icpUpdatedAt — bumped only by a write that actually touches
+    // `icp` — over the whole-object updatedAt, which every marketStrategy
+    // write bumps regardless of which field changed (businessOverview- or
+    // competitors-only saves included). Falling back to updatedAt when
+    // icpUpdatedAt is absent keeps existing records (saved before this field
+    // existed) working exactly as before; it only stops applying once a
+    // write path that sets icpUpdatedAt touches the record (ENG-1955
+    // follow-up — a competitors edit or an Emma "update the competitors"
+    // tool call was otherwise silently and permanently switching the org
+    // off its cached, richer icpResult-derived ICP filters).
+    const marketStrategyIcpTimestamp = marketStrategy?.icpUpdatedAt || marketStrategy?.updatedAt;
     const marketStrategyIsNewer =
       !marketStrategyFromOwnerFallback &&
       marketIcp.length > 0 &&
-      !!marketStrategy?.updatedAt &&
+      !!marketStrategyIcpTimestamp &&
       !!user?.icpCompletedAt &&
-      new Date(marketStrategy.updatedAt).getTime() > new Date(user.icpCompletedAt).getTime();
+      new Date(marketStrategyIcpTimestamp).getTime() > new Date(user.icpCompletedAt).getTime();
 
     let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     let fromMarketStrategy = false;
