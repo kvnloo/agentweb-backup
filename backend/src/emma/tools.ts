@@ -16,7 +16,7 @@ import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
-import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval } from '../services/autoHumanEvalService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   buildPendingUserQuestion,
@@ -74,6 +74,18 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const userId = context?.userId || context?.agentUserId;
     const sessionId = context?.sessionId;
+
+    // ENG-1854: this manual path bypasses enqueueAutoHumanEval entirely (it calls
+    // createCandidate directly), so it never went through that function's own dedup — an
+    // auto-trigger could already have posted this exact artifact (e.g. right after
+    // generate_image completes) before Emma also decides to send it herself. Claim the
+    // artifact URL first so whichever path gets here first wins, not both.
+    if (args.artifact_url && !(await claimArtifactForHumanEval(args.artifact_url))) {
+      return {
+        success: true,
+        message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
+      };
+    }
 
     const candidate = await humanEvalService.createCandidate({
       reviewType: args.review_type as HumanEvalReviewType,
@@ -268,7 +280,15 @@ function enqueueLeadEnrichmentEval(input: {
   toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
 }): void {
   const processedCount = Number(input.summary?.processedCount ?? 0);
-  if (!input.userId || processedCount <= 0) return;
+  const failedCount = Number(input.summary?.failedCount ?? 0);
+  // ENG-1854: a routine, zero-failure enrichment run was never a real candidate for human
+  // review — it's a completion log entry, not a judgment call. This was the dominant source
+  // of #eval-queue noise (confirmed via a real Slack dump: near-identical "processed N,
+  // failed 0" posts, minutes apart, differing only by list). Only enqueue when something's
+  // actually anomalous. Does not apply to rerunLeadEnrichment (humanEvalActionService.ts) —
+  // that path fires because a human explicitly asked for and is waiting on this specific
+  // re-run, so it should always report back regardless of outcome.
+  if (!input.userId || processedCount <= 0 || failedCount <= 0) return;
 
   const fields = outputFieldNames(input.outputFields);
   const runId = typeof input.summary?.runId === 'string' && input.summary.runId
