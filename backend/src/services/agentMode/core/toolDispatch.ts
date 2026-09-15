@@ -608,6 +608,23 @@ export async function executePreparedTools(
   let mediaBudgetDeferred = false;
   // ENG-426: search calls ALLOWED to execute this iteration (see SEARCH_CALL_SESSION_CAP).
   let searchCallsThisIteration = 0;
+  // ENG-1945 follow-up: install_skills calls that already ran an eager head-start
+  // execution in Phase 1 below (so a sibling call gated by the newly-installed skill,
+  // appearing later in this SAME batch, sees it unlocked). Keyed by tool_call_id so
+  // Phase 2's runOne can replay this outcome instead of executing install_skills a
+  // second time for the identical call — see the eager block below for why a second,
+  // independent execution is unsafe rather than merely redundant.
+  const eagerToolOutcomes = new Map<string, ToolExecOutcome>();
+  // Same, but keyed by (name + args) signature rather than tool_call_id: the eager
+  // block below runs BEFORE the shared same-turn dedupe check further down (that
+  // check's own suppression bookkeeping — messages/ledger/counters — must stay
+  // ordered after every call has had a chance to unlock siblings, so it can't be
+  // moved earlier to gate the eager execution itself). Without this, two
+  // install_skills calls with IDENTICAL arguments emitted in the same batch (the
+  // model repeats itself) would each run the eager execution for real — the second
+  // one re-recording a failure/re-mutating session state for a call the later
+  // dedupe check goes on to suppress as a duplicate anyway.
+  const eagerInstallSkillsByArgs = new Map<string, ToolExecOutcome>();
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
@@ -764,55 +781,6 @@ export async function executePreparedTools(
 
       if (toolCall.function.name === 'install_skills') {
         skillsUpdated = true;
-
-        /*
-         * ENG-1945: a model very commonly emits install_skills AND a tool that skill
-         * gates in the SAME batch ("install the browser skill, then navigate"). The
-         * authoritative execution below (Phase 2) runs install_skills, but only AFTER
-         * this whole Phase-1 loop finishes gating every call in the batch against
-         * `allowedToolNames` — so the sibling navigate/snapshot/etc. call, appearing
-         * later in this same array, was rejected as "not available" a beat before the
-         * install it depends on actually took effect. installSkills' `addAssociatedSkills`
-         * write is an idempotent Set union, so running it once, eagerly, here (ahead of
-         * its normal Phase 2 execution) is safe — it does not double-charge or
-         * double-mutate anything Phase 2 re-running it a moment later can't already
-         * tolerate. Best-effort: any real failure (unentitled/invalid skill) still
-         * surfaces normally through the authoritative Phase 2 call below.
-         *
-         * Routed through the gateway (not called directly) with the same runId/
-         * budgetScopeId and this call's own policyDecision, so the repeated-failure/
-         * session-timeout breaker (findTrippedFailure/findTrippedSessionTimeout —
-         * unconditional regardless of AGENT_TOOL_GATEWAY_ENFORCE) short-circuits this
-         * eager call too. Without that, a retry loop calling install_skills with a bad
-         * skillId keeps paying the full entitlement-check cost (getSkillsForDisplay,
-         * classifySkillRejections, userDb.getUserById) every batch even after Phase 2's
-         * breaker would otherwise refuse to run it at all.
-         */
-        try {
-          const eagerOutcome = await ports.executeAgentToolThroughGateway({
-            toolName: 'install_skills',
-            args: functionArgs,
-            policyDecision: initialPolicyDecision,
-            runId: agentRuntimeRunId,
-            budgetScopeId: sessionId,
-            execute: () => ports.executePreparedAgentTool({
-              llmModel,
-              toolName: 'install_skills',
-              functionArgs,
-              userId,
-              sessionId,
-              mockMode,
-              isDelegatedAccess,
-            }),
-          });
-          const eagerResult = eagerOutcome.status === 'success' ? eagerOutcome.result : undefined;
-          if (Array.isArray(eagerResult?.installedToolNames)) {
-            eagerResult.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
-          }
-        } catch {
-          // Best-effort head start only — Phase 2 below remains the authoritative
-          // execution and reports any real error.
-        }
       }
 
       const inputSchema = ports.getToolInputSchema(toolCall.function.name);
@@ -855,6 +823,77 @@ export async function executePreparedTools(
         const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
         appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
         continue;
+      }
+
+      if (toolCall.function.name === 'install_skills') {
+        /*
+         * ENG-1945: a model very commonly emits install_skills AND a tool that skill
+         * gates in the SAME batch ("install the browser skill, then navigate"). Phase 2
+         * below runs every prepared call's tool ONLY after this whole Phase-1 loop
+         * finishes gating every call in the batch against `allowedToolNames` — so the
+         * sibling navigate/snapshot/etc. call, appearing later in this same array, was
+         * rejected as "not available" a beat before the install it depends on actually
+         * took effect.
+         *
+         * Run install_skills HERE instead — once, for real, through the gateway — the
+         * moment it has cleared every preflight gate every other tool call clears before
+         * reaching Phase 2 (schema validation/repair above, policy allow-check just
+         * above). That ordering matters, not just for consistency: running it any
+         * earlier (e.g. on the raw pre-repair args, before the policy gate) could
+         * execute — and mutate session state via addAssociatedSkills — for a call this
+         * same loop iteration goes on to preflight-reject a moment later, leaving the
+         * model told the call never happened while it actually did.
+         *
+         * The outcome is cached by tool_call_id in `eagerToolOutcomes` and Phase 2's
+         * runOne replays it instead of executing install_skills a SECOND time for the
+         * identical call. A second independent execution is not just redundant, it is
+         * actively unsafe for the repeated-failure breaker: a rejected install (bad
+         * skillId, unentitled skill) classifies as a FAST_TRIP error class
+         * (skill_install_refused/subscription_blocked/invalid_args — 2-failure
+         * threshold), and the gateway's own failure counter is keyed by run+tool+scope,
+         * not by tool_call_id — so two executions of ONE model-emitted call would
+         * record two failures and trip the breaker after a single turn instead of two,
+         * silently halving the model's real retry budget and replacing install_skills'
+         * accurate, bucketed rejection reason with a generic "stop retrying" message on
+         * what the model experiences as its very next attempt.
+         */
+        const argsKey = stableStringify(preparedFunctionArgs);
+        let outcome = eagerInstallSkillsByArgs.get(argsKey);
+        if (!outcome) {
+          // Same execute_tool span shape runOne (Phase 2) creates for every other tool —
+          // this eager call is install_skills' only real execution now, so it must be the
+          // one carrying the span, or the tool would vanish from OTel entirely.
+          const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} install_skills`, {
+            [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
+            [ATTR_GEN_AI_TOOL_NAME]: 'install_skills',
+            [ATTR_SESSION_ID]: sessionId,
+          });
+          outcome = await ports.executeAgentToolThroughGateway({
+            toolName: 'install_skills',
+            args: preparedFunctionArgs,
+            policyDecision,
+            runId: agentRuntimeRunId,
+            budgetScopeId: sessionId,
+            execute: () => ports.executePreparedAgentTool({
+              llmModel,
+              toolName: 'install_skills',
+              functionArgs: preparedFunctionArgs,
+              userId,
+              sessionId,
+              mockMode,
+              isDelegatedAccess,
+            }),
+          });
+          endExecuteToolSpan(span, outcome.status === 'error'
+            ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }
+            : {});
+        }
+        eagerInstallSkillsByArgs.set(argsKey, outcome);
+        eagerToolOutcomes.set(toolCall.id, outcome);
+        const result = outcome.status === 'success' ? outcome.result : undefined;
+        if (Array.isArray(result?.installedToolNames)) {
+          result.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
+        }
       }
 
       if (
@@ -968,6 +1007,13 @@ export async function executePreparedTools(
   let toolResults: DispatchToolResult[];
 
   const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
+    // ENG-1945 follow-up: install_skills already ran (for real, through the gateway) in
+    // Phase 1 above so a sibling call gated by it could unlock within the same batch —
+    // replay that outcome instead of executing it again. See the Phase-1 eager block for
+    // why a second execution is unsafe, not merely redundant.
+    const cachedOutcome = eagerToolOutcomes.get(toolCall.id);
+    if (cachedOutcome) return cachedOutcome;
+
     // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
     // its outcome shape, and error propagation are untouched.
     const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
