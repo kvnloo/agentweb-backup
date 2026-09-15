@@ -35,7 +35,8 @@
  * lockout with no admin override.
  */
 
-import { userDb, taskDb } from "./db";
+import { userDb, taskDb, orgDb } from "./db";
+import { resolveOrgProfileField } from "./orgProfileResolver";
 import { v4 as uuidv4 } from "uuid";
 import {
   buildFailedPatch,
@@ -99,18 +100,26 @@ const defaultUpdateKnowledgeBaseFile: UpdateKnowledgeBaseFileFn = (...args) => {
   return agentModeService.updateKnowledgeBaseFile(...args);
 };
 
-/** Same precedence onboardingBrandBuildService.pickCompanyUrl uses. */
+/**
+ * Same precedence onboardingBrandBuildService.pickCompanyUrl uses
+ * (productDomain -> brandGuidelines.brandData.domain -> legacy companyUrl).
+ *
+ * `productDomain` is dual-purposed — it's also the plain-domain analytics
+ * feature-tracking field (see db.ts's doc comment: "e.g. 'app.example.com'")
+ * — so callers that only ever went through onboarding's own https://-prepend
+ * (handleBrandSubmit) never noticed it can arrive with no scheme. cssExtractor's
+ * `new URL()` parse throws on a bare domain, so normalize here rather than
+ * failing every scrape for an account whose productDomain came from Settings.
+ */
 function pickCompanyUrl(user: any): string | null {
   if (!user) return null;
-  if (typeof user.productDomain === "string" && user.productDomain.trim()) {
-    return user.productDomain.trim();
-  }
-  const bdDomain = user.brandGuidelines?.brandData?.domain;
-  if (typeof bdDomain === "string" && bdDomain.trim()) return bdDomain.trim();
-  if (typeof user.companyUrl === "string" && user.companyUrl.trim()) {
-    return user.companyUrl.trim();
-  }
-  return null;
+  const raw =
+    (typeof user.productDomain === "string" && user.productDomain.trim()) ||
+    (typeof user.brandGuidelines?.brandData?.domain === "string" && user.brandGuidelines.brandData.domain.trim()) ||
+    (typeof user.companyUrl === "string" && user.companyUrl.trim()) ||
+    "";
+  if (!raw) return null;
+  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -486,9 +495,22 @@ export async function triggerDesignSystemBuildForUser(
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
-  const companyUrl = pickCompanyUrl(user);
+  // brandGuidelines — the manual-fallback content source — is an
+  // org-authoritative pillar (same as designSystem's own status). Reading
+  // `user.brandGuidelines` directly misses it for any account whose brand
+  // was saved onto the Organization record (the common case once an org
+  // exists), producing an emptier fallback than the account actually has
+  // data for. Resolve it the same way /api/auth/me does.
+  const org = (user as any).orgId ? await orgDb.getOrgById((user as any).orgId) : null;
+  const resolvedBrandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
+  const effectiveUser = {
+    ...(user as any),
+    brandGuidelines: resolvedBrandGuidelines ?? (user as any).brandGuidelines,
+  };
+
+  const companyUrl = pickCompanyUrl(effectiveUser);
   if (!companyUrl) {
-    await completeWithManualFallback(userId, user, now, updateKnowledgeBaseFile, "no website URL on account");
+    await completeWithManualFallback(userId, effectiveUser, now, updateKnowledgeBaseFile, "no website URL on account");
     return;
   }
 
@@ -519,6 +541,6 @@ export async function triggerDesignSystemBuildForUser(
       userId,
       error: e?.message ?? String(e),
     });
-    await completeWithManualFallback(userId, user, now, updateKnowledgeBaseFile, e?.message ?? String(e));
+    await completeWithManualFallback(userId, effectiveUser, now, updateKnowledgeBaseFile, e?.message ?? String(e));
   }
 }

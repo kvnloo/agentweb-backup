@@ -48,7 +48,7 @@ router.post("/design-system/start", authenticateToken, async (req, res) => {
       return res.json({ status: snapshot((existing as any)?.designSystem) });
     }
 
-    const patch = buildStartPatch();
+    const patch = buildStartPatch((existing as any)?.designSystem);
     await userDb.updateUser(userId, patch as any);
 
     // Fire-and-forget background work; route returns immediately so the UI

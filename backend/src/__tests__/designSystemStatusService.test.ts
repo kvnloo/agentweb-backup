@@ -24,11 +24,27 @@ describe("designSystemStatusService", () => {
   describe("buildStartPatch", () => {
     it("flips to running and clears prior terminal fields", () => {
       const now = new Date("2026-01-01T00:00:00.000Z");
-      const patch = buildStartPatch(now);
+      const patch = buildStartPatch(undefined, now);
       expect(patch.designSystem.status).toBe("running");
       expect(patch.designSystem.startedAt).toBe(now.toISOString());
       expect(patch.designSystem.completedAt).toBeUndefined();
       expect(patch.designSystem.error).toBeUndefined();
+    });
+
+    it("carries kbTaskId forward from the current state (regression: a retry must reuse the same KB task, not orphan it)", () => {
+      // Live-verified against the real dev backend (ENG-328): dropping this
+      // caused a genuine duplicate "Website Design System" KB task on every
+      // retry, because designSystem is a single nested object and a patch
+      // that omits kbTaskId SETs the whole object, wiping the pointer
+      // ensureKbTask relies on to find the existing task.
+      const patch = buildStartPatch({ status: "failed", kbTaskId: "existing-task-id", error: "boom" });
+      expect(patch.designSystem.kbTaskId).toBe("existing-task-id");
+      expect(patch.designSystem.status).toBe("running");
+    });
+
+    it("has no kbTaskId to carry forward on a genuinely first run", () => {
+      expect(buildStartPatch(undefined).designSystem.kbTaskId).toBeUndefined();
+      expect(buildStartPatch({ status: "idle" }).designSystem.kbTaskId).toBeUndefined();
     });
   });
 

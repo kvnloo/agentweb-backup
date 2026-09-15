@@ -50,7 +50,21 @@ export const DESIGN_SYSTEM_TIMEOUT_MS = 120_000;
 /** Hard watchdog wall — set above the budget so persistFailure normally wins the race. */
 export const DESIGN_SYSTEM_HARD_TIMEOUT_MS = 150_000;
 
-export function buildStartPatch(now: Date = new Date()): DesignSystemPatch {
+/**
+ * `designSystem` is a single nested object, so persisting a patch SETs the
+ * whole thing — unlike brandBuildStatus's flat top-level fields, there's no
+ * per-key merge. Carrying `kbTaskId` forward from `current` is therefore
+ * required, not optional: dropping it here silently orphans the previous
+ * Knowledge Base task on every retry, and ensureKbTask (which only reuses a
+ * task when it finds a `kbTaskId` to look up) creates a fresh one instead —
+ * a duplicate design.md-holding task per retry. Verified live against the
+ * real dev backend (ENG-328): omitting `current` here reproduced exactly
+ * that duplication on a second run.
+ */
+export function buildStartPatch(
+  current?: DesignSystemFields,
+  now: Date = new Date()
+): DesignSystemPatch {
   return {
     designSystem: {
       status: "running",
@@ -58,6 +72,7 @@ export function buildStartPatch(now: Date = new Date()): DesignSystemPatch {
       completedAt: undefined,
       durationMs: undefined,
       error: undefined,
+      kbTaskId: current?.kbTaskId,
     },
   };
 }

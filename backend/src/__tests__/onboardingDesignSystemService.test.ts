@@ -26,6 +26,9 @@ jest.mock("../services/db", () => ({
     getTaskById: jest.fn(),
     createTask: jest.fn(),
   },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 jest.mock("uuid", () => ({ v4: jest.fn(() => "generated-task-id") }));
@@ -39,13 +42,14 @@ import {
   buildManualFallbackMarkdown,
 } from "../services/onboardingDesignSystemService";
 
-const { userDb, taskDb } = require("../services/db");
+const { userDb, taskDb, orgDb } = require("../services/db");
 
 beforeEach(() => {
   userDb.getUserById.mockReset();
   userDb.updateUser.mockReset();
   taskDb.getTaskById.mockReset();
   taskDb.createTask.mockReset();
+  orgDb.getOrgById.mockReset();
 });
 
 const emptyTokens = () => ({
@@ -322,5 +326,68 @@ describe("onboardingDesignSystemService — triggerDesignSystemBuildForUser (orc
     expect(taskDb.getTaskById).toHaveBeenCalledWith("existing-task-id");
     expect(taskDb.createTask).not.toHaveBeenCalled();
     expect(updateKnowledgeBaseFile.mock.calls[0][0]).toBe("existing-task-id");
+  });
+
+  // Regression coverage for defects found live-testing this exact orchestration
+  // against the real dev backend/DB (ENG-328): a real seeded account had a
+  // schemeless productDomain and org-owned brandGuidelines, and the fallback
+  // it produced was emptier than the account's actual data.
+
+  it("normalizes a schemeless productDomain before scraping (productDomain doubles as the analytics plain-domain field, e.g. 'app.example.com')", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      productDomain: "app.owner-acme-test.com", // no http(s):// prefix
+      designSystem: { status: "running" },
+    });
+    const extractCSSFromURL = jest.fn().mockResolvedValue({
+      url: "https://app.owner-acme-test.com",
+      brandIdentity: {},
+      computedElements: {},
+    });
+
+    await triggerDesignSystemBuildForUser("u1", {
+      extractCSSFromURL,
+      analyzeDesignTokens: jest.fn().mockResolvedValue(emptyTokens()),
+      inferBrandTokens: jest.fn().mockReturnValue({
+        colors: { primary: "#000", secondary: "#000", palette: [] },
+        typography: { headingFont: "x", bodyFont: "x", fontWeights: { regular: 400, semibold: 600, bold: 700 } },
+        visualEffects: { primaryShadow: "none", borderRadius: "0" },
+      }),
+      fetchHtml: jest.fn().mockResolvedValue(""),
+      updateKnowledgeBaseFile: jest.fn().mockResolvedValue({ success: true }),
+    });
+
+    expect(extractCSSFromURL).toHaveBeenCalledWith("https://app.owner-acme-test.com");
+  });
+
+  it("resolves brandGuidelines org-first for the manual fallback (matches designSystem's own org-authoritative resolution)", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      orgId: "org-1",
+      orgRole: "owner",
+      designSystem: { status: "running" },
+      // The owner's OWN user-record copy is empty/stale — brand actually
+      // lives on the Organization record (the common case once an org
+      // exists; see orgProfileResolver.ts's ENG-927 precedence).
+      brandGuidelines: undefined,
+    });
+    orgDb.getOrgById.mockResolvedValue({
+      orgId: "org-1",
+      brandGuidelines: {
+        brandData: { brandName: "Acme Org", primaryColor: "#abcdef", secondaryColor: "#123456", fontFamily: "Inter" },
+        attachments: [{ type: "logo", url: "https://acme.com/org-logo.png" }],
+      },
+    });
+    const updateKnowledgeBaseFile = jest.fn().mockResolvedValue({ success: true });
+
+    // No companyUrl anywhere -> goes straight to the manual-fallback path,
+    // which is exactly where the org-resolved brand data must show up.
+    await triggerDesignSystemBuildForUser("u1", { updateKnowledgeBaseFile });
+
+    expect(orgDb.getOrgById).toHaveBeenCalledWith("org-1");
+    const mdArg = updateKnowledgeBaseFile.mock.calls[0][2];
+    expect(mdArg).toContain("Acme Org");
+    expect(mdArg).toContain("#abcdef");
+    expect(mdArg).toContain("https://acme.com/org-logo.png");
   });
 });
