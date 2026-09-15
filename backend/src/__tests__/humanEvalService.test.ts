@@ -7,9 +7,9 @@ function makeHarness() {
   settings.set('human_eval_slack_channel', 'C_EVAL');
   settings.set('human_eval_reviewer_matt_slack_user_id', 'U_MATT');
   settings.set('human_eval_reviewer_fangfang_slack_user_id', 'U_FANGFANG');
-  // ENG-1854: posting is off by default now — every existing test in this file predates
-  // that change and asserts on a real Slack post happening, so opt this shared harness in.
-  // Tests for the new disabled-by-default/exception-list behavior override this explicitly.
+  // ENG-1854: posting is ON by default now (redundant with this explicit 'true' — kept so the
+  // harness's intent reads clearly even after the default flip). Individual tests for the
+  // kill-switch/exception-list behavior override this explicitly.
   settings.set('human_eval_slack_posting_enabled', 'true');
 
   const db = {
@@ -830,9 +830,29 @@ describe('HumanEvalService', () => {
       expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated despite a Slack failure.');
     });
 
-    it('still posts for a userId on the exception list even when the global toggle is explicitly off, using a concise message', async () => {
+    // Round-3 review finding: an earlier version checked the exception list BEFORE the
+    // explicit-'false' kill switch, so an exception-listed user kept posting even when someone
+    // deliberately turned everything off — "a single explicit false is the full rollback lever"
+    // wasn't actually true once the exception list had any entries. Fixed: the kill switch is
+    // now checked first and unconditionally.
+    it('an explicit global "false" overrides the exception list — a real kill switch, not one exception-listed accounts silently ignore', async () => {
       const { service, slack, settings } = makeHarness();
       settings.set('human_eval_slack_posting_enabled', 'false');
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Haven creative for review.',
+        userId: 'user-haven',
+        artifactUrl: 'https://example.com/haven-creative.png',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+    });
+
+    it('an exception-listed userId gets the concise message format when the toggle is not explicitly off', async () => {
+      const { service, slack, settings } = makeHarness();
       settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
 
       const candidate = await service.createCandidate({
@@ -849,6 +869,9 @@ describe('HumanEvalService', () => {
       // ENG-1854 item 6: exception posts are a deliberately different, concise shape —
       // one line, one mention, one link — not the full multi-field dump every other
       // candidate gets. Assert the actual posted text, not just that posting happened.
+      // Note: since the default is now ON, this list's remaining practical role is choosing
+      // the message FORMAT for specific accounts, not whether posting happens at all — posting
+      // already happens for everyone unless explicitly killed (see the test above).
       const postedMessage = slack.postSlackMessage.mock.calls[0][1];
       expect(postedMessage).toBe('<@U_MATT> — new review ready: <https://example.com/haven-creative.png>');
       expect(postedMessage).not.toContain('*Human eval:');
