@@ -407,6 +407,15 @@ describe('listSpendEventsBounded (ENG-1841)', () => {
     expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
   });
 
+  it('asks each page for no more than the remaining budget plus one (CodeRabbit, PR #2925)', async () => {
+    mockDynamoDB.query.mockReturnValueOnce(page(6, 0, false)).mockReturnValueOnce(page(4, 6, true));
+
+    await listSpendEventsBounded('owner-1', '2026-09-01', '2026-09-31', 10);
+
+    expect(mockDynamoDB.query.mock.calls[0][0].Limit).toBe(11);
+    expect(mockDynamoDB.query.mock.calls[1][0].Limit).toBe(5);
+  });
+
   it('an exactly-at-ceiling range is not exceeded', async () => {
     mockDynamoDB.query.mockReturnValueOnce(page(10, 0, true));
 

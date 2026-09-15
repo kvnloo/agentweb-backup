@@ -428,6 +428,10 @@ export async function listSpendEventsBounded(
         KeyConditionExpression: "billingUserId = :user AND occurredAt BETWEEN :start AND :end",
         ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
         ScanIndexForward: false,
+        // Never read past the budget: one event beyond it is enough to know the
+        // range is too large (CodeRabbit, PR #2925). Pagination still works —
+        // LastEvaluatedKey carries on from wherever Limit stopped.
+        Limit: maxEvents - items.length + 1,
         ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
       })
       .promise();
