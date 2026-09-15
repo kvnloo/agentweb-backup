@@ -348,10 +348,22 @@ export function mapIcpResultToMarketStrategy(
  * tidy. The eventual-consistency window we already navigated for the
  * cascade trigger doesn't apply here — we're writing to the base table
  * by email via updateUser, which is strongly consistent.
+ *
+ * `completedAt` is stamped onto `marketStrategy.updatedAt` in place of the
+ * wall-clock time of this write. This mirror runs a moment (write + re-read
+ * round-trip) AFTER `icpCompletedAt` is persisted, so timestamping it with
+ * `now()` made every onboarding generation — not just a real edit on the
+ * Market Strategy page — look like it happened *after* `icpCompletedAt`,
+ * which permanently flipped `GET /icp/filters` onto the lossy
+ * marketStrategy-derived persona path (ENG-1955). Backdating to the
+ * generation's own completion time keeps this system write indistinguishable
+ * in age from the icpResult it mirrors, so only a later, genuine
+ * `POST /market-strategy` edit reads as newer.
  */
 async function mirrorIcpsToMarketStrategy(
   userId: string,
   personas: ICPPersona[],
+  completedAt: string,
 ): Promise<void> {
   try {
     const fresh: any = await userDb.getUserById(userId);
@@ -374,7 +386,7 @@ async function mirrorIcpsToMarketStrategy(
       competitors: existing.competitors ?? [],
       icp: mapIcpResultToMarketStrategy(personas),
       createdAt: existing.createdAt ?? now,
-      updatedAt: now,
+      updatedAt: completedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
   } catch (err) {
@@ -714,7 +726,12 @@ export async function regenerateSingleIcpForUser(
       // leaves its spinner stuck. Status belongs to whoever owns it now.
       await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
     }
-    await mirrorIcpsToMarketStrategy(userId, currentList);
+    // Use whichever icpCompletedAt this write actually landed under — the
+    // patch's freshly-stamped one, or (when another regeneration already
+    // owned the `ready` transition) the one already on the record.
+    const mirroredCompletedAt =
+      patch?.icpCompletedAt ?? current.icpCompletedAt ?? new Date().toISOString();
+    await mirrorIcpsToMarketStrategy(userId, currentList, mirroredCompletedAt);
 
     await regenerateCompetitorEntry(userId, current, brand, fresh, spliceAt, deps);
   } catch (err) {
@@ -824,7 +841,7 @@ export async function triggerIcpDiscoveryForUser(
     // this, v2 onboarding writes to User.icpResult only and the user
     // finishes onboarding with an apparently-blank market strategy.
     // Best-effort — errors logged but do NOT block the cascade.
-    await mirrorIcpsToMarketStrategy(userId, personas);
+    await mirrorIcpsToMarketStrategy(userId, personas, patch.icpCompletedAt!);
 
     // Cascade kickoff: fire-and-forget the competitor step now that ICPs
     // are persisted and `icpStatus === 'ready'`. Without this, the user
