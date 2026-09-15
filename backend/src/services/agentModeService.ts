@@ -4752,7 +4752,13 @@ export class AgentModeService {
               role: 'assistant',
               content: deckPrompt,
               llm: llmModel,
-              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
+              // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
+              // ask_user_question, this halt is pushed as plain content) — this is the only
+              // correlator the frontend has to know THIS message should render the
+              // interactive ApprovalDeckCard instead of (or over) the plain-text prompt.
+              // Matched against session.pendingApprovalDeck.deckId, same "current slot"
+              // check the ask_user_question card already does for its own questionId.
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId }
             });
             if (onProgress) {
               runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
