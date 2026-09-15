@@ -2437,6 +2437,19 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
     } else if (!marketStrategyFromOwnerFallback) {
       const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
 
+      // mapMarketIcpToResult filters out non-object entries BEFORE mapping,
+      // so `icpIndex` (an index into that filtered+mapped array, same as
+      // the read path above) does NOT necessarily equal the matching
+      // entry's index in the raw `icp` array whenever a malformed entry
+      // (e.g. `null`) precedes it — POST /market-strategy stores `icp`
+      // verbatim with no shape validation. Match by object identity against
+      // the same filter instead of by raw index, so the write always lands
+      // on the entry the cache was actually computed for.
+      const rawIcpEntryFor = (freshIcp: any[]) => {
+        const filtered = freshIcp.filter((p: any) => p && typeof p === 'object');
+        return filtered[icpIndex];
+      };
+
       if (user.orgId) {
         const freshOrg: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
         const freshIcp: any[] = Array.isArray(freshOrg?.marketStrategy?.icp) ? freshOrg.marketStrategy.icp : [];
@@ -2445,8 +2458,9 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
           freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
 
         if (cacheStillApplies) {
-          const nextIcp = freshIcp.map((p: any, i: number) =>
-            i === icpIndex ? { ...p, extractedFilters } : p,
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
           );
           await orgDb.updateOrg(user.orgId, {
             marketStrategy: { ...freshOrg.marketStrategy, icp: nextIcp },
@@ -2460,8 +2474,9 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
           freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
 
         if (cacheStillApplies) {
-          const nextIcp = freshIcp.map((p: any, i: number) =>
-            i === icpIndex ? { ...p, extractedFilters } : p,
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
           );
           await userDb.updateUser(userId, {
             marketStrategy: { ...freshUser.marketStrategy, icp: nextIcp },

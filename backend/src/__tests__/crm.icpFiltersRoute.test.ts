@@ -762,6 +762,39 @@ describe('GET /api/crm/icp/filters', () => {
     expect(orgDb.updateOrg).not.toHaveBeenCalled();
   });
 
+  // mapMarketIcpToResult filters out non-object entries BEFORE mapping, so
+  // a malformed leading entry (POST /market-strategy stores `icp` verbatim
+  // with no shape validation) shifts every later index in the
+  // filtered+mapped array relative to the raw array. The cache write-back
+  // must still land on the entry the LLM result was actually computed for
+  // — not on whatever raw-array index happens to numerically match
+  // icpIndex, which here would be the malformed entry itself.
+  it('cache write-back targets the correct raw entry when a malformed entry precedes it in marketStrategy.icp', async () => {
+    const rawIcpWithJunkEntry = [null, marketIcp()[0], marketIcp()[1]];
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: rawIcpWithJunkEntry },
+    });
+
+    // icpIndex=0 refers to the FIRST valid (filtered+mapped) persona, i.e.
+    // marketIcp()[0] — which sits at raw index 1, not 0.
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.persona.name).toBe('ICP 1 — The Margin-Squeezed DTC Founder');
+
+    expect(orgDb.updateOrg).toHaveBeenCalledTimes(1);
+    const [, patch] = (orgDb.updateOrg as jest.Mock).mock.calls[0];
+    // The junk entry must survive untouched — not get corrupted into `{}`
+    // by a wrongly-targeted `{ ...p, extractedFilters }` spread over null.
+    expect(patch.marketStrategy.icp[0]).toBeNull();
+    // The cache must land on the REAL entry (raw index 1), not raw index 0.
+    expect(patch.marketStrategy.icp[1].extractedFilters.variants).toEqual(llmVariants());
+    expect(patch.marketStrategy.icp[2].extractedFilters).toBeUndefined();
+  });
+
   // Round-trip through the REAL mapMarketIcpToResult (not mocked in this
   // file) to prove the cache actually gets picked up on the next request,
   // not just written in the right shape.
