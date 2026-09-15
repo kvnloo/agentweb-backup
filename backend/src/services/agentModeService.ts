@@ -25,7 +25,7 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
-import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase, MetaWriteManifestOutcome } from './chatbotService';
+import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -131,7 +131,13 @@ import {
   type ApprovalDeckAnsweredBy,
   type InboundDeckAnswer,
 } from './agentMode/core/approvalDeck';
-import { type WorkflowStepDefinition, type WorkflowStepVerification, type WorkflowRunState } from './agentMode/core/workflow';
+import {
+  type WorkflowStepDefinition,
+  type WorkflowStepVerification,
+  type WorkflowRunState,
+  type WorkflowVerificationMismatch,
+  summarizeIndependentStepBatch,
+} from './agentMode/core/workflow';
 import { startWorkflow, advanceIndependentWorkflow } from './agentMode/workflowRunner';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
@@ -530,6 +536,19 @@ type MetaApiResult = {
   error?: string;
   details?: any;
   [key: string]: any;
+};
+
+// ENG-1635/1644: per-item detail behind an approval deck's fully_applied/
+// partially_applied/unapplied result — see summarizeApprovalDeckRun.
+type ApprovalDeckExecutionSummary = {
+  status: 'fully_applied' | 'partially_applied' | 'unapplied';
+  items: Array<{
+    stepId: string;
+    status: 'verified' | 'failed';
+    appliedObjectId?: string;
+    error?: string;
+    mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
+  }>;
 };
 
 import {
@@ -20291,6 +20310,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           itemId: `write-${i + 1}`,
           kind: 'meta_write',
           question: item.detail,
+          // Haven's CS-64 "REJECT — <correction>" convention (gap 1) applies to
+          // a Meta write item too — the correction is captured as data on the
+          // answer, never auto-applied; a rejected item simply never becomes a
+          // workflow step (see approvedWriteItems), the correction text itself
+          // is for whatever surfaces it back to Emma next turn.
+          allowFreeText: true,
           metaWriteManifestDigest: item.digest,
           metaWriteDispatch: item.dispatch,
         });
@@ -21016,11 +21041,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // read anywhere in this function anymore (only stripped before dispatch,
     // see above, so it never leaks to Meta as a literal field).
     let manifestGranted = false;
-    // ENG-1635: the digest THIS grant was claimed against, so the eventual
-    // outcome-recording call after dispatch (below) can record against the exact
-    // digest the user approved rather than re-resolving credentials a third time.
-    // Only meaningful when manifestGranted is true; unset on every other path.
-    let grantedManifestDigest: string | undefined;
     if (
       AgentModeService.isMetaWriteAction(entity_type, action) &&
       sessionId
@@ -21029,7 +21049,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
       manifestGranted = grant.granted;
-      if (grant.granted) grantedManifestDigest = grant.digest;
     }
 
     if (
@@ -21159,39 +21178,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, overrideApproved, sessionId,
     );
 
-    // ENG-1635: this write executed under a manifest grant (not a plain confirm=true
-    // replay) — record its outcome against the exact digest the user approved, then
-    // check whether every digest in ITS manifest now has an outcome. If so, this was
-    // the LAST outstanding write in the batch: attach the aggregated result to this
-    // response so the model reports ONE unified outcome instead of leaving N scattered
-    // pass/fail tool messages with no summary, which is what a manifest-granted batch
-    // produced before this. A recording/reconciliation failure must never mask the
-    // real dispatch result — log and continue rather than throwing over a write that
-    // itself succeeded or failed on its own terms.
-    if (manifestGranted && grantedManifestDigest && sessionId) {
-      try {
-        await chatbotDb.recordMetaWriteManifestOutcome(sessionId, grantedManifestDigest, {
-          status: dispatchResult?.success ? 'applied' : 'failed',
-          error: dispatchResult?.success ? undefined : ((dispatchResult as any)?.error || dispatchResult?.message),
-          message: typeof dispatchResult?.message === 'string' ? dispatchResult.message : undefined,
-          appliedObjectId: AgentModeService.extractDispatchedObjectId(dispatchResult),
-          readBackVerified: typeof (dispatchResult as any)?.readBackVerified === 'boolean'
-            ? (dispatchResult as any).readBackVerified
-            : undefined,
-          readBackMismatches: Array.isArray((dispatchResult as any)?.readBackMismatches)
-            ? (dispatchResult as any).readBackMismatches
-            : undefined,
-          appliedAt: new Date().toISOString(),
-        });
-        const manifestReconciliation = await this.reconcileMetaWriteManifestIfComplete(sessionId, grantedManifestDigest);
-        if (manifestReconciliation) {
-          return { ...dispatchResult, manifestReconciliation };
-        }
-      } catch (recordError) {
-        console.error('AgentMode: failed to record/reconcile manifest write outcome (write itself succeeded/failed independently):', recordError);
-      }
-    }
-
+    // ENG-1635/1644 Migration note: the old per-write outcome recording +
+    // reconciliation (recordMetaWriteManifestOutcome / reconcileMetaWriteManifestIfComplete)
+    // that used to run here is RETIRED, not kept running alongside its
+    // replacement — a manifest-granted write dispatched through THIS function
+    // (the model-driven path; the normal path is now submitApprovalDeckAnswers's
+    // step-per-write dispatch, which never re-enters this function at all) has
+    // its outcome recorded as a workflow checkpoint instead, and
+    // summarizeApprovalDeckRun reads run.checkpoints directly rather than a
+    // separate outcome map — one source of truth, not two that could drift.
     return dispatchResult;
   }
 
@@ -21455,7 +21450,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   ): Promise<
     | { outcome: 'invalid'; reason: string }
     | { outcome: 'conflict' }
-    | { outcome: 'submitted'; run: WorkflowRunState | null }
+    | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null }
   > {
     const session = await chatbotDb.getChatSession(sessionId);
     const deck = session?.pendingApprovalDeck;
@@ -21475,8 +21470,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     const approved = approvedWriteItems(answered);
     if (approved.length === 0) {
-      // Every item was rejected — nothing to execute, no workflow needed.
-      return { outcome: 'submitted', run: null };
+      // Every item was rejected — nothing to execute, no workflow needed. `summary:
+      // null` here is distinct from an 'unapplied' summary: nothing was ATTEMPTED
+      // at all, versus every item being attempted and every one failing.
+      return { outcome: 'submitted', run: null, summary: null };
     }
 
     const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
@@ -21495,56 +21492,38 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run') {
       return { outcome: 'conflict' };
     }
-    return { outcome: 'submitted', run: outcome.run };
+    return { outcome: 'submitted', run: outcome.run, summary: this.summarizeApprovalDeckRun(outcome.run) };
   }
 
   /**
-   * ENG-1635: once every digest belonging to `digest`'s own manifest has a recorded
-   * outcome (metaWriteManifestOutcomes), aggregate them into ONE result: fully_applied
-   * (every write succeeded), partially_applied (naming every exact failure), or
-   * unapplied (every write failed). Returns null while that manifest still has
-   * outstanding writes — the caller (right after recording each write's outcome) is
-   * naturally invoked exactly once more per write, so this fires exactly once, on
-   * whichever write happens to be the LAST to complete (order-independent — Meta calls
-   * can finish out of order). Scoped to the ONE manifest `digest` belongs to, never
-   * "any complete manifest on this session," so an unrelated later manifest's writes
-   * never trigger a stale/wrong reconciliation.
+   * ENG-1635/1644: turn a completed independent-step run's checkpoints into
+   * one fully_applied/partially_applied/unapplied result with per-item detail
+   * — the checkpoint-scanning replacement for the retired
+   * metaWriteManifestOutcomes map / reconcileMetaWriteManifestIfComplete
+   * (see the Migration note in the reviewed plan: these are REPLACED, not
+   * kept running alongside the new step-based tracking). The three-way
+   * status itself is domain-agnostic (summarizeIndependentStepBatch, pure,
+   * workflow.ts); this layer adds the Meta-specific per-item shape
+   * (appliedObjectId, error/mismatches) that a domain-agnostic engine file
+   * has no business knowing about. Returns null while the run has not
+   * reached 'completed' yet — same as the pure function underneath.
    */
-  private async reconcileMetaWriteManifestIfComplete(
-    sessionId: string,
-    digest: string,
-  ): Promise<{
-    manifestStatus: 'fully_applied' | 'partially_applied' | 'unapplied';
-    items: Array<{ digest: string } & MetaWriteManifestOutcome>;
-  } | null> {
-    const session = await chatbotDb.getChatSession(sessionId);
-    if (!session) return null;
-    const candidates: PendingUserQuestion[] = [];
-    if (session.pendingUserQuestion?.kind === 'meta_write_manifest') {
-      candidates.push(session.pendingUserQuestion);
-    }
-    if (session.answeredQuestions) {
-      for (const q of Object.values(session.answeredQuestions)) {
-        if (q.kind === 'meta_write_manifest') candidates.push(q);
-      }
-    }
-    const outcomes = session.metaWriteManifestOutcomes || {};
-    for (const q of candidates) {
-      const approveOption = q.options.find((o) => o.id === 'approve');
-      const manifestDigests: unknown = approveOption?.payload?.digests;
-      if (!Array.isArray(manifestDigests) || !manifestDigests.includes(digest)) continue;
-      const allRecorded = manifestDigests.every((d: string) => outcomes[d]);
-      if (!allRecorded) return null; // this write's manifest still has outstanding items
-      const items = manifestDigests.map((d: string) => ({ digest: d, ...(outcomes[d] as MetaWriteManifestOutcome) }));
-      const failedCount = items.filter((i) => i.status === 'failed').length;
-      const manifestStatus: 'fully_applied' | 'partially_applied' | 'unapplied' =
-        failedCount === 0 ? 'fully_applied' : failedCount === items.length ? 'unapplied' : 'partially_applied';
-      return { manifestStatus, items };
-    }
-    // digest didn't match any manifest candidate on this session — shouldn't happen
-    // if manifestGranted was true (that grant came from one of these same candidates
-    // moments earlier), but degrade to "nothing to reconcile" rather than throwing.
-    return null;
+  private summarizeApprovalDeckRun(run: WorkflowRunState): ApprovalDeckExecutionSummary | null {
+    const status = summarizeIndependentStepBatch(run);
+    if (!status) return null;
+    const items = run.checkpoints.map((c) => ({
+      stepId: c.stepId,
+      status: c.status,
+      ...(c.status === 'verified'
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        : {}),
+      ...(c.status === 'failed'
+        ? Array.isArray(c.discrepancy)
+          ? { mismatches: c.discrepancy as WorkflowVerificationMismatch[] }
+          : { error: (c.discrepancy as { error: string } | undefined)?.error }
+        : {}),
+    }));
+    return { status, items };
   }
 
   /**

@@ -470,6 +470,27 @@ export function recordIndependentStepOutcome(
   };
 }
 
+export type WorkflowBatchOutcome = 'fully_applied' | 'partially_applied' | 'unapplied';
+
+/**
+ * Three-way outcome for an independent-step batch (ENG-1635/1644) — scans a
+ * COMPLETED run's checkpoints (recordIndependentStepOutcome's own header:
+ * this driver's run only reaches 'completed' once every step has been
+ * attempted, success or failure — never 'failed') and classifies the whole
+ * batch. Returns null while the run has not reached that terminal state —
+ * there is nothing to summarize while steps remain unattempted. Deliberately
+ * domain-agnostic (no Meta-specific field names) — a consumer wanting
+ * per-item detail (e.g. which Meta object each step applied) reads
+ * run.checkpoints itself; this only answers the roll-up question.
+ */
+export function summarizeIndependentStepBatch(run: WorkflowRunState): WorkflowBatchOutcome | null {
+  if (run.status !== 'completed') return null;
+  const failedCount = run.checkpoints.filter((c) => c.status === 'failed').length;
+  if (failedCount === 0) return 'fully_applied';
+  if (failedCount === run.checkpoints.length) return 'unapplied';
+  return 'partially_applied';
+}
+
 /** Human/log-facing rendering of "failed-at-step-N". Uses the step's 1-based
  *  position in definition order plus its stable id, since the ticket's own
  *  phrase doesn't specify index vs id and no acceptance criterion checks this
