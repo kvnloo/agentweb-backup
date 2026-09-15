@@ -1732,7 +1732,8 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const leadIds = Array.isArray(req.body?.leadIds)
       ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
       : undefined;
-    const deps = buildV3OrchestratorDeps(userId);
+    // ENG-1388: user-initiated runs may use Enigma card revenue (flag/allowlist-gated).
+    const deps = buildV3OrchestratorDeps(userId, { enigma: true });
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
     console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
     const { buildListContext } = await import('../emma/enrichmentToolRunner');

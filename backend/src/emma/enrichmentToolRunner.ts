@@ -121,7 +121,8 @@ export async function runEmmaEnrichment(
     buildConfigProcessingDeps(),
   );
 
-  const deps = buildOrchestratorDeps(params.userId);
+  // ENG-1388: user-initiated via Emma, so Enigma card revenue may be used (flag/allowlist-gated).
+  const deps = buildOrchestratorDeps(params.userId, { enigma: true });
   const result = await runEnrichment(
     {
       listId: params.listId,

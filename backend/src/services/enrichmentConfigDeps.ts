@@ -34,13 +34,15 @@ async function llmInferAliases(
   if (fields.length === 0) return {};
   // Lazy import — avoids circular deps + keeps the LLM service out of the
   // hot path for callers that never hit alias inference.
-  const { FIELD_GROUPS } = await import('./enrichmentGroups');
+  const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
   const { createLLMService } = await import('../utils/llmService');
 
   // Build the canonical-field cheat sheet for the system prompt. Grouping
   // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
-  // → funding_stage instead of guessing across groups).
+  // → funding_stage instead of guessing across groups). Enigma card revenue
+  // (ENG-1388) is left out: it is paid per value and only routed by exact name.
   const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
+    .filter(([group]) => group !== CARD_REVENUE_GROUP)
     .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
     .join('\n');
 
@@ -90,14 +92,16 @@ async function llmClassifySmartFields(
   fields: Array<{ name: string; instruction: string }>,
 ): Promise<Record<string, SmartFieldClassification>> {
   if (fields.length === 0) return {};
-  const { FIELD_GROUPS } = await import('./enrichmentGroups');
+  const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
   const { createLLMService: mkLLM } = await import('../utils/llmService');
   const {
     buildSmartFieldClassificationSystemPrompt,
     buildSmartFieldClassificationUserPrompt,
   } = await import('./enrichmentPrompts');
 
+  // Enigma card revenue excluded for the same reason as in llmInferAliases.
   const canonicalFieldList = Object.entries(FIELD_GROUPS)
+    .filter(([group]) => group !== CARD_REVENUE_GROUP)
     .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
     .join('\n');
 
