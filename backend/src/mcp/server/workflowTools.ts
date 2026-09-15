@@ -249,7 +249,9 @@ mcpToolRegistry.register({
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
-      is_onboarded: me?.hasBrandGuidelines ?? null,
+      // ENG-328: design system is a second mandatory onboarding pillar
+      // alongside brand guidelines — both must be done to report onboarded.
+      is_onboarded: me?.hasBrandGuidelines == null ? null : (!!me.hasBrandGuidelines && !!me.hasDesignSystem),
       usage: me?.tokenUsage ?? null,
     });
   },

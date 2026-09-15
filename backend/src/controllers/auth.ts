@@ -375,7 +375,14 @@ export const login = async (req: Request, res: Response) => {
     );
 
     const { password: _, ...userWithoutPassword } = user;
-    res.json({ token, user: { ...userWithoutPassword, hasBrandGuidelines: !!(user.brandGuidelines?.brandData?.brandName) } });
+    res.json({
+      token,
+      user: {
+        ...userWithoutPassword,
+        hasBrandGuidelines: !!(user.brandGuidelines?.brandData?.brandName),
+        hasDesignSystem: user.designSystem?.status === 'ready',
+      },
+    });
   } catch (error) {
     console.error("Error in login:", error);
     res.status(500).json({ message: "Error logging in", code: "server_error" });
