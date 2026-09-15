@@ -381,17 +381,25 @@ export class HumanEvalService {
       ConditionExpression: 'attribute_not_exists(candidateId)',
     }).promise();
 
-    if (await this.isSlackPostingEnabledFor(input.userId)) {
+    const postingReason = await this.slackPostingReasonFor(input.userId);
+    if (postingReason) {
       try {
         const slackChannel = await this.getEvalChannel();
-        const message = this.buildSlackMessage({
-          ...preparedInput,
-          candidateId,
-          reviewer,
-          reviewerSlackUserId,
-          chatUrl,
-          normalizedCategory: category,
-        });
+        const message = postingReason === 'exception'
+          ? this.buildConciseExceptionMessage({
+              reviewer,
+              reviewerSlackUserId,
+              chatUrl,
+              artifactUrl: preparedInput.artifactUrl,
+            })
+          : this.buildSlackMessage({
+              ...preparedInput,
+              candidateId,
+              reviewer,
+              reviewerSlackUserId,
+              chatUrl,
+              normalizedCategory: category,
+            });
         const posted = await this.slack.postSlackMessage(slackChannel, message);
 
         candidate.slackChannel = posted.channel || slackChannel;
@@ -763,17 +771,52 @@ export class HumanEvalService {
    * given candidate additionally gets posted to Slack. DB-backed (not an env var) so it's
    * flippable without a redeploy, same reasoning as `getEvalChannel`'s own setting above.
    */
-  private async isSlackPostingEnabledFor(userId: string | undefined): Promise<boolean> {
-    if (userId) {
-      const exceptions = await this.settings.getSetting('human_eval_slack_posting_exception_user_ids');
-      const exceptionIds = (exceptions?.settingValue || '')
-        .split(',')
-        .map((id) => id.trim())
-        .filter(Boolean);
-      if (exceptionIds.includes(userId)) return true;
+  /**
+   * Returns why (if at all) this candidate should be posted — the caller uses this to pick
+   * the message format: a normal global-toggle post gets the full multi-field message, an
+   * exception-list post gets a deliberately concise one (ENG-1854 item 6 — "one concise
+   * reviewer assignment/link", not the same noisy format this ticket exists to quiet down).
+   */
+  private async slackPostingReasonFor(userId: string | undefined): Promise<'global' | 'exception' | false> {
+    // Deliberately fail-safe: `settingsService.getSetting` re-throws on a DynamoDB error, and
+    // this is called AFTER the candidate is already persisted (createCandidate's whole point
+    // is that persistence must never depend on anything Slack-related succeeding). A transient
+    // settings-lookup failure defaults to "don't post" rather than letting the exception
+    // propagate out of createCandidate — which would skip the caller's own post-persist steps
+    // (e.g. autoHumanEvalService's dedupe-key write) and risk a duplicate candidate on retry.
+    try {
+      if (userId) {
+        const exceptions = await this.settings.getSetting('human_eval_slack_posting_exception_user_ids');
+        const exceptionIds = (exceptions?.settingValue || '')
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean);
+        if (exceptionIds.includes(userId)) return 'exception';
+      }
+      const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
+      return globalToggle?.settingValue === 'true' ? 'global' : false;
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve Slack posting toggle, defaulting to not posting:', err?.message || err);
+      return false;
     }
-    const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
-    return globalToggle?.settingValue === 'true';
+  }
+
+  /** ENG-1854 item 6: one line, one mention, one link — not the full field dump. */
+  private buildConciseExceptionMessage(input: {
+    reviewer: HumanEvalReviewer;
+    reviewerSlackUserId?: string;
+    chatUrl?: string;
+    artifactUrl?: string;
+  }): string {
+    const reviewerMention = input.reviewerSlackUserId
+      ? `<@${input.reviewerSlackUserId}>`
+      : input.reviewer === 'fangfang'
+        ? 'Fangfang'
+        : 'Matt';
+    const link = input.chatUrl || input.artifactUrl;
+    return link
+      ? `${reviewerMention} — new review ready: <${link}>`
+      : `${reviewerMention} — new review ready.`;
   }
 
   private async getReviewerSlackUserId(reviewer: HumanEvalReviewer): Promise<string | undefined> {
