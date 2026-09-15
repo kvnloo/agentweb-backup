@@ -39,6 +39,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { userDb } from '../services/db';
 import { enrichWithRCA } from '../loops/instances/ai-eval-funnel/rcaEnricher';
 import { asMutationId } from '../loops/core/types';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 const mockResolveBilling = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockMeter = meterUserUsage as jest.MockedFunction<typeof meterUserUsage>;
@@ -119,6 +120,22 @@ describe('callLLM metering resolves the billing subject', () => {
     expect(mockMeter).not.toHaveBeenCalled();
     release(ORG_ROOT);
     await flush();
+    expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({ userId: member, billingUserId: ORG_ROOT }));
+  });
+
+  it('is tracked for graceful shutdown until the deferred write settles (CodeRabbit, PR #2926)', async () => {
+    const member = freshMember();
+    let release!: (v: string) => void;
+    mockResolveBilling.mockImplementationOnce(() => new Promise<string>((resolve) => { release = resolve; }));
+
+    await call({ userId: member, feature: 'session_title' });
+
+    // runDrain awaits cronJobRegistry.drain(), so an in-flight metering write
+    // holds shutdown open instead of being lost with the process.
+    expect(cronJobRegistry.snapshot().deferredLlmMetering).toBe(1);
+    release(ORG_ROOT);
+    await flush();
+    expect(cronJobRegistry.snapshot().deferredLlmMetering).toBeUndefined();
     expect(mockMeter).toHaveBeenCalledWith(expect.objectContaining({ userId: member, billingUserId: ORG_ROOT }));
   });
 
