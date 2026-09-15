@@ -860,8 +860,8 @@ describe('HumanEvalService', () => {
       const { service, slack, settingsService, settings, items } = makeHarness();
       // Target only the toggle lookup by name — an unscoped mockRejectedValueOnce would
       // instead hit getReviewerSlackUserId's own getSetting call, which runs earlier and
-      // ISN'T guarded, throwing before persistence and disproving the very thing this test
-      // exists to check.
+      // is now ALSO guarded (see the sibling test below) but would still make this
+      // specific test fail to isolate the toggle lookup it's meant to check.
       settingsService.getSetting.mockImplementation(async (name: string) => {
         if (name === 'human_eval_slack_posting_enabled') {
           throw new Error('DynamoDB GetItem transiently failed');
@@ -877,6 +877,29 @@ describe('HumanEvalService', () => {
 
       expect(slack.postSlackMessage).not.toHaveBeenCalled();
       expect(items.get(candidate.candidateId)?.outputSummary).toBe('Persists even if the toggle lookup itself fails.');
+    });
+
+    it('persists and still resolves a reviewer mention (plain-text fallback) when the reviewer-Slack-ID lookup itself throws — this runs BEFORE db.put, so an unguarded version would drop the candidate entirely', async () => {
+      const { service, slack, settingsService, settings, items } = makeHarness();
+      settingsService.getSetting.mockImplementation(async (name: string) => {
+        if (name === 'human_eval_reviewer_matt_slack_user_id') {
+          throw new Error('DynamoDB GetItem transiently failed');
+        }
+        const settingValue = settings.get(name);
+        return settingValue ? { settingValue } : null;
+      });
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Persists even if the reviewer-ID lookup itself fails.',
+      });
+
+      expect(candidate.reviewerSlackUserId).toBeUndefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Persists even if the reviewer-ID lookup itself fails.');
+      // Posting still goes ahead (the toggle is enabled by this harness's default) — the
+      // message just falls back to a plain-text mention instead of a real Slack @-mention.
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toContain('Reviewer: Matt');
     });
 
     it('does not post for a userId NOT on the exception list when the global toggle is off', async () => {
