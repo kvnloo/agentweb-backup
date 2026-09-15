@@ -754,6 +754,14 @@ export async function executePreparedTools(
         continue;
       }
 
+      const initialPolicyDecision = ports.evaluateAgentToolPolicy({
+        toolName: toolCall.function.name,
+        args: functionArgs,
+        isAdmin: hasAdminAccess,
+        isSharedSession: isInteractiveShare,
+        enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
+      });
+
       if (toolCall.function.name === 'install_skills') {
         skillsUpdated = true;
 
@@ -770,17 +778,34 @@ export async function executePreparedTools(
          * double-mutate anything Phase 2 re-running it a moment later can't already
          * tolerate. Best-effort: any real failure (unentitled/invalid skill) still
          * surfaces normally through the authoritative Phase 2 call below.
+         *
+         * Routed through the gateway (not called directly) with the same runId/
+         * budgetScopeId and this call's own policyDecision, so the repeated-failure/
+         * session-timeout breaker (findTrippedFailure/findTrippedSessionTimeout —
+         * unconditional regardless of AGENT_TOOL_GATEWAY_ENFORCE) short-circuits this
+         * eager call too. Without that, a retry loop calling install_skills with a bad
+         * skillId keeps paying the full entitlement-check cost (getSkillsForDisplay,
+         * classifySkillRejections, userDb.getUserById) every batch even after Phase 2's
+         * breaker would otherwise refuse to run it at all.
          */
         try {
-          const eagerResult = await ports.executePreparedAgentTool({
-            llmModel,
+          const eagerOutcome = await ports.executeAgentToolThroughGateway({
             toolName: 'install_skills',
-            functionArgs,
-            userId,
-            sessionId,
-            mockMode,
-            isDelegatedAccess,
+            args: functionArgs,
+            policyDecision: initialPolicyDecision,
+            runId: agentRuntimeRunId,
+            budgetScopeId: sessionId,
+            execute: () => ports.executePreparedAgentTool({
+              llmModel,
+              toolName: 'install_skills',
+              functionArgs,
+              userId,
+              sessionId,
+              mockMode,
+              isDelegatedAccess,
+            }),
           });
+          const eagerResult = eagerOutcome.status === 'success' ? eagerOutcome.result : undefined;
           if (Array.isArray(eagerResult?.installedToolNames)) {
             eagerResult.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
           }
@@ -789,14 +814,6 @@ export async function executePreparedTools(
           // execution and reports any real error.
         }
       }
-
-      const initialPolicyDecision = ports.evaluateAgentToolPolicy({
-        toolName: toolCall.function.name,
-        args: functionArgs,
-        isAdmin: hasAdminAccess,
-        isSharedSession: isInteractiveShare,
-        enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
-      });
 
       const inputSchema = ports.getToolInputSchema(toolCall.function.name);
       const contractResult = ports.validateAndRepairToolArgs({
