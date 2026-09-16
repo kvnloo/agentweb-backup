@@ -18,7 +18,10 @@ const shouldBootstrapBackgroundJobs = jest.fn();
 jest.mock('../utils/instanceState', () => ({ shouldBootstrapBackgroundJobs }));
 
 const initialize = jest.fn().mockResolvedValue(undefined);
-jest.mock('../services/agentModeService', () => ({ agentModeService: { initialize } }));
+// isInitialized must be present: the worker latches on it, so a mock without it reads
+// undefined, the worker treats init as degraded, and every test here silently exercises
+// the retry branch instead of the healthy one.
+jest.mock('../services/agentModeService', () => ({ agentModeService: { initialize, isInitialized: true } }));
 jest.mock('../workers/workerShutdownGuards', () => ({ installWorkerShutdownGuards: jest.fn() }));
 
 /** Flushes the microtask queue so the module's own async ensureInitialized() chain settles. */
