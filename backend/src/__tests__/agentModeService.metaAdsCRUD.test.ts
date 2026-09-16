@@ -1,3 +1,4 @@
+jest.mock('../services/agentMode/adsLearning', () => ({ recordCreativeLearningReceipt: jest.fn().mockResolvedValue(undefined) }));
 // Mock MCP client service first
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({

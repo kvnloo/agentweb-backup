@@ -460,7 +460,7 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   });
 });
 
-describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settling window, per-account + per-day failure isolation)', () => {
+describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 30-day refresh window, per-account + per-day failure isolation)', () => {
   const cronModule = jest.requireActual('../cron/metaMetricsSnapshotCron');
 
   /** A single user with a single connected Meta account — the degenerate, pre-widening case. */
@@ -490,11 +490,9 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
     mockAdsDb.putSnapshot.mockResolvedValue(undefined as any);
   });
 
-  // The 28 below is PINNED ON PURPOSE rather than imported from the module. Asserting against
-  // the constant itself would pass for any value, which is exactly how this drifted to 3 in the
-  // first place — the number is sized against Meta's documented 28-day insights-mutability window,
-  // so changing it must be a deliberate edit here too.
-  it('processes 28 distinct dates (today-1 through today-28), not just yesterday', async () => {
+  // Pinned independently: the 28-day settlement interval starts after the
+  // reporting day ends; two extra dates cover UTC-12 and daily ingestion.
+  it('processes 30 distinct dates so the final refresh follows reporting-day settlement, not just yesterday', async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
       json: async () => makeCampaignInsightsResponse([
@@ -505,7 +503,7 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
     await runMetaMetricsSnapshot();
 
     const datesWritten = mockAdsDb.putSnapshot.mock.calls.map((c: any) => c[0].date);
-    expect(new Set(datesWritten).size).toBe(28);
+    expect(new Set(datesWritten).size).toBe(30);
   });
 
   it('logs and continues when one day in the window fails, instead of aborting the whole run', async () => {
@@ -526,8 +524,8 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
 
     await runMetaMetricsSnapshot();
 
-    // 27 of the 28 days should still have succeeded and written a campaign row.
-    expect(campaignRows()).toHaveLength(27);
+    // 29 of the 30 days should still have succeeded and written a campaign row.
+    expect(campaignRows()).toHaveLength(29);
     // The failure must be visible, not swallowed silently.
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
@@ -569,7 +567,7 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
     // ...while every day in the window still got written.
     const datesWritten = mockAdsDb.putSnapshot.mock.calls.map((c: any) => c[0].date);
-    expect(new Set(datesWritten).size).toBe(28);
+    expect(new Set(datesWritten).size).toBe(30);
   });
 
   it('attempts NO days and logs once when credentials cannot be resolved', async () => {
@@ -606,7 +604,7 @@ describe('ENG-916/ENG-1552 runMetaMetricsSnapshot (account-scoped, 28-day settli
     expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(1);
     expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(1);
     // ...and every day in the window still got written.
-    expect(new Set(mockAdsDb.putSnapshot.mock.calls.map((c: any) => c[0].date)).size).toBe(28);
+    expect(new Set(mockAdsDb.putSnapshot.mock.calls.map((c: any) => c[0].date)).size).toBe(30);
   });
 
   it('bounds every Graph read with an abort signal', async () => {

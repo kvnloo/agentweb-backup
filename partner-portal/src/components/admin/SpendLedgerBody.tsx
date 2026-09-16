@@ -143,7 +143,44 @@ export interface SpendLedgerPayload {
   pause: PauseExplanation;
   /** Absent from a backend that predates ENG-1934 — read as vendor-only. */
   llmLedger?: LlmLedgerCoverage;
+  /** Absent from a backend that predates ENG-1886. */
+  enforcement?: EnforcementState;
+  /**
+   * ENG-1841: detail rows the server left out of each bounded cut. Totals are
+   * always over the whole month; this only says how many rows are not listed.
+   * Absent from a backend that predates the bound.
+   */
+  omitted?: Partial<Record<"byProvider" | "byFeature" | "byMember" | "bySession" | "inFlight", OmittedRows>>;
 }
+
+/** Mirrors backend spendReadModel.OmittedRows. */
+export interface OmittedRows {
+  rows: number;
+  eventCount: number;
+  settledMicroUsd: number;
+  reservedMicroUsd: number;
+}
+
+/**
+ * The enforcer's own admission decision (ENG-1886). Mirrors
+ * backend enforcementStateView.EnforcementState — a re-labelling of what
+ * checkTokenUsage returned, never a recomputation.
+ */
+export type EnforcementState =
+  | {
+      available: true;
+      month: string;
+      paused: boolean;
+      usageMode: string | null;
+      gatedBy: "cost" | "tokens" | "none";
+      used: number;
+      limit: number | null;
+      percentUsed: number;
+      resetsOn: string;
+      usagePolicyVersion: string | null;
+    }
+  | { available: false; reason: "not-current-month"; currentMonth: string }
+  | { available: false; reason: "unreadable"; message: string };
 
 // ── Pure helpers, exported for unit tests ────────────────────────────────────
 
@@ -214,6 +251,29 @@ export function partialCoverageCaption(coverage: LlmLedgerCoverage): string {
   return `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
 }
 
+type LiveEnforcement = Extract<EnforcementState, { available: true }>;
+type PastMonthEnforcement = Extract<EnforcementState, { reason: "not-current-month" }>;
+
+/** Type guards: this project's compiler settings do not narrow the union on `available`. */
+export function isLiveEnforcement(state: EnforcementState): state is LiveEnforcement {
+  return state.available === true;
+}
+function isPastMonthEnforcement(state: EnforcementState): state is PastMonthEnforcement {
+  return state.available === false && (state as PastMonthEnforcement).reason === "not-current-month";
+}
+
+/**
+ * The enforcer's counter in its own unit: dollars when the cost cap gates,
+ * token counts otherwise.
+ */
+export function enforcementCounter(state: LiveEnforcement): string {
+  if (state.gatedBy === "none") return "no cap configured";
+  const fmt = (n: number) =>
+    state.gatedBy === "cost" ? `$${n.toFixed(2)}` : `${Math.round(n).toLocaleString()} tokens`;
+  const limit = state.limit == null ? "no limit" : fmt(state.limit);
+  return `${fmt(state.used)} of ${limit} (${state.percentUsed.toFixed(1)}%)`;
+}
+
 /** `2026-09-14` → `Sep 14`. */
 export function shortDay(day: string): string {
   const d = new Date(`${day}T00:00:00.000Z`);
@@ -250,11 +310,14 @@ const SLICE_TITLES: Record<string, { title: string; caption: string }> = {
  */
 export const MAX_ROWS_PER_CUT = 25;
 
-const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) => {
+const SliceTable: React.FC<{ id: string; rows: SpendSlice[]; omitted?: OmittedRows }> = ({ id, rows, omitted }) => {
   const meta = SLICE_TITLES[id];
   const max = Math.max(...rows.map((r) => r.settledMicroUsd + r.reservedMicroUsd), 0);
   const shown = rows.slice(0, MAX_ROWS_PER_CUT);
-  const hidden = rows.length - shown.length;
+  // Rows the server already left out (ENG-1841) are just as unlisted as rows
+  // cut here, so both count toward "of N" and "more not shown".
+  const totalRows = rows.length + (omitted?.rows ?? 0);
+  const hidden = totalRows - shown.length;
 
   return (
     <Box sx={{ mb: 2 }} data-testid={`spend-slice-${id}`}>
@@ -311,7 +374,7 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
       )}
       {hidden > 0 && (
         <Typography variant="caption" color="text.secondary" data-testid={`spend-slice-${id}-more`}>
-          Showing the {MAX_ROWS_PER_CUT} largest of {rows.length.toLocaleString()} — {hidden.toLocaleString()} more
+          Showing the {shown.length.toLocaleString()} largest of {totalRows.toLocaleString()} — {hidden.toLocaleString()} more
           not shown, but included in every total above.
         </Typography>
       )}
@@ -356,15 +419,57 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
         </Alert>
       )}
 
-      {/* The pause explanation stays WITHHELD (ENG-1874), even now that LLM
-          spend reaches the ledger (ENG-1934).
+      {/* Whether the account is ACTUALLY paused — ENG-1886.
 
-          `explainPause` judges a pause from this ledger's total, which now
-          counts LLM AND vendor spend. The live gate that actually pauses an
-          account still counts LLM spend only (AW-Users.tokenUsage). The two
-          bases differ in the other direction now, so a pause claim built here
-          could name a pause that never happened. Showing whether an account is
-          really paused is ENG-1886. */}
+          This is the enforcer's own decision (checkTokenUsage), re-labelled, not
+          a recomputation. The ledger's `pause` (explainPause) stays withheld: it
+          judges a pause from this ledger's total, which counts LLM and vendor
+          spend, while the live gate counts LLM spend only — a pause claim built
+          there could name a pause that never happened (ENG-1874).
+
+          The card says which counter it read, because that counter
+          (AW-Users.tokenUsage) can differ from the ledger total below
+          (ENG-1247). It reports what the enforcer decided — the customer's
+          actual experience — not what the account spent. */}
+      {data.enforcement && (
+        <Alert
+          severity={isLiveEnforcement(data.enforcement) ? (data.enforcement.paused ? "error" : "success") : "info"}
+          sx={{ mb: 2 }}
+          data-testid="spend-ledger-enforcement"
+        >
+          {isLiveEnforcement(data.enforcement) ? (
+            <>
+              <Typography variant="body2" fontWeight={600}>
+                {/* A pause always wins the heading; an uncapped account must not
+                    read as "the usage cap is admitting work" beside "no cap
+                    configured" (CodeRabbit, PR #2922). */}
+                {data.enforcement.paused
+                  ? "Paused now by the usage cap"
+                  : data.enforcement.gatedBy === "none"
+                  ? "Not paused: no usage cap is configured"
+                  : "Not paused: the usage cap is admitting work"}
+                {data.enforcement.usageMode ? ` (mode: ${data.enforcement.usageMode})` : ""}
+              </Typography>
+              <Typography variant="body2">
+                Enforcer's counter
+                {data.enforcement.gatedBy === "cost" ? " (LLM cost)" : data.enforcement.gatedBy === "tokens" ? " (token count)" : ""}:{" "}
+                {enforcementCounter(data.enforcement)} · resets {shortDay(data.enforcement.resetsOn)}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" component="div">
+                This is the counter that decides admission (AW-Users), not the ledger total below. The two can
+                differ.
+              </Typography>
+            </>
+          ) : isPastMonthEnforcement(data.enforcement) ? (
+            <Typography variant="body2">
+              Pause state is only known for the current month ({data.enforcement.currentMonth}); the enforcer's
+              counter resets monthly.
+            </Typography>
+          ) : (
+            <Typography variant="body2">Could not read whether this account is paused right now.</Typography>
+          )}
+        </Alert>
+      )}
 
       {/* Raw spend, what is committed but unresolved, and what the account may
           actually spend — three figures, never netted into one (ENG-1250 §3). */}
@@ -584,21 +689,21 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                   ))}
                 </TableBody>
               </Table>
-              {data.inFlight.length > MAX_ROWS_PER_CUT && (
+              {data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) > MAX_ROWS_PER_CUT && (
                 <Typography variant="caption" color="text.secondary" data-testid="spend-ledger-inflight-more">
-                  Showing the {MAX_ROWS_PER_CUT} most recent of{" "}
-                  {data.inFlight.length.toLocaleString()} open reservations —{" "}
-                  {(data.inFlight.length - MAX_ROWS_PER_CUT).toLocaleString()} more not shown, but the
+                  Showing the {Math.min(MAX_ROWS_PER_CUT, data.inFlight.length).toLocaleString()} most recent of{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0)).toLocaleString()} open reservations —{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) - Math.min(MAX_ROWS_PER_CUT, data.inFlight.length)).toLocaleString()} more not shown, but the
                   in-flight total above counts all of them.
                 </Typography>
               )}
             </Box>
           )}
 
-          <SliceTable id="byProvider" rows={data.byProvider} />
-          <SliceTable id="byFeature" rows={data.byFeature} />
-          <SliceTable id="byMember" rows={data.byMember} />
-          <SliceTable id="bySession" rows={data.bySession} />
+          <SliceTable id="byProvider" rows={data.byProvider} omitted={data.omitted?.byProvider} />
+          <SliceTable id="byFeature" rows={data.byFeature} omitted={data.omitted?.byFeature} />
+          <SliceTable id="byMember" rows={data.byMember} omitted={data.omitted?.byMember} />
+          <SliceTable id="bySession" rows={data.bySession} omitted={data.omitted?.bySession} />
 
           {data.daily.length > 0 && (
             <Box data-testid="spend-ledger-daily">

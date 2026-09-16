@@ -10121,6 +10121,39 @@ export const browserCookieDb = {
   },
 };
 
+/** Keep structured ads lessons out of generic relevance injection, without consuming its
+ * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed. */
+async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.QueryInput): Promise<any[]> {
+  const rows: any[] = [];
+  let query = { ...params };
+  let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+  for (let page = 0; page < 10; page++) {
+    const result = await dynamodb.query({ ...query, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      ...(params.Limit ? { Limit: params.Limit - rows.length } : {}) }).promise();
+    if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed account memory page');
+    for (const item of result.Items ?? []) {
+      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
+        throw new Error('Malformed account memory item');
+      }
+      if (!item.memoryId.startsWith('ads-learning#')) rows.push(item);
+    }
+    cursor = result.LastEvaluatedKey;
+    if (!params.IndexName && typeof cursor?.memoryId === 'string' && cursor.memoryId.startsWith('ads-learning#')) {
+      // Learning IDs form one contiguous range. Jump over it rather than consuming an
+      // arbitrary number of pages (or starving ordinary ULID memories in descending reads).
+      const descending = params.ScanIndexForward === false;
+      query = { ...params, KeyConditionExpression: `${params.KeyConditionExpression} AND memoryId ${descending ? '<' : '>'} :learningBoundary`,
+        ExpressionAttributeValues: { ...params.ExpressionAttributeValues,
+          ':learningBoundary': descending ? 'ads-learning#' : 'ads-learning#\uffff' } };
+      cursor = undefined;
+      if (params.Limit && rows.length >= params.Limit) return rows.slice(0, params.Limit);
+      continue;
+    }
+    if (!cursor || (params.Limit ? rows.length >= params.Limit : rows.length > 0)) return params.Limit ? rows.slice(0, params.Limit) : rows;
+  }
+  throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
+}
+
 export const accountMemoryDb = {
   async addMemory(
     userId: string,
@@ -10192,8 +10225,7 @@ export const accountMemoryDb = {
           ...(limit ? { Limit: limit } : {}),
         };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await queryOrdinaryAccountMemories(params);
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
       throw error;
@@ -10210,8 +10242,7 @@ export const accountMemoryDb = {
         Limit: limit,
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await queryOrdinaryAccountMemories(params);
     } catch (error) {
       handleDynamoDbError(error, 'getRecentMemories');
       throw error;
@@ -10239,6 +10270,7 @@ export const accountMemoryDb = {
     memoryId: string,
     updates: { content?: string; category?: string }
   ) {
+    if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     if (updates.category && !VALID_MEMORY_CATEGORIES.includes(updates.category as MemoryCategory)) {
       throw new Error(`Invalid category: ${updates.category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
     }
@@ -10281,6 +10313,7 @@ export const accountMemoryDb = {
   },
 
   async deleteMemory(userId: string, memoryId: string) {
+    if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     try {
       await dynamodb.delete({
         TableName: ACCOUNT_MEMORY_TABLE,

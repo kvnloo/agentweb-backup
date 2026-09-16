@@ -1,4 +1,5 @@
 import { agentModeService } from './agentModeService';
+import type { LLMUsageContext } from '../utils/llmService';
 
 export type ReportType = 'creative' | 'research' | 'performance';
 
@@ -15,7 +16,7 @@ Categories:
 
 Reply with ONLY one word: creative, performance, or research.`;
 
-export async function classifyReport(filename: string, contentExcerpt: string): Promise<ReportType> {
+export async function classifyReport(filename: string, contentExcerpt: string, usageContext?: LLMUsageContext): Promise<ReportType> {
   const truncated = contentExcerpt.slice(0, MAX_CONTENT_CHARS);
   const userMessage = `Filename: ${filename}\nContent: ${truncated}`;
 
@@ -26,7 +27,13 @@ export async function classifyReport(filename: string, contentExcerpt: string): 
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userMessage },
       ],
-      { temperature: 0, max_completion_tokens: 5, taskClass: 'nonstandard_consumer' }
+      {
+        temperature: 0,
+        max_completion_tokens: 5,
+        taskClass: 'nonstandard_consumer',
+        // ENG-1858: labelling the user's own reports — attribute it to them.
+        usageContext: usageContext ?? { feature: 'report_classification' },
+      }
     );
 
     const timeoutPromise = new Promise<never>((_, reject) =>

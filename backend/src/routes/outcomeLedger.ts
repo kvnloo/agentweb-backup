@@ -18,6 +18,7 @@
 
 import express from 'express';
 import { randomUUID } from 'crypto';
+import { LearningReviewConflict } from '../services/adsScopedLearning';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { cleanAccountId, getConnectedMetaAccountsList } from '../services/metaAccountCredentials';
@@ -68,12 +69,94 @@ router.get('/:platform/:accountId', authenticateToken, async (req: any, res) => 
     const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
     if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
 
-    const recommendations = await getRecommendationsForAccount(owned.platform, owned.accountId);
+    const recommendations = (await getRecommendationsForAccount(owned.platform, owned.accountId))
+      // Shared platform accounts do not grant access to another client's captured rationale.
+      // Existing connected-account ownership proves access to the account, not to a legacy
+      // row. createdBy is an admin/execution actor, not its client. Ambiguous rows fail closed.
+      .filter(r => r.context?.clientUserId === req.user.userId);
     res.json({ platform: owned.platform, accountId: owned.accountId, recommendations });
   } catch (error: any) {
     console.error('[ENG-1550] read outcome ledger failed:', error);
     res.status(500).json({ error: 'Failed to read outcome ledger' });
   }
+});
+
+/** Keep diagnostic scope without logging tokens, exception messages or recommendation content. */
+function logLearningFailure(req: any, action: string, error: unknown): void {
+  const field = (value: unknown) => typeof value === 'string' ? value.slice(0, 128).replace(/[^a-zA-Z0-9_.:#-]/g, '_') : undefined;
+  console.error('[AdsLearning] request failed', {
+    userId: field(req.user?.userId), accountId: field(req.params.accountId), action: field(action),
+    targetId: field(req.params.memoryId ?? req.params.recommendationId),
+    error: field(error instanceof Error ? error.name : 'unknown'),
+  });
+}
+
+/** Only known domain/conditional refusals are conflicts; outages must remain server failures. */
+function learningFailureStatus(error: unknown): 409 | 500 | 503 {
+  if (error instanceof LearningReviewConflict) return 409;
+  if (!error || typeof error !== 'object') return 500;
+  const e = error as { code?: unknown; retryable?: unknown; statusCode?: unknown; CancellationReasons?: unknown };
+  if (e.code === 'ConditionalCheckFailedException') return 409;
+  if (e.code === 'TransactionCanceledException' && Array.isArray(e.CancellationReasons) &&
+    e.CancellationReasons.some(r => r?.Code === 'ConditionalCheckFailed') &&
+    e.CancellationReasons.every(r => r?.Code === 'None' || r?.Code === 'ConditionalCheckFailed')) return 409;
+  if (e.retryable === true || (typeof e.statusCode === 'number' && e.statusCode >= 500) ||
+    ['TimeoutError', 'NetworkingError', 'RequestAbortedError', 'ProvisionedThroughputExceededException',
+      'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable', 'TransactionCanceledException'].includes(String(e.code))) return 503;
+  return 500;
+}
+
+/** Recommendation IDs are opaque legacy/UUID/hash strings; DynamoDB sort keys allow 1–1024 UTF-8 bytes. */
+function validRecommendationId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= 1024;
+}
+
+/** Bounded scoped guidance; account ownership and client identity are server-derived. */
+router.get('/:platform/:accountId/learning', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (req.query.campaignId !== undefined && (typeof req.query.campaignId !== 'string' || !req.query.campaignId.trim() || req.query.campaignId.length > 2000)) {
+      return res.status(400).json({ error: 'Invalid campaign scope' });
+    }
+    const { getScopedLearning } = await import('../services/adsLearningDb');
+    const lessons = await getScopedLearning({ userId: req.user.userId, accountId: owned.accountId, platform: owned.platform,
+      campaignId: typeof req.query.campaignId === 'string' ? req.query.campaignId : undefined, now: new Date().toISOString() });
+    res.json({ mode: 'shadow', lessons });
+  } catch (error) { logLearningFailure(req, 'read', error); res.status(503).json({ error: 'Learning unavailable' }); }
+});
+
+/** Explicit review/rollback only; the scheduler has no authority to call this. */
+router.post('/:platform/:accountId/learning/:memoryId/:action', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (!['approve', 'revert'].includes(req.params.action)) return res.status(400).json({ error: 'Invalid review action' });
+    if (!/^ads-learning#[a-f0-9]{64}$/.test(req.params.memoryId)) return res.status(400).json({ error: 'Learning review could not be applied' });
+    const targetScope = req.body?.scope ?? 'campaign';
+    if (!['client', 'campaign', 'channel'].includes(targetScope)) return res.status(400).json({ error: 'Invalid learning scope' });
+    const { reviewLearning } = await import('../services/adsLearningReview');
+    const result = await reviewLearning({ userId: req.user.userId, accountId: owned.accountId, platform: owned.platform,
+      campaignId: typeof req.body?.campaignId === 'string' ? req.body.campaignId : undefined, now: new Date().toISOString() },
+      req.params.memoryId, req.params.action, targetScope);
+    return res.status(result.applied ? 200 : 409).json(result);
+  } catch (error) { logLearningFailure(req, req.params.action, error); res.status(learningFailureStatus(error)).json({ error: 'Learning review could not be applied' }); }
+});
+
+router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (!validRecommendationId(req.params.recommendationId)) return res.status(400).json({ error: 'Recommendation could not be declined' });
+    const r = await getRecommendation(owned.platform, owned.accountId, req.params.recommendationId);
+    if (!r?.context || r.context.clientUserId !== req.user.userId) return res.status(404).json({ error: 'Recommendation not found' });
+    if (r.status !== 'pending' || r.context.execution) return res.status(409).json({ error: 'Recommendation already resolved' });
+    const { attachExecutionReceipt } = await import('../services/adsLearningDb');
+    await attachExecutionReceipt(r, { reference: `decline:${req.user.userId}:${r.recommendationId}`, clientUserId: req.user.userId,
+      platform: owned.platform, accountId: owned.accountId, campaignId: r.context.campaignId, recommendationId: r.recommendationId,
+      status: 'declined', adopted: false, executedAt: new Date().toISOString() }, 1500);
+    res.json({ adopted: false });
+  } catch (error) { logLearningFailure(req, 'decline', error); res.status(learningFailureStatus(error)).json({ error: 'Recommendation could not be declined' }); }
 });
 
 /**
@@ -127,10 +210,17 @@ router.post('/:platform/:accountId/:recommendationId/score', authenticateToken, 
       return res.status(400).json({ error: `platform '${req.params.platform}' is not supported` });
     }
     const accountId = cleanAccountId(req.params.accountId);
+    if (!validRecommendationId(req.params.recommendationId)) return res.status(400).json({ error: 'Failed to score recommendation' });
     const existing = await getRecommendation(req.params.platform, accountId, req.params.recommendationId);
     if (!existing) return res.status(404).json({ error: 'Recommendation not found' });
     if (existing.status !== 'pending') {
       return res.status(409).json({ error: 'Recommendation has already been scored', reason: 'already_scored' });
+    }
+    // The manual scorer has no attribution/evidence contract and cannot establish ad-level
+    // outcomes from ENG-916's campaign metrics. Keep shadow captures pending until a supported
+    // evaluator exists; do not let a manual numeric pair fabricate a causal verdict.
+    if (existing.context) {
+      return res.status(409).json({ error: 'Shadow recommendation requires attributed evaluation', reason: 'attributed_evaluation_required' });
     }
 
     const { adopted, actualValue, baselineValue } = req.body ?? {};

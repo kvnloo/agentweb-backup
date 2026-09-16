@@ -7,6 +7,10 @@ function makeHarness() {
   settings.set('human_eval_slack_channel', 'C_EVAL');
   settings.set('human_eval_reviewer_matt_slack_user_id', 'U_MATT');
   settings.set('human_eval_reviewer_fangfang_slack_user_id', 'U_FANGFANG');
+  // ENG-1854: posting is ON by default now (redundant with this explicit 'true' — kept so the
+  // harness's intent reads clearly even after the default flip). Individual tests for the
+  // kill-switch/exception-list behavior override this explicitly.
+  settings.set('human_eval_slack_posting_enabled', 'true');
 
   const db = {
     put: jest.fn((params: any) => ({
@@ -24,10 +28,16 @@ function makeHarness() {
       promise: async () => {
         const item = items.get(params.Key.candidateId);
         if (!item) return;
-        const feedback = params.ExpressionAttributeValues[':feedback'];
-        item.feedback = [...(item.feedback || []), ...feedback];
-        item.status = params.ExpressionAttributeValues[':status'];
-        item.updatedAt = params.ExpressionAttributeValues[':updatedAt'];
+        const values = params.ExpressionAttributeValues || {};
+        // ENG-1854: this mock now backs two distinct update shapes — appendFeedback's
+        // feedback-append, and createCandidate's post-hoc slackChannel/slackMessageTs set.
+        if (':feedback' in values) {
+          item.feedback = [...(item.feedback || []), ...values[':feedback']];
+          item.status = values[':status'];
+          item.updatedAt = values[':updatedAt'];
+        }
+        if (':c' in values) item.slackChannel = values[':c'];
+        if (':t' in values) item.slackMessageTs = values[':t'];
         items.set(item.candidateId, item);
       },
     })),
@@ -425,8 +435,8 @@ describe('HumanEvalService', () => {
     });
 
     const handled = await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000001.000001',
       slackUserId: 'U_MATT',
       text: 'Hero is clear, but mobile hierarchy fails and CTA is too low.',
@@ -478,8 +488,8 @@ describe('HumanEvalService', () => {
     slack.postSlackMessage.mockClear();
 
     const handled = await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000002.000001',
       slackUserId: 'U_HARSHA',
       text: 'Looks good, but make it a modal on login instead.',
@@ -529,8 +539,8 @@ describe('HumanEvalService', () => {
     slack.postSlackMessage.mockClear();
 
     await service.handleSlackThreadReply({
-      channel: candidate.slackChannel,
-      threadTs: candidate.slackMessageTs,
+      channel: candidate.slackChannel!,
+      threadTs: candidate.slackMessageTs!,
       messageTs: '1780000003.000001',
       slackUserId: 'U_FANGFANG',
       text: 'Too dark, brighten the background.',
@@ -772,5 +782,176 @@ describe('HumanEvalService', () => {
 
     expect(handled).toBe(false);
     expect(chatbot.addMessageToSession).not.toHaveBeenCalled();
+  });
+
+  describe('Slack posting toggle (ENG-1854)', () => {
+    it('posts by default when the toggle setting is absent entirely — ENG-1854 defaults to ON once the real noise sources (lead-enrichment volume, cross-path duplicates) were fixed independently of this toggle', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.delete('human_eval_slack_posting_enabled');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated, no toggle setting configured at all.',
+        userId: 'user-no-exception',
+      });
+
+      expect(slack.postSlackMessage).toHaveBeenCalled();
+      expect(candidate.slackChannel).toBe('C_EVAL');
+    });
+
+    it('persists the candidate even when Slack posting is explicitly disabled — never a silent drop', async () => {
+      const { service, slack, items, settings } = makeHarness();
+      settings.set('human_eval_slack_posting_enabled', 'false');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated.',
+        userId: 'user-no-exception',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+      expect(candidate.slackMessageTs).toBeUndefined();
+      expect(items.get(candidate.candidateId)).toBeDefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated.');
+    });
+
+    it('persists the candidate even when the Slack post itself throws', async () => {
+      const { service, slack, items } = makeHarness();
+      slack.postSlackMessage.mockRejectedValueOnce(new Error('Slack channel is not configured'));
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Image generated despite a Slack failure.',
+      });
+
+      expect(candidate.slackChannel).toBeUndefined();
+      expect(candidate.slackMessageTs).toBeUndefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Image generated despite a Slack failure.');
+    });
+
+    // Round-3 review finding: an earlier version checked the exception list BEFORE the
+    // explicit-'false' kill switch, so an exception-listed user kept posting even when someone
+    // deliberately turned everything off — "a single explicit false is the full rollback lever"
+    // wasn't actually true once the exception list had any entries. Fixed: the kill switch is
+    // now checked first and unconditionally.
+    it('an explicit global "false" overrides the exception list — a real kill switch, not one exception-listed accounts silently ignore', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.set('human_eval_slack_posting_enabled', 'false');
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Haven creative for review.',
+        userId: 'user-haven',
+        artifactUrl: 'https://example.com/haven-creative.png',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+    });
+
+    it('an exception-listed userId gets the concise message format when the toggle is not explicitly off', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Haven creative for review.',
+        userId: 'user-haven',
+        artifactUrl: 'https://example.com/haven-creative.png',
+      });
+
+      expect(slack.postSlackMessage).toHaveBeenCalledWith('C_EVAL', expect.any(String));
+      expect(candidate.slackChannel).toBe('C_EVAL');
+      expect(candidate.slackMessageTs).toBe('1780000000.123456');
+
+      // ENG-1854 item 6: exception posts are a deliberately different, concise shape —
+      // one line, one mention, one link — not the full multi-field dump every other
+      // candidate gets. Assert the actual posted text, not just that posting happened.
+      // Note: since the default is now ON, this list's remaining practical role is choosing
+      // the message FORMAT for specific accounts, not whether posting happens at all — posting
+      // already happens for everyone unless explicitly killed (see the test above).
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toBe('<@U_MATT> — new review ready: <https://example.com/haven-creative.png>');
+      expect(postedMessage).not.toContain('*Human eval:');
+      expect(postedMessage).not.toContain('Reply in this thread');
+    });
+
+    it('uses the full multi-field message for a normal global-toggle post, not the concise exception format', async () => {
+      const { service, slack } = makeHarness();
+
+      await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Ordinary candidate.',
+        userId: 'user-not-excepted',
+      });
+
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toContain('*Human eval:');
+      expect(postedMessage).toContain('Reply in this thread');
+      expect(postedMessage).not.toBe('<@U_MATT> — new review ready.');
+    });
+
+    it('defaults to not posting (fail-safe), not throwing, when the settings lookup itself throws — the candidate is already persisted by this point', async () => {
+      const { service, slack, settingsService, settings, items } = makeHarness();
+      // Target only the toggle lookup by name — an unscoped mockRejectedValueOnce would
+      // instead hit getReviewerSlackUserId's own getSetting call, which runs earlier and
+      // is now ALSO guarded (see the sibling test below) but would still make this
+      // specific test fail to isolate the toggle lookup it's meant to check.
+      settingsService.getSetting.mockImplementation(async (name: string) => {
+        if (name === 'human_eval_slack_posting_enabled') {
+          throw new Error('DynamoDB GetItem transiently failed');
+        }
+        const settingValue = settings.get(name);
+        return settingValue ? { settingValue } : null;
+      });
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Persists even if the toggle lookup itself fails.',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Persists even if the toggle lookup itself fails.');
+    });
+
+    it('persists and still resolves a reviewer mention (plain-text fallback) when the reviewer-Slack-ID lookup itself throws — this runs BEFORE db.put, so an unguarded version would drop the candidate entirely', async () => {
+      const { service, slack, settingsService, settings, items } = makeHarness();
+      settingsService.getSetting.mockImplementation(async (name: string) => {
+        if (name === 'human_eval_reviewer_matt_slack_user_id') {
+          throw new Error('DynamoDB GetItem transiently failed');
+        }
+        const settingValue = settings.get(name);
+        return settingValue ? { settingValue } : null;
+      });
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Persists even if the reviewer-ID lookup itself fails.',
+      });
+
+      expect(candidate.reviewerSlackUserId).toBeUndefined();
+      expect(items.get(candidate.candidateId)?.outputSummary).toBe('Persists even if the reviewer-ID lookup itself fails.');
+      // Posting still goes ahead (the toggle is enabled by this harness's default) — the
+      // message just falls back to a plain-text mention instead of a real Slack @-mention.
+      const postedMessage = slack.postSlackMessage.mock.calls[0][1];
+      expect(postedMessage).toContain('Reviewer: Matt');
+    });
+
+    it('does not post for a userId NOT on the exception list when the global toggle is explicitly off', async () => {
+      const { service, slack, settings } = makeHarness();
+      settings.set('human_eval_slack_posting_enabled', 'false');
+      settings.set('human_eval_slack_posting_exception_user_ids', 'user-haven,user-every');
+
+      const candidate = await service.createCandidate({
+        reviewType: 'creative_image',
+        outputSummary: 'Some other customer entirely.',
+        userId: 'user-someone-else',
+      });
+
+      expect(slack.postSlackMessage).not.toHaveBeenCalled();
+      expect(candidate.slackChannel).toBeUndefined();
+    });
   });
 });

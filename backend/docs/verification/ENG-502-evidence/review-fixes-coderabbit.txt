@@ -1,0 +1,15 @@
+Command: coderabbit review --agent --uncommitted
+CLI: 0.7.6, authenticated API-key session
+Scope: all nine changed source/test files in the independent-review correction
+Result: review_completed; 0 findings; no outstanding applicable findings
+Docs/evidence added after the review are not claimed reviewed. No latest-SHA remote review claim.
+
+{"type":"review_context","reviewType":"uncommitted","currentBranch":"feat/eng-502-self-learning","baseBranch":"origin/main","workingDirectory":"<checkout>"}
+{"type":"status","phase":"connecting","status":"connecting_to_review_service"}
+{"type":"status","phase":"setup","status":"setting_up"}
+{"type":"status","phase":"setup","status":"preparing_sandbox"}
+{"type":"status","phase":"analyzing","status":"summarizing"}
+{"type":"status","phase":"analyzing","status":"tools_completed"}
+{"type":"status","phase":"analyzing","status":"reviewing"}
+{"type":"heartbeat","status":"reviewing"}
+{"type":"complete","status":"review_completed","findings":0,"reviewedFiles":["backend/src/__tests__/eng1967.evaluator.test.ts","backend/src/__tests__/eng1968.learning.test.ts","backend/src/__tests__/eng502.loop.test.ts","backend/src/cron/adsLearningCron.ts","backend/src/services/adsLearningDb.ts","backend/src/services/adsLearningReview.ts","backend/src/services/adsOutcomeEvaluator.ts","backend/src/services/adsScopedLearning.ts","backend/src/services/outcomeLedger.ts"]}

@@ -22,6 +22,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { getGCSPPrivateKey } from "../utils/secretsManager";
 import { getS3ObjectAsString } from "../utils/s3Utils";
@@ -777,6 +778,7 @@ async function regenerateCompetitorEntry(
         brand: IcpBrandContext,
         personas: ICPPersona[],
         deps?: unknown,
+        usageContext?: LLMUsageContext,
       ) => Promise<{ per_icp: unknown[] }>;
     };
   },
@@ -787,7 +789,9 @@ async function regenerateCompetitorEntry(
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const competitor =
       deps.competitor ?? require("./onboardingCompetitorService");
-    const result = await competitor.generateCompetitorStrategyForUser(brand, [persona]);
+    // ENG-1858: attribute and charge the refresh to this user, not "system".
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_competitors" };
+    const result = await competitor.generateCompetitorStrategyForUser(brand, [persona], undefined, usageContext);
     const entry = result?.per_icp?.[0];
     if (!entry) return;
     const next = [...existing];
