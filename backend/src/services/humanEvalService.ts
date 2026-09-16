@@ -792,12 +792,14 @@ export class HumanEvalService {
   }
 
   /**
-   * ENG-1854: default-off switch for #eval-queue Slack fan-out. The queue itself (creation,
-   * persistence, the admin read API) is unaffected either way — this only gates whether a
-   * given candidate additionally gets posted to Slack. DB-backed (not an env var) so it's
-   * flippable without a redeploy, same reasoning as `getEvalChannel`'s own setting above.
-   */
-  /**
+   * ENG-1854: switch for #eval-queue Slack fan-out, default ON — an explicit 'false' is an
+   * unconditional kill switch. (It shipped default-off; the default was flipped back once the
+   * two real noise sources — routine lead-enrichment pings and cross-path duplicates — were
+   * fixed independently of this toggle.) The queue itself (creation, persistence, the admin
+   * read API) is unaffected either way; this only gates whether a candidate additionally gets
+   * posted to Slack. DB-backed (not an env var) so it's flippable without a redeploy, same
+   * reasoning as `getEvalChannel`'s own setting above.
+   *
    * Returns why (if at all) this candidate should be posted — the caller uses this to pick
    * the message format: a normal global-toggle post gets the full multi-field message, an
    * exception-list post gets a deliberately concise one (ENG-1854 item 6 — "one concise
