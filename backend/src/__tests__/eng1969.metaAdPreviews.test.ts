@@ -4,7 +4,11 @@ jest.mock('../services/agentModeService', () => ({
 
 import { emmaToolRegistry } from '../emma/registry';
 import { agentModeService } from '../services/agentModeService';
+import axios from 'axios';
+import { META_READ_CALL_TIMEOUT_MS, metaService } from '../services/metaService';
 import '../emma/tools';
+
+jest.mock('axios');
 
 describe('ENG-1969 Meta ad previews', () => {
   const tool = emmaToolRegistry.getTool('call_meta_marketing_api');
@@ -48,5 +52,43 @@ describe('ENG-1969 Meta ad previews', () => {
 
   it('documents that preview iframes expire after 24 hours', () => {
     expect(tool?.definition.description).toContain('24 hours');
+  });
+
+  it('bounds the Graph request and returns non-blank preview HTML', async () => {
+    (axios.get as jest.Mock).mockResolvedValue({ data: { data: [{ body: '<iframe />' }] } });
+
+    await expect(metaService.generateAdPreview('secret-token', 'ad_1', 'DESKTOP_FEED_STANDARD'))
+      .resolves.toEqual([{ body: '<iframe />' }]);
+    expect(axios.get).toHaveBeenCalledWith(
+      expect.stringContaining('/ad_1/previews'),
+      expect.objectContaining({
+        params: { ad_format: 'DESKTOP_FEED_STANDARD', access_token: 'secret-token' },
+        timeout: META_READ_CALL_TIMEOUT_MS,
+        maxContentLength: 1_000_000,
+      }),
+    );
+  });
+
+  it.each([
+    { rows: [] },
+    { rows: [{ body: '' }] },
+    { rows: [{ body: '   ' }] },
+    { rows: [{ nope: true }] },
+  ])(
+    'rejects malformed or blank preview rows: %j',
+    async ({ rows }) => {
+      (axios.get as jest.Mock).mockResolvedValue({ data: { data: rows } });
+      await expect(metaService.generateAdPreview('secret-token', 'ad_1', 'DESKTOP_FEED_STANDARD'))
+        .rejects.toThrow('Meta returned an invalid ad preview response.');
+    },
+  );
+
+  it('does not propagate the access token in request errors', async () => {
+    const requestError: any = new Error('Meta request failed');
+    requestError.config = { params: { access_token: 'secret-token' } };
+    (axios.get as jest.Mock).mockRejectedValue(requestError);
+
+    await expect(metaService.generateAdPreview('secret-token', 'ad_1', 'DESKTOP_FEED_STANDARD'))
+      .rejects.not.toHaveProperty('config');
   });
 });
