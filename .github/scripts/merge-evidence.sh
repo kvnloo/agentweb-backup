@@ -173,14 +173,12 @@ BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend build}"
 # fails closed on a rename rather than trying to infer intent, which an
 # allowlist preserves and dynamic introspection would not.
 #
-# Also not matched by GitHub App identity, which reads as the more principled
-# axis until checked against the actual payload: `Require Greptile Review`
-# was a first-party Actions job (app "github-actions", the same app as every
-# other job in this workflow), not the third-party Greptile integration
-# itself (`Greptile Review`, app "greptile-apps", which passes and was never
-# the blocker). An app-identity rule would be unable to tell this job apart
-# from any other Actions job, active or not.
-RETIRED_CHECKS="${MERGE_EVIDENCE_RETIRED_CHECKS:-Require Greptile Review}"
+# Both Greptile surfaces are retired under AGENTS.md (ENG-1371): the
+# first-party Actions job and the third-party integration, which can still emit
+# pending runs on ready PRs. Exact names only; active checks remain fail-closed.
+# Retired successes must not count as positive execution evidence either.
+RETIRED_CHECKS="${MERGE_EVIDENCE_RETIRED_CHECKS:-Require Greptile Review
+Greptile Review}"
 
 log() { printf 'merge-evidence: %s\n' "$*"; }
 

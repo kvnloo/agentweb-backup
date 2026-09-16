@@ -122,3 +122,18 @@ describe('itemToRecommendation — corrupted data fails loud, not silently', () 
     expect(itemToRecommendation(item({ status: 'scored', actualMagnitudePct: null }))?.actualMagnitudePct).toBeNull();
   });
 });
+
+describe('ENG-502 strict stored attribution and scalar types', () => {
+  it.each([
+    { adopted: 'false' }, { createdBy: {} }, { hypothesis: true },
+    { evaluationDate: 'not-a-date' }, { createdAt: 'not-a-date' },
+    { predictedMagnitudePct: true }, { actualMagnitudePct: [] }, { verdictReason: {} },
+  ])('rejects wrong-type-but-truthy stored data %p', fields => {
+    expect(() => itemToRecommendation(item(fields))).toThrow();
+  });
+});
+
+it('preserves legacy finite numeric-string normalization', () => {
+  expect(itemToRecommendation(item({ predictedMagnitudePct: '5', actualMagnitudePct: '-2' })))
+    .toMatchObject({ predictedMagnitudePct: 5, actualMagnitudePct: -2 });
+});

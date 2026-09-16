@@ -1,3 +1,4 @@
+import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -19173,6 +19174,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
+        await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -19187,7 +19189,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        const result = await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        if (result.success === true && result.verified === true && result.new_creative_id) {
+          await recordCreativeLearningReceipt(userId, accountId, adId, result.new_creative_id, true);
+        }
+        return result;
       }
 
       // Standard ad-level update (status, name, etc.)

@@ -78,13 +78,23 @@ export class ThresholdCorruptionError extends Error {
  */
 /** Exported for direct unit testing — pure, touches no AWS SDK state. */
 export function itemToParameter(item: AWS.DynamoDB.DocumentClient.AttributeMap): AdsThreshold | null {
+  if (!item || typeof item !== 'object') throw new ThresholdCorruptionError('Invalid parameter item');
+  if (item.revisions != null && (!Array.isArray(item.revisions) || !item.revisions.every((r: any) =>
+    r && typeof r === 'object' && typeof r.evidence === 'string' && r.evidence.length <= 2000 &&
+    typeof r.changedBy === 'string' && r.changedBy.length > 0 && typeof r.changedAt === 'string' && Number.isFinite(Date.parse(r.changedAt)) &&
+    ['default', 'user', 'learned'].includes(r.source) && typeof r.value === 'number' && Number.isFinite(r.value) &&
+    (r.previousValue == null || (typeof r.previousValue === 'number' && Number.isFinite(r.previousValue))) &&
+    (r.sampleSize == null || (Number.isInteger(r.sampleSize) && r.sampleSize >= 0))))) {
+    throw new ThresholdCorruptionError('Invalid parameter revision');
+  }
+
   const parsed = parseThresholdEntityKey(String(item.entityKey));
   if (!parsed) return null;
 
   // `item.currentValue == null` is checked explicitly, separately from Number.isFinite: `Number(null)`
   // is `0`, not `NaN` — a missing/null attribute would otherwise convert to a plausible-looking
   // real number instead of failing the finiteness check below.
-  if (item.currentValue == null || !Number.isFinite(Number(item.currentValue))) {
+  if (!((typeof item.currentValue === 'number' || (typeof item.currentValue === 'string' && item.currentValue.trim() !== '')) && Number.isFinite(Number(item.currentValue)))) {
     throw new ThresholdCorruptionError(
       `${ADS_THRESHOLDS_TABLE} item '${item.entityKey}'/'${item.paramKey}' has a non-finite ` +
         `currentValue (${String(item.currentValue)})`,
