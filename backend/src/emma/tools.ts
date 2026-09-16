@@ -1648,6 +1648,127 @@ emmaToolRegistry.register({
   }
 });
 
+// ENG-1550 / G6: record a prediction in the outcome ledger.
+//
+// WHY THIS TOOL EXISTS. The ledger's store, service and REST routes all shipped, but nothing any
+// agent could call ever wrote to it — the only non-test importer of `outcomeLedger` in the backend
+// was the route mount in `app.ts`, and the route file's intended consumer is "the loop system that
+// actually generates recommendations … once it exists", which does not exist. So every ads skill
+// stayed architecturally amnesiac: advice was emitted as prose and evaporated. This is the missing
+// write path.
+//
+// ⭐ RECORD-ONLY, AND DELIBERATELY SO. `routes/outcomeLedger.ts` gates BOTH record and score behind
+// `requireAdmin`, reasoning that letting a caller "mint or resolve its own scored verdicts would
+// let them rewrite the agent's track record". That risk is real but asymmetric: recording a
+// *pending* prediction is the agent committing to a falsifiable claim before the outcome is known,
+// which is the whole point of the ledger and is safe to expose; *scoring* is where a model could
+// launder its own record by marking its predictions correct. So this tool can only ever create a
+// pending row — there is no scoring tool, and scoring stays on the admin/cron path. Do not add a
+// `score_ads_recommendation` sibling without re-deciding this explicitly.
+//
+// ⚠ OWNER-SCOPED ONLY — no `client_id` admin cross-tenant parameter, unlike the 3 read-only Meta
+// reporting tools. `agentModeService.ts`'s `getMetaCredentials` carries an explicit ENG-1801
+// warning that client-scope "must never be wired from a write/mutate tool without its own fresh
+// authorization decision". This is a write, so it takes the ownership check rather than working
+// around that warning. If an admin-scoped run (e.g. a scheduled report analysing a client) later
+// needs to record against the client's account, that needs its own authorization decision and
+// audit entry — deliberately not inherited here.
+emmaToolRegistry.register({
+  name: 'record_ads_recommendation',
+  definition: {
+    name: 'record_ads_recommendation',
+    description: "Record a prediction you are making about one of your connected ad accounts, so it can be scored against what actually happens later. Call this whenever you recommend a change and can state a specific, falsifiable expected effect (e.g. 'pausing this ad set will decrease cost per lead by ~15%'). Records the prediction only — you cannot score it, and scoring is deliberately not available to you. Do not call it for vague advice with no measurable predicted change.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platform: {
+          type: 'string',
+          enum: ['meta'],
+          description: "Ad platform. Only 'meta' is supported today."
+        },
+        account_id: {
+          type: 'string',
+          description: 'Ad account ID from list_connected_accounts.'
+        },
+        hypothesis: {
+          type: 'string',
+          description: 'What you are recommending and why, in one or two plain sentences. Must be specific enough that someone reading it later can tell whether it was followed.'
+        },
+        predicted_metric: {
+          type: 'string',
+          description: "The single metric you expect to move, e.g. 'cost_per_lead', 'ctr', 'leads'."
+        },
+        predicted_direction: {
+          type: 'string',
+          enum: ['increase', 'decrease'],
+          description: 'Which way you expect that metric to move if the recommendation is adopted.'
+        },
+        predicted_magnitude_pct: {
+          type: 'number',
+          description: 'Expected size of the change as a non-negative percentage (e.g. 15 for ~15%). Use your honest best estimate; scoring is direction-first, so a rough magnitude is fine.'
+        },
+        evaluation_date: {
+          type: 'string',
+          description: 'ISO date when this should be checked (e.g. 2026-10-01). Scoring additionally waits out the platform settling window (28d for Meta) after this date, because Meta revises insights for up to 28 days.'
+        }
+      },
+      required: ['platform', 'account_id', 'hypothesis', 'predicted_metric', 'predicted_direction', 'predicted_magnitude_pct', 'evaluation_date']
+    }
+  },
+  execute: async (args, context) => {
+    if (args.platform !== 'meta') {
+      return { success: false, error: `platform '${args.platform}' is not supported yet — only 'meta' has a connected-account ownership check` };
+    }
+
+    const user = await userDb.getUserById(context?.userId);
+    if (!user) return { success: false, error: 'User not found' };
+
+    const { cleanAccountId, getConnectedMetaAccountsList } = await import('../services/metaAccountCredentials');
+    const cleaned = cleanAccountId(args.account_id);
+    const owned = getConnectedMetaAccountsList(user).some((acc: any) => acc.accountId === cleaned);
+    if (!owned) {
+      return { success: false, error: 'Ad account is not one of your connected accounts' };
+    }
+
+    const { randomUUID } = await import('crypto');
+    const { createRecommendation } = await import('../services/outcomeLedger');
+    const { putNewRecommendation } = await import('../services/outcomeLedgerDb');
+
+    try {
+      // `recommendationId` is server-minted, never taken from the model — the caller states what it
+      // predicted, not what its own audit-trail key should be. Same rule the REST route follows.
+      const recommendation = createRecommendation({
+        accountId: cleaned,
+        platform: 'meta',
+        recommendationId: randomUUID(),
+        hypothesis: args.hypothesis,
+        predictedMetric: args.predicted_metric,
+        predictedDirection: args.predicted_direction,
+        predictedMagnitudePct: args.predicted_magnitude_pct,
+        evaluationDate: args.evaluation_date,
+        createdAt: new Date().toISOString(),
+        createdBy: context?.userId,
+      });
+
+      await putNewRecommendation(recommendation);
+
+      return {
+        success: true,
+        recommendation_id: recommendation.recommendationId,
+        platform: 'meta',
+        account_id: cleaned,
+        evaluation_date: recommendation.evaluationDate,
+        status: recommendation.status,
+      };
+    } catch (error: any) {
+      // createRecommendation's validation (empty hypothesis, non-finite/negative magnitude, bad
+      // direction, unparseable evaluationDate) throws a plain Error describing a malformed input —
+      // surface its message so the model can correct and retry rather than silently giving up.
+      return { success: false, error: error?.message ?? 'Failed to record recommendation' };
+    }
+  }
+});
+
 // --- LinkedIn Ads Tools ---
 emmaToolRegistry.register({
   name: 'call_linkedin_marketing_api',
