@@ -228,6 +228,64 @@ function resetSharedMocks() {
   mockBuildSkillContext.mockReturnValue({ allowedToolNames: new Set(), installedSkillContextMsg: '' });
 }
 
+describe('generateChatResponse — entitlement probe at dispatch (log-only)', () => {
+  let warnSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    resetSharedMocks();
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('stays silent when the model calls a tool it was offered', async () => {
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({
+      allowedToolNames: new Set(['list_connected_accounts']),
+      installedSkillContextMsg: '',
+    });
+    mockCallLLM
+      .mockResolvedValueOnce(makeToolCallCompletion('list_connected_accounts'))
+      .mockResolvedValueOnce(makeCompletion('done'));
+
+    await generateChatResponse('sess-1', 'Run it', {
+      portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-opus-5',
+    });
+
+    const probeWarnings = warnSpy.mock.calls.filter((c) => String(c[0]).includes('[ENTITLEMENT-PROBE]'));
+    expect(probeWarnings).toHaveLength(0);
+  });
+
+  it('warns — and still dispatches — when the model calls a tool it was NOT offered', async () => {
+    // The whole point of the probe. Entitlement is enforced only by which schemas the
+    // model is handed; dispatch never re-checks. If a provider ever lets a name through
+    // that was not offered, this is the line that says so, and nothing else would.
+    seedSession({ associatedSkills: ['google-ads-skill'] });
+    mockBuildSkillContext.mockReturnValue({
+      allowedToolNames: new Set(['list_connected_accounts']),
+      installedSkillContextMsg: '',
+    });
+    mockCallLLM
+      .mockResolvedValueOnce(makeToolCallCompletion('publish_landing_page_changes'))
+      .mockResolvedValueOnce(makeCompletion('done'));
+
+    await generateChatResponse('sess-1', 'Run it', {
+      portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-opus-5',
+    });
+
+    const probeWarnings = warnSpy.mock.calls.filter((c) => String(c[0]).includes('[ENTITLEMENT-PROBE]'));
+    expect(probeWarnings).toHaveLength(1);
+    expect(String(probeWarnings[0][0])).toContain('publish_landing_page_changes');
+
+    // Log-only: the call must still have gone through. Turning this into a refusal is a
+    // separate, evidence-led decision — see the comment at the probe.
+    expect(mockExecuteTool).toHaveBeenCalledTimes(1);
+    expect(mockExecuteTool.mock.calls[0][1]).toBe('publish_landing_page_changes');
+  });
+});
+
 describe('generateChatResponse — skill-session tool binding (ENG-1222)', () => {
   beforeEach(() => {
     resetSharedMocks();

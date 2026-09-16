@@ -5479,6 +5479,41 @@ export async function generateChatResponse(
         let functionArgs: any;
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
+
+          // ENTITLEMENT PROBE — log only, deliberately does NOT refuse.
+          //
+          // Entitlement is enforced in exactly one place: visibility. getFilteredTools()
+          // decides which schemas the model is handed, and `availableToolNames` above is
+          // literally toolDefinitions.map(t => t.function.name) — the set offered on this
+          // turn. Dispatch never re-checks it: the name below goes straight into
+          // executeTool, whose guards (evaluation account, arg contract, ENG-803 publish
+          // approval, ENG-822 anonymous, ENG-827 scheduled-publish consent, unknown-tool)
+          // are all real but none is entitlement. The tool registry holds every registered
+          // tool with no entitlement filter, so a name that arrives here resolves and runs.
+          // The Agent Tool Gateway that looks like the backstop runs with enforce:false in
+          // production — AGENT_TOOL_GATEWAY_ENFORCE is not set in the prod EB config.
+          //
+          // So the only thing preventing an unentitled call is the model being constrained
+          // to the schemas it was given — a PROVIDER-side guarantee, not ours. That is
+          // probably true, and this warn exists to find out rather than assume: this
+          // codebase routes through OpenRouter across providers of differing strictness,
+          // and this model has previously fabricated a UI control and an audit table with
+          // full confidence (ENG-1855, ENG-1625).
+          //
+          // Log-only on purpose. Refusing here could break a flow that legitimately
+          // dispatches outside the offered list (delegated admin, internal tooling, the
+          // sandbox path) and there is no evidence yet about what those are. If this never
+          // fires, the provider constraint holds and enforcement can be enabled knowing it
+          // is inert. If it fires, there is a real gap AND the log names the tool and
+          // session, so enforcement can be scoped rather than guessed.
+          if (!availableToolNames.includes(toolCall.function.name)) {
+            console.warn(
+              `[ENTITLEMENT-PROBE] model dispatched a tool it was not offered: ` +
+              `tool=${toolCall.function.name} session=${sessionId} portal=${portalType} ` +
+              `offeredCount=${availableToolNames.length}`,
+            );
+          }
+
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
           const extraContext: Record<string, any> = {};
