@@ -584,12 +584,18 @@ export function buildThresholdRevert(args: {
  */
 export function resolveThresholds(
   stored: readonly AdsThreshold[],
+  now = new Date(),
 ): Record<string, { value: number; source: ThresholdSource }> {
   const byKey = new Map(stored.map(p => [p.paramKey, p]));
   const resolved: Record<string, { value: number; source: ThresholdSource }> = {};
 
   for (const definition of THRESHOLD_REGISTRY.values()) {
-    const hit = byKey.get(definition.key);
+    const storedHit = byKey.get(definition.key);
+    // ENG-1968 reviewed learning has a 90-day horizon. Keep history; expire only its effect.
+    const evidence = storedHit?.revisions?.[0]?.evidence;
+    const expires = storedHit?.source === 'learned' && typeof evidence === 'string' && evidence.startsWith('Reviewed ads-learning#') &&
+      (!Number.isFinite(Date.parse(storedHit.updatedAt)) || now.getTime() >= Date.parse(storedHit.updatedAt) + 90 * 86400000);
+    const hit = expires ? undefined : storedHit;
     resolved[definition.key] = hit
       ? { value: hit.currentValue, source: hit.source }
       : { value: definition.defaultValue, source: 'default' };

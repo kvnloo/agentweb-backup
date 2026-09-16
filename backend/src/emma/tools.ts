@@ -964,8 +964,8 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
+  AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -975,6 +975,12 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
   LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
   Use GET to verify a creative you just built or swapped onto an ad, and to read a
   placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+AD / AD_CREATIVE PREVIEW — render an existing ad or creative for one Meta placement.
+  AD requires ad_id; AD_CREATIVE requires params.creative_id. Pass params.ad_format (for example
+  DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY). The response contains Meta's
+  iframe HTML, not a permanent public URL; Meta preview iframes expire after 24 hours and are only
+  visible to people who can access the selected ad account.
 
 SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
   ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
@@ -1142,7 +1148,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1240,6 +1246,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
+            ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
@@ -1540,6 +1547,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
+        include_learning: { type: 'boolean', description: 'Include bounded shadow learning in global, client, campaign, channel order. Advisory only.' },
+        campaign_id: { type: 'string', description: 'Campaign scope for learning retrieval.' },
         platform: {
           type: 'string',
           enum: ['meta'],
@@ -1573,7 +1582,20 @@ emmaToolRegistry.register({
     const stored = await getThresholdsForAccount('meta', cleaned);
     const resolved = resolveThresholds(stored);
 
+    let learningResult: Record<string, unknown> = {};
+    if (args.include_learning === true) {
+      try {
+        const { getScopedLearning } = await import('../services/adsLearningDb');
+        learningResult = { learning: await getScopedLearning({ userId: context.userId, platform: 'meta', accountId: cleaned,
+          campaignId: typeof args.campaign_id === 'string' ? args.campaign_id : undefined, now: new Date().toISOString() }) };
+      } catch {
+        console.error('[AdsLearning] scoped retrieval unavailable');
+        learningResult = { learningUnavailable: true };
+      }
+    }
+
     return {
+      ...learningResult,
       success: true,
       platform: 'meta',
       account_id: cleaned,

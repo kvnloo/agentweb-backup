@@ -30,7 +30,58 @@ export type OutcomePlatform = 'meta' | 'google_ads';
 
 export type PredictedDirection = 'increase' | 'decrease';
 export type ActualDirection = 'increase' | 'decrease' | 'flat';
-export type OutcomeVerdict = 'correct' | 'incorrect' | 'unscoreable';
+export type OutcomeVerdict = 'correct' | 'incorrect' | 'inconclusive' | 'unscoreable';
+
+/** Optional, additive capture contract. Legacy/manual recommendations remain readable.
+ * A shadow proposal is not an adopted intervention or a calibrated prediction. */
+export interface RecommendationContext {
+  execution?: import('./adsOutcomeEvaluator').ExecutionReceipt;
+  version: 1;
+  clientUserId: string;
+  campaignId: string;
+  adId: string;
+  metricScope: 'ad' | 'campaign';
+  mode: 'shadow';
+  source: 'assess_client_health';
+  sourceWindow: { since: string; until: string };
+  rationale: string;
+  evidence: Array<{ reference: string; metric: string; value: number }>;
+  assumptions: string[];
+  confidence: 'uncalibrated';
+  reviewState: 'unreviewed';
+  reviewAfter: string;
+}
+
+/** Validate at BOTH persistence boundaries; never trust a cast of external data. */
+export function validateRecommendationContext(value: unknown): asserts value is RecommendationContext {
+  const c = value as RecommendationContext | null;
+  const text = (s: unknown): s is string => typeof s === 'string' && s.trim().length > 0 && s.length <= 2000;
+  const date = (s: unknown): boolean => text(s) && Number.isFinite(Date.parse(s));
+  if (c?.execution !== undefined) {
+    const e = c.execution;
+    if (!e || typeof e !== 'object' || ![e.reference, e.clientUserId, e.platform, e.accountId, e.campaignId, e.recommendationId].every(text) ||
+      !date(e.executedAt) || !((e.status === 'succeeded' && e.adopted === true) || (e.status === 'declined' && e.adopted === false)) ||
+      e.clientUserId !== c.clientUserId || e.campaignId !== c.campaignId) throw new Error('outcomeLedger: invalid execution receipt');
+  }
+
+  if (!c || typeof c !== 'object' || c.version !== 1 || c.mode !== 'shadow' || !['ad', 'campaign'].includes(c.metricScope) ||
+      c.source !== 'assess_client_health' || c.confidence !== 'uncalibrated' || c.reviewState !== 'unreviewed' ||
+      ![c.clientUserId, c.campaignId, c.adId, c.rationale].every(text) ||
+      !date(c.sourceWindow?.since) || !date(c.sourceWindow?.until) ||
+      Date.parse(c.sourceWindow.since) > Date.parse(c.sourceWindow.until) || !date(c.reviewAfter) ||
+      !Array.isArray(c.assumptions) || c.assumptions.length < 1 || c.assumptions.length > 20 || !c.assumptions.every(text) ||
+      !Array.isArray(c.evidence) || c.evidence.length < 1 || c.evidence.length > 20 ||
+      !c.evidence.every(e => e && typeof e === 'object' && text(e.reference) && text(e.metric) && typeof e.value === 'number' && Number.isFinite(e.value))) {
+    throw new Error('outcomeLedger: invalid recommendation context');
+  }
+}
+
+/** Only the validated ENG-502 capture contract opts a row into automatic evaluation.
+ * Missing attribution is not permission to terminally score a legacy/manual record. */
+export function hasLearningContext(r: Recommendation): r is Recommendation & { context: RecommendationContext } {
+  try { validateRecommendationContext(r.context); return true; }
+  catch { return false; }
+}
 
 /** Below this relative change, an actual is treated as `flat` rather than a direction — avoids
  * scoring predictions "wrong" on noise no reasonable prediction could have avoided. */
@@ -54,6 +105,7 @@ export function getSettlingWindowDays(platform: OutcomePlatform): number {
 }
 
 export interface Recommendation {
+  context?: RecommendationContext;
   accountId: string;
   platform: OutcomePlatform;
   recommendationId: string;
@@ -90,6 +142,7 @@ export function parseOutcomeEntityKey(
 }
 
 export interface CreateRecommendationInput {
+  context?: RecommendationContext;
   accountId: string;
   platform: OutcomePlatform;
   recommendationId: string;
@@ -105,6 +158,7 @@ export interface CreateRecommendationInput {
 /** Builds a new pending recommendation record. Adoption is unknown at creation time — it is set
  * later, by whatever surface acts on (or ignores) the recommendation. */
 export function createRecommendation(input: CreateRecommendationInput): Recommendation {
+  if (input.context !== undefined) validateRecommendationContext(input.context);
   if (!input.hypothesis || !input.hypothesis.trim()) {
     throw new Error('outcomeLedger: hypothesis must not be empty — an unscoreable-by-design prediction is not a prediction');
   }
@@ -126,6 +180,7 @@ export function createRecommendation(input: CreateRecommendationInput): Recommen
   }
 
   return {
+    ...(input.context === undefined ? {} : { context: input.context }),
     accountId: input.accountId,
     platform: input.platform,
     recommendationId: input.recommendationId,
