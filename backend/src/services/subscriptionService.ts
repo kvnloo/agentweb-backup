@@ -66,34 +66,75 @@ export const SUBSCRIPTION_FEATURES = {
  * reaching for one (same shape as usageWriteFailureMonitor's `setDroppedWriteAlertSink`). There
  * is no metrics facade in this codebase; a greppable marker prefix is the house convention.
  */
+/**
+ * Two DISTINCT kinds, deliberately not summable:
+ *
+ *  - `wildcard-grant`   every registered tool was just granted because something failed.
+ *                       This is the number that answers "how risky is the current fail-open?"
+ *  - `unconfirmed-tier` the tier could not be CONFIRMED for this user, but the grant that
+ *                       followed may have been perfectly normal and restricted.
+ *
+ * Keeping them apart matters more than it looks. `unconfirmed-tier` is expected to be the
+ * highest-volume reason, and it frequently accompanies a *restricted* result — an unreadable
+ * user row still resolves to a real Free tier with a real skill list. Counting those as
+ * over-grants would oversize the risk and argue for the fail-closed change on false evidence,
+ * which is the opposite of what this instrumentation is for.
+ */
+export type EntitlementObservationKind = "wildcard-grant" | "unconfirmed-tier";
+
 export type WildcardGrantSink = (event: {
+  kind: EntitlementObservationKind;
   reason: string;
   userId: string;
   detail: Record<string, unknown>;
 }) => void;
 
-let emitWildcardGrant: WildcardGrantSink = (event) => {
-  console.warn(
-    "[entitlement] WILDCARD-GRANT granting all tools without a confirmed entitlement:",
-    JSON.stringify(event)
-  );
+const DEFAULT_ENTITLEMENT_SINK: WildcardGrantSink = (event) => {
+  const marker =
+    event.kind === "wildcard-grant"
+      ? "[entitlement] WILDCARD-GRANT granting all tools without a confirmed entitlement:"
+      : "[entitlement] UNCONFIRMED-TIER entitlement resolved from an unconfirmed tier:";
+  console.warn(marker, JSON.stringify(event));
 };
 
-/** Route wildcard-grant observations somewhere other than the console (tests, alerting). */
+let emitWildcardGrant: WildcardGrantSink = DEFAULT_ENTITLEMENT_SINK;
+
+/** Route entitlement observations somewhere other than the console (tests, alerting). */
 export function setWildcardGrantSink(sink: WildcardGrantSink): void {
   emitWildcardGrant = sink;
 }
 
-function reportWildcardGrant(
+/** Restore the console sink. Tests must call this rather than installing a silent stub, or every
+ *  test declared after theirs runs with observation disabled. */
+export function resetWildcardGrantSink(): void {
+  emitWildcardGrant = DEFAULT_ENTITLEMENT_SINK;
+}
+
+function reportEntitlementObservation(
+  kind: EntitlementObservationKind,
   reason: string,
   userId: string,
   detail: Record<string, unknown> = {}
 ): void {
   try {
-    emitWildcardGrant({ reason, userId, detail });
+    // `Promise.resolve(...)` on purpose: the sink is typed `=> void`, but TypeScript happily
+    // accepts an `async` function there, and a rejected promise would escape this synchronous
+    // catch entirely — surfacing as an unhandled rejection, which under Node's default in EB
+    // terminates the process. Observation must never be the reason the SERVER fails, not just
+    // the reason a check fails.
+    void Promise.resolve(emitWildcardGrant({ kind, reason, userId, detail })).catch(() => {});
   } catch {
-    // Observation must never be the reason an entitlement check fails.
+    // A synchronous throw from the sink.
   }
+}
+
+/** Every registered tool was just granted because something could not be resolved. */
+function reportWildcardGrant(
+  reason: string,
+  userId: string,
+  detail: Record<string, unknown> = {}
+): void {
+  reportEntitlementObservation("wildcard-grant", reason, userId, detail);
 }
 
 export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
@@ -298,6 +339,19 @@ export async function getSubscriptionTypeConfig(
     // treat as all skills allowed (wildcard)
     const allowedSkills = subscriptionType.allowedSkills || ["*"];
 
+    // ENG-1978 (observation only): this rewrite happens BEFORE getAllowedSkills ever sees the
+    // row, so without recording it here a tier missing `allowedSkills` grants the entire registry
+    // indistinguishably from an admin deliberately typing ["*"] — and that legacy shape is the
+    // likeliest real malformation, being the documented pre-`allowedSkills` config format.
+    // Identified by tier name rather than userId on purpose: this is a property of the config
+    // row, identical for every user on that tier, not something a particular user did.
+    if (!subscriptionType.allowedSkills) {
+      reportWildcardGrant("tier-config-missing-allowed-skills", `tier:${subscriptionTypeName}`, {
+        subscriptionTypeName,
+        hasLegacyAllowedFunctionCalls: Array.isArray(subscriptionType.allowedFunctionCalls),
+      });
+    }
+
     // Normalize paths: remove "/marketing" prefix from allowedPages
     return {
       ...subscriptionType,
@@ -417,7 +471,9 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
     const { subscriptionType: subscriptionTypeName, resolved } =
       await getUserSubscriptionResolution(userId);
     if (!resolved) {
-      reportWildcardGrant("subscription-type-unresolved", userId, {
+      // NOT a wildcard-grant: the assumed tier below is frequently a real, restricted one, so
+      // this is recorded under its own kind and must not be summed with the over-grants.
+      reportEntitlementObservation("unconfirmed-tier", "subscription-type-unresolved", userId, {
         assumedSubscriptionType: subscriptionTypeName,
       });
     }
@@ -463,7 +519,12 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
  * For __other_skills__, returns tools not associated with any published skill
  * Returns ["*"] if input contains "*"
  */
-export async function resolveSkillsToToolNames(skillIds: string[]): Promise<string[]> {
+export async function resolveSkillsToToolNames(
+  skillIds: string[],
+  /** ENG-1978 observation only — attributes the event below. Optional so no caller is forced to
+   *  change; when absent the event is still emitted, just unattributed. */
+  userIdForObservation?: string
+): Promise<string[]> {
   try {
     if (skillIds.includes("*")) {
       return ["*"];
@@ -489,7 +550,7 @@ export async function resolveSkillsToToolNames(skillIds: string[]): Promise<stri
     return Array.from(toolNames);
   } catch (error: any) {
     console.error("Error resolving skills to tool names:", error);
-    reportWildcardGrant("skill-to-tool-resolution-failed", "(n/a)", {
+    reportWildcardGrant("skill-to-tool-resolution-failed", userIdForObservation || "(unattributed)", {
       skillIds,
       error: error?.message || String(error),
     });
@@ -593,7 +654,9 @@ export async function getAllowedFunctionCalls(
 ): Promise<string[]> {
   try {
     const allowedSkillIds = await getAllowedSkills(userId);
-    return resolveSkillsToToolNames(allowedSkillIds);
+    // `return await`, not bare `return`: a returned rejected promise is adopted OUTSIDE the try
+    // block, so the catch below could never see it (pre-existing, unrelated to the observation).
+    return await resolveSkillsToToolNames(allowedSkillIds, userId);
   } catch (error: any) {
     console.error("Error getting allowed function calls:", error);
     // Default to allowing all functions on error

@@ -20,6 +20,7 @@ import {
   getAllowedFeatures,
   isSubscriptionFeatureEnabled,
   setWildcardGrantSink,
+  resetWildcardGrantSink,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -527,7 +528,9 @@ describe('subscriptionService', () => {
    * thinking they were only touching logging.
    */
   describe('wildcard-grant observation (no behaviour change)', () => {
-    afterEach(() => setWildcardGrantSink(() => {}));
+    // resetWildcardGrantSink, not a silent stub: installing `() => {}` here would leave every
+    // test declared after this block running with observation disabled.
+    afterEach(() => resetWildcardGrantSink());
 
     it('records, and still grants, when the tier name is not in the config', async () => {
       const events: any[] = [];
@@ -555,7 +558,13 @@ describe('subscriptionService', () => {
       expect(events.map((e) => e.reason)).toContain('empty-allowed-skills-treated-as-wildcard');
     });
 
-    it('records, and still grants, when the tier could not be confirmed for this user', async () => {
+    /*
+     * Review finding: an unconfirmed tier frequently produces a RESTRICTED result, not a wildcard
+     * — an unreadable user row still resolves to a real Free tier with a real skill list. If that
+     * were recorded as a wildcard-grant it would inflate the over-grant count and argue for the
+     * fail-closed change on false evidence. Hence the separate `kind`, asserted here.
+     */
+    it('records an unconfirmed tier as its OWN kind, not as a wildcard grant', async () => {
       const events: any[] = [];
       setWildcardGrantSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce(null as any);
@@ -564,19 +573,84 @@ describe('subscriptionService', () => {
         settingValue: JSON.stringify([{ name: 'Free', allowedPages: ['/tasks'], allowedSkills: ['skill-free'] }]),
       } as any);
 
-      // Still resolves to the assumed Free tier exactly as before — only the observation is new.
+      // Restricted list, NOT ["*"] — exactly as before; only the observation is new.
       expect(await getAllowedSkills('ghost')).toEqual(['skill-free']);
-      expect(events.map((e) => e.reason)).toContain('subscription-type-unresolved');
+      const unresolved = events.find((e) => e.reason === 'subscription-type-unresolved');
+      expect(unresolved).toBeDefined();
+      expect(unresolved.kind).toBe('unconfirmed-tier');
+      expect(events.filter((e) => e.kind === 'wildcard-grant')).toHaveLength(0);
     });
 
-    it('records, and still grants, when the settings lookup throws', async () => {
+    /*
+     * Review finding: this previously asserted only `events.length > 0` and was named as though it
+     * covered getAllowedSkills' own catch. It does not — a rejected getSetting is caught inside
+     * getSubscriptionTypeConfig, so the branch taken is the config-unavailable one. Asserting the
+     * reason string is what exposed the mislabel.
+     */
+    it('records config-unavailable (not the outer catch) when the settings lookup throws', async () => {
       const events: any[] = [];
       setWildcardGrantSink((e) => events.push(e));
       mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u3', subscriptionType: 'Pro' } as any);
       mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
 
       expect(await getAllowedSkills('u3')).toEqual(['*']);
-      expect(events.length).toBeGreaterThan(0);
+      expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
+    });
+
+    /* The genuine trigger for getAllowedSkills' own catch: a non-array allowedSkills makes
+     * `.includes` throw. Previously uncovered entirely. */
+    it('records, and still grants, when allowedSkills is not an array', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u4', subscriptionType: 'Pro' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: { nope: true } }]),
+      } as any);
+
+      expect(await getAllowedSkills('u4')).toEqual(['*']);
+      expect(events.map((e) => e.reason)).toContain('allowed-skills-lookup-failed');
+    });
+
+    /* A tier row missing allowedSkills entirely is rewritten to ["*"] inside
+     * getSubscriptionTypeConfig, before getAllowedSkills sees it — the likeliest real
+     * malformation, and previously invisible to this instrumentation. */
+    it('records a tier row that omits allowedSkills, which silently becomes a wildcard', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u5', subscriptionType: 'Legacy' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/tasks'] }]),
+      } as any);
+
+      expect(await getAllowedSkills('u5')).toEqual(['*']);
+      expect(events.map((e) => e.reason)).toContain('tier-config-missing-allowed-skills');
+    });
+
+    /* Observation must never be the reason the SERVER fails. An async sink is assignable to a
+     * `=> void` type, and its rejection would otherwise escape as an unhandled rejection. */
+    it('survives a sink that rejects asynchronously', async () => {
+      setWildcardGrantSink((() => Promise.reject(new Error('sink blew up'))) as any);
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u6', subscriptionType: 'NoSuchTier' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['s'] }]),
+      } as any);
+
+      await expect(getAllowedSkills('u6')).resolves.toEqual(['*']);
+      await new Promise((r) => setImmediate(r)); // let any unhandled rejection surface
+    });
+
+    it('survives a sink that throws synchronously', async () => {
+      setWildcardGrantSink(() => { throw new Error('sync boom'); });
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u7', subscriptionType: 'NoSuchTier' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['s'] }]),
+      } as any);
+
+      await expect(getAllowedSkills('u7')).resolves.toEqual(['*']);
     });
   });
 
