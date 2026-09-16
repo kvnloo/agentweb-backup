@@ -72,6 +72,20 @@ describe('ENG-1550 record_ads_recommendation', () => {
     expect(emmaToolRegistry.getTool(TOOL)).toBeDefined();
   });
 
+  // The migration writes its own TOOL_NAME constant into three live customer-facing
+  // skills. That constant and the name this tool registers under are independent
+  // string literals, so a rename on either side would leave those skills pointing at
+  // a tool the runtime cannot resolve — on production rows that have no undo. Pin
+  // them together so a rename breaks the build instead of three skills.
+  it('registers under exactly the name the migration wires into skills', () => {
+    const {
+      TOOL_NAME: MIGRATION_TOOL_NAME,
+    } = require('../scripts/eng1550-wire-record-ads-recommendation');
+
+    expect(MIGRATION_TOOL_NAME).toBe(TOOL);
+    expect(emmaToolRegistry.getTool(MIGRATION_TOOL_NAME)).toBeDefined();
+  });
+
   // THE integrity invariant. If a future change adds a scoring tool, this fails loudly and whoever
   // adds it has to re-decide the record/score split on purpose rather than by accident.
   it('exposes NO way for an agent to score a recommendation', () => {
