@@ -152,6 +152,28 @@ function isConformingLiveResponse(raw: any): boolean {
   return raw.items.every(isConformingLiveItem);
 }
 
+/**
+ * ENG-1938: the better of the live and ledger estimates for one invitation.
+ *
+ * Both are upper bounds on the real send — LinkedIn exposes a relative age and
+ * Unipile resolves it at REQUEST time — so the earlier value is the tighter one
+ * and neither can be earlier than the real send.
+ *
+ * Why it matters here: a live page collapses to one timestamp per label, while
+ * the ledger keeps the earliest estimate ever observed. Production, 2026-09-16:
+ * a live page of 99 pending invitations carried ONE distinct `sent_at` (exactly
+ * 14 days before the call — "2 weeks ago"), while the ledger held 9 distinct
+ * values for the same account, the oldest 44 days. Serving the live value alone
+ * makes "withdraw the oldest" unrankable from this action's output.
+ */
+export function earliestSentAt(a: string | null | undefined, b: string | null | undefined): string | null {
+  const aMs = typeof a === 'string' ? Date.parse(a) : NaN;
+  const bMs = typeof b === 'string' ? Date.parse(b) : NaN;
+  if (Number.isNaN(aMs)) return Number.isNaN(bMs) ? (typeof a === 'string' ? a : null) : (b as string);
+  if (Number.isNaN(bMs)) return a as string;
+  return aMs <= bMs ? (a as string) : (b as string);
+}
+
 function trimLive(item: any): TrimmedSentInvitation {
   return {
     id: item?.id ?? null,
@@ -192,7 +214,9 @@ const NOT_TRACKED_NOTICE =
  * Resolve the pending-invitation list for an account, naming its provenance.
  *
  * Order of preference, and why:
- *   1. A CONFORMING live response with rows — freshest and authoritative.
+ *   1. A CONFORMING live response with rows — freshest and authoritative, with each
+ *      row's `sent_at` merged against our ledger's estimate (ENG-1938, see
+ *      `earliestSentAt`).
  *   2. The cache, whenever live is unusable OR live says zero while our ledger holds
  *      rows. A live zero during an active cooldown is precisely the observed
  *      failure; the ledger is refreshed every ~10 minutes and is the better answer.
@@ -219,14 +243,39 @@ export async function getSentInvitationsView(
     liveFailureDetail = `the live sent-invitations read failed (${error instanceof Error ? error.message : 'unknown error'})`;
   }
 
+  // Read the ledger alongside a usable live page too: its `sentAt` is the earliest
+  // estimate ever observed for each invitation, which a single live page cannot be
+  // (ENG-1938). Failure here must never degrade a working live read.
+  let cachedRows: any[] = [];
+  let cacheFailed = false;
+  try {
+    cachedRows = await deps.fetchCached(accountId);
+  } catch (error) {
+    cacheFailed = true;
+    console.error(`[linkedInSentInvitationsView] cache read failed for ${accountId}:`, error);
+  }
+
   if (!liveUnavailable) {
-    const items = (live.items as any[]).map(trimLive);
+    const ledgerSentAtByPublicId = new Map<string, string>();
+    for (const row of cachedRows) {
+      const publicId = typeof row?.invitedUserPublicId === 'string' ? row.invitedUserPublicId : '';
+      if (publicId && typeof row?.sentAt === 'string') ledgerSentAtByPublicId.set(publicId, row.sentAt);
+    }
+    const items = (live.items as any[]).map((item) => {
+      const trimmed = trimLive(item);
+      const ledgerSentAt = trimmed.invited_user_public_id
+        ? ledgerSentAtByPublicId.get(trimmed.invited_user_public_id)
+        : undefined;
+      return ledgerSentAt ? { ...trimmed, sent_at: earliestSentAt(trimmed.sent_at, ledgerSentAt) } : trimmed;
+    });
     if (items.length > 0) {
       // A cursor means more pages exist, so this page's length is a floor on the
       // backlog, not its size. Say "at least" rather than overstate our knowledge.
       const morePages = Boolean(live.cursor);
+      // Oldest first: the merged estimates finally make this ordering meaningful.
+      const ordered = [...items].sort((a, b) => String(a.sent_at ?? '').localeCompare(String(b.sent_at ?? '')));
       return {
-        items: items.slice(0, MAX_RETURNED_INVITATIONS),
+        items: ordered.slice(0, MAX_RETURNED_INVITATIONS),
         totalPending: items.length,
         ...(morePages ? { totalPendingIsLowerBound: true } : {}),
         source: 'live',
@@ -235,7 +284,7 @@ export async function getSentInvitationsView(
         notice:
           `${morePages ? 'At least ' : ''}${items.length} pending invitation${items.length === 1 ? '' : 's'} `
           + `read live from LinkedIn`
-          + `${items.length > MAX_RETURNED_INVITATIONS ? `; showing the first ${MAX_RETURNED_INVITATIONS}` : ''}.`
+          + `${items.length > MAX_RETURNED_INVITATIONS ? `; showing the ${MAX_RETURNED_INVITATIONS} oldest` : ''}.`
           + (morePages
             ? ' More pages remain, so the real backlog is larger than this number — pass the cursor to read on.'
             : '')
@@ -247,15 +296,7 @@ export async function getSentInvitationsView(
   // Either live was unusable, or live said zero. Both are cases where our own
   // ledger is the better answer — and in the ENG-1132 incident it held 126 rows
   // for the very account that was reporting nothing.
-  let cached: any[] = [];
-  let cacheFailed = false;
-  try {
-    cached = await deps.fetchCached(accountId);
-  } catch (error) {
-    cacheFailed = true;
-    console.error(`[linkedInSentInvitationsView] cache read failed for ${accountId}:`, error);
-  }
-
+  const cached = cachedRows;
   if (cached.length > 0) {
     const items = cached
       .map(trimCached)
