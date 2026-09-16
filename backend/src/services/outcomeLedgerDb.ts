@@ -43,10 +43,20 @@ const PAGE_SIZE = 200;
 
 /** Capture callers can bound their latency without changing the legacy API's retry policy.
  * Abort the SDK request, rather than racing a timer and leaving orphaned network work. */
-async function ledgerRequest<T>(request: AWS.Request<T, AWS.AWSError>, timeoutMs?: number): Promise<T> {
-  const timer = timeoutMs === undefined ? undefined : setTimeout(() => request.abort(), timeoutMs);
-  try { return await request.promise(); }
+export async function ledgerRequest<T>(request: AWS.Request<T, AWS.AWSError>, timeoutMs?: number): Promise<T> {
+  if (timeoutMs === undefined) return request.promise();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = request.promise();
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      // Reject first: SDK abort is best effort and may settle asynchronously.
+      reject(new Error('outcomeLedger: request deadline exceeded'));
+      try { request.abort(); } catch { /* deadline remains authoritative */ }
+    }, Math.max(0, timeoutMs));
+  });
+  try { return await Promise.race([operation, deadline]); }
   finally { if (timer !== undefined) clearTimeout(timer); }
+
 }
 
 function finiteMetric(value: unknown): boolean {
@@ -66,7 +76,7 @@ export class RecommendationExistsError extends Error {}
 
 const PREDICTED_DIRECTIONS: ReadonlyArray<PredictedDirection> = ['increase', 'decrease'];
 const ACTUAL_DIRECTIONS: ReadonlyArray<ActualDirection> = ['increase', 'decrease', 'flat'];
-const VERDICTS: ReadonlyArray<OutcomeVerdict> = ['correct', 'incorrect', 'unscoreable'];
+const VERDICTS: ReadonlyArray<OutcomeVerdict> = ['correct', 'incorrect', 'inconclusive', 'unscoreable'];
 
 /** Exported for direct unit testing — pure, touches no AWS SDK state. */
 export function itemToRecommendation(item: AWS.DynamoDB.DocumentClient.AttributeMap): Recommendation | null {

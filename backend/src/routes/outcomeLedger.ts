@@ -70,13 +70,60 @@ router.get('/:platform/:accountId', authenticateToken, async (req: any, res) => 
 
     const recommendations = (await getRecommendationsForAccount(owned.platform, owned.accountId))
       // Shared platform accounts do not grant access to another client's captured rationale.
-      // Legacy rows retain the existing account-owner visibility contract.
-      .filter(r => !r.context || r.context.clientUserId === req.user.userId);
+      // Existing connected-account ownership proves access to the account, not to a legacy
+      // row. createdBy is an admin/execution actor, not its client. Ambiguous rows fail closed.
+      .filter(r => r.context?.clientUserId === req.user.userId);
     res.json({ platform: owned.platform, accountId: owned.accountId, recommendations });
   } catch (error: any) {
     console.error('[ENG-1550] read outcome ledger failed:', error);
     res.status(500).json({ error: 'Failed to read outcome ledger' });
   }
+});
+
+/** Bounded scoped guidance; account ownership and client identity are server-derived. */
+router.get('/:platform/:accountId/learning', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (req.query.campaignId !== undefined && (typeof req.query.campaignId !== 'string' || !req.query.campaignId.trim() || req.query.campaignId.length > 2000)) {
+      return res.status(400).json({ error: 'Invalid campaign scope' });
+    }
+    const { getScopedLearning } = await import('../services/adsLearningDb');
+    const lessons = await getScopedLearning({ userId: req.user.userId, accountId: owned.accountId, platform: owned.platform,
+      campaignId: typeof req.query.campaignId === 'string' ? req.query.campaignId : undefined, now: new Date().toISOString() });
+    res.json({ mode: 'shadow', lessons });
+  } catch { res.status(503).json({ error: 'Learning unavailable' }); }
+});
+
+/** Explicit review/rollback only; the scheduler has no authority to call this. */
+router.post('/:platform/:accountId/learning/:memoryId/:action', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (!['approve', 'revert'].includes(req.params.action)) return res.status(400).json({ error: 'Invalid review action' });
+    const targetScope = req.body?.scope ?? 'campaign';
+    if (!['client', 'campaign', 'channel'].includes(targetScope)) return res.status(400).json({ error: 'Invalid learning scope' });
+    const { reviewLearning } = await import('../services/adsLearningReview');
+    const result = await reviewLearning({ userId: req.user.userId, accountId: owned.accountId, platform: owned.platform,
+      campaignId: typeof req.body?.campaignId === 'string' ? req.body.campaignId : undefined, now: new Date().toISOString() },
+      req.params.memoryId, req.params.action, targetScope);
+    return res.status(result.applied ? 200 : 409).json(result);
+  } catch { res.status(409).json({ error: 'Learning review could not be applied' }); }
+});
+
+router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken, async (req: any, res) => {
+  try {
+    const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
+    if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    const r = await getRecommendation(owned.platform, owned.accountId, req.params.recommendationId);
+    if (!r?.context || r.context.clientUserId !== req.user.userId) return res.status(404).json({ error: 'Recommendation not found' });
+    if (r.status !== 'pending' || r.context.execution) return res.status(409).json({ error: 'Recommendation already resolved' });
+    const { attachExecutionReceipt } = await import('../services/adsLearningDb');
+    await attachExecutionReceipt(r, { reference: `decline:${req.user.userId}:${r.recommendationId}`, clientUserId: req.user.userId,
+      platform: owned.platform, accountId: owned.accountId, campaignId: r.context.campaignId, recommendationId: r.recommendationId,
+      status: 'declined', adopted: false, executedAt: new Date().toISOString() });
+    res.json({ adopted: false });
+  } catch { res.status(409).json({ error: 'Recommendation could not be declined' }); }
 });
 
 /**

@@ -233,7 +233,7 @@ describe('ENG-502 captured client scope', () => {
     ]);
     const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
     expect(res.status).toBe(200);
-    expect(res.body.recommendations.map((r: any) => r.recommendationId)).toEqual(['mine', 'legacy']);
+    expect(res.body.recommendations.map((r: any) => r.recommendationId)).toEqual(['mine']);
   });
   it('refuses an unsupported manual score for a shadow proposal even by an admin', async () => {
     CALLER_IS_ADMIN = true;
@@ -244,4 +244,29 @@ describe('ENG-502 captured client scope', () => {
     expect(res.body.reason).toBe('attributed_evaluation_required');
     expect(mockDb.putScoredRecommendation).not.toHaveBeenCalled();
   });
+});
+
+it.each([undefined, 'other-client', 'caller-1'])('hides ambiguous legacy ownership even with creator %s', async createdBy => {
+  (mockDb.getRecommendationsForAccount as jest.Mock).mockResolvedValue([{ recommendationId: 'legacy', createdBy }]);
+  const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+  expect(res.status).toBe(200);
+  expect(res.body.recommendations).toEqual([]);
+});
+
+jest.mock('../services/adsLearningDb', () => ({ getScopedLearning: jest.fn().mockResolvedValue([]), attachExecutionReceipt: jest.fn().mockResolvedValue(undefined) }));
+import { attachExecutionReceipt } from '../services/adsLearningDb';
+it('records explicit owner rejection as non-adoption, never as a performance failure', async () => {
+  mockDb.getRecommendation.mockResolvedValue({ status: 'pending', recommendationId: 'r', context: { clientUserId: 'caller-1', campaignId: 'c' } } as any);
+  const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/r/decline`);
+  expect(res.status).toBe(200);
+  expect(attachExecutionReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ adopted: false, status: 'declined', clientUserId: 'caller-1' }));
+});
+it('does not allow shared-account peers to decline another client recommendation', async () => {
+  mockDb.getRecommendation.mockResolvedValue({ status: 'pending', context: { clientUserId: 'other' } } as any);
+  expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/r/decline`)).status).toBe(404);
+  expect(attachExecutionReceipt).not.toHaveBeenCalled();
+});
+
+it('rejects repeated campaign query values instead of silently dropping scope', async () => {
+  expect((await request(app()).get(`/api/outcome-ledger/meta/${OWNED}/learning?campaignId=a&campaignId=b`)).status).toBe(400);
 });

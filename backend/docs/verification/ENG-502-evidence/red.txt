@@ -1,0 +1,1036 @@
+# ENG-502 TDD evidence
+Baseline: 61ea656e66e0271ae8075a2cacfc61bf13bb3d5c
+RED runs precede implementation of the named behavior. Stub seams returned no result, not mock success.
+
+## review-red
+  ● Console
+
+    console.error
+      [ENG-1550] record recommendation failed: Error: outcomeLedger: hypothesis must not be empty — an unscoreable-by-design prediction is not a prediction
+          at createRecommendation (/home/harsha/agentweb-eng502/backend/src/services/outcomeLedger.ts:148:11)
+          at /home/harsha/agentweb-eng502/backend/src/routes/outcomeLedger.ts:95:48
+          at Layer.handle [as handle_request] (/home/harsha/agentweb/backend/node_modules/express/lib/router/layer.js:95:5)
+          at next (/home/harsha/agentweb/backend/node_modules/express/lib/router/route.js:149:13)
+          at requireAdmin (/home/harsha/agentweb-eng502/backend/src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:28:5)
+          at Layer.handle [as handle_request] (/home/harsha/agentweb/backend/node_modules/express/lib/router/layer.js:95:5)
+          at next (/home/harsha/agentweb/backend/node_modules/express/lib/router/route.js:149:13)
+          at authenticateToken (/home/harsha/agentweb-eng502/backend/src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:24:5)
+          at Layer.handle [as handle_request] (/home/harsha/agentweb/backend/node_modules/express/lib/router/layer.js:95:5)
+          at next (/home/harsha/agentweb/backend/node_modules/express/lib/router/route.js:149:13)
+          at Route.dispatch (/home/harsha/agentweb/backend/node_modules/express/lib/router/route.js:119:3)
+          at Layer.handle [as handle_request] (/home/harsha/agentweb/backend/node_modules/express/lib/router/layer.js:95:5)
+          at /home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:284:15
+          at param (/home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:365:14)
+          at param (/home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:376:14)
+          at param (/home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:376:14)
+          at router.process_params (/home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:421:3)
+          at next (/home/harsha/agentweb/backend/node_modules/express/lib/router/index.js:280:10)
+  ● ENG-502 captured client scope › filters another client even when both clients own the same platform account
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 0
+    + Received  + 1
+
+      Array [
+        "mine",
+    +   "legacy",
+      ]
+
+      234 |     const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+      235 |     expect(res.status).toBe(200);
+    > 236 |     expect(res.body.recommendations.map((r: any) => r.recommendationId)).toEqual(['mine']);
+          |                                                                          ^
+      237 |   });
+      238 |   it('refuses an unsupported manual score for a shadow proposal even by an admin', async () => {
+      239 |     CALLER_IS_ADMIN = true;
+
+      at Object.<anonymous> (src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:236:74)
+
+  ● hides ambiguous legacy ownership even with creator undefined
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 5
+
+    - Array []
+    + Array [
+    +   Object {
+    +     "recommendationId": "legacy",
+    +   },
+    + ]
+
+      251 |   const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+      252 |   expect(res.status).toBe(200);
+    > 253 |   expect(res.body.recommendations).toEqual([]);
+          |                                    ^
+      254 | });
+      255 |
+
+      at src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:253:36
+  ● hides ambiguous legacy ownership even with creator other-client
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 6
+
+    - Array []
+    + Array [
+    +   Object {
+    +     "createdBy": "other-client",
+    +     "recommendationId": "legacy",
+    +   },
+    + ]
+
+      251 |   const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+      252 |   expect(res.status).toBe(200);
+    > 253 |   expect(res.body.recommendations).toEqual([]);
+          |                                    ^
+      254 | });
+      255 |
+
+  ● hides ambiguous legacy ownership even with creator caller-1
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 6
+
+    - Array []
+    + Array [
+    +   Object {
+    +     "createdBy": "caller-1",
+    +     "recommendationId": "legacy",
+    +   },
+    + ]
+
+      251 |   const res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}`);
+      252 |   expect(res.status).toBe(200);
+    > 253 |   expect(res.body.recommendations).toEqual([]);
+          |                                    ^
+      254 | });
+      255 |
+
+  ● Console
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_36d8735671bc850f96a47f1c0210a8eb447bb372da6842a1058569dfb6b7615c',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:101:15
+          at async Promise.all (index 0)
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_36d8735671bc850f96a47f1c0210a8eb447bb372da6842a1058569dfb6b7615c',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:101:15
+          at async Promise.all (index 0)
+          at async Promise.all (index 0)
+
+    console.info
+  ● enforces a 100ms TOTAL capture deadline even when SDK abort settles late
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: true
+    Received: false
+
+      203 |   const result = assessClientHealth('admin', 'client-a@example.com', true).then(r => { finished = true; return r; });
+      204 |   await jest.advanceTimersByTimeAsync(100);
+    > 205 |   expect(finished).toBe(true);
+          |                    ^
+      206 |   expect((await result).success).toBe(true);
+      207 |   expect(abort).toHaveBeenCalledTimes(1);
+      208 |   reject(new Error('late SDK rejection'));
+
+      at Object.<anonymous> (src/__tests__/eng502.capture.test.ts:205:20)
+
+Test Suites: 2 failed, 2 total
+Tests:       5 failed, 39 passed, 44 total
+Time:        1.098 s
+
+## evaluator-red
+  ● scores settled attributed recovery correct
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      20 |   receipt: receipt(), baseline: { rows: rows('2026-03-01', 100), truncated: false },
+      21 |   outcome: { rows: rows('2026-03-16', 200), truncated: false }, ...patch });
+    > 22 | it('scores settled attributed recovery correct', () => expect(run()).toMatchObject({ verdict: 'correct', adopted: true }));
+         |                                                                      ^
+      23 | it('scores an attributed decrease incorrect, but never a missing receipt', () => {
+      24 |   expect(run({ outcome: { rows: rows('2026-03-16', 50), truncated: false } })).toMatchObject({ verdict: 'incorrect' });
+      25 |   expect(run({ receipt: null })).toMatchObject({ verdict: 'unscoreable', adopted: null });
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:22:70)
+
+  ● scores an attributed decrease incorrect, but never a missing receipt
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      22 | it('scores settled attributed recovery correct', () => expect(run()).toMatchObject({ verdict: 'correct', adopted: true }));
+      23 | it('scores an attributed decrease incorrect, but never a missing receipt', () => {
+    > 24 |   expect(run({ outcome: { rows: rows('2026-03-16', 50), truncated: false } })).toMatchObject({ verdict: 'incorrect' });
+         |                                                                                ^
+      25 |   expect(run({ receipt: null })).toMatchObject({ verdict: 'unscoreable', adopted: null });
+      26 | });
+      27 | it('labels statistically indistinguishable results inconclusive', () =>
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:24:80)
+
+  ● labels statistically indistinguishable results inconclusive
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      26 | });
+      27 | it('labels statistically indistinguishable results inconclusive', () =>
+    > 28 |   expect(run({ outcome: { rows: rows('2026-03-16', 100), truncated: false } })).toMatchObject({ verdict: 'inconclusive' }));
+         |                                                                                 ^
+      29 | it('passing safety control: unsettled data is never correct', () => expect(run({ now: '2026-04-01' })?.verdict).not.toBe('correct'));
+      30 | it.each(['userId', 'accountId', 'campaignId', 'platform'])('refuses foreign snapshot %s', key => {
+      31 |   const foreign = rows('2026-03-16', 200); foreign[0][key] = 'foreign';
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:28:81)
+
+  ● refuses foreign snapshot userId
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      30 | it.each(['userId', 'accountId', 'campaignId', 'platform'])('refuses foreign snapshot %s', key => {
+      31 |   const foreign = rows('2026-03-16', 200); foreign[0][key] = 'foreign';
+    > 32 |   expect(run({ outcome: { rows: foreign, truncated: false } })).toMatchObject({ verdict: 'unscoreable' });
+         |                                                                 ^
+      33 | });
+      34 | it('does not score ad-level predictions against campaign metrics', () => {
+      35 |   const r = recommendation(); r.context.metricScope = 'ad';
+
+      at src/__tests__/eng1967.evaluator.test.ts:32:65
+
+  ● refuses foreign snapshot accountId
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      30 | it.each(['userId', 'accountId', 'campaignId', 'platform'])('refuses foreign snapshot %s', key => {
+      31 |   const foreign = rows('2026-03-16', 200); foreign[0][key] = 'foreign';
+    > 32 |   expect(run({ outcome: { rows: foreign, truncated: false } })).toMatchObject({ verdict: 'unscoreable' });
+         |                                                                 ^
+      33 | });
+      34 | it('does not score ad-level predictions against campaign metrics', () => {
+      35 |   const r = recommendation(); r.context.metricScope = 'ad';
+
+      at src/__tests__/eng1967.evaluator.test.ts:32:65
+
+  ● refuses foreign snapshot campaignId
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      30 | it.each(['userId', 'accountId', 'campaignId', 'platform'])('refuses foreign snapshot %s', key => {
+      31 |   const foreign = rows('2026-03-16', 200); foreign[0][key] = 'foreign';
+    > 32 |   expect(run({ outcome: { rows: foreign, truncated: false } })).toMatchObject({ verdict: 'unscoreable' });
+         |                                                                 ^
+      33 | });
+      34 | it('does not score ad-level predictions against campaign metrics', () => {
+      35 |   const r = recommendation(); r.context.metricScope = 'ad';
+
+      at src/__tests__/eng1967.evaluator.test.ts:32:65
+
+  ● refuses foreign snapshot platform
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      30 | it.each(['userId', 'accountId', 'campaignId', 'platform'])('refuses foreign snapshot %s', key => {
+      31 |   const foreign = rows('2026-03-16', 200); foreign[0][key] = 'foreign';
+    > 32 |   expect(run({ outcome: { rows: foreign, truncated: false } })).toMatchObject({ verdict: 'unscoreable' });
+         |                                                                 ^
+      33 | });
+      34 | it('does not score ad-level predictions against campaign metrics', () => {
+      35 |   const r = recommendation(); r.context.metricScope = 'ad';
+
+      at src/__tests__/eng1967.evaluator.test.ts:32:65
+
+  ● does not score ad-level predictions against campaign metrics
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      34 | it('does not score ad-level predictions against campaign metrics', () => {
+      35 |   const r = recommendation(); r.context.metricScope = 'ad';
+    > 36 |   expect(run({ recommendation: r })).toMatchObject({ verdict: 'unscoreable' });
+         |                                      ^
+      37 | });
+      38 | it('waits for platform settlement; partial reads and low samples never become incorrect', () => {
+      39 |   expect(run({ now: '2026-04-01' })).toBeNull();
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:36:38)
+
+  ● waits for platform settlement; partial reads and low samples never become incorrect
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      38 | it('waits for platform settlement; partial reads and low samples never become incorrect', () => {
+      39 |   expect(run({ now: '2026-04-01' })).toBeNull();
+    > 40 |   expect(run({ baseline: { rows: [], truncated: true } })).toMatchObject({ verdict: 'unscoreable' });
+         |                                                            ^
+      41 |   expect(run({ outcome: { rows: rows('2026-03-16', 1), truncated: false } })).toMatchObject({ verdict: 'inconclusive' });
+      42 | });
+      43 | it('rejects a receipt for a different client and preserves explicit non-adoption', () => {
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:40:60)
+
+  ● rejects a receipt for a different client and preserves explicit non-adoption
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      42 | });
+      43 | it('rejects a receipt for a different client and preserves explicit non-adoption', () => {
+    > 44 |   expect(run({ receipt: { ...receipt(), clientUserId: 'other' } })).toMatchObject({ verdict: 'unscoreable', adopted: null });
+         |                                                                     ^
+      45 |   expect(run({ receipt: { ...receipt(), adopted: false, status: 'declined' } })).toMatchObject({ verdict: 'unscoreable', adopted: false });
+      46 | });
+      47 |
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:44:69)
+
+Test Suites: 1 failed, 1 total
+Tests:       10 failed, 1 passed, 11 total
+Time:        0.635 s
+
+## learning-red
+  ● preserves provenance, confidence, expiry, review and reversible history in account memory
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+       7 |     execution: { reference: 'exec', executedAt: '2026-01-15', adopted: true } } };
+       8 | it('preserves provenance, confidence, expiry, review and reversible history in account memory', () => {
+    >  9 |   expect(buildOutcomeLesson(row)).toMatchObject({ userId: 'u', category: 'insight', learning: {
+         |                                   ^
+      10 |     scope: 'campaign', campaignId: 'c', reviewState: 'proposed', confidence: 'directional',
+      11 |     references: ['meta#a/r', 'exec'], createdAt: now, updatedAt: now,
+      12 |     expiresAt: '2026-08-30T00:00:00.000Z', history: [{ state: 'proposed', at: now }] } });
+
+      at Object.<anonymous> (src/__tests__/eng1968.learning.test.ts:9:35)
+
+  ● retrieves bounded deterministic global/client/campaign/channel order without another tenant
+
+    TypeError: Cannot read properties of null (reading 'learning')
+
+      14 | it('retrieves bounded deterministic global/client/campaign/channel order without another tenant', () => {
+      15 |   const lesson = buildOutcomeLesson(row)!;
+    > 16 |   const items = ['channel', 'campaign', 'client'].map((scope, i) => ({ ...lesson, memoryId: String(i), learning: { ...lesson.learning, scope, channel: 'meta' } }));
+         |                                                                                                                              ^
+      17 |   const foreign = { ...lesson, userId: 'other' };
+      18 |   const resolved = resolveScopedLessons([foreign, ...items], { userId: 'u', accountId: 'a', platform: 'meta', campaignId: 'c', now });
+      19 |   expect(resolved.map((x: any) => x.learning.scope)).toEqual(['global', 'client', 'campaign', 'channel']);
+
+      at src/__tests__/eng1968.learning.test.ts:16:126
+          at Array.map (<anonymous>)
+      at Object.<anonymous> (src/__tests__/eng1968.learning.test.ts:16:51)
+
+  ● proposes a capped ENG-918 parameter only from repeated independent supported outcomes
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 2
+    + Received  + 1
+
+      Object {
+    -   "allowed": true,
+    -   "value": 25,
+    +   "allowed": false,
+      }
+
+      22 |   const rows = Array.from({ length: 30 }, (_, i) => ({ ...row, recommendationId: String(i), context: { ...row.context,
+      23 |     campaignId: `campaign-${i}`, execution: { ...row.context.execution, reference: `exec-${i}` } } }));
+    > 24 |   expect(proposeParameterLearning(rows, null, now)).toMatchObject({ allowed: true, value: 25 });
+         |                                                     ^
+      25 |   expect(proposeParameterLearning(rows.slice(0, 29), null, now)).toMatchObject({ allowed: false });
+      26 |   expect(proposeParameterLearning(rows, { source: 'user', currentValue: 15 } as any, now)).toMatchObject({ allowed: false, reason: 'learned_would_override_user' });
+      27 | });
+
+      at Object.<anonymous> (src/__tests__/eng1968.learning.test.ts:24:53)
+  ● excludes expired, rolled back, wrong-account and wrong-campaign lessons
+
+    TypeError: Cannot read properties of null (reading 'learning')
+
+      30 |   const l = buildOutcomeLesson(row)!;
+      31 |   const lessons = [
+    > 32 |     { ...l, learning: { ...l.learning, expiresAt: '2026-01-01' } },
+         |                              ^
+      33 |     { ...l, learning: { ...l.learning, reviewState: 'reverted' } },
+      34 |     { ...l, learning: { ...l.learning, campaignId: 'other' } },
+      35 |     { ...l, learning: { ...l.learning, accountId: 'other' } },
+
+      at Object.<anonymous> (src/__tests__/eng1968.learning.test.ts:32:30)
+
+Test Suites: 1 failed, 1 total
+Tests:       4 failed, 2 passed, 6 total
+Time:        0.629 s
+
+## loop-red
+  ● Console
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:107:15
+          at async Promise.all (index 0)
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:107:15
+          at async Promise.all (index 0)
+
+    console.info
+      [AdsLearning] capture confirmed {
+  ● capture → ledger → due evaluation → scoped learning without manually writing ledger or memory
+
+    expect(received).toHaveLength(expected)
+
+    Expected length: 2
+    Received length: 0
+    Received array:  []
+
+      48 |   await runAdsLearningEvaluation(new Date('2026-05-01'));
+      49 |   const learning = await getScopedLearning({ userId: 'u', accountId: 'a', platform: 'meta', campaignId: 'c', now: '2026-05-01' });
+    > 50 |   expect(learning).toHaveLength(2);
+         |                    ^
+      51 |   expect(learning[1].learning).toMatchObject({ reviewState: 'proposed', confidence: 'unsupported' });
+      52 |   expect([...table('AW-AdsOutcomeLedger').values()][0]).toMatchObject({ status: 'scored', verdict: 'unscoreable', adopted: null });
+      53 | });
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:50:20)
+
+  ● replay cannot duplicate a learned item or rewrite a verdict
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 0
+
+      56 |   await runAdsLearningEvaluation(new Date('2026-05-01'));
+      57 |   await runAdsLearningEvaluation(new Date('2026-05-02'));
+    > 58 |   expect(table('AW-AccountMemory').size).toBe(1);
+         |                                          ^
+      59 |   expect([...table('AW-AdsOutcomeLedger').values()][0].scoredAt).toBe('2026-05-01T00:00:00.000Z');
+      60 | });
+      61 | it('isolates shared-account clients through evaluation and retrieval', async () => {
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:58:42)
+
+  ● isolates shared-account clients through evaluation and retrieval
+
+    expect(received).toHaveLength(expected)
+
+    Expected length: 2
+    Received length: 0
+    Received array:  []
+
+      64 |   await runAdsLearningEvaluation(new Date('2026-05-01'));
+      65 |   const learning = await getScopedLearning({ userId: 'other', accountId: 'a', platform: 'meta', campaignId: 'c', now: '2026-05-01' });
+    > 66 |   expect(learning).toHaveLength(2);
+         |                    ^
+      67 |   expect(learning.every(x => x.userId === 'other')).toBe(true);
+      68 | });
+      69 | it('passing safety control: off switch performs no evaluation writes', async () => {
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:66:20)
+
+Test Suites: 1 failed, 1 total
+Tests:       3 failed, 1 passed, 4 total
+Time:        0.746 s
+
+## campaign-red
+  ● Console
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:107:15
+          at async Promise.all (index 0)
+
+    console.info
+      [AdsLearning] evaluated {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        verdict: 'unscoreable'
+      }
+
+      at runAdsLearningEvaluation (src/cron/adsLearningCron.ts:34:19)
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+  ● captures supported campaign evidence and attaches only a verified execution receipt, then learns
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 2
+    Received: 1
+
+      86 |   await metrics('2026-02-15', 200); await metrics('2026-03-01', 100);
+      87 |   await captureFatigueRecommendations(input);
+    > 88 |   expect(table('AW-AdsOutcomeLedger').size).toBe(2);
+         |                                             ^
+      89 |   await observeVerifiedCreativeExecution({ userId: 'u', accountId: 'a', adId: 'ad', creativeId: 'replacement', verified: true,
+      90 |     now: '2026-03-15T12:00:00.000Z' });
+      91 |   await metrics('2026-03-15', 200);
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:88:45)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 5 passed, 6 total
+Time:        0.678 s, estimated 1 s
+
+## promotion-red
+  ● Console
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        mode: 'shadow'
+      }
+
+      at src/services/adsRecommendationCapture.ts:136:15
+          at async Promise.all (index 0)
+
+    console.info
+      [AdsLearning] evaluated {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+        verdict: 'unscoreable'
+      }
+
+      at runAdsLearningEvaluation (src/cron/adsLearningCron.ts:33:19)
+
+    console.info
+      [AdsLearning] capture confirmed {
+        recommendationId: 'fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0',
+  ● supported shadow learning requires review, then updates ENG-918 once with capped movement and provenance
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+    -   "applied": true,
+    +   "applied": false,
+      }
+
+      126 |   const lesson = await supportedFleet();
+      127 |   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+    > 128 |   expect(await reviewLearning({ ...scope, campaignId: lesson.learning.campaignId }, lesson.memoryId, 'approve')).toMatchObject({ applied: true });
+          |                                                                                                                  ^
+      129 |   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toMatchObject({ currentValue: 25, source: 'learned',
+      130 |     revisions: [expect.objectContaining({ sampleSize: 30, changedBy: 'u', evidence: expect.stringContaining(lesson.memoryId) })] });
+      131 | });
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:128:114)
+
+  ● approval replay cannot walk the movement cap
+
+    expect(received).toHaveLength(expected)
+
+    Matcher error: received value must have a length property whose value must be a number
+
+    Received has value: undefined
+
+      135 |   await reviewLearning(s, lesson.memoryId, 'approve');
+      136 |   await reviewLearning(s, lesson.memoryId, 'approve');
+    > 137 |   expect((await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct'))?.revisions).toHaveLength(1);
+          |                                                                                              ^
+      138 | });
+      139 | it('rollback restores registry default with audit history and cooldown', async () => {
+      140 |   const lesson = await supportedFleet();
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:137:94)
+
+  ● rollback restores registry default with audit history and cooldown
+
+    expect(received).toMatchObject(expected)
+
+    Matcher error: received value must be a non-null object
+
+    Received has value: null
+
+      142 |   await reviewLearning(s, lesson.memoryId, 'approve');
+      143 |   await reviewLearning({ ...s, now: '2026-05-03T00:00:00.000Z' }, lesson.memoryId, 'revert');
+    > 144 |   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toMatchObject({ currentValue: 20, source: 'default',
+          |                                                                                 ^
+      145 |     learnedCooldownUntil: expect.any(String), revisions: [expect.any(Object), expect.any(Object)] });
+      146 | });
+      147 |
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:144:81)
+
+Test Suites: 1 failed, 1 total
+Tests:       3 failed, 6 passed, 9 total
+Time:        0.91 s, estimated 1 s
+
+## retrieval-red
+  ● Console
+
+    console.warn
+      ⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.
+
+      37 |     : new WebClient(process.env.SLACK_BOT_TOKEN);
+      38 | } else {
+    > 39 |   console.warn("⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.");
+         |           ^
+      40 | }
+      41 |
+      42 | export const APPROVAL_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL || "#approvals";
+
+      at Object.<anonymous> (src/services/slackService.ts:39:11)
+      at Object.<anonymous> (src/services/humanEvalService.ts:8:1)
+      at Object.<anonymous> (src/emma/tools.ts:18:1)
+      at Object.<anonymous> (src/__tests__/eng918.getAdsThresholdsTool.test.ts:28:1)
+
+  ● retrieves scoped guidance only when requested, using the authenticated client
+
+    expect(received).toEqual(expected) // deep equality
+
+    Expected: [{"content": "fixture guidance"}]
+    Received: undefined
+
+      141 |   const tool = emmaToolRegistry.getTool('get_ads_thresholds')!;
+      142 |   const result = await tool.execute({ platform: 'meta', account_id: OWNED, include_learning: true, campaign_id: 'campaign' }, { userId: 'caller-1' });
+    > 143 |   expect(result.learning).toEqual([{ content: 'fixture guidance' }]);
+          |                           ^
+      144 |   expect(getScopedLearning).toHaveBeenCalledWith(expect.objectContaining({ userId: 'caller-1', campaignId: 'campaign', accountId: OWNED }));
+      145 | });
+      146 | it('keeps parameter output usable and marks guidance unavailable on retrieval failure', async () => {
+
+      at Object.<anonymous> (src/__tests__/eng918.getAdsThresholdsTool.test.ts:143:27)
+
+  ● keeps parameter output usable and marks guidance unavailable on retrieval failure
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 0
+
+    @@ -1,8 +1,7 @@
+      Object {
+        "account_id": "1842363582956923",
+    -   "learningUnavailable": true,
+        "parameters": Array [
+          Object {
+            "defaultValue": 20,
+            "description": "CTR decline vs baseline that contributes to a critical fatigue verdict.",
+            "key": "creativeFatigue.ctrDropCriticalPct",
+
+      151 |   const baseline = await tool.execute({ platform: 'meta', account_id: OWNED }, { userId: 'caller-1' });
+      152 |   const result = await tool.execute({ platform: 'meta', account_id: OWNED, include_learning: true }, { userId: 'caller-1' });
+    > 153 |   expect(result).toEqual({ ...baseline, learningUnavailable: true });
+          |                  ^
+      154 | });
+Test Suites: 1 failed, 1 total
+Tests:       2 failed, 6 passed, 8 total
+Time:        3.029 s
+
+## expiry-red
+  ● expired learned parameter falls back without deleting numeric audit history
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Object {
+    -   "source": "default",
+    -   "value": 20,
+    +   "source": "learned",
+    +   "value": 25,
+      }
+
+      46 |   const parameter: any = { paramKey: 'creativeFatigue.ctrDropCriticalPct', currentValue: 25, source: 'learned',
+      47 |     updatedAt: '2026-01-01', revisions: [{ evidence: 'Reviewed ads-learning#fixture', changedAt: '2026-01-01' }] };
+    > 48 |   expect(resolveThresholds([parameter])['creativeFatigue.ctrDropCriticalPct']).toEqual({ value: 20, source: 'default' });
+         |                                                                                ^
+      49 |   expect(parameter.revisions).toHaveLength(1);
+      50 | });
+      51 |
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 6 passed, 7 total
+Time:        0.629 s, estimated 1 s
+
+## memory-red
+  ● ENG-1968 structured learning stays out of generic memory › fills the requested ordinary-memory limit across filtered pages: getUserMemories
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 3
+    + Received  + 1
+
+    - Array [
+    -   "ordinary",
+    - ]
+    + Array []
+
+      435 |     const result = method === 'getRecentMemories' ? await accountMemoryDb.getRecentMemories('user1', 1)
+      436 |       : await accountMemoryDb.getUserMemories('user1', undefined, 1);
+    > 437 |     expect(result.map((x: any) => x.memoryId)).toEqual(['ordinary']);
+          |                                                ^
+      438 |     expect(mockDocumentClientMethods.query.mock.calls[1][0].ExclusiveStartKey.memoryId).toBe('ads-learning#1');
+      439 |   });
+      440 |   it('fails closed on a wrong-type memory row', async () => {
+
+      at src/__tests__/accountMemory.test.ts:437:48
+
+  ● ENG-1968 structured learning stays out of generic memory › fills the requested ordinary-memory limit across filtered pages: getRecentMemories
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 3
+    + Received  + 1
+
+    - Array [
+    -   "ordinary",
+    - ]
+    + Array []
+
+      435 |     const result = method === 'getRecentMemories' ? await accountMemoryDb.getRecentMemories('user1', 1)
+      436 |       : await accountMemoryDb.getUserMemories('user1', undefined, 1);
+    > 437 |     expect(result.map((x: any) => x.memoryId)).toEqual(['ordinary']);
+          |                                                ^
+      438 |     expect(mockDocumentClientMethods.query.mock.calls[1][0].ExclusiveStartKey.memoryId).toBe('ads-learning#1');
+      439 |   });
+      440 |   it('fails closed on a wrong-type memory row', async () => {
+
+      at src/__tests__/accountMemory.test.ts:437:48
+
+  ● ENG-1968 structured learning stays out of generic memory › fails closed on a wrong-type memory row
+
+    expect(received).rejects.toThrow()
+
+    Received promise resolved instead of rejected
+    Resolved to value: [{"content": "user preference", "memoryId": "ordinary"}]
+
+      440 |   it('fails closed on a wrong-type memory row', async () => {
+      441 |     mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [true] }) });
+    > 442 |     await expect(accountMemoryDb.getUserMemories('user1')).rejects.toThrow(/memory/i);
+          |           ^
+      443 |   });
+      444 | });
+      445 |
+
+      at expect (../../agentweb/backend/node_modules/expect/build/index.js:113:15)
+      at Object.<anonymous> (src/__tests__/accountMemory.test.ts:442:11)
+
+Test Suites: 1 failed, 1 total
+Tests:       3 failed, 26 passed, 29 total
+Time:        0.89 s
+
+## history-red
+  ● preserves structured learning audit history from generic memory update
+
+    expect(received).rejects.toThrow()
+
+    Received promise resolved instead of rejected
+    Resolved to value: undefined
+
+      447 |   const work = action === 'update' ? accountMemoryDb.updateMemory('u', 'ads-learning#r', { content: 'rewrite' })
+      448 |     : accountMemoryDb.deleteMemory('u', 'ads-learning#r');
+    > 449 |   await expect(work).rejects.toThrow(/review/i);
+          |         ^
+      450 | });
+      451 |
+
+      at expect (../../agentweb/backend/node_modules/expect/build/index.js:113:15)
+      at src/__tests__/accountMemory.test.ts:449:9
+
+  ● preserves structured learning audit history from generic memory delete
+
+    expect(received).rejects.toThrow()
+
+    Received promise resolved instead of rejected
+    Resolved to value: undefined
+
+      447 |   const work = action === 'update' ? accountMemoryDb.updateMemory('u', 'ads-learning#r', { content: 'rewrite' })
+      448 |     : accountMemoryDb.deleteMemory('u', 'ads-learning#r');
+    > 449 |   await expect(work).rejects.toThrow(/review/i);
+          |         ^
+      450 | });
+      451 |
+
+      at expect (../../agentweb/backend/node_modules/expect/build/index.js:113:15)
+      at src/__tests__/accountMemory.test.ts:449:9
+
+Test Suites: 1 failed, 1 total
+Tests:       2 failed, 29 passed, 31 total
+Time:        0.914 s, estimated 1 s
+
+## decline-red
+  ● records explicit owner rejection as non-adoption, never as a performance failure
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 200
+    Received: 404
+
+      259 |   mockDb.getRecommendation.mockResolvedValue({ status: 'pending', recommendationId: 'r', context: { clientUserId: 'caller-1', campaignId: 'c' } } as any);
+      260 |   const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/r/decline`);
+    > 261 |   expect(res.status).toBe(200);
+          |                      ^
+      262 |   expect(attachExecutionReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ adopted: false, status: 'declined', clientUserId: 'caller-1' }));
+      263 | });
+      264 | it('does not allow shared-account peers to decline another client recommendation', async () => {
+
+      at Object.<anonymous> (src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:261:22)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 17 passed, 18 total
+Time:        0.903 s, estimated 1 s
+
+
+## future-snapshot-red
+  ● refuses campaign capture from snapshots dated after the assessment
+
+    expect(received).toHaveLength(expected)
+
+    Expected length: 0
+    Received length: 1
+    Received array:  [{"context": {"adId": "ad", "assumptions": ["Campaign snapshots measure aggregate CTR, not the individual ad.", "A verified creative-swap receipt and stable-spend complete settled windows are required.", "An observational direction match does not establish causal impact."], "campaignId": "c", "clientUserId": "u", "confidence": "uncalibrated", "evidence": [{"metric": "ctr_drop_pct", "reference": "meta:a:c:2026-02-15/2026-03-14", "value": 50}], "metricScope": "campaign", "mode": "shadow", "rationale": "The existing client-health CTR-drop detector flagged this creative against its resolved account threshold.", "reviewAfter": "2026-04-26T23:59:59.999Z", "reviewState": "unreviewed", "source": "assess_client_health", "sourceWindow": {"since": "2026-03-01", "until": "2026-03-14"}, "version": 1}, "createdAt": "2026-03-15T00:00:00.000Z", "createdBy": "emma:creative-fatigue", "entityKey": "meta#a", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Refreshing the flagged creative may recover campaign CTR toward its prior-window level.", "predictedDirection": "increase", "predictedMagnitudePct": 100, "predictedMetric": "ctr", "recommendationId": "campaign_fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0", "status": "pending"}]
+
+      174 |   await metrics('2026-02-15', 200); await metrics('2026-03-01', 100);
+      175 |   await captureFatigueRecommendations(input);
+    > 176 |   expect([...table('AW-AdsOutcomeLedger').values()].filter(r => r.context.metricScope === 'campaign')).toHaveLength(0);
+          |                                                                                                        ^
+      177 | });
+      178 |
+
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:176:104)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 11 passed, 12 total
+Time:        0.884 s, estimated 1 s
+
+## review-second-red
+  ● supported shadow learning requires review, then updates ENG-918 once with capped movement and provenance
+
+    Learning expired or scope mismatch
+
+      13 |   }
+      14 |   if (lesson.learning.reviewState === (action === 'approve' ? 'approved' : 'reverted')) return { applied: false, reason: 'already_reviewed' };
+    > 15 |   if (action === 'approve' && !resolveScopedLessons([lesson], scope).some(x => x.memoryId === memoryId)) throw new Error('Learning expired or scope mismatch');
+         |                                                                                                                ^
+      16 |   if (Date.parse(scope.now) <= Date.parse(lesson.updatedAt)) throw new Error('Review must advance revision time');
+      17 |   // ENG-918 is account-keyed. Do not promote client-derived evidence into a shared account.
+      18 |   const users = await userDb.getAllUsers();
+
+      at reviewLearning (src/services/adsLearningReview.ts:15:112)
+      at Object.<anonymous> (src/__tests__/eng502.loop.test.ts:133:10)
+
+FAIL src/__tests__/eng1550.outcomeLedgerRoutes.test.ts
+  ● rejects repeated campaign query values instead of silently dropping scope
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 400
+    Received: 200
+
+      269 |
+      270 | it('rejects repeated campaign query values instead of silently dropping scope', async () => {
+    > 271 |   expect((await request(app()).get(`/api/outcome-ledger/meta/${OWNED}/learning?campaignId=a&campaignId=b`)).status).toBe(400);
+          |                                                                                                                     ^
+      272 | });
+      273 |
+
+      at Object.<anonymous> (src/__tests__/eng1550.outcomeLedgerRoutes.test.ts:271:117)
+
+FAIL src/__tests__/eng1967.evaluator.test.ts
+  ● rejects invalid prediction dates before attempting evaluation
+
+    expect(received).toThrow(expected)
+
+    Expected pattern: /date/i
+
+    Received function did not throw
+
+      60 | it('rejects invalid prediction dates before attempting evaluation', () => {
+      61 |   const r = recommendation(); r.evaluationDate = 'invalid';
+    > 62 |   expect(() => run({ recommendation: r })).toThrow(/date/i);
+         |                                            ^
+      63 | });
+      64 |
+
+      at Object.<anonymous> (src/__tests__/eng1967.evaluator.test.ts:62:44)
+
+Test Suites: 3 failed, 3 total
+Tests:       3 failed, 45 passed, 48 total
+Time:        1.297 s
+
+## threshold-boundary-red
+  ● rejects malformed revision elements null at the shared storage boundary
+
+    expect(received).toThrow(expected)
+
+    Expected pattern: /revision/i
+
+    Received function did not throw
+
+      78 | });
+      79 | it.each([[null], [true], [{ evidence: true }]])('rejects malformed revision elements %p at the shared storage boundary', revision => {
+    > 80 |   expect(() => itemToParameter(item({ revisions: [revision] }))).toThrow(/revision/i);
+         |                                                                  ^
+      81 | });
+      82 | it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+      83 |   expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+
+      at src/__tests__/eng918.adsThresholdsDb.test.ts:80:66
+
+  ● rejects malformed revision elements true at the shared storage boundary
+
+    expect(received).toThrow(expected)
+
+    Expected pattern: /revision/i
+
+    Received function did not throw
+
+      78 | });
+      79 | it.each([[null], [true], [{ evidence: true }]])('rejects malformed revision elements %p at the shared storage boundary', revision => {
+    > 80 |   expect(() => itemToParameter(item({ revisions: [revision] }))).toThrow(/revision/i);
+         |                                                                  ^
+      81 | });
+      82 | it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+      83 |   expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+
+      at src/__tests__/eng918.adsThresholdsDb.test.ts:80:66
+
+  ● rejects malformed revision elements {"evidence": true} at the shared storage boundary
+
+    expect(received).toThrow(expected)
+
+    Expected pattern: /revision/i
+
+    Received function did not throw
+
+      78 | });
+      79 | it.each([[null], [true], [{ evidence: true }]])('rejects malformed revision elements %p at the shared storage boundary', revision => {
+    > 80 |   expect(() => itemToParameter(item({ revisions: [revision] }))).toThrow(/revision/i);
+         |                                                                  ^
+      81 | });
+      82 | it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+      83 |   expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+
+      at src/__tests__/eng918.adsThresholdsDb.test.ts:80:66
+
+  ● rejects wrong-type current values true rather than numeric coercion
+
+    expect(received).toThrow()
+
+    Received function did not throw
+
+      81 | });
+      82 | it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+    > 83 |   expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+         |                                                                ^
+      84 | });
+      85 |
+
+      at src/__tests__/eng918.adsThresholdsDb.test.ts:83:64
+
+  ● rejects wrong-type current values [] rather than numeric coercion
+
+    expect(received).toThrow()
+
+    Received function did not throw
+
+      81 | });
+      82 | it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+    > 83 |   expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+         |                                                                ^
+      84 | });
+      85 |
+
+      at src/__tests__/eng918.adsThresholdsDb.test.ts:83:64
+
+Test Suites: 1 failed, 1 total
+Tests:       5 failed, 16 passed, 21 total
+Time:        0.608 s, estimated 1 s
+
+## memory-block-red
+  ● does not let a large contiguous learning block hide ordinary recent memories
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 3
+    + Received  + 1
+
+    - Array [
+    -   "01ORDINARY",
+    - ]
+    + Array []
+
+      455 |       : { Items: [{ memoryId: 'ads-learning#abc', content: 'proposal' }], LastEvaluatedKey: { userId: 'u', memoryId: 'ads-learning#abc' } }
+      456 |   }));
+    > 457 |   expect((await accountMemoryDb.getRecentMemories('u', 1)).map((x: any) => x.memoryId)).toEqual(['01ORDINARY']);
+          |                                                                                         ^
+      458 | });
+      459 |
+
+      at Object.<anonymous> (src/__tests__/accountMemory.test.ts:457:89)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 31 passed, 32 total
+Time:        0.899 s, estimated 1 s

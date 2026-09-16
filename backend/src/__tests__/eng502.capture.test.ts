@@ -186,10 +186,26 @@ it('aborts a timed-out SDK write instead of leaving the request running', async 
   mockPut.mockImplementationOnce(() => ({ promise: () => promise, abort }));
   jest.useFakeTimers();
   try {
-    const pending = expect(putNewRecommendation(rec, 25)).rejects.toThrow('request aborted');
+    const pending = expect(putNewRecommendation(rec, 25)).rejects.toThrow('request deadline exceeded');
     await jest.advanceTimersByTimeAsync(25);
     await pending;
     expect(abort).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
   } finally { jest.useRealTimers(); }
+});
+
+it('enforces a 100ms TOTAL capture deadline even when SDK abort settles late', async () => {
+  let reject!: (e: Error) => void;
+  const slow = new Promise<never>((_, fail) => { reject = fail; });
+  const abort = jest.fn();
+  mockPut.mockImplementationOnce(() => ({ promise: () => slow, abort }));
+  let finished = false;
+  const result = assessClientHealth('admin', 'client-a@example.com', true).then(r => { finished = true; return r; });
+  await jest.advanceTimersByTimeAsync(100);
+  expect(finished).toBe(true);
+  expect((await result).success).toBe(true);
+  expect(abort).toHaveBeenCalledTimes(1);
+  reject(new Error('late SDK rejection'));
+  await jest.advanceTimersByTimeAsync(1);
+  expect(jest.getTimerCount()).toBe(0);
 });

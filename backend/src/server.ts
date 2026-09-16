@@ -744,6 +744,14 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
+      const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
+      setInterval(() => {
+        if (!isCronEnabled()) return;
+        cronJobRegistry.track('AdsLearningEvaluation', runAdsLearningEvaluation())
+          .catch(e => console.error('[AdsLearning] due evaluation failed:', e));
+      }, 15 * 60 * 1000).unref();
+
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
       // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
       // (28, sized against Meta's documented insights-mutability window) so a stored row

@@ -30,16 +30,17 @@ export type OutcomePlatform = 'meta' | 'google_ads';
 
 export type PredictedDirection = 'increase' | 'decrease';
 export type ActualDirection = 'increase' | 'decrease' | 'flat';
-export type OutcomeVerdict = 'correct' | 'incorrect' | 'unscoreable';
+export type OutcomeVerdict = 'correct' | 'incorrect' | 'inconclusive' | 'unscoreable';
 
 /** Optional, additive capture contract. Legacy/manual recommendations remain readable.
  * A shadow proposal is not an adopted intervention or a calibrated prediction. */
 export interface RecommendationContext {
+  execution?: import('./adsOutcomeEvaluator').ExecutionReceipt;
   version: 1;
   clientUserId: string;
   campaignId: string;
   adId: string;
-  metricScope: 'ad';
+  metricScope: 'ad' | 'campaign';
   mode: 'shadow';
   source: 'assess_client_health';
   sourceWindow: { since: string; until: string };
@@ -56,7 +57,14 @@ export function validateRecommendationContext(value: unknown): asserts value is 
   const c = value as RecommendationContext | null;
   const text = (s: unknown): s is string => typeof s === 'string' && s.trim().length > 0 && s.length <= 2000;
   const date = (s: unknown): boolean => text(s) && Number.isFinite(Date.parse(s));
-  if (!c || typeof c !== 'object' || c.version !== 1 || c.mode !== 'shadow' || c.metricScope !== 'ad' ||
+  if (c?.execution !== undefined) {
+    const e = c.execution;
+    if (!e || typeof e !== 'object' || ![e.reference, e.clientUserId, e.platform, e.accountId, e.campaignId, e.recommendationId].every(text) ||
+      !date(e.executedAt) || !((e.status === 'succeeded' && e.adopted === true) || (e.status === 'declined' && e.adopted === false)) ||
+      e.clientUserId !== c.clientUserId || e.campaignId !== c.campaignId) throw new Error('outcomeLedger: invalid execution receipt');
+  }
+
+  if (!c || typeof c !== 'object' || c.version !== 1 || c.mode !== 'shadow' || !['ad', 'campaign'].includes(c.metricScope) ||
       c.source !== 'assess_client_health' || c.confidence !== 'uncalibrated' || c.reviewState !== 'unreviewed' ||
       ![c.clientUserId, c.campaignId, c.adId, c.rationale].every(text) ||
       !date(c.sourceWindow?.since) || !date(c.sourceWindow?.until) ||

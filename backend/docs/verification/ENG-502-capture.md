@@ -1,137 +1,214 @@
-# ENG-502: automatic shadow capture — first production slice
+# ENG-502 / ENG-1967 / ENG-1968 — shadow learning loop
 
-## Shipping boundary
+**DRAFT — DATA-PLANE APPROVAL REQUIRED. Do not merge or deploy this branch yet.**
 
-This implements capture → ENG-1550 persistence → authenticated ledger retrieval. It does **not**
-complete ENG-502. [ENG-1967](https://linear.app/emmabyaw/issue/ENG-1967) owns adoption-backed,
-scheduled evaluation; [ENG-1968](https://linear.app/emmabyaw/issue/ENG-1968) owns supported threshold
-learning, deterministic global/client/campaign/channel context, expiry/history, and full-loop proof.
-Those changes are not independently deployable yet, so this PR contains no dormant evaluator or
-parallel memory store. Keep the PR draft; the controller owns subsequent gates and merging.
+The capture-only boundary in the previous revision is superseded. This branch now implements
+capture → ledger → scheduled settled evaluation → scoped account-memory guidance → explicitly
+reviewed ENG-918 parameter promotion/revert. It performs no autonomous campaign writes or spend
+increases. All development writes used an in-memory DynamoDB transport; no production writes,
+manual production fixture rows, deployment, or production verification occurred.
 
-**Data-plane gate:** approve the optional `context` attribute on existing `AW-AdsOutcomeLedger`
-items and the client-filtered read semantics before merge. No key, index, table provisioning,
-backfill, retention, or production data write was performed in development. The attribute is a
-new persistence contract even though DynamoDB needs no migration. Existing rows stay readable.
+## Remaining external gates
 
-**Copy review:** the new shadow hypothesis/rationale/assumptions are readable through the existing
-ledger API; review this wording before making it customer-visible. Tool names, prompts, and health
-assessment response text are unchanged. The prediction is explicitly *uncalibrated*, not evidence
-that refreshing a creative will recover performance.
+1. **Harsha's data-plane approval:** approve the extended ledger context (campaign measurement
+   scope and execution receipt), `inconclusive` verdict, atomic ledger/account-memory writes,
+   structured account-memory lifecycle metadata, client-filtered legacy read semantics, and
+   reviewed threshold/lifecycle transactions. No new table, key, index, retention change or
+   backfill. Existing `StatusEvaluationDateIndex` was confirmed **ACTIVE** with a read-only
+   `describe-table`; evidence is linked below. Existing ambiguous legacy records stay stored but
+   are hidden from client reads. They have no trustworthy client ownership attribution;
+   `createdBy` identifies the administrator/execution actor, not the client.
+2. **Review new external wording:** campaign hypotheses/assumptions, scoped guidance, tool input
+   descriptions, and review/decline error text are new customer/model-visible copy.
+3. **Okareo comparison on the changed build:** no Okareo tool is bound in this session. The
+   archived local runner was found, but its prerequisite check fails:
+   ```sh
+   python3 /home/harsha/.claude/plugins/marketplaces/okareo-tools/reps/run_suite.py --help
+   # ModuleNotFoundError: No module named 'okareo'
+   ```
+   This is not a simulation pass. The documented existing production baseline target is
+   `emma-prod-anthropic.claude-opus-4-8`; the changed build has not been deployed to an isolated
+   comparison target. Do not run against production to substitute for changed-build evidence.
+   Keep the receipt-hook/tool-retrieval/memory-filter slice unmerged until the same scenarios
+   and checks are compared on baseline and the changed build. No new permanent human gate.
+4. After those gates, the ordinary current-head build/CI checks, approved deployment and real
+   end-to-end smoke must run. The parent criterion explicitly requiring **production** proof
+   remains unfulfilled; deterministic local proof is not production proof.
 
-## Behavior
+## Implemented behavior
 
-The existing `assess_client_health` path detects CTR fatigue using ENG-918 thresholds. For up to three
-CTR-drop findings per assessment (stable ad-id order) with complete campaign attribution and two valid reporting windows, it captures
-a shadow creative-refresh proposal in ENG-1550. The proposed recovery magnitude is the relative
-change from current ad CTR to prior ad CTR. It is a hypothesis, with the confounders and metric
-scope recorded; it is not a fitted effect, confidence estimate, or instruction to execute.
+### Capture and response compatibility
 
-Identity includes client, platform account, campaign, ad and reporting window. The existing
-conditional create is authoritative. Retry conflicts require a strongly consistent read proving
-scope; they retain the first prediction and timestamp even if platform metrics later settle.
-A later reporting window is a distinct observation. No approval/adoption is inferred.
+`assess_client_health` captures at most three CTR-fatigue findings in stable ad-id order.
+Original ad-level predictions remain ad-level. A companion campaign prediction is created only
+when ENG-916 supplies complete, tenant-matching 28-day campaign snapshots (two 14-day windows) with
+valid click/impression counts and a campaign CTR decline. No averaging ad CTRs into a campaign
+metric. Both record rationale, evidence references, assumptions, uncalibrated prediction,
+evaluation horizon, actor, and client/account/campaign/ad/window identity.
 
-Records carry explicit **ad-level** scope. ENG-916 campaign/day snapshots cannot score this metric.
-The manual scorer refuses these captures until an attributed evaluator supports their scope.
-They remain pending/unreviewed, with a review date after the forecast horizon plus the existing
-28-day Meta settling window. This date is not an evaluator, expiry mechanism, or settled-data proof.
+All capture I/O, including conflict reads and optional campaign capture, shares **one 100 ms total
+deadline**. SDK requests are aborted; a promise deadline remains authoritative even if abort
+settles late. Late rejections remain handled. Failure/omission logs never claim successful capture.
+The health response stays unchanged. Conditional creates preserve original predictions on retries.
 
-Capture uses at most three concurrent proposals and 1.5-second abortable SDK requests (at most
-two requests per proposal on a retry). Additional findings remain in the assessment and emit an
-explicit omitted-count warning; this bounded first slice does not promise fleet-wide capture.
-Capture failure is logged per finding and cannot claim success. Invalid or truncated platform
-responses cannot generate a proposal. Existing health output remains available on ledger failure.
-Reads exclude another client's new records even if both clients connect the same platform account.
-Legacy rows retain the pre-existing account-level visibility contract.
+### Execution provenance and scheduled evaluation
+
+The existing confirmed creative-update path records a receipt only after its existing read-back
+reports `verified: true`; an API success without read-back proof is insufficient. It matches the
+latest pending client/account/ad/window per measurement grain, within a separate 100 ms observer
+budget (50 ms maximum for candidate lookup). No receipt authorizes an intervention. An explicit
+owner decline records a negative receipt; absence remains **unknown**, never false.
+
+Every 15 minutes, the existing server cron registry runs one bounded GSI page (100 due records).
+A process-local cursor rotates pages, and the normal cron switch and shutdown registry apply.
+Replicas can race: a transaction conditionally scores the pending row and creates its deterministic
+memory projection together. The condition also compares the context, preventing a concurrent
+receipt from being overwritten. Failure leaves the row pending; malformed rows and failures emit
+observable errors. No duplicate lesson or second verdict on replay.
+
+Meta uses 28 days; Google uses 90. Only campaign CTR is currently supported for scoring; the
+production capture/verified-execution adapter is Meta. Ad-level outcomes are honestly unscoreable.
+Supported comparisons require complete daily baseline/outcome windows, matching tenant/account/
+campaign/platform/currency/timezone, exact data, final-window refresh timestamps, a verified receipt
+outside both measurement windows, at least 1,000 impressions and 30 clicks per window, and spend
+movement within 20%. Noise is the maximum of binomial uncertainty, that campaign's observed daily
+variation, and a 1% relative floor. Direction outside that band is correct/incorrect; small samples,
+noise and spend confounding are inconclusive. Missing attribution/data is unscoreable. These are
+**observational direction comparisons, not causal treatment-effect claims**.
+
+### Learning, precedence and reversal
+
+Only scoreable campaign outcomes create qualitative lessons in existing `AW-AccountMemory`.
+Unscoreable/ad-only outcomes remain in the ledger. Lessons carry outcome/receipt references,
+confidence, creation/update/expiry timestamps, review state and bounded reversible history.
+Numeric predictions/scores remain in `AW-AdsOutcomeLedger`; parameter history remains in ENG-918.
+
+Retrieval is deterministic: code-owned global policy → client → campaign → channel/playbook.
+All persisted layers are scoped to the authenticated client and platform account; omitted campaign
+scope never broadens a campaign lesson. Retrieval reads at most 100 stored items and returns at
+most 20 ordered items, with explicit truncation logging. Proposed guidance is labelled proposed
+and advisory. Expired/reverted guidance is excluded. Generic account-memory readers exclude these
+structured lessons, fill ordinary-memory limits across filtered pages (jumping the contiguous learning key range), and reject malformed data. Category-index reads fail explicitly if their bounded page budget is exhausted.
+Generic edits/deletes cannot erase their review history.
+
+The loop proposes; **only an explicit authenticated owner review** promotes a parameter. Thirty
+independent correct campaign outcomes are required, with duplicate execution receipts and
+intersecting observation windows excluded. The median observed CTR drop proposes the existing
+`creativeFatigue.ctrDropCriticalPct` parameter. ENG-918 enforces sample size, absolute bounds,
+per-cycle movement cap, explicit-user precedence and revert cooldown. New promotions require new
+outcomes after the preceding parameter revision; another lesson cannot replay the same batch to
+walk the cap. Shared accounts fail closed for client-derived parameter promotion because ENG-918
+is account-keyed. Reviewed guidance can be scoped to the client, campaign, or channel.
+
+Threshold and lesson review writes are atomic and compare the prior revisions. Revert uses the
+existing ENG-918 default/cooldown/history behavior, and refuses to undo an intervening parameter
+change. Automatically learned parameter effects expire after 90 days without deleting history;
+explicit user values retain precedence and do not expire. No numeric fitting claims calibrated
+causality or permission to spend.
+
+**Bounded-capacity behavior:** receipt matching and promotion inspect at most 100 account ledger
+records and refuse incomplete pages. Scoped retrieval logs truncation. These limits deliberately
+trade coverage for bounded work; a saturated account does not fabricate receipt/sample evidence.
+Capture also logs omitted candidates. This is not a claim of exhaustive fleet capture or retrieval.
+
+## Surfaces
+
+- Existing `assess_client_health`: automatic capture, response unchanged.
+- Existing `get_ads_thresholds`: optional `include_learning: true` and `campaign_id` return scoped
+  guidance. Without that flag, existing output is unchanged. Retrieval failure preserves parameters
+  and returns `learningUnavailable: true`.
+- `GET /api/outcome-ledger/:platform/:accountId/learning?campaignId=...`: scoped guidance.
+- `POST /api/outcome-ledger/:platform/:accountId/learning/:memoryId/approve` with optional
+  `{campaignId, scope: "client" | "campaign" | "channel"}`: explicit reviewed promotion.
+- Same path ending `/revert`: conditional rollback, retaining evidence/history.
+- `POST /api/outcome-ledger/:platform/:accountId/:recommendationId/decline`: explicit non-adoption.
+- Existing manual score route still refuses captured/contextual records.
 
 ## Acceptance mapping
 
-| ENG-502 criterion | This slice |
+| Parent contract | Implementation / evidence |
 | --- | --- |
-| 1. Automatic structured capture | Implemented for the shadow CTR-fatigue proposal path |
-| 2. Idempotency | Conditional create, stable scope/window identity, verified retry |
-| 3–4. Scheduled evaluation, settling/noise/sample gates | ENG-1967; not implemented |
-| 5. Supported threshold learning | ENG-1968; not implemented |
-| 6. Scoped retrieval and isolation | Client isolation on ledger reads implemented; full context precedence remains ENG-1968 |
-| 7. Provenance/confidence/expiry/history for learned items | Capture provenance and uncalibrated/review state only; no learned items yet |
-| 8. Safe unavailable path | Implemented; output parity and observable storage failures |
-| 9. Tests | Capture/isolation/retries/malformed attribution/rollback/failure covered; evaluator tests remain ENG-1967 |
-| 10. Complete real loop verification | Capture/API-read procedure below; evaluation → learning proof remains ENG-1968 |
+| Real recommendation-producing capture with scope/evidence/actor | Health assessment, ad and supported campaign companions |
+| Idempotent recording | Stable scoped identity + conditional create |
+| Scheduled adopted/correct/incorrect/inconclusive/unscoreable evaluation | GSI cron, receipt-only adoption, pure evaluator, atomic completion |
+| Platform settlement and campaign-specific noise/sample gates | Meta/Google windows; complete-window, sample, spend and uncertainty tests |
+| Supported ENG-918 learning, caps, provenance, rollback | 30 independent outcomes; explicit review; atomic promotion/revert; expiry |
+| Deterministic global/client/campaign/channel retrieval; tenant isolation | Existing tool + authenticated API; shared-account and foreign-row regressions |
+| Qualitative memory versus numeric ledger separation | Existing account-memory table projection; generic injection exclusion |
+| Learned lifecycle | References/confidence/timestamps/90-day expiry/review/history |
+| Shadow default and no autonomous spend/destructive writes | No campaign writer in loop; only observes existing verified execution |
+| Compatibility and honest failures | Total deadline, late rejection test, failure logs, baseline response comparison |
+| Tests for isolation/replay/noise/attribution/rollback/failure | 381 focused tests, 14 suites |
+| Production end-to-end verification | **Pending approval/deployment**; local full-loop proof passes |
 
-Numeric predictions remain in the ledger. No account-memory, playbook, threshold, ad-platform,
-budget, or destructive write is introduced. Shadow mode is the only capture mode; `off` disables it.
+Thus the engineering slices are implemented; **not every ENG-502 acceptance criterion is complete**:
+production verification and the required Okareo comparison remain external gates.
 
-## Reproducible validation
+## Verification evidence and reproduction
 
-From `backend/`, sequentially (no full-suite run):
+[RED evidence](ENG-502-evidence/red.txt) retains expected behavioral failures before each named
+implementation. Major runs: review fixes 5 failed/39 passed; evaluator 10/1; learning 4/2; loop 3/1;
+promotion 3/6. Smaller follow-up runs are individually recorded, not inflated to three failures.
+[Focused regression](ENG-502-evidence/final-tests.txt): **381 passed / 14 suites**.
+[Checks](ENG-502-evidence/checks.txt): production TypeScript no-emit and `git diff --check` passed.
+[Parity](ENG-502-evidence/parity-summary.json): against prior head
+`61ea656e66e0271ae8075a2cacfc61bf13bb3d5c`, 120 unchanged fixture tests passed and **25 creative-update
+response pairs were identical**, including failure/unverified cases. The same existing fixtures
+and assertions ran on both modules; temporary baseline modules were removed. Existing health
+capture-enabled/off/failure parity tests also remain. This does not replace an LLM simulation.
+[GSI metadata](ENG-502-evidence/gsi-readonly.json) and [Okareo prerequisite failure](ENG-502-evidence/okareo-runner.txt).
+
+From `backend/`, sequentially on this host:
 
 ```sh
-node --max-old-space-size=2048 node_modules/jest/bin/jest.js --runInBand --runTestsByPath \
-  src/__tests__/eng502.capture.test.ts src/__tests__/clientHealth.test.ts \
+node --max-old-space-size=2048 node_modules/jest/bin/jest.js --silent --runInBand --runTestsByPath \
+  src/__tests__/eng502.capture.test.ts src/__tests__/eng502.loop.test.ts \
+  src/__tests__/eng1967.evaluator.test.ts src/__tests__/eng1968.learning.test.ts \
   src/__tests__/eng1550.outcomeLedger.test.ts src/__tests__/eng1550.outcomeLedgerDb.test.ts \
-  src/__tests__/eng1550.outcomeLedgerRoutes.test.ts src/__tests__/eng918.adsThresholds.test.ts
-node --max-old-space-size=4096 node_modules/typescript/bin/tsc --noEmit -p tsconfig.build.json
+  src/__tests__/eng1550.outcomeLedgerRoutes.test.ts src/__tests__/eng918.adsThresholds.test.ts \
+  src/__tests__/eng918.adsThresholdsDb.test.ts src/__tests__/eng918.adsThresholdsRoutes.test.ts \
+  src/__tests__/eng918.getAdsThresholdsTool.test.ts src/__tests__/clientHealth.test.ts \
+  src/__tests__/accountMemory.test.ts src/__tests__/agentModeService.metaAdsCRUD.test.ts
+node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit -p tsconfig.build.json
 ```
 
-Before implementation, the first four capture tests produced **3 expected failures / 1 passing
-existing authorization control**: zero stored rows failed automatic capture, retry, and client
-separation assertions. After implementation: **194 passing tests across six suites**, and production
-TypeScript no-emit passes. The inherited dependency tree contained extraneous `@types/axios@0.9.36`,
-absent from the lockfile. Worktree-local links exclude that obsolete ambient package; shared
-`node_modules` and package/lock files were not changed.
+The loop test uses the real capture, ledger, bounded snapshot reads, receipt observer, evaluator,
+account-memory projection and threshold services. Only AWS transport is in memory. Fixture metrics
+enter through `adsMetricsDb.putSnapshot`; ledger/memory/threshold records are produced by the actual
+services, never manually seeded. It proves both unsupported outcomes staying out of guidance and
+supported capture → receipt → due evaluation → scoped retrieval, plus 30-outcome promotion/revert.
 
-Before/after rehearsal compared the original `clientHealthService.ts` from baseline
-`c59c293abc13196e73161675ffb1f08c1db8e2f7` with the changed service under identical fixtures:
-capture enabled, capture disabled, and storage failure returned deeply equal responses (3/3).
-The temporary baseline module was removed afterward. Permanent tests retain enabled/disabled and
-failure parity checks. No LLM invocation, provider routing, prompt, tool schema, dispatch, or memory
-injection changes are in this slice. Okareo was not run; context-injection parity/Okareo remains an
-explicit gate on ENG-1968. This is not a claim of live production verification.
+Local CodeRabbit reviewed the evolving branch. Applicable findings were fixed: helper extraction,
+ordinary-memory pagination, unsupported/ad-scope guidance exclusion, receipt deadline allocation,
+baseline date-key normalization, and stale documentation. Its duplicate-function finding did not
+match the source (one declaration; TypeScript passes). Its index concern was resolved by read-only
+ACTIVE-index evidence, not by provisioning. The second review completed with eight findings (including a duplicate). Fixed its applicable findings: generic-memory key-range starvation, optional campaign review scope, malformed query input, direct evaluator date validation, and threshold revision validation. Its data-plane hold remains. The request to remove the external Okareo command was declined because Harsha explicitly requested the exact command/blocker; the command is historical failure evidence, not a portable setup claim. Missing campaign scope remains intentionally valid for client/channel retrieval, while provided malformed scope is rejected. See [review dispositions](ENG-502-evidence/review.txt). No clean latest-SHA remote-review claim is made.
 
-## Real capture smoke after approval and deployment
+## Post-approval smoke and rollback
 
-1. Use the existing authenticated admin Emma tool `assess_client_health` with the exact email of
-   an approved client who has a CTR-drop finding and complete ad/campaign attribution. Its backing
-   request is `GET /api/client-health/:client_name_or_email`.
-2. Confirm the assessment still reports the fatigue finding and normal health result. If no real
-   eligible finding exists, report **not exercised**; never create a synthetic production DB row.
-3. With that client's own authenticated session, call `GET /api/outcome-ledger/meta/:accountId`.
-   Find the new `emma:creative-fatigue` record and verify its client/campaign/ad identity, source
-   windows, evidence values/references, assumptions, horizon, review date and unknown adoption.
-4. Repeat the assessment within the same reporting window. Read the ledger again: the same id and
-   original `createdAt` must remain, with exactly one row per captured scope/window. Concurrent
-   retries should produce the same result.
-5. Authenticate as a second approved client. A foreign account is denied; on a deliberately shared
-   platform account, the first client's contextual records must not appear.
-6. Check application logs for `[AdsLearning] capture confirmed` or `capture failed`. Confirm no ad
-   write, threshold update, account-memory update, or budget change occurred.
-7. Stop at pending/unreviewed. No supported evaluation endpoint exists for these records yet;
-   manual scoring must return 409 `attributed_evaluation_required`. Record the missing evaluator
-   and full-loop proof against ENG-1967/1968, rather than claiming ENG-502 is done.
+After approval, current-head build/CI, and deployment: invoke `assess_client_health` for an approved
+client with a real eligible fatigue finding and complete campaign snapshots; read its ledger as that
+client; retry and verify unchanged identity/time. A real, separately approved creative refresh must
+produce a **verified** receipt. Wait for distinct post-intervention measurement days and platform
+settlement; observe the scheduled verdict and query scoped guidance using the existing tool or API.
+Verify a peer on a shared account cannot read the record or guidance. If sufficient independent
+outcomes do not exist, record promotion **not exercised**; never seed production DB rows or invent
+adoption. No campaign change is authorized by this runbook alone.
 
-## Rollback
-
-Set `ADS_LEARNING_MODE=off` and restart the backend to stop new captures. Keep the additive ledger
-reader, context validation, and client filter deployed so captured audit records remain private and
-readable. Do **not** roll the whole application back to a reader that discards context or omits its
-client filter after records exist. Revert the capture import/call/module only if a code rollback is
-needed. No row deletion, table migration, or threshold rollback is needed for this slice.
+Set `ADS_LEARNING_MODE=off` and restart to stop capture, receipt observation and evaluation. Retain
+privacy filters, structured-memory exclusion and new verdict/context readers once rows exist.
+Revert an approved parameter through the review endpoint while its revision is still current, or use
+the existing ENG-918 owner revert surface. Never delete provenance. Do not roll back to a reader
+that exposes context-less/shared-client rows or injects unreviewed lessons indiscriminately.
 
 ## Complexity and attribution
 
-One capture adapter plus optional fields on the existing ledger. Reuse the existing fatigue detector,
-threshold resolution, conditional write and read API. No new table, index, endpoint, scheduler, LLM,
-dependency or memory subsystem. Net complexity increases for structured capture and boundary checks;
-the remaining learning loop is intentionally tracked rather than hidden behind no-op scaffolding.
+Net complexity **increases** for the evaluator, receipt adapter, atomic storage adapter, scoped
+learning/review and tests. Reuses three existing stores, the existing GSI, server cron registry,
+existing creative read-back, and ENG-918 governance. New tables/indexes/dependencies/LLM calls: **0**.
+New scheduler: **1**; four authenticated learning/decline surfaces and optional existing-tool inputs.
+No parallel memory store. The bounded lookup limits above are explicit, not hidden coverage claims.
 
-Accountable owner: Harsha Vankayalapati (`harshmoney123`). Execution actor: Astra (`gpt-6-astra`).
-Run: `eng502-astra-20260915`. Argusoft branches/PRs were not modified or rebased.
-
-## Local review
-
-CodeRabbit identified two implementation issues: legacy finite numeric strings must remain readable,
-and capture must not add unbounded serial latency to health requests. Both are fixed and covered by
-regression tests (strict non-numeric rejection retained, three concurrent proposals maximum, SDK
-request abort deadlines). Its separate persistence-approval finding is the explicit gate above;
-this draft is not a claim that approval exists.
+Prior commits and immutable run `eng502-astra-20260915` are preserved. Accountable owner remains
+Harsha Vankayalapati (`142fef82-4d45-4070-99be-c5debe565ac6`, GitHub `harshmoney123`). Continuation
+execution actor: Codex; run `eng502-codex-continuation-20260915`. No Argusoft branches or rows changed.

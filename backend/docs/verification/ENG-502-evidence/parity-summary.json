@@ -1,0 +1,8 @@
+{
+  "baseline": "61ea656e66e0271ae8075a2cacfc61bf13bb3d5c",
+  "fixture_suite": "agentModeService.metaAdsCRUD.test.ts",
+  "unchanged_assertions": 120,
+  "response_pairs": 25,
+  "deep_equal": true,
+  "response_digest": "c5c0beeef293c44802e06f7a80bab85edec33fbdfc4dcb837115970ce221137a"
+}

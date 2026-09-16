@@ -425,3 +425,33 @@ describe('Memory API Routes', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('ENG-1968 structured learning stays out of generic memory', () => {
+  it.each(['getUserMemories', 'getRecentMemories'])('fills the requested ordinary-memory limit across filtered pages: %s', async method => {
+    mockDocumentClientMethods.query.mockReset();
+    mockDocumentClientMethods.query
+      .mockReturnValueOnce({ promise: async () => ({ Items: [{ memoryId: 'ads-learning#1', content: 'proposal' }], LastEvaluatedKey: { userId: 'user1', memoryId: 'ads-learning#1' } }) })
+      .mockReturnValueOnce({ promise: async () => ({ Items: [{ memoryId: 'ordinary', content: 'user preference' }] }) });
+    const result = method === 'getRecentMemories' ? await accountMemoryDb.getRecentMemories('user1', 1)
+      : await accountMemoryDb.getUserMemories('user1', undefined, 1);
+    expect(result.map((x: any) => x.memoryId)).toEqual(['ordinary']);
+  });
+  it('fails closed on a wrong-type memory row', async () => {
+    mockDocumentClientMethods.query.mockReturnValue({ promise: async () => ({ Items: [true] }) });
+    await expect(accountMemoryDb.getUserMemories('user1')).rejects.toThrow(/memory/i);
+  });
+});
+
+it.each(['update', 'delete'])('preserves structured learning audit history from generic memory %s', async action => {
+  const work = action === 'update' ? accountMemoryDb.updateMemory('u', 'ads-learning#r', { content: 'rewrite' })
+    : accountMemoryDb.deleteMemory('u', 'ads-learning#r');
+  await expect(work).rejects.toThrow(/review/i);
+});
+it('does not let a large contiguous learning block hide ordinary recent memories', async () => {
+  mockDocumentClientMethods.query.mockImplementation((params: any) => ({ promise: async () =>
+    params.KeyConditionExpression.includes('memoryId <')
+      ? { Items: [{ memoryId: '01ORDINARY', content: 'preference' }] }
+      : { Items: [{ memoryId: 'ads-learning#abc', content: 'proposal' }], LastEvaluatedKey: { userId: 'u', memoryId: 'ads-learning#abc' } }
+  }));
+  expect((await accountMemoryDb.getRecentMemories('u', 1)).map((x: any) => x.memoryId)).toEqual(['01ORDINARY']);
+});
