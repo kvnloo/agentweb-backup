@@ -68,6 +68,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
   const mockGetChatSession = jest.fn();
   const mockAddMessageToSession = jest.fn();
   const mockUploadFileToS3 = jest.fn();
+  const mockGetMessages = jest.fn();
 
   beforeAll(() => {
     jest.isolateModules(() => {
@@ -92,6 +93,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
         chatbotDb: {
           getChatSession: (...a: any[]) => mockGetChatSession(...a),
           addMessageToSession: (...a: any[]) => mockAddMessageToSession(...a),
+          getMessagesFromMessagesTable: (...a: any[]) => mockGetMessages(...a),
         },
       }));
       jest.doMock('../utils/s3Utils', () => ({
@@ -128,6 +130,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     mockGetUser.mockResolvedValue({ userId: 'owner-1', isAdmin: false });
     mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'owner-1' });
     mockAddMessageToSession.mockResolvedValue({});
+    mockGetMessages.mockResolvedValue([]);
     mockUploadFileToS3.mockResolvedValue({
       success: true,
       url: 'https://bucket.s3.us-west-2.amazonaws.com/users/owner-1/files/1/ad-placid-tpl-abcd.png',
@@ -318,6 +321,41 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     // One render, one charge — the retry is of the write, not of Placid.
     expect(mockAxiosGet).toHaveBeenCalledTimes(1);
     expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
+  });
+
+  // Greptile, PR #2935. addMessageToSession appends at the current count, so a
+  // retry after a LOST RESPONSE (rather than a rejected write) would attach the
+  // same image twice. The scanner de-dupes by URL within one pass but the
+  // incremental cache merge concatenates passes, so the second copy would show
+  // up as a duplicate image on the page.
+  it('does not attach twice when the first write landed but its response was lost', async () => {
+    const transient: any = new Error('connection reset');
+    transient.code = 'ProvisionedThroughputExceededException';
+    mockAddMessageToSession.mockRejectedValueOnce(transient);
+    // The lost write is in fact already in the table.
+    mockGetMessages.mockResolvedValue([
+      {
+        metadata: {
+          toolCalls: [
+            {
+              name: 'upload_image',
+              result: {
+                success: true,
+                imageUrl:
+                  'https://bucket.s3.us-west-2.amazonaws.com/users/owner-1/files/1/ad-placid-tpl-abcd.png',
+              },
+            },
+          ],
+        },
+      },
+    ]);
+    const r = res();
+    await generateFromTemplateToExecution(agentModeReq(), r);
+
+    expect(mockGetMessages).toHaveBeenCalledWith('sess-1');
+    // Only the original attempt wrote; the retry saw the image was already there.
+    expect(mockAddMessageToSession).toHaveBeenCalledTimes(1);
+    expect(r.status).toHaveBeenCalledWith(200);
   });
 
   it('reports the image when it could not be attached, instead of a bare 500', async () => {

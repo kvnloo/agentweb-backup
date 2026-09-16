@@ -1476,8 +1476,34 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       // the URL, rather than reporting a generic 500 that buries a paid render.
       // (A retry by the user is a genuinely new Placid render and is billed as
       // one; that is real vendor spend, not a double count.)
+      //
+      // addMessageToSession is not idempotent: it appends at the current count,
+      // so retrying a write whose RESPONSE was lost — rather than whose write was
+      // rejected — would append the same image a second time. The asset scanner
+      // de-dupes by URL only within one pass, and the incremental cache merge
+      // concatenates passes, so the second copy would surface as a duplicate
+      // image. Before every retry, check whether the previous attempt actually
+      // landed; the S3 URL is unique to this render, so it is the stable identity.
+      let attachAttempted = false;
+      const alreadyAttached = async (): Promise<boolean> => {
+        try {
+          const existing = await chatbotDb.getMessagesFromMessagesTable(agentSessionId);
+          return (existing || []).some((m: any) =>
+            (m?.metadata?.toolCalls || []).some((tc: any) => tc?.result?.imageUrl === url),
+          );
+        } catch {
+          // Unreadable: fall through and retry. A duplicate is recoverable by
+          // hand; a silently dropped paid render is not.
+          return false;
+        }
+      };
+
       try {
-        await retryTransientWrite(attachMessage);
+        await retryTransientWrite(async () => {
+          if (attachAttempted && (await alreadyAttached())) return;
+          attachAttempted = true;
+          await attachMessage();
+        });
       } catch (attachErr) {
         console.error(
           `[Placid] billed render not attached to session ${agentSessionId}; image is orphaned at ${url}:`,
