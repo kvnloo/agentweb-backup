@@ -19,6 +19,7 @@ import {
   findTiersAllowingSkill,
   getAllowedFeatures,
   isSubscriptionFeatureEnabled,
+  setWildcardGrantSink,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -517,6 +518,66 @@ describe('subscriptionService', () => {
 
     const skills2 = await getAllowedSkills('u2');
     expect(skills2).toEqual(['*']);
+  });
+
+  /*
+   * ENG-1978 observation pass. These assert that an unconfirmed wildcard grant is now RECORDED.
+   * They deliberately also assert the return value is still ["*"] — this change must not alter
+   * behaviour, and these tests are what would catch it if someone later edited the return while
+   * thinking they were only touching logging.
+   */
+  describe('wildcard-grant observation (no behaviour change)', () => {
+    afterEach(() => setWildcardGrantSink(() => {}));
+
+    it('records, and still grants, when the tier name is not in the config', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'NoSuchTier' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['skill-1'] }]),
+      } as any);
+
+      expect(await getAllowedSkills('u1')).toEqual(['*']);
+      expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
+    });
+
+    it('records, and still grants, when a tier lists no skills at all', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: [] }]),
+      } as any);
+
+      expect(await getAllowedSkills('u2')).toEqual(['*']);
+      expect(events.map((e) => e.reason)).toContain('empty-allowed-skills-treated-as-wildcard');
+    });
+
+    it('records, and still grants, when the tier could not be confirmed for this user', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce(null as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Free', allowedPages: ['/tasks'], allowedSkills: ['skill-free'] }]),
+      } as any);
+
+      // Still resolves to the assumed Free tier exactly as before — only the observation is new.
+      expect(await getAllowedSkills('ghost')).toEqual(['skill-free']);
+      expect(events.map((e) => e.reason)).toContain('subscription-type-unresolved');
+    });
+
+    it('records, and still grants, when the settings lookup throws', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u3', subscriptionType: 'Pro' } as any);
+      mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
+
+      expect(await getAllowedSkills('u3')).toEqual(['*']);
+      expect(events.length).toBeGreaterThan(0);
+    });
   });
 
   // ---- getAllowedSkills for anonymous users ----
