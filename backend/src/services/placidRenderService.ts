@@ -53,6 +53,20 @@ interface PlacidImageResponse {
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Whether `candidate` addresses the same scheme+host as `base`. Used to decide
+ * if a URL handed back by the API may carry our private token.
+ */
+function isSameOrigin(candidate: string, base: string): boolean {
+  try {
+    const c = new URL(candidate);
+    const b = new URL(base);
+    return c.protocol === b.protocol && c.host === b.host;
+  } catch {
+    return false;
+  }
+}
+
 /** Who a successful render is billed to (ENG-698 / ENG-1957). */
 export interface PlacidRenderBilling {
   /** The acting caller. */
@@ -141,7 +155,21 @@ export async function renderPlacidImage(opts: {
   }
 
   // Queued: poll until it finishes, errors, or we hit the ceiling.
-  const pollingUrl = image.polling_url || (image.id ? `${base}/images/${image.id}` : null);
+  //
+  // The polling request carries the private token, and `polling_url` arrives in
+  // a response body — so it is only followed when it points at the same origin
+  // we called. Anything else is ignored in favour of the id-derived URL we built
+  // ourselves, rather than sending the token wherever the body says
+  // (CodeRabbit, #2943).
+  const idDerivedUrl = image.id ? `${base}/images/${image.id}` : null;
+  let pollingUrl: string | null = idDerivedUrl;
+  if (image.polling_url) {
+    if (isSameOrigin(image.polling_url, base)) {
+      pollingUrl = image.polling_url;
+    } else {
+      console.warn('[Placid] ignoring off-origin polling_url from the API response');
+    }
+  }
   if (!pollingUrl) {
     throw new PlacidRenderError('Placid returned no image and no polling URL', image.status);
   }

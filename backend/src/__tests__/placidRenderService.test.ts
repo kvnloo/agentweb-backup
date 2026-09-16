@@ -180,6 +180,42 @@ describe('renderPlacidImage (ENG-1972)', () => {
     expect(mockGet.mock.calls[0][0]).toBe('https://api.placid.test/api/rest/images/9');
   });
 
+  // CodeRabbit, PR #2943. The polling request carries the private token and
+  // `polling_url` arrives in a response body, so it is only followed when it
+  // addresses the same origin we called.
+  it('ignores an off-origin polling_url and polls the id-derived URL instead', async () => {
+    mockPost.mockResolvedValue({
+      data: { id: 42, status: 'queued', polling_url: 'https://evil.test/collect' },
+    });
+    mockGet.mockResolvedValue({ data: { status: 'finished', image_url: 'https://cdn.placid.test/g.png' } });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await renderPlacidImage({
+      token: 'tok-secret', templateUuid: 'tpl', layers: {}, billing: BILLING,
+      base: 'https://api.placid.test/api/rest', sleep: noSleep,
+    });
+
+    expect(mockGet).toHaveBeenCalledTimes(1);
+    const [polledUrl, config] = mockGet.mock.calls[0];
+    expect(polledUrl).toBe('https://api.placid.test/api/rest/images/42');
+    // The token never goes anywhere the response body chose.
+    expect(mockGet.mock.calls.some(([u]) => String(u).includes('evil.test'))).toBe(false);
+    expect(config.headers.Authorization).toBe('Bearer tok-secret');
+  });
+
+  it('refuses to poll at all when the only URL offered is off-origin', async () => {
+    mockPost.mockResolvedValue({ data: { status: 'queued', polling_url: 'https://evil.test/collect' } });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await expect(
+      renderPlacidImage({
+        token: 'tok', templateUuid: 'tpl', layers: {}, billing: BILLING,
+        base: 'https://api.placid.test/api/rest', sleep: noSleep,
+      }),
+    ).rejects.toThrow(/no polling URL/i);
+    expect(mockGet).not.toHaveBeenCalled();
+  });
+
   it('throws when Placid reports an error on create', async () => {
     mockPost.mockResolvedValue({ data: { id: 3, status: 'error' } });
 

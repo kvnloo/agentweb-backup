@@ -1364,7 +1364,12 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
 
     // The REST API returns a URL rather than the bytes, so fetch it; everything
     // downstream (S3 layout, result file, session message) is unchanged.
-    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
+    // Bounded: axios has no default timeout, so a stalled download would hold
+    // this request (and its resources) open indefinitely (CodeRabbit, #2943).
+    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, {
+      responseType: 'arraybuffer' as const,
+      timeout: 30_000,
+    });
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
