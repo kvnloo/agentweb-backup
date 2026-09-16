@@ -464,6 +464,8 @@ router.post("/report-ui-bug", async (req, res) => {
         userName: user.displayName || user.email,
         reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
+        // ENG-1961: the dedup judge this filing runs is the caller's work, not "system".
+        actingUserId: userId,
         reportFingerprint: fingerprint,
         // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
         funnelStatus: user.funnelStatus,
