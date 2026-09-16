@@ -34,6 +34,24 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedConnectedAccounts: (...args: any[]) => mockGetAllowedConnectedAccounts(...args),
 }));
 
+// ENG-1541 remainder (items 1-2). Explicit mock, not the generic aws-sdk auto-mock every other
+// test here gets for free — that auto-mock resolves every DynamoDB call to `{}`, which would
+// make `upsertAccountCapabilityStatus` "succeed" without ever proving the calling convention
+// (status mapping, existing-row branching, suppression) is right. Defaults to "no existing
+// row, upsert succeeds" so pre-existing tests that don't care about tracking keep passing
+// unchanged; tests below override per-case.
+const mockGetCapabilityRequirement = jest.fn().mockResolvedValue(null);
+const mockUpsertCapabilityStatus = jest.fn().mockImplementation((existing, _userId, _capability, status) => Promise.resolve({
+  userId: 'mock', capability: 'ad_platform_integration', requiredSince: '', source: 'paid_ads_intent',
+  sourceDetail: 'goal', status, statusChangedAt: '', lastVerifiedAt: '', ...existing,
+}));
+const mockIsSuppressed = jest.fn().mockReturnValue(false);
+jest.mock('../services/accountCapabilityRequirementsDb', () => ({
+  getAccountCapabilityRequirement: (...args: any[]) => mockGetCapabilityRequirement(...args),
+  upsertAccountCapabilityStatus: (...args: any[]) => mockUpsertCapabilityStatus(...args),
+  isSuppressed: (...args: any[]) => mockIsSuppressed(...args),
+}));
+
 import { runRenewalIntegrationHealthCheck, evaluateRenewalIntegrationHealth } from '../cron/renewalIntegrationHealthCron';
 import { userDb } from '../services/db';
 
@@ -543,6 +561,151 @@ describe('runRenewalIntegrationHealthCheck', () => {
       await evaluateRenewalIntegrationHealth(user({ connected_accounts: [] }));
       expect(userDb.scanWithFilter).not.toHaveBeenCalled();
       expect(mockSendAlert).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ENG-1541 remainder (items 1-2). Wiring tests: does every decision branch reach the right
+   * tracking call, before the would_flag gate (not after it — that exact placement bug
+   * survived one review round before being caught), and does an active suppression actually
+   * stop the alert from sending.
+   */
+  describe('capability tracking (ENG-1541 remainder)', () => {
+    it('writes status "unhealthy" for a would_flag decision', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u10', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalledWith(
+        null, 'u10', 'ad_platform_integration', 'unhealthy', expect.any(String),
+      );
+    });
+
+    it('writes status "healthy" for a skipped_healthy_integration decision — a branch that never alerts, but must still be tracked', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u11', connected_accounts: [adAccount({ expiresAt: NOW + 30 * DAY_MS })] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalledWith(
+        null, 'u11', 'ad_platform_integration', 'healthy', expect.any(String),
+      );
+    });
+
+    it('writes status "not_entitled" for a skipped_no_ad_entitlement decision', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u12', connected_accounts: [] }),
+      ]);
+      mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['linkedin', 'gmail']);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalledWith(
+        null, 'u12', 'ad_platform_integration', 'not_entitled', expect.any(String),
+      );
+    });
+
+    it('does NOT create a row for a user who has never expressed paid-ads intent — skip entirely, no row ever created', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u13', emmaHelpInterests: [], connected_accounts: [] }),
+      ]);
+      mockGetCapabilityRequirement.mockResolvedValueOnce(null);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockUpsertCapabilityStatus).not.toHaveBeenCalled();
+    });
+
+    it('DOES update an existing row to not_required when intent has lapsed (the row already existed from an earlier occurrence)', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u14', emmaHelpInterests: [], connected_accounts: [] }),
+      ]);
+      const existingRow = {
+        userId: 'u14', capability: 'ad_platform_integration', requiredSince: '', source: 'paid_ads_intent',
+        sourceDetail: 'goal', status: 'unhealthy', statusChangedAt: '', lastVerifiedAt: '',
+      };
+      mockGetCapabilityRequirement.mockResolvedValueOnce(existingRow);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalledWith(
+        existingRow, 'u14', 'ad_platform_integration', 'not_required', null,
+      );
+    });
+
+    it('tracking write happens BEFORE the would_flag gate — a non-alerting branch still gets tracked', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u15', connected_accounts: [adAccount({ expiresAt: NOW + 30 * DAY_MS })] }),
+      ]);
+
+      await runRenewalIntegrationHealthCheck();
+
+      // skipped_healthy_integration never reaches sendAgentModeOncallAlert, but tracking
+      // must still have run — this is the exact placement bug caught during design review
+      // (an earlier draft put the write after the gate, which only ever fires for would_flag).
+      expect(mockSendAlert).not.toHaveBeenCalled();
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalled();
+    });
+
+    it('suppresses the alert when isSuppressed returns true for a would_flag decision', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u16', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+      ]);
+      mockIsSuppressed.mockReturnValueOnce(true);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.flagged).toBe(1);
+      expect(summary.suppressedByCorrection).toBe(1);
+      expect(mockSendAlert).not.toHaveBeenCalled();
+    });
+
+    it('does not suppress, and sends the alert, when isSuppressed returns false', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u17', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+      ]);
+      mockIsSuppressed.mockReturnValueOnce(false);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.suppressedByCorrection).toBe(0);
+      expect(mockSendAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('isSuppressed is checked against the POST-write row (upsert\'s return value), not the pre-write read', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u18', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+      ]);
+      const staleRow = { status: 'healthy', statusChangedAt: 'stale' };
+      const freshRow = { status: 'unhealthy', statusChangedAt: 'fresh' };
+      mockGetCapabilityRequirement.mockResolvedValueOnce(staleRow);
+      mockUpsertCapabilityStatus.mockResolvedValueOnce(freshRow);
+
+      await runRenewalIntegrationHealthCheck();
+
+      expect(mockIsSuppressed).toHaveBeenCalledWith(freshRow);
+    });
+
+    it('isolates a tracking failure — one user\'s tracking-write throw does not abort the scan, and does not suppress their own real alert', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'u19', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+        user({ userId: 'u20', connected_accounts: [adAccount({ expiresAt: NOW - DAY_MS })] }),
+      ]);
+      mockGetCapabilityRequirement
+        .mockRejectedValueOnce(new Error('dynamo down for this user'))
+        .mockResolvedValueOnce(null);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.scannedUsers).toBe(2);
+      expect(summary.trackingFailed).toBe(1);
+      // Both users still get evaluated and alerted — a tracking failure for u19 must not
+      // suppress u19's own real alert, and must not take u20 down with it.
+      expect(summary.flagged).toBe(2);
+      expect(mockSendAlert).toHaveBeenCalledTimes(2);
     });
   });
 });

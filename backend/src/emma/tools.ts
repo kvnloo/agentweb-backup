@@ -16,7 +16,7 @@ import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
-import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   buildPendingUserQuestion,
@@ -75,16 +75,40 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     const sessionId = context?.sessionId;
 
-    const candidate = await humanEvalService.createCandidate({
-      reviewType: args.review_type as HumanEvalReviewType,
-      outputSummary: args.output_summary,
-      artifactUrl: args.artifact_url,
-      chatUrl: args.chat_url,
-      originalRequest: args.original_request,
-      agentRunId: args.agent_run_id,
-      userId,
-      sessionId,
-    });
+    // ENG-1854: this manual path bypasses enqueueAutoHumanEval entirely (it calls
+    // createCandidate directly), so it never went through that function's own dedup — an
+    // auto-trigger could already have posted this exact artifact (e.g. right after
+    // generate_image completes) before Emma also decides to send it herself. Claim the
+    // artifact URL first so whichever path gets here first wins, not both.
+    let claimedArtifact = false;
+    if (args.artifact_url) {
+      if (!(await claimArtifactForHumanEval(args.artifact_url))) {
+        return {
+          success: true,
+          message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
+        };
+      }
+      claimedArtifact = true;
+    }
+
+    let candidate;
+    try {
+      candidate = await humanEvalService.createCandidate({
+        reviewType: args.review_type as HumanEvalReviewType,
+        outputSummary: args.output_summary,
+        artifactUrl: args.artifact_url,
+        chatUrl: args.chat_url,
+        originalRequest: args.original_request,
+        agentRunId: args.agent_run_id,
+        userId,
+        sessionId,
+      });
+    } catch (err) {
+      // Release the claim on failure — otherwise a transient createCandidate error
+      // permanently blackholes this artifact from ever being sent for review again.
+      if (claimedArtifact) await releaseArtifactClaim(args.artifact_url);
+      throw err;
+    }
 
     return {
       success: true,
@@ -268,7 +292,15 @@ function enqueueLeadEnrichmentEval(input: {
   toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
 }): void {
   const processedCount = Number(input.summary?.processedCount ?? 0);
-  if (!input.userId || processedCount <= 0) return;
+  const failedCount = Number(input.summary?.failedCount ?? 0);
+  // ENG-1854: a routine, zero-failure enrichment run was never a real candidate for human
+  // review — it's a completion log entry, not a judgment call. This was the dominant source
+  // of #eval-queue noise (confirmed via a real Slack dump: near-identical "processed N,
+  // failed 0" posts, minutes apart, differing only by list). Only enqueue when something's
+  // actually anomalous. Does not apply to rerunLeadEnrichment (humanEvalActionService.ts) —
+  // that path fires because a human explicitly asked for and is waiting on this specific
+  // re-run, so it should always report back regardless of outcome.
+  if (!input.userId || processedCount <= 0 || failedCount <= 0) return;
 
   const fields = outputFieldNames(input.outputFields);
   const runId = typeof input.summary?.runId === 'string' && input.summary.runId
@@ -496,7 +528,7 @@ Actions:
 - search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school, company_size_min/company_size_max. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. COMPANY SIZE: there is no native LinkedIn/Unipile filter for a person's employer headcount, so company_size_min/max is a post-filter applied after the search — it can meaningfully shrink the result count (candidates whose employer size can't be verified are excluded, not guessed at), and the response may report companySizeFiltered with a count and a message when this happens. Only pass it when the user actually asked for a size constraint (e.g. "at startups", "at large companies") — it costs extra lookups per search. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
-- list-sent-invitations: List this account's PENDING connection requests. Always returns a named outcome — never a bare empty result. "source" is 'live' (read from LinkedIn just now), 'cache' (our own ledger, refreshed every ~10 minutes — used when the live read was unavailable or returned nothing while we still hold records), or 'none'. "notice" explains the outcome in plain language and MUST be relayed to the user rather than summarised away. "totalPending" is how many pending invitations we know about, which may exceed the returned "items". When "totalPendingIsLowerBound" is true the account has MORE pages than were read, so treat totalPending as "at least this many" and never quote it as the exact backlog — pass "cursor" back to read further. Each item carries "sent_at", so stale invitations can be picked by age and withdrawn with cancel-invitation. CRITICAL: source 'none' WITH liveUnavailable:true means we could NOT read the backlog — it is NOT evidence the account has none, and must never be reported as "no pending invitations". Only source 'none' WITHOUT liveUnavailable means genuinely nothing is tracked here, in which case the backlog was likely built outside AgentWeb and only the account owner can clear it from LinkedIn directly.
+- list-sent-invitations: List this account's PENDING connection requests. Always returns a named outcome — never a bare empty result. "source" is 'live' (read from LinkedIn just now), 'cache' (our own ledger, refreshed every ~10 minutes — used when the live read was unavailable or returned nothing while we still hold records), or 'none'. "notice" explains the outcome in plain language and MUST be relayed to the user rather than summarised away. "totalPending" is how many pending invitations we know about, which may exceed the returned "items". When "totalPendingIsLowerBound" is true the account has MORE pages than were read, so treat totalPending as "at least this many" and never quote it as the exact backlog — pass "cursor" back to read further. Each item carries "sent_at", so stale invitations can be picked by age and withdrawn with cancel-invitation — but sent_at is APPROXIMATE ("sentAtIsApproximate": true): LinkedIn only reports relative ages, so many invitations share an identical timestamp. Never report identical sent_at values as a burst of sends or an anomaly. CRITICAL: source 'none' WITH liveUnavailable:true means we could NOT read the backlog — it is NOT evidence the account has none, and must never be reported as "no pending invitations". Only source 'none' WITHOUT liveUnavailable means genuinely nothing is tracked here, in which case the backlog was likely built outside AgentWeb and only the account owner can clear it from LinkedIn directly.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
 - send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree. CRM ATTRIBUTION: when you are running outreach for a CRM lead list, ALWAYS pass list_id with send-invite, plus the invitee's own first_name/last_name/company/title when you actually know them for THAT person (from search-people or get-profile) — never reuse the filters you searched with, or the lead is stamped with the wrong employer/title. The invite is then mirrored into that list — the person is created as a lead if absent, marked contacted, and logged with a linkedin.invite.sent engagement — so contact volume is attributed and follow-up cadence can fire. Also pass lead_id when you already know the CRM lead.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
@@ -970,8 +1002,8 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
+  AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -981,6 +1013,12 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
   LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
   Use GET to verify a creative you just built or swapped onto an ad, and to read a
   placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+AD / AD_CREATIVE PREVIEW — render an existing ad or creative for one Meta placement.
+  AD requires ad_id; AD_CREATIVE requires params.creative_id. Pass params.ad_format (for example
+  DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY). The response contains Meta's
+  iframe HTML, not a permanent public URL; Meta preview iframes expire after 24 hours and are only
+  visible to people who can access the selected ad account.
 
 SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
   ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
@@ -1148,7 +1186,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1246,6 +1284,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
+            ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
@@ -1546,6 +1585,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
+        include_learning: { type: 'boolean', description: 'Include bounded shadow learning in global, client, campaign, channel order. Advisory only.' },
+        campaign_id: { type: 'string', description: 'Campaign scope for learning retrieval.' },
         platform: {
           type: 'string',
           enum: ['meta'],
@@ -1579,7 +1620,20 @@ emmaToolRegistry.register({
     const stored = await getThresholdsForAccount('meta', cleaned);
     const resolved = resolveThresholds(stored);
 
+    let learningResult: Record<string, unknown> = {};
+    if (args.include_learning === true) {
+      try {
+        const { getScopedLearning } = await import('../services/adsLearningDb');
+        learningResult = { learning: await getScopedLearning({ userId: context.userId, platform: 'meta', accountId: cleaned,
+          campaignId: typeof args.campaign_id === 'string' ? args.campaign_id : undefined, now: new Date().toISOString() }) };
+      } catch {
+        console.error('[AdsLearning] scoped retrieval unavailable');
+        learningResult = { learningUnavailable: true };
+      }
+    }
+
     return {
+      ...learningResult,
       success: true,
       platform: 'meta',
       account_id: cleaned,
@@ -2870,7 +2924,7 @@ emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
-    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool.',
+    description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3. If the user refers to a template by name and multiple templates share that name, you MUST ask which template_id to use before calling this tool. IMPORTANT: every variable value is inserted into the template as literal text, exactly as you write it — do NOT format values with HTML tags (e.g. <ul>, <li>, <strong>) or Markdown syntax (e.g. **bold**, "- " bullets, # headers). Write plain sentences only; for multiple points within one variable, separate them with periods, not a list.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2880,11 +2934,11 @@ emmaToolRegistry.register({
         },
         variable_values_json: {
           type: 'string',
-          description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
+          description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Values are inserted as literal plain text — no HTML tags or Markdown formatting. Example: {"title": "Hello", "company_name": "Acme Corp"}'
         },
         array_variable_values_json: {
           type: 'string',
-          description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
+          description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. Each string is inserted as literal plain text — no HTML tags or Markdown formatting. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
         }
       },
       required: ['template_id', 'variable_values_json', 'array_variable_values_json']
@@ -4870,12 +4924,17 @@ emmaToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any, _context?: any) => {
+  execute: async (args: any, context?: any) => {
     // Intentionally pass no model: describe_image always uses the configured
     // agent_mode_default_model (resolved inside describeImage), not the chat's
     // selected model. (`args.llmModel` was never populated — the schema doesn't
     // expose it and the registry doesn't merge context into args.)
-    return await agentModeService.describeImage(undefined, args.image_url, args.prompt);
+    // ENG-1858: meter the vision call to the calling user instead of "system".
+    return await agentModeService.describeImage(undefined, args.image_url, args.prompt, {
+      userId: context?.userId || context?.agentUserId,
+      sessionId: context?.sessionId,
+      feature: 'describe_image',
+    });
   }
 });
 
@@ -7898,7 +7957,12 @@ emmaToolRegistry.register({
               },
               run_id: {
                 type: 'string',
-                description: 'Optional AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure.'
+                description: 'AgentRun id (from the AgentRun inspector / runtime telemetry). When given, the server automatically attaches the run dossier — verdict, failed tool calls with error class/message and the failing arguments — to the report. Strongly recommended when reporting an agent/tool failure. REQUIRED whenever claimed_unavailable_tools is set.'
+              },
+              claimed_unavailable_tools: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Exact tool name(s) this report asserts are broken, unavailable, or not working (e.g. ["playwright_browser_navigate"]). Set this whenever the bug claims a SPECIFIC tool does not work. run_id is then REQUIRED: the server verifies each named tool was actually called in that run\'s telemetry before filing — a tool you never called in this session cannot be reported as broken, no matter how the description is worded. Call the tool and observe the real failure first; do not infer unavailability from a different tool\'s error or from not having tried yet. Leave this empty for reports that are not about a specific tool failing (general output-quality complaints, missing product capabilities — use type: feature_request for those).'
               },
               type: {
                 type: 'string',
@@ -7959,6 +8023,50 @@ emmaToolRegistry.register({
     const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
     const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
+    // ENG-1945 second follow-up: the `claimed_unavailable_tools` gate above only engages
+    // when the model actually populates that field — a report that describes the SAME
+    // claim only in free-text `description`/`title` bypasses it entirely, which is exactly
+    // how session ff31ccb7 got filed (it named playwright_browser_navigate/snapshot/
+    // evaluate/click by their real tool identifiers, in prose, with zero calls behind any
+    // of them). Close that path by detecting the claim FROM the wording itself: scan for
+    // any of AgentWeb's real, known tool-name identifiers appearing alongside
+    // unavailability language, and treat a match as an IMPLICIT claimed_unavailable_tools
+    // entry, subject to the exact same verification below. Tool names are unambiguous
+    // snake_case identifiers a customer would never type — a real tool name appearing in
+    // this report's own wording is, in practice, always the AGENT's own technical
+    // description of a call it made or is describing, never coincidental prose.
+    const UNAVAILABLE_WORDING = /\b(unavailable|not available|no longer available|not working|isn'?t working|doesn'?t work|didn'?t work|does not work|did not work|not callable|not accessible|not exposed|did not appear|does not appear|remain(?:s|ed)? unavailable|stayed unavailable|is broken|are broken|was broken|were broken|can'?t use|cannot use|unable to use)\b/i;
+    // Lazy + memoized: the published-skills scan is a real DynamoDB read (TTL-cached
+    // service-side, but still I/O), so only pay for it if some issue in this batch
+    // actually uses unavailability wording — the common case (most bug/feature reports)
+    // never needs it. Best-effort: a lookup failure degrades to "detect nothing" rather
+    // than blocking any report — the explicit claimed_unavailable_tools field above
+    // remains the one guaranteed-enforced path regardless of this catalog's health.
+    let knownToolNamesPatternPromise: Promise<RegExp | null> | null = null;
+    const getKnownToolNamesPattern = (): Promise<RegExp | null> => {
+      if (!knownToolNamesPatternPromise) {
+        knownToolNamesPatternPromise = (async () => {
+          try {
+            const knownToolNames = new Set<string>(emmaToolRegistry.getToolNames());
+            const { skillService } = await import('../services/skillService');
+            const publishedSkills = await skillService.getPublishedSkills();
+            for (const skill of publishedSkills) {
+              for (const name of skill.toolNames || []) knownToolNames.add(name);
+            }
+            if (knownToolNames.size === 0) return null;
+            const escaped = Array.from(knownToolNames)
+              .sort((a, b) => b.length - a.length) // longest-first so a prefix name can't shadow a longer match
+              .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            return new RegExp(`\\b(${escaped.join('|')})\\b`, 'g');
+          } catch (e) {
+            console.warn('[report_product_issues] known-tool-name catalog lookup failed (prose-claim detection skipped, report still filed):', e instanceof Error ? e.message : e);
+            return null;
+          }
+        })();
+      }
+      return knownToolNamesPatternPromise;
+    };
+
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
       const issue = typeof rawIssue === 'string' ? JSON.parse(rawIssue) : rawIssue;
@@ -7985,7 +8093,66 @@ emmaToolRegistry.register({
         // Server-side run-dossier enrichment: the reporter passes a run_id and
         // the server pulls the telemetry it already has. Best-effort — a
         // failed lookup must never block the report.
+        //
+        // EXCEPT for `claimed_unavailable_tools` (ENG-1945 follow-up): that field is an
+        // evidence-backed claim, not prose, and it exists specifically because prose could
+        // not be trusted — session ff31ccb7 filed "navigation and extraction tools remain
+        // unavailable" without ever having called playwright_browser_navigate/snapshot/
+        // evaluate/click, and the model proved itself wrong on its very next real attempt.
+        // Once a report asserts a SPECIFIC tool is broken via this field, "best-effort" no
+        // longer applies to verifying it: an unverifiable claim (lookup failed, run not
+        // found) must be REJECTED, same as a claim the telemetry contradicts, or this
+        // channel would be exactly as trustable as the free-text prose it replaces.
         let description: string = issue.description;
+        const claimedUnavailableTools = Array.isArray(issue.claimed_unavailable_tools)
+          ? issue.claimed_unavailable_tools.filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 0)
+          : [];
+        // Prose-implied claims (see the lazy catalog loader above): real tool identifiers
+        // named in THIS issue's own title/description alongside unavailability wording,
+        // even though claimed_unavailable_tools was left empty. The catalog fetch only
+        // happens (once, memoized for the batch) when this cheap regex test matches —
+        // an ordinary bug/feature report never pays for the DynamoDB read.
+        const impliedTextToScan = `${typeof issue.title === 'string' ? issue.title : ''} ${typeof issue.description === 'string' ? issue.description : ''}`;
+        const impliedUnavailableTools: string[] = [];
+        if (UNAVAILABLE_WORDING.test(impliedTextToScan)) {
+          const knownToolNamesPattern = await getKnownToolNamesPattern();
+          if (knownToolNamesPattern) {
+            knownToolNamesPattern.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            const seen = new Set<string>();
+            while ((match = knownToolNamesPattern.exec(impliedTextToScan))) {
+              if (!seen.has(match[1])) {
+                seen.add(match[1]);
+                impliedUnavailableTools.push(match[1]);
+              }
+            }
+          }
+        }
+        // The combined set this issue is asserting is broken/unavailable, whether stated
+        // explicitly via the field or implied by its own wording — both verified identically.
+        const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
+        // ENG-1945 follow-up (live-prod finding): the model has no legitimate way to learn
+        // its own agentRuntimeRunId — it is never surfaced in any tool result or prompt text
+        // — so requiring it to TYPE that id back (as the original version of this gate did)
+        // made even an honest same-turn claim unverifiable; live testing confirmed the model
+        // simply invents a plausible-looking placeholder ("current-run") instead. Default to
+        // `context.currentRunId` — the server's OWN id for the run this call is executing
+        // within, threaded in by toolDispatch.ts, not something the model can fake or
+        // mistype — whenever the model doesn't supply an explicit `run_id`. An EXPLICIT
+        // `run_id` argument still takes priority when given, preserving ENG-939's citing-a-
+        // DIFFERENT-run case (a reviewer analysing another session) exactly as before.
+        const explicitRunId = typeof issue.run_id === 'string' && issue.run_id.trim() ? issue.run_id.trim() : undefined;
+        const effectiveRunId = explicitRunId ?? (typeof context?.currentRunId === 'string' ? context.currentRunId : undefined);
+        if (effectiveUnavailableTools.length > 0 && !effectiveRunId) {
+          const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
+          throw new Error(
+            `Cannot file "${issue.title}": ${viaWording
+              ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
+              : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
+            } — that requires a resolvable run to check the claim against, and none is available (no run_id given and no ` +
+            `current run context). Only call report_product_issues about a tool being broken from within an active agent run.`
+          );
+        }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
         // report (an internal reviewer surfacing a telemetry/satisfaction-report pattern from a
         // customer's session). When it does, THAT user — not the reviewer — is the affected
@@ -7995,12 +8162,49 @@ emmaToolRegistry.register({
         let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
         let affectedSessionId: string | undefined;
         let affectedUserUnresolved = false;
-        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+        // Uses `effectiveRunId` (explicit run_id, else the server-supplied current run) so
+        // an in-progress agent run gets its dossier auto-attached even when the model never
+        // passed run_id explicitly — not just when claimed_unavailable_tools forces the issue.
+        if (effectiveRunId) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
-            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const { runs } = await fetchAgentRunSummaries({ runId: effectiveRunId, limit: 1 });
             const run = runs[0];
-            if (run) {
+            if (!run) {
+              if (effectiveUnavailableTools.length > 0) {
+                throw new Error(
+                  `Cannot file "${issue.title}": run_id "${effectiveRunId}" does not resolve to a known run, so ` +
+                  `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
+                  `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
+                );
+              }
+            } else {
+              // The hard gate: a tool can only be REPORTED broken/unavailable if it was
+              // actually invoked (any outcome — success, failure, or deferral all count as
+              // "attempted"; only a tool with ZERO invocations this run is an unverified
+              // claim) in this exact run. Checked against EVT_TOOL_INVOKED telemetry, which
+              // is recorded independently of anything the model writes — the claim cannot
+              // talk its way past this the way it could past a prompt-only instruction.
+              // Covers BOTH claimed_unavailable_tools and a real tool name the report's own
+              // wording named alongside unavailability language (effectiveUnavailableTools).
+              if (effectiveUnavailableTools.length > 0) {
+                const invokedToolNames = new Set(
+                  (run.outcomes || [])
+                    .filter((o: any) => o.eventType === 'agent_tool_invoked' && typeof o.toolName === 'string')
+                    .map((o: any) => o.toolName as string)
+                );
+                const neverAttempted = effectiveUnavailableTools.filter((name: string) => !invokedToolNames.has(name));
+                if (neverAttempted.length > 0) {
+                  throw new Error(
+                    `Cannot file "${issue.title}": this report asserts ${neverAttempted.join(', ')} ${neverAttempted.length === 1 ? 'is' : 'are'} ` +
+                    `broken/unavailable (via claimed_unavailable_tools and/or its own wording), but run ${run.runId} never ` +
+                    `actually called ${neverAttempted.length === 1 ? 'it' : 'them'}. A tool can only be reported broken/unavailable ` +
+                    `after you have actually called it in THIS session and observed the failure yourself — call it first, or ` +
+                    `reword the report so it does not assert that tool is broken.`
+                  );
+                }
+              }
+
               const failures = (run.outcomes || [])
                 .filter((o: any) => o.eventType === 'agent_tool_failed')
                 .slice(0, 10)
@@ -8008,6 +8212,17 @@ emmaToolRegistry.register({
                   const argsPart = o.failedArgsJson ? `\n  args: ${o.failedArgsJson}` : '';
                   return `- ${o.toolName || 'unknown'} [${o.errorClass || 'Error'}]: ${o.errorMessage || ''}${argsPart}`;
                 });
+              // Ground truth for whoever triages this (ENG-1945 follow-up): the tools this
+              // run ACTUALLY invoked, attached whenever a run_id is present — even for
+              // reports that never populate claimed_unavailable_tools. A model can still
+              // describe unavailability in free-text `description` without using the
+              // structured field above, which the hard gate can't see; this makes the
+              // mismatch visible to a human/triage pipeline reading the filed report either way.
+              const invokedNames = Array.from(new Set(
+                (run.outcomes || [])
+                  .filter((o: any) => o.eventType === 'agent_tool_invoked' && typeof o.toolName === 'string')
+                  .map((o: any) => o.toolName as string)
+              )).sort();
               description += [
                 '',
                 '',
@@ -8015,6 +8230,7 @@ emmaToolRegistry.register({
                 `AgentRun dossier (auto-attached from run_id ${run.runId}):`,
                 `- verdict: ${(run as any).verdict || 'n/a'}  |  tool calls: ${(run as any).toolCalls ?? 'n/a'}  |  failed: ${(run as any).failedToolCalls ?? 'n/a'}`,
                 ...(run.sessionId ? [`- session: ${run.sessionId}`] : []),
+                `- tools actually invoked this run: ${invokedNames.length > 0 ? invokedNames.join(', ') : 'none'}`,
                 ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
               ].join('\n');
               issueContext['AgentRun ID'] = run.runId;
@@ -8038,6 +8254,9 @@ emmaToolRegistry.register({
               }
             }
           } catch (e) {
+            // An explicit OR wording-implied claim turns this from best-effort into a
+            // hard requirement — an unverifiable claim must not silently file (see above).
+            if (effectiveUnavailableTools.length > 0) throw e;
             console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
           }
         }
@@ -9044,7 +9263,7 @@ ACTION MATRIX:
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
               REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?, target_google_search?, target_search_network?, target_content_network?, target_partner_search_network?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
@@ -9126,6 +9345,10 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
+        target_google_search: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google Search. Maps to network_settings.target_google_search.' },
+        target_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google search partners. Maps to network_settings.target_search_network.' },
+        target_content_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether Search campaigns use Display Network expansion. Set false to disable Display expansion. Maps to network_settings.target_content_network.' },
+        target_partner_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Controls a separate partner network available only to select eligible accounts. This does not control Google Search Partners; use target_search_network for that. Maps to network_settings.target_partner_search_network.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },

@@ -231,6 +231,31 @@ describe('handleCallGoogleAdsApi', () => {
     );
   });
 
+  it('forwards false campaign network settings instead of dropping them', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      target_google_search: true,
+      target_search_network: false,
+      target_content_network: false,
+      target_partner_search_network: false,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({
+        targetGoogleSearch: true,
+        targetSearchNetwork: false,
+        targetContentNetwork: false,
+        targetPartnerSearchNetwork: false,
+      }),
+    );
+  });
+
   it('handles CAMPAIGN ADD_PROXIMITY action (ENG-487)', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',

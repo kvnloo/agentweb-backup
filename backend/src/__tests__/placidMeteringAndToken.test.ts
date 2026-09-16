@@ -31,6 +31,7 @@ jest.mock('aws-sdk', () => {
 });
 
 import { getPlacidPrivateToken, __resetPlacidTokenCache, PLACID_TOKEN_TTL_MS } from '../utils/secretsManager';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('getPlacidPrivateToken (ENG-698)', () => {
   const originalEnv = process.env;
@@ -238,6 +239,13 @@ describe('Placid render metering (ENG-698)', () => {
     mockGetExecution.mockResolvedValue({ taskId: 'task-1', result_files: [] });
     mockUpdateExecution.mockResolvedValue(undefined);
     mockPutObject.mockResolvedValue({});
+    // ENG-1972: the render is a REST create (POST) that returns a URL, then a GET
+    // of that URL for the bytes. The token is the same one the editor-token and
+    // template-listing calls already use.
+    mockGetToken.mockResolvedValue('placid-private-token');
+    mockAxiosPost.mockResolvedValue({
+      data: { id: 77, status: 'finished', image_url: 'https://cdn.placid.test/out.png' },
+    });
     mockAxiosGet.mockResolvedValue({ data: new ArrayBuffer(8), headers: { 'content-type': 'image/png' } });
   });
 
@@ -255,11 +263,12 @@ describe('Placid render metering (ENG-698)', () => {
         operation: 'image_render',
         unit: 'render',
         quantity: 1,
-        costSource: 'allocated',
+        // ENG-1929: priced by the recorder from this key, not at the call site.
+        rateKey: 'image_render',
       }),
     );
     // $0.095 per image render, from the ENG-703 card.
-    expect(mockRecordVendorUsage.mock.calls[0][0].costUsd).toBeCloseTo(0.095, 6);
+    expect(getAllocatedRate('placid', 'image_render')).toBeCloseTo(0.095, 6);
   });
 
   // CodeRabbit, PR #2901. The access check lets an admin render a task that a
@@ -290,7 +299,7 @@ describe('Placid render metering (ENG-698)', () => {
   });
 
   it('does not record when Placid returned no image', async () => {
-    mockAxiosGet.mockRejectedValue(new Error('404 template'));
+    mockAxiosPost.mockRejectedValue(new Error('404 template'));
     const r = res();
     await generateFromTemplateToExecution(renderReq(), r);
 

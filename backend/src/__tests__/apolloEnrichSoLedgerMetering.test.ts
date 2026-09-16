@@ -100,7 +100,9 @@ describe('Apollo $ ledger mirroring (ENG-696)', () => {
     expect(ctx.provider).toBe('apollo');
     expect(ctx.userId).toBe(OWNER);
     expect(ctx.operation).toBe('person_match');
-    expect(ctx.costSource).toBe('allocated');
+    // ENG-1929: priced by the recorder from the rate key, never at the call site.
+    expect(ctx.rateKey).toBe('person_match');
+    expect(ctx).not.toHaveProperty('costUsd');
   });
 
   it('AC2: records against the platform when no userId is resolvable', async () => {

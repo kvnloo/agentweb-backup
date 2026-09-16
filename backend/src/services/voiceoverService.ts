@@ -6,7 +6,6 @@ import * as path from 'path';
 import { getElevenLabsApiKey } from '../utils/secretsManager';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { recordVendorUsage } from './usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 // Remotion ships its own ffmpeg binary — use it so we don't need a system install
 const FFMPEG_BIN = path.join(
@@ -52,12 +51,10 @@ async function getApiKey(): Promise<string> {
 /**
  * Record one synthesis against the requesting user (ENG-1878, split from ENG-698).
  *
- * Wrapped in try/catch, and that is load-bearing rather than defensive habit:
- * `computeAllocatedCost` THROWS on an unpriced unit by design (ENG-703 AC2), so
- * calling it inline would let a rate-card key rename break every voiceover.
- * AC5 says a metering failure must never stop the caller getting its audio, and
- * an unpriced unit is a metering failure. It still fails loud — into the log —
- * it just does not fail the user's request.
+ * Priced by `rateKey` inside the recorder (ENG-1929), so an unpriced unit is
+ * recorded `unpriced` and logged loudly instead of throwing into the voiceover
+ * (AC5: a metering failure never stops the caller getting its audio). The
+ * try/catch remains as a last line of defence against any synchronous throw.
  *
  * `model_id` at the call site is hardcoded `eleven_turbo_v2_5`, so the
  * Flash/Turbo rate applies unconditionally. If a caller ever chooses the model,
@@ -76,8 +73,7 @@ function meterElevenLabsCall(characterCount: number, userId: string): void {
       feature: 'voiceover',
       unit: '1k_characters',
       quantity: units,
-      costSource: 'allocated',
-      costUsd: computeAllocatedCost('elevenlabs', 'characters_flash_turbo', units),
+      rateKey: 'characters_flash_turbo',
     });
   } catch (error) {
     console.error(

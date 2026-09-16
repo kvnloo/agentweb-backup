@@ -205,7 +205,8 @@ router.post('/describe-media', async (req: Request, res: Response) => {
     if (type === 'video') {
       result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time, userId: userId(req) });
     } else {
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
+      // ENG-1858: meter to the API caller instead of "system".
+      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, { userId: userId(req), feature: 'describe_image' });
     }
     res.json(result);
   } catch (err: any) {

@@ -13,6 +13,8 @@
 
 import {
   MAX_RETURNED_INVITATIONS,
+  SENT_AT_PRECISION_NOTE,
+  earliestSentAt,
   getSentInvitationsView,
 } from '../services/agentMode/linkedInSentInvitationsView';
 
@@ -244,5 +246,154 @@ describe('a paginated page length is not the backlog size', () => {
     expect(view.totalPendingIsLowerBound).toBeUndefined();
     expect(view.notice).toContain('3 pending invitations read live');
     expect(view.notice).not.toContain('At least');
+  });
+});
+
+/**
+ * ENG-1718 follow-up, found in production: a customer's scheduled runs read ~50
+ * identical sent_at values and reported "an unexplained ~50-invite burst" to the
+ * customer, twice. The timestamp was exactly N days before the run's own list
+ * call: Unipile resolves LinkedIn's "Sent N days ago" label at request time.
+ */
+describe('sent_at is labelled approximate wherever rows are returned', () => {
+  // What a real page looks like: one relative label, one timestamp for all of them.
+  const sameLabel = Array.from({ length: 5 }, (_, i) => liveItem(`burst-${i}`, '2026-09-05T17:17:37.000Z'));
+
+  it('live rows carry the flag, and the notice says identical timestamps are not a burst', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({
+      object: 'InvitationList', items: sameLabel, cursor: null,
+    }));
+
+    expect(view.source).toBe('live');
+    expect(view.sentAtIsApproximate).toBe(true);
+    expect(view.notice).toContain(SENT_AT_PRECISION_NOTE);
+    expect(view.notice).toMatch(/NOT a burst/);
+  });
+
+  it('cached rows carry the flag too — the ledger stores the same estimates', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(
+      { object: 'InvitationList', items: [], cursor: null },
+      [cachedRow('x', '2026-09-04T21:17:36.000Z'), cachedRow('y', '2026-09-04T21:17:36.000Z')],
+    ));
+
+    expect(view.source).toBe('cache');
+    expect(view.sentAtIsApproximate).toBe(true);
+    expect(view.notice).toContain(SENT_AT_PRECISION_NOTE);
+  });
+
+  it('is absent when there are no rows to misread', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({ object: 'InvitationList', items: [], cursor: null }));
+
+    expect(view.source).toBe('none');
+    expect(view).not.toHaveProperty('sentAtIsApproximate');
+    expect(view.notice).not.toContain(SENT_AT_PRECISION_NOTE);
+  });
+});
+
+
+/**
+ * ENG-1938 — a live page carries ONE timestamp per relative label, so "withdraw
+ * the oldest" is unrankable from it. Production, 2026-09-16: a live page of 99
+ * pending invitations had a single distinct `sent_at`, exactly 14 days before the
+ * call, while the ledger held 9 distinct values for the same account, the oldest
+ * 44 days. The ledger keeps the earliest estimate ever observed, so merge it in.
+ */
+describe('live rows are merged with the ledger estimate', () => {
+  const label = '2026-09-02T11:27:37.376Z'; // what "2 weeks ago" resolves to on every row
+  const livePage = {
+    object: 'InvitationList',
+    items: [liveItem('a', label), liveItem('b', label), liveItem('c', label)],
+    cursor: null,
+  };
+
+  it('prefers the ledger value when it is earlier, and returns oldest first', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(livePage, [
+      cachedRow('pub-a', '2026-08-03T00:00:00.000Z'), // 44 days: the real backlog
+      cachedRow('pub-b', '2026-08-20T00:00:00.000Z'),
+    ]));
+
+    expect(view.source).toBe('live');
+    expect(view.items.map((i) => i.sent_at)).toEqual([
+      '2026-08-03T00:00:00.000Z',
+      '2026-08-20T00:00:00.000Z',
+      label, // 'c' is not in the ledger, so the live value stands
+    ]);
+    expect(view.totalPending).toBe(3);
+  });
+
+  it('keeps the live value when the ledger is later', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(
+      { object: 'InvitationList', items: [liveItem('a', '2026-07-01T00:00:00.000Z')], cursor: null },
+      [cachedRow('pub-a', '2026-09-01T00:00:00.000Z')],
+    ));
+
+    expect(view.items[0].sent_at).toBe('2026-07-01T00:00:00.000Z');
+  });
+
+  it('still serves the live page when the ledger read fails', async () => {
+    const d = {
+      fetchLive: jest.fn(async () => livePage),
+      fetchCached: jest.fn(async () => { throw new Error('dynamo down'); }),
+    };
+    const view = await getSentInvitationsView(ACCOUNT, undefined, d);
+
+    expect(view.source).toBe('live');
+    expect(view.items).toHaveLength(3);
+    expect(view.items.every((i) => i.sent_at === label)).toBe(true);
+  });
+});
+
+describe('earliestSentAt', () => {
+  it('takes the earlier of two estimates, tolerating missing or unparseable values', () => {
+    expect(earliestSentAt('2026-08-03T00:00:00.000Z', '2026-09-02T00:00:00.000Z')).toBe('2026-08-03T00:00:00.000Z');
+    expect(earliestSentAt('2026-09-02T00:00:00.000Z', '2026-08-03T00:00:00.000Z')).toBe('2026-08-03T00:00:00.000Z');
+    expect(earliestSentAt(null, '2026-08-03T00:00:00.000Z')).toBe('2026-08-03T00:00:00.000Z');
+    expect(earliestSentAt('2026-08-03T00:00:00.000Z', undefined)).toBe('2026-08-03T00:00:00.000Z');
+    expect(earliestSentAt('not a date', '2026-08-03T00:00:00.000Z')).toBe('2026-08-03T00:00:00.000Z');
+    expect(earliestSentAt(null, null)).toBeNull();
+  });
+});
+
+
+describe('review fixes on PR #2941', () => {
+  it('orders live rows by TIME, with unknown dates last so they cannot displace the oldest', async () => {
+    const undated = { object: 'InvitationSent', id: 'no-date', invited_user_public_id: 'pub-no-date', invited_user: 'X' };
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({
+      object: 'InvitationList',
+      items: [liveItem('new', '2026-09-10T00:00:00.000Z'), undated, liveItem('old', '2026-07-01T00:00:00.000Z')],
+      cursor: null,
+    }));
+
+    expect(view.items.map((i) => i.id)).toEqual(['old', 'new', 'no-date']);
+  });
+
+  it('merges the ledger estimate for a row that carries the alternate public-id field', async () => {
+    const alternate = {
+      object: 'InvitationSent',
+      id: 'alt',
+      invited_user_public_identifier: 'pub-alt',
+      invited_user: 'Alt Person',
+      parsed_datetime: '2026-09-02T11:27:37.376Z',
+    };
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(
+      { object: 'InvitationList', items: [alternate], cursor: null },
+      [cachedRow('pub-alt', '2026-08-03T00:00:00.000Z')],
+    ));
+
+    expect(view.source).toBe('live');
+    expect(view.items[0].invited_user_public_id).toBe('pub-alt');
+    expect(view.items[0].sent_at).toBe('2026-08-03T00:00:00.000Z');
+  });
+
+  it('never calls an unreadable ledger "nothing is tracked" when live says zero', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, {
+      fetchLive: jest.fn(async () => ({ object: 'InvitationList', items: [], cursor: null })),
+      fetchCached: jest.fn(async () => { throw new Error('dynamo down'); }),
+    });
+
+    expect(view.source).toBe('none');
+    expect(view.liveUnavailable).toBe(true);
+    expect(view.notice).toMatch(/NOT confirmation/);
+    expect(view.notice).not.toContain('No pending invitations are tracked in our system');
   });
 });

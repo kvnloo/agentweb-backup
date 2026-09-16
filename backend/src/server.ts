@@ -620,7 +620,18 @@ createTestAccount().then(async () => {
     console.log('Initializing Agent Mode Tools (non-blocking)...');
     agentModeService.initialize()
       .then(() => {
-        console.log('Agent Mode Tools initialized successfully');
+        // initialize() resolves even when a step failed — every step swallows its own
+        // errors — so this must report the actual outcome. Logging unconditional success
+        // directly beneath the latch's own failure line is how a degraded boot reads as a
+        // healthy one, which cost real debugging time on ENG-1852.
+        if (agentModeService.isInitialized) {
+          console.log('Agent Mode Tools initialized successfully');
+        } else {
+          console.error(
+            'Agent Mode Tools initialization DEGRADED — a later request will retry. ' +
+            'See the AgentMode latch error above for which step failed.',
+          );
+        }
         // Pre-start the worker process so MCP servers are ready before the first chat message
         console.log('Pre-starting worker process...');
         generateMarketingResponseWorkerService.ensureWorkerReady()
@@ -744,10 +755,18 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
+      const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
+      setInterval(() => {
+        if (!isCronEnabled()) return;
+        cronJobRegistry.track('AdsLearningEvaluation', runAdsLearningEvaluation())
+          .catch(e => console.error('[AdsLearning] due evaluation failed:', e));
+      }, 15 * 60 * 1000).unref();
+      console.info('[AdsLearning] evaluation scheduled every 15 minutes');
+
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
-      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
-      // (28, sized against Meta's documented insights-mutability window) so a stored row
-      // doesn't freeze while Meta is still revising it.
+      // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
+      // final refresh occurs after reporting-day end plus 28 elapsed days.
       try {
         const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
         const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
