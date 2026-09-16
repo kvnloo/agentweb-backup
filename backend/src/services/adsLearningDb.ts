@@ -1,5 +1,7 @@
 /** Existing ledger + account-memory tables; no new table/index. All writes are conditional. */
 import AWS from 'aws-sdk';
+import { cleanAccountId } from './metaAccountCredentials';
+import { isEvaluationUser } from './evaluationPolicy';
 import { OUTCOME_LEDGER_TABLE, itemToRecommendation, ledgerRequest, getRecommendation } from './outcomeLedgerDb';
 import { buildOutcomeEntityKey, hasLearningContext, validateRecommendationContext, type Recommendation } from './outcomeLedger';
 import { buildOutcomeLesson, resolveScopedLessons, LEARNING_PREFIX, type LearningScope, type ScopedLesson } from './adsScopedLearning';
@@ -10,7 +12,9 @@ export async function getDueRecommendations(now: Date, cursor?: AWS.DynamoDB.Doc
   const result = await ledgerRequest(db.query({ TableName: OUTCOME_LEDGER_TABLE, IndexName: 'StatusEvaluationDateIndex',
     KeyConditionExpression: '#status = :pending AND evaluationDate <= :due', ExpressionAttributeNames: { '#status': 'status' },
     ExpressionAttributeValues: { ':pending': 'pending', ':due': new Date(now.getTime() - 28 * 86400000).toISOString() },
-    Limit: 100, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }), 5000);
+    // 75 × (1.5s reread + 3s metrics + 5s transaction + 1.5s conflict read)
+    // + 5s page read = at most 830s of request budgets, below the 900s tick.
+    Limit: 75, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }), 5000);
   if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed due page');
   const rows: Recommendation[] = [];
   for (const item of result.Items ?? []) {
@@ -96,4 +100,44 @@ export async function commitLearningReview(lesson: ScopedLesson, previous: Scope
       ExpressionAttributeNames: { '#updatedAt': 'updatedAt', '#learning': 'learning', '#state': 'reviewState' },
       ExpressionAttributeValues: { ':expected': previous.updatedAt, ':state': previous.learning.reviewState } } },
   ] }), 5000);
+}
+
+/** Sole-owner proof without the admin dashboard's unrelated count scans.
+ * No ownership index exists: bound the projected scan to 2,000 evaluated users,
+ * 20 pages and one 5-second deadline. Any incomplete/malformed read fails closed. */
+export async function getLearningAccountOwners(accountId: string): Promise<Set<string>> {
+  const deadline = Date.now() + 5000;
+  const owners = new Set<string>();
+  let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+  for (let page = 0; page < 20; page++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('Ownership read deadline exceeded');
+    const result = await ledgerRequest(db.scan({
+      TableName: `${process.env.NODE_ENV === 'development' ? 'Dev-' : ''}AW-Users`,
+      ProjectionExpression: 'userId, adAccount, connected_accounts',
+      ConsistentRead: true, Limit: 100, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+    }), remaining);
+    if (!Array.isArray(result.Items)) throw new Error('Ownership page malformed');
+    for (const user of result.Items) {
+      if (!user || typeof user.userId !== 'string' || !user.userId) throw new Error('Ownership identity malformed');
+      if (user.userId.startsWith('deleted_') || isEvaluationUser(user.userId)) continue;
+      if (user.adAccount != null && typeof user.adAccount !== 'string') throw new Error('Ownership account malformed');
+      if (user.connected_accounts != null && !Array.isArray(user.connected_accounts)) throw new Error('Ownership connections malformed');
+      for (const account of user.connected_accounts ?? []) {
+        if (!account || typeof account !== 'object' || Array.isArray(account) ||
+          (account.config != null && (typeof account.config !== 'object' || Array.isArray(account.config))) ||
+          [account.platform, account.account_id, account.config?.ad_account_id, account.config?.account_type].some(value => value != null && typeof value !== 'string')) {
+          throw new Error('Ownership connection malformed');
+        }
+      }
+      if ((typeof user.adAccount === 'string' && cleanAccountId(user.adAccount) === accountId) ||
+        (user.connected_accounts ?? []).some((account: any) =>
+          (account.platform === 'meta' || account.platform === 'facebook') && account.config?.account_type === 'ad_account' &&
+          cleanAccountId(account.account_id || account.config?.ad_account_id || '') === accountId)) owners.add(user.userId);
+      if (owners.size > 1) return owners; // Already enough evidence to refuse account-wide promotion.
+    }
+    cursor = result.LastEvaluatedKey;
+    if (!cursor) return owners;
+  }
+  throw new Error('Ownership read incomplete');
 }

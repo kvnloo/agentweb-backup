@@ -1,6 +1,4 @@
-import { userDb } from './db';
-import { getConnectedMetaAccountsList, cleanAccountId } from './metaAccountCredentials';
-import { getLearningItem, getLearningRecommendations, commitLearningReview } from './adsLearningDb';
+import { getLearningItem, getLearningRecommendations, commitLearningReview, getLearningAccountOwners } from './adsLearningDb';
 import { proposeParameterLearning, resolveScopedLessons, type LearningScope } from './adsScopedLearning';
 import { getThreshold } from './adsThresholdsDb';
 import { applyThresholdWrite, buildThresholdRevert, resolveThresholds } from './adsThresholds';
@@ -26,9 +24,7 @@ export async function reviewLearning(scope: LearningScope, memoryId: string, act
   // only an explicit client approval can authorize a parameter affecting that account.
   if (targetScope === 'client') {
     // ENG-918 is account-keyed. Do not promote client-derived evidence into a shared account.
-    const users = await userDb.getAllUsers();
-    if (!Array.isArray(users) || users.some(u => !u || typeof u.userId !== 'string')) throw new Error('Ownership unavailable');
-    const owners = new Set(users.filter(u => getConnectedMetaAccountsList(u).some((a: { accountId: string }) => a.accountId === scope.accountId) || (typeof u.adAccount === 'string' && cleanAccountId(u.adAccount) === scope.accountId)).map(u => u.userId));
+    const owners = await getLearningAccountOwners(scope.accountId);
     if (scope.platform !== 'meta' || owners.size !== 1 || !owners.has(scope.userId)) return { applied: false, reason: 'ambiguous_account_ownership' };
     const paramKey = 'creativeFatigue.ctrDropCriticalPct';
     const existing = await getThreshold('meta', scope.accountId, paramKey);

@@ -39,7 +39,7 @@ latest pending client/account/ad/window per measurement grain, within a separate
 budget (50 ms maximum for candidate lookup). No receipt authorizes an intervention. An explicit
 owner decline records a negative receipt; absence remains **unknown**, never false.
 
-Every 15 minutes, the existing server cron registry runs one bounded GSI page (100 due records).
+Every 15 minutes, the existing server cron registry runs one bounded GSI page (75 due records).
 The daily snapshot producer refreshes today-1 through today-30, allowing a final refresh after
 reporting-day end plus 28 elapsed days even at UTC-12. Meta evaluation waits until UTC midnight
 31 days after the final outcome date, giving that daily refresh a chance to complete before any
@@ -249,3 +249,13 @@ nor changes active build, failure, missing-evidence, draft or base-freshness gat
 112 tests passed (2 new red cases reproduced before the fix). Retired success cannot count as proof.
 CodeRabbit's host-path findings were addressed by sanitizing committed evidence and replacing the
 obsolete prerequisite section. These changes add no storage schema, dependency, or parallel path.
+
+The CodeRabbit summary's performance warning was actionable despite its clean inline-review
+headline. Client-scope review now performs an ownership-only projected scan, not the admin user
+listing and three unrelated count scans. The read is bounded to 20 pages, 100 evaluated users per
+page, and one 5-second deadline. Incomplete/malformed ownership data fails closed; a linked peer
+counts even without a usable token. No new index or persistence contract. The due page is reduced
+to 75 records: its request budgets total at most 830 seconds (including transaction-conflict reads),
+below the 15-minute interval, with the existing overlap guard retained. Fresh row rereads are kept
+because the GSI may lag a receipt or verdict; removing them would sacrifice data integrity.
+Docstring percentage is advisory: no behavior change was made solely to satisfy that metric.

@@ -4,6 +4,7 @@ const key = (x: any) => x.memoryId ? `${x.userId}/${x.memoryId}` : `${x.entityKe
 const table = (name: string) => { if (!mockTables.has(name)) mockTables.set(name, new Map()); return mockTables.get(name)!; };
 const conflict = () => Object.assign(new Error('condition'), { code: 'ConditionalCheckFailedException' });
 const mockClient = {
+  scan: jest.fn(),
   put: (p: any) => ({ promise: async () => { const t = table(p.TableName), k = key(p.Item);
     if (p.ConditionExpression?.includes('attribute_not_exists') && t.has(k)) throw conflict();
     t.set(k, structuredClone(p.Item)); return {}; } }),
@@ -43,7 +44,7 @@ const input = { clientUserId: 'u', accountId: 'a', campaignIds: ['c'], now: '202
   fatigued: [{ id: 'ad', reasons: ['ctr_drop'] }], ads: [{ id: 'ad', campaign_id: 'c',
     current_insights: { data: [{ date_start: '2026-03-01', date_stop: '2026-03-14', ctr: 1 }] },
     prior_insights: { data: [{ date_start: '2026-02-15', date_stop: '2026-02-28', ctr: 2 }] } }] };
-beforeEach(() => { mockTables.clear(); delete process.env.ADS_LEARNING_MODE; });
+beforeEach(() => { mockTables.clear(); delete process.env.ADS_LEARNING_MODE; mockClient.scan.mockReset().mockImplementation(() => ({ promise: async () => ({ Items: [{ userId: 'u', adAccount: 'a' }] }) })); });
 it('unsupported ad evidence stays in the ledger without generating guidance', async () => {
   await captureFatigueRecommendations(input);
   await runAdsLearningEvaluation(new Date('2026-05-01'));
@@ -109,7 +110,7 @@ it('never infers adoption from unverified success', async () => {
 });
 
 jest.mock('../services/metaTokenRefresh', () => ({ ensureFreshMetaAdAccountToken: jest.fn() }));
-jest.mock('../services/db', () => ({ userDb: { getAllUsers: jest.fn().mockResolvedValue([{ userId: 'u', adAccount: 'a' }]) } }));
+jest.mock('../services/db', () => ({}));
 import { reviewLearning } from '../services/adsLearningReview';
 import { getThreshold } from '../services/adsThresholdsDb';
 async function supportedFleet() {
@@ -163,8 +164,7 @@ it('keeps pending evidence and emits an error when the atomic evaluation write f
 });
 it('refuses a shared-account parameter promotion despite sufficient evidence', async () => {
   const lesson = await supportedFleet();
-  const { userDb } = await import('../services/db');
-  (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([{ userId: 'u', adAccount: 'a' }, { userId: 'peer', adAccount: 'a' }]);
+  mockClient.scan.mockImplementationOnce(() => ({ promise: async () => ({ Items: [{ userId: 'u', adAccount: 'a' }, { userId: 'peer', adAccount: 'a' }] }) }));
   expect(await reviewLearning({ ...scope, campaignId: lesson.learning.campaignId }, lesson.memoryId, 'approve', 'client'))
     .toMatchObject({ applied: false, reason: 'ambiguous_account_ownership' });
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
@@ -247,4 +247,49 @@ it('transaction boundary refuses a parameter paired with campaign-scoped approva
     { accountId: 'a', platform: 'meta', paramKey: 'creativeFatigue.ctrDropCriticalPct', currentValue: 25 } as any, null))
     .rejects.toThrow(/scope/i);
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+});
+
+it.each([true, { userId: 'peer', connected_accounts: true }, { userId: 'peer', connected_accounts: [null] }])(
+  'cannot promote a threshold when ownership data is malformed (%p)', async malformed => {
+    const lesson = await supportedFleet();
+    mockClient.scan.mockImplementation(() => ({ promise: async () => ({ Items: [malformed] }) }));
+    await expect(reviewLearning(scope, lesson.memoryId, 'approve', 'client')).rejects.toThrow(/ownership/i);
+    expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+  });
+it('cannot promote on an incomplete bounded ownership read', async () => {
+  const lesson = await supportedFleet();
+  mockClient.scan.mockImplementation(() => ({ promise: async () => ({ Items: [{ userId: 'u', adAccount: 'a' }], LastEvaluatedKey: { userId: 'more' } }) }));
+  await expect(reviewLearning(scope, lesson.memoryId, 'approve', 'client')).rejects.toThrow(/ownership/i);
+  expect(mockClient.scan.mock.calls.length).toBeLessThanOrEqual(20);
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+});
+it('finds a second account owner on a later page and refuses promotion', async () => {
+  const lesson = await supportedFleet();
+  mockClient.scan.mockImplementationOnce(() => ({ promise: async () => ({ Items: [{ userId: 'u', adAccount: 'a' }], LastEvaluatedKey: { userId: 'u' } }) }))
+    .mockImplementationOnce(() => ({ promise: async () => ({ Items: [{ userId: 'peer', adAccount: 'a' }] }) }));
+  expect(await reviewLearning(scope, lesson.memoryId, 'approve', 'client')).toMatchObject({ applied: false, reason: 'ambiguous_account_ownership' });
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+});
+
+it('counts a linked peer as an owner even when its access token is unavailable', async () => {
+  const lesson = await supportedFleet();
+  mockClient.scan.mockImplementationOnce(() => ({ promise: async () => ({ Items: [
+    { userId: 'u', adAccount: 'a' },
+    { userId: 'peer', connected_accounts: [{ platform: 'meta', account_id: 'act_a', config: { account_type: 'ad_account' } }] },
+  ] }) }));
+  expect(await reviewLearning(scope, lesson.memoryId, 'approve', 'client')).toMatchObject({ applied: false, reason: 'ambiguous_account_ownership' });
+});
+
+it('bounds an unresponsive ownership read without writing a threshold', async () => {
+  const lesson = await supportedFleet();
+  const abort = jest.fn();
+  mockClient.scan.mockImplementationOnce(() => ({ promise: () => new Promise(() => {}), abort }));
+  jest.useFakeTimers();
+  try {
+    const rejected = expect(reviewLearning(scope, lesson.memoryId, 'approve', 'client')).rejects.toThrow(/deadline/i);
+    await jest.advanceTimersByTimeAsync(5001);
+    await rejected;
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+  } finally { jest.useRealTimers(); }
 });
