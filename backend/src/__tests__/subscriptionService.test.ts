@@ -21,6 +21,7 @@ import {
   isSubscriptionFeatureEnabled,
   setWildcardGrantSink,
   resetWildcardGrantSink,
+  flushUnconfirmedTierObservations,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -575,10 +576,69 @@ describe('subscriptionService', () => {
 
       // Restricted list, NOT ["*"] — exactly as before; only the observation is new.
       expect(await getAllowedSkills('ghost')).toEqual(['skill-free']);
-      const unresolved = events.find((e) => e.reason === 'subscription-type-unresolved');
-      expect(unresolved).toBeDefined();
-      expect(unresolved.kind).toBe('unconfirmed-tier');
+      // unconfirmed-tier is windowed (60s), so nothing emits until the window is flushed.
+      expect(events).toHaveLength(0);
+      flushUnconfirmedTierObservations(Date.now() + 61_000);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].kind).toBe('unconfirmed-tier');
+      expect(events[0].detail.byReason).toEqual({ 'subscription-type-unresolved': 1 });
       expect(events.filter((e) => e.kind === 'wildcard-grant')).toHaveLength(0);
+    });
+
+    /*
+     * Round-2 review, finding #1: the PR's documented "grep WILDCARD-GRANT" instruction cannot
+     * see unconfirmed-tier events at all, since they use a different marker string. Both must
+     * share the `[entitlement]` prefix so a broader grep catches both kinds.
+     */
+    it('both kinds share the [entitlement] prefix so one grep catches both', async () => {
+      const lines: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: any[]) => { lines.push(args.join(' ')); };
+      try {
+        mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u9', subscriptionType: 'NoSuchTier' } as any);
+        mockedSettingsService.getSetting.mockResolvedValue({
+          settingName: 'subscription_types',
+          settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['s'] }]),
+        } as any);
+        await getAllowedSkills('u9');
+        expect(lines.some((l) => l.startsWith('[entitlement]'))).toBe(true);
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+
+    /*
+     * Round-2 review, finding #7: a "Basic" fallback (no subscription_types row at all) grants
+     * ["*"] with no flag, contradicting the file's own "only an explicit config wildcard is
+     * deliberate" claim. Now shares the same allowedSkillsDefaulted mechanism, with its own reason
+     * so it stays distinguishable from a malformed row on a real tier.
+     */
+    it('records the legacy Basic fallback distinctly from a malformed real-tier row', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u10', subscriptionType: 'Basic' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue(null as any); // setting entirely absent
+
+      expect(await getAllowedSkills('u10')).toEqual(['*']);
+      expect(events.map((e) => e.reason)).toContain('legacy-basic-fallback-no-tier-config');
+      expect(events.map((e) => e.reason)).not.toContain('tier-config-missing-allowed-skills');
+    });
+
+    /*
+     * Round-2 review, finding #5: agentModeService's hottest call site (inside the agent
+     * iteration loop) threads userId through so the one reason that is ALWAYS a genuine
+     * full-registry grant does not end up unattributable.
+     */
+    it('resolveSkillsToToolNames attributes skill-to-tool-resolution-failed to the given userId', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      const skillSvc = jest.requireMock('../services/skillService').skillService;
+      skillSvc.getPublishedSkills.mockImplementationOnce(() => { throw new Error('dynamo scan failed'); });
+
+      expect(await resolveSkillsToToolNames(['skill-1'], 'u11')).toEqual(['*']);
+      const ev = events.find((e) => e.reason === 'skill-to-tool-resolution-failed');
+      expect(ev?.userId).toBe('u11');
     });
 
     /*
@@ -594,7 +654,10 @@ describe('subscriptionService', () => {
       mockedSettingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
 
       expect(await getAllowedSkills('u3')).toEqual(['*']);
-      expect(events.map((e) => e.reason)).toContain('subscription-type-config-unavailable');
+      const ev = events.find((e) => e.reason === 'subscription-type-config-unavailable');
+      expect(ev).toBeDefined();
+      // A genuine full-registry grant — must be kind 'wildcard-grant', not 'unconfirmed-tier'.
+      expect(ev.kind).toBe('wildcard-grant');
     });
 
     /* The genuine trigger for getAllowedSkills' own catch: a non-array allowedSkills makes
@@ -610,6 +673,26 @@ describe('subscriptionService', () => {
 
       expect(await getAllowedSkills('u4')).toEqual(['*']);
       expect(events.map((e) => e.reason)).toContain('allowed-skills-lookup-failed');
+    });
+
+    /*
+     * Round-2 review, finding #3. `allowedSkillsDefaulted` is the sole discriminator between "an
+     * admin deliberately typed ["*"]" and "the row carried no allowedSkills and was silently
+     * defaulted". Without this test a mutation that always treats the wildcard as defaulted
+     * (e.g. `if (true)` in place of the flag check) turns every explicit-wildcard tier into a
+     * reported over-grant on every request for every user on that tier — with no test failing.
+     */
+    it('does NOT emit for a tier that explicitly authored allowedSkills: ["*"]', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u12', subscriptionType: 'Pro' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Pro', allowedPages: ['/tasks'], allowedSkills: ['*'] }]),
+      } as any);
+
+      expect(await getAllowedSkills('u12')).toEqual(['*']);
+      expect(events).toHaveLength(0);
     });
 
     /* A tier row missing allowedSkills entirely is rewritten to ["*"] inside
