@@ -138,6 +138,7 @@ export async function syncSentInvitationsForAccount(
   const now = new Date().toISOString();
   let unchanged = 0;
   let stoppedEarly = false;
+  let loggedMissingParsedDatetime = false;
   let consecutiveKnownPages = 0;
 
   // sentAt keeps the EARLIEST estimate observed (resolveLedgerSentAt, ENG-1938),
@@ -175,6 +176,17 @@ export async function syncSentInvitationsForAccount(
       // The prune relies on the complete feed, so every pending id is retained
       // even when its unchanged row does not need another write.
       stillPendingPublicIds.add(publicId);
+
+      // ENG-1938 diagnostic: rows Unipile gives no `parsed_datetime` for keep the
+      // sync time as their sentAt and never heal, which is the drain's remaining
+      // blind spot on large backlogs. The SDK schema always carries a raw `date`;
+      // sample ONE per account per walk to learn its shape before deciding whether
+      // it can be parsed. Logs the value's shape only — no invitee identity.
+      if (item.parsed_datetime == null && !loggedMissingParsedDatetime) {
+        loggedMissingParsedDatetime = true;
+        const raw = (item as any).date;
+        console.warn(`${TAG} account=${accountId} parsed_datetime missing (ENG-1938 probe): date=${JSON.stringify(raw)} type=${typeof raw} parsable=${typeof raw === 'string' && !Number.isNaN(Date.parse(raw))}`);
+      }
 
       const cached = cachedByPublicId.get(publicId);
       const candidate: UnipileSentInvitation = {
