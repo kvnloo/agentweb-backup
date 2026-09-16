@@ -117,18 +117,29 @@ export async function enqueueAutoHumanEval(
       category: input.category,
     });
 
-    await settingsService.setSetting(
-      settingKey,
-      candidate.candidateId,
-      `Automatic human eval candidate for ${sourceKey}`,
-      'auto-human-eval',
-    );
+    // Round-4 review finding: this sourceKey-marker write is housekeeping, not the actual
+    // success condition — it must be its own try/catch, non-fatal on failure. Letting it
+    // propagate to the outer catch would incorrectly treat an already-persisted candidate as a
+    // failure: the artifact claim would get released even though it was genuinely consumed,
+    // reopening the exact cross-path duplicate window this claim exists to close (a different
+    // path could then claim and create a second candidate for the same real artifact), and the
+    // sourceKey dedupe would silently stop guarding this sourceKey against a later retry.
+    try {
+      await settingsService.setSetting(
+        settingKey,
+        candidate.candidateId,
+        `Automatic human eval candidate for ${sourceKey}`,
+        'auto-human-eval',
+      );
+    } catch (markerErr: any) {
+      console.warn('[auto-human-eval] sourceKey dedupe marker write failed after the candidate was already created (non-fatal):', markerErr?.message || markerErr);
+    }
 
     return candidate;
   } catch (err: any) {
-    // Release the claim on any failure AFTER it was won — otherwise a transient createCandidate
-    // failure permanently blackholes this artifact from ever being sent (see
-    // claimArtifactForHumanEval's own doc comment).
+    // Only reachable if the claim was won but createCandidate itself never succeeded — release
+    // it so a retry (or a different path) can claim it again, rather than permanently
+    // blackholing this artifact (see claimArtifactForHumanEval's own doc comment).
     if (claimedArtifact) await releaseArtifactClaim(input.artifactUrl);
     console.warn('[auto-human-eval] enqueue failed:', err?.message || err);
     return null;
