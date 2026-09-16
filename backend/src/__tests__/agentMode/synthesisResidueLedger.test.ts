@@ -7,7 +7,7 @@
  * "already applied".
  */
 
-import { buildExecutedActionsFallback, buildExecutedActionsFooter } from '../../services/agentMode/core/synthesisResidue';
+import { buildExecutedActionsFallback, buildExecutedActionsFooter, buildAcceptanceFailureNotice } from '../../services/agentMode/core/synthesisResidue';
 
 describe('buildExecutedActionsFallback — outcome bucketing (ENG-1054)', () => {
   it('reports succeeded and failed calls separately', () => {
@@ -161,5 +161,118 @@ describe('recap states its counting basis (ENG-1054)', () => {
   it('says the same in the full fallback', () => {
     const text = buildExecutedActionsFallback([{ name: 'add_leads_to_list', result: {} }]);
     expect(text).toContain('Counts are tool calls, not the number of records created or changed');
+  });
+});
+
+/**
+ * ENG-1899: coding_agent's own deterministic acceptance checks can fail while the model's free-text
+ * report claims success — a live incident where "visual verification passed with screenshot" was
+ * reported while a `selector_exists` check had failed and the described button copy matched neither
+ * the brief nor the deployed page. `acceptanceStatus`/`acceptance` are real fields already on the
+ * ledger entry; this states them as fact, unconditionally, ahead of the model's own claim.
+ */
+describe('buildAcceptanceFailureNotice (ENG-1899)', () => {
+  it('states the real failed check when acceptanceStatus is failed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          message: 'Visual verification passed with screenshot — CTA buttons are now visible.',
+          acceptanceStatus: 'failed',
+          acceptance: {
+            status: 'failed',
+            summary: '1 of 2 checks failed',
+            checks: [
+              { label: 'CTA text present', status: 'passed', message: 'found' },
+              { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+            ],
+          },
+        },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('VERIFICATION FAILED');
+    expect(notice).toContain('form selector');
+    expect(notice).toContain("selector 'form' not found");
+    // The passed check must not be reported as a failure alongside the real one.
+    expect(notice).not.toContain('CTA text present: found');
+  });
+
+  it('fires for a blocked acceptance status too, not only failed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          acceptanceStatus: 'blocked',
+          acceptance: { status: 'blocked', summary: 'blocked', checks: [
+            { label: 'deploy check', status: 'blocked', message: 'preview deploy did not complete' },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('preview deploy did not complete');
+  });
+
+  it('returns null when the acceptance check genuinely passed — redundant-when-honest stays quiet', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: true,
+          message: 'Fixed the CTA button styling.',
+          acceptanceStatus: 'passed',
+          acceptance: { status: 'passed', summary: 'all checks passed', checks: [
+            { label: 'CTA text present', status: 'passed', message: 'found' },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null when no acceptance checks were configured (not_run)', () => {
+    const notice = buildAcceptanceFailureNotice([
+      { name: 'coding_agent', result: { success: true, message: 'done', acceptanceStatus: 'not_run' } },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null when the turn has no coding_agent call at all', () => {
+    const notice = buildAcceptanceFailureNotice([
+      { name: 'generate_image', result: { url: 'https://example.com/a.png' } },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null for an empty ledger', () => {
+    expect(buildAcceptanceFailureNotice([])).toBeNull();
+  });
+
+  it('covers multiple failed coding_agent calls in the same turn without dropping either', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'attempt 1 check', status: 'failed', message: 'still transparent' },
+        ] } },
+      },
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'attempt 2 check', status: 'failed', message: "form selector not found" },
+        ] } },
+      },
+    ]);
+
+    expect(notice).toContain('attempt 1 check');
+    expect(notice).toContain('attempt 2 check');
   });
 });
