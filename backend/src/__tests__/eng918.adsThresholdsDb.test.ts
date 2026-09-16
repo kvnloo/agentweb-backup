@@ -76,3 +76,9 @@ describe('itemToParameter — corrupted data fails loud, not silently', () => {
     expect(itemToParameter(item({ source: validSource }))?.source).toBe(validSource);
   });
 });
+it.each([[null], [true], [{ evidence: true }]])('rejects malformed revision elements %p at the shared storage boundary', revision => {
+  expect(() => itemToParameter(item({ revisions: [revision] }))).toThrow(/revision/i);
+});
+it.each([true, [], {}])('rejects wrong-type current values %p rather than numeric coercion', value => {
+  expect(() => itemToParameter(item({ currentValue: value }))).toThrow();
+});

@@ -1547,6 +1547,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
+        include_learning: { type: 'boolean', description: 'Include bounded shadow learning in global, client, campaign, channel order. Advisory only.' },
+        campaign_id: { type: 'string', description: 'Campaign scope for learning retrieval.' },
         platform: {
           type: 'string',
           enum: ['meta'],
@@ -1580,7 +1582,20 @@ emmaToolRegistry.register({
     const stored = await getThresholdsForAccount('meta', cleaned);
     const resolved = resolveThresholds(stored);
 
+    let learningResult: Record<string, unknown> = {};
+    if (args.include_learning === true) {
+      try {
+        const { getScopedLearning } = await import('../services/adsLearningDb');
+        learningResult = { learning: await getScopedLearning({ userId: context.userId, platform: 'meta', accountId: cleaned,
+          campaignId: typeof args.campaign_id === 'string' ? args.campaign_id : undefined, now: new Date().toISOString() }) };
+      } catch {
+        console.error('[AdsLearning] scoped retrieval unavailable');
+        learningResult = { learningUnavailable: true };
+      }
+    }
+
     return {
+      ...learningResult,
       success: true,
       platform: 'meta',
       account_id: cleaned,

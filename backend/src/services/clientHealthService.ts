@@ -13,9 +13,41 @@ import { userDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
 import { getThresholdsForAccount } from './adsThresholdsDb';
 import { resolveThresholds } from './adsThresholds';
+import { captureFatigueRecommendations } from './adsRecommendationCapture';
 import { isEvaluationUser } from './evaluationPolicy';
 
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
+
+/** Both Meta reads share this boundary. A malformed element makes the read incomplete,
+ * rather than letting a partial array manufacture a fatigue recommendation. */
+function healthRows(result: any): any[] {
+  const object = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!object(result)) throw new Error('Invalid Meta health response');
+  if (result.error) return [];
+  if (!Array.isArray(result.data)) throw new Error('Invalid Meta health data');
+  for (const row of result.data) {
+    if (!object(row) || typeof row.id !== 'string' || !row.id.trim() ||
+        (row.status !== undefined && typeof row.status !== 'string') ||
+        (row.campaign_id !== undefined && typeof row.campaign_id !== 'string') ||
+        (row.creative !== undefined && !object(row.creative))) throw new Error('Invalid Meta health row');
+    if (row.insights !== undefined) {
+      if (!object(row.insights) || !Array.isArray(row.insights.data)) throw new Error('Invalid Meta insights');
+      for (const insight of row.insights.data) {
+        if (!object(insight)) throw new Error('Invalid Meta insight row');
+        for (const key of ['date_start', 'date_stop']) {
+          if (insight[key] !== undefined && typeof insight[key] !== 'string') throw new Error('Invalid Meta insight date');
+        }
+        for (const key of ['spend', 'frequency', 'ctr', 'cpm']) {
+          const value = insight[key];
+          if (value !== undefined &&
+              !((typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) &&
+                Number.isFinite(Number(value)) && Number(value) >= 0)) throw new Error('Invalid Meta insight metric');
+        }
+      }
+    }
+  }
+  return result.data;
+}
 
 interface AdsLayerHealth {
   connected: boolean;
@@ -365,7 +397,7 @@ export async function assessClientHealth(
           const campaignsData = await fetchWithRetryAndPaging(
             `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
           );
-          activeCampaigns = (campaignsData.data || []).filter(
+          activeCampaigns = healthRows(campaignsData).filter(
             (c: any) => c.status === 'ACTIVE'
           );
           campaignsComplete = campaignsData.pagingTruncated !== true && !campaignsData.error;
@@ -375,7 +407,7 @@ export async function assessClientHealth(
           // returns two rows per ad in `insights.data`, distinguished by `date_start`.
           if (activeCampaigns.length > 0) {
             const filtering = `[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]`;
-            const insightsFields = 'spend,frequency,ctr,cpm,date_start';
+            const insightsFields = 'spend,frequency,ctr,cpm,date_start,date_stop';
             const timeRanges = JSON.stringify([
               { since: currentWindowStart, until: currentWindowEnd },
               { since: priorWindowStart, until: priorWindowEnd },
@@ -405,11 +437,11 @@ export async function assessClientHealth(
             // "nothing to check" default, which would otherwise misreport a crashed read as complete.
             adLevelDataComplete = false;
             const adData = await fetchWithRetryAndPaging(
-              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,${creativeSelector},status,` +
+              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,campaign_id,${creativeSelector},status,` +
                 `${insightsSelector}` +
                 `&filtering=${filtering}&access_token=${accessToken}`
             );
-            adLevelData = (adData.data || []).map((ad: any) => {
+            adLevelData = healthRows(adData).map((ad: any) => {
               // Matched by RELATIVE ORDER (newest date_start = current, oldest = prior), not by
               // exact string equality against our own UTC-computed date strings. Meta buckets
               // insights `date_start` in the AD ACCOUNT's own timezone, not UTC — this codebase
@@ -613,6 +645,14 @@ export async function assessClientHealth(
       // isolated success.
       creative_data_complete: adLevelDataComplete && campaignsComplete,
     };
+
+    if (creativeVariety.creative_data_complete && resolvedAdAccountId) {
+      await captureFatigueRecommendations({
+        clientUserId: client.userId, accountId: resolvedAdAccountId,
+        campaignIds: activeCampaigns.map((c: any) => c.id), ads: activeAds,
+        fatigued: fatiguedCreatives, now: new Date().toISOString(),
+      });
+    }
 
     // --- Overall Status ---
     const { status, reasons } = determineStatus(adsLayer, landerLayer, leadQualityLayer, creativeVariety);
