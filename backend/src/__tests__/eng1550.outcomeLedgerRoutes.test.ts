@@ -288,7 +288,7 @@ it.each(['read', 'approve', 'revert', 'decline'])('logs a sanitized %s failure w
     } else {
       const { reviewLearning } = await import('../services/adsLearningReview');
       (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
-      res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/lesson/${action}`);
+      res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent('ads-learning#' + 'a'.repeat(64))}/${action}`);
     }
     expect(res.status).toBe(action === 'read' ? 503 : 409);
     expect(audit).toHaveBeenCalledWith('[AdsLearning] request failed', expect.objectContaining({ userId: 'caller-1', accountId: OWNED, action, error: 'Error' }));
@@ -303,7 +303,7 @@ it('bounds and sanitizes request-controlled audit identifiers and error classes'
   (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
   const audit = jest.spyOn(console, 'error').mockImplementation(() => {});
   try {
-    const target = encodeURIComponent('lesson\n' + 'x'.repeat(512));
+    const target = encodeURIComponent('ads-learning#' + 'a'.repeat(64));
     expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${target}/approve`)).status).toBe(409);
     const fields = audit.mock.calls[0][1] as Record<string, string>;
     for (const value of Object.values(fields)) {
@@ -311,4 +311,18 @@ it('bounds and sanitizes request-controlled audit identifiers and error classes'
       expect(value).toMatch(/^[a-zA-Z0-9_.:#-]*$/);
     }
   } finally { audit.mockRestore(); }
+});
+
+
+it.each(['ads-learning#short', 'ads-learning#' + 'g'.repeat(64), 'ads-learning#' + 'a'.repeat(1025)])('rejects malformed learning keys before review/storage (%s)', async memoryId => {
+  const { reviewLearning } = await import('../services/adsLearningReview');
+  expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent(memoryId)}/approve`)).status).toBe(400);
+  expect(reviewLearning).not.toHaveBeenCalled();
+});
+
+it.each(['decline', 'score'])('rejects oversized UTF-8 recommendation keys before %s storage access', async action => {
+  CALLER_IS_ADMIN = true;
+  const target = encodeURIComponent('é'.repeat(513));
+  expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/${target}/${action}`)).status).toBe(400);
+  expect(mockDb.getRecommendation).not.toHaveBeenCalled();
 });

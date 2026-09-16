@@ -90,6 +90,11 @@ function logLearningFailure(req: any, action: string, error: unknown): void {
   });
 }
 
+/** Recommendation IDs are opaque legacy/UUID/hash strings; DynamoDB sort keys allow 1–1024 UTF-8 bytes. */
+function validRecommendationId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= 1024;
+}
+
 /** Bounded scoped guidance; account ownership and client identity are server-derived. */
 router.get('/:platform/:accountId/learning', authenticateToken, async (req: any, res) => {
   try {
@@ -111,6 +116,7 @@ router.post('/:platform/:accountId/learning/:memoryId/:action', authenticateToke
     const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
     if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
     if (!['approve', 'revert'].includes(req.params.action)) return res.status(400).json({ error: 'Invalid review action' });
+    if (!/^ads-learning#[a-f0-9]{64}$/.test(req.params.memoryId)) return res.status(400).json({ error: 'Learning review could not be applied' });
     const targetScope = req.body?.scope ?? 'campaign';
     if (!['client', 'campaign', 'channel'].includes(targetScope)) return res.status(400).json({ error: 'Invalid learning scope' });
     const { reviewLearning } = await import('../services/adsLearningReview');
@@ -125,6 +131,7 @@ router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken
   try {
     const owned = await resolveOwnedAccount(req.user.userId, req.params.platform, req.params.accountId);
     if (!owned.ok) return res.status(owned.status).json({ error: owned.error });
+    if (!validRecommendationId(req.params.recommendationId)) return res.status(400).json({ error: 'Recommendation could not be declined' });
     const r = await getRecommendation(owned.platform, owned.accountId, req.params.recommendationId);
     if (!r?.context || r.context.clientUserId !== req.user.userId) return res.status(404).json({ error: 'Recommendation not found' });
     if (r.status !== 'pending' || r.context.execution) return res.status(409).json({ error: 'Recommendation already resolved' });
@@ -187,6 +194,7 @@ router.post('/:platform/:accountId/:recommendationId/score', authenticateToken, 
       return res.status(400).json({ error: `platform '${req.params.platform}' is not supported` });
     }
     const accountId = cleanAccountId(req.params.accountId);
+    if (!validRecommendationId(req.params.recommendationId)) return res.status(400).json({ error: 'Failed to score recommendation' });
     const existing = await getRecommendation(req.params.platform, accountId, req.params.recommendationId);
     if (!existing) return res.status(404).json({ error: 'Recommendation not found' });
     if (existing.status !== 'pending') {

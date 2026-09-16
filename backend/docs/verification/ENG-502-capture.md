@@ -268,9 +268,10 @@ Official Okareo SDK with the REPS single-turn passthrough driver ran the same fo
 read-only scenarios and three version-pinned checks against `https://api-stage.agentweb.pro`.
 Both baseline `c59c293abc13196e73161675ffb1f08c1db8e2f7` and changed
 `16e35bc169e07a838089193fe9f7ceb299ef6a02` reached EB Ready/Green in the development
-environment, using Dev-prefixed stores. Subsequent source changes only add bounded error
-metadata and reduce the cron page from 75 to 50; 459 focused tests and typecheck cover those
-changes, including unchanged HTTP responses. No model-facing behavior changed after that target.
+environment, using Dev-prefixed stores. Subsequent source changes add bounded error metadata, reduce the cron page from 75 to 50,
+and reject invalid/oversized HTTP review and recommendation keys before storage. 464 focused
+tests and typecheck cover those changes, including preserved valid-request responses and the
+new early 400 for invalid keys. No model-facing behavior changed after that target.
 
 - Baseline: https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/d3f355e1-e0ca-4f46-8e85-115b4b250f81
 - Changed: https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/2ee4833f-2a91-4616-a76e-e8f473de8aa6

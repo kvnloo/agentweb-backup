@@ -10,3 +10,5 @@ Performance-warning correction: 5 failures / 21 passes reproduced before bounded
 Audit correction: 4 failures / 19 passes before logging; final 458 tests / 15 suites pass. Production TypeScript no-emit passes. Evaluation page now 50 rows with 555 seconds of request budgets, preserving fresh-read/conditional-write integrity. No API response or model-visible text changed in this correction.
 
 Audit metadata hardening: 1 failing regression before fix; final 459 tests across 15 suites pass, TypeScript no-emit and diff check pass. Logged fields are capped at 128 characters and restricted to identifier-safe characters. Client responses unchanged.
+
+Route-key boundary: 5 failing regressions / 24 passing before fix. Final 464 tests across 15 suites pass. Learning IDs match the generated SHA-256 contract; opaque recommendation IDs retain their existing format but enforce DynamoDB UTF-8 sort-key size. Both decline and sibling score reject oversized IDs before storage. Existing response wording reused.
