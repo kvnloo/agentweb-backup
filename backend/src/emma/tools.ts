@@ -8093,14 +8093,26 @@ emmaToolRegistry.register({
         // The combined set this issue is asserting is broken/unavailable, whether stated
         // explicitly via the field or implied by its own wording — both verified identically.
         const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
-        if (effectiveUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+        // ENG-1945 follow-up (live-prod finding): the model has no legitimate way to learn
+        // its own agentRuntimeRunId — it is never surfaced in any tool result or prompt text
+        // — so requiring it to TYPE that id back (as the original version of this gate did)
+        // made even an honest same-turn claim unverifiable; live testing confirmed the model
+        // simply invents a plausible-looking placeholder ("current-run") instead. Default to
+        // `context.currentRunId` — the server's OWN id for the run this call is executing
+        // within, threaded in by toolDispatch.ts, not something the model can fake or
+        // mistype — whenever the model doesn't supply an explicit `run_id`. An EXPLICIT
+        // `run_id` argument still takes priority when given, preserving ENG-939's citing-a-
+        // DIFFERENT-run case (a reviewer analysing another session) exactly as before.
+        const explicitRunId = typeof issue.run_id === 'string' && issue.run_id.trim() ? issue.run_id.trim() : undefined;
+        const effectiveRunId = explicitRunId ?? (typeof context?.currentRunId === 'string' ? context.currentRunId : undefined);
+        if (effectiveUnavailableTools.length > 0 && !effectiveRunId) {
           const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
           throw new Error(
             `Cannot file "${issue.title}": ${viaWording
               ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
               : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
-            } — that requires run_id so the claim can be checked against that run's actual tool-call telemetry. Include ` +
-            `the run_id from THIS session, or reword the report so it does not assert a specific tool is broken/unavailable.`
+            } — that requires a resolvable run to check the claim against, and none is available (no run_id given and no ` +
+            `current run context). Only call report_product_issues about a tool being broken from within an active agent run.`
           );
         }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
@@ -8112,15 +8124,18 @@ emmaToolRegistry.register({
         let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
         let affectedSessionId: string | undefined;
         let affectedUserUnresolved = false;
-        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+        // Uses `effectiveRunId` (explicit run_id, else the server-supplied current run) so
+        // an in-progress agent run gets its dossier auto-attached even when the model never
+        // passed run_id explicitly — not just when claimed_unavailable_tools forces the issue.
+        if (effectiveRunId) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
-            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const { runs } = await fetchAgentRunSummaries({ runId: effectiveRunId, limit: 1 });
             const run = runs[0];
             if (!run) {
               if (effectiveUnavailableTools.length > 0) {
                 throw new Error(
-                  `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
+                  `Cannot file "${issue.title}": run_id "${effectiveRunId}" does not resolve to a known run, so ` +
                   `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
                   `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
                 );
@@ -9210,7 +9225,7 @@ ACTION MATRIX:
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
               REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?, target_google_search?, target_search_network?, target_content_network?, target_partner_search_network?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
@@ -9292,6 +9307,10 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
+        target_google_search: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google Search. Maps to network_settings.target_google_search.' },
+        target_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google search partners. Maps to network_settings.target_search_network.' },
+        target_content_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether Search campaigns use Display Network expansion. Set false to disable Display expansion. Maps to network_settings.target_content_network.' },
+        target_partner_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Controls a separate partner network available only to select eligible accounts. This does not control Google Search Partners; use target_search_network for that. Maps to network_settings.target_partner_search_network.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
