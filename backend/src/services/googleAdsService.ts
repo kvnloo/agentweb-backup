@@ -1079,7 +1079,7 @@ export class GoogleAdsService {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
     }
-    if (params.targetSearchNetwork === true && params.targetGoogleSearch === false) {
+    if (params.targetSearchNetwork === true && params.targetGoogleSearch !== true) {
       throw new Error('target_search_network=true requires target_google_search=true; nothing was sent to Google Ads.');
     }
     assertBidTargetIsAddressable(params);

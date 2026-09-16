@@ -1356,6 +1356,13 @@ describe('updateCampaign', () => {
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
+  it('rejects enabling the search network without explicitly enabling Google Search', async () => {
+    await expect(service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetSearchNetwork: true,
+    })).rejects.toThrow(/requires target_google_search=true.*nothing was sent/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
   it('returns false and makes no API call when no recognized fields are provided', async () => {
     const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {});
     expect(mockAxiosPost).not.toHaveBeenCalled();
