@@ -505,6 +505,7 @@ describe('GET /api/crm/icp/filters', () => {
       marketStrategy: {
         icp: marketIcp(),
         updatedAt: '2026-09-12T00:36:22.746Z', // saved AFTER icpCompletedAt
+        icpUpdatedAt: '2026-09-12T00:36:22.746Z',
       },
     });
     mockReq.query = { icpIndex: '0' };
@@ -538,6 +539,8 @@ describe('GET /api/crm/icp/filters', () => {
     // system write indistinguishable from a genuine future user edit,
     // exactly the failure mode the mirror-write backdating fix addresses.
     expect(patch.marketStrategy.updatedAt).toBe('2026-09-12T00:36:22.746Z');
+    // Must not touch icpUpdatedAt either, for the same reason.
+    expect(patch.marketStrategy.icpUpdatedAt).toBe('2026-09-12T00:36:22.746Z');
     // Untouched entries survive the merge.
     expect(patch.marketStrategy.icp[1].title).toBe('ICP 2 — The Shopify Agency Operator');
   });
@@ -701,7 +704,11 @@ describe('GET /api/crm/icp/filters', () => {
     });
     (orgDb.getOrgById as jest.Mock).mockResolvedValue({
       orgId: 'org1',
-      marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' },
+      marketStrategy: {
+        icp: marketIcp(),
+        updatedAt: '2026-09-12T00:36:22.746Z',
+        icpUpdatedAt: '2026-09-12T00:36:22.746Z',
+      },
     });
     mockReq.query = { icpIndex: '0' };
     await handler!(mockReq, mockRes);
@@ -717,6 +724,9 @@ describe('GET /api/crm/icp/filters', () => {
     expect(patch.marketStrategy.icp[0].extractedFilters.cacheVersion).toBe(ICP_FILTER_CACHE_VERSION);
     // Must not bump updatedAt — same rationale as the solo-user cache write.
     expect(patch.marketStrategy.updatedAt).toBe('2026-09-12T00:36:22.746Z');
+    // Must not touch icpUpdatedAt either — a cache write is not a real ICP
+    // edit, and this field is what the staleness check now actually trusts.
+    expect(patch.marketStrategy.icpUpdatedAt).toBe('2026-09-12T00:36:22.746Z');
   });
 
   it('does not cache when marketStrategy came from the org OWNER fallback (write target would be a different user)', async () => {
