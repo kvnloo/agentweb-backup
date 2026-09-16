@@ -5,6 +5,7 @@ import { asLoopId, asSubjectId, type NormalizedEvent } from '../loops/core/types
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { chatbotDb } from './chatbotService';
+import { userDb } from './db';
 import {
   getSlackUserDisplayName,
   getSlackUserEmail,
@@ -399,6 +400,7 @@ export class HumanEvalService {
               reviewerSlackUserId,
               chatUrl,
               normalizedCategory: category,
+              userEmail: await this.resolveUserEmail(input.userId),
             });
         const posted = await this.slack.postSlackMessage(slackChannel, message);
 
@@ -714,12 +716,35 @@ export class HumanEvalService {
     }
   }
 
+  /**
+   * Whose chat produced this candidate. Matt asked for the account's email on the card: the
+   * reviewer otherwise can't tell which customer an artifact belongs to without opening the
+   * chat link, which is the context-free-noise complaint ENG-1853/1854 exist to fix.
+   *
+   * Deliberately fail-safe and resolved only for the Slack message — never let a user lookup
+   * decide whether a candidate posts at all. `getUserById` is a GSI query that can throw on a
+   * transient DynamoDB error; swallowing it here means the card just omits the line, instead of
+   * the error bubbling into createCandidate's posting try/catch and silently costing the whole
+   * notification.
+   */
+  private async resolveUserEmail(userId: string | undefined): Promise<string | undefined> {
+    if (!userId) return undefined;
+    try {
+      const user = await userDb.getUserById(userId);
+      return user?.email || undefined;
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve user email for the Slack card:', err?.message || err);
+      return undefined;
+    }
+  }
+
   private buildSlackMessage(input: CreateHumanEvalCandidateInput & {
     candidateId: string;
     reviewer: HumanEvalReviewer;
     reviewerSlackUserId?: string;
     chatUrl?: string;
     normalizedCategory: HumanEvalCategory;
+    userEmail?: string;
   }): string {
     const reviewerMention = input.reviewerSlackUserId
       ? `<@${input.reviewerSlackUserId}>`
@@ -737,6 +762,7 @@ export class HumanEvalService {
       `*Human eval: ${reviewTypeLabel(input.reviewType)}*`,
       showCategory ? `*Category:* ${humanEvalCategoryLabel(input.normalizedCategory)}` : '',
       `Reviewer: ${reviewerMention}`,
+      input.userEmail ? `*User:* ${input.userEmail}` : '',
       '',
       input.artifactUrl ? `*Output:* <${input.artifactUrl}|open output>` : '',
       input.chatUrl ? `*Chat:* <${input.chatUrl}|open associated chat>` : '',
@@ -766,12 +792,14 @@ export class HumanEvalService {
   }
 
   /**
-   * ENG-1854: default-off switch for #eval-queue Slack fan-out. The queue itself (creation,
-   * persistence, the admin read API) is unaffected either way — this only gates whether a
-   * given candidate additionally gets posted to Slack. DB-backed (not an env var) so it's
-   * flippable without a redeploy, same reasoning as `getEvalChannel`'s own setting above.
-   */
-  /**
+   * ENG-1854: switch for #eval-queue Slack fan-out, default ON — an explicit 'false' is an
+   * unconditional kill switch. (It shipped default-off; the default was flipped back once the
+   * two real noise sources — routine lead-enrichment pings and cross-path duplicates — were
+   * fixed independently of this toggle.) The queue itself (creation, persistence, the admin
+   * read API) is unaffected either way; this only gates whether a candidate additionally gets
+   * posted to Slack. DB-backed (not an env var) so it's flippable without a redeploy, same
+   * reasoning as `getEvalChannel`'s own setting above.
+   *
    * Returns why (if at all) this candidate should be posted — the caller uses this to pick
    * the message format: a normal global-toggle post gets the full multi-field message, an
    * exception-list post gets a deliberately concise one (ENG-1854 item 6 — "one concise
