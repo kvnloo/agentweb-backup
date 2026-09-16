@@ -1,4 +1,5 @@
 import { HumanEvalCandidate, HumanEvalService, parseHumanEvalCategoryFilter } from '../services/humanEvalService';
+import { userDb } from '../services/db';
 
 function makeHarness() {
   const items = new Map<string, HumanEvalCandidate>();
@@ -98,6 +99,13 @@ function makeHarness() {
   );
   return { service, db, settingsService, slack, chatbot, learning, actions, assetStore, telemetry, items, settings };
 }
+
+// jest.config.js sets clearMocks but NOT restoreMocks, so a spy's mockResolvedValue survives
+// between tests — a per-test mockRestore() at the end of the body is skipped whenever an
+// assertion throws, leaking the stub into whatever runs next. Restore centrally instead.
+afterEach(() => {
+  jest.restoreAllMocks();
+});
 
 describe('HumanEvalService', () => {
   it('routes creative images to Matt and posts a Slack thread-native candidate', async () => {
@@ -211,6 +219,76 @@ describe('HumanEvalService', () => {
     expect(slack.postSlackMessage).toHaveBeenCalledWith(
       'C_EVAL',
       expect.not.stringContaining('open associated chat'),
+    );
+  });
+
+  // Matt's ask: the card must name WHOSE account produced the artifact, so a reviewer can tell
+  // customers apart without opening the chat link first.
+  it('shows the originating user email on the Slack card', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ email: 'founder@haven.com' } as any);
+
+    await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated an ad variant.',
+      userId: 'user-haven',
+    });
+
+    expect(spy).toHaveBeenCalledWith('user-haven');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*User:* founder@haven.com'),
+    );
+  });
+
+  it('still posts the card, minus the user line, when the user lookup fails', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById').mockRejectedValue(new Error('GSI query transiently failed'));
+
+    await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated an ad variant.',
+      userId: 'user-haven',
+    });
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*User:*'),
+    );
+  });
+
+  // getUserById returns undefined both for a missing user and, explicitly, for any account
+  // tombstoned with a `deleted_` userId prefix (db.ts). A deleted account whose older artifact
+  // is still being reviewed is a likelier real-world path than a transient GSI throw.
+  it('omits the user line when the account no longer exists', async () => {
+    const { service, slack } = makeHarness();
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue(undefined as any);
+
+    await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated an ad variant.',
+      userId: 'deleted_user-gone',
+    });
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*User:*'),
+    );
+  });
+
+  it('omits the user line entirely for candidates with no originating user', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById');
+
+    await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Enrichment completed.',
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*User:*'),
     );
   });
 

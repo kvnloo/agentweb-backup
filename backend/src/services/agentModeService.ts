@@ -1521,60 +1521,181 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
-  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
-  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
-  // no known code path that mutates the registry in between (see the brain node).
-  // The one remaining live hypothesis is that more than one AgentModeService instance
-  // is answering requests inside the same forked worker process (e.g. the per-message
-  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
-  // worker after all). Stamping each instance at construction settles it directly: if
-  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
-  // reads on the same pid, that's a second instance, proven, not inferred.
-  private readonly instanceId = Math.random().toString(36).slice(2, 10);
-
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
-    // instanceId alone proved a second, empty-registry instance answers requests
-    // inside the same worker process, but every known construction site (module
-    // singleton, the worker's own instance, chatbotService.ts's per-message
-    // throwaway) traces to a call graph that shouldn't reach the worker a second
-    // time. Capturing the actual construction stack settles which site it really
-    // is instead of continuing to reason about it from the outside.
-    // Stack goes inside the same JSON blob (not a second console.log argument) so a
-    // log shipper that splits on newline can't separate it from its pid/instanceId —
-    // a raw multi-line stack string passed alongside would risk exactly that.
-    console.log('[ENG-1852-CTOR]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      stack: new Error('construction site').stack,
-    }));
   }
 
-  public async initialize() {
+  // ENG-1852 follow-up: the EXPENSIVE half of initialize() runs once per
+  // instance; the cheap half still runs on every call.
+  //
+  // Why a guard at all: server.ts kicks boot init off deliberately NON-blocking
+  // ("Initialize Agent Mode tools in background - don't block server startup ...
+  // prevents health check timeouts during deployment"), so a request can land
+  // mid-init. chatbotService's widget path then calls initialize() again per
+  // message on the same shared module singleton. Unguarded, that re-runs a full
+  // registerTools()/initializeMcp()/ensureBuiltInSkills() pass over shared state
+  // on every message, or races boot init and reads a half-populated registry —
+  // the same empty-registry symptom ENG-1852 turned out to be.
+  //
+  // Why loadFoundationTools() stays OUTSIDE the latch: it writes the
+  // process-global static AgentModeService.FOUNDATION_TOOLS, which the admin
+  // route `PUT /foundation-tools` (routes/agentMode.ts) mutates only in the
+  // process that served the request. Before this change, every gate-open widget
+  // message re-read the `foundation_tools` row and refreshed that static. Latching
+  // it would mean an added foundation tool never reaches a process until restart,
+  // surfacing as "tool not available" — the ENG-280/ENG-404 class this very
+  // function's own comment warns about. It is one settings read that swallows its
+  // own errors and always leaves the set populated, so per-call is cheap and safe;
+  // the registration pass is what actually cost anything.
+  //
+  // Why the latch is NOT just "didn't throw": every step of runInitialize()
+  // swallows its own errors (loadFoundationTools, both halves of registerTools,
+  // initializeMcp, ensureBuiltInSkills all catch-and-log; downstream singletons
+  // are void-ed), so runInitialize() is effectively incapable of rejecting.
+  // Latching on mere completion would make a silently-degraded init — e.g. a
+  // transient throw inside registerTools leaving an empty registry — PERMANENT
+  // for the process lifetime, with no reset. That is strictly worse than the bug
+  // this branch fixes: before it, the per-message fresh instance re-ran
+  // registration and self-healed on the next message. So we latch only on signals
+  // that can observably be false, and leave `initialized` false otherwise so the
+  // next caller retries.
+  //
+  // The flag is per-INSTANCE, not module-level, so tests that construct their own
+  // AgentModeService in beforeEach still initialize normally.
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+  // Set true only when registerTools()'s emmaToolRegistry copy actually completes.
+  //
+  // A registry-size check alone is NOT a success signal, and an earlier version of this
+  // latch that used one was a tautology. registerTools() registers four built-ins
+  // (search_tool_response, read_tool_response, notify_session, wait_seconds)
+  // UNCONDITIONALLY, after both of its try/catch blocks, and ToolRegistry.register is a
+  // Map.set that cannot throw — so getAllTools().length > 0 is always true no matter how
+  // badly registration went. initializeMcp() then adds more afterwards. Confirmed twice:
+  // by fault injection on test-env-1 (the size check latched a fully degraded init, with
+  // "Error registering tools to instance" logged one line earlier) and by an independent
+  // review that ran registerTools() with an empty emmaToolRegistry and observed
+  // initialized=true with a 4-tool registry.
+  //
+  // Both halves of registerTools() have to be checked, because they fail independently:
+  // step 1 (sixteen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
+  // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
+  // without error — so the flag below alone would latch a degraded init too.
+  private emmaToolsRegistered = false;
+  // Not a latch signal — only prevents the retry path from re-scanning every skill and
+  // re-updating each built-in on every failed attempt.
+  private builtInSkillsSeeded = false;
+  // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
+  // that could never report failure:
+  //
+  //   initializeMcp() — McpClientService.initialize() cannot reject in practice. Its two
+  //   statements before the try (startSessionCleanup, a setInterval+unref; and
+  //   sweepStalePlaywrightConfigs, which has its own outer try/catch) cannot throw, the
+  //   rest of the body is inside try/catch, per-server failures are swallowed deeper
+  //   still in safeConnectToServer, and the config read has its own catch. A flag
+  //   set on its success path is therefore constant true. A tool-count check would be
+  //   wrong too: this deployment's only non-internal MCP server carries secret
+  //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
+  //   There is no signal here to gate on, and shipping one that always reads true is
+  //   worse than none — it reads as coverage.
+  //
+  //   CAVEAT, because this is an operational fact rather than a code invariant: that
+  //   zero-tools property holds for mcp_config.ts AND for the current `mcp_servers`
+  //   settings row, which mcpClientService also reads at every boot. If an operator adds
+  //   a placeholder-free server there, a healthy boot registers a non-zero count and a
+  //   transient outage registers zero — and with no MCP signal in the latch, that outage
+  //   latches for the process lifetime rather than retrying on the next message. If that
+  //   day comes, the fix is a real signal (e.g. a getFailedServers() next to
+  //   serversWithSecretPlaceholders: "every server we actually attempted connected"),
+  //   NOT a tool count.
+  //
+  //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
+  //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
+  //   row failing welcome-message validation) silently reverted this whole optimization
+  //   to per-message registration PLUS a full skills-table scan per chat message,
+  //   surfaced only by one console.error per message.
+  //
+  // The latch gates on what ENG-1852 was actually about: whether this instance's tool
+  // registry is usable.
+  // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
+  // its five inits replace live singletons unconditionally. The latch's retry path
+  // would otherwise swap them under in-flight tool calls on every failed attempt.
+  private downstreamSingletonsStarted = false;
+
+  /**
+   * Whether the last initialize() completed with every step reporting success. False
+   * means a degraded init that the next caller will retry — see initialize().
+   */
+  public get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  public async initialize(): Promise<void> {
+    // Deliberately before and outside the latch — see the note above.
     await this.loadFoundationTools();
+
+    if (this.initialized) return;
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = this.runInitialize();
+    try {
+      await this.initializationPromise;
+      // Two conjuncts, both of which can observably be false. A third,
+      // `this.toolRegistry.getAllTools().length > 0`, was here and is deliberately gone:
+      // registerTools() registers four built-ins unconditionally after both of its
+      // try/catch blocks and ToolRegistry.register is a Map.set that cannot throw, so it
+      // could never report failure. That is the same defect this file deleted mcpStepOk
+      // for, and an inert conjunct in an && chain is worse than no conjunct — it reads as
+      // coverage. It also carried a FALSE coverage claim: mutating it to `true` fails no
+      // test, because no test can distinguish it.
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered;
+      if (!this.initialized) {
+        console.error(
+          'AgentMode: initialize() completed but tool registration did not succeed ' +
+          `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
+          `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
+          'treating init as failed so the next caller retries.',
+        );
+      }
+    } finally {
+      this.initializationPromise = null;
+    }
+  }
+
+  private async runInitialize(): Promise<void> {
     await this.registerTools();
+
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
-    // Ensure built-in skills exist in the database
-    await this.ensureBuiltInSkills();
+    // Skipped once it has succeeded: it re-scans every skill and issues an update per
+    // built-in, which the retry path would otherwise repeat on every failed attempt.
+    // Its outcome does NOT gate the latch — see the note on the fields above.
+    if (!this.builtInSkillsSeeded) {
+      await this.ensureBuiltInSkills();
+    }
 
     // Bootstrap downstream service singletons. Server boot also calls these
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
     // (generateMarketingResponseWorker) doesn't run that path — so any tool
     // that resolves a singleton via getEnrichSoService / getUnipile*Service
-    // would throw "service not initialized" inside the worker. Each init is
-    // idempotent and wrapped in try/catch so a single failure (e.g. missing
-    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // would throw "service not initialized" inside the worker. Each is wrapped in
+    // try/catch so a single failure (e.g. a missing enrich.so secret in dev) doesn't
+    // block the rest — but they are NOT all idempotent: initEnrichSoService,
+    // initApolloService and initUnipileSearchParamService each replace their singleton
+    // unconditionally, which is why the guard below runs this once. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
-    void this.initializeDownstreamSingletons();
+    if (!this.downstreamSingletonsStarted) {
+      this.downstreamSingletonsStarted = true;
+      void this.initializeDownstreamSingletons();
+    }
 
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
@@ -1654,6 +1775,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
+    this.builtInSkillsSeeded = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1686,6 +1808,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
+      this.builtInSkillsSeeded = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1726,6 +1849,13 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
+    // Idempotent. On origin/main a fresh instance per widget message meant each call
+    // started an interval on an object that then leaked — the bug this branch fixes. On
+    // the shared singleton a repeat call is no longer hypothetical: the latch's retry
+    // path runs the whole initialization body again whenever init was degraded, and
+    // unguarded each pass would assign a new interval and orphan the previous one, every
+    // orphan retaining this instance through its closure.
+    if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
     }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
@@ -1855,6 +1985,7 @@ export class AgentModeService {
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
+    this.emmaToolsRegistered = false;
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
@@ -1882,6 +2013,24 @@ export class AgentModeService {
             requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
+      }
+      // "Didn't throw" is not success. Every statement in this try is non-throwing
+      // (Array.from, Map.get, Map.set), so an empty or unresolvable emmaToolRegistry
+      // copies ZERO tools and completes cleanly — which an earlier version of this
+      // latch accepted, leaving an instance live with only the four built-ins
+      // registered below. That is the ENG-1852 symptom exactly. Require the copy to
+      // be complete and non-empty.
+      // `copied === toolNames.length` was here and is deliberately gone: against the real
+      // McpToolRegistry (a synchronous Map — getToolNames() is Array.from(keys),
+      // getTool() is Map.get) it can never be false, and a condition that cannot fail is
+      // the exact thing three prior rounds shipped by accident. `toolNames.length > 0` is
+      // the term that does real work: it catches an emmaToolRegistry that was never
+      // populated, which is the ENG-1852 state.
+      this.emmaToolsRegistered = toolNames.length > 0;
+      if (!this.emmaToolsRegistered) {
+        console.error(
+          'AgentMode: emmaToolRegistry was empty — no Emma tools copied into this instance.',
+        );
       }
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
@@ -6140,32 +6289,6 @@ export class AgentModeService {
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
-
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
-    // across 5 calls within a single 6-second window of ONE user turn, all bearing
-    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
-    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
-    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
-    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
-    // this.toolRegistry is somehow being read as empty intermittently (no code path
-    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
-    // pure/synchronous, and registerTools() is called exactly once in this file), or
-    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
-    // restart/still draining, a new one still initializing) and both happen to log
-    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
-    // across all lines confirms (a); differing pids confirms (b).
-    console.log('[ENG-1852-DIAG]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      allToolsCount: allTools.length,
-      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
-      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
-      associatedToolNamesCount: associatedToolNames.size,
-      excludedToolsCount: excludedTools.size,
-      publishedSkillsCount: publishedSkills.length,
-    }));
 
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
@@ -10820,12 +10943,18 @@ export class AgentModeService {
       }
 
       // Prepare market strategy data - merge with existing if available
+      const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
-        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: existingMarketStrategy?.createdAt || updateTimestamp,
+        updatedAt: updateTimestamp,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): Emma is
+        // explicitly told to send only the fields that changed, so a
+        // competitors-only tool call must not look like an ICP correction to
+        // routes/crm.ts's staleness check.
+        icpUpdatedAt: icp !== undefined ? updateTimestamp : existingMarketStrategy?.icpUpdatedAt,
       };
 
       // Update org-level or personal market strategy
