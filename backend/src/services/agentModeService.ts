@@ -131,6 +131,7 @@ import {
   type ApprovalDeckItem,
   type ApprovalDeckAnsweredBy,
   type InboundDeckAnswer,
+  type QuestionDeckQuestionInput,
 } from './agentMode/core/approvalDeck';
 import {
   type WorkflowStepDefinition,
@@ -4911,19 +4912,29 @@ export class AgentModeService {
         const iterationResults = toolCalls
           .slice(toolCallsLengthBeforeIteration)
           .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
-        // ENG-1635/1644 gap 5 (Round-3 consequence #1): when this iteration halted on
-        // ANY Meta write(s) and nothing else — one write or several — wrap them in ONE
-        // approval deck instead of the plain text batch below. One submission then
-        // grants every listed write (claimMetaWriteManifestGrant, now sourced from this
-        // deck) rather than requiring N separate confirm=true replays. Fires on a SINGLE
-        // write too: once gap 5 closed confirm=true as an independent bypass, there is
-        // no other path left for a solo write to ever proceed, so it can no longer be
-        // left on a separate unhardened path alongside this one. Falls back to the
-        // unchanged plain-prompt path below on any null: no sessionId, a non-Meta-write
-        // confirmation mixed into the batch (out of scope for this ticket — see
-        // buildMetaWriteApprovalDeck), or losing the (expected-rare) race to post the
-        // session's one live human-interrupt slot.
-        const approvalDeck = sessionId ? this.buildMetaWriteApprovalDeck(iterationResults) : null;
+        // ENG-1635/1644 gap 5 (Round-3 consequence #1) + Phase 2 v3: when this
+        // iteration halted on ANY Meta write(s) and/or present_question_deck
+        // call(s), wrap them in ONE approval deck instead of the plain text
+        // batch below. Partition first — both deck kinds share the SAME
+        // persist-and-tag seam below (parameterized by which deck got built);
+        // only `otherHalts` (a genuinely unsupported/future halt shape) bails
+        // to the old plain-text path, preserving today's safety net exactly.
+        // Priority within this iteration, deterministic, not a race:
+        //   1. any otherHalts present -> bail entirely (unchanged behavior).
+        //   2. writeHalts present -> build the WRITE deck; writes always win a
+        //      mixed turn (security-critical: a write must never dead-loop
+        //      behind a lower-stakes planning question) — any questionDeckHalts
+        //      in this SAME iteration are dropped from this deck, stashed on
+        //      it as droppedQuestionDeckPayload so the re-ask directive
+        //      reaches Emma once this write-deck is answered or cancelled
+        //      (never through userMessage — same round-6 fix as the outcome
+        //      note).
+        //   3. else questionDeckHalts present -> build the QUESTION deck.
+        const { writeHalts, questionDeckHalts, otherHalts } = this.partitionApprovalHalts(iterationResults);
+        const approvalDeck: PendingApprovalDeck | null =
+          sessionId && otherHalts.length === 0
+            ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
+            : null;
         if (approvalDeck) {
           const posted = await chatbotDb.updateSessionApprovalDeck(sessionId as string, approvalDeck, {
             failIfAwaitingExists: true,
@@ -4942,6 +4953,9 @@ export class AgentModeService {
               // interactive ApprovalDeckCard instead of (or over) the plain-text prompt.
               // Matched against session.pendingApprovalDeck.deckId, same "current slot"
               // check the ask_user_question card already does for its own questionId.
+              // Applies identically regardless of which deck kind this is (Phase 2) —
+              // the frontend only ever branches on pendingApprovalDeckId matching, never
+              // on deck contents.
               metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId }
             });
             if (onProgress) {
@@ -6349,6 +6363,14 @@ export class AgentModeService {
     // voluntarily. Restriction to Meta-only is prompt-level (tool description),
     // not code-enforced — see emma/tools.ts for the explicit scope language.
     'ask_user_question',
+    // ENG-1635/1644 Phase 2: registered here for the same reason
+    // ask_user_question is -- without this, subscription/skill filtering
+    // strips a new tool from most real sessions despite it working in every
+    // unit test (this exact class of bug already happened once, ENG-396/400).
+    // MANDATORY, not DEFAULT_FOUNDATION_TOOLS above -- that's a weaker
+    // fallback-only list; this one is force-merged unconditionally, "so no
+    // config can strip them", regardless of any DB override.
+    'present_question_deck',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -7175,6 +7197,21 @@ export class AgentModeService {
           options: result.options,
           recommendedOptionId: result.recommendedOptionId,
           allowEmmaDecide: result.allowEmmaDecide,
+        };
+      }
+      // ENG-1635/1644 Phase 2g: same class of bug as metaWriteManifestDigest/
+      // metaWriteDispatch above — this minimizer discards anything it doesn't
+      // name, and the iteration-end seam's partitionApprovalHalts reads
+      // questionDeckPayload off the SAME halted result to classify this as a
+      // question-deck halt at all. Without this, present_question_deck would
+      // work in every unit test (which calls the dispatcher directly) and
+      // silently produce zero question-decks in real sessions — named
+      // explicitly here rather than discovered live, this time.
+      if (result.type === 'present_question_deck') {
+        return {
+          ...base,
+          type: 'present_question_deck',
+          questionDeckPayload: result.questionDeckPayload,
         };
       }
       return base;
@@ -20554,46 +20591,56 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * built, or would silently downgrade its protection to "was in an approved deck," a
    * guarantee this ticket never verified for that tool).
    */
-  private buildMetaWriteApprovalDeck(
+  /**
+   * ENG-1635/1644 Phase 2 v3: split one iteration's halts into the three
+   * buckets the generalized seam needs. A halt only ever lands in ONE bucket:
+   * a real Meta-write shape (digest + dispatch) -> writeHalts; a real
+   * present_question_deck shape (questionDeckPayload array) -> questionDeckHalts;
+   * anything else that set awaitingUserConfirmation -> otherHalts (e.g. a
+   * genuinely unsupported/future halt type — the seam bails to the old
+   * plain-text path on any of these, preserving today's safety net exactly).
+   */
+  private partitionApprovalHalts(
     toolResults: Array<{ status: 'success' | 'error'; result?: any }>
-  ): PendingApprovalDeck | null {
-    const items: Array<{ digest: string; detail: string; dispatch: any }> = [];
+  ): { writeHalts: any[]; questionDeckHalts: any[]; otherHalts: any[] } {
+    const writeHalts: any[] = [];
+    const questionDeckHalts: any[] = [];
+    const otherHalts: any[] = [];
     for (const tr of toolResults) {
       if (tr.status !== 'success') continue;
       const r: any = tr.result;
       if (!r || r.awaitingUserConfirmation !== true) continue;
-      if (typeof r.metaWriteManifestDigest !== 'string' || !r.metaWriteManifestDigest || !r.metaWriteDispatch) {
-        // A non-Meta-write confirmation is mixed into this batch — bail out entirely
-        // rather than deck-wrapping only the Meta writes and silently leaving this one
-        // to the old per-item path; a caller seeing null falls back uniformly for the
-        // WHOLE iteration. Missing metaWriteDispatch alongside a real digest would be
-        // an internal bug (the halt always sets both together) — never reachable in
-        // practice, but treated the same as "not a Meta write" rather than assumed.
-        return null;
+      if (typeof r.metaWriteManifestDigest === 'string' && r.metaWriteManifestDigest && r.metaWriteDispatch) {
+        writeHalts.push(r);
+      } else if (Array.isArray(r.questionDeckPayload)) {
+        questionDeckHalts.push(r);
+      } else {
+        otherHalts.push(r);
       }
-      items.push({
-        digest: r.metaWriteManifestDigest,
-        detail: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
-        dispatch: r.metaWriteDispatch,
-      });
     }
-    if (items.length === 0) return null;
+    return { writeHalts, questionDeckHalts, otherHalts };
+  }
 
+  /** Build a write-only deck from ALREADY-PARTITIONED write halts (see
+   *  partitionApprovalHalts above — the caller guarantees every entry here
+   *  has a real digest + dispatch, so no mixed-shape bail is needed here). */
+  private buildMetaWriteApprovalDeckFromHalts(writeHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length === 0) return null;
     try {
       let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
-      items.forEach((item, i) => {
+      writeHalts.forEach((r, i) => {
         deck = appendApprovalDeckItem(deck, {
           itemId: `write-${i + 1}`,
           kind: 'meta_write',
-          question: item.detail,
+          question: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
           // Haven's CS-64 "REJECT — <correction>" convention (gap 1) applies to
           // a Meta write item too — the correction is captured as data on the
           // answer, never auto-applied; a rejected item simply never becomes a
           // workflow step (see approvedWriteItems), the correction text itself
           // is for whatever surfaces it back to Emma next turn.
           allowFreeText: true,
-          metaWriteManifestDigest: item.digest,
-          metaWriteDispatch: item.dispatch,
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
         });
       });
       return finalizeApprovalDeck(deck, new Date().toISOString());
@@ -20601,9 +20648,72 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Should be unreachable (every item built above is well-formed), but a
       // malformed deck must fall back to the old per-item prompt, never throw and
       // silently drop the halt.
-      console.error('AgentMode: buildMetaWriteApprovalDeck failed, falling back to plain prompt:', err);
+      console.error('AgentMode: buildMetaWriteApprovalDeckFromHalts failed, falling back to plain prompt:', err);
       return null;
     }
+  }
+
+  /** Build a question-only deck from ALREADY-PARTITIONED question-deck halts.
+   *  Each halt's questionDeckPayload is an array (present_question_deck can
+   *  front-load several questions in one call) — if the model somehow made
+   *  more than one present_question_deck call in the same iteration, every
+   *  question across all of them merges into this one deck, same "merge
+   *  same-iteration halts" behavior the write-deck builder already has. */
+  private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
+    const questions: QuestionDeckQuestionInput[] = [];
+    for (const r of questionHalts) {
+      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+    }
+    if (questions.length === 0) return null;
+    try {
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      questions.forEach((q, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `question-${i + 1}`,
+          kind: 'plan_choice',
+          question: q.question,
+          options: q.options,
+          allowEmmaDecide: q.allowEmmaDecide === true,
+        });
+      });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
+    } catch (err) {
+      // Same fallback contract as the write-deck builder above — a malformed
+      // deck (e.g. a bad recommended-option count) falls back to the old
+      // plain-text prompt rather than throwing and dropping the halt.
+      console.error('AgentMode: buildQuestionApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 Phase 2 v3: the iteration-end priority rule, deterministic
+   * not a race. Callers pass ALREADY-PARTITIONED halts (partitionApprovalHalts
+   * above) with otherHalts already confirmed empty. Writes always win a mixed
+   * turn — security-critical: a write must never dead-loop behind a
+   * lower-stakes planning question — so any questionDeckHalts present
+   * alongside a write are dropped from the deck that gets built and stashed
+   * on it as droppedQuestionDeckPayload instead, so the re-ask directive can
+   * reach Emma once this write-deck is answered or cancelled.
+   */
+  private buildApprovalDeckForIteration(writeHalts: any[], questionDeckHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length > 0) {
+      let deck = this.buildMetaWriteApprovalDeckFromHalts(writeHalts);
+      if (deck && questionDeckHalts.length > 0) {
+        const dropped: QuestionDeckQuestionInput[] = [];
+        for (const r of questionDeckHalts) {
+          if (Array.isArray(r.questionDeckPayload)) dropped.push(...r.questionDeckPayload);
+        }
+        if (dropped.length > 0) {
+          deck = { ...deck, droppedQuestionDeckPayload: dropped };
+        }
+      }
+      return deck;
+    }
+    if (questionDeckHalts.length > 0) {
+      return this.buildQuestionApprovalDeckFromHalts(questionDeckHalts);
+    }
+    return null;
   }
 
   /**

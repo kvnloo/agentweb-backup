@@ -62,6 +62,19 @@ async function previewAd(adId: string) {
   return (service as any).extractMinimalToolResult(raw, 'call_meta_marketing_api');
 }
 
+// ENG-1635/1644 Phase 2 v3: the seam's real control flow is now partition ->
+// build-from-the-relevant-bucket, composed of two smaller private methods
+// (partitionApprovalHalts, buildMetaWriteApprovalDeckFromHalts) instead of one
+// monolithic buildMetaWriteApprovalDeck. This helper composes them the exact
+// same way agentModeService's real iteration-end seam does, so these tests
+// keep proving the real observable behavior (iterationResults in, deck-or-null
+// out) through the actual production code path, not a bespoke test-only shim.
+function buildWriteDeckFromIterationResults(toolResults: Array<{ status: 'success' | 'error'; result?: any }>) {
+  const { writeHalts, otherHalts } = (service as any).partitionApprovalHalts(toolResults);
+  if (otherHalts.length > 0) return null;
+  return (service as any).buildMetaWriteApprovalDeckFromHalts(writeHalts);
+}
+
 describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression', () => {
   it('replays Phoenix: 12 halted writes in one iteration become ONE approval deck, not 12 prompts', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: SESSION_ID });
@@ -87,7 +100,7 @@ describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression'
     // loop builds from toolCalls.slice(...).map(...) before trying the deck
     // producer, ahead of the old per-item collectConfirmationPrompt fallback.
     const iterationResults = previews.map((result) => ({ status: 'success' as const, result }));
-    const deck = (service as any).buildMetaWriteApprovalDeck(iterationResults);
+    const deck = buildWriteDeckFromIterationResults(iterationResults);
 
     expect(deck).not.toBeNull();
     expect(deck.status).toBe('awaiting');
@@ -139,7 +152,7 @@ describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression'
       awaitingUserConfirmation: true,
       confirmationDetail: 'Regenerate 2 images.',
     };
-    const result = (service as any).buildMetaWriteApprovalDeck([
+    const result = buildWriteDeckFromIterationResults([
       { status: 'success', result: metaHalt },
       { status: 'success', result: nonMetaHalt },
     ]);
@@ -147,7 +160,7 @@ describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression'
   });
 
   it('a SINGLE Meta write still becomes a deck (deck of one) — gap 5 Round 3: confirm=true alone can no longer carry a solo write', () => {
-    const result = (service as any).buildMetaWriteApprovalDeck([
+    const result = buildWriteDeckFromIterationResults([
       {
         status: 'success',
         result: {
@@ -188,7 +201,7 @@ describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression'
   });
 
   it('falls back to null when nothing halted this iteration', () => {
-    const result = (service as any).buildMetaWriteApprovalDeck([
+    const result = buildWriteDeckFromIterationResults([
       { status: 'success', result: { success: true, message: 'read-only, nothing to confirm' } },
     ]);
     expect(result).toBeNull();
