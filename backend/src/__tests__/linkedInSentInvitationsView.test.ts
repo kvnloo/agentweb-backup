@@ -353,3 +353,47 @@ describe('earliestSentAt', () => {
     expect(earliestSentAt(null, null)).toBeNull();
   });
 });
+
+
+describe('review fixes on PR #2941', () => {
+  it('orders live rows by TIME, with unknown dates last so they cannot displace the oldest', async () => {
+    const undated = { object: 'InvitationSent', id: 'no-date', invited_user_public_id: 'pub-no-date', invited_user: 'X' };
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps({
+      object: 'InvitationList',
+      items: [liveItem('new', '2026-09-10T00:00:00.000Z'), undated, liveItem('old', '2026-07-01T00:00:00.000Z')],
+      cursor: null,
+    }));
+
+    expect(view.items.map((i) => i.id)).toEqual(['old', 'new', 'no-date']);
+  });
+
+  it('merges the ledger estimate for a row that carries the alternate public-id field', async () => {
+    const alternate = {
+      object: 'InvitationSent',
+      id: 'alt',
+      invited_user_public_identifier: 'pub-alt',
+      invited_user: 'Alt Person',
+      parsed_datetime: '2026-09-02T11:27:37.376Z',
+    };
+    const view = await getSentInvitationsView(ACCOUNT, undefined, deps(
+      { object: 'InvitationList', items: [alternate], cursor: null },
+      [cachedRow('pub-alt', '2026-08-03T00:00:00.000Z')],
+    ));
+
+    expect(view.source).toBe('live');
+    expect(view.items[0].invited_user_public_id).toBe('pub-alt');
+    expect(view.items[0].sent_at).toBe('2026-08-03T00:00:00.000Z');
+  });
+
+  it('never calls an unreadable ledger "nothing is tracked" when live says zero', async () => {
+    const view = await getSentInvitationsView(ACCOUNT, undefined, {
+      fetchLive: jest.fn(async () => ({ object: 'InvitationList', items: [], cursor: null })),
+      fetchCached: jest.fn(async () => { throw new Error('dynamo down'); }),
+    });
+
+    expect(view.source).toBe('none');
+    expect(view.liveUnavailable).toBe(true);
+    expect(view.notice).toMatch(/NOT confirmation/);
+    expect(view.notice).not.toContain('No pending invitations are tracked in our system');
+  });
+});

@@ -134,9 +134,7 @@ export const MAX_RETURNED_INVITATIONS = 50;
 function isConformingLiveItem(item: any): boolean {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
   const hasId = typeof item.id === 'string' && item.id.trim().length > 0;
-  const hasPublicId = typeof item.invited_user_public_id === 'string'
-    && item.invited_user_public_id.trim().length > 0;
-  return hasId || hasPublicId;
+  return hasId || livePublicId(item) !== null;
 }
 
 /**
@@ -174,11 +172,25 @@ export function earliestSentAt(a: string | null | undefined, b: string | null | 
   return aMs <= bMs ? (a as string) : (b as string);
 }
 
+/**
+ * The invitee's public identifier, under either field Unipile uses. The sync walk
+ * accepts both (`linkedInSentInvitationsSyncService`), so reading only the first
+ * would drop the ledger merge for rows carrying the alternate spelling (Greptile
+ * on PR #2941).
+ */
+function livePublicId(item: any): string | null {
+  const primary = item?.invited_user_public_id;
+  if (typeof primary === 'string' && primary.trim() !== '') return primary;
+  const alternate = item?.invited_user_public_identifier;
+  if (typeof alternate === 'string' && alternate.trim() !== '') return alternate;
+  return null;
+}
+
 function trimLive(item: any): TrimmedSentInvitation {
   return {
     id: item?.id ?? null,
     invited_user_id: item?.invited_user_id ?? null,
-    invited_user_public_id: item?.invited_user_public_id ?? null,
+    invited_user_public_id: livePublicId(item),
     invited_user: item?.invited_user ?? null,
     // `parsed_datetime` is the normalized one and can be null; `date` is the raw
     // string the schema always carries. Prefer the parsed value, fall back.
@@ -273,7 +285,15 @@ export async function getSentInvitationsView(
       // backlog, not its size. Say "at least" rather than overstate our knowledge.
       const morePages = Boolean(live.cursor);
       // Oldest first: the merged estimates finally make this ordering meaningful.
-      const ordered = [...items].sort((a, b) => String(a.sent_at ?? '').localeCompare(String(b.sent_at ?? '')));
+      // By TIME, not by string: an unknown date must not sort ahead of the genuinely
+      // oldest rows and take their place in the returned window (CodeRabbit/Greptile).
+      const ordered = [...items].sort((a, b) => {
+        const aMs = Date.parse(a.sent_at ?? '');
+        const bMs = Date.parse(b.sent_at ?? '');
+        if (Number.isNaN(aMs)) return Number.isNaN(bMs) ? 0 : 1;
+        if (Number.isNaN(bMs)) return -1;
+        return aMs - bMs;
+      });
       return {
         items: ordered.slice(0, MAX_RETURNED_INVITATIONS),
         totalPending: items.length,
@@ -321,7 +341,22 @@ export async function getSentInvitationsView(
 
   // Nothing anywhere. Say which kind of nothing it is — this is the distinction
   // AC #7 asks for, and the one the old bare `{}` destroyed.
-  if (liveUnavailable) {
+  if (liveUnavailable || cacheFailed) {
+    if (!liveUnavailable) {
+      // Live said zero and our ledger could not be read, so "none" is not a fact.
+      // Reporting it as one is the exact failure ENG-1718 exists to remove.
+      return {
+        items: [],
+        totalPending: 0,
+        source: 'none',
+        liveUnavailable: true,
+        notice:
+          'LinkedIn reported no pending invitations, but our own records could not be read, so this '
+          + 'is NOT confirmation that the account has none — a live zero during an active cooldown is '
+          + 'exactly the case our records exist to cover. Retry later, or ask the account owner to '
+          + 'check LinkedIn\'s "My Network → Sent" page directly.',
+      };
+    }
     return {
       items: [],
       totalPending: 0,
