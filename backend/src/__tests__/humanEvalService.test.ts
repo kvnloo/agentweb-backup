@@ -1,4 +1,5 @@
 import { HumanEvalCandidate, HumanEvalService, parseHumanEvalCategoryFilter } from '../services/humanEvalService';
+import { userDb } from '../services/db';
 
 function makeHarness() {
   const items = new Map<string, HumanEvalCandidate>();
@@ -212,6 +213,60 @@ describe('HumanEvalService', () => {
       'C_EVAL',
       expect.not.stringContaining('open associated chat'),
     );
+  });
+
+  // Matt's ask: the card must name WHOSE account produced the artifact, so a reviewer can tell
+  // customers apart without opening the chat link first.
+  it('shows the originating user email on the Slack card', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ email: 'founder@haven.com' } as any);
+
+    await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated an ad variant.',
+      userId: 'user-haven',
+    });
+
+    expect(spy).toHaveBeenCalledWith('user-haven');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*User:* founder@haven.com'),
+    );
+    spy.mockRestore();
+  });
+
+  it('still posts the card, minus the user line, when the user lookup fails', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById').mockRejectedValue(new Error('GSI query transiently failed'));
+
+    await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Generated an ad variant.',
+      userId: 'user-haven',
+    });
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*User:*'),
+    );
+    spy.mockRestore();
+  });
+
+  it('omits the user line entirely for candidates with no originating user', async () => {
+    const { service, slack } = makeHarness();
+    const spy = jest.spyOn(userDb, 'getUserById');
+
+    await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Enrichment completed.',
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*User:*'),
+    );
+    spy.mockRestore();
   });
 
   it('routes lead enrichment to Fangfang', async () => {
