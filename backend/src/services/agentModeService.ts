@@ -39371,6 +39371,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
             finalUrlSuffix: args.final_url_suffix,
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+            targetPartnerSearchNetwork: args.target_partner_search_network,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be

@@ -1071,9 +1071,16 @@ export class GoogleAdsService {
     cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
     finalUrlSuffix?: string;
+    targetGoogleSearch?: boolean;
+    targetSearchNetwork?: boolean;
+    targetContentNetwork?: boolean;
+    targetPartnerSearchNetwork?: boolean;
   }): Promise<boolean> {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
+    }
+    if (params.targetSearchNetwork === true && params.targetGoogleSearch === false) {
+      throw new Error('target_search_network=true requires target_google_search=true; nothing was sent to Google Ads.');
     }
     assertBidTargetIsAddressable(params);
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
@@ -1083,6 +1090,20 @@ export class GoogleAdsService {
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.budgetResourceName) { update.campaignBudget = params.budgetResourceName; updateMask.push('campaign_budget'); }
     if (params.finalUrlSuffix !== undefined) { update.finalUrlSuffix = params.finalUrlSuffix; updateMask.push('final_url_suffix'); }
+    const networkSettings: Record<string, boolean> = {};
+    const networkSettingFields = [
+      ['targetGoogleSearch', 'target_google_search'],
+      ['targetSearchNetwork', 'target_search_network'],
+      ['targetContentNetwork', 'target_content_network'],
+      ['targetPartnerSearchNetwork', 'target_partner_search_network'],
+    ] as const;
+    for (const [paramName, maskName] of networkSettingFields) {
+      if (params[paramName] !== undefined) {
+        networkSettings[paramName] = params[paramName];
+        updateMask.push(`network_settings.${maskName}`);
+      }
+    }
+    if (Object.keys(networkSettings).length > 0) update.networkSettings = networkSettings;
     if (params.biddingStrategyResourceName) {
       // Portfolio/shared strategy: bidding_strategy is a scalar resource-name field, so masking
       // the leaf directly is correct (and setting it detaches any prior embedded strategy).

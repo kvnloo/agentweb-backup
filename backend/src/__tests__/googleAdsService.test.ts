@@ -1324,6 +1324,38 @@ describe('updateCampaign', () => {
     expect(didUpdate).toBe(true);
   });
 
+  it('sends each explicitly supplied campaign network setting with a leaf update mask', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetGoogleSearch: true,
+      targetSearchNetwork: false,
+      targetContentNetwork: false,
+      targetPartnerSearchNetwork: true,
+    });
+    const operation = mockAxiosPost.mock.calls[0][1].operations[0];
+    expect(operation.update.networkSettings).toEqual({
+      targetGoogleSearch: true,
+      targetSearchNetwork: false,
+      targetContentNetwork: false,
+      targetPartnerSearchNetwork: true,
+    });
+    expect(operation.updateMask).toBe([
+      'network_settings.target_google_search',
+      'network_settings.target_search_network',
+      'network_settings.target_content_network',
+      'network_settings.target_partner_search_network',
+    ].join(','));
+    expect(didUpdate).toBe(true);
+  });
+
+  it('rejects enabling the search network while disabling Google Search', async () => {
+    await expect(service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      targetGoogleSearch: false,
+      targetSearchNetwork: true,
+    })).rejects.toThrow(/requires target_google_search=true.*nothing was sent/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
   it('returns false and makes no API call when no recognized fields are provided', async () => {
     const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {});
     expect(mockAxiosPost).not.toHaveBeenCalled();
