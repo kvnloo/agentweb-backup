@@ -628,6 +628,28 @@ describe('subscriptionService', () => {
       expect(events.map((e) => e.reason)).toContain('tier-config-missing-allowed-skills');
     });
 
+    /*
+     * The report for a missing allowedSkills must fire ONLY on the skills path.
+     * getSubscriptionTypeConfig has ~18 callers across unrelated subsystems (token usage, LLM
+     * usage policy, unit economics, Stripe, evaluation store, allowedPages/Features/HiddenPages);
+     * reporting from inside it — as an earlier revision did — turned one malformed row into an
+     * event on every one of them. This pins that it does not.
+     */
+    it('does not emit for a malformed tier row when resolving something other than skills', async () => {
+      const events: any[] = [];
+      setWildcardGrantSink((e) => events.push(e));
+      mockedUserDb.getUserById.mockResolvedValue({ userId: 'u8', subscriptionType: 'Legacy' } as any);
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/tasks'] }]),
+      } as any);
+
+      await getAllowedPages('u8');
+      await getAllowedFeatures('u8');
+
+      expect(events).toHaveLength(0);
+    });
+
     /* Observation must never be the reason the SERVER fails. An async sink is assignable to a
      * `=> void` type, and its rejection would otherwise escape as an unhandled rejection. */
     it('survives a sink that rejects asynchronously', async () => {

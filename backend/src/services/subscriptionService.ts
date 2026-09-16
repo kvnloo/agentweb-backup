@@ -14,6 +14,11 @@ export interface SubscriptionType {
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
+  /** ENG-1978, observation only, never persisted: true when the stored row carried NO
+   *  `allowedSkills` and it was defaulted to ["*"] on read. Set by getSubscriptionTypeConfig so
+   *  the skills path can record that silent full-registry grant without this function's ~18 other
+   *  callers each emitting a duplicate for the same malformed row. */
+  allowedSkillsDefaulted?: boolean;
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
@@ -339,23 +344,20 @@ export async function getSubscriptionTypeConfig(
     // treat as all skills allowed (wildcard)
     const allowedSkills = subscriptionType.allowedSkills || ["*"];
 
-    // ENG-1978 (observation only): this rewrite happens BEFORE getAllowedSkills ever sees the
-    // row, so without recording it here a tier missing `allowedSkills` grants the entire registry
-    // indistinguishably from an admin deliberately typing ["*"] — and that legacy shape is the
-    // likeliest real malformation, being the documented pre-`allowedSkills` config format.
-    // Identified by tier name rather than userId on purpose: this is a property of the config
-    // row, identical for every user on that tier, not something a particular user did.
-    if (!subscriptionType.allowedSkills) {
-      reportWildcardGrant("tier-config-missing-allowed-skills", `tier:${subscriptionTypeName}`, {
-        subscriptionTypeName,
-        hasLegacyAllowedFunctionCalls: Array.isArray(subscriptionType.allowedFunctionCalls),
-      });
-    }
+    // ENG-1978 (observation only): flag the legacy shape rather than reporting it here.
+    //
+    // This function has ~18 callers across unrelated subsystems — token usage, LLM usage policy,
+    // unit economics, Stripe, the evaluation store, plus allowedPages/Features/HiddenPages — so
+    // emitting from this point would fire on every one of them for a single malformed row, which
+    // is a firehose, not an observation. The report belongs to the skills path only, so the fact
+    // is carried out and recorded by getAllowedSkills instead.
+    const allowedSkillsDefaulted = !subscriptionType.allowedSkills;
 
     // Normalize paths: remove "/marketing" prefix from allowedPages
     return {
       ...subscriptionType,
       allowedSkills,
+      allowedSkillsDefaulted,
       allowedPages: subscriptionType.allowedPages.map((page: string) => {
         if (page.startsWith('/marketing/')) {
           return page.replace('/marketing', '');
@@ -490,6 +492,14 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
 
     // If all skills are allowed, return wildcard
     if (subscriptionType.allowedSkills.includes("*")) {
+      // Distinguish "an admin deliberately typed ["*"]" from "the row carried no allowedSkills at
+      // all and was defaulted to ["*"] on read" — the latter is a silent full-registry grant and
+      // the likeliest real malformation, being the documented pre-`allowedSkills` config shape.
+      if (subscriptionType.allowedSkillsDefaulted) {
+        reportWildcardGrant("tier-config-missing-allowed-skills", userId, {
+          subscriptionTypeName,
+        });
+      }
       return ["*"];
     }
 
