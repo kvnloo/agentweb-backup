@@ -291,3 +291,73 @@ export async function resolveAllowanceInputs(
     policy,
   };
 }
+
+/** What a bounded cut left out, so the screen can state it (ENG-1841). */
+export interface OmittedRows {
+  rows: number;
+  eventCount: number;
+  settledMicroUsd: number;
+  reservedMicroUsd: number;
+}
+
+export type BreakdownOmissions = Record<"byProvider" | "byFeature" | "byMember" | "bySession" | "inFlight", OmittedRows>;
+
+/**
+ * Bound the detail rows of a breakdown for a response, without touching a
+ * single total (ENG-1841).
+ *
+ * Applied AFTER `buildSpendBreakdown`, so every headline figure (settled,
+ * in-flight, the daily trend) is still summed over the whole month; only the
+ * unbounded row lists (one row per session, per open reservation, …) are cut to
+ * their largest `limit`. What was cut is counted and summed in `omitted`, so a
+ * reader is told exactly how much detail is not listed — never left to assume
+ * the listed rows are the whole month.
+ */
+export function boundBreakdownRows(
+  breakdown: SpendBreakdown,
+  limit: number,
+): SpendBreakdown & { omitted: BreakdownOmissions } {
+  const cut = (rows: SpendSlice[]): { rows: SpendSlice[]; omitted: OmittedRows } => {
+    const rest = rows.slice(limit);
+    return {
+      rows: rows.slice(0, limit),
+      omitted: {
+        rows: rest.length,
+        eventCount: rest.reduce((t, r) => t + r.eventCount, 0),
+        settledMicroUsd: rest.reduce((t, r) => t + r.settledMicroUsd, 0),
+        reservedMicroUsd: rest.reduce((t, r) => t + r.reservedMicroUsd, 0),
+      },
+    };
+  };
+
+  const byProvider = cut(breakdown.byProvider);
+  const byFeature = cut(breakdown.byFeature);
+  const byMember = cut(breakdown.byMember);
+  const bySession = cut(breakdown.bySession);
+  // In-flight keeps its newest-first order — the screen labels these "most
+  // recent" — so the cut drops the oldest reservations. Their money still sits
+  // in inFlightMicroUsd, and is summed again in omitted.
+  const inFlightShown = breakdown.inFlight.slice(0, limit);
+  const inFlightRest = breakdown.inFlight.slice(limit);
+
+  return {
+    ...breakdown,
+    byProvider: byProvider.rows,
+    byFeature: byFeature.rows,
+    byMember: byMember.rows,
+    bySession: bySession.rows,
+    inFlight: inFlightShown,
+    omitted: {
+      byProvider: byProvider.omitted,
+      byFeature: byFeature.omitted,
+      byMember: byMember.omitted,
+      bySession: bySession.omitted,
+      inFlight: {
+        rows: inFlightRest.length,
+        eventCount: inFlightRest.length,
+        settledMicroUsd: 0,
+        reservedMicroUsd: inFlightRest.reduce((t, r) => t + r.costMicroUsd, 0),
+      },
+    },
+  };
+}

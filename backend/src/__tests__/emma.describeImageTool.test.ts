@@ -58,11 +58,14 @@ describe('describe_image Emma tool', () => {
     expect(agentModeService.describeImage).toHaveBeenCalledWith(
       undefined,
       'https://example.com/chart.png',
-      'describe it'
+      'describe it',
+      // ENG-1858: metered to the calling user, not "system".
+      { userId: 'user-123', sessionId: 'sess-1', feature: 'describe_image' }
     );
     // Guard against regressing to forwarding the chat model
     expect(agentModeService.describeImage).not.toHaveBeenCalledWith(
       'anthropic.claude-opus-4-8',
+      expect.anything(),
       expect.anything(),
       expect.anything()
     );
@@ -80,7 +83,9 @@ describe('describe_image Emma tool', () => {
     expect(agentModeService.describeImage).toHaveBeenCalledWith(
       undefined,
       'https://example.com/a.png',
-      undefined
+      undefined,
+      // ENG-1858: no user in context → feature only, never an invented user.
+      { feature: 'describe_image' }
     );
   });
 });

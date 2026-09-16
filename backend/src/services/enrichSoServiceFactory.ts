@@ -24,7 +24,6 @@ import type { EnrichSoEndpoint } from './enrichSoCacheKeys';
 import { crmDb } from './db';
 import { getEnrichSoApiKey } from '../utils/secretsManager';
 import { recordVendorUsage } from './usageRecorderService';
-import { computeAllocatedCost } from '../utils/vendorRateCard';
 
 // ─── Vendor $ ledger mirroring (ENG-696) ───────────────────────────────────
 //
@@ -56,8 +55,8 @@ function recordEnrichSoLedger(endpoint: EnrichSoEndpoint, userId: string | undef
     feature: 'crm_enrichment',
     unit: ENRICHSO_RATE_UNIT[endpoint],
     quantity: 1,
-    costSource: 'allocated',
-    costUsd: computeAllocatedCost('enrich.so', rateKey, 1),
+    // ENG-1929: priced inside the recorder — never thrown into the enrich.so call.
+    rateKey,
   });
 }
 

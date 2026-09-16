@@ -1,6 +1,5 @@
 import AWS from "aws-sdk";
 import { recordVendorUsage } from "./usageRecorderService";
-import { computeAllocatedCost } from "../utils/vendorRateCard";
 
 /**
  * Parameters for composing a branded video via Remotion Lambda.
@@ -422,16 +421,10 @@ export class RemotionService {
       // ENG-699: record at submission — the only point every render attempt
       // passes through, including one that fails before renderMediaOnLambda
       // even returns a renderId. A metering failure can never fail or delay
-      // the render (recordVendorUsage is fire-and-forget internally), so the
-      // cost lookup itself is isolated too — a missing/invalid rate must not
-      // throw synchronously into this method's outer catch and turn a
-      // metering config error into a render failure (CodeRabbit).
-      let submitCostUsd = 0;
-      try {
-        submitCostUsd = computeAllocatedCost("remotion", "render", shardCount);
-      } catch (rateError) {
-        console.error("RemotionService: metering rate lookup failed (non-fatal):", rateError);
-      }
+      // the render: the rate is resolved inside the recorder (ENG-1929), which
+      // never throws. That also retires the old fallback here, which caught a
+      // missing rate and booked the submission as $0 "allocated" — the silent
+      // $0 ENG-703 AC2 forbids. A missing rate is now recorded unpriced.
       void recordVendorUsage({
         userId: params.userId,
         provider: "remotion",
@@ -439,8 +432,7 @@ export class RemotionService {
         feature: "branded_video",
         unit: "render",
         quantity: shardCount,
-        costSource: "allocated",
-        costUsd: submitCostUsd,
+        rateKey: "render",
       });
 
       // Single failure recorder used by every failed-render exit (fatal
