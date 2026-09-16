@@ -59,6 +59,10 @@ interface ICPPersonaLite {
   desire: string;
   objection: string;
   meta_targeting_brief: string;
+  // Passed through from the source marketStrategy.icp entry when present —
+  // lets routes/crm.ts's icp/filters cache-hit check work the same way for
+  // marketStrategy-derived personas as it does for icpResult ones (ENG-1955).
+  extractedFilters?: any;
 }
 
 interface CompetitorEntry {
@@ -194,6 +198,7 @@ export function mapMarketIcpToResult(
         desire: stringOr(p.valueProposition, ""),
         objection: "",
         meta_targeting_brief: stringOr(firstPersona, ""),
+        ...(p.extractedFilters ? { extractedFilters: p.extractedFilters } : {}),
       };
     })
     .slice(0, 5);
