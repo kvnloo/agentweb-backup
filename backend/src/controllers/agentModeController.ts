@@ -8883,9 +8883,14 @@ export const agentModeController = {
     // build, so the optimistic ApprovalDeckCard flips to its locked/answered
     // view immediately instead of only after a page reload.
     let answeredApprovalDeck: PendingApprovalDeck | undefined;
+    // ENG-1635/1644 Phase 1b: true when this turn cancelled a deck — tells the
+    // frontend to clear its own copy of pendingApprovalDeck (the deck was
+    // cleared to null server-side, not answered, so answeredApprovalDeck's
+    // "flip to locked view" shape doesn't apply here).
+    let deckCancelled = false;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, clientId } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -9047,10 +9052,15 @@ export const agentModeController = {
       // read later — submitApprovalDeckAnswers actually dispatches every approved
       // write (step-per-write, independent-step engine) SYNCHRONOUSLY before this
       // request returns, so by the time Emma sees this turn the writes have
-      // already run. The outcome (and gap 4: any REJECT — <correction> free text)
-      // is injected the same way workPlanInputAnswer's structured values are —
-      // appended to userMessage — so Emma reacts to what actually happened
-      // instead of assuming success or asking the user to confirm again.
+      // already run. The outcome (and gap 4: any REJECT — <correction> free text,
+      // and any 'comment' free text) is injected via answerAck — the same
+      // LLM-only channel ENG-396 already uses, "never stored on the displayed
+      // user bubble" (see its own doc comment on generateSessionResponse) — NOT
+      // appended to userMessage. userMessage becomes userMessageObj.content
+      // verbatim below and is rendered in the user's own chat history; the
+      // frontend already sends a clean, human-readable label as userMessage
+      // (e.g. "Approved all 3") specifically for that display, so appending raw
+      // JSON onto it was a leak, not an LLM-only channel (round 6 finding).
       if (deckAnswer) {
         if (!session.pendingApprovalDeck) {
           return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
@@ -9066,11 +9076,77 @@ export const agentModeController = {
         const rejections = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
-        userMessage = `${userMessage}\n\n[Approval deck outcome: ${JSON.stringify({
-          status: result.summary?.status ?? 'nothing_approved',
-          items: result.summary?.items ?? [],
+        const commented = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
+        // Found live on env1 (2026-09-16): a pure question-deck (present_question_deck,
+        // no Meta write items at all) has approvedWriteItems() === [] by construction,
+        // so submitApprovalDeckAnswers ALWAYS returns summary: null for it — not because
+        // nothing was answered, but because "summary" only ever described WRITE
+        // execution outcomes. The old code below rendered that as
+        // status:'nothing_approved', items:[] regardless of what was actually picked,
+        // which read to Emma as "the user answered nothing" — she re-asked the exact
+        // same deck, a real dead loop (confirmed live: 3 identical decks in a row).
+        // Fix: resolve every non-write, non-comment item's actual selection (option
+        // label if resolvable) into its own `selections` array, and don't claim
+        // 'nothing_approved' for a deck that was never about writes at all.
+        const deckItems = answeredApprovalDeck?.items ?? [];
+        const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
+        const selections = deckItems
+          .filter((item) => !item.metaWriteManifestDigest)
+          .map((item) => {
+            const ans = answeredApprovalDeck?.answers?.find((a) => a.itemId === item.itemId);
+            if (!ans || ans.verdict === 'comment') return null;
+            const pickedOption = item.options?.find((o) => o.id === ans.verdict);
+            return { itemId: item.itemId, question: item.question, selected: pickedOption?.label ?? ans.verdict };
+          })
+          .filter((s): s is { itemId: string; question: string; selected: string } => s !== null);
+        const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
+          status: isWriteDeck ? (result.summary?.status ?? 'nothing_approved') : 'answered',
+          ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
+          ...(selections.length > 0 ? { selections } : {}),
           ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
+          ...(commented.length > 0 ? { commented } : {}),
         })}]`;
+        answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
+      }
+
+      // ENG-1635/1644 Phase 1b: abandon the whole deck without answering any
+      // item. Mirrors AskUserQuestion's real abandon precedent exactly — clear
+      // to null (chatbotDb.updateSessionApprovalDeck(sessionId, null, ...)), no
+      // new status value. Once pendingApprovalDeck is null, the original halt
+      // message's card match (metadata.pendingApprovalDeckId ===
+      // session.pendingApprovalDeck?.deckId) is false for every message, so it
+      // falls back to the plain-text prompt — the same, already-accepted
+      // behavior a superseded deck already has.
+      if (deckCancel) {
+        if (!session.pendingApprovalDeck || session.pendingApprovalDeck.deckId !== deckCancel.deckId) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const cleared = await chatbotDb.updateSessionApprovalDeck(sessionId, null, {
+          requireStillAwaiting: deckCancel.deckId,
+        });
+        if (!cleared) {
+          return res.status(409).json({ error: 'This approval deck was already answered or cancelled by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        deckCancelled = true;
+        // ENG-1635/1644 Phase 2b/1b: a write-deck can carry droppedQuestionDeckPayload
+        // (questions dropped because a write halted in the same turn and won
+        // priority — see buildApprovalDeckForIteration). The answer path already
+        // reads this field; the cancel path is a SEPARATE code path and must read
+        // it too, or cancelling a write-deck with a dropped question loses it
+        // permanently — read from the pre-clear snapshot still in `session`, since
+        // the deck itself is about to be nulled.
+        const droppedQuestions = session.pendingApprovalDeck.droppedQuestionDeckPayload;
+        const cancelDirective = droppedQuestions && droppedQuestions.length > 0
+          ? `[Approval deck cancelled by the user — no item in it was approved, rejected, or executed. ` +
+            `Do not treat any pending write as granted. This deck had also dropped ${droppedQuestions.length} ` +
+            `question(s) that were never asked (a write halted in the same turn and took priority): ` +
+            `${JSON.stringify(droppedQuestions.map((q: any) => q.question))}. Re-ask them via present_question_deck, ` +
+            `or ask what they would like to do instead.]`
+          : '[Approval deck cancelled by the user — no item in it was approved, rejected, ' +
+            'or executed. Do not treat any pending write as granted; ask what they would like to do instead.]';
+        answerAck = answerAck ? `${answerAck}\n\n${cancelDirective}` : cancelDirective;
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
@@ -9584,6 +9660,7 @@ export const agentModeController = {
         // frontend only does that off pendingApprovalDeck above), or the same deck
         // would match two messages at once and render the card twice.
         ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
+        ...(deckCancelled ? { deckCancelled: true } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
