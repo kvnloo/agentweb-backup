@@ -469,10 +469,33 @@ async function recordVendorUsageIdempotent(ctx: ResolvedVendorUsageContext, now:
   try {
     const built = buildShadowEvent(ctx, now.toISOString());
     if ("skip" in built) {
-      // Unpriced: no spend event may exist for it, so there is nothing to make
-      // the aggregate write idempotent against. Fall back to the plain write
-      // rather than inventing a $0 event the billing boundary forbids.
-      await usageRecordDb.incrementUsage(buildVendorIncrement(ctx, userId, billingUserId, now));
+      // Unpriced: no spend event may exist for it (the billing boundary forbids
+      // a $0 one), so it can't dedupe via the spend-event transaction.
+      const increment = buildVendorIncrement(ctx, userId, billingUserId, now);
+      if (ctx.idempotencyKey) {
+        // ENG-1958: a KEYED unpriced call can still be replayed, and a plain
+        // ADD double-counts the aggregate on retry. Guard it with a conditional
+        // dedupe marker in the same transaction so a replay is a no-op. Conflict
+        // is a write that didn't happen, so retry it as transient (matches the
+        // priced path); "applied" and "duplicate" are both terminal successes.
+        await retryTransientWrite(async () => {
+          const outcome = await usageRecordDb.incrementUsageWithDedupeMarker(
+            increment,
+            billingUserId,
+            ctx.idempotencyKey!,
+          );
+          if (outcome === "conflict") {
+            throw Object.assign(new Error("transaction conflict on unpriced vendor usage"), {
+              code: "TransactionConflictException",
+            });
+          }
+          return outcome;
+        });
+      } else {
+        // Unkeyed: a replay is not detectable anyway, so keep the plain write
+        // rather than pay for a marker that could never match (ENG-1958 AC3).
+        await usageRecordDb.incrementUsage(increment);
+      }
       // Recovery on ANY successful path closes an open window, not just the
       // priced+keyed one (CodeRabbit, PR #2807) — otherwise an account whose
       // vendor traffic is all unpriced never reports its final alert.
