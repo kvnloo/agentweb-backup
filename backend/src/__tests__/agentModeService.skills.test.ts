@@ -1139,6 +1139,49 @@ describe('AgentModeService - Skills', () => {
       expect(names).toContain('regular_tool');
       expect(names).not.toContain('get_visual_context');
     });
+
+    // ENG-1550: record_ads_recommendation writes a prediction into the outcome
+    // ledger, which only has a referent inside a skill that just made one. Every
+    // production tier enables __other_skills__, so without this exclusion the tool
+    // would be offered to every customer in unrelated sessions, where a model could
+    // only call it spuriously — writing junk into the very track record the ledger
+    // exists to make trustworthy.
+    it('should exclude record_ads_recommendation from the __other_skills__ catch-all', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'record_ads_recommendation', definition: { function: { description: 'records a prediction' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const names = agentModeService.getUnassociatedToolNames(publishedSkills);
+
+      expect(names).toContain('regular_tool');
+      expect(names).not.toContain('record_ads_recommendation');
+    });
+
+    // The exclusion must restrict how the tool is REACHED, not who may run it: a
+    // skill that declares the tool still grants it, and it is deliberately NOT an
+    // admin-only tool. If it ever lands in ADMIN_SKILL_TOOL_NAMES, ordinary
+    // customers on the ads skills silently lose it.
+    it('keeps record_ads_recommendation grantable through a skill that declares it', () => {
+      expect(agentModeService.getAdminToolNames()).not.toContain('record_ads_recommendation');
+      expect(agentModeService.getFoundationToolNames().has('record_ads_recommendation')).toBe(false);
+
+      const publishedSkills = [
+        { skillId: 's1', isPublished: true, toolNames: ['record_ads_recommendation'] },
+      ];
+      const mockTools = [
+        { name: 'record_ads_recommendation', definition: { function: { description: 'records a prediction' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      // Associated with a published skill, so it is not "unassociated" either way —
+      // resolveSkillsToToolNames reads skill.toolNames directly for a named skill,
+      // a path this exclusion does not touch.
+      expect(agentModeService.getUnassociatedToolNames(publishedSkills)).not.toContain('record_ads_recommendation');
+      expect(publishedSkills[0].toolNames).toContain('record_ads_recommendation');
+    });
   });
 
   describe('buildAvailableSkillsMessage', () => {
