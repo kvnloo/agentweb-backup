@@ -93,11 +93,11 @@ export interface SentInvitationsView {
  * Our ledger stores the first value it observed, or the sync time itself when
  * Unipile omitted the field.
  *
- * Found in production, 2026-09-14: TFA Connect's scheduled runs of 09-11 and 09-13
- * read ~50 identical `sent_at` values and told the customer, twice, about an
- * "unexplained ~50-invite burst sent within ~16 seconds". The "burst" was
- * 2026-09-05T17:17:37Z — exactly six days before the run's own 17:17:36Z list
- * call. Its 681-row ledger held only 39 distinct `sentAt` values.
+ * Found in production (ENG-1718): a customer's scheduled runs read ~50 identical
+ * `sent_at` values and reported an "unexplained ~50-invite burst sent within
+ * seconds" to the customer, twice. The "burst" timestamp was exactly N days before
+ * the run's own list call, to the second, and the account's ledger of several
+ * hundred rows held only a few dozen distinct `sentAt` values.
  */
 export const SENT_AT_PRECISION_NOTE =
   'sent_at values are APPROXIMATE: LinkedIn only reports relative ages ("3 days ago", "2 months ago"), '
