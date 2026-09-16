@@ -69,16 +69,23 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
   const mockAddMessageToSession = jest.fn();
   const mockUploadFileToS3 = jest.fn();
   const mockGetMessages = jest.fn();
+  const mockAxiosPost = jest.fn();
+  const mockGetToken = jest.fn();
 
   beforeAll(() => {
     jest.isolateModules(() => {
       jest.doMock('../services/usageRecorderService', () => ({
         recordVendorUsage: (...a: any[]) => mockRecordVendorUsage(...a),
       }));
-      jest.doMock('../utils/secretsManager', () => ({ getPlacidPrivateToken: jest.fn() }));
+      jest.doMock('../utils/secretsManager', () => ({
+        getPlacidPrivateToken: (...a: any[]) => mockGetToken(...a),
+      }));
       jest.doMock('axios', () => ({
         __esModule: true,
-        default: { get: (...a: any[]) => mockAxiosGet(...a), post: jest.fn() },
+        default: {
+          get: (...a: any[]) => mockAxiosGet(...a),
+          post: (...a: any[]) => mockAxiosPost(...a),
+        },
       }));
       jest.doMock('../services/db', () => ({
         taskDb: {
@@ -135,6 +142,11 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
       success: true,
       url: 'https://bucket.s3.us-west-2.amazonaws.com/users/owner-1/files/1/ad-placid-tpl-abcd.png',
     });
+    // ENG-1972: render = REST create (POST) returning a URL, then a GET for bytes.
+    mockGetToken.mockResolvedValue('placid-private-token');
+    mockAxiosPost.mockResolvedValue({
+      data: { id: 77, status: 'finished', image_url: 'https://cdn.placid.test/out.png' },
+    });
     mockAxiosGet.mockResolvedValue({ data: new ArrayBuffer(8), headers: { 'content-type': 'image/png' } });
     mockGetTask.mockResolvedValue({ taskId: 'task-1', userId: 'owner-1' });
     mockGetExecution.mockResolvedValue({ taskId: 'task-1', result_files: [] });
@@ -151,7 +163,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     // The synthetic id is never looked up as a task — that lookup is the 404.
     expect(mockGetTask).not.toHaveBeenCalled();
     expect(mockGetExecution).not.toHaveBeenCalled();
-    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
 
     // Filed under the session OWNER, so it lands on their Images page.
     expect(mockUploadFileToS3).toHaveBeenCalledWith(
@@ -228,7 +240,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     await generateFromTemplateToExecution(agentModeReq('intruder-1'), r);
 
     expect(r.status).toHaveBeenCalledWith(403);
-    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPost).not.toHaveBeenCalled();
     expect(mockRecordVendorUsage).not.toHaveBeenCalled();
     expect(mockAddMessageToSession).not.toHaveBeenCalled();
   });
@@ -240,7 +252,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
 
     expect(r.status).toHaveBeenCalledWith(404);
     expect(r.json).toHaveBeenCalledWith({ message: 'Session not found' });
-    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
   it('does not treat a mismatched id pair as an agent-mode render', async () => {
@@ -259,7 +271,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     expect(mockGetChatSession).not.toHaveBeenCalled();
     expect(r.status).toHaveBeenCalledWith(404);
     expect(r.json).toHaveBeenCalledWith({ message: 'Task not found' });
-    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
   // AC4
@@ -302,7 +314,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     await generateFromTemplateToExecution(agentModeReq('admin-1'), r);
 
     expect(r.status).toHaveBeenCalledWith(500);
-    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockAxiosPost).not.toHaveBeenCalled();
     expect(mockRecordVendorUsage).not.toHaveBeenCalled();
     expect(mockUploadFileToS3).not.toHaveBeenCalled();
   });
@@ -319,7 +331,7 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     expect(mockAddMessageToSession).toHaveBeenCalledTimes(2);
     expect(r.status).toHaveBeenCalledWith(200);
     // One render, one charge — the retry is of the write, not of Placid.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
     expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
   });
 
@@ -370,6 +382,20 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     expect(body.message).toMatch(/could not be saved/i);
     // The URL of the paid render still reaches the caller for recovery.
     expect(body.resultFile.url).toContain('ad-placid-tpl-abcd.png');
+  });
+
+  // ENG-1972: the REST render needs the private token, so an unconfigured token
+  // must fail before Placid is called rather than sending an unauthenticated
+  // request that would be refused anyway.
+  it('refuses to render when the Placid token is not configured', async () => {
+    mockGetToken.mockResolvedValue(null);
+    const r = res();
+    await generateFromTemplateToExecution(agentModeReq(), r);
+
+    expect(r.status).toHaveBeenCalledWith(500);
+    expect(r.json).toHaveBeenCalledWith({ message: 'Placid private token is not configured' });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(mockRecordVendorUsage).not.toHaveBeenCalled();
   });
 
   it('serves no image when the S3 upload fails', async () => {
