@@ -4445,7 +4445,22 @@ export class AgentModeService {
           // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
           // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
           // the claim's numbers against `toolCalls` instead of the text's shape.
-          if (falseClaimGuardEnabled && content) {
+          //
+          // ENG-1635/1644: skip when this turn resolves an approval-deck
+          // submission. Deck-approved writes dispatch via
+          // buildMetaWriteWorkflowSteps().execute() in the controller, BEFORE this
+          // function (and its `toolCalls` ledger) ever runs — so a turn that
+          // narrates "all 6 creatives created" off the already-verified
+          // `[Approval deck outcome: ...]` note this function was handed has a
+          // correctly non-empty claim against a `toolCalls` ledger that is
+          // legitimately empty, not a hallucination. Found live-driving: this
+          // guard fired a false "0 of 6 were actually produced" correction directly
+          // under a summary table of 6 real, verified creative IDs. The deck
+          // outcome note is itself a server-computed, per-item, already-verified
+          // record — strictly more precise than this heuristic ever is — so
+          // deferring to it here is correct, not just a suppression.
+          const turnResolvesApprovalDeck = messageContent.includes('[Approval deck outcome:');
+          if (falseClaimGuardEnabled && content && !turnResolvesApprovalDeck) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
