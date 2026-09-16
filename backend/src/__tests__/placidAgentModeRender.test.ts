@@ -284,6 +284,56 @@ describe('Placid render for agent-mode images (ENG-1957)', () => {
     expect(mockRecordVendorUsage.mock.calls[0][0].sessionId).toBeUndefined();
   });
 
+  // CodeRabbit, PR #2935. An owner-less session row would otherwise sail past the
+  // owner comparison for an admin caller and become both the S3 folder and the
+  // billing subject: `users/undefined/...`, billed to "undefined".
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['blank', '   '],
+    ['non-string', 42],
+  ])('refuses to render against a session whose owner is %s', async (_label, owner) => {
+    mockGetUser.mockResolvedValue({ userId: 'admin-1', isAdmin: true });
+    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: owner as any });
+    const r = res();
+    await generateFromTemplateToExecution(agentModeReq('admin-1'), r);
+
+    expect(r.status).toHaveBeenCalledWith(500);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+    expect(mockRecordVendorUsage).not.toHaveBeenCalled();
+    expect(mockUploadFileToS3).not.toHaveBeenCalled();
+  });
+
+  // Greptile, PR #2935. Past the render the customer has already been billed, so
+  // a lost attach must not be reported as an anonymous 500.
+  it('retries a transient attach failure rather than orphaning a billed render', async () => {
+    const transient: any = new Error('throughput exceeded');
+    transient.code = 'ProvisionedThroughputExceededException';
+    mockAddMessageToSession.mockRejectedValueOnce(transient).mockResolvedValueOnce({});
+    const r = res();
+    await generateFromTemplateToExecution(agentModeReq(), r);
+
+    expect(mockAddMessageToSession).toHaveBeenCalledTimes(2);
+    expect(r.status).toHaveBeenCalledWith(200);
+    // One render, one charge — the retry is of the write, not of Placid.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+    expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the image when it could not be attached, instead of a bare 500', async () => {
+    mockAddMessageToSession.mockRejectedValue(new Error('Session not found'));
+    const r = res();
+    await generateFromTemplateToExecution(agentModeReq(), r);
+
+    // A permanent failure is not retried — a slower failure helps nobody.
+    expect(mockAddMessageToSession).toHaveBeenCalledTimes(1);
+    expect(r.status).toHaveBeenCalledWith(500);
+    const body = r.json.mock.calls[0][0];
+    expect(body.message).toMatch(/could not be saved/i);
+    // The URL of the paid render still reaches the caller for recovery.
+    expect(body.resultFile.url).toContain('ad-placid-tpl-abcd.png');
+  });
+
   it('serves no image when the S3 upload fails', async () => {
     mockUploadFileToS3.mockResolvedValue({ success: false, error: 'denied' });
     const r = res();

@@ -14,6 +14,7 @@ import { recordVendorUsage } from '../services/usageRecorderService';
 import { canViewItem, canEditItem } from '../services/orgShareService';
 import { getPlacidPrivateToken } from '../utils/secretsManager';
 import { parseAgentModeImageIds } from '../utils/agentModeAssetIds';
+import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -1276,12 +1277,23 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       if (!session) return res.status(404).json({ message: 'Session not found' });
       const user = await userDb.getUserById(userId);
       if (!user) return res.status(401).json({ message: 'User not found' });
+      // CodeRabbit, PR #2935. getChatSession hands back whatever DynamoDB holds,
+      // and the legacy-shape migration never repairs `userId`. An owner-less row
+      // would sail past the comparison below for an admin caller and then become
+      // the billing subject and the S3 folder — `users/undefined/...` billed to
+      // "undefined". Refuse before either use; a session nobody owns is a data
+      // defect, not a render this endpoint can attribute.
+      const sessionOwnerId = typeof session.userId === 'string' ? session.userId.trim() : '';
+      if (!sessionOwnerId) {
+        console.error('[Placid] chat session has no owner; refusing to render:', agentSessionId);
+        return res.status(500).json({ message: 'Session owner is unknown' });
+      }
       // Plain equality is delegation-safe: middleware/auth.ts already resolves
       // req.user to the target user for a delegated token.
-      if (session.userId !== userId && !user.isAdmin) {
+      if (sessionOwnerId !== userId && !user.isAdmin) {
         return res.status(403).json({ message: 'Access denied' });
       }
-      renderOwnerId = session.userId;
+      renderOwnerId = sessionOwnerId;
     } else {
       const task = await taskDb.getTaskById(taskId);
       if (!task) return res.status(404).json({ message: 'Task not found' });
@@ -1434,7 +1446,7 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       // uploadImageToSession writes. addMessageToSession bumps messageCount, so
       // the next read rescans and the image appears in assetCache.
       const renderedAt = new Date().toISOString();
-      await chatbotDb.addMessageToSession(agentSessionId, {
+      const attachMessage = () => chatbotDb.addMessageToSession(agentSessionId, {
         role: 'system' as const,
         content: `Image generated from Placid template: ${filename}`,
         timestamp: renderedAt,
@@ -1456,6 +1468,26 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
           ],
         },
       });
+
+      // Greptile, PR #2935. By this point Placid has rendered and the customer
+      // has been billed, and the image is in S3 — if this last write is lost the
+      // image exists but nothing references it, so it never reaches the Images
+      // page. Retry the transient shapes, and when it still fails say so and log
+      // the URL, rather than reporting a generic 500 that buries a paid render.
+      // (A retry by the user is a genuinely new Placid render and is billed as
+      // one; that is real vendor spend, not a double count.)
+      try {
+        await retryTransientWrite(attachMessage);
+      } catch (attachErr) {
+        console.error(
+          `[Placid] billed render not attached to session ${agentSessionId}; image is orphaned at ${url}:`,
+          attachErr instanceof Error ? attachErr.message : attachErr,
+        );
+        return res.status(500).json({
+          message: 'Image was generated but could not be saved to this chat',
+          resultFile: newResultFile,
+        });
+      }
     } else {
       const current = execution?.result_files || [];
       const updated = [...current, newResultFile];
