@@ -2450,6 +2450,28 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
         return filtered[icpIndex];
       };
 
+      // The hash check above only guards the ONE persona's content — it says
+      // nothing about competitors, businessOverview, or any OTHER icp entry.
+      // Those can still change between this fresh re-read and the write
+      // below (another org member's edit, the Market Strategy route, Emma),
+      // and a blind `{ ...freshSnapshot, icp: nextIcp }` replace would
+      // silently clobber that concurrent change with the now-stale snapshot.
+      // Condition the write on marketStrategy.updatedAt still matching what
+      // we just read: if anything else wrote in between, updatedAt moved and
+      // the condition fails, so we skip this cache write rather than lose
+      // someone else's edit. Self-healing — the next click regenerates and
+      // retries against whatever is current.
+      const conditionOnUnchangedSnapshot = (snapshotUpdatedAt: string | undefined) =>
+        snapshotUpdatedAt === undefined
+          ? undefined
+          : {
+              condition: {
+                expression: '#marketStrategy.#msUpdatedAt = :expectedMsUpdatedAt',
+                names: { '#marketStrategy': 'marketStrategy', '#msUpdatedAt': 'updatedAt' },
+                values: { ':expectedMsUpdatedAt': snapshotUpdatedAt },
+              },
+            };
+
       if (user.orgId) {
         const freshOrg: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
         const freshIcp: any[] = Array.isArray(freshOrg?.marketStrategy?.icp) ? freshOrg.marketStrategy.icp : [];
@@ -2462,9 +2484,15 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
           const nextIcp = freshIcp.map((p: any) =>
             p === targetRaw ? { ...p, extractedFilters } : p,
           );
-          await orgDb.updateOrg(user.orgId, {
-            marketStrategy: { ...freshOrg.marketStrategy, icp: nextIcp },
-          } as any);
+          try {
+            await orgDb.updateOrg(
+              user.orgId,
+              { marketStrategy: { ...freshOrg.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshOrg?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
         }
       } else {
         const freshUser: any = await userDb.getUserById(userId);
@@ -2478,9 +2506,15 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
           const nextIcp = freshIcp.map((p: any) =>
             p === targetRaw ? { ...p, extractedFilters } : p,
           );
-          await userDb.updateUser(userId, {
-            marketStrategy: { ...freshUser.marketStrategy, icp: nextIcp },
-          } as any);
+          try {
+            await userDb.updateUser(
+              userId,
+              { marketStrategy: { ...freshUser.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshUser?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
         }
       }
     }

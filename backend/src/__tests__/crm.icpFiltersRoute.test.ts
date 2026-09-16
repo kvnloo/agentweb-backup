@@ -521,8 +521,13 @@ describe('GET /api/crm/icp/filters', () => {
     // ...but SHOULD be cached onto the solo user's own marketStrategy, so
     // repeat clicks don't keep re-running the LLM (ENG-1955 follow-up).
     expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-    const [userId, patch] = (userDb.updateUser as jest.Mock).mock.calls[0];
+    const [userId, patch, options] = (userDb.updateUser as jest.Mock).mock.calls[0];
     expect(userId).toBe('u1');
+    // Greptile P1: the write must be conditioned on marketStrategy.updatedAt
+    // still matching what was just read, so a concurrent edit to competitors/
+    // businessOverview/another ICP during the ~3s LLM window can't be
+    // silently clobbered by this cache-only write.
+    expect(options?.condition?.values?.[':expectedMsUpdatedAt']).toBe('2026-09-12T00:36:22.746Z');
     expect(patch.marketStrategy.icp[0].extractedFilters).toEqual({
       cacheKey: personaCacheKey({
         name: 'ICP 1 — The Margin-Squeezed DTC Founder',
@@ -718,7 +723,7 @@ describe('GET /api/crm/icp/filters', () => {
     expect(mockRes.status).toHaveBeenCalledWith(200);
 
     expect(orgDb.updateOrg).toHaveBeenCalledTimes(1);
-    const [orgId, patch] = (orgDb.updateOrg as jest.Mock).mock.calls[0];
+    const [orgId, patch, options] = (orgDb.updateOrg as jest.Mock).mock.calls[0];
     expect(orgId).toBe('org1');
     expect(patch.marketStrategy.icp[0].extractedFilters.variants).toEqual(llmVariants());
     expect(patch.marketStrategy.icp[0].extractedFilters.cacheVersion).toBe(ICP_FILTER_CACHE_VERSION);
@@ -727,6 +732,57 @@ describe('GET /api/crm/icp/filters', () => {
     // Must not touch icpUpdatedAt either — a cache write is not a real ICP
     // edit, and this field is what the staleness check now actually trusts.
     expect(patch.marketStrategy.icpUpdatedAt).toBe('2026-09-12T00:36:22.746Z');
+    // Greptile P1: guarded against clobbering a concurrent edit from another
+    // org member (or the Market Strategy route, or Emma) to competitors,
+    // businessOverview, or another ICP entry during the ~3s LLM window — the
+    // persona hash check alone doesn't cover those other fields.
+    expect(options?.condition?.values?.[':expectedMsUpdatedAt']).toBe('2026-09-12T00:36:22.746Z');
+  });
+
+  // Greptile P1 follow-up: the hash check only guards the ONE persona being
+  // cached. If a DIFFERENT field (competitors, businessOverview, another ICP
+  // entry) changed concurrently, the persona hash still matches, but writing
+  // our stale full-object snapshot would silently clobber that other change.
+  // The ConditionExpression must catch this and skip the write — the LLM
+  // result is still returned to the caller, just not persisted.
+  it('skips the org cache write (without erroring) when an UNRELATED field changed concurrently, even though the target persona did not', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' },
+    });
+    (orgDb.updateOrg as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('The conditional request failed'), {
+        code: 'ConditionalCheckFailedException',
+      }),
+    );
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    // The route must not surface the swallowed conflict as a 500 — the
+    // caller still gets their (unpersisted) LLM result.
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.variants).toEqual(llmVariants());
+  });
+
+  it('does NOT swallow a real (non-conflict) error from the org cache write', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'u1', orgId: 'org1' });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+      orgId: 'org1',
+      marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' },
+    });
+    (orgDb.updateOrg as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('boom'), { code: 'ValidationException' }),
+    );
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    // A genuine fault is a genuine fault — must surface as a 500, not be
+    // silently absorbed the way a ConditionalCheckFailedException is.
+    expect(mockRes.status).toHaveBeenCalledWith(500);
   });
 
   it('does not cache when marketStrategy came from the org OWNER fallback (write target would be a different user)', async () => {
@@ -803,6 +859,28 @@ describe('GET /api/crm/icp/filters', () => {
     // The cache must land on the REAL entry (raw index 1), not raw index 0.
     expect(patch.marketStrategy.icp[1].extractedFilters.variants).toEqual(llmVariants());
     expect(patch.marketStrategy.icp[2].extractedFilters).toBeUndefined();
+  });
+
+  // Greptile P1: the solo-user branch has the identical clobber risk as the
+  // org branch above — a concurrent edit (e.g. from another device, or a
+  // background Emma tool call) to competitors/businessOverview/another ICP
+  // during the ~3s LLM window must not be silently overwritten.
+  it('skips the solo-user cache write (without erroring) when an UNRELATED field changed concurrently', async () => {
+    (userDb.getUserById as jest.Mock)
+      .mockResolvedValueOnce({ userId: 'u1', marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' } })
+      .mockResolvedValueOnce({ userId: 'u1', marketStrategy: { icp: marketIcp(), updatedAt: '2026-09-12T00:36:22.746Z' } });
+    (userDb.updateUser as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('The conditional request failed'), {
+        code: 'ConditionalCheckFailedException',
+      }),
+    );
+
+    mockReq.query = { icpIndex: '0' };
+    await handler!(mockReq, mockRes);
+
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    const body = (mockRes.json as jest.Mock).mock.calls[0][0];
+    expect(body.variants).toEqual(llmVariants());
   });
 
   // Round-trip through the REAL mapMarketIcpToResult (not mocked in this
