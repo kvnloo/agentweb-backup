@@ -99,8 +99,11 @@ function wrapLLMService(svc: LLMService): LLMServiceInterface {
       // Shadow usage metering attribution only — no behavior change. The
       // loop's LLM calls are per onboarding step (not per user), so there is
       // no single userId to attribute; the recorder logs them under 'system'.
+      // ENG-1858: that is correct — this is platform-funded prompt optimisation,
+      // not any customer's work — so it is named as such rather than left to read
+      // as unattributed customer spend.
       const result = await svc.generateJsonRobust<unknown>(system, user, undefined, {
-        feature: 'onboarding:cron',
+        feature: 'platform:onboarding_loop',
       });
       return typeof result === 'string' ? result : JSON.stringify(result);
     },

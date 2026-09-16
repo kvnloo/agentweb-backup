@@ -11,6 +11,8 @@ import SpendLedgerBody, {
   shortDay,
   allowanceComparison,
   partialCoverageCaption,
+  enforcementCounter,
+  EnforcementState,
   SpendLedgerPayload,
   MonthlyProjection,
 } from "../SpendLedgerBody";
@@ -479,5 +481,178 @@ describe("SpendLedgerBody with LLM ledger coverage (ENG-1934)", () => {
     render(<SpendLedgerBody data={payload(coverage("full"))} />);
 
     expect(within(screen.getByTestId("spend-slice-byProvider")).getByText("By provider")).toBeInTheDocument();
+  });
+});
+
+// ── ENG-1886: the enforcer's own pause decision ─────────────────────────────
+
+describe("SpendLedgerBody enforcement state (ENG-1886)", () => {
+  const live = (over: Partial<Extract<EnforcementState, { available: true }>> = {}): EnforcementState => ({
+    available: true,
+    month: "2026-09",
+    paused: false,
+    usageMode: "full_choice",
+    gatedBy: "cost",
+    used: 187.23,
+    limit: 200,
+    percentUsed: 93.6,
+    resetsOn: "2026-10-01",
+    usagePolicyVersion: "v3",
+    ...over,
+  });
+
+  it("AC1: says plainly when the account is paused now, against which counter and threshold", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live({ paused: true, usageMode: "paused", used: 204.1, percentUsed: 102.1 }) })} />);
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Paused now by the usage cap (mode: paused)");
+    expect(card).toHaveTextContent("Enforcer's counter (LLM cost): $204.10 of $200.00 (102.1%) · resets Oct 1");
+  });
+
+  it("says when the account is not paused", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live() })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Not paused: the usage cap is admitting work");
+  });
+
+  it("an uncapped account says no cap is configured, not that a cap is admitting work (CodeRabbit, PR #2922)", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live({ gatedBy: "none", limit: null }) })} />);
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Not paused: no usage cap is configured");
+    expect(card).not.toHaveTextContent("the usage cap is admitting work");
+  });
+
+  it("AC3: distinguishes the enforcer's counter from the ledger total", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: live() })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent(
+      "This is the counter that decides admission (AW-Users), not the ledger total below. The two can differ.",
+    );
+  });
+
+  it("reads a token-gated account in tokens, and an uncapped one as having no cap", () => {
+    expect(enforcementCounter(live({ gatedBy: "tokens", used: 1_200_000, limit: 3_000_000, percentUsed: 40 }) as any)).toBe(
+      "1,200,000 tokens of 3,000,000 tokens (40.0%)",
+    );
+    expect(enforcementCounter(live({ gatedBy: "none", limit: null }) as any)).toBe("no cap configured");
+  });
+
+  it("never claims a pause for a past month", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({ billingMonth: "2026-08", enforcement: { available: false, reason: "not-current-month", currentMonth: "2026-09" } })}
+      />,
+    );
+
+    const card = screen.getByTestId("spend-ledger-enforcement");
+    expect(card).toHaveTextContent("Pause state is only known for the current month (2026-09)");
+    expect(card).not.toHaveTextContent("Paused now");
+  });
+
+  it("says it could not read the state instead of implying either answer", () => {
+    render(<SpendLedgerBody data={payload({ enforcement: { available: false, reason: "unreadable", message: "x" } })} />);
+
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Could not read whether this account is paused");
+  });
+
+  it("AC4: the shadow ledger pause is still never rendered, even when it says paused", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          enforcement: live({ paused: false }),
+          pause: {
+            paused: true,
+            reason: "Committed spend $210.00 reached the cap against a usable allowance of $200.00.",
+            settledMicroUsd: 210_000_000,
+            reservedMicroUsd: 0,
+            usableAllowanceMicroUsd: 200_000_000,
+            overspentMicroUsd: 10_000_000,
+            topProviders: [],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.queryByText(/reached the cap/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("spend-ledger-enforcement")).toHaveTextContent("Not paused");
+  });
+
+  it("renders nothing about enforcement for a backend that does not send it", () => {
+    render(<SpendLedgerBody data={payload()} />);
+
+    expect(screen.queryByTestId("spend-ledger-enforcement")).not.toBeInTheDocument();
+  });
+});
+
+// ── ENG-1841: rows the server left out are still stated ─────────────────────
+
+describe("SpendLedgerBody with server-bounded rows (ENG-1841)", () => {
+  const rows = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      key: `s${i}`,
+      settledMicroUsd: 1_000,
+      reservedMicroUsd: 0,
+      eventCount: 1,
+      percentOfSettled: 1,
+    }));
+
+  it("counts rows the server omitted in 'of N' and 'more not shown'", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          bySession: rows(100),
+          omitted: { bySession: { rows: 407, eventCount: 407, settledMicroUsd: 407_000, reservedMicroUsd: 0 } },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-slice-bySession-more")).toHaveTextContent(
+      `Showing the ${MAX_ROWS_PER_CUT} largest of 507 — ${507 - MAX_ROWS_PER_CUT} more not shown, but included in every total above.`,
+    );
+  });
+
+  it("states a remainder even when the server list alone fits on screen", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          bySession: rows(3),
+          omitted: { bySession: { rows: 2, eventCount: 2, settledMicroUsd: 2_000, reservedMicroUsd: 0 } },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-slice-bySession-more")).toHaveTextContent("Showing the 3 largest of 5 — 2 more not shown");
+  });
+
+  it("counts omitted open reservations too", () => {
+    const inFlight = Array.from({ length: 30 }, (_, i) => ({
+      eventId: `r${i}`,
+      occurredAt: "2026-09-04T10:00:00.000Z",
+      provider: "v0",
+      operation: "generate",
+      costMicroUsd: 1_000,
+      actingUserId: "member-1",
+    }));
+    render(
+      <SpendLedgerBody
+        data={payload({
+          inFlight,
+          inFlightMicroUsd: 40_000,
+          omitted: { inFlight: { rows: 10, eventCount: 10, settledMicroUsd: 0, reservedMicroUsd: 10_000 } },
+          projection: projection({ reservedMicroUsd: 40_000, reservedEventCount: 40 }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-ledger-inflight-more")).toHaveTextContent(
+      `Showing the ${MAX_ROWS_PER_CUT} most recent of 40 open reservations — ${40 - MAX_ROWS_PER_CUT} more not shown`,
+    );
+  });
+
+  it("AC4: without omitted rows the screen is exactly as before", () => {
+    render(<SpendLedgerBody data={payload({ bySession: rows(3) })} />);
+
+    expect(screen.queryByTestId("spend-slice-bySession-more")).not.toBeInTheDocument();
   });
 });
