@@ -2312,7 +2312,7 @@ export async function getExecutionsWithAssets(
   if (assetType === 'html-reports') {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
-      .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich))
+      .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
       .catch(() => {/* non-fatal */});
   }
 
@@ -2408,7 +2408,7 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
  * Uses the filename + cached searchableText as context for the LLM call.
  * Persists results back to DynamoDB (same lazy-backfill pattern as searchableText).
  */
-async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: ChatbotDB, userId: string): Promise<void> {
   const CONCURRENCY = 5;
 
   const filesToClassify: Array<{ file: any; executionId: string; sessionId?: string }> = [];
@@ -2426,9 +2426,14 @@ async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: 
 
   for (let i = 0; i < filesToClassify.length; i += CONCURRENCY) {
     const batch = filesToClassify.slice(i, i + CONCURRENCY);
-    await Promise.all(batch.map(async ({ file }) => {
+    await Promise.all(batch.map(async ({ file, sessionId }) => {
       try {
-        file.reportType = await classifyReport(file.filename || '', file.searchableText || '');
+        // ENG-1858: these are the requesting user's reports — attribute them to that user.
+        file.reportType = await classifyReport(file.filename || '', file.searchableText || '', {
+          userId,
+          sessionId,
+          feature: 'report_classification',
+        });
       } catch {
         // Non-fatal
       }

@@ -1,3 +1,4 @@
+import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -141,6 +142,7 @@ import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
+import { meterWithResolvedBilling } from './agentMode/deferredBillingMetering';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -1120,6 +1122,7 @@ export interface SupportedModelInfo {
   costScore?: number;
   costScoreSource?: string;
 }
+
 
 // Type for LLM call options
 /**
@@ -3034,7 +3037,7 @@ export class AgentModeService {
           const usage: any = (res as any)?.usage;
           if (usage) {
             const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            meterUserUsage({
+            meterWithResolvedBilling({
               userId: usageContext?.userId,
               billingUserId: usageContext?.billingUserId,
               sessionId: usageContext?.sessionId,
@@ -4666,7 +4669,13 @@ export class AgentModeService {
               .filter((m: any) => typeof m.content === 'string')
               .slice(-6);
             try {
-              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              // ENG-1858: reuse the loop's resolved billing subject.
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs, {
+                userId,
+                billingUserId,
+                sessionId,
+                feature: meteringFeature('suggested_replies', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+              });
               if (suggestions && suggestions.length > 0) {
                 // Stamp into the last assistant responseMessage's metadata so it persists
                 // in DynamoDB and survives page refresh. The message index in the persisted
@@ -4966,10 +4975,21 @@ export class AgentModeService {
             finalText: content,
             ledger: finalizeLedger,
             ports: {
+              // ENG-1858: attributed to this run's user/billing subject.
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses),
+                this.judgeFinalizeClaims(text, candidateClasses, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               requestCorrection: ({ finalText, systemNote }) =>
-                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_correction', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               toolResultError,
               mediaGenProducedAsset,
               recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
@@ -6700,6 +6720,19 @@ export class AgentModeService {
         message: `Successfully installed ${installedNames.length} skill(s).`,
         installedSkills: installedNames
       };
+
+      /*
+       * ENG-1945: the actual tool names this call just unlocked, resolved the same way
+       * `rejectedToolNames` already is below. toolDispatch's same-batch preview call
+       * (a model very commonly asks for a tool in the SAME response it installs the
+       * skill that gates it) reads this field to fold the newly-allowed names into
+       * `allowedToolNames` before the rest of that batch is gated — without it, that
+       * sibling call has no way to learn what this install just granted.
+       */
+      const installedToolNames = Array.from(
+        new Set(validSkillIds.flatMap((id) => availableById.get(id)?.toolNames || [])),
+      );
+      if (installedToolNames.length > 0) result.installedToolNames = installedToolNames;
 
       if (rejectedSkillIds.length > 0) {
         /*
@@ -8650,11 +8683,21 @@ export class AgentModeService {
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
+    agentRuntimeRunId?: string;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
+    // within — never something the model supplies or can even see elsewhere, unlike the
+    // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
+    // already-completed run — e.g. a reviewer analysing another session, ENG-939). Threading
+    // the real value through as ground truth lets a tool verify a same-turn claim against
+    // the run it is ACTUALLY in, instead of requiring the model to correctly type back an
+    // opaque id it was never given — which live testing showed it cannot do (it guessed the
+    // literal string "current-run").
+    if (input.agentRuntimeRunId) toolOptions.currentRunId = input.agentRuntimeRunId;
     // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
     // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
     // ENG-123). Scoping it here keeps every other tool's context unchanged.
@@ -9147,7 +9190,7 @@ export class AgentModeService {
    *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
    *   runs on its own dedicated vision model — independent of the chat/default model.
    */
-  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string, usageContext?: LLMUsageContext): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -9298,6 +9341,8 @@ export class AgentModeService {
       // gateway, so AgentWeb never makes a second vision completion itself.
       const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
         max_completion_tokens: 2000,
+        // ENG-1858: vision analysis is the requesting user's work, not "system".
+        usageContext: usageContext ?? { feature: 'describe_image' },
       });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
@@ -15321,7 +15366,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
       let competitorResult: any = { per_icp: [] };
       if (Array.isArray(personas) && personas.length > 0) {
-        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+        // ENG-1858: attribute and charge the regeneration to the requesting user.
+        competitorResult = await generateCompetitorStrategyForUser(
+          brand,
+          personas,
+          deps,
+          { userId, feature: 'onboarding_competitors' },
+        );
       }
 
       const icp = mapIcpResultToMarketStrategy(personas);
@@ -16538,7 +16589,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     }
   }
 
-  async generateSessionTitle(userMessage: string): Promise<string> {
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -16551,7 +16602,12 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
+      ], {
+        response_format: { type: 'json_object' },
+        taskClass: 'interactive_chat',
+        // ENG-1858: attribute to the requesting user, not "system".
+        usageContext: usageContext ?? { feature: 'session_title' },
+      });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -16592,7 +16648,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * to produce a context-aware error message instead of the generic fallback.
    * Returns null if diagnosis fails (caller should use the generic message).
    */
-  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+  async generateDiagnosticMessage(context: DiagnosisContext, usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-971: the truthfulness rules exist because this agent wrote "the system
       // timed out ... so your changes were not saved. Please try your request again"
@@ -16647,6 +16703,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 200,
         temperature: 0.3,
         taskClass: 'nonstandard_consumer',
+        // ENG-1858: the failed run's user pays for explaining its failure.
+        usageContext: usageContext ?? { feature: 'diagnostic_message' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16672,7 +16730,7 @@ TRUTHFULNESS RULES (these override tone):
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[], usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-803: the summary becomes the run's title suffix, so it must describe
       // what the run DID, not what its prose claimed. Previously this saw only the
@@ -16696,6 +16754,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 20,
         temperature: 0.3,
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_summary' },
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16732,7 +16792,7 @@ TRUTHFULNESS RULES (these override tone):
     lastRunStatus: string | null;
     lastRunSummary: string | null;
     consecutiveNoOutputRuns: number;
-  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+  }, usageContext?: LLMUsageContext): Promise<ScheduledRunPreCheckLLMResult | null> {
     try {
       const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
 
@@ -16760,6 +16820,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0,
         response_format: { type: 'json_object' },
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_precheck' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16797,7 +16859,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   async generateSuggestedReplies(
     lastAssistantMessage: string,
-    recentMessages: Array<{ role: string; content: string }>
+    recentMessages: Array<{ role: string; content: string }>,
+    usageContext?: LLMUsageContext,
   ): Promise<string[] | null> {
     const SUGGESTION_TIMEOUT_MS = 5_000;
     try {
@@ -16820,6 +16883,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0.7,
         response_format: { type: 'text' },
         taskClass: 'interactive_chat',
+        // ENG-1858: chips are part of the user's turn.
+        usageContext: usageContext ?? { feature: 'suggested_replies' },
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -16864,6 +16929,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   private async judgeFinalizeClaims(
     finalText: string,
     candidateClasses: readonly ClaimClass[],
+    usageContext?: LLMUsageContext,
   ): Promise<JudgedClaim[]> {
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
@@ -16877,7 +16943,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      max_completion_tokens: 500,
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: the guard audits the user's own reply, so the user's run pays.
+      usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16904,6 +16976,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     finalText: string,
     systemNote: string,
     llmModel: string,
+    usageContext?: LLMUsageContext,
   ): Promise<string> {
     const response = await this.callLLM(llmModel, [
       {
@@ -16913,7 +16986,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: see judgeFinalizeClaims.
+      usageContext: usageContext ?? { feature: 'finalize_guard_correction' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -17822,7 +17900,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST': {
         // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
@@ -17905,6 +17983,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           creative,
         };
       }
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+        MetaService.assertOwnedByAccount(creative?.account_id, params.creative_id, 'Ad creative', accountId);
+        const previews = await metaService.generateAdPreview(accessToken, params.creative_id, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
@@ -17918,13 +18008,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
         // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
         // from the top-level argument or from params, since callers have used both spellings.
         return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        await metaService.getAd(accessToken, ad_id!, accountId);
+        const previews = await metaService.generateAdPreview(accessToken, ad_id!, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -19229,6 +19330,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
+        await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -19243,7 +19345,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        const result = await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        if (result.success === true && result.verified === true && result.new_creative_id) {
+          await recordCreativeLearningReceipt(userId, accountId, adId, result.new_creative_id, true);
+        }
+        return result;
       }
 
       // Standard ad-level update (status, name, etc.)
@@ -20131,6 +20237,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // message whichever layer sees it first. A GET with no id must never
           // fall through to something account-wide.
           throw new Error('AD_CREATIVE GET requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.creative_id) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -20145,6 +20255,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'PREVIEW' && !ad_id) {
+          throw new Error('AD PREVIEW requires "ad_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -29090,7 +29204,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
           try {
             const visionCheck = await withTimeoutOrReject(
-              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              // ENG-1858: the check is part of this user's image generation.
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT, { userId, sessionId, feature: 'describe_image' }),
               FABRICATED_METRICS_CHECK_TIMEOUT_MS,
               'generate_image data-fabrication check'
             );
@@ -31978,6 +32093,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           response_format: { type: 'json_object' },
           max_completion_tokens: maxTokens,
           taskClass: 'content_generation',
+          // ENG-1858: the user's template work — attribute it to them, not "system".
+          usageContext: { userId, sessionId, feature: 'html_template' },
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -39387,6 +39504,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
             finalUrlSuffix: args.final_url_suffix,
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+            targetPartnerSearchNetwork: args.target_partner_search_network,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be

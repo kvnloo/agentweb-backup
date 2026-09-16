@@ -122,8 +122,13 @@ describe('enrich_leads_execute', () => {
     }));
   });
 
-  it('sends completed list enrichment runs to Fangfang for human eval', async () => {
+  // ENG-1854: routine, zero-failure completions are no longer sent for review at all — they
+  // were the dominant source of #eval-queue noise and were never a real judgment call. This
+  // replaces the old "always sends" test with the actual current behavior: only a run with a
+  // genuine failure counts as review-worthy.
+  it('sends list enrichment runs with genuine failures to Fangfang for human eval', async () => {
     (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 4, failedCount: 1 });
     const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
     await tool.execute(
       { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
@@ -135,7 +140,7 @@ describe('enrich_leads_execute', () => {
       userId: 'user1',
       sessionId: 'session-1',
       originalRequest: 'enrich_leads_execute list=list-abc fields=industry',
-      outputSummary: expect.stringContaining('processed 5 lead'),
+      outputSummary: expect.stringContaining('processed 4 lead'),
       sourceKey: 'lead-enrichment:run-1',
       action: expect.objectContaining({
         type: 'lead_enrichment_rerun',
@@ -145,6 +150,18 @@ describe('enrich_leads_execute', () => {
         toolName: 'enrich_leads_execute',
       }),
     }));
+  });
+
+  it('does NOT send a routine, zero-failure list enrichment run for human eval', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    // SUMMARY's default failedCount is 0 — the routine, no-issue case.
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).not.toHaveBeenCalled();
   });
 
   it('passes an explicit lead_ids subset through', async () => {
@@ -225,8 +242,8 @@ describe('enrich_lead_custom', () => {
     expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
   });
 
-  it('sends completed single-lead enrichment runs to Fangfang for human eval', async () => {
-    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1 });
+  it('sends a single-lead enrichment run with a genuine failure to Fangfang for human eval', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1, failedCount: 1 });
     const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
     await tool.execute(
       {
@@ -253,6 +270,21 @@ describe('enrich_lead_custom', () => {
         toolName: 'enrich_lead_custom',
       }),
     }));
+  });
+
+  it('does NOT send a routine, zero-failure single-lead enrichment run for human eval', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1 });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'company_size', instruction: 'find headcount' }],
+      },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).not.toHaveBeenCalled();
   });
 
   it('returns sanitized per-field enrichmentMetadata so the agent can cite source/confidence', async () => {

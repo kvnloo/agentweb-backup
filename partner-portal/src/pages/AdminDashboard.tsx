@@ -5112,13 +5112,13 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                   <Grid item xs={6}>
                                     <HelpCaption
                                       label="Spend ledger"
-                                      help="Every AgentWeb-paid vendor call for this billing subject this month, from the immutable spend ledger: by vendor, feature, member and session, plus open reservations and — when the account is paused — why. Read-only; nothing here changes a balance."
+                                      help="Every AgentWeb-paid call for this billing subject this month, LLM and vendor alike, from the immutable spend ledger: by provider, feature, member and session, plus open reservations and the allowance comparison with how much of the month's LLM spend it covers. It does not explain a pause (the live cap counts LLM spend only). Read-only; nothing here changes a balance."
                                     />
                                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                       <Typography variant="body2" color="text.secondary">
-                                        all vendors, this month
+                                        LLM + vendors, this month
                                       </Typography>
-                                      <Tooltip title="Open the cross-vendor spend ledger">
+                                      <Tooltip title="Open the spend ledger (LLM + vendors)">
                                         <IconButton
                                           size="small"
                                           onClick={() => openSpendLedger(user)}

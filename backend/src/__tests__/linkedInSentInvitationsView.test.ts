@@ -249,11 +249,10 @@ describe('a paginated page length is not the backlog size', () => {
 });
 
 /**
- * ENG-1718 follow-up, found in production 2026-09-14. TFA Connect's scheduled runs
- * of 09-11 and 09-13 read ~50 identical sent_at values and reported "an unexplained
- * ~50-invite burst sent within ~16 seconds" to the customer, twice. The timestamp,
- * 2026-09-05T17:17:37Z, was exactly six days before the run's own list call:
- * Unipile resolves LinkedIn's "Sent 6 days ago" label at request time.
+ * ENG-1718 follow-up, found in production: a customer's scheduled runs read ~50
+ * identical sent_at values and reported "an unexplained ~50-invite burst" to the
+ * customer, twice. The timestamp was exactly N days before the run's own list
+ * call: Unipile resolves LinkedIn's "Sent N days ago" label at request time.
  */
 describe('sent_at is labelled approximate wherever rows are returned', () => {
   // What a real page looks like: one relative label, one timestamp for all of them.

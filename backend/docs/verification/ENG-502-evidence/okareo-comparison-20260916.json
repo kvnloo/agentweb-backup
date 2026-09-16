@@ -1,0 +1,71 @@
+{
+  "baseline_run": "d3f355e1-e0ca-4f46-8e85-115b4b250f81",
+  "changed_run": "2ee4833f-2a91-4616-a76e-e8f473de8aa6",
+  "scenario_count": 4,
+  "checks_per_scenario": 3,
+  "failed_checks": 0,
+  "baseline_means": {
+    "emma-correct_tool_selection": 5.0,
+    "emma-no_hallucinated_capabilities": 1.0,
+    "emma-actionable_response": 4.939371956504909
+  },
+  "changed_means": {
+    "emma-correct_tool_selection": 4.992671942312161,
+    "emma-actionable_response": 4.588510663170025,
+    "emma-no_hallucinated_capabilities": 1.0
+  },
+  "rows": [
+    {
+      "scenario_id": "df79f2dc-0e69-4b5d-a310-a3e582ee82e8",
+      "baseline": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 5.0
+      },
+      "changed": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.0
+      }
+    },
+    {
+      "scenario_id": "eebdd896-6df3-46d3-bdd2-afece2b5c4b8",
+      "baseline": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 5.0
+      },
+      "changed": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.939913349825992
+      }
+    },
+    {
+      "scenario_id": "f4de8951-2607-4a9e-a82e-ce6667e06fd3",
+      "baseline": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.817574476193643
+      },
+      "changed": {
+        "emma-correct_tool_selection": 4.970687769248644,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.85195280196831
+      }
+    },
+    {
+      "scenario_id": "975730dc-7a98-4cfc-8691-88d48e0f5cb9",
+      "baseline": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.939913349825993
+      },
+      "changed": {
+        "emma-correct_tool_selection": 5.0,
+        "emma-no_hallucinated_capabilities": true,
+        "emma-actionable_response": 4.562176500885799
+      }
+    }
+  ]
+}
