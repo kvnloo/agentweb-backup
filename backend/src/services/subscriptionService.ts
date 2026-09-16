@@ -46,6 +46,56 @@ export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
 } as const;
 
+/**
+ * ENG-1978 — observation only, no behaviour change.
+ *
+ * Several paths through this file resolve to `["*"]`, which grants every registered tool: an
+ * unknown tier name, a malformed `subscription_types` row, an empty allowedSkills list, and any
+ * thrown error. Only the explicit `["*"]` in a tier config is deliberate.
+ *
+ * Whether those paths ever actually fire in production is unknown, because nothing has ever
+ * recorded them — the error cases log a bare `console.error` with no user and no marker, and the
+ * non-error cases log nothing at all. "We have never had a problem" is therefore not evidence:
+ * a silent over-grant looks exactly like normal operation from the outside.
+ *
+ * This records them so the question can be answered with data before anyone changes the
+ * behaviour. Deliberately NOT a fix — see the PR for the fail-closed change this is meant to
+ * de-risk, and why shipping that blind was judged too risky.
+ *
+ * Sink is injectable so this can be routed at a real alerting surface without this module
+ * reaching for one (same shape as usageWriteFailureMonitor's `setDroppedWriteAlertSink`). There
+ * is no metrics facade in this codebase; a greppable marker prefix is the house convention.
+ */
+export type WildcardGrantSink = (event: {
+  reason: string;
+  userId: string;
+  detail: Record<string, unknown>;
+}) => void;
+
+let emitWildcardGrant: WildcardGrantSink = (event) => {
+  console.warn(
+    "[entitlement] WILDCARD-GRANT granting all tools without a confirmed entitlement:",
+    JSON.stringify(event)
+  );
+};
+
+/** Route wildcard-grant observations somewhere other than the console (tests, alerting). */
+export function setWildcardGrantSink(sink: WildcardGrantSink): void {
+  emitWildcardGrant = sink;
+}
+
+function reportWildcardGrant(
+  reason: string,
+  userId: string,
+  detail: Record<string, unknown> = {}
+): void {
+  try {
+    emitWildcardGrant({ reason, userId, detail });
+  } catch {
+    // Observation must never be the reason an entitlement check fails.
+  }
+}
+
 export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
 
 const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
@@ -360,26 +410,50 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
       return getPublicAllowedSkills();
     }
 
-    const subscriptionTypeName = await getUserSubscriptionType(userId);
+    // ENG-1978 (observation only): `resolved: false` means the tier could not be confirmed —
+    // a missing user row, an unreadable org owner, or an org-lookup blip. Behaviour is unchanged;
+    // we still use the tier name exactly as before. This only records that the grant below rests
+    // on an unconfirmed tier.
+    const { subscriptionType: subscriptionTypeName, resolved } =
+      await getUserSubscriptionResolution(userId);
+    if (!resolved) {
+      reportWildcardGrant("subscription-type-unresolved", userId, {
+        assumedSubscriptionType: subscriptionTypeName,
+      });
+    }
+
     const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
 
     if (!subscriptionType) {
       // If subscription type not found, return wildcard for all
+      reportWildcardGrant("subscription-type-config-unavailable", userId, {
+        subscriptionTypeName,
+      });
       return ["*"];
     }
 
     // If all skills are allowed, return wildcard
-    if (
-      subscriptionType.allowedSkills.includes("*") ||
-      subscriptionType.allowedSkills.length === 0
-    ) {
+    if (subscriptionType.allowedSkills.includes("*")) {
+      return ["*"];
+    }
+
+    // An empty list currently means "everything", not "nothing". That is almost certainly
+    // inverted (FREE_TIER_FALLBACK is `allowedSkills: []`, commented "No premium skills on Free
+    // tier"), but no live tier is empty today, so this records the case instead of changing it.
+    if (subscriptionType.allowedSkills.length === 0) {
+      reportWildcardGrant("empty-allowed-skills-treated-as-wildcard", userId, {
+        subscriptionTypeName,
+      });
       return ["*"];
     }
 
     return subscriptionType.allowedSkills;
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error getting allowed skills:", error);
     // Default to allowing all skills on error
+    reportWildcardGrant("allowed-skills-lookup-failed", userId, {
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
@@ -413,8 +487,12 @@ export async function resolveSkillsToToolNames(skillIds: string[]): Promise<stri
     }
 
     return Array.from(toolNames);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error resolving skills to tool names:", error);
+    reportWildcardGrant("skill-to-tool-resolution-failed", "(n/a)", {
+      skillIds,
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
@@ -516,9 +594,12 @@ export async function getAllowedFunctionCalls(
   try {
     const allowedSkillIds = await getAllowedSkills(userId);
     return resolveSkillsToToolNames(allowedSkillIds);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error getting allowed function calls:", error);
     // Default to allowing all functions on error
+    reportWildcardGrant("allowed-function-calls-failed", userId, {
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
