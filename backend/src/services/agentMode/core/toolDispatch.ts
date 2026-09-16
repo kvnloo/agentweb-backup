@@ -1049,6 +1049,10 @@ export async function executePreparedTools(
           // a soft media-only budget, so it both under-budgets the work and, once it has
           // passed, would report no time left while the turn still has minutes.
           turnHardCapMs,
+          // ENG-1945 follow-up: the server's own id for the run THIS call is executing
+          // within, so a tool (report_product_issues) can verify a same-turn claim against
+          // ground truth instead of requiring the model to know/supply an opaque id.
+          agentRuntimeRunId,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
