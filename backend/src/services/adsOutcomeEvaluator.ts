@@ -43,6 +43,10 @@ export function evaluateSettledRecommendation(args: {
   if (r.status !== 'pending' || !hasLearningContext(r)) return null;
   if (!Number.isFinite(Date.parse(r.evaluationDate))) throw new Error('Invalid evaluation date');
   if (clock < Date.parse(r.evaluationDate) + getSettlingWindowDays(r.platform) * DAY) return null;
+  // The daily 09:00 UTC snapshot producer includes today-30. Wait through
+  // that final refresh opportunity (including UTC-12 reporting days), rather
+  // than permanently scoring a stale snapshot on the first 15-minute tick.
+  if (r.platform === 'meta' && clock < Date.parse(r.evaluationDate.slice(0, 10)) + 31 * DAY) return null;
   const finish = (verdict: Recommendation['verdict'], reason: string, adopted: boolean | null = null,
     actualMagnitudePct: number | null = null): Recommendation => ({ ...r, status: 'scored', scoredAt: now,
       verdict, verdictReason: reason, adopted, actualMagnitudePct,

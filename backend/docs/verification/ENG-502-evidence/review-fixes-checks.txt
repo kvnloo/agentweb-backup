@@ -1,4 +1,4 @@
-Host: Atem
+Host: test compute host
 Production typecheck: PASS (exit 0)
 cd backend && node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit -p tsconfig.build.json
 

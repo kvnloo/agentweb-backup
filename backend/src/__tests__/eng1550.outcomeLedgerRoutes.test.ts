@@ -259,7 +259,7 @@ it('records explicit owner rejection as non-adoption, never as a performance fai
   mockDb.getRecommendation.mockResolvedValue({ status: 'pending', recommendationId: 'r', context: { clientUserId: 'caller-1', campaignId: 'c' } } as any);
   const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/r/decline`);
   expect(res.status).toBe(200);
-  expect(attachExecutionReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ adopted: false, status: 'declined', clientUserId: 'caller-1' }));
+  expect(attachExecutionReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ adopted: false, status: 'declined', clientUserId: 'caller-1' }), 1500);
 });
 it('does not allow shared-account peers to decline another client recommendation', async () => {
   mockDb.getRecommendation.mockResolvedValue({ status: 'pending', context: { clientUserId: 'other' } } as any);

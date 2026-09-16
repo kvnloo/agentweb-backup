@@ -4,7 +4,7 @@ Scope: all nine changed source/test files in the independent-review correction
 Result: review_completed; 0 findings; no outstanding applicable findings
 Docs/evidence added after the review are not claimed reviewed. No latest-SHA remote review claim.
 
-{"type":"review_context","reviewType":"uncommitted","currentBranch":"feat/eng-502-self-learning","baseBranch":"origin/main","workingDirectory":"/home/harsha/agentweb-eng502"}
+{"type":"review_context","reviewType":"uncommitted","currentBranch":"feat/eng-502-self-learning","baseBranch":"origin/main","workingDirectory":"<checkout>"}
 {"type":"status","phase":"connecting","status":"connecting_to_review_service"}
 {"type":"status","phase":"setup","status":"setting_up"}
 {"type":"status","phase":"setup","status":"preparing_sandbox"}

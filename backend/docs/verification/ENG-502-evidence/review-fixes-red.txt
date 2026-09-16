@@ -1,4 +1,4 @@
-Independent-review RED evidence (excerpts; full raw logs retained on Atem at /tmp/eng502-review-fixes/)
+Independent-review RED evidence (excerpts; full raw logs retained on test compute host at <scratch-evidence>/)
 
 Original code head: 0dc8b47c828395c6805d52460b91b3227ecfe930
 

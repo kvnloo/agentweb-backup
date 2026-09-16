@@ -1,39 +1,19 @@
 # ENG-502 / ENG-1967 / ENG-1968 — shadow learning loop
 
-**DRAFT — DATA-PLANE APPROVAL REQUIRED. Do not merge or deploy this branch yet.**
+**Authorized for merge after current-head verification.** Harsha explicitly approved the
+additive data-plane contract and cautious customer/model-visible wording on 2026-09-15.
+No manual production data repair, fixture writes, migration or backfill is authorized.
 
-The capture-only boundary in the previous revision is superseded. This branch now implements
-capture → ledger → scheduled settled evaluation → scoped account-memory guidance → explicitly
-reviewed ENG-918 parameter promotion/revert. It performs no autonomous campaign writes or spend
-increases. All development writes used an in-memory DynamoDB transport; no production writes,
-manual production fixture rows, deployment, or production verification occurred.
+The branch implements capture → ledger → scheduled settled evaluation → scoped guidance →
+explicitly reviewed ENG-918 parameter promotion/revert. It performs no autonomous campaign
+writes or spend increases. The required isolated baseline/changed-build Okareo comparison,
+current-head CI, deployment observation and safe production smoke remain gates until recorded.
+The organic production full-loop outcome remains not exercised until eligible evidence exists.
 
-## Remaining external gates
-
-1. **Harsha's data-plane approval:** approve the extended ledger context (campaign measurement
-   scope and execution receipt), `inconclusive` verdict, atomic ledger/account-memory writes,
-   structured account-memory lifecycle metadata, client-filtered legacy read semantics, and
-   reviewed threshold/lifecycle transactions. No new table, key, index, retention change or
-   backfill. Existing `StatusEvaluationDateIndex` was confirmed **ACTIVE** with a read-only
-   `describe-table`; evidence is linked below. Existing ambiguous legacy records stay stored and are excluded from due selection,
-   evaluation, completion writes and client reads. No migration is performed. They have no trustworthy client ownership attribution;
-   `createdBy` identifies the administrator/execution actor, not the client.
-2. **Review new external wording:** campaign hypotheses/assumptions, scoped guidance, tool input
-   descriptions, and review/decline error text are new customer/model-visible copy.
-3. **Okareo comparison on the changed build:** no Okareo tool is bound in this session. The
-   archived local runner was found, but its prerequisite check fails:
-   ```sh
-   python3 /home/harsha/.claude/plugins/marketplaces/okareo-tools/reps/run_suite.py --help
-   # ModuleNotFoundError: No module named 'okareo'
-   ```
-   This is not a simulation pass. The documented existing production baseline target is
-   `emma-prod-anthropic.claude-opus-4-8`; the changed build has not been deployed to an isolated
-   comparison target. Do not run against production to substitute for changed-build evidence.
-   Keep the receipt-hook/tool-retrieval/memory-filter slice unmerged until the same scenarios
-   and checks are compared on baseline and the changed build. No new permanent human gate.
-4. After those gates, the ordinary current-head build/CI checks, approved deployment and real
-   end-to-end smoke must run. The parent criterion explicitly requiring **production** proof
-   remains unfulfilled; deterministic local proof is not production proof.
+The previous missing-Okareo-SDK prerequisite is resolved: the official runner help now works.
+Use the installed Okareo REPS runner (`reps/run_suite.py`) or official SDK. The staging target
+uses `NODE_ENV=development` and Dev-prefixed stores. Both baseline and changed behavior must
+run there; production is never a substitute for the unmerged changed build.
 
 ## Implemented behavior
 
@@ -60,6 +40,11 @@ budget (50 ms maximum for candidate lookup). No receipt authorizes an interventi
 owner decline records a negative receipt; absence remains **unknown**, never false.
 
 Every 15 minutes, the existing server cron registry runs one bounded GSI page (100 due records).
+The daily snapshot producer refreshes today-1 through today-30, allowing a final refresh after
+reporting-day end plus 28 elapsed days even at UTC-12. Meta evaluation waits until UTC midnight
+31 days after the final outcome date, giving that daily refresh a chance to complete before any
+terminal verdict. The per-row reporting-zone settlement check remains mandatory. A failed final
+refresh is never treated as settled evidence.
 A process-local cursor rotates pages, and the normal cron switch and shutdown registry apply.
 Replicas can race: a transaction conditionally scores the pending row and creates its deterministic
 memory projection together. The condition also compares the context, preventing a concurrent
@@ -156,7 +141,7 @@ Capture also logs omitted candidates. This is not a claim of exhaustive fleet ca
 | Shadow default and no autonomous spend/destructive writes | No campaign writer in loop; only observes existing verified execution |
 | Compatibility and honest failures | Total deadline, late rejection test, failure logs, baseline response comparison |
 | Tests for isolation/replay/noise/attribution/rollback/failure | 409 focused tests, 14 suites |
-| Production end-to-end verification | **Pending approval/deployment**; local full-loop proof passes |
+| Production end-to-end verification | **Pending deployment and organic eligible outcome**; local full-loop proof passes |
 
 Thus the engineering slices are implemented; **not every ENG-502 acceptance criterion is complete**:
 production verification and the required Okareo comparison remain external gates.
@@ -249,3 +234,18 @@ Harsha Vankayalapati (`142fef82-4d45-4070-99be-c5debe565ac6`, GitHub `harshmoney
 execution actor: Codex; run `eng502-codex-continuation-20260915`. This correction uses execution
 actor Codex / model Astra; run `eng502-astra-codex-review-fixes-20260915`. No Argusoft branches or
 rows changed.
+
+### Authorized deployment continuation (2026-09-16 UTC)
+
+Harsha approved the additive persistence contract and model-visible wording. Remote review found
+a producer/evaluator timing gap: the old 28-date ingestion window could never deliver the final
+post-settlement refresh. Reproduced with 7 failing / 62 passing tests; fixed with a 30-date refresh
+and evaluation no earlier than final date + 31 UTC days, retaining per-row timezone settlement.
+Additional UTC-12 boundary coverage proves final-refresh acceptance. The decline route now uses
+a 1.5-second interactive write budget; observers retain their bounded 100 ms budget.
+
+The separate CI repair excludes exactly the two retired Greptile names. It neither creates statuses
+nor changes active build, failure, missing-evidence, draft or base-freshness gates. Regression run:
+112 tests passed (2 new red cases reproduced before the fix). Retired success cannot count as proof.
+CodeRabbit's host-path findings were addressed by sanitizing committed evidence and replacing the
+obsolete prerequisite section. These changes add no storage schema, dependency, or parallel path.

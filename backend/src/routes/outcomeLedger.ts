@@ -121,7 +121,7 @@ router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken
     const { attachExecutionReceipt } = await import('../services/adsLearningDb');
     await attachExecutionReceipt(r, { reference: `decline:${req.user.userId}:${r.recommendationId}`, clientUserId: req.user.userId,
       platform: owned.platform, accountId: owned.accountId, campaignId: r.context.campaignId, recommendationId: r.recommendationId,
-      status: 'declined', adopted: false, executedAt: new Date().toISOString() });
+      status: 'declined', adopted: false, executedAt: new Date().toISOString() }, 1500);
     res.json({ adopted: false });
   } catch { res.status(409).json({ error: 'Recommendation could not be declined' }); }
 });

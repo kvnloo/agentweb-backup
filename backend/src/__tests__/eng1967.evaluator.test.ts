@@ -111,3 +111,19 @@ it.each(['Not/AZone', '+05:00', '', true])('rejects unsupported reporting timezo
   const outcome = rows('2026-03-16', 200).map(x => ({ ...x, reportingTimezone }));
   expect(run({ baseline: { rows: baseline }, outcome: { rows: outcome } })).toMatchObject({ verdict: 'unscoreable' });
 });
+
+// Daily ingestion needs time to perform the post-settlement refresh. A cron tick
+// at the provider boundary must not permanently score the still-mutable snapshot.
+it.each(['2026-04-26T23:59:59.999Z', '2026-04-27T09:00:00.000Z', '2026-04-28T09:00:00.000Z'])(
+  'keeps a due campaign pending while the final daily refresh is still due (%s)', clock => {
+    const stale = rows('2026-03-16', 200);
+    stale[13].capturedAt = '2026-04-26T09:00:00.000Z';
+    expect(run({ now: clock, outcome: { rows: stale, truncated: false } })).toBeNull();
+  });
+
+it('scores after the daily final refresh even at the latest reporting-day boundary', () => {
+  const baseline = rows('2026-03-01', 100).map(x => ({ ...x, reportingTimezone: 'Etc/GMT+12', capturedAt: '2026-04-28T09:00:00.000Z' }));
+  const outcome = rows('2026-03-16', 200).map(x => ({ ...x, reportingTimezone: 'Etc/GMT+12', capturedAt: '2026-04-28T09:00:00.000Z' }));
+  expect(run({ now: '2026-04-29T00:00:00.000Z', baseline: { rows: baseline }, outcome: { rows: outcome } }))
+    .toMatchObject({ verdict: 'correct', adopted: true });
+});
