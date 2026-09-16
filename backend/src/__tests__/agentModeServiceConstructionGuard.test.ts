@@ -254,6 +254,28 @@ function collectClassBindings(sourceFile: ts.SourceFile): {
       direct.add(node.left.text);
     }
 
+    // const m2 = mod  /  m2 = mod  — laundering the NAMESPACE binding itself. The
+    // previous round closed laundering of the CLASS binding and claimed "all closed";
+    // this is the half it missed, found by a review probing countConstructions directly.
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isIdentifier(unwrap(node.initializer)) &&
+      namespaces.has((unwrap(node.initializer) as ts.Identifier).text)
+    ) {
+      namespaces.add(node.name.text);
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left) &&
+      ts.isIdentifier(unwrap(node.right)) &&
+      namespaces.has((unwrap(node.right) as ts.Identifier).text)
+    ) {
+      namespaces.add(node.left.text);
+    }
+
     // const { AgentModeService: C } = mod  — destructuring off a tracked namespace
     // binding. Destructuring directly off require()/import() was already covered.
     if (
@@ -757,6 +779,27 @@ describe('AgentModeService construction guard — detection behaviour', () => {
       'void svc;',
     ].join('\n');
     expect(() => assertConstructionAllowed('services/someService.ts', src)).not.toThrow();
+  });
+
+  it('flags construction through a laundered namespace binding', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'const m2 = mod;',
+      'const a = new m2.AgentModeService();',
+      "const b = new m2['AgentModeService']();",
+      'void a; void b;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService 2 time/);
+  });
+
+  it('flags the assignment form of namespace laundering', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'let m2: any;',
+      'm2 = mod;',
+      'void new m2.AgentModeService();',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
   });
 
   it('flags a namespace-style construction', () => {

@@ -35,10 +35,12 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   })),
 }));
 
-// The registry reports one tool by default. initialize() latches on a NON-EMPTY
-// registry rather than on "runInitialize didn't throw" (it provably cannot throw),
-// so a mock that always returns [] would model a permanently-failing init, not a
-// healthy one.
+// A stub registry so the real ToolRegistry is not constructed here. It is NOT a latch
+// signal: initialize() latches on AgentModeService.toolsRegistered && emmaToolsRegistered,
+// and the registry-size conjunct that once existed was deleted for being unable to ever
+// report failure. This value now only feeds the `registrySize=` field of the degraded-init
+// diagnostic. The latch's signal is pinned in degradedInit/step1Failure, against the real
+// registerTools() path.
 let registryTools: Array<{ name: string }> = [{ name: 'some_tool' }];
 jest.mock('../mcp/client/toolRegistry', () => ({
   ToolRegistry: jest.fn().mockImplementation(() => ({
