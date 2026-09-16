@@ -172,6 +172,26 @@ describe('enqueueAutoHumanEval', () => {
 
     expect(mockReleaseSetMember).not.toHaveBeenCalled();
   });
+
+  // Round-4 review finding: the sourceKey dedupe-marker write happens AFTER createCandidate
+  // already succeeded — a failure there is housekeeping, not a real failure. It must not
+  // release an artifact claim that a real candidate already legitimately consumed (that would
+  // reopen the exact cross-path duplicate window this claim exists to close), and the
+  // already-created candidate must still be returned to the caller.
+  it('does not release the artifact claim, and still returns the candidate, when the dedupe-marker write fails after createCandidate already succeeded', async () => {
+    mockSetSetting.mockRejectedValue(new Error('DynamoDB PutItem transiently failed'));
+
+    const result = await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      userId: 'user-1',
+      artifactUrl: 'https://example.com/marker-write-fails.png',
+      outputSummary: 'Image generated.',
+      sourceKey: 'image:session-1:marker-write-fails.png',
+    });
+
+    expect(result?.candidateId).toBe('candidate-1');
+    expect(mockReleaseSetMember).not.toHaveBeenCalled();
+  });
 });
 
 describe('claimArtifactForHumanEval', () => {
