@@ -88,6 +88,18 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
     icp: shouldFillIcps ? fallbackIcps : (existing?.icp ?? []),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
+    // Tracked separately from updatedAt (ENG-1955 follow-up). When this copy
+    // fills in icp from the owner's onboarding icpResult, it's a system copy
+    // of that generation, not a fresh manual edit — backdate to the owner's
+    // own icpCompletedAt (mirrors mirrorIcpsToMarketStrategy's reasoning) so
+    // routes/crm.ts's staleness check doesn't mistake "profile copied to org"
+    // for "ICP corrected", which would permanently switch every org member
+    // off their cached, richer icpResult-derived filters for no reason. When
+    // icp isn't being (re)filled here, carry the existing value forward
+    // unchanged — this copy didn't touch icp content.
+    icpUpdatedAt: shouldFillIcps
+      ? (user.icpCompletedAt ?? now)
+      : existing?.icpUpdatedAt,
   };
 }
 
