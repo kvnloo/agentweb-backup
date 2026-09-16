@@ -1,0 +1,232 @@
+Independent-review RED evidence (excerpts; full raw logs retained on Atem at /tmp/eng502-review-fixes/)
+
+Original code head: 0dc8b47c828395c6805d52460b91b3227ecfe930
+
+
+red.txt
+
+SHA256: b20f8ef3f3ce2010ed32ec71e646ef404f7ee99c33c7ad1f77cc5a5d7b555b01
+
+  ● due selection excludes legacy pending rows and cron leaves them byte-for-byte untouched
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  -  1
+    + Received  + 21
+
+    - Array []
+
+  ● completion refuses a contextless scored legacy row before any write
+
+    expect(received).rejects.toThrow()
+
+    Received promise resolved instead of rejected
+    Resolved to value: undefined
+
+      193 |   const legacy = legacyItem(); table('AW-AdsOutcomeLedger').set(key(legacy), legacy);
+
+  ● production due adapter leaves Google rows pending (guard support is not an integration)
+
+    expect(received).toEqual(expected) // deep equality
+
+    - Expected  -  1
+    + Received  + 56
+
+    - Array []
+
+  ● campaign approval and revert are qualitative only, even with 30 supported outcomes
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  -  1
+    + Received  + 20
+
+    @@ -4,7 +4,26 @@
+
+  ● channel approval and revert are qualitative only, even with 30 supported outcomes
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  -  1
+    + Received  + 20
+
+    @@ -4,7 +4,26 @@
+
+  ● rechecks context after a stale due-index candidate before invoking the evaluator
+
+    expect(jest.fn()).not.toHaveBeenCalled()
+
+    Expected number of calls: 0
+    Received number of calls: 1
+
+    1: {"baseline": {"rows": [], "truncated": false}, "now": "2026-06-01T00:00:00.000Z", "outcome": {"rows": [], "truncated": false}, "receipt": null, "recommendation": {"accountId": "a", "actualDirection": null, "actualMagnitudePct": null, "adopted": null, "createdAt": "2026-03-15T00:00:00.000Z", "createdBy": "emma:creative-fatigue", "evaluationDate": "2026-03-28T23:59:59.999Z", "hypothesis": "Review refreshing the fatigued creative; a replacement may recover its prior-window CTR.", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 100, "predictedMetric": "ctr", "recommendationId": "fatigue_fb46945f64e873bfcb1c824837f24c592f3158ca987368730c6a8ac5d93703c0", "scoredAt": null, "status": "pending", "verdict": null, "verdictReason": null}}
+
+  ● leaves contextless legacy rows unevaluated (undefined)
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": null, "actualMagnitudePct": null, "adopted": null, "context": undefined, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "unscoreable", "verdictReason": "missing_client_attribution"}
+
+      67 | it.each([undefined, null])('leaves contextless legacy rows unevaluated (%p)', context => {
+      68 |   const r = { ...recommendation(), context }, before = structuredClone(r);
+
+  ● leaves contextless legacy rows unevaluated (null)
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": null, "actualMagnitudePct": null, "adopted": null, "context": null, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "unscoreable", "verdictReason": "missing_client_attribution"}
+
+      67 | it.each([undefined, null])('leaves contextless legacy rows unevaluated (%p)', context => {
+      68 |   const r = { ...recommendation(), context }, before = structuredClone(r);
+
+  ● does not evaluate unknown context or missing client attribution: {"version": 2}
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": "increase", "actualMagnitudePct": 100, "adopted": true, "context": {"adId": "ad", "assumptions": ["stable spend"], "campaignId": "campaign", "clientUserId": "client", "confidence": "uncalibrated", "evidence": [{"metric": "ctr_drop_pct", "reference": "snapshot", "value": 40}], "metricScope": "campaign", "mode": "shadow", "rationale": "Recovery", "reviewAfter": "2026-06-01T00:00:00.000Z", "reviewState": "unreviewed", "source": "assess_client_health", "sourceWindow": {"since": "2026-03-01", "until": "2026-03-14"}, "version": 2}, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "correct", "verdictReason": "settled_direction_comparison_not_causal_proof"}
+
+      73 |   'does not evaluate unknown context or missing client attribution: %p', patch => {
+      74 |     const r = recommendation(); Object.assign(r.context, patch);
+
+  ● does not evaluate unknown context or missing client attribution: {"source": "manual"}
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": "increase", "actualMagnitudePct": 100, "adopted": true, "context": {"adId": "ad", "assumptions": ["stable spend"], "campaignId": "campaign", "clientUserId": "client", "confidence": "uncalibrated", "evidence": [{"metric": "ctr_drop_pct", "reference": "snapshot", "value": 40}], "metricScope": "campaign", "mode": "shadow", "rationale": "Recovery", "reviewAfter": "2026-06-01T00:00:00.000Z", "reviewState": "unreviewed", "source": "manual", "sourceWindow": {"since": "2026-03-01", "until": "2026-03-14"}, "version": 1}, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "correct", "verdictReason": "settled_direction_comparison_not_causal_proof"}
+
+      73 |   'does not evaluate unknown context or missing client attribution: %p', patch => {
+      74 |     const r = recommendation(); Object.assign(r.context, patch);
+
+  ● does not evaluate unknown context or missing client attribution: {"clientUserId": ""}
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": null, "actualMagnitudePct": null, "adopted": null, "context": {"adId": "ad", "assumptions": ["stable spend"], "campaignId": "campaign", "clientUserId": "", "confidence": "uncalibrated", "evidence": [{"metric": "ctr_drop_pct", "reference": "snapshot", "value": 40}], "metricScope": "campaign", "mode": "shadow", "rationale": "Recovery", "reviewAfter": "2026-06-01T00:00:00.000Z", "reviewState": "unreviewed", "source": "assess_client_health", "sourceWindow": {"since": "2026-03-01", "until": "2026-03-14"}, "version": 1}, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "unscoreable", "verdictReason": "missing_or_mismatched_execution_receipt"}
+
+      73 |   'does not evaluate unknown context or missing client attribution: %p', patch => {
+      74 |     const r = recommendation(); Object.assign(r.context, patch);
+
+  ● does not evaluate unknown context or missing client attribution: {"clientUserId": null}
+
+    expect(received).toBeNull()
+
+    Received: {"accountId": "a", "actualDirection": null, "actualMagnitudePct": null, "adopted": null, "context": {"adId": "ad", "assumptions": ["stable spend"], "campaignId": "campaign", "clientUserId": null, "confidence": "uncalibrated", "evidence": [{"metric": "ctr_drop_pct", "reference": "snapshot", "value": 40}], "metricScope": "campaign", "mode": "shadow", "rationale": "Recovery", "reviewAfter": "2026-06-01T00:00:00.000Z", "reviewState": "unreviewed", "source": "assess_client_health", "sourceWindow": {"since": "2026-03-01", "until": "2026-03-14"}, "version": 1}, "createdAt": "2026-03-01T00:00:00.000Z", "createdBy": "emma", "evaluationDate": "2026-03-29T23:59:59.999Z", "hypothesis": "Recovery", "platform": "meta", "predictedDirection": "increase", "predictedMagnitudePct": 20, "predictedMetric": "ctr", "recommendationId": "r", "scoredAt": "2026-06-01T00:00:00.000Z", "status": "scored", "verdict": "unscoreable", "verdictReason": "missing_or_mismatched_execution_receipt"}
+
+      73 |   'does not evaluate unknown context or missing client attribution: %p', patch => {
+      74 |     const r = recommendation(); Object.assign(r.context, patch);
+
+  ● requires the final reporting day to end in Pacific/Kiritimati before settlement
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● requires the final reporting day to end in America/Los_Angeles before settlement
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● requires the final reporting day to end in America/New_York before settlement
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● uses the DST-adjusted end of reporting day 2026-03-08
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● uses the DST-adjusted end of reporting day 2026-11-01
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● rejects unsupported reporting timezone "Not/AZone"
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● rejects unsupported reporting timezone "+05:00"
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 1
+    + Received  + 1
+
+      Object {
+
+  ● keeps incorrect outcomes out of guidance projection
+
+    expect(received).toBeNull()
+
+    Received: {"category": "insight", "content": "This observation does not support parameter promotion. Review the linked outcome and its measurement limitations before reusing the recommendation.", "createdAt": "2026-06-01T00:00:00.000Z", "learning": {"accountId": "a", "campaignId": "c", "confidence": "unsupported", "createdAt": "2026-06-01T00:00:00.000Z", "expiresAt": "2026-08-30T00:00:00.000Z", "history": [{"at": "2026-06-01T00:00:00.000Z", "state": "proposed"}], "platform": "meta", "references": ["meta#a/r", "exec"], "reviewState": "proposed", "scope": "campaign", "updatedAt": "2026-06-01T00:00:00.000Z"}, "memoryId": "ads-learning#18f7629518ee6c797e6d0a36fb745a6687dd0125e2579304808db4932d09e3db", "updatedAt": "2026-06-01T00:00:00.000Z", "userId": "u"}
+
+      51 |
+      52 | it.each(['incorrect', 'inconclusive', 'unscoreable'])('keeps %s outcomes out of guidance projection', verdict => {
+
+  ● keeps inconclusive outcomes out of guidance projection
+
+    expect(received).toBeNull()
+
+    Received: {"category": "insight", "content": "This observation does not support parameter promotion. Review the linked outcome and its measurement limitations before reusing the recommendation.", "createdAt": "2026-06-01T00:00:00.000Z", "learning": {"accountId": "a", "campaignId": "c", "confidence": "unsupported", "createdAt": "2026-06-01T00:00:00.000Z", "expiresAt": "2026-08-30T00:00:00.000Z", "history": [{"at": "2026-06-01T00:00:00.000Z", "state": "proposed"}], "platform": "meta", "references": ["meta#a/r", "exec"], "reviewState": "proposed", "scope": "campaign", "updatedAt": "2026-06-01T00:00:00.000Z"}, "memoryId": "ads-learning#18f7629518ee6c797e6d0a36fb745a6687dd0125e2579304808db4932d09e3db", "updatedAt": "2026-06-01T00:00:00.000Z", "userId": "u"}
+
+      51 |
+      52 | it.each(['incorrect', 'inconclusive', 'unscoreable'])('keeps %s outcomes out of guidance projection', verdict => {
+
+  ● excludes previously stored unsupported guidance on retrieval
+
+    expect(received).toHaveLength(expected)
+
+    Expected length: 1
+    Received length: 2
+    Received array:  [{"category": "insight", "content": "Shadow learning is advisory. Explicit user parameters take precedence. Never increase spend or execute a campaign change from learned guidance alone.", "createdAt": "2026-09-15T00:00:00.000Z", "learning": {"accountId": "a", "confidence": "unsupported", "createdAt": "2026-09-15T00:00:00.000Z", "expiresAt": "9999-01-01T00:00:00.000Z", "history": [], "platform": "meta", "references": ["ENG-502", "ENG-918"], "reviewState": "approved", "scope": "global", "updatedAt": "2026-09-15T00:00:00.000Z"}, "memoryId": "ads-policy-v1", "updatedAt": "2026-09-15T00:00:00.000Z", "userId": "u"}, {"category": "insight", "content": "The settled campaign comparison supported the predicted direction. This is observational evidence, not proof of causality; review the linked outcome before reuse.", "createdAt": "2026-06-01T00:00:00.000Z", "learning": {"accountId": "a", "campaignId": "c", "confidence": "unsupported", "createdAt": "2026-06-01T00:00:00.000Z", "expiresAt": "2026-08-30T00:00:00.000Z", "history": [{"at": "2026-06-01T00:00:00.000Z", "state": "proposed"}], "platform": "meta", "references": ["meta#a/r", "exec"], "reviewState": "proposed", "scope": "campaign", "updatedAt": "2026-06-01T00:00:00.000Z"}, "memoryId": "ads-learning#18f7629518ee6c797e6d0a36fb745a6687dd0125e2579304808db4932d09e3db", "updatedAt": "2026-06-01T00:00:00.000Z", "userId": "u"}]
+
+
+
+Test Suites: 3 failed, 3 total
+Tests:       22 failed, 40 passed, 62 total
+Snapshots:   0 total
+Time:        1.078 s
+
+
+scope-boundary-red.txt
+
+SHA256: b1620737890da719619b257024b1abdb7c4415f65b020b138143fdfceb127bd3
+
+  ● transaction boundary refuses a parameter paired with campaign-scoped approval
+
+    expect(received).rejects.toThrow()
+
+    Received promise resolved instead of rejected
+    Resolved to value: undefined
+
+      243 | it('transaction boundary refuses a parameter paired with campaign-scoped approval', async () => {
+
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 20 passed, 21 total
+Snapshots:   0 total
+Time:        2.093 s

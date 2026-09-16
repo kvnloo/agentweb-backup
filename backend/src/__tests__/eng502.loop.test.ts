@@ -25,6 +25,7 @@ const mockClient = {
   transactWrite: (p: any) => ({ promise: async () => {
     for (const { Put, Update } of p.TransactItems) {
       const x = Put ?? Update, old = table(x.TableName).get(key(x.Item ?? x.Key));
+      if (Put?.ExpressionAttributeValues?.[':context'] && JSON.stringify(old?.context) !== JSON.stringify(Put.ExpressionAttributeValues[':context'])) throw Object.assign(conflict(), { code: 'TransactionCanceledException' });
       if (Update ? old?.status !== 'pending' : Put.ConditionExpression.includes(':pending') ? old?.status !== 'pending' : Put.ConditionExpression.includes(':expected') ? old?.updatedAt !== Put.ExpressionAttributeValues[':expected'] : !!old) throw Object.assign(conflict(), { code: 'TransactionCanceledException' });
     }
     for (const { Put, Update } of p.TransactItems) {
@@ -37,7 +38,7 @@ const mockClient = {
 jest.mock('aws-sdk', () => ({ __esModule: true, default: { DynamoDB: { DocumentClient: jest.fn(() => mockClient) } } }));
 import { captureFatigueRecommendations } from '../services/adsRecommendationCapture';
 import { runAdsLearningEvaluation } from '../cron/adsLearningCron';
-import { getScopedLearning } from '../services/adsLearningDb';
+import { getDueRecommendations, completeEvaluation, commitLearningReview, getScopedLearning } from '../services/adsLearningDb';
 const input = { clientUserId: 'u', accountId: 'a', campaignIds: ['c'], now: '2026-03-15T00:00:00.000Z',
   fatigued: [{ id: 'ad', reasons: ['ctr_drop'] }], ads: [{ id: 'ad', campaign_id: 'c',
     current_insights: { data: [{ date_start: '2026-03-01', date_stop: '2026-03-14', ctr: 1 }] },
@@ -77,7 +78,7 @@ async function metrics(since: string, clicks: number, settled = true, campaignId
     const date = new Date(Date.parse(since) + i * 86400000).toISOString().slice(0, 10);
     await adsMetricsDb.putSnapshot({ entityKey: `meta#a#${campaignId}`, platform: 'meta', accountId: 'a', campaignId, userId: 'u',
       date, rowType: 'campaign', currency: 'USD', reportingTimezone: 'UTC', dataQuality: 'exact',
-      impressions: 10000, clicks, spend: 100, capturedAt: settled ? new Date(Date.parse(date) + 28 * 86400000).toISOString() : input.now,
+      impressions: 10000, clicks, spend: 100, capturedAt: settled ? new Date(Date.parse(date) + 29 * 86400000).toISOString() : input.now,
       parentAccountId: null, campaignName: 'C', platformMetrics: {}, snapshotSource: 'daily' });
   }
 }
@@ -130,21 +131,21 @@ const scope = { userId: 'u', accountId: 'a', platform: 'meta', campaignId: 'c-0'
 it('supported shadow learning requires review, then updates ENG-918 once with capped movement and provenance', async () => {
   const lesson = await supportedFleet();
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
-  expect(await reviewLearning({ ...scope, campaignId: undefined }, lesson.memoryId, 'approve')).toMatchObject({ applied: true });
+  expect(await reviewLearning({ ...scope, campaignId: undefined }, lesson.memoryId, 'approve', 'client')).toMatchObject({ applied: true });
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toMatchObject({ currentValue: 25, source: 'learned',
     revisions: [expect.objectContaining({ sampleSize: 30, changedBy: 'u', evidence: expect.stringContaining(lesson.memoryId) })] });
 });
 it('approval replay cannot walk the movement cap', async () => {
   const lesson = await supportedFleet();
   const s = { ...scope, campaignId: lesson.learning.campaignId };
-  await reviewLearning(s, lesson.memoryId, 'approve');
-  await reviewLearning(s, lesson.memoryId, 'approve');
+  await reviewLearning(s, lesson.memoryId, 'approve', 'client');
+  await reviewLearning(s, lesson.memoryId, 'approve', 'client');
   expect((await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct'))?.revisions).toHaveLength(1);
 });
 it('rollback restores registry default with audit history and cooldown', async () => {
   const lesson = await supportedFleet();
   const s = { ...scope, campaignId: lesson.learning.campaignId };
-  await reviewLearning(s, lesson.memoryId, 'approve');
+  await reviewLearning(s, lesson.memoryId, 'approve', 'client');
   await reviewLearning({ ...s, now: '2026-05-03T00:00:00.000Z' }, lesson.memoryId, 'revert');
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toMatchObject({ currentValue: 20, source: 'default',
     learnedCooldownUntil: expect.any(String), revisions: [expect.any(Object), expect.any(Object)] });
@@ -164,7 +165,7 @@ it('refuses a shared-account parameter promotion despite sufficient evidence', a
   const lesson = await supportedFleet();
   const { userDb } = await import('../services/db');
   (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([{ userId: 'u', adAccount: 'a' }, { userId: 'peer', adAccount: 'a' }]);
-  expect(await reviewLearning({ ...scope, campaignId: lesson.learning.campaignId }, lesson.memoryId, 'approve'))
+  expect(await reviewLearning({ ...scope, campaignId: lesson.learning.campaignId }, lesson.memoryId, 'approve', 'client'))
     .toMatchObject({ applied: false, reason: 'ambiguous_account_ownership' });
   expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
 });
@@ -172,4 +173,78 @@ it('refuses campaign capture from snapshots dated after the assessment', async (
   await metrics('2026-02-15', 200); await metrics('2026-03-01', 100);
   await captureFatigueRecommendations(input);
   expect([...table('AW-AdsOutcomeLedger').values()].filter(r => r.context.metricScope === 'campaign')).toHaveLength(0);
+});
+
+import { createRecommendation } from '../services/outcomeLedger';
+function legacyItem() {
+  const { platform, accountId, ...r } = createRecommendation({ platform: 'meta', accountId: 'a', recommendationId: 'legacy',
+    createdBy: 'manual', hypothesis: 'Legacy', predictedMetric: 'ctr', predictedDirection: 'increase',
+    predictedMagnitudePct: 20, createdAt: '2026-03-01', evaluationDate: '2026-03-29' });
+  return { ...r, entityKey: 'meta#a' };
+}
+it('due selection excludes legacy pending rows and cron leaves them byte-for-byte untouched', async () => {
+  const legacy = legacyItem(); table('AW-AdsOutcomeLedger').set(key(legacy), legacy);
+  expect((await getDueRecommendations(new Date('2026-06-01'))).rows).toEqual([]);
+  await runAdsLearningEvaluation(new Date('2026-06-01'));
+  expect(table('AW-AdsOutcomeLedger').get(key(legacy))).toEqual(legacyItem());
+  expect(table('AW-AccountMemory').size).toBe(0);
+});
+it('completion refuses a contextless scored legacy row before any write', async () => {
+  const legacy = legacyItem(); table('AW-AdsOutcomeLedger').set(key(legacy), legacy);
+  const { entityKey, ...fields } = legacy;
+  await expect(completeEvaluation({ ...fields, platform: 'meta', accountId: 'a', status: 'scored', scoredAt: '2026-06-01',
+    verdict: 'unscoreable', verdictReason: 'missing_client_attribution' })).rejects.toThrow(/context|ENG-502/i);
+  expect(table('AW-AdsOutcomeLedger').get(key(legacy))).toEqual(legacyItem());
+});
+it('production due adapter leaves Google rows pending (guard support is not an integration)', async () => {
+  await captureFatigueRecommendations(input);
+  const r = [...table('AW-AdsOutcomeLedger').values()][0];
+  table('AW-AdsOutcomeLedger').clear(); r.entityKey = 'google_ads#a';
+  table('AW-AdsOutcomeLedger').set(key(r), r);
+  expect((await getDueRecommendations(new Date('2026-09-01'))).rows).toEqual([]);
+  await runAdsLearningEvaluation(new Date('2026-09-01'));
+  expect(table('AW-AdsOutcomeLedger').get(key(r)).status).toBe('pending');
+});
+it.each(['campaign', 'channel'] as const)('%s approval and revert are qualitative only, even with 30 supported outcomes', async target => {
+  const lesson = await supportedFleet(), s = { ...scope, campaignId: lesson.learning.campaignId };
+  const result = await reviewLearning(s, lesson.memoryId, 'approve', target);
+  expect(result).toMatchObject({ applied: true, parameter: null, lesson: { learning: { scope: target, reviewState: 'approved' } } });
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+  expect(await reviewLearning({ ...s, now: '2026-05-03' }, lesson.memoryId, 'revert')).toMatchObject({
+    applied: true, parameter: null, lesson: { learning: { reviewState: 'reverted' } } });
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+});
+it('rechecks context after a stale due-index candidate before invoking the evaluator', async () => {
+  await captureFatigueRecommendations(input);
+  const fresh = jest.spyOn(mockClient, 'get').mockImplementationOnce((p: any) => ({ promise: async () => {
+    const r = structuredClone(table(p.TableName).get(key(p.Key))); delete r.context; return { Item: r };
+  } }));
+  const evaluator = jest.spyOn(require('../services/adsOutcomeEvaluator'), 'evaluateSettledRecommendation');
+  await runAdsLearningEvaluation(new Date('2026-06-01'));
+  expect(evaluator).not.toHaveBeenCalled();
+  expect([...table('AW-AdsOutcomeLedger').values()][0].status).toBe('pending');
+  fresh.mockRestore(); evaluator.mockRestore();
+});
+it('atomic completion cannot overwrite a row whose ENG-502 context was removed', async () => {
+  await captureFatigueRecommendations(input);
+  const r = (await getDueRecommendations(new Date('2026-06-01'))).rows[0];
+  const stored = [...table('AW-AdsOutcomeLedger').values()][0]; delete stored.context;
+  await expect(completeEvaluation({ ...r, status: 'scored', scoredAt: '2026-06-01', verdict: 'unscoreable' }))
+    .rejects.toThrow();
+  expect(stored.status).toBe('pending');
+});
+
+it('default review scope approves guidance without changing an account parameter', async () => {
+  const lesson = await supportedFleet();
+  expect(await reviewLearning({ ...scope, campaignId: lesson.learning.campaignId }, lesson.memoryId, 'approve'))
+    .toMatchObject({ applied: true, parameter: null, lesson: { learning: { scope: 'campaign' } } });
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
+});
+it('transaction boundary refuses a parameter paired with campaign-scoped approval', async () => {
+  const lesson = await supportedFleet();
+  await expect(commitLearningReview({ ...lesson, updatedAt: scope.now,
+    learning: { ...lesson.learning, reviewState: 'approved' } }, lesson,
+    { accountId: 'a', platform: 'meta', paramKey: 'creativeFatigue.ctrDropCriticalPct', currentValue: 25 } as any, null))
+    .rejects.toThrow(/scope/i);
+  expect(await getThreshold('meta', 'a', 'creativeFatigue.ctrDropCriticalPct')).toBeNull();
 });

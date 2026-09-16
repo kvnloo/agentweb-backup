@@ -1,7 +1,7 @@
 /** Existing ledger + account-memory tables; no new table/index. All writes are conditional. */
 import AWS from 'aws-sdk';
 import { OUTCOME_LEDGER_TABLE, itemToRecommendation, ledgerRequest, getRecommendation } from './outcomeLedgerDb';
-import { buildOutcomeEntityKey, validateRecommendationContext, type Recommendation } from './outcomeLedger';
+import { buildOutcomeEntityKey, hasLearningContext, validateRecommendationContext, type Recommendation } from './outcomeLedger';
 import { buildOutcomeLesson, resolveScopedLessons, LEARNING_PREFIX, type LearningScope, type ScopedLesson } from './adsScopedLearning';
 import type { ExecutionReceipt } from './adsOutcomeEvaluator';
 const db = new AWS.DynamoDB.DocumentClient();
@@ -14,7 +14,7 @@ export async function getDueRecommendations(now: Date, cursor?: AWS.DynamoDB.Doc
   if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed due page');
   const rows: Recommendation[] = [];
   for (const item of result.Items ?? []) {
-    try { const r = itemToRecommendation(item); if (r) rows.push(r); }
+    try { const r = itemToRecommendation(item); if (r && r.platform === 'meta' && hasLearningContext(r)) rows.push(r); }
     catch { console.error('[AdsLearning] corrupt due record', { recommendationId: item?.recommendationId }); }
   }
   return { rows, cursor: result.LastEvaluatedKey };
@@ -30,14 +30,14 @@ export async function getScopedLearning(scope: LearningScope): Promise<ScopedLes
 /** Atomic score + qualitative projection. A crash can never strand the score without its lesson. */
 export async function completeEvaluation(r: Recommendation): Promise<void> {
   if (r.status !== 'scored' || !r.scoredAt) throw new Error('Expected scored outcome');
-  if (r.context) validateRecommendationContext(r.context);
+  if (r.platform !== 'meta' || !hasLearningContext(r)) throw new Error('Expected Meta ENG-502 context');
   const lesson = buildOutcomeLesson(r);
   const { platform, accountId, ...fields } = r;
   const item = { ...fields, entityKey: buildOutcomeEntityKey(platform, accountId) };
   try {
     await ledgerRequest(db.transactWrite({ TransactItems: [
-      { Put: { TableName: OUTCOME_LEDGER_TABLE, Item: item, ConditionExpression: r.context ? '#status = :pending AND #context = :context' : '#status = :pending AND attribute_not_exists(#context)',
-        ExpressionAttributeNames: { '#status': 'status', '#context': 'context' }, ExpressionAttributeValues: { ':pending': 'pending', ...(r.context ? { ':context': r.context } : {}) } } },
+      { Put: { TableName: OUTCOME_LEDGER_TABLE, Item: item, ConditionExpression: '#status = :pending AND #context = :context',
+        ExpressionAttributeNames: { '#status': 'status', '#context': 'context' }, ExpressionAttributeValues: { ':pending': 'pending', ':context': r.context } } },
       ...(lesson ? [{ Put: { TableName: MEMORY_TABLE, Item: lesson, ConditionExpression: 'attribute_not_exists(memoryId)' } }] : []),
     ] }), 5000);
   } catch (error: any) {
@@ -84,13 +84,14 @@ export async function getLearningItem(userId: string, memoryId: string): Promise
   return (result.Item as ScopedLesson) ?? null;
 }
 export async function commitLearningReview(lesson: ScopedLesson, previous: ScopedLesson,
-  parameter: import('./adsThresholds').AdsThreshold, expectedParameterTime: string | null): Promise<void> {
+  parameter: import('./adsThresholds').AdsThreshold | null, expectedParameterTime: string | null): Promise<void> {
+  if (parameter && lesson.learning.scope !== 'client') throw new Error('Account parameter requires explicit client scope');
   const { ADS_THRESHOLDS_TABLE } = await import('./adsThresholdsDb');
-  const { accountId, platform, ...fields } = parameter;
+  const { accountId, platform, ...fields } = parameter ?? {};
   await ledgerRequest(db.transactWrite({ TransactItems: [
-    { Put: { TableName: ADS_THRESHOLDS_TABLE, Item: { ...fields, entityKey: `${platform}#${accountId}` },
+    ...(parameter ? [{ Put: { TableName: ADS_THRESHOLDS_TABLE, Item: { ...fields, entityKey: `${platform}#${accountId}` },
       ConditionExpression: expectedParameterTime ? '#updatedAt = :expected' : 'attribute_not_exists(entityKey)',
-      ...(expectedParameterTime ? { ExpressionAttributeNames: { '#updatedAt': 'updatedAt' }, ExpressionAttributeValues: { ':expected': expectedParameterTime } } : {}) } },
+      ...(expectedParameterTime ? { ExpressionAttributeNames: { '#updatedAt': 'updatedAt' }, ExpressionAttributeValues: { ':expected': expectedParameterTime } } : {}) } }] : []),
     { Put: { TableName: MEMORY_TABLE, Item: lesson, ConditionExpression: '#updatedAt = :expected AND #learning.#state = :state',
       ExpressionAttributeNames: { '#updatedAt': 'updatedAt', '#learning': 'learning', '#state': 'reviewState' },
       ExpressionAttributeValues: { ':expected': previous.updatedAt, ':state': previous.learning.reviewState } } },

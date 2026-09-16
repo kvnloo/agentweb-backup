@@ -15,8 +15,8 @@ manual production fixture rows, deployment, or production verification occurred.
    structured account-memory lifecycle metadata, client-filtered legacy read semantics, and
    reviewed threshold/lifecycle transactions. No new table, key, index, retention change or
    backfill. Existing `StatusEvaluationDateIndex` was confirmed **ACTIVE** with a read-only
-   `describe-table`; evidence is linked below. Existing ambiguous legacy records stay stored but
-   are hidden from client reads. They have no trustworthy client ownership attribution;
+   `describe-table`; evidence is linked below. Existing ambiguous legacy records stay stored and are excluded from due selection,
+   evaluation, completion writes and client reads. No migration is performed. They have no trustworthy client ownership attribution;
    `createdBy` identifies the administrator/execution actor, not the client.
 2. **Review new external wording:** campaign hypotheses/assumptions, scoped guidance, tool input
    descriptions, and review/decline error text are new customer/model-visible copy.
@@ -66,20 +66,30 @@ memory projection together. The condition also compares the context, preventing 
 receipt from being overwritten. Failure leaves the row pending; malformed rows and failures emit
 observable errors. No duplicate lesson or second verdict on replay.
 
-Meta uses 28 days; Google uses 90. Only campaign CTR is currently supported for scoring; the
-production capture/verified-execution adapter is Meta. Ad-level outcomes are honestly unscoreable.
+Production capture, verified execution, due selection, cron and completion are **Meta-only**.
+The pure evaluator retains the existing Google 90-day guard, tested only for deferring early
+attempts; this is **not a settled Google evaluation integration**. No Google capture or receipt
+is invented. Meta campaign CTR uses 28 elapsed days after the **end of each reporting calendar
+day in that snapshot's IANA timezone**. Positive/negative offsets and both DST transitions are
+tested at one millisecond before and exactly at settlement. Invalid/unsupported zones and dates
+fail closed. Ad-level outcomes with recognized context are honestly unscoreable.
 Supported comparisons require complete daily baseline/outcome windows, matching tenant/account/
 campaign/platform/currency/timezone, exact data, final-window refresh timestamps, a verified receipt
 outside both measurement windows, at least 1,000 impressions and 30 clicks per window, and spend
 movement within 20%. Noise is the maximum of binomial uncertainty, that campaign's observed daily
 variation, and a 1% relative floor. Direction outside that band is correct/incorrect; small samples,
-noise and spend confounding are inconclusive. Missing attribution/data is unscoreable. These are
+noise and spend confounding are inconclusive. Missing data/receipts on recognized ENG-502 rows
+is unscoreable. Missing/null context, missing client attribution, and unrecognized context source
+or version are excluded without any verdict or write. The transaction requires the pending row's
+full recognized context to match, including any receipt; legacy/manual rows require an explicit
+migration before joining this loop. These are
 **observational direction comparisons, not causal treatment-effect claims**.
 
 ### Learning, precedence and reversal
 
-Only scoreable campaign outcomes create qualitative lessons in existing `AW-AccountMemory`.
-Unscoreable/ad-only outcomes remain in the ledger. Lessons carry outcome/receipt references,
+Only **correct, adopted campaign outcomes** create qualitative lessons in existing
+`AW-AccountMemory`. Incorrect, inconclusive, unscoreable and ad-only outcomes remain in the ledger
+without guidance. Previously stored `unsupported` lessons are excluded from retrieval. Lessons carry outcome/receipt references,
 confidence, creation/update/expiry timestamps, review state and bounded reversible history.
 Numeric predictions/scores remain in `AW-AdsOutcomeLedger`; parameter history remains in ENG-918.
 
@@ -98,7 +108,11 @@ intersecting observation windows excluded. The median observed CTR drop proposes
 per-cycle movement cap, explicit-user precedence and revert cooldown. New promotions require new
 outcomes after the preceding parameter revision; another lesson cannot replay the same batch to
 walk the cap. Shared accounts fail closed for client-derived parameter promotion because ENG-918
-is account-keyed. Reviewed guidance can be scoped to the client, campaign, or channel.
+is account-keyed. **Only explicit `scope: "client"` review can promote an account-wide parameter.**
+Campaign/channel review (including the default campaign scope) approves qualitative guidance only,
+returns `parameter: null`, and performs no threshold read/write. Its revert changes only guidance.
+The transaction boundary rejects a non-null parameter paired with campaign/channel scope.
+No persistence key/schema is added to represent narrower numeric scope.
 
 Threshold and lesson review writes are atomic and compare the prior revisions. Revert uses the
 existing ENG-918 default/cooldown/history behavior, and refuses to undo an intervening parameter
@@ -119,7 +133,10 @@ Capture also logs omitted candidates. This is not a claim of exhaustive fleet ca
   and returns `learningUnavailable: true`.
 - `GET /api/outcome-ledger/:platform/:accountId/learning?campaignId=...`: scoped guidance.
 - `POST /api/outcome-ledger/:platform/:accountId/learning/:memoryId/approve` with optional
-  `{campaignId, scope: "client" | "campaign" | "channel"}`: explicit reviewed promotion.
+  `{campaignId, scope: "client" | "campaign" | "channel"}`: campaign (default) and channel approve
+  qualitative guidance only (`parameter: null`); explicit client scope may promote the account-wide
+  threshold after all evidence/ownership checks. `applied: true` means the returned lesson revision
+  was saved; a non-null `parameter` identifies an actual account-wide threshold change.
 - Same path ending `/revert`: conditional rollback, retaining evidence/history.
 - `POST /api/outcome-ledger/:platform/:accountId/:recommendationId/decline`: explicit non-adoption.
 - Existing manual score route still refuses captured/contextual records.
@@ -131,14 +148,14 @@ Capture also logs omitted candidates. This is not a claim of exhaustive fleet ca
 | Real recommendation-producing capture with scope/evidence/actor | Health assessment, ad and supported campaign companions |
 | Idempotent recording | Stable scoped identity + conditional create |
 | Scheduled adopted/correct/incorrect/inconclusive/unscoreable evaluation | GSI cron, receipt-only adoption, pure evaluator, atomic completion |
-| Platform settlement and campaign-specific noise/sample gates | Meta/Google windows; complete-window, sample, spend and uncertainty tests |
+| Platform settlement and campaign-specific noise/sample gates | Meta reporting-day settlement; Google early guard only; complete-window, sample, spend and uncertainty tests |
 | Supported ENG-918 learning, caps, provenance, rollback | 30 independent outcomes; explicit review; atomic promotion/revert; expiry |
 | Deterministic global/client/campaign/channel retrieval; tenant isolation | Existing tool + authenticated API; shared-account and foreign-row regressions |
 | Qualitative memory versus numeric ledger separation | Existing account-memory table projection; generic injection exclusion |
 | Learned lifecycle | References/confidence/timestamps/90-day expiry/review/history |
 | Shadow default and no autonomous spend/destructive writes | No campaign writer in loop; only observes existing verified execution |
 | Compatibility and honest failures | Total deadline, late rejection test, failure logs, baseline response comparison |
-| Tests for isolation/replay/noise/attribution/rollback/failure | 381 focused tests, 14 suites |
+| Tests for isolation/replay/noise/attribution/rollback/failure | 409 focused tests, 14 suites |
 | Production end-to-end verification | **Pending approval/deployment**; local full-loop proof passes |
 
 Thus the engineering slices are implemented; **not every ENG-502 acceptance criterion is complete**:
@@ -149,8 +166,8 @@ production verification and the required Okareo comparison remain external gates
 [RED evidence](ENG-502-evidence/red.txt) retains expected behavioral failures before each named
 implementation. Major runs: review fixes 5 failed/39 passed; evaluator 10/1; learning 4/2; loop 3/1;
 promotion 3/6. Smaller follow-up runs are individually recorded, not inflated to three failures.
-[Focused regression](ENG-502-evidence/final-tests.txt): **381 passed / 14 suites**.
-[Checks](ENG-502-evidence/checks.txt): production TypeScript no-emit and `git diff --check` passed.
+[Focused regression](ENG-502-evidence/review-fixes-tests.txt): **409 passed / 14 suites**.
+[Checks](ENG-502-evidence/review-fixes-checks.txt): production TypeScript no-emit and `git diff --check` passed.
 [Parity](ENG-502-evidence/parity-summary.json): against prior head
 `61ea656e66e0271ae8075a2cacfc61bf13bb3d5c`, 120 unchanged fixture tests passed and **25 creative-update
 response pairs were identical**, including failure/unverified cases. The same existing fixtures
@@ -184,6 +201,21 @@ baseline date-key normalization, and stale documentation. Its duplicate-function
 match the source (one declaration; TypeScript passes). Its index concern was resolved by read-only
 ACTIVE-index evidence, not by provisioning. The second review completed with eight findings (including a duplicate). Fixed its applicable findings: generic-memory key-range starvation, optional campaign review scope, malformed query input, direct evaluator date validation, and threshold revision validation. Its data-plane hold remains. The request to remove the external Okareo command was declined because Harsha explicitly requested the exact command/blocker; the command is historical failure evidence, not a portable setup claim. Missing campaign scope remains intentionally valid for client/channel retrieval, while provided malformed scope is rejected. See [review dispositions](ENG-502-evidence/review.txt). No clean latest-SHA remote-review claim is made.
 
+### Independent-review corrections (2026-09-15)
+
+The supplied blocking findings were reproduced before implementation: **22 failed / 40 passed**
+in three focused suites, followed by a transaction-scope regression (**1 failed / 20 passed**).
+See [RED evidence](ENG-502-evidence/review-fixes-red.txt). Existing settled fixtures now represent
+refreshes after the whole reporting day plus the provider window; numeric promotion tests now
+explicitly request client scope. Tests cover due selection, stale-index rechecks, context-null and
+missing-client inputs, direct completion, concurrent context removal, truthful scope/revert behavior,
+reporting-zone boundaries, unsupported guidance, and the Meta-only production adapter.
+
+No GitHub review or inline-comment objects were present on PR #2931 at this pass; the two independent
+reviews supplied in the task are the correction contract. Local CodeRabbit 0.7.6 completed with **0 findings** across the nine changed source/test files
+(`coderabbit review --agent --uncommitted`); the exact result is recorded in [review evidence](ENG-502-evidence/review-fixes-coderabbit.txt).
+No remote review, production verification, Okareo pass or approval is claimed.
+
 ## Post-approval smoke and rollback
 
 After approval, current-head build/CI, and deployment: invoke `assess_client_health` for an approved
@@ -206,9 +238,14 @@ that exposes context-less/shared-client rows or injects unreviewed lessons indis
 Net complexity **increases** for the evaluator, receipt adapter, atomic storage adapter, scoped
 learning/review and tests. Reuses three existing stores, the existing GSI, server cron registry,
 existing creative read-back, and ENG-918 governance. New tables/indexes/dependencies/LLM calls: **0**.
-New scheduler: **1**; four authenticated learning/decline surfaces and optional existing-tool inputs.
+This correction removes legacy terminal scoring and unsupported guidance, restricts numeric
+promotion to the existing account key, and adds a reporting-calendar boundary helper and a
+qualitative-only review path. No new tables, keys, indexes, dependencies, LLM calls or schedulers.
+New scheduler in the overall PR: **1**; four authenticated learning/decline surfaces and optional existing-tool inputs.
 No parallel memory store. The bounded lookup limits above are explicit, not hidden coverage claims.
 
 Prior commits and immutable run `eng502-astra-20260915` are preserved. Accountable owner remains
 Harsha Vankayalapati (`142fef82-4d45-4070-99be-c5debe565ac6`, GitHub `harshmoney123`). Continuation
-execution actor: Codex; run `eng502-codex-continuation-20260915`. No Argusoft branches or rows changed.
+execution actor: Codex; run `eng502-codex-continuation-20260915`. This correction uses execution
+actor Codex / model Astra; run `eng502-astra-codex-review-fixes-20260915`. No Argusoft branches or
+rows changed.

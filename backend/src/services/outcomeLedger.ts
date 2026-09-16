@@ -76,6 +76,13 @@ export function validateRecommendationContext(value: unknown): asserts value is 
   }
 }
 
+/** Only the validated ENG-502 capture contract opts a row into automatic evaluation.
+ * Missing attribution is not permission to terminally score a legacy/manual record. */
+export function hasLearningContext(r: Recommendation): r is Recommendation & { context: RecommendationContext } {
+  try { validateRecommendationContext(r.context); return true; }
+  catch { return false; }
+}
+
 /** Below this relative change, an actual is treated as `flat` rather than a direction — avoids
  * scoring predictions "wrong" on noise no reasonable prediction could have avoided. */
 const FLAT_BAND_PCT = 1;

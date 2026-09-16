@@ -5,14 +5,16 @@ function recommendation(): any {
   return { ...createRecommendation({ platform: 'meta', accountId: 'a', recommendationId: 'r', createdBy: 'emma',
     hypothesis: 'Recovery', predictedMetric: 'ctr', predictedDirection: 'increase', predictedMagnitudePct: 20,
     createdAt: '2026-03-01T00:00:00.000Z', evaluationDate: '2026-03-29T23:59:59.999Z' }),
-    context: { clientUserId: 'client', campaignId: 'campaign', metricScope: 'campaign',
+    context: { version: 1, source: 'assess_client_health', mode: 'shadow', adId: 'ad',
+      rationale: 'Recovery', confidence: 'uncalibrated', reviewState: 'unreviewed', reviewAfter: now,
+      evidence: [{ reference: 'snapshot', metric: 'ctr_drop_pct', value: 40 }], assumptions: ['stable spend'], clientUserId: 'client', campaignId: 'campaign', metricScope: 'campaign',
       sourceWindow: { since: '2026-03-01', until: '2026-03-14' } } };
 }
 function rows(since: string, clicks: number): any[] {
   return Array.from({ length: 14 }, (_, i) => ({ entityKey: 'meta#a#campaign', accountId: 'a', platform: 'meta',
     userId: 'client', campaignId: 'campaign', rowType: 'campaign', dataQuality: 'exact', currency: 'USD', reportingTimezone: 'UTC',
     date: new Date(Date.parse(since) + i * 86400000).toISOString().slice(0, 10),
-    impressions: 10000, clicks, spend: 100, capturedAt: new Date(Date.parse(since) + (i + 28) * 86400000).toISOString() }));
+    impressions: 10000, clicks, spend: 100, capturedAt: new Date(Date.parse(since) + (i + 29) * 86400000).toISOString() }));
 }
 const receipt = () => ({ reference: 'execution:1', clientUserId: 'client', campaignId: 'campaign', accountId: 'a', platform: 'meta',
   recommendationId: 'r', executedAt: '2026-03-15T00:00:00.000Z', status: 'succeeded', adopted: true });
@@ -60,4 +62,52 @@ it.each([null, true, { impressions: '1000' }])('never fabricates a verdict from 
 it('rejects invalid prediction dates before attempting evaluation', () => {
   const r = recommendation(); r.evaluationDate = 'invalid';
   expect(() => run({ recommendation: r })).toThrow(/date/i);
+});
+
+it.each([undefined, null])('leaves contextless legacy rows unevaluated (%p)', context => {
+  const r = { ...recommendation(), context }, before = structuredClone(r);
+  expect(run({ recommendation: r })).toBeNull();
+  expect(r).toEqual(before);
+});
+it.each([{ version: 2 }, { source: 'manual' }, { clientUserId: '' }, { clientUserId: null }])(
+  'does not evaluate unknown context or missing client attribution: %p', patch => {
+    const r = recommendation(); Object.assign(r.context, patch);
+    expect(run({ recommendation: r })).toBeNull();
+  });
+it.each([
+  ['Pacific/Kiritimati', '2026-04-26T10:00:00.000Z'],
+  ['America/Los_Angeles', '2026-04-27T07:00:00.000Z'],
+  // The baseline includes the March 8 DST transition (23-hour reporting day).
+  ['America/New_York', '2026-04-27T04:00:00.000Z'],
+])('requires the final reporting day to end in %s before settlement', (zone, settledAt) => {
+  const outcome = rows('2026-03-16', 200).map(x => ({ ...x, reportingTimezone: zone, capturedAt: now }));
+  const baseline = rows('2026-03-01', 100).map(x => ({ ...x, reportingTimezone: zone, capturedAt: now }));
+  outcome[13].capturedAt = new Date(Date.parse(settledAt) - 1).toISOString();
+  expect(run({ baseline: { rows: baseline }, outcome: { rows: outcome } })).toMatchObject({ verdict: 'unscoreable' });
+  outcome[13].capturedAt = settledAt;
+  expect(run({ baseline: { rows: baseline }, outcome: { rows: outcome } })).toMatchObject({ verdict: 'correct' });
+});
+it.each([
+  ['2026-03-08', '2026-04-06T04:00:00.000Z'],
+  ['2026-11-01', '2026-11-30T05:00:00.000Z'],
+])('uses the DST-adjusted end of reporting day %s', (date, settledAt) => {
+  // Exercise a DST-transition row directly within a complete 14-day window.
+  const r = recommendation();
+  const start = new Date(Date.parse(date) - 13 * 86400000).toISOString().slice(0, 10);
+  r.evaluationDate = date + 'T23:59:59.999Z';
+  r.createdAt = '2026-01-01T00:00:00.000Z';
+  r.context.sourceWindow = { since: '2026-01-01', until: '2026-01-14' };
+  const e = { ...receipt(), executedAt: '2026-01-15T00:00:00.000Z' };
+  const baseline = rows('2026-01-01', 100).map(x => ({ ...x, reportingTimezone: 'America/New_York', capturedAt: '2026-12-01' }));
+  const outcome = rows(start, 200).map(x => ({ ...x, reportingTimezone: 'America/New_York', capturedAt: '2026-12-01' }));
+  const args = { recommendation: r, receipt: e, now: '2026-12-02', baseline: { rows: baseline }, outcome: { rows: outcome } };
+  outcome[13].capturedAt = new Date(Date.parse(settledAt) - 1).toISOString();
+  expect(run(args)).toMatchObject({ verdict: 'unscoreable' });
+  outcome[13].capturedAt = settledAt;
+  expect(run(args)).toMatchObject({ verdict: 'correct' });
+});
+it.each(['Not/AZone', '+05:00', '', true])('rejects unsupported reporting timezone %p', reportingTimezone => {
+  const baseline = rows('2026-03-01', 100).map(x => ({ ...x, reportingTimezone }));
+  const outcome = rows('2026-03-16', 200).map(x => ({ ...x, reportingTimezone }));
+  expect(run({ baseline: { rows: baseline }, outcome: { rows: outcome } })).toMatchObject({ verdict: 'unscoreable' });
 });

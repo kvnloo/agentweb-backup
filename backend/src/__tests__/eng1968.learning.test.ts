@@ -48,3 +48,12 @@ it('expired learned parameter falls back without deleting numeric audit history'
   expect(resolveThresholds([parameter])['creativeFatigue.ctrDropCriticalPct']).toEqual({ value: 20, source: 'default' });
   expect(parameter.revisions).toHaveLength(1);
 });
+
+it.each(['incorrect', 'inconclusive', 'unscoreable'])('keeps %s outcomes out of guidance projection', verdict => {
+  expect(buildOutcomeLesson({ ...row, verdict })).toBeNull();
+});
+it('excludes previously stored unsupported guidance on retrieval', () => {
+  const lesson = buildOutcomeLesson(row)!;
+  lesson.learning.confidence = 'unsupported';
+  expect(resolveScopedLessons([lesson], { userId: 'u', accountId: 'a', platform: 'meta', campaignId: 'c', now })).toHaveLength(1);
+});

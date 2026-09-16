@@ -1,0 +1,9 @@
+Host: Atem
+Production typecheck: PASS (exit 0)
+cd backend && node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit -p tsconfig.build.json
+
+Focused tests: PASS (exit 0), 409 tests / 14 suites.
+Exact command: see ../ENG-502-capture.md.
+
+git diff --check: PASS (exit 0).
+No production writes, deployment, ready transition or merge.

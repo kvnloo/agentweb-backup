@@ -13,19 +13,16 @@ export interface ScopedLesson {
   };
 }
 export function buildOutcomeLesson(r: Recommendation): ScopedLesson | null {
-  if (!r.context || r.context.metricScope !== 'campaign' || r.verdict === 'unscoreable' || r.status !== 'scored' || !r.scoredAt) return null;
+  if (!r.context || r.context.metricScope !== 'campaign' || (r.verdict !== 'correct' || r.adopted !== true) || r.status !== 'scored' || !r.scoredAt) return null;
   const reference = `${r.platform}#${r.accountId}/${r.recommendationId}`;
-  const supported = r.verdict === 'correct' && r.adopted === true;
   return {
     userId: r.context.clientUserId, memoryId: LEARNING_PREFIX + createHash('sha256').update(reference).digest('hex'),
     category: 'insight', createdAt: r.scoredAt, updatedAt: r.scoredAt,
-    content: supported
-      ? 'The settled campaign comparison supported the predicted direction. This is observational evidence, not proof of causality; review the linked outcome before reuse.'
-      : 'This observation does not support parameter promotion. Review the linked outcome and its measurement limitations before reusing the recommendation.',
+    content: 'The settled campaign comparison supported the predicted direction. This is observational evidence, not proof of causality; review the linked outcome before reuse.',
     learning: {
       scope: 'campaign', accountId: r.accountId, platform: r.platform, campaignId: r.context.campaignId,
       references: [reference, ...(r.context.execution ? [r.context.execution.reference] : [])],
-      confidence: supported ? 'directional' : 'unsupported', reviewState: 'proposed',
+      confidence: 'directional', reviewState: 'proposed',
       createdAt: r.scoredAt, updatedAt: r.scoredAt, expiresAt: new Date(Date.parse(r.scoredAt) + 90 * 86400000).toISOString(),
       history: [{ state: 'proposed', at: r.scoredAt }],
     },
@@ -48,7 +45,7 @@ export function resolveScopedLessons(items: unknown[], scope: LearningScope): Sc
     return !!x && typeof x === 'object' && x.userId === scope.userId && typeof x.memoryId === 'string' &&
       typeof x.content === 'string' && x.content.length <= 2000 && !!l && typeof l === 'object' &&
       l.accountId === scope.accountId && l.platform === scope.platform && ['client', 'campaign', 'channel'].includes(l.scope) &&
-      ['proposed', 'approved'].includes(l.reviewState) && ['directional', 'unsupported'].includes(l.confidence) &&
+      ['proposed', 'approved'].includes(l.reviewState) && l.confidence === 'directional' &&
       Number.isFinite(Date.parse(l.createdAt)) && Number.isFinite(Date.parse(l.updatedAt)) && Date.parse(l.expiresAt) > now &&
       Array.isArray(l.references) && l.references.length > 0 && l.references.length <= 40 && l.references.every(r => typeof r === 'string' && r.length <= 2000) &&
       Array.isArray(l.history) && l.history.length <= 20 && l.history.every(h => h && typeof h.state === 'string' && Number.isFinite(Date.parse(h.at))) &&

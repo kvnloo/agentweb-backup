@@ -1,4 +1,5 @@
 import { getDueRecommendations, completeEvaluation, getLearningMetrics } from '../services/adsLearningDb';
+import { hasLearningContext } from '../services/outcomeLedger';
 import { getRecommendation } from '../services/outcomeLedgerDb';
 import { evaluateSettledRecommendation } from '../services/adsOutcomeEvaluator';
 import { adsMetricsDb } from '../services/adsMetricsDb';
@@ -14,7 +15,7 @@ export async function runAdsLearningEvaluation(now = new Date()): Promise<void> 
     for (const candidate of page.rows) {
       try {
         const r = await getRecommendation(candidate.platform, candidate.accountId, candidate.recommendationId, 1500);
-        if (!r || r.status !== 'pending') continue;
+        if (!r || r.status !== 'pending' || r.platform !== 'meta' || !hasLearningContext(r)) continue;
         const c = r.context;
         let baseline = { rows: [], truncated: false } as Awaited<ReturnType<typeof adsMetricsDb.getSnapshotsByCampaign>>;
         let outcome = baseline;

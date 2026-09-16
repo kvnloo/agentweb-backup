@@ -1,5 +1,5 @@
 /** Settled campaign evidence only. No provider calls, writes, or inferred adoption. */
-import { getSettlingWindowDays, type Recommendation } from './outcomeLedger';
+import { getSettlingWindowDays, hasLearningContext, type Recommendation } from './outcomeLedger';
 import type { SnapshotQueryResult } from './adsMetricsDb';
 export interface ExecutionReceipt {
   reference: string;
@@ -13,6 +13,26 @@ export interface ExecutionReceipt {
   adopted: boolean;
 }
 const DAY = 86_400_000;
+/** Exclusive end of a calendar date in the provider's IANA reporting zone.
+ * Search the date transition instead of assuming a 24-hour local day (DST).
+ * Invalid dates/zones, including skipped calendar dates, fail closed as NaN. */
+function reportingDayEnd(date: string, timezone: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) ||
+    new Date(date).toISOString().slice(0, 10) !== date || /^[+-]/.test(timezone)) return NaN;
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const localDate = (instant: number) => {
+      const parts = formatter.formatToParts(instant);
+      return ['year', 'month', 'day'].map(type => parts.find(p => p.type === type)!.value).join('-');
+    };
+    let low = Date.parse(date) - 36 * DAY / 24, high = Date.parse(date) + 60 * DAY / 24;
+    while (high - low > 1) {
+      const mid = Math.floor((low + high) / 2);
+      if (localDate(mid) <= date) low = mid; else high = mid;
+    }
+    return localDate(high - 1) === date ? high : NaN;
+  } catch { return NaN; }
+}
 export function evaluateSettledRecommendation(args: {
   recommendation: Recommendation; now: string; receipt: ExecutionReceipt | null;
   baseline: SnapshotQueryResult; outcome: SnapshotQueryResult;
@@ -20,7 +40,7 @@ export function evaluateSettledRecommendation(args: {
   const { recommendation: r, now, receipt, baseline, outcome } = args;
   const clock = Date.parse(now);
   if (!Number.isFinite(clock)) throw new Error('Invalid evaluator clock');
-  if (r.status !== 'pending') return null;
+  if (r.status !== 'pending' || !hasLearningContext(r)) return null;
   if (!Number.isFinite(Date.parse(r.evaluationDate))) throw new Error('Invalid evaluation date');
   if (clock < Date.parse(r.evaluationDate) + getSettlingWindowDays(r.platform) * DAY) return null;
   const finish = (verdict: Recommendation['verdict'], reason: string, adopted: boolean | null = null,
@@ -28,7 +48,6 @@ export function evaluateSettledRecommendation(args: {
       verdict, verdictReason: reason, adopted, actualMagnitudePct,
       actualDirection: actualMagnitudePct === null ? null : actualMagnitudePct > 0 ? 'increase' : actualMagnitudePct < 0 ? 'decrease' : 'flat' });
   const c = r.context;
-  if (!c) return finish('unscoreable', 'missing_client_attribution');
   const validReceipt = receipt && typeof receipt.reference === 'string' && receipt.reference.length > 0 &&
     receipt.clientUserId === c.clientUserId && receipt.accountId === r.accountId && receipt.platform === r.platform &&
     receipt.campaignId === c.campaignId && receipt.recommendationId === r.recommendationId &&
@@ -60,7 +79,7 @@ export function evaluateSettledRecommendation(args: {
       ['impressions', 'clicks', 'spend'].every(k => typeof (x as any)[k] === 'number' && Number.isFinite((x as any)[k]) && (x as any)[k] >= 0) &&
       Number.isInteger(x.impressions) && Number.isInteger(x.clicks) && x.clicks <= x.impressions &&
       // Last refresh must reach the end of the provider's mutable reporting interval.
-      Date.parse(x.capturedAt) >= Date.parse(x.date) + getSettlingWindowDays(r.platform) * DAY && Date.parse(x.capturedAt) <= clock);
+      Date.parse(x.capturedAt) >= reportingDayEnd(x.date, timezone) + getSettlingWindowDays(r.platform) * DAY && Date.parse(x.capturedAt) <= clock);
   if (!valid(baseline.rows, since, until) || !valid(outcome.rows, afterStart, end)) return finish('unscoreable', 'missing_unsettled_or_foreign_metrics', true);
   const totals = (rows: typeof all) => rows.reduce((a, x) => ({ n: a.n + x.impressions, k: a.k + x.clicks, spend: a.spend + x.spend }), { n: 0, k: 0, spend: 0 });
   const before = totals(baseline.rows), after = totals(outcome.rows);
