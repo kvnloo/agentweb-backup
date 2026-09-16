@@ -10,11 +10,11 @@ import { S3 } from 'aws-sdk';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
-import { recordVendorUsage } from '../services/usageRecorderService';
 import { canViewItem, canEditItem } from '../services/orgShareService';
 import { getPlacidPrivateToken } from '../utils/secretsManager';
 import { parseAgentModeImageIds } from '../utils/agentModeAssetIds';
 import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
+import { renderPlacidImage } from '../services/placidRenderService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -1309,65 +1309,62 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const tplUuid = template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
     if (!tplUuid) return res.status(400).json({ message: 'template_uuid is required' });
 
-    const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
-    const params = new URLSearchParams();
-    // Map provided layers -> URL API notation
-    // Note: The following properties will be sent to Placid API:
-    // - 'hide' (boolean): Set true to hide this layer; defaults to false
-    // - 'opacity' (number): Adjust layer opacity from 0 to 100
-    // - 'rotation' (number): Set layer rotation from 0 to 359 degrees
-    // - 'position_x_absolute' (string): Set absolute X position (e.g., "10px")
-    // - 'position_y_absolute' (string): Set absolute Y position (e.g., "10px")
-    // - 'position_x_relative' (string): Set relative X position (e.g., "+10px", "-10px")
-    // - 'position_y_relative' (string): Set relative Y position (e.g., "+10px", "-10px")
-    // - 'width' (string): Set width (e.g., "50%", "+10px", "100px")
-    // - 'height' (string): Set height (e.g., "50%", "+10px", "100px")
-    // Placid will handle all these properties to control layer appearance and positioning
+    // ENG-1972: rendered through the REST API, not the URL API
+    // (`api.placid.app/u/<uuid>`), which answers 403 for this project on every
+    // render — parameter-free requests included — so no ad image could be created
+    // at all. The REST API uses the private token this backend already holds and
+    // already uses for the editor token and template listing, so it does not
+    // depend on the project's URL-API settings.
+    const placidToken = await getPlacidPrivateToken();
+    if (!placidToken) {
+      console.error('[Placid] private token is not configured; cannot render');
+      return res.status(500).json({ message: 'Placid private token is not configured' });
+    }
+
+    // The REST body takes the same {layer: {prop: value}} shape the client already
+    // sends, so the layers pass straight through; values keep their own types
+    // rather than being stringified as the URL API's query notation required.
+    // Supported properties are unchanged: text, image, hide, opacity, rotation,
+    // position_x_absolute / position_y_absolute, position_x_relative /
+    // position_y_relative, width, height.
+    const restLayers: Record<string, Record<string, unknown>> = {};
     if (layers && typeof layers === 'object') {
       for (const [layerName, props] of Object.entries(layers)) {
         if (!props || typeof props !== 'object') continue;
+        const cleaned: Record<string, unknown> = {};
         for (const [propName, value] of Object.entries(props)) {
           if (value === undefined || value === null) continue;
-          params.set(`${layerName}[${propName}]`, String(value));
+          cleaned[propName] = value;
         }
+        if (Object.keys(cleaned).length > 0) restLayers[layerName] = cleaned;
       }
     }
-    // Optional convenience mapping for source image
-    if (source_image_url && !params.has('image[image]')) {
-      params.set('image[image]', source_image_url);
+    // Same convenience mapping the URL API expressed as `image[image]=`.
+    if (source_image_url && restLayers.image?.image === undefined) {
+      restLayers.image = { ...(restLayers.image || {}), image: source_image_url };
     }
-    const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
-    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
-    // ENG-698: a Placid URL-API fetch that returns is a billed render. Metered
-    // here, on the success path only (axios throws on non-2xx), so a failed
-    // fetch books nothing -- the same rule apollo/enrich.so use. Rate read from
-    // the card, never embedded. Bills the task owner; the acting caller may be
-    // an admin, hence onBehalfOf.
-    //
-    // Priced by rateKey inside the recorder (ENG-1929), so a rate-card key
-    // rename is recorded unpriced and logged, not thrown into the render
-    // (ENG-698 AC6). The try/catch stays as a last line of defence.
+    // ENG-698: a render that produced an image is a billed render, and the
+    // recorder call lives with the egress in placidRenderService so the two
+    // cannot drift (ENG-701's coverage guard enforces that). Bills the owner --
+    // task owner, or session owner for a chat image -- while the acting caller,
+    // who may be an admin, is kept in onBehalfOf.
     const placidOwner = renderOwnerId;
-    try {
-      void recordVendorUsage({
+    const { imageUrl: placidImageUrl } = await renderPlacidImage({
+      token: placidToken,
+      templateUuid: tplUuid,
+      layers: restLayers,
+      billing: {
         userId,
         billingUserId: placidOwner,
         ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
         ...(agentSessionId ? { sessionId: agentSessionId } : {}),
-        provider: 'placid',
-        operation: 'image_render',
-        feature: 'ad_image',
-        unit: 'render',
-        quantity: 1,
-        rateKey: 'image_render',
-      });
-    } catch (meterErr) {
-      console.error(
-        '[Placid] failed to meter render (image still served):',
-        meterErr instanceof Error ? meterErr.message : meterErr,
-      );
-    }
+      },
+    });
+
+    // The REST API returns a URL rather than the bytes, so fetch it; everything
+    // downstream (S3 layout, result file, session message) is unchanged.
+    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
