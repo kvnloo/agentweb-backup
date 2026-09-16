@@ -101,6 +101,38 @@ const defaultUpdateKnowledgeBaseFile: UpdateKnowledgeBaseFileFn = (...args) => {
 };
 
 /**
+ * Strip userinfo, query string, and fragment from a URL that is about to be
+ * scraped and/or persisted (CodeRabbit finding, ENG-328). design.md is a
+ * private Knowledge Base file Emma is explicitly instructed to read for
+ * every visual task, and the same string is echoed into design.md's "Scraped
+ * from"/"Pages scanned" lines and into any scrape-failure error text — so a
+ * stray basic-auth userinfo or signed/token query string on productDomain
+ * would otherwise flow verbatim into an LLM-readable file and error logs.
+ * Sanitizing once at the source (here, and in discoverSecondaryPageUrls)
+ * means every downstream consumer of these URLs is clean for free. Falls
+ * back to the raw input if it isn't a parseable URL.
+ */
+function sanitizeScrapeUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (!u.username && !u.password && !u.search && !u.hash) {
+      // Nothing to strip — return the original string untouched rather than
+      // URL's reserialized form, which e.g. adds a trailing "/" to a bare
+      // origin. Avoids a gratuitous behavior/string change on the (vast
+      // majority) common case of a clean company URL.
+      return rawUrl;
+    }
+    u.username = "";
+    u.password = "";
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+/**
  * Same precedence onboardingBrandBuildService.pickCompanyUrl uses
  * (productDomain -> brandGuidelines.brandData.domain -> legacy companyUrl).
  *
@@ -119,7 +151,8 @@ function pickCompanyUrl(user: any): string | null {
     (typeof user.companyUrl === "string" && user.companyUrl.trim()) ||
     "";
   if (!raw) return null;
-  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  const absolute = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  return sanitizeScrapeUrl(absolute);
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -167,7 +200,7 @@ export function discoverSecondaryPageUrls(html: string, baseUrl: string): string
     for (const kw of SECONDARY_PAGE_KEYWORDS) {
       if (found.has(kw)) continue;
       if (path.includes(kw)) {
-        found.set(kw, abs.toString());
+        found.set(kw, sanitizeScrapeUrl(abs.toString()));
         break;
       }
     }

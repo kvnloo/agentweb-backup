@@ -26,6 +26,25 @@ import { triggerDesignSystemBuildForUser } from "../services/onboardingDesignSys
 const router = express.Router();
 
 /**
+ * Guards the idle/failed -> running transition with a DynamoDB
+ * ConditionExpression (CodeRabbit/Greptile finding, ENG-328) — the plain
+ * read-then-write below it replaced let two concurrent /start requests both
+ * observe a non-in-flight status and both win, launching two scrapes and
+ * creating two Knowledge Base tasks. userDb.updateUser already supports
+ * conditional writes for exactly this class of race (see
+ * userDb.updateUser.condition.test.ts, ENG-792's ad-image axis); this uses
+ * the same primitive to make the claim atomic instead of adding new
+ * machinery. Distinct alias names avoid colliding with the update's own
+ * `#designSystem` placeholder (see userDb.updateUser's name-merging).
+ */
+const START_CLAIM_CONDITION = {
+  expression:
+    "attribute_not_exists(#dsGuard) OR (#dsGuard.#dsGuardStatus <> :dsGuardRunning AND #dsGuard.#dsGuardStatus <> :dsGuardReady)",
+  names: { "#dsGuard": "designSystem", "#dsGuardStatus": "status" },
+  values: { ":dsGuardRunning": "running", ":dsGuardReady": "ready" },
+};
+
+/**
  * POST /api/onboarding/design-system/start
  *
  * (1) Flips designSystem.status to "running". (2) Fires the scrape in the
@@ -49,7 +68,16 @@ router.post("/design-system/start", authenticateToken, async (req, res) => {
     }
 
     const patch = buildStartPatch((existing as any)?.designSystem);
-    await userDb.updateUser(userId, patch as any);
+    try {
+      await userDb.updateUser(userId, patch as any, { condition: START_CLAIM_CONDITION });
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // Lost the race — another concurrent /start already claimed it.
+        const current = await userDb.getUserById(userId);
+        return res.json({ status: snapshot((current as any)?.designSystem) });
+      }
+      throw err;
+    }
 
     // Fire-and-forget background work; route returns immediately so the UI
     // can poll /status without holding an HTTP connection open.

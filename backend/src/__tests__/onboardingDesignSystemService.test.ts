@@ -84,6 +84,12 @@ describe("onboardingDesignSystemService — pure helpers", () => {
       expect(discoverSecondaryPageUrls("<a href='/x'>x</a>", "not-a-url")).toEqual([]);
       expect(discoverSecondaryPageUrls("<a href='/blog'>Blog</a>", "https://acme.com")).toEqual([]);
     });
+
+    it("strips query strings from discovered links before they can reach design.md (CodeRabbit finding, ENG-328)", () => {
+      const html = `<a href="/about?ref=newsletter&token=abc123">About</a>`;
+      const urls = discoverSecondaryPageUrls(html, "https://acme.com");
+      expect(urls).toEqual(["https://acme.com/about"]);
+    });
   });
 
   describe("mergeDesignTokens", () => {
@@ -299,6 +305,44 @@ describe("onboardingDesignSystemService — triggerDesignSystemBuildForUser (orc
     const lastCall = userDb.updateUser.mock.calls[userDb.updateUser.mock.calls.length - 1];
     expect(lastCall[1].designSystem.status).toBe("ready");
     expect(lastCall[1].designSystem.source).toBe("scrape");
+  });
+
+  it("strips userinfo and a query string from productDomain before scraping or persisting it (CodeRabbit finding, ENG-328: design.md is a private KB file Emma reads for every visual task)", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "u1",
+      productDomain: "https://alice:secret@acme.com/?token=abc123",
+      designSystem: { status: "running" },
+    });
+    const homepage = {
+      url: "https://acme.com/",
+      brandIdentity: { brandName: "Acme" },
+      computedElements: {},
+    };
+    const extractCSSFromURL = jest.fn().mockResolvedValue(homepage);
+    const analyzeDesignTokens = jest.fn().mockResolvedValue(emptyTokens());
+    const inferBrandTokens = jest.fn().mockReturnValue({
+      colors: { primary: "#112233", secondary: "#445566", palette: [] },
+      typography: { headingFont: "Inter", bodyFont: "Inter", fontWeights: { regular: 400, semibold: 600, bold: 700 } },
+      visualEffects: { primaryShadow: "none", borderRadius: "0" },
+    });
+    const fetchHtml = jest.fn().mockResolvedValue("<html></html>");
+    const updateKnowledgeBaseFile = jest.fn().mockResolvedValue({ success: true });
+
+    await triggerDesignSystemBuildForUser("u1", {
+      extractCSSFromURL,
+      analyzeDesignTokens,
+      inferBrandTokens,
+      fetchHtml,
+      updateKnowledgeBaseFile,
+    });
+
+    // The credential and token never reach the network call...
+    expect(extractCSSFromURL).toHaveBeenCalledWith("https://acme.com/");
+    // ...or the persisted markdown.
+    const mdArg = updateKnowledgeBaseFile.mock.calls[updateKnowledgeBaseFile.mock.calls.length - 1][2];
+    expect(mdArg).not.toContain("alice");
+    expect(mdArg).not.toContain("secret");
+    expect(mdArg).not.toContain("token=abc123");
   });
 
   it("re-runs upsert design.md via the persisted kbTaskId instead of creating a duplicate task", async () => {

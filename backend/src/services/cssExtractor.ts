@@ -149,6 +149,16 @@ interface ExtractionOptions {
 const CSS_EXTRACTOR_MAX_REDIRECTS = 5;
 
 /**
+ * Hard ceiling on a fetched HTML/CSS document (CodeRabbit finding, ENG-328).
+ * This scraper now runs on every mandatory onboarding signup with a
+ * user-controlled target URL, and axios had no maxContentLength/maxBodyLength
+ * set — an adversarial or merely huge origin could stream an unbounded body
+ * into memory. 5MB is generous headroom over any real page's HTML or a single
+ * stylesheet while keeping one scrape's worst-case footprint bounded.
+ */
+const MAX_TEXT_FETCH_BYTES = 5 * 1024 * 1024;
+
+/**
  * SSRF-safe text fetch: re-validates (DNS-pins via ssrfGuard's
  * resolvePinnedPublicAddress) the destination on EVERY redirect hop, not just
  * the first request — a public-looking URL that redirects to a private/
@@ -172,6 +182,8 @@ async function fetchTextSSRFSafe(
       headers,
       responseType: 'text',
       maxRedirects: 0,
+      maxContentLength: MAX_TEXT_FETCH_BYTES,
+      maxBodyLength: MAX_TEXT_FETCH_BYTES,
       validateStatus: (s: number) => (s >= 200 && s < 300) || (s >= 300 && s < 400),
       lookup: (_hostname: string, options: any, callback: any) => {
         if (typeof options === 'function') callback = options;
