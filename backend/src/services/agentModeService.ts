@@ -217,6 +217,22 @@ const SKILL_NO_SUBSTITUTION =
 // mutation tool remains manage_predefined_work_plan.
 const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
+// ENG-1550: tools that are only ever meaningful INSIDE a skill that explicitly
+// declares them, and must therefore never reach a session through the
+// `__other_skills__` catch-all (which every production subscription tier enables).
+//
+// These are not admin tools — a normal customer absolutely may use them — but only
+// in the context that gives them meaning. `record_ads_recommendation` writes a
+// prediction into the outcome ledger, which is coherent only when the skill has
+// just produced a recommendation to predict about. Offered to an unrelated session
+// it has no referent, so a model could only call it spuriously, writing junk into
+// the very track record the ledger exists to make trustworthy.
+//
+// Unlike a foundation or admin tool, membership here does NOT restrict who may run
+// the tool — it restricts how the tool can be REACHED. Skills that list it in their
+// own toolNames still grant it normally.
+const SKILL_SCOPED_ONLY_TOOL_NAMES = ['record_ads_recommendation'];
+
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
@@ -6137,6 +6153,9 @@ export class AgentModeService {
     ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
     // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
     excludedTools.add('get_visual_context');
+    // ENG-1550: skill-scoped-only tools are reachable solely through a skill that
+    // declares them, never through this catch-all. See SKILL_SCOPED_ONLY_TOOL_NAMES.
+    SKILL_SCOPED_ONLY_TOOL_NAMES.forEach(t => excludedTools.add(t));
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
