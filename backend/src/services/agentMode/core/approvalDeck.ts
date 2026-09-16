@@ -77,11 +77,18 @@ export interface ApprovalDeckItem {
     ad_id?: string;
     params: unknown;
   };
+  /** Option-item only (Phase 2f) — when true, the card offers a "Let Emma
+   *  decide" delegation button for THIS item, resolving to its recommended
+   *  option. Same non-model-attributed `answeredBy: 'delegation'` invariant
+   *  as AskUserQuestion's own delegation — never a model self-answer. */
+  allowEmmaDecide?: boolean;
 }
 
 export interface ApprovalDeckAnswer {
   itemId: string;
-  /** An optionId (plain item) or 'approve'/'reject' (write item). */
+  /** An optionId or 'approve'/'reject' (write item), or the universal 'comment'
+   *  verdict — valid on ANY item kind, doesn't execute/decide anything, requires
+   *  non-empty freeText. */
   verdict: string;
   /** A correction/reason, only meaningful when the item allows it. Lands
    *  inside the REBUILT item's `params` when Emma acts on it — which is what
@@ -95,6 +102,15 @@ export interface ApprovalDeckAnswer {
   at: string;
 }
 
+/** One front-loaded question, as present_question_deck's execute() returns it
+ *  (already normalized — every option carries a stable id) — the same shape
+ *  used both live (building a question-deck) and stashed (a dropped one). */
+export interface QuestionDeckQuestionInput {
+  question: string;
+  options: AskUserQuestionOption[];
+  allowEmmaDecide?: boolean;
+}
+
 export interface PendingApprovalDeck {
   deckId: string;
   items: ApprovalDeckItem[];
@@ -104,6 +120,13 @@ export interface PendingApprovalDeck {
   createdAt: string;
   /** Present only once status has passed 'building' — the building->awaiting signal (gap 2). */
   finalizedAt?: string;
+  /** ENG-1635/1644 v3 (round 6): set when a mixed turn produced BOTH a write
+   *  halt and a present_question_deck halt — writes win the slot, so these
+   *  questions were dropped from THIS deck rather than shown. Read (and
+   *  cleared) when this write-deck is later answered OR cancelled, so the
+   *  re-ask directive reaches Emma through answerAck/messageContent — never
+   *  through userMessage. Only ever set on a 'meta_write' deck. */
+  droppedQuestionDeckPayload?: QuestionDeckQuestionInput[];
 }
 
 export class ApprovalDeckError extends Error {
@@ -159,6 +182,14 @@ function validateItemShape(item: ApprovalDeckItem, existingIds: ReadonlySet<stri
     if (!opt || typeof opt.id !== 'string' || opt.id.trim() === '') {
       throw new ApprovalDeckError(`Item ${item.itemId}: each option needs a non-empty id`);
     }
+    // Reserved word guard: 'comment' is the universal 3rd verdict, checked ahead
+    // of write/option branching in applyDeckAnswers — an option genuinely named
+    // that would be misread as the comment verdict on submission. Only 'comment'
+    // collides: a write item can never carry options[] at all (checked above),
+    // so 'approve'/'reject' are never compared against an option id.
+    if (opt.id === 'comment') {
+      throw new ApprovalDeckError(`Item ${item.itemId}: option id 'comment' is reserved for the universal comment verdict`);
+    }
     if (ids.has(opt.id)) {
       throw new ApprovalDeckError(`Item ${item.itemId}: duplicate option id ${opt.id}`);
     }
@@ -166,6 +197,18 @@ function validateItemShape(item: ApprovalDeckItem, existingIds: ReadonlySet<stri
     if (typeof opt.label !== 'string' || opt.label.trim() === '') {
       throw new ApprovalDeckError(`Item ${item.itemId}: option ${opt.id} needs a non-empty label`);
     }
+  }
+
+  // Same invariant askUserQuestion.ts's resolveRecommendedOptionId enforces for a
+  // real PendingUserQuestion — the recommendation is the product, never zero,
+  // never ambiguous. approvalDeck.ts never had this check even for its existing
+  // plan_choice fixture path; present_question_deck (Phase 2) makes it reachable
+  // from real model-authored input, so it can no longer go unenforced.
+  const recommended = item.options.filter((o) => o.recommended === true);
+  if (recommended.length !== 1) {
+    throw new ApprovalDeckError(
+      `Item ${item.itemId}: exactly one option must be recommended, got ${recommended.length}`,
+    );
   }
 }
 
@@ -212,14 +255,23 @@ export interface InboundDeckAnswer {
   itemId: string;
   verdict: string;
   freeText?: string;
+  /** Phase 2f: true when reached via "Let Emma decide" on THIS item — the
+   *  discriminated-per-item version of askUserQuestion.ts's resolveInboundAnswer
+   *  delegation branch, generalized to a batch (a submission can have some
+   *  items delegated and others directly answered). When true, `verdict` is
+   *  IGNORED and the item's recommended option is used instead — same "a
+   *  stray client-supplied verdict can never become a silent different
+   *  choice" guarantee the single-question primitive already has. */
+  delegated?: boolean;
 }
 
 /**
  * Apply a full, one-shot submission of answers (one per item — no partial
  * submissions, no re-answering one item later) and transition the deck to
- * 'answered'. `answeredBy` is a single value for the whole submission,
- * mirroring resolveInboundAnswer's derivation from the request's own
- * provenance rather than any per-item client-supplied flag.
+ * 'answered'. `answeredBy` is the default for the whole submission, but a
+ * per-item `delegated:true` overrides it to 'delegation' for THAT item only —
+ * mirroring resolveInboundAnswer's derivation from provenance, generalized so
+ * one submission can mix directly-answered and delegated items.
  */
 export function applyDeckAnswers(
   deck: PendingApprovalDeck,
@@ -252,25 +304,52 @@ export function applyDeckAnswers(
     }
     seenItemIds.add(item.itemId);
 
-    const isWriteItem = typeof item.metaWriteManifestDigest === 'string' && item.metaWriteManifestDigest.trim() !== '';
-    if (isWriteItem) {
-      if (answer.verdict !== 'approve' && answer.verdict !== 'reject') {
-        throw new ApprovalDeckError(
-          `Item ${item.itemId} is a Meta write preview — verdict must be 'approve' or 'reject', got '${answer.verdict}'`,
-        );
+    const isDelegated = answer.delegated === true;
+    let verdict = answer.verdict;
+    if (isDelegated) {
+      // Deterministic, never re-inferred: a stray client-supplied verdict on a
+      // delegated answer must never become a silent different choice — same
+      // guarantee askUserQuestion.ts's resolveInboundAnswer already has. Only
+      // an option item can be delegated (a write item has no "recommended
+      // option" concept); a write item here has no options, so the find below
+      // returns undefined and this correctly rejects rather than delegating
+      // to an approve/reject it never chose.
+      const recommended = item.options?.find((option) => option.recommended === true);
+      if (!recommended) {
+        throw new ApprovalDeckError(`Item ${item.itemId}: delegation requires a recommended option, but this item has none`);
       }
-    } else if (!item.options?.some((option) => option.id === answer.verdict)) {
-      throw new ApprovalDeckError(`Item ${item.itemId}: '${answer.verdict}' is not one of its options`);
+      verdict = recommended.id;
     }
-    if (typeof answer.freeText === 'string' && answer.freeText.trim() !== '' && item.allowFreeText !== true) {
-      throw new ApprovalDeckError(`Item ${item.itemId} does not allow a free-text answer`);
+
+    if (verdict === 'comment') {
+      // Universal 3rd verdict — valid on ANY item kind (write or option-based),
+      // unlike reject-with-correction below which stays gated on allowFreeText.
+      // A comment with nothing said is meaningless, so unlike reject, freeText
+      // is required here, not merely permitted.
+      if (typeof answer.freeText !== 'string' || answer.freeText.trim() === '') {
+        throw new ApprovalDeckError(`Item ${item.itemId}: a 'comment' verdict requires non-empty freeText`);
+      }
+    } else {
+      const isWriteItem = typeof item.metaWriteManifestDigest === 'string' && item.metaWriteManifestDigest.trim() !== '';
+      if (isWriteItem) {
+        if (verdict !== 'approve' && verdict !== 'reject') {
+          throw new ApprovalDeckError(
+            `Item ${item.itemId} is a Meta write preview — verdict must be 'approve', 'reject', or 'comment', got '${verdict}'`,
+          );
+        }
+      } else if (!item.options?.some((option) => option.id === verdict)) {
+        throw new ApprovalDeckError(`Item ${item.itemId}: '${verdict}' is not one of its options`);
+      }
+      if (typeof answer.freeText === 'string' && answer.freeText.trim() !== '' && item.allowFreeText !== true) {
+        throw new ApprovalDeckError(`Item ${item.itemId} does not allow a free-text answer`);
+      }
     }
 
     return {
       itemId: item.itemId,
-      verdict: answer.verdict,
+      verdict,
       ...(typeof answer.freeText === 'string' && answer.freeText.trim() !== '' ? { freeText: answer.freeText } : {}),
-      answeredBy,
+      answeredBy: isDelegated ? 'delegation' : answeredBy,
       at,
     };
   });
