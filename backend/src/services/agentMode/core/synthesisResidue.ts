@@ -851,6 +851,73 @@ export function buildUnavailableCapabilityNotice(toolCalls: ExecutedToolCall[]):
   );
 }
 
+/** Shape of the fields `coding_agent`'s own result carries through to the ledger — see
+ *  `codingAgentService.ts`'s `AcceptanceStatus`/`AcceptanceVerificationResult` for the source of
+ *  truth; duplicated narrowly here rather than imported so this module stays free of a dependency
+ *  on a specific tool's service file, matching how the rest of this file reads `call.result`. */
+interface CodingAgentResultShape {
+  acceptanceStatus?: string;
+  acceptance?: {
+    checks?: Array<{ label?: string; status?: string; message?: string }>;
+  };
+}
+
+function codingAgentResult(call: ExecutedToolCall): CodingAgentResultShape | null {
+  if (call?.name !== 'coding_agent') return null;
+  const result = call.result as CodingAgentResultShape | null | undefined;
+  return result && typeof result === 'object' ? result : null;
+}
+
+/**
+ * ENG-1899. `coding_agent`'s own deterministic acceptance checks are real — they run against the
+ * actual preview URL, not the model's opinion of it — and `codingAgentService.ts` already forces
+ * `success: false` when they fail. But the human-readable `message` it returns is built as
+ * `${result.message}\n\n${acceptance.summary}...` — a concatenation that puts the MODEL's own
+ * original claim first and the real verification failure after. A live incident (ENG-1899): the
+ * model reported "visual verification passed with screenshot" while its own `selector_exists`
+ * check had failed and the button copy it described matched neither the brief nor the deployed
+ * page. The failure was always present in `acceptanceStatus`/`acceptance` on the ledger entry —
+ * nothing downstream read it before this.
+ *
+ * Same fix shape as `buildUnavailableCapabilityNotice` above, for the same reason:
+ * UNCONDITIONAL — this states a fact already in the ledger (a specific check failed), never tries
+ * to detect that the model's prose claims success, so a claim phrased in a way no detector
+ * anticipated (exactly what happened live) cannot slip through. And it is PREPENDED — the true
+ * state must be seen before the model's own possibly-false claim, not after it, or the same
+ * anchoring effect that produced the original incident this module exists for repeats here.
+ *
+ * Returns null when no `coding_agent` call this turn has a real failure — a `'passed'` result, a
+ * `'not_run'` result (no acceptance checks configured), or no `coding_agent` call at all. Redundant
+ * when the model was already honest about it; that is the cheap direction to be wrong.
+ */
+export function buildAcceptanceFailureNotice(toolCalls: ExecutedToolCall[]): string | null {
+  const calls = toolCalls ?? [];
+  const failures: Array<{ summaryLine: string }> = [];
+
+  calls.forEach((call) => {
+    const result = codingAgentResult(call);
+    if (!result) return;
+    if (result.acceptanceStatus !== 'failed' && result.acceptanceStatus !== 'blocked') return;
+
+    const failedChecks = (result.acceptance?.checks ?? []).filter((c) => c.status !== 'passed');
+    const checkLines = failedChecks.length > 0
+      ? failedChecks.map((c) => `  - ${c.label ?? 'check'}: ${c.message ?? 'failed'}`).join('\n')
+      : '  - (no per-check detail was returned)';
+    failures.push({ summaryLine: checkLines });
+  });
+
+  if (failures.length === 0) return null;
+
+  const plural = failures.length > 1;
+  return (
+    `⚠️ VERIFICATION FAILED — coding_agent's own acceptance check${plural ? 's did' : ' did'} not ` +
+    `pass this turn, so the change below may not actually be live or correct even if it is ` +
+    `described as done:\n` +
+    failures.map((f) => f.summaryLine).join('\n') +
+    `\n\nTreat the summary that follows as the model's own unverified account of what it did, not ` +
+    `as confirmed fact — it may describe a state that does not match what is actually deployed.`
+  );
+}
 
 export function buildFalseClaimCorrectionFooter(
   claim: FalseCompletionClaim,
