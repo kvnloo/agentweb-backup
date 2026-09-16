@@ -36,6 +36,23 @@ const mockDb = db as jest.Mocked<typeof db>;
 const OWNED = '1842363582956923';
 const NOT_OWNED = '9999999999999999';
 
+/** Always ahead of `createdAt`, which the route mints as the real current time.
+ *
+ * These fixtures were a hardcoded '2026-01-01'. That is a date, so it went stale the moment the
+ * wall clock passed it — and once `createRecommendation` started rejecting an evaluationDate that
+ * precedes createdAt (retroactive prediction), every one of these authorisation tests began failing
+ * on its fixture rather than on the behaviour it exists to check. Derive it instead, so the suite
+ * cannot rot again. */
+const FUTURE_EVALUATION_DATE = new Date(Date.now() + 30 * 86400000).toISOString();
+
+/** For rows read back as ALREADY CREATED, where the point of the test is scoring.
+ *
+ * These must sit past the 28-day settling window or `scoreRecommendation` returns `unscoreable`,
+ * and the scoring tests below — which assert only status 200 — would keep passing while silently
+ * exercising the unsettled path instead of a real verdict. Creation's no-backdating rule does not
+ * apply here: nothing in these tests calls `createRecommendation`. */
+const SETTLED_EVALUATION_DATE = new Date(Date.now() - 120 * 86400000).toISOString();
+
 function app() {
   const a = express();
   a.use(express.json());
@@ -90,7 +107,7 @@ describe('write authorisation', () => {
         predictedMetric: 'ctr',
         predictedDirection: 'increase',
         predictedMagnitudePct: 5,
-        evaluationDate: '2026-01-01',
+        evaluationDate: FUTURE_EVALUATION_DATE,
       });
     expect(res.status).toBe(403);
     expect(mockDb.putNewRecommendation).not.toHaveBeenCalled();
@@ -113,7 +130,7 @@ describe('write authorisation', () => {
         predictedMetric: 'ctr',
         predictedDirection: 'increase',
         predictedMagnitudePct: 5,
-        evaluationDate: '2026-01-01',
+        evaluationDate: FUTURE_EVALUATION_DATE,
       });
     expect(res.status).toBe(201);
     expect(mockDb.putNewRecommendation).toHaveBeenCalledTimes(1);
@@ -129,7 +146,7 @@ describe('write authorisation', () => {
         predictedMetric: 'ctr',
         predictedDirection: 'increase',
         predictedMagnitudePct: 5,
-        evaluationDate: '2026-01-01',
+        evaluationDate: FUTURE_EVALUATION_DATE,
       });
     expect(res.status).toBe(400);
     expect(mockDb.putNewRecommendation).not.toHaveBeenCalled();
@@ -153,7 +170,7 @@ describe('write authorisation', () => {
       predictedMetric: 'ctr',
       predictedDirection: 'increase',
       predictedMagnitudePct: 5,
-      evaluationDate: '2026-01-01',
+      evaluationDate: SETTLED_EVALUATION_DATE,
       createdAt: '2025-12-01T00:00:00.000Z',
       createdBy: 'agent',
       adopted: true,
@@ -181,7 +198,7 @@ describe('score input validation', () => {
     predictedMetric: 'ctr',
     predictedDirection: 'increase',
     predictedMagnitudePct: 5,
-    evaluationDate: '2026-01-01',
+    evaluationDate: SETTLED_EVALUATION_DATE,
     createdAt: '2025-12-01T00:00:00.000Z',
     createdBy: 'agent',
     adopted: null,
