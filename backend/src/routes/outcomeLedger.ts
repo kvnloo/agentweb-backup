@@ -18,6 +18,7 @@
 
 import express from 'express';
 import { randomUUID } from 'crypto';
+import { LearningReviewConflict } from '../services/adsScopedLearning';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { cleanAccountId, getConnectedMetaAccountsList } from '../services/metaAccountCredentials';
@@ -90,6 +91,21 @@ function logLearningFailure(req: any, action: string, error: unknown): void {
   });
 }
 
+/** Only known domain/conditional refusals are conflicts; outages must remain server failures. */
+function learningFailureStatus(error: unknown): 409 | 500 | 503 {
+  if (error instanceof LearningReviewConflict) return 409;
+  if (!error || typeof error !== 'object') return 500;
+  const e = error as { code?: unknown; retryable?: unknown; statusCode?: unknown; CancellationReasons?: unknown };
+  if (e.code === 'ConditionalCheckFailedException') return 409;
+  if (e.code === 'TransactionCanceledException' && Array.isArray(e.CancellationReasons) &&
+    e.CancellationReasons.some(r => r?.Code === 'ConditionalCheckFailed') &&
+    e.CancellationReasons.every(r => r?.Code === 'None' || r?.Code === 'ConditionalCheckFailed')) return 409;
+  if (e.retryable === true || (typeof e.statusCode === 'number' && e.statusCode >= 500) ||
+    ['TimeoutError', 'NetworkingError', 'RequestAbortedError', 'ProvisionedThroughputExceededException',
+      'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable', 'TransactionCanceledException'].includes(String(e.code))) return 503;
+  return 500;
+}
+
 /** Recommendation IDs are opaque legacy/UUID/hash strings; DynamoDB sort keys allow 1–1024 UTF-8 bytes. */
 function validRecommendationId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= 1024;
@@ -124,7 +140,7 @@ router.post('/:platform/:accountId/learning/:memoryId/:action', authenticateToke
       campaignId: typeof req.body?.campaignId === 'string' ? req.body.campaignId : undefined, now: new Date().toISOString() },
       req.params.memoryId, req.params.action, targetScope);
     return res.status(result.applied ? 200 : 409).json(result);
-  } catch (error) { logLearningFailure(req, req.params.action, error); res.status(409).json({ error: 'Learning review could not be applied' }); }
+  } catch (error) { logLearningFailure(req, req.params.action, error); res.status(learningFailureStatus(error)).json({ error: 'Learning review could not be applied' }); }
 });
 
 router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken, async (req: any, res) => {
@@ -140,7 +156,7 @@ router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken
       platform: owned.platform, accountId: owned.accountId, campaignId: r.context.campaignId, recommendationId: r.recommendationId,
       status: 'declined', adopted: false, executedAt: new Date().toISOString() }, 1500);
     res.json({ adopted: false });
-  } catch (error) { logLearningFailure(req, 'decline', error); res.status(409).json({ error: 'Recommendation could not be declined' }); }
+  } catch (error) { logLearningFailure(req, 'decline', error); res.status(learningFailureStatus(error)).json({ error: 'Recommendation could not be declined' }); }
 });
 
 /**

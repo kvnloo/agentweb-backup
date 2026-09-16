@@ -1,5 +1,5 @@
 import { getLearningItem, getLearningRecommendations, commitLearningReview, getLearningAccountOwners } from './adsLearningDb';
-import { proposeParameterLearning, resolveScopedLessons, type LearningScope } from './adsScopedLearning';
+import { proposeParameterLearning, resolveScopedLessons, LearningReviewConflict, type LearningScope } from './adsScopedLearning';
 import { getThreshold } from './adsThresholdsDb';
 import { applyThresholdWrite, buildThresholdRevert, resolveThresholds } from './adsThresholds';
 /** Explicit owner review promotes shadow guidance. No cron ever calls this or mutates a campaign. */
@@ -7,16 +7,16 @@ export async function reviewLearning(scope: LearningScope, memoryId: string, act
   targetScope: 'client' | 'campaign' | 'channel' = 'campaign') {
   const lesson = await getLearningItem(scope.userId, memoryId);
   if (!lesson || lesson.userId !== scope.userId || lesson.learning?.accountId !== scope.accountId || lesson.learning.platform !== scope.platform) {
-    throw new Error('Learning scope mismatch');
+    throw new LearningReviewConflict('Learning scope mismatch');
   }
   if (lesson.learning.reviewState === (action === 'approve' ? 'approved' : 'reverted')) return { applied: false, reason: 'already_reviewed' };
-  if (action === 'approve' && !resolveScopedLessons([lesson], { ...scope, campaignId: scope.campaignId ?? lesson.learning.campaignId }).some(x => x.memoryId === memoryId)) throw new Error('Learning expired or scope mismatch');
-  if (Date.parse(scope.now) <= Date.parse(lesson.updatedAt)) throw new Error('Review must advance revision time');
+  if (action === 'approve' && !resolveScopedLessons([lesson], { ...scope, campaignId: scope.campaignId ?? lesson.learning.campaignId }).some(x => x.memoryId === memoryId)) throw new LearningReviewConflict('Learning expired or scope mismatch');
+  if (Date.parse(scope.now) <= Date.parse(lesson.updatedAt)) throw new LearningReviewConflict('Review must advance revision time');
   if (action === 'revert') targetScope = lesson.learning.scope as 'client' | 'campaign' | 'channel';
   if (action === 'approve' && (lesson.learning.reviewState !== 'proposed' || lesson.learning.confidence !== 'directional')) {
     return { applied: false, reason: 'unsupported_learning' };
   }
-  if (targetScope === 'campaign' && !lesson.learning.campaignId) throw new Error('Campaign scope requires campaign attribution');
+  if (targetScope === 'campaign' && !lesson.learning.campaignId) throw new LearningReviewConflict('Campaign scope requires campaign attribution');
   let parameter = null;
   let expectedParameterTime: string | null = null;
   let references = lesson.learning.references;

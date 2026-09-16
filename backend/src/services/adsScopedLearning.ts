@@ -3,6 +3,8 @@ import { createHash } from 'crypto';
 import { evaluateThresholdWrite, type AdsThreshold } from './adsThresholds';
 import type { Recommendation } from './outcomeLedger';
 export const LEARNING_PREFIX = 'ads-learning#';
+/** A safe domain refusal, distinct from dependency or implementation failures. */
+export class LearningReviewConflict extends Error {}
 export interface ScopedLesson {
   userId: string; memoryId: string; category: 'insight'; content: string; createdAt: string; updatedAt: string;
   learning: {

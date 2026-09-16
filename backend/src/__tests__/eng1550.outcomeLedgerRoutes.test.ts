@@ -1,3 +1,4 @@
+import { LearningReviewConflict } from '../services/adsScopedLearning';
 /**
  * ENG-1550 — outcome ledger API, focused on the authorisation boundary.
  *
@@ -290,7 +291,7 @@ it.each(['read', 'approve', 'revert', 'decline'])('logs a sanitized %s failure w
       (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
       res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent('ads-learning#' + 'a'.repeat(64))}/${action}`);
     }
-    expect(res.status).toBe(action === 'read' ? 503 : 409);
+    expect(res.status).toBe(action === 'read' ? 503 : 500);
     expect(audit).toHaveBeenCalledWith('[AdsLearning] request failed', expect.objectContaining({ userId: 'caller-1', accountId: OWNED, action, error: 'Error' }));
     expect(JSON.stringify(audit.mock.calls)).not.toContain('secret-token');
     expect(JSON.stringify(res.body)).not.toContain('secret-token');
@@ -304,7 +305,7 @@ it('bounds and sanitizes request-controlled audit identifiers and error classes'
   const audit = jest.spyOn(console, 'error').mockImplementation(() => {});
   try {
     const target = encodeURIComponent('ads-learning#' + 'a'.repeat(64));
-    expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${target}/approve`)).status).toBe(409);
+    expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${target}/approve`)).status).toBe(500);
     const fields = audit.mock.calls[0][1] as Record<string, string>;
     for (const value of Object.values(fields)) {
       expect(value.length).toBeLessThanOrEqual(128);
@@ -325,4 +326,44 @@ it.each(['decline', 'score'])('rejects oversized UTF-8 recommendation keys befor
   const target = encodeURIComponent('é'.repeat(513));
   expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/${target}/${action}`)).status).toBe(400);
   expect(mockDb.getRecommendation).not.toHaveBeenCalled();
+});
+
+
+it.each(['approve', 'revert', 'decline'])('reports %s dependency failure as 503 without exposing details', async action => {
+  const error = Object.assign(new Error('private provider response'), { code: 'ProvisionedThroughputExceededException', retryable: true });
+  let path;
+  if (action === 'decline') {
+    mockDb.getRecommendation.mockRejectedValueOnce(error);
+    path = `/api/outcome-ledger/meta/${OWNED}/r/decline`;
+  } else {
+    const { reviewLearning } = await import('../services/adsLearningReview');
+    (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
+    path = `/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent('ads-learning#' + 'a'.repeat(64))}/${action}`;
+  }
+  const res = await request(app()).post(path);
+  expect(res.status).toBe(503);
+  expect(JSON.stringify(res.body)).not.toContain('private provider response');
+});
+
+it('keeps an explicit non-applied review as a 409 conflict', async () => {
+  const { reviewLearning } = await import('../services/adsLearningReview');
+  (reviewLearning as jest.Mock).mockResolvedValueOnce({ applied: false, reason: 'already_reviewed' });
+  const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent('ads-learning#' + 'a'.repeat(64))}/approve`);
+  expect(res.status).toBe(409);
+  expect(res.body).toEqual({ applied: false, reason: 'already_reviewed' });
+});
+
+
+it.each([
+  [new LearningReviewConflict('scope mismatch'), 409],
+  [Object.assign(new Error('race'), { code: 'ConditionalCheckFailedException' }), 409],
+  [Object.assign(new Error('race'), { code: 'TransactionCanceledException', CancellationReasons: [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }] }), 409],
+  [Object.assign(new Error('outage'), { code: 'TransactionCanceledException', CancellationReasons: [{ Code: 'ProvisionedThroughputExceeded' }] }), 503],
+  [Object.assign(new Error('malformed provider metadata'), { code: 'TransactionCanceledException', CancellationReasons: [null] }), 503],
+])('classifies review failure safely (%s)', async (error, status) => {
+  const { reviewLearning } = await import('../services/adsLearningReview');
+  (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
+  const res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${encodeURIComponent('ads-learning#' + 'a'.repeat(64))}/approve`);
+  expect(res.status).toBe(status);
+  expect(res.body.error).toBe('Learning review could not be applied');
 });
