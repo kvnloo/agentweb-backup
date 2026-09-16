@@ -36,6 +36,16 @@ describe('renderPlacidImage (ENG-1972)', () => {
     jest.clearAllMocks();
   });
 
+  // clearAllMocks drops call history but keeps implementations and spies, so a
+  // test that makes the recorder throw, or silences console.error, would leak
+  // that into every test after it. Reset the implementations too (Greptile, #2943).
+  afterEach(() => {
+    jest.restoreAllMocks();
+    mockRecordVendorUsage.mockReset();
+    mockPost.mockReset();
+    mockGet.mockReset();
+  });
+
   it('creates the image with the private token and returns the finished URL', async () => {
     mockPost.mockResolvedValue({
       data: { id: 1, status: 'finished', image_url: 'https://cdn.placid.test/a.png' },
