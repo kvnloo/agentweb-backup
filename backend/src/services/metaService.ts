@@ -2712,6 +2712,24 @@ export class MetaService {
     }
   }
 
+  /** Render one existing ad or creative in a Meta placement. */
+  public async generateAdPreview(accessToken: string, nodeId: string, adFormat: string) {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const response = await axios.get(
+        `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(nodeId)}/previews`,
+        { params: { ad_format: adFormat, access_token: accessToken } },
+      );
+      const rows = response?.data?.data;
+      if (!Array.isArray(rows) || rows.length === 0 || rows.some((row: any) => !row || typeof row.body !== 'string')) {
+        throw new Error('Meta returned an invalid ad preview response.');
+      }
+      return rows.map((row: any) => ({ body: row.body }));
+    } catch (error) {
+      return this.handleError(error, 'generateAdPreview');
+    }
+  }
+
   /**
    * Update ad
    *
