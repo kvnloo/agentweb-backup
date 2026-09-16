@@ -8071,14 +8071,26 @@ emmaToolRegistry.register({
         // The combined set this issue is asserting is broken/unavailable, whether stated
         // explicitly via the field or implied by its own wording — both verified identically.
         const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
-        if (effectiveUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+        // ENG-1945 follow-up (live-prod finding): the model has no legitimate way to learn
+        // its own agentRuntimeRunId — it is never surfaced in any tool result or prompt text
+        // — so requiring it to TYPE that id back (as the original version of this gate did)
+        // made even an honest same-turn claim unverifiable; live testing confirmed the model
+        // simply invents a plausible-looking placeholder ("current-run") instead. Default to
+        // `context.currentRunId` — the server's OWN id for the run this call is executing
+        // within, threaded in by toolDispatch.ts, not something the model can fake or
+        // mistype — whenever the model doesn't supply an explicit `run_id`. An EXPLICIT
+        // `run_id` argument still takes priority when given, preserving ENG-939's citing-a-
+        // DIFFERENT-run case (a reviewer analysing another session) exactly as before.
+        const explicitRunId = typeof issue.run_id === 'string' && issue.run_id.trim() ? issue.run_id.trim() : undefined;
+        const effectiveRunId = explicitRunId ?? (typeof context?.currentRunId === 'string' ? context.currentRunId : undefined);
+        if (effectiveUnavailableTools.length > 0 && !effectiveRunId) {
           const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
           throw new Error(
             `Cannot file "${issue.title}": ${viaWording
               ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
               : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
-            } — that requires run_id so the claim can be checked against that run's actual tool-call telemetry. Include ` +
-            `the run_id from THIS session, or reword the report so it does not assert a specific tool is broken/unavailable.`
+            } — that requires a resolvable run to check the claim against, and none is available (no run_id given and no ` +
+            `current run context). Only call report_product_issues about a tool being broken from within an active agent run.`
           );
         }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
@@ -8090,15 +8102,18 @@ emmaToolRegistry.register({
         let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
         let affectedSessionId: string | undefined;
         let affectedUserUnresolved = false;
-        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+        // Uses `effectiveRunId` (explicit run_id, else the server-supplied current run) so
+        // an in-progress agent run gets its dossier auto-attached even when the model never
+        // passed run_id explicitly — not just when claimed_unavailable_tools forces the issue.
+        if (effectiveRunId) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
-            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const { runs } = await fetchAgentRunSummaries({ runId: effectiveRunId, limit: 1 });
             const run = runs[0];
             if (!run) {
               if (effectiveUnavailableTools.length > 0) {
                 throw new Error(
-                  `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
+                  `Cannot file "${issue.title}": run_id "${effectiveRunId}" does not resolve to a known run, so ` +
                   `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
                   `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
                 );

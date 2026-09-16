@@ -8559,11 +8559,21 @@ export class AgentModeService {
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
+    agentRuntimeRunId?: string;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
+    // within — never something the model supplies or can even see elsewhere, unlike the
+    // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
+    // already-completed run — e.g. a reviewer analysing another session, ENG-939). Threading
+    // the real value through as ground truth lets a tool verify a same-turn claim against
+    // the run it is ACTUALLY in, instead of requiring the model to correctly type back an
+    // opaque id it was never given — which live testing showed it cannot do (it guessed the
+    // literal string "current-run").
+    if (input.agentRuntimeRunId) toolOptions.currentRunId = input.agentRuntimeRunId;
     // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
     // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
     // ENG-123). Scoping it here keeps every other tool's context unchanged.
