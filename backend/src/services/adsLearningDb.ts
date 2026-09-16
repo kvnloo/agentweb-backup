@@ -12,9 +12,9 @@ export async function getDueRecommendations(now: Date, cursor?: AWS.DynamoDB.Doc
   const result = await ledgerRequest(db.query({ TableName: OUTCOME_LEDGER_TABLE, IndexName: 'StatusEvaluationDateIndex',
     KeyConditionExpression: '#status = :pending AND evaluationDate <= :due', ExpressionAttributeNames: { '#status': 'status' },
     ExpressionAttributeValues: { ':pending': 'pending', ':due': new Date(now.getTime() - 28 * 86400000).toISOString() },
-    // 75 × (1.5s reread + 3s metrics + 5s transaction + 1.5s conflict read)
-    // + 5s page read = at most 830s of request budgets, below the 900s tick.
-    Limit: 75, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }), 5000);
+    // 50 × (1.5s reread + 3s metrics + 5s transaction + 1.5s conflict read)
+    // + 5s page read = at most 555s of request budgets, below the 900s tick.
+    Limit: 50, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }), 5000);
   if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed due page');
   const rows: Recommendation[] = [];
   for (const item of result.Items ?? []) {

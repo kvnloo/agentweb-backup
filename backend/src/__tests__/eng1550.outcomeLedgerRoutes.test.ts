@@ -270,3 +270,29 @@ it('does not allow shared-account peers to decline another client recommendation
 it('rejects repeated campaign query values instead of silently dropping scope', async () => {
   expect((await request(app()).get(`/api/outcome-ledger/meta/${OWNED}/learning?campaignId=a&campaignId=b`)).status).toBe(400);
 });
+
+jest.mock('../services/adsLearningReview', () => ({ reviewLearning: jest.fn() }));
+it.each(['read', 'approve', 'revert', 'decline'])('logs a sanitized %s failure without changing the client response', async action => {
+  const error = new Error('secret-token and private recommendation content');
+  const audit = jest.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    let res;
+    if (action === 'read') {
+      const { getScopedLearning } = await import('../services/adsLearningDb');
+      (getScopedLearning as jest.Mock).mockRejectedValueOnce(error);
+      res = await request(app()).get(`/api/outcome-ledger/meta/${OWNED}/learning`);
+    } else if (action === 'decline') {
+      mockDb.getRecommendation.mockResolvedValue({ status: 'pending', recommendationId: 'r', context: { clientUserId: 'caller-1', campaignId: 'c' } } as any);
+      (attachExecutionReceipt as jest.Mock).mockRejectedValueOnce(error);
+      res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/r/decline`);
+    } else {
+      const { reviewLearning } = await import('../services/adsLearningReview');
+      (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
+      res = await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/lesson/${action}`);
+    }
+    expect(res.status).toBe(action === 'read' ? 503 : 409);
+    expect(audit).toHaveBeenCalledWith('[AdsLearning] request failed', expect.objectContaining({ userId: 'caller-1', accountId: OWNED, action, error: 'Error' }));
+    expect(JSON.stringify(audit.mock.calls)).not.toContain('secret-token');
+    expect(JSON.stringify(res.body)).not.toContain('secret-token');
+  } finally { audit.mockRestore(); }
+});

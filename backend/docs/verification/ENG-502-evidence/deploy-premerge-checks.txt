@@ -6,3 +6,5 @@ Snapshot/evaluator regression RED: 7 failed, 62 passed; GREEN including final UT
 No production data mutation or deployment performed during these checks.
 
 Performance-warning correction: 5 failures / 21 passes reproduced before bounded ownership reads. Final suite: 454 tests / 15 suites pass; TypeScript no-emit and diff check pass. Includes malformed/incomplete pages, later-page shared owner, tokenless linked owner, and timeout/abort without threshold mutation.
+
+Audit correction: 4 failures / 19 passes before logging; final 458 tests / 15 suites pass. Production TypeScript no-emit passes. Evaluation page now 50 rows with 555 seconds of request budgets, preserving fresh-read/conditional-write integrity. No API response or model-visible text changed in this correction.

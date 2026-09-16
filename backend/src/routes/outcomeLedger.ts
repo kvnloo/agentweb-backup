@@ -80,6 +80,15 @@ router.get('/:platform/:accountId', authenticateToken, async (req: any, res) => 
   }
 });
 
+/** Keep diagnostic scope without logging tokens, exception messages or recommendation content. */
+function logLearningFailure(req: any, action: string, error: unknown): void {
+  console.error('[AdsLearning] request failed', {
+    userId: req.user?.userId, accountId: req.params.accountId, action,
+    targetId: req.params.memoryId ?? req.params.recommendationId,
+    error: error instanceof Error ? error.name : 'unknown',
+  });
+}
+
 /** Bounded scoped guidance; account ownership and client identity are server-derived. */
 router.get('/:platform/:accountId/learning', authenticateToken, async (req: any, res) => {
   try {
@@ -92,7 +101,7 @@ router.get('/:platform/:accountId/learning', authenticateToken, async (req: any,
     const lessons = await getScopedLearning({ userId: req.user.userId, accountId: owned.accountId, platform: owned.platform,
       campaignId: typeof req.query.campaignId === 'string' ? req.query.campaignId : undefined, now: new Date().toISOString() });
     res.json({ mode: 'shadow', lessons });
-  } catch { res.status(503).json({ error: 'Learning unavailable' }); }
+  } catch (error) { logLearningFailure(req, 'read', error); res.status(503).json({ error: 'Learning unavailable' }); }
 });
 
 /** Explicit review/rollback only; the scheduler has no authority to call this. */
@@ -108,7 +117,7 @@ router.post('/:platform/:accountId/learning/:memoryId/:action', authenticateToke
       campaignId: typeof req.body?.campaignId === 'string' ? req.body.campaignId : undefined, now: new Date().toISOString() },
       req.params.memoryId, req.params.action, targetScope);
     return res.status(result.applied ? 200 : 409).json(result);
-  } catch { res.status(409).json({ error: 'Learning review could not be applied' }); }
+  } catch (error) { logLearningFailure(req, req.params.action, error); res.status(409).json({ error: 'Learning review could not be applied' }); }
 });
 
 router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken, async (req: any, res) => {
@@ -123,7 +132,7 @@ router.post('/:platform/:accountId/:recommendationId/decline', authenticateToken
       platform: owned.platform, accountId: owned.accountId, campaignId: r.context.campaignId, recommendationId: r.recommendationId,
       status: 'declined', adopted: false, executedAt: new Date().toISOString() }, 1500);
     res.json({ adopted: false });
-  } catch { res.status(409).json({ error: 'Recommendation could not be declined' }); }
+  } catch (error) { logLearningFailure(req, 'decline', error); res.status(409).json({ error: 'Recommendation could not be declined' }); }
 });
 
 /**

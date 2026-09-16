@@ -125,7 +125,9 @@ async function supportedFleet() {
     await metrics('2026-03-01', 100, true, c);
     await metrics('2026-03-16', 200, true, c);
   }
+  // Sixty ad/campaign records exceed one bounded tick; the next tick drains the rest.
   await runAdsLearningEvaluation(new Date('2026-05-01'));
+  await runAdsLearningEvaluation(new Date('2026-05-01T00:15:00Z'));
   return [...table('AW-AccountMemory').values()].find(r => r.learning.confidence === 'directional');
 }
 const scope = { userId: 'u', accountId: 'a', platform: 'meta', campaignId: 'c-0', now: '2026-05-02T00:00:00.000Z' };
