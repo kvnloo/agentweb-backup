@@ -263,6 +263,116 @@ If the user replies with a TYPED message instead of clicking an option, that ope
   },
 });
 
+// ENG-1635/1644 Phase 2: front-load MULTIPLE planning questions into one
+// swipeable deck instead of ask_user_question's one-per-turn serial
+// round-trips. Unlike ask_user_question, execute() does NO DB write and
+// builds NO deck — it returns a bare halt marker (questionDeckPayload),
+// mirroring exactly how a Meta write's halt works (call_meta_marketing_api's
+// awaitingUserConfirmation + metaWriteManifestDigest, no persistence at
+// execute time). The actual deck gets built at the SAME generalized
+// iteration-end seam that already builds write-decks (agentModeService.ts,
+// buildMetaWriteApprovalDeckFromHalts / buildQuestionApprovalDeckFromHalts),
+// so a question-deck renders through the identical pendingApprovalDeckId-
+// tagged message mechanism a write-deck already uses — not a separate,
+// unspecified rendering path (the gap that made an earlier version of this
+// design unshippable).
+emmaToolRegistry.register({
+  name: 'present_question_deck',
+  definition: {
+    name: 'present_question_deck',
+    description: `Ask the user 1-6 structured, blocking multiple-choice questions AT ONCE, front-loaded into a single swipeable deck the user fills and submits together — instead of one ask_user_question call per question (which is one-per-turn by design and forces N serial round-trips). Use this whenever you have MORE THAN ONE predictable planning question determinable right now (e.g. objective + budget + audience) — front-load everything you can into ONE call rather than spacing them across turns. A single genuine question is also valid (a "deck of one") when that's all you have right now.
+
+Each question needs 2-4 options, each with a one-line consequence. EXACTLY ONE option per question must be marked recommended:true with a one-line why grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d"). Optionally set allow_emma_decide:true on a question to offer a "Let Emma decide" delegation button for THAT question specifically (takes its recommended option).
+
+Do NOT call call_meta_marketing_api (or any other Meta write) in the SAME turn as this tool. If a write and a question-deck both halt in one turn, the write wins the turn (security-critical — a write must never dead-loop behind a lower-stakes planning question) and this question-deck is silently dropped, then re-asked automatically on a LATER turn once the write-deck is resolved — wasting a round-trip, not catastrophic, but avoidable. Front-load your questions on their own turn, before any write.
+
+After you call this the run BLOCKS until the user submits the whole deck — you will NOT be able to answer it yourself and no further action executes until they do. Do not restate the questions as prose asking for answers; emit this tool instead.
+
+ask_user_question remains available, unchanged, as a narrow escape hatch for a genuinely unpredictable question that only came up mid-execution — it is NOT the default path for planning questions determinable up front; use this tool for those.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 6,
+          description: '1-6 questions to front-load into one deck. A single question is valid — front-load whatever you actually have determinable right now.',
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string', description: 'The question to ask, e.g. "What daily budget should this campaign use?"' },
+              options: {
+                type: 'array',
+                minItems: 2,
+                maxItems: 4,
+                description: '2-4 options; exactly one with recommended:true and a one-line why.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+                    label: { type: 'string', description: 'Short button label, e.g. "$50/day".' },
+                    consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+                    recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+                    why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+                    payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+                  },
+                  required: ['label', 'consequence'],
+                },
+              },
+              allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button for THIS question (takes its recommended option).' },
+            },
+            required: ['question', 'options'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'present_question_deck requires an active session.' };
+    }
+    const rawQuestions = Array.isArray(args.questions) ? args.questions : [];
+    if (rawQuestions.length === 0) {
+      return { success: false, message: 'present_question_deck requires at least 1 question.' };
+    }
+
+    // Normalize each question's options the same way ask_user_question does
+    // (stable id assigned from position when the model omitted one) — the
+    // seam that builds the actual deck later trusts this shape as-is; full
+    // structural validation (exactly-one-recommended, no duplicate/reserved
+    // ids) happens once, at deck construction (approvalDeck.ts's
+    // validateItemShape), not duplicated here.
+    const questionDeckPayload = rawQuestions.map((q: any) => ({
+      question: q?.question,
+      options: Array.isArray(q?.options)
+        ? q.options.map((o: any, i: number) => ({
+            id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+            label: o?.label,
+            consequence: o?.consequence,
+            recommended: o?.recommended === true,
+            why: o?.why,
+            payload: o?.payload,
+          }))
+        : [],
+      allow_emma_decide: q?.allow_emma_decide === true,
+    }));
+
+    const summary = `Review the following ${questionDeckPayload.length} question(s) and submit your answers for all of them at once.`;
+    // awaitingUserConfirmation halts the loop, exactly like a Meta write's halt
+    // — no DB write, no deck built here (see the block comment above).
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'present_question_deck',
+      questionDeckPayload,
+      confirmationPrompt: summary,
+      summary,
+    };
+  },
+});
+
 function outputFieldNames(outputFields: unknown): string[] {
   if (!Array.isArray(outputFields)) return [];
   return outputFields
