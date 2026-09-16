@@ -1554,9 +1554,9 @@ export class AgentModeService {
   // transient throw inside registerTools leaving an empty registry — PERMANENT
   // for the process lifetime, with no reset. That is strictly worse than the bug
   // this branch fixes: before it, the per-message fresh instance re-ran
-  // registration and self-healed on the next message. So we latch on an actual
-  // success signal, a non-empty tool registry, and leave `initialized` false
-  // otherwise so the next caller retries.
+  // registration and self-healed on the next message. So we latch only on signals
+  // that can observably be false, and leave `initialized` false otherwise so the
+  // next caller retries.
   //
   // The flag is per-INSTANCE, not module-level, so tests that construct their own
   // AgentModeService in beforeEach still initialize normally.
@@ -1587,14 +1587,26 @@ export class AgentModeService {
   // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
   // that could never report failure:
   //
-  //   initializeMcp() — McpClientService.initialize() is structurally incapable of
-  //   rejecting (its whole body is inside try/catch, per-server failures are swallowed
-  //   deeper still in safeConnectToServer, and the config read has its own catch). A flag
+  //   initializeMcp() — McpClientService.initialize() cannot reject in practice. Its two
+  //   statements before the try (startSessionCleanup, a setInterval+unref; and
+  //   sweepStalePlaywrightConfigs, which has its own outer try/catch) cannot throw, the
+  //   rest of the body is inside try/catch, per-server failures are swallowed deeper
+  //   still in safeConnectToServer, and the config read has its own catch. A flag
   //   set on its success path is therefore constant true. A tool-count check would be
   //   wrong too: this deployment's only non-internal MCP server carries secret
   //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
   //   There is no signal here to gate on, and shipping one that always reads true is
   //   worse than none — it reads as coverage.
+  //
+  //   CAVEAT, because this is an operational fact rather than a code invariant: that
+  //   zero-tools property holds for mcp_config.ts AND for the current `mcp_servers`
+  //   settings row, which mcpClientService also reads at every boot. If an operator adds
+  //   a placeholder-free server there, a healthy boot registers a non-zero count and a
+  //   transient outage registers zero — and with no MCP signal in the latch, that outage
+  //   latches for the process lifetime rather than retrying on the next message. If that
+  //   day comes, the fix is a real signal (e.g. a getFailedServers() next to
+  //   serversWithSecretPlaceholders: "every server we actually attempted connected"),
+  //   NOT a tool count.
   //
   //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
   //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
@@ -1627,10 +1639,15 @@ export class AgentModeService {
     this.initializationPromise = this.runInitialize();
     try {
       await this.initializationPromise;
-      this.initialized =
-        AgentModeService.toolsRegistered &&
-        this.emmaToolsRegistered &&
-        this.toolRegistry.getAllTools().length > 0;
+      // Two conjuncts, both of which can observably be false. A third,
+      // `this.toolRegistry.getAllTools().length > 0`, was here and is deliberately gone:
+      // registerTools() registers four built-ins unconditionally after both of its
+      // try/catch blocks and ToolRegistry.register is a Map.set that cannot throw, so it
+      // could never report failure. That is the same defect this file deleted mcpStepOk
+      // for, and an inert conjunct in an && chain is worse than no conjunct — it reads as
+      // coverage. It also carried a FALSE coverage claim: mutating it to `true` fails no
+      // test, because no test can distinguish it.
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered;
       if (!this.initialized) {
         console.error(
           'AgentMode: initialize() completed but tool registration did not succeed ' +

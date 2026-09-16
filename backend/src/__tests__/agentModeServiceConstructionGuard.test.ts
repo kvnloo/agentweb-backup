@@ -47,6 +47,16 @@ const AGENT_MODE_SERVICE_MODULE = /(^|\/)agentModeService(\.js)?$/;
 
 const CLASS_NAME = 'AgentModeService';
 
+/** `X.AgentModeService` or `X['AgentModeService']` where X is a tracked module binding. */
+function memberResolvesToClass(node: ts.Expression, namespaces: Set<string>): boolean {
+  let base: ts.Expression | undefined;
+  if (ts.isPropertyAccessExpression(node) && node.name.text === CLASS_NAME) base = node.expression;
+  else if (ts.isElementAccessExpression(node) && isClassNameLiteral(node.argumentExpression)) base = node.expression;
+  if (!base) return false;
+  const b = unwrap(base);
+  return (ts.isIdentifier(b) && namespaces.has(b.text)) || isModuleLoadCall(b);
+}
+
 /** True for the string literal 'AgentModeService' in a computed member access. */
 function isClassNameLiteral(node: ts.Expression | undefined): boolean {
   return !!node && ts.isStringLiteralLike(node) && node.text === CLASS_NAME;
@@ -224,17 +234,41 @@ function collectClassBindings(sourceFile: ts.SourceFile): {
       direct.add(node.name.text);
     }
 
-    // const Alias = mod.AgentModeService  — namespace member pulled into a local.
+    // const Alias = mod.AgentModeService / mod['AgentModeService'] / (mod as any).X
+    // — a namespace member pulled into a local. unwrap() and the computed-member form
+    // reached the construction sites in an earlier round but not here, so the binding
+    // could simply be laundered one step before use.
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      if (memberResolvesToClass(unwrap(node.initializer), namespaces)) {
+        direct.add(node.name.text);
+      }
+    }
+
+    // C = mod.AgentModeService / mod['AgentModeService']  — the assignment twin.
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left) &&
+      memberResolvesToClass(unwrap(node.right), namespaces)
+    ) {
+      direct.add(node.left.text);
+    }
+
+    // const { AgentModeService: C } = mod  — destructuring off a tracked namespace
+    // binding. Destructuring directly off require()/import() was already covered.
     if (
       ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
+      ts.isObjectBindingPattern(node.name) &&
       node.initializer &&
-      ts.isPropertyAccessExpression(node.initializer) &&
-      node.initializer.name.text === CLASS_NAME &&
-      ts.isIdentifier(node.initializer.expression) &&
-      namespaces.has(node.initializer.expression.text)
+      ts.isIdentifier(unwrap(node.initializer)) &&
+      namespaces.has((unwrap(node.initializer) as ts.Identifier).text)
     ) {
-      direct.add(node.name.text);
+      for (const el of node.name.elements) {
+        const imported = el.propertyName ?? el.name;
+        if (ts.isIdentifier(imported) && imported.text === CLASS_NAME && ts.isIdentifier(el.name)) {
+          direct.add(el.name.text);
+        }
+      }
     }
 
     ts.forEachChild(node, visit);
@@ -298,7 +332,10 @@ export function countConstructions(content: string, fileName = 'source.ts'): num
         const b = unwrap(a.expression);
         if ((ts.isIdentifier(b) && namespaces.has(b.text)) || isModuleLoadCall(b)) count++;
       }
-      if (ts.isElementAccessExpression(a) && isClassNameLiteral(a.argumentExpression)) count++;
+      if (ts.isElementAccessExpression(a) && isClassNameLiteral(a.argumentExpression)) {
+        const b = unwrap(a.expression);
+        if ((ts.isIdentifier(b) && namespaces.has(b.text)) || isModuleLoadCall(b)) count++;
+      }
     }
 
     if (ts.isNewExpression(node)) {
@@ -663,6 +700,60 @@ describe('AgentModeService construction guard — detection behaviour', () => {
     const src = [
       "import * as other from './someOtherLib';",
       'const svc = Reflect.construct(other.AgentModeService, []);',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).not.toThrow();
+  });
+
+  // The six forms a fifth review round defeated the previous version with. All laundered
+  // the binding one step before constructing, which the construction-site checks could
+  // not see because unwrap() and the computed-member case had never reached the
+  // alias-tracking branches.
+  it('flags an alias taken from a computed module member', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      "const C = mod['AgentModeService'];",
+      'const svc = new C();',
+      'void svc;',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags an alias taken through parens or a cast', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'const A = (mod).AgentModeService;',
+      'const B = (mod as any).AgentModeService;',
+      'void new A(); void new B();',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService 2 time/);
+  });
+
+  it('flags the assignment form of a member alias', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'let C: any;',
+      "C = mod['AgentModeService'];",
+      'void new C();',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('flags destructuring off a namespace binding', () => {
+    const src = [
+      "import * as mod from './agentModeService';",
+      'const { AgentModeService: C } = mod;',
+      'void new C();',
+    ].join('\n');
+    expect(() => assertConstructionAllowed('services/someService.ts', src)).toThrow(/constructs AgentModeService/);
+  });
+
+  it('does not flag a same-named computed member from an unrelated module via Reflect', () => {
+    // The property-access spelling was gated last round; this one was not, so the false
+    // positive the previous commit claimed to fix still fired.
+    const src = [
+      "import * as other from './someOtherLib';",
+      "const svc = Reflect.construct(other['AgentModeService'], []);",
       'void svc;',
     ].join('\n');
     expect(() => assertConstructionAllowed('services/someService.ts', src)).not.toThrow();

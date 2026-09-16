@@ -78,7 +78,6 @@ describe('AgentModeService.initialize — idempotency (ENG-1852 follow-up)', () 
     service = new AgentModeService();
     // Spy on the private worker so these tests assert the guard itself, not any
     // particular side effect of the initialization body.
-    // The mock stands in for a SUCCESSFUL runInitialize, so it must set the same signals
     (AgentModeService as any).toolsRegistered = true;
     runSpy = jest
       .spyOn(service as any, 'runInitialize')

@@ -22,6 +22,9 @@ const generateMarketingResponse = jest.fn();
 // `new AgentModeService()`), so a value-shaped mock is what the real import resolves to.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    // Present deliberately — the worker latches on it; omitting it makes every test
+    // here run the degraded/retry branch without asserting anything.
+    isInitialized: true,
     initialize: jest.fn().mockResolvedValue(undefined),
     generateMarketingResponse,
     releaseSessionMcpClients: jest.fn().mockResolvedValue(undefined),
