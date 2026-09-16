@@ -1,0 +1,19 @@
+PASS src/__tests__/eng502.loop.test.ts
+PASS src/__tests__/agentModeService.metaAdsCRUD.test.ts
+PASS src/__tests__/accountMemory.test.ts
+PASS src/__tests__/eng918.getAdsThresholdsTool.test.ts
+PASS src/__tests__/eng918.adsThresholdsRoutes.test.ts
+PASS src/__tests__/eng1550.outcomeLedgerRoutes.test.ts
+PASS src/__tests__/eng1967.evaluator.test.ts
+PASS src/__tests__/eng502.capture.test.ts
+PASS src/__tests__/eng918.adsThresholds.test.ts
+PASS src/__tests__/clientHealth.test.ts
+PASS src/__tests__/eng1550.outcomeLedgerDb.test.ts
+PASS src/__tests__/eng1550.outcomeLedger.test.ts
+PASS src/__tests__/eng918.adsThresholdsDb.test.ts
+PASS src/__tests__/eng1968.learning.test.ts
+
+Test Suites: 14 passed, 14 total
+Tests:       409 passed, 409 total
+Snapshots:   0 total
+Time:        4.547 s, estimated 5 s

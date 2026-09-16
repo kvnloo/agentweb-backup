@@ -964,8 +964,8 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
+  AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -975,6 +975,12 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
   LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
   Use GET to verify a creative you just built or swapped onto an ad, and to read a
   placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+AD / AD_CREATIVE PREVIEW — render an existing ad or creative for one Meta placement.
+  AD requires ad_id; AD_CREATIVE requires params.creative_id. Pass params.ad_format (for example
+  DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY). The response contains Meta's
+  iframe HTML, not a permanent public URL; Meta preview iframes expire after 24 hours and are only
+  visible to people who can access the selected ad account.
 
 SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
   ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
@@ -1142,7 +1148,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1240,6 +1246,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
+            ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
@@ -1540,6 +1547,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
+        include_learning: { type: 'boolean', description: 'Include bounded shadow learning in global, client, campaign, channel order. Advisory only.' },
+        campaign_id: { type: 'string', description: 'Campaign scope for learning retrieval.' },
         platform: {
           type: 'string',
           enum: ['meta'],
@@ -1573,7 +1582,20 @@ emmaToolRegistry.register({
     const stored = await getThresholdsForAccount('meta', cleaned);
     const resolved = resolveThresholds(stored);
 
+    let learningResult: Record<string, unknown> = {};
+    if (args.include_learning === true) {
+      try {
+        const { getScopedLearning } = await import('../services/adsLearningDb');
+        learningResult = { learning: await getScopedLearning({ userId: context.userId, platform: 'meta', accountId: cleaned,
+          campaignId: typeof args.campaign_id === 'string' ? args.campaign_id : undefined, now: new Date().toISOString() }) };
+      } catch {
+        console.error('[AdsLearning] scoped retrieval unavailable');
+        learningResult = { learningUnavailable: true };
+      }
+    }
+
     return {
+      ...learningResult,
       success: true,
       platform: 'meta',
       account_id: cleaned,
@@ -9203,7 +9225,7 @@ ACTION MATRIX:
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
               REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?, target_google_search?, target_search_network?, target_content_network?, target_partner_search_network?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
@@ -9285,6 +9307,10 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
+        target_google_search: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google Search. Maps to network_settings.target_google_search.' },
+        target_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google search partners. Maps to network_settings.target_search_network.' },
+        target_content_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether Search campaigns use Display Network expansion. Set false to disable Display expansion. Maps to network_settings.target_content_network.' },
+        target_partner_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Controls a separate partner network available only to select eligible accounts. This does not control Google Search Partners; use target_search_network for that. Maps to network_settings.target_partner_search_network.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },

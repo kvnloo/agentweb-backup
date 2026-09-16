@@ -1,3 +1,4 @@
+import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
@@ -17776,7 +17777,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST': {
         // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
@@ -17859,6 +17860,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           creative,
         };
       }
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+        MetaService.assertOwnedByAccount(creative?.account_id, params.creative_id, 'Ad creative', accountId);
+        const previews = await metaService.generateAdPreview(accessToken, params.creative_id, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
@@ -17872,13 +17885,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
         // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
         // from the top-level argument or from params, since callers have used both spellings.
         return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        await metaService.getAd(accessToken, ad_id!, accountId);
+        const previews = await metaService.generateAdPreview(accessToken, ad_id!, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -19183,6 +19207,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
+        await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -19197,7 +19222,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        const result = await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        if (result.success === true && result.verified === true && result.new_creative_id) {
+          await recordCreativeLearningReceipt(userId, accountId, adId, result.new_creative_id, true);
+        }
+        return result;
       }
 
       // Standard ad-level update (status, name, etc.)
@@ -20085,6 +20114,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // message whichever layer sees it first. A GET with no id must never
           // fall through to something account-wide.
           throw new Error('AD_CREATIVE GET requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.creative_id) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -20099,6 +20132,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'PREVIEW' && !ad_id) {
+          throw new Error('AD PREVIEW requires "ad_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -39344,6 +39381,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
             finalUrlSuffix: args.final_url_suffix,
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+            targetPartnerSearchNetwork: args.target_partner_search_network,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be

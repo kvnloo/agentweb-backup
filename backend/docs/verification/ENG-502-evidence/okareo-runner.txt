@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "<okareo-tools>/reps/run_suite.py", line 29, in <module>
+    from reps.common import (  # noqa: E402
+  File "<okareo-tools>/reps/common.py", line 25, in <module>
+    from okareo import Okareo
+ModuleNotFoundError: No module named 'okareo'
