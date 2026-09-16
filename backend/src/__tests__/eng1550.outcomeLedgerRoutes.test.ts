@@ -296,3 +296,19 @@ it.each(['read', 'approve', 'revert', 'decline'])('logs a sanitized %s failure w
     expect(JSON.stringify(res.body)).not.toContain('secret-token');
   } finally { audit.mockRestore(); }
 });
+
+it('bounds and sanitizes request-controlled audit identifiers and error classes', async () => {
+  const { reviewLearning } = await import('../services/adsLearningReview');
+  const error = new Error('private content'); error.name = 'Provider\n' + 'x'.repeat(512);
+  (reviewLearning as jest.Mock).mockRejectedValueOnce(error);
+  const audit = jest.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const target = encodeURIComponent('lesson\n' + 'x'.repeat(512));
+    expect((await request(app()).post(`/api/outcome-ledger/meta/${OWNED}/learning/${target}/approve`)).status).toBe(409);
+    const fields = audit.mock.calls[0][1] as Record<string, string>;
+    for (const value of Object.values(fields)) {
+      expect(value.length).toBeLessThanOrEqual(128);
+      expect(value).toMatch(/^[a-zA-Z0-9_.:#-]*$/);
+    }
+  } finally { audit.mockRestore(); }
+});

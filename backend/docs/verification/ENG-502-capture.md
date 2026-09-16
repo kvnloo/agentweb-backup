@@ -261,3 +261,33 @@ because the GSI may lag a receipt or verdict; removing them would sacrifice data
 Docstring percentage is advisory: no behavior change was made solely to satisfy that metric.
 
 Learning read/review/revert/decline exception paths emit a sanitized structured error with actor, account, action, target ID and error class; messages, tokens and recommendation content are excluded. Client status/body contracts remain unchanged. Four failing audit regressions were reproduced before the fix.
+
+## Isolated comparison — 2026-09-16 UTC
+
+Official Okareo SDK with the REPS single-turn passthrough driver ran the same four
+read-only scenarios and three version-pinned checks against `https://api-stage.agentweb.pro`.
+Both baseline `c59c293abc13196e73161675ffb1f08c1db8e2f7` and changed
+`16e35bc169e07a838089193fe9f7ceb299ef6a02` reached EB Ready/Green in the development
+environment, using Dev-prefixed stores. Subsequent source changes only add bounded error
+metadata and reduce the cron page from 75 to 50; 459 focused tests and typecheck cover those
+changes, including unchanged HTTP responses. No model-facing behavior changed after that target.
+
+- Baseline: https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/d3f355e1-e0ca-4f46-8e85-115b4b250f81
+- Changed: https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/2ee4833f-2a91-4616-a76e-e8f473de8aa6
+- Changed deployment: https://github.com/AgentWebPro/agentweb/actions/runs/35045210008
+
+Both runs finished four scenarios with zero failed checks. Tool-selection mean: 5.000 →
+4.993; no-hallucinated-capabilities: 1.000 → 1.000; actionability: 4.939 → 4.589. All
+individual scored checks remain at least 4 (the existing rubric's clear/appropriate tier).
+Manual comparison confirms missing-client honesty, no invented adoption/causal benefit,
+unauthorized-ledger refusal, and no writes. These are semantic safety checks, not identical
+responses: the changed missing-account response explored accessible campaign data and discussed
+Meta delivery thresholds; this four-case run does not establish every threshold-tool path or
+statistical equivalence. The actionability decrease primarily penalizes not executing forbidden
+or impossible reads; it does not demonstrate a product regression. Deterministic focused tests
+cover actual optional-learning retrieval and authorization.
+
+Changed staging smoke: health 200; learning without auth 401; authenticated unowned-account
+learning and ledger reads 403. No synthetic production finding, receipt, review, threshold
+mutation, or settled outcome was created. Organic production full-loop acceptance remains
+not exercised until eligible data exists.

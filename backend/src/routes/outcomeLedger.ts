@@ -82,10 +82,11 @@ router.get('/:platform/:accountId', authenticateToken, async (req: any, res) => 
 
 /** Keep diagnostic scope without logging tokens, exception messages or recommendation content. */
 function logLearningFailure(req: any, action: string, error: unknown): void {
+  const field = (value: unknown) => typeof value === 'string' ? value.slice(0, 128).replace(/[^a-zA-Z0-9_.:#-]/g, '_') : undefined;
   console.error('[AdsLearning] request failed', {
-    userId: req.user?.userId, accountId: req.params.accountId, action,
-    targetId: req.params.memoryId ?? req.params.recommendationId,
-    error: error instanceof Error ? error.name : 'unknown',
+    userId: field(req.user?.userId), accountId: field(req.params.accountId), action: field(action),
+    targetId: field(req.params.memoryId ?? req.params.recommendationId),
+    error: field(error instanceof Error ? error.name : 'unknown'),
   });
 }
 
