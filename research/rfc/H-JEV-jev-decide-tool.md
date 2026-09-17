@@ -24,9 +24,9 @@ Fail-open on timeout/error — never block the agent loop.
 
 ## Acceptance (Phase 1)
 
-- [ ] #10 — `jevTools.ts` in Emma tool catalog
-- [ ] #11 — JSON fixture tests
-- [ ] Document env vars
+- [x] #10 — `jevTools.ts` in Emma tool catalog
+- [x] #11 — JSON fixture tests
+- [x] Document env vars (`backend/.env.example`)
 
 ## Sub-issues
 

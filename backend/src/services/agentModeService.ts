@@ -1976,6 +1976,7 @@ export class AgentModeService {
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
         await import('../emma/calendarTools');
+        await import('../emma/jevTools');
         await import('../emma/localAgentTools');
 
         AgentModeService.toolsRegistered = true;
