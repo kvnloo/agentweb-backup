@@ -143,3 +143,62 @@ describe('incrementUsageWithSpendEvent', () => {
     await expect(usageRecordDb.incrementUsageWithSpendEvent(increment, spendEvent())).rejects.toThrow('boom');
   });
 });
+
+describe('incrementUsageWithDedupeMarker (ENG-1958)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+  });
+
+  it('pairs the aggregate ADD with a conditional marker Put in ONE transaction', async () => {
+    await usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'vendor-key-1');
+    const items = mockDynamoDB.transactWrite.mock.calls[0][0].TransactItems;
+    expect(items).toHaveLength(2);
+    expect(items[0].Update).toBeDefined();
+    expect(items[1].Put.ConditionExpression).toBe('attribute_not_exists(userId) AND attribute_not_exists(sk)');
+  });
+
+  it('writes the marker to its own idem# partition, keyed on the idempotencyKey, with a ttl', async () => {
+    await usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'vendor-key-1');
+    const marker = mockDynamoDB.transactWrite.mock.calls[0][0].TransactItems[1].Put.Item;
+    expect(marker.userId).toBe('idem#owner-1');
+    expect(marker.sk).toBe('vendor-key-1');
+    expect(typeof marker.ttl).toBe('number');
+  });
+
+  it('the marker carries no provider/unit/cost, so it can never read as a usage row', async () => {
+    await usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'vendor-key-1');
+    const marker = mockDynamoDB.transactWrite.mock.calls[0][0].TransactItems[1].Put.Item;
+    expect(marker).not.toHaveProperty('provider');
+    expect(marker).not.toHaveProperty('unit');
+    expect(marker).not.toHaveProperty('costMicroUsd');
+  });
+
+  it('a replayed key is reported as duplicate (marker condition failed), not an error', async () => {
+    mockDynamoDB.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(cancelled([{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }])),
+    });
+    await expect(usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'k')).resolves.toBe('duplicate');
+  });
+
+  it('a LEDGER condition failure (index 0) is NOT read as a duplicate', async () => {
+    mockDynamoDB.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(cancelled([{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }])),
+    });
+    await expect(usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'k')).rejects.toBeDefined();
+  });
+
+  it('reports a pure conflict as retryable', async () => {
+    mockDynamoDB.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(cancelled([{ Code: 'TransactionConflict' }, { Code: 'None' }])),
+    });
+    await expect(usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'k')).resolves.toBe('conflict');
+  });
+
+  it('propagates an unrelated failure rather than classifying it', async () => {
+    mockDynamoDB.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(Object.assign(new Error('boom'), { code: 'ProvisionedThroughputExceededException' })),
+    });
+    await expect(usageRecordDb.incrementUsageWithDedupeMarker(increment, 'owner-1', 'k')).rejects.toThrow('boom');
+  });
+});

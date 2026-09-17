@@ -239,6 +239,13 @@ describe('Placid render metering (ENG-698)', () => {
     mockGetExecution.mockResolvedValue({ taskId: 'task-1', result_files: [] });
     mockUpdateExecution.mockResolvedValue(undefined);
     mockPutObject.mockResolvedValue({});
+    // ENG-1972: the render is a REST create (POST) that returns a URL, then a GET
+    // of that URL for the bytes. The token is the same one the editor-token and
+    // template-listing calls already use.
+    mockGetToken.mockResolvedValue('placid-private-token');
+    mockAxiosPost.mockResolvedValue({
+      data: { id: 77, status: 'finished', image_url: 'https://cdn.placid.test/out.png' },
+    });
     mockAxiosGet.mockResolvedValue({ data: new ArrayBuffer(8), headers: { 'content-type': 'image/png' } });
   });
 
@@ -292,7 +299,7 @@ describe('Placid render metering (ENG-698)', () => {
   });
 
   it('does not record when Placid returned no image', async () => {
-    mockAxiosGet.mockRejectedValue(new Error('404 template'));
+    mockAxiosPost.mockRejectedValue(new Error('404 template'));
     const r = res();
     await generateFromTemplateToExecution(renderReq(), r);
 

@@ -43,7 +43,7 @@ export interface UnipileSentInvitation {
   invitationId: string;        // Unipile invitation id (for withdraw, if ever needed)
   invitedUserName: string;
   invitationText: string;
-  sentAt: string;              // ISO — Unipile parsed_datetime when the invite was sent
+  sentAt: string;              // ISO — earliest estimate of the send (exact for our own sends; LinkedIn's relative age otherwise). See resolveLedgerSentAt (ENG-1938)
   syncedAt: string;            // ISO — when this row was last written
 }
 

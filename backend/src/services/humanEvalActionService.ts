@@ -55,6 +55,10 @@ async function reviseAgentModeImage(
     // ready," so silence here reads as the bot having forgotten. Tell them explicitly
     // instead of leaving that promise unfulfilled with no explanation.
     if (isSessionBusyError(error)) {
+      // Reachable only via a Slack thread reply, so a real posted message must already
+      // exist — but the type is optional now (ENG-1854, posting can be skipped), so guard
+      // explicitly rather than asserting.
+      if (!candidate.slackChannel) return;
       const { postSlackMessage } = await import('./slackService');
       await postSlackMessage(
         candidate.slackChannel,

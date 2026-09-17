@@ -24,6 +24,7 @@ import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboa
 import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './contactEventsDb';
 import { LLM_CHARGE_EVENTS_TABLE, LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX } from './llmChargeAuditDb';
 import { SPEND_EVENTS_TABLE, SPEND_EVENTS_OCCURRED_AT_INDEX } from './spendEventDb';
+import { SPEND_PROJECTION_TABLE } from './spendProjectionDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -79,6 +80,23 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
     // accidental console/API delete is unrecoverable. Guard it. Purely
     // additive protection -- it prevents a delete, it cannot orphan, expose or
     // lose data, so it is the opposite of what the data-plane gate guards.
+    DeletionProtectionEnabled: true,
+  },
+  {
+    // ENG-1250 §3b -- persisted monthly projection for fast admission. Keyed
+    // exactly at the read shape (billingUserId + billingMonth), a single Get.
+    // Delete-protected like the ledger; no TTL (authoritative for admission,
+    // rebuildable from events).
+    TableName: SPEND_PROJECTION_TABLE,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'billingMonth', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'billingMonth', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
     DeletionProtectionEnabled: true,
   },
   {

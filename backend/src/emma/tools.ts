@@ -16,7 +16,7 @@ import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
-import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   buildPendingUserQuestion,
@@ -75,16 +75,40 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     const sessionId = context?.sessionId;
 
-    const candidate = await humanEvalService.createCandidate({
-      reviewType: args.review_type as HumanEvalReviewType,
-      outputSummary: args.output_summary,
-      artifactUrl: args.artifact_url,
-      chatUrl: args.chat_url,
-      originalRequest: args.original_request,
-      agentRunId: args.agent_run_id,
-      userId,
-      sessionId,
-    });
+    // ENG-1854: this manual path bypasses enqueueAutoHumanEval entirely (it calls
+    // createCandidate directly), so it never went through that function's own dedup — an
+    // auto-trigger could already have posted this exact artifact (e.g. right after
+    // generate_image completes) before Emma also decides to send it herself. Claim the
+    // artifact URL first so whichever path gets here first wins, not both.
+    let claimedArtifact = false;
+    if (args.artifact_url) {
+      if (!(await claimArtifactForHumanEval(args.artifact_url))) {
+        return {
+          success: true,
+          message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
+        };
+      }
+      claimedArtifact = true;
+    }
+
+    let candidate;
+    try {
+      candidate = await humanEvalService.createCandidate({
+        reviewType: args.review_type as HumanEvalReviewType,
+        outputSummary: args.output_summary,
+        artifactUrl: args.artifact_url,
+        chatUrl: args.chat_url,
+        originalRequest: args.original_request,
+        agentRunId: args.agent_run_id,
+        userId,
+        sessionId,
+      });
+    } catch (err) {
+      // Release the claim on failure — otherwise a transient createCandidate error
+      // permanently blackholes this artifact from ever being sent for review again.
+      if (claimedArtifact) await releaseArtifactClaim(args.artifact_url);
+      throw err;
+    }
 
     return {
       success: true,
@@ -268,7 +292,15 @@ function enqueueLeadEnrichmentEval(input: {
   toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
 }): void {
   const processedCount = Number(input.summary?.processedCount ?? 0);
-  if (!input.userId || processedCount <= 0) return;
+  const failedCount = Number(input.summary?.failedCount ?? 0);
+  // ENG-1854: a routine, zero-failure enrichment run was never a real candidate for human
+  // review — it's a completion log entry, not a judgment call. This was the dominant source
+  // of #eval-queue noise (confirmed via a real Slack dump: near-identical "processed N,
+  // failed 0" posts, minutes apart, differing only by list). Only enqueue when something's
+  // actually anomalous. Does not apply to rerunLeadEnrichment (humanEvalActionService.ts) —
+  // that path fires because a human explicitly asked for and is waiting on this specific
+  // re-run, so it should always report back regardless of outcome.
+  if (!input.userId || processedCount <= 0 || failedCount <= 0) return;
 
   const fields = outputFieldNames(input.outputFields);
   const runId = typeof input.summary?.runId === 'string' && input.summary.runId
@@ -964,8 +996,8 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
+  AD_CREATIVE   → LIST, GET, PREVIEW, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, PREVIEW, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -975,6 +1007,12 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
   LIST omits asset_feed_spec, so it cannot tell you what a specific creative actually contains.
   Use GET to verify a creative you just built or swapped onto an ad, and to read a
   placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
+
+AD / AD_CREATIVE PREVIEW — render an existing ad or creative for one Meta placement.
+  AD requires ad_id; AD_CREATIVE requires params.creative_id. Pass params.ad_format (for example
+  DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY). The response contains Meta's
+  iframe HTML, not a permanent public URL; Meta preview iframes expire after 24 hours and are only
+  visible to people who can access the selected ad account.
 
 SCOPING AND COMPLETENESS ON EVERY LIST — read this before reporting that something is absent.
   ALWAYS pass campaign_id (or ad_set_id) when you care about one campaign or ad set. AD LIST
@@ -1142,7 +1180,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "PREVIEW", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1240,6 +1278,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             link_url: { type: "string", description: "Destination URL." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
+            ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
 
             // --- Custom Audience ---
             subtype: { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
@@ -1540,6 +1579,8 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
+        include_learning: { type: 'boolean', description: 'Include bounded shadow learning in global, client, campaign, channel order. Advisory only.' },
+        campaign_id: { type: 'string', description: 'Campaign scope for learning retrieval.' },
         platform: {
           type: 'string',
           enum: ['meta'],
@@ -1573,7 +1614,20 @@ emmaToolRegistry.register({
     const stored = await getThresholdsForAccount('meta', cleaned);
     const resolved = resolveThresholds(stored);
 
+    let learningResult: Record<string, unknown> = {};
+    if (args.include_learning === true) {
+      try {
+        const { getScopedLearning } = await import('../services/adsLearningDb');
+        learningResult = { learning: await getScopedLearning({ userId: context.userId, platform: 'meta', accountId: cleaned,
+          campaignId: typeof args.campaign_id === 'string' ? args.campaign_id : undefined, now: new Date().toISOString() }) };
+      } catch {
+        console.error('[AdsLearning] scoped retrieval unavailable');
+        learningResult = { learningUnavailable: true };
+      }
+    }
+
     return {
+      ...learningResult,
       success: true,
       platform: 'meta',
       account_id: cleaned,
@@ -4921,7 +4975,8 @@ emmaToolRegistry.register({
       return_scenes: args.return_scenes,
       start_time: args.start_time,
       end_time: args.end_time,
-      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
+      userId: context?.userId, // charge this describe_video spend to the caller (ENG-200)
+      sessionId: context?.sessionId, // ENG-1961: trace the row back to the chat
     });
   }
 });
@@ -6341,7 +6396,7 @@ emmaToolRegistry.register({
   name: 'launch_predefined_work_plan',
   definition: {
     name: 'launch_predefined_work_plan',
-    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Two distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously.',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Three distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously; (3) the user already declined this exact plan by clicking "Keep chatting" on its recommendation card — confirm the user actually wants to start it now, then call again with confirmedDeclinedPlan=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6352,13 +6407,20 @@ emmaToolRegistry.register({
         force: {
           type: 'boolean',
           description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        },
+        confirmedDeclinedPlan: {
+          type: 'boolean',
+          description: 'Set to true to launch a plan the user previously declined via "Keep chatting". Only do this after the user explicitly confirms they want to start it now.'
         }
       },
       required: ['planTitle']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+      force: args.force === true,
+      confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
+    });
   }
 });
 
@@ -8071,14 +8133,26 @@ emmaToolRegistry.register({
         // The combined set this issue is asserting is broken/unavailable, whether stated
         // explicitly via the field or implied by its own wording — both verified identically.
         const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
-        if (effectiveUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+        // ENG-1945 follow-up (live-prod finding): the model has no legitimate way to learn
+        // its own agentRuntimeRunId — it is never surfaced in any tool result or prompt text
+        // — so requiring it to TYPE that id back (as the original version of this gate did)
+        // made even an honest same-turn claim unverifiable; live testing confirmed the model
+        // simply invents a plausible-looking placeholder ("current-run") instead. Default to
+        // `context.currentRunId` — the server's OWN id for the run this call is executing
+        // within, threaded in by toolDispatch.ts, not something the model can fake or
+        // mistype — whenever the model doesn't supply an explicit `run_id`. An EXPLICIT
+        // `run_id` argument still takes priority when given, preserving ENG-939's citing-a-
+        // DIFFERENT-run case (a reviewer analysing another session) exactly as before.
+        const explicitRunId = typeof issue.run_id === 'string' && issue.run_id.trim() ? issue.run_id.trim() : undefined;
+        const effectiveRunId = explicitRunId ?? (typeof context?.currentRunId === 'string' ? context.currentRunId : undefined);
+        if (effectiveUnavailableTools.length > 0 && !effectiveRunId) {
           const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
           throw new Error(
             `Cannot file "${issue.title}": ${viaWording
               ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
               : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
-            } — that requires run_id so the claim can be checked against that run's actual tool-call telemetry. Include ` +
-            `the run_id from THIS session, or reword the report so it does not assert a specific tool is broken/unavailable.`
+            } — that requires a resolvable run to check the claim against, and none is available (no run_id given and no ` +
+            `current run context). Only call report_product_issues about a tool being broken from within an active agent run.`
           );
         }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
@@ -8090,15 +8164,18 @@ emmaToolRegistry.register({
         let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
         let affectedSessionId: string | undefined;
         let affectedUserUnresolved = false;
-        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+        // Uses `effectiveRunId` (explicit run_id, else the server-supplied current run) so
+        // an in-progress agent run gets its dossier auto-attached even when the model never
+        // passed run_id explicitly — not just when claimed_unavailable_tools forces the issue.
+        if (effectiveRunId) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
-            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const { runs } = await fetchAgentRunSummaries({ runId: effectiveRunId, limit: 1 });
             const run = runs[0];
             if (!run) {
               if (effectiveUnavailableTools.length > 0) {
                 throw new Error(
-                  `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
+                  `Cannot file "${issue.title}": run_id "${effectiveRunId}" does not resolve to a known run, so ` +
                   `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
                   `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
                 );
@@ -8243,6 +8320,10 @@ emmaToolRegistry.register({
               ? user.email
               : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
             sessionId: affectedSessionId ?? context?.sessionId,
+            // ENG-1961: who PAYS for the dedup judge is the caller running this
+            // tool, never `userEmail` — under ENG-939 that is the affected user
+            // of a cross-user review, who did not ask for the analysis.
+            actingUserId: userId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
@@ -9188,7 +9269,7 @@ ACTION MATRIX:
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
               REMOVE (conversion_action_resource_name; requires confirm_conversion_action_removal=true AND a matching conversion_action_removal_token from the disclosure halt) stops the action recording permanently. The flag alone does nothing — a token minted for a DIFFERENT conversion action is refused too, so never reuse one.
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?, target_google_search?, target_search_network?, target_content_network?, target_partner_search_network?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
@@ -9270,6 +9351,10 @@ ACTION MATRIX:
           },
         },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
+        target_google_search: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google Search. Maps to network_settings.target_google_search.' },
+        target_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether ads serve on Google search partners. Maps to network_settings.target_search_network.' },
+        target_content_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Whether Search campaigns use Display Network expansion. Set false to disable Display expansion. Maps to network_settings.target_content_network.' },
+        target_partner_search_network: { type: 'boolean', description: 'CAMPAIGN UPDATE only. Controls a separate partner network available only to select eligible accounts. This does not control Google Search Partners; use target_search_network for that. Maps to network_settings.target_partner_search_network.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD, AD LIST/CREATE, AD_GROUP UPDATE. For KEYWORD ADD_NEGATIVE, required only as an alternative to campaign_resource_name (either one works). Not used by KEYWORD REMOVE, which identifies the keyword via criterion_resource_name alone.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },

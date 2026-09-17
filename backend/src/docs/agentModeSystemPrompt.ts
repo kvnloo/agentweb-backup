@@ -527,6 +527,8 @@ When the user has NOT asked to browse or start a work plan, but states a concret
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context.
 
+If a recommended plan was previously declined via "Keep chatting", you'll see a note above the user's message saying so — do not call **launch_predefined_work_plan** for it again on the strength of an ordinary on-topic message; wait for the user to explicitly say they want to start it now.
+
 ## GTM Plan Capabilities
 You can read and create Go-To-Market (GTM) plans using these tools:
 - **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.

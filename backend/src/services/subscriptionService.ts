@@ -14,6 +14,11 @@ export interface SubscriptionType {
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
+  /** ENG-1978, observation only, never persisted: true when the stored row carried NO
+   *  `allowedSkills` and it was defaulted to ["*"] on read. Set by getSubscriptionTypeConfig so
+   *  the skills path can record that silent full-registry grant without this function's ~18 other
+   *  callers each emitting a duplicate for the same malformed row. */
+  allowedSkillsDefaulted?: boolean;
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
@@ -45,6 +50,192 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
 export const SUBSCRIPTION_FEATURES = {
   SCHEDULED_CHATS: "scheduled_chats",
 } as const;
+
+/**
+ * ENG-1978 — observation only, no behaviour change.
+ *
+ * Several paths through this file resolve to `["*"]`, which grants every registered tool: an
+ * unknown tier name, a malformed `subscription_types` row, an empty allowedSkills list, and any
+ * thrown error. Only the explicit `["*"]` in a tier config is deliberate.
+ *
+ * Whether those paths ever actually fire in production is unknown, because nothing has ever
+ * recorded them — the error cases log a bare `console.error` with no user and no marker, and the
+ * non-error cases log nothing at all. "We have never had a problem" is therefore not evidence:
+ * a silent over-grant looks exactly like normal operation from the outside.
+ *
+ * This records them so the question can be answered with data before anyone changes the
+ * behaviour. Deliberately NOT a fix — see the PR for the fail-closed change this is meant to
+ * de-risk, and why shipping that blind was judged too risky.
+ *
+ * Sink is injectable so this can be routed at a real alerting surface without this module
+ * reaching for one (same shape as usageWriteFailureMonitor's `setDroppedWriteAlertSink`). There
+ * is no metrics facade in this codebase; a greppable marker prefix is the house convention.
+ */
+/**
+ * Two DISTINCT kinds, deliberately not summable:
+ *
+ *  - `wildcard-grant`   every registered tool was just granted because something failed.
+ *                       This is the number that answers "how risky is the current fail-open?"
+ *  - `unconfirmed-tier` the tier could not be CONFIRMED for this user, but the grant that
+ *                       followed may have been perfectly normal and restricted.
+ *
+ * Keeping them apart matters more than it looks. `unconfirmed-tier` is expected to be the
+ * highest-volume reason, and it frequently accompanies a *restricted* result — an unreadable
+ * user row still resolves to a real Free tier with a real skill list. Counting those as
+ * over-grants would oversize the risk and argue for the fail-closed change on false evidence,
+ * which is the opposite of what this instrumentation is for.
+ */
+// Round-2 review: grep both markers, not just WILDCARD-GRANT, and break down by `kind` — do not
+// sum them. `[entitlement]` is the shared prefix precisely so one grep catches both.
+export type EntitlementObservationKind = "wildcard-grant" | "unconfirmed-tier";
+
+export interface EntitlementObservationEvent {
+  kind: EntitlementObservationKind;
+  reason: string;
+  userId: string;
+  detail: Record<string, unknown>;
+}
+
+export type WildcardGrantSink = (event: EntitlementObservationEvent) => void;
+
+const DEFAULT_ENTITLEMENT_SINK: WildcardGrantSink = (event) => {
+  // Both markers share the `[entitlement]` prefix on purpose — `grep '\[entitlement\]'` catches
+  // both kinds; then break down by the `kind` field in each JSON line rather than summing them.
+  const marker =
+    event.kind === "wildcard-grant"
+      ? "[entitlement] WILDCARD-GRANT granting all tools without a confirmed entitlement:"
+      : "[entitlement] UNCONFIRMED-TIER entitlement resolved from an unconfirmed tier:";
+  console.warn(marker, JSON.stringify(event));
+};
+
+let emitWildcardGrant: WildcardGrantSink = DEFAULT_ENTITLEMENT_SINK;
+
+/** Route entitlement observations somewhere other than the console (tests, alerting). */
+export function setWildcardGrantSink(sink: WildcardGrantSink): void {
+  emitWildcardGrant = sink;
+}
+
+/** Restore the console sink. Tests must call this rather than installing a silent stub, or every
+ *  test declared after theirs runs with observation disabled. */
+export function resetWildcardGrantSink(): void {
+  emitWildcardGrant = DEFAULT_ENTITLEMENT_SINK;
+  unconfirmedTierWindow = null;
+}
+
+function emitEntitlementObservation(event: EntitlementObservationEvent): void {
+  try {
+    // `Promise.resolve(...)` on purpose: the sink is typed `=> void`, but TypeScript happily
+    // accepts an `async` function there, and a rejected promise would escape this synchronous
+    // catch entirely — surfacing as an unhandled rejection, which under Node's default in EB
+    // terminates the process. Observation must never be the reason the SERVER fails, not just
+    // the reason a check fails.
+    void Promise.resolve(emitWildcardGrant(event)).catch(() => {});
+  } catch {
+    // A synchronous throw from the sink.
+  }
+}
+
+/**
+ * `unconfirmed-tier` windowed dedupe (round-2 review, finding #4).
+ *
+ * `settingsService.getSetting` is uncached, so a DynamoDB brownout wide enough to hit the users
+ * table also hits it — every `getAllowedSkills` call then emits one line, and this runs on every
+ * agent turn, `/me`, and every Emma turn with an active skill. Unthrottled, a sustained incident
+ * fills the EB instance's capped journald (`SystemMaxUse=200M`, `.ebextensions/06-log-retention`)
+ * in hours, evicting the logs `request-environment-info --info-type tail/bundle` reads — the
+ * production debugging path documented in this repo's own CLAUDE.md. That file's own comment on
+ * those caps: "the app fix removes the source; these bound the blast radius regardless" — i.e.
+ * the house rule is fix the source, not lean on the caps.
+ *
+ * `wildcard-grant` stays per-event: it is low-volume by construction (a genuine full-registry
+ * grant, not a routine unresolved lookup) and per-user attribution is load-bearing there — the
+ * PR's whole point is knowing whether an over-grant hit one user or four hundred.
+ */
+const UNCONFIRMED_TIER_WINDOW_MS = 60_000;
+
+interface UnconfirmedTierWindow {
+  count: number;
+  distinctUserIds: Set<string>;
+  byReason: Record<string, number>;
+  firstAt: string;
+  lastAt: string;
+  sampleUserId: string;
+  startedAt: number;
+}
+
+let unconfirmedTierWindow: UnconfirmedTierWindow | null = null;
+
+function emitUnconfirmedTierWindow(): void {
+  const pending = unconfirmedTierWindow;
+  unconfirmedTierWindow = null;
+  if (!pending) return;
+  emitEntitlementObservation({
+    kind: "unconfirmed-tier",
+    reason: "windowed-summary",
+    userId: pending.sampleUserId,
+    detail: {
+      count: pending.count,
+      distinctUserCount: pending.distinctUserIds.size,
+      byReason: pending.byReason,
+      firstAt: pending.firstAt,
+      lastAt: pending.lastAt,
+      windowMs: UNCONFIRMED_TIER_WINDOW_MS,
+    },
+  });
+}
+
+/**
+ * Emit whatever the open window holds, if anything (mirrors
+ * usageWriteFailureMonitor.flushDroppedWriteAlerts). Without this the LAST window of an incident
+ * is never reported — `reportUnconfirmedTier` only flushes when a later call arrives after the
+ * window expires, so when the failures stop, exactly when someone starts investigating, the
+ * final batch sits unemitted. Call periodically (e.g. a low-frequency interval) or at shutdown;
+ * not required for correctness within a sustained incident, only for its tail.
+ */
+export function flushUnconfirmedTierObservations(now: number = Date.now()): void {
+  if (!unconfirmedTierWindow) return;
+  if (now - unconfirmedTierWindow.startedAt >= UNCONFIRMED_TIER_WINDOW_MS) {
+    emitUnconfirmedTierWindow();
+  }
+}
+
+function reportUnconfirmedTier(
+  reason: string,
+  userId: string,
+  detail: Record<string, unknown> = {},
+  now: number = Date.now()
+): void {
+  if (unconfirmedTierWindow && now - unconfirmedTierWindow.startedAt >= UNCONFIRMED_TIER_WINDOW_MS) {
+    emitUnconfirmedTierWindow();
+  }
+  if (!unconfirmedTierWindow) {
+    unconfirmedTierWindow = {
+      count: 0,
+      distinctUserIds: new Set(),
+      byReason: {},
+      firstAt: new Date(now).toISOString(),
+      lastAt: new Date(now).toISOString(),
+      sampleUserId: userId,
+      startedAt: now,
+    };
+  }
+  unconfirmedTierWindow.count += 1;
+  unconfirmedTierWindow.distinctUserIds.add(userId);
+  unconfirmedTierWindow.byReason[reason] = (unconfirmedTierWindow.byReason[reason] || 0) + 1;
+  unconfirmedTierWindow.lastAt = new Date(now).toISOString();
+  // Not gated on `detail` — kept for parity with the per-event shape, unused by the summary.
+  void detail;
+}
+
+/** Every registered tool was just granted because something could not be resolved. Per-event,
+ *  not windowed — see the comment on UNCONFIRMED_TIER_WINDOW_MS for why the two kinds differ. */
+function reportWildcardGrant(
+  reason: string,
+  userId: string,
+  detail: Record<string, unknown> = {}
+): void {
+  emitEntitlementObservation({ kind: "wildcard-grant", reason, userId, detail });
+}
 
 export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
 
@@ -231,6 +422,11 @@ export async function getSubscriptionTypeConfig(
           name: "Basic",
           allowedPages: getAllAvailablePages(),
           allowedSkills: ["*"],
+          // ENG-1978 (observation only): this ["*"] is hardcoded here, not authored by an admin
+          // in the subscription_types config — it only fires when that setting is entirely
+          // absent, a degraded bootstrap state. Flagged the same as the missing-allowedSkills
+          // case in the well-formed branch below, so getAllowedSkills can record it.
+          allowedSkillsDefaulted: true,
         };
       }
       return null;
@@ -248,10 +444,20 @@ export async function getSubscriptionTypeConfig(
     // treat as all skills allowed (wildcard)
     const allowedSkills = subscriptionType.allowedSkills || ["*"];
 
+    // ENG-1978 (observation only): flag the legacy shape rather than reporting it here.
+    //
+    // This function has ~18 callers across unrelated subsystems — token usage, LLM usage policy,
+    // unit economics, Stripe, the evaluation store, plus allowedPages/Features/HiddenPages — so
+    // emitting from this point would fire on every one of them for a single malformed row, which
+    // is a firehose, not an observation. The report belongs to the skills path only, so the fact
+    // is carried out and recorded by getAllowedSkills instead.
+    const allowedSkillsDefaulted = !subscriptionType.allowedSkills;
+
     // Normalize paths: remove "/marketing" prefix from allowedPages
     return {
       ...subscriptionType,
       allowedSkills,
+      allowedSkillsDefaulted,
       allowedPages: subscriptionType.allowedPages.map((page: string) => {
         if (page.startsWith('/marketing/')) {
           return page.replace('/marketing', '');
@@ -360,26 +566,67 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
       return getPublicAllowedSkills();
     }
 
-    const subscriptionTypeName = await getUserSubscriptionType(userId);
+    // ENG-1978 (observation only): `resolved: false` means the tier could not be confirmed —
+    // a missing user row, an unreadable org owner, or an org-lookup blip. Behaviour is unchanged;
+    // we still use the tier name exactly as before. This only records that the grant below rests
+    // on an unconfirmed tier.
+    const { subscriptionType: subscriptionTypeName, resolved } =
+      await getUserSubscriptionResolution(userId);
+    if (!resolved) {
+      // NOT a wildcard-grant: the assumed tier below is frequently a real, restricted one, so
+      // this is recorded under its own kind and must not be summed with the over-grants.
+      // Windowed (not per-event): expected to be the highest-volume reason, and unlike
+      // wildcard-grant it is not itself a security-relevant over-grant, so a summary with a
+      // count/distinct-user-count is a better 2-week signal than one line per occurrence.
+      reportUnconfirmedTier("subscription-type-unresolved", userId, {
+        assumedSubscriptionType: subscriptionTypeName,
+      });
+    }
+
     const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
 
     if (!subscriptionType) {
       // If subscription type not found, return wildcard for all
+      reportWildcardGrant("subscription-type-config-unavailable", userId, {
+        subscriptionTypeName,
+      });
       return ["*"];
     }
 
     // If all skills are allowed, return wildcard
-    if (
-      subscriptionType.allowedSkills.includes("*") ||
-      subscriptionType.allowedSkills.length === 0
-    ) {
+    if (subscriptionType.allowedSkills.includes("*")) {
+      // Distinguish "an admin deliberately typed ["*"]" from "the row carried no allowedSkills at
+      // all and was defaulted to ["*"] on read" — the latter is a silent full-registry grant and
+      // the likeliest real malformation, being the documented pre-`allowedSkills` config shape.
+      if (subscriptionType.allowedSkillsDefaulted) {
+        // Two distinct causes share the flag; kept separable in the data by name rather than
+        // subscriptionTypeName alone ("Basic" is itself a real tier name a config could also use).
+        const reason =
+          subscriptionTypeName === "Basic"
+            ? "legacy-basic-fallback-no-tier-config"
+            : "tier-config-missing-allowed-skills";
+        reportWildcardGrant(reason, userId, { subscriptionTypeName });
+      }
+      return ["*"];
+    }
+
+    // An empty list currently means "everything", not "nothing". That is almost certainly
+    // inverted (FREE_TIER_FALLBACK is `allowedSkills: []`, commented "No premium skills on Free
+    // tier"), but no live tier is empty today, so this records the case instead of changing it.
+    if (subscriptionType.allowedSkills.length === 0) {
+      reportWildcardGrant("empty-allowed-skills-treated-as-wildcard", userId, {
+        subscriptionTypeName,
+      });
       return ["*"];
     }
 
     return subscriptionType.allowedSkills;
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error getting allowed skills:", error);
     // Default to allowing all skills on error
+    reportWildcardGrant("allowed-skills-lookup-failed", userId, {
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
@@ -389,7 +636,12 @@ export async function getAllowedSkills(userId: string): Promise<string[]> {
  * For __other_skills__, returns tools not associated with any published skill
  * Returns ["*"] if input contains "*"
  */
-export async function resolveSkillsToToolNames(skillIds: string[]): Promise<string[]> {
+export async function resolveSkillsToToolNames(
+  skillIds: string[],
+  /** ENG-1978 observation only — attributes the event below. Optional so no caller is forced to
+   *  change; when absent the event is still emitted, just unattributed. */
+  userIdForObservation?: string
+): Promise<string[]> {
   try {
     if (skillIds.includes("*")) {
       return ["*"];
@@ -413,8 +665,12 @@ export async function resolveSkillsToToolNames(skillIds: string[]): Promise<stri
     }
 
     return Array.from(toolNames);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error resolving skills to tool names:", error);
+    reportWildcardGrant("skill-to-tool-resolution-failed", userIdForObservation || "(unattributed)", {
+      skillIds,
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
@@ -515,10 +771,15 @@ export async function getAllowedFunctionCalls(
 ): Promise<string[]> {
   try {
     const allowedSkillIds = await getAllowedSkills(userId);
-    return resolveSkillsToToolNames(allowedSkillIds);
-  } catch (error) {
+    // `return await`, not bare `return`: a returned rejected promise is adopted OUTSIDE the try
+    // block, so the catch below could never see it (pre-existing, unrelated to the observation).
+    return await resolveSkillsToToolNames(allowedSkillIds, userId);
+  } catch (error: any) {
     console.error("Error getting allowed function calls:", error);
     // Default to allowing all functions on error
+    reportWildcardGrant("allowed-function-calls-failed", userId, {
+      error: error?.message || String(error),
+    });
     return ["*"];
   }
 }
