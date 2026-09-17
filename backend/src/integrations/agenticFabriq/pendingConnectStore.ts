@@ -64,9 +64,8 @@ export async function createPendingConnect(
   if (!previous && !connected.has(accountKey) && pending.size + connected.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
   const state = crypto.randomBytes(32).toString('hex');
   if (previous) pending.delete(previous.connectionId);
-  // Replace this account's completed slot; reads require fresh verification.
-  // Allocate and check collisions first so failure preserves the old binding.
-  connected.delete(accountKey);
+  // Preserve a completed slot until the replacement is verified. A failed
+  // vendor initiation must not revoke an already-working mailbox binding.
   pending.set(connectionId, { userId, accountId, provider, connectionId, createdAt: nowMs, stateDigest: crypto.createHash('sha256').update(state).digest(), verificationAttempts: 0 });
   return { connectionId, state };
 }
@@ -117,7 +116,11 @@ export async function finishPendingConnectVerification(
   const record = pending.get(connectionId);
   if (!record || record.verificationId !== verificationId) return false;
   if (expired(record, Date.now())) { pending.delete(connectionId); return false; }
-  if (outcome === 'connected') connected.set(connectionIdForAccount(record.accountId, record.userId), connectionId);
+  if (outcome === 'connected') {
+    const accountKey = connectionIdForAccount(record.accountId, record.userId);
+    connected.delete(accountKey);
+    connected.set(accountKey, connectionId);
+  }
   if (outcome !== 'retry' || record.verificationAttempts >= 3) pending.delete(connectionId);
   else delete record.verificationId;
   return true;

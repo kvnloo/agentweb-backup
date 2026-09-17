@@ -25,13 +25,24 @@ describe('bounded single-use OAuth state', () => {
 
     const replacement = await create('u', 'mailbox-0', 'gmail', 1002);
     expect(replacement.connectionId).not.toBe(first.connectionId);
-    expect(verifiedConnectionIdForAccount('mailbox-0', 'u')).toBeUndefined();
+    expect(verifiedConnectionIdForAccount('mailbox-0', 'u')).toBe(first.connectionId);
     expect(await beginPendingConnectVerification(first.connectionId, 1003)).toBeNull();
     await expect(create('u', 'new-mailbox', 'gmail', 1003)).rejects.toThrow(/capacity/);
     const fresh = await beginPendingConnectVerification(replacement.connectionId, 1003);
     expect(await finishPendingConnectVerification(replacement.connectionId, fresh!.verificationId, 'connected')).toBe(true);
     expect(verifiedConnectionIdForAccount('mailbox-0', 'u')).toBe(replacement.connectionId);
     await expect(create('u', 'new-mailbox', 'gmail', 1004)).rejects.toThrow(/capacity/);
+  });
+
+  it('preserves a working binding when replacement initiation is abandoned', async () => {
+    const first = await create('u', 'mailbox', 'gmail', 1000);
+    const verification = await beginPendingConnectVerification(first.connectionId, 1001);
+    await finishPendingConnectVerification(first.connectionId, verification!.verificationId, 'connected');
+
+    const replacement = await create('u', 'mailbox', 'gmail', 1002);
+    await deletePendingConnect(replacement.connectionId, replacement.state);
+
+    expect(verifiedConnectionIdForAccount('mailbox', 'u')).toBe(first.connectionId);
   });
 
   it('fails closed on a random connection collision without replacing another binding', async () => {
