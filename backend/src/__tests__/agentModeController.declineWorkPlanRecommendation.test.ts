@@ -12,7 +12,6 @@
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import * as predefinedWorkPlanResolver from '../services/predefinedWorkPlanResolver';
 import { AuthenticatedRequest } from '../middleware/auth';
 
 jest.mock('../services/chatbotService', () => ({
@@ -79,7 +78,6 @@ const authedUser: AuthenticatedRequest['user'] = { userId: 'user-1', email: 'a@a
 describe('agentModeController.declineWorkPlanRecommendation', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    jest.spyOn(predefinedWorkPlanResolver, 'resolveAccessiblePredefinedWorkPlan').mockResolvedValue({} as any);
   });
 
   it('returns 401 when unauthenticated', async () => {
@@ -139,6 +137,24 @@ describe('agentModeController.declineWorkPlanRecommendation', () => {
     );
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  // Independent review finding: the write's boolean result was previously discarded,
+  // so this endpoint answered 200 even when the decline was never actually recorded
+  // (the only path that returns false: the session was deleted/purged in the window
+  // between the getChatSession check and this write) -- a silently-unrecorded decline
+  // is exactly the "the model has no idea this was declined" defect this PR exists to
+  // close. A false-positive 200 here would have gone completely undetected.
+  it('returns 404 (not a false-positive 200) when the write does not actually record — the session vanished between the fetch and the write', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockChatbotDb.recordDeclinedWorkPlanRecommendation.mockResolvedValue(false);
+    const req = mockRequest(authedUser, { sessionId: 'sess-1', recommendationId: 'reco-abc' });
+    const res = mockResponse();
+
+    await agentModeController.declineWorkPlanRecommendation(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.json).not.toHaveBeenCalledWith({ success: true });
   });
 
   // ENG-1974's whole point: declining must only ever record the decline, never
