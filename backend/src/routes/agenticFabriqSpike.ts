@@ -26,6 +26,24 @@ const INIT_WINDOW_MS = 10 * 60 * 1000;
 const INIT_LIMIT = 5;
 const initAttempts = new Map<string, number[]>();
 
+class InvalidMailboxError extends Error {}
+
+async function resolveRequestedEmailAccount(userId: string, accountId: string) {
+  try {
+    const resolved = await resolveEmailAccount(userId, accountId, 'read');
+    if (resolved.platform !== 'gmail' || resolved.ownerUserId !== userId || resolved.accountId !== accountId) {
+      throw new InvalidMailboxError();
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof InvalidMailboxError) throw error;
+    if (error instanceof Error && /connected account .* not found|not an email account/i.test(error.message)) {
+      throw new InvalidMailboxError();
+    }
+    throw error;
+  }
+}
+
 /** Applies a small process-local limit; the allowlist already bounds key cardinality. */
 function consumeInitAllowance(userId: string, nowMs = Date.now()): boolean {
   const recent = (initAttempts.get(userId) ?? []).filter((at) => nowMs - at < INIT_WINDOW_MS);
@@ -60,17 +78,17 @@ router.get('/init', authenticateToken, async (req: any, res) => {
   let challenge: PendingConnectChallenge | undefined;
   try {
     await bootstrapEmailProviders();
-    const resolved = await resolveEmailAccount(userId, accountId, 'read');
-    if (resolved.platform !== 'gmail' || resolved.ownerUserId !== userId || resolved.accountId !== accountId) {
-      return res.status(400).json({ error: 'unsupported_mailbox' });
-    }
+    await resolveRequestedEmailAccount(userId, accountId);
     const { appId } = await getAgenticFabriqAppCredentials();
     challenge = await createPendingConnect(userId, accountId, PROVIDER);
     await agenticFabriqClient.ensureExternalUser(appId, userId); // idempotent — 409 tolerated internally
     const initiated = await agenticFabriqClient.initiateOAuth(appId, userId, PROVIDER, challenge);
     res.json({ success: true, oauth_url: initiated.oauth_url });
-  } catch {
+  } catch (error) {
     if (challenge) await deletePendingConnect(challenge.connectionId, challenge.state);
+    if (error instanceof InvalidMailboxError) {
+      return res.status(400).json({ error: 'unsupported_mailbox' });
+    }
     console.error('[ENG-1685 spike] initiation failed');
     res.status(502).json({ error: 'agentic_fabriq_initiate_failed', message: 'Could not start the Agentic Fabriq connect flow.' });
   }

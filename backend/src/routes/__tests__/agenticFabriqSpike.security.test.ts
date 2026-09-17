@@ -115,6 +115,21 @@ describe('hostile Fabriq OAuth routes', () => {
     expect(mockEnsure).not.toHaveBeenCalled();
     expect(mockInitiate).not.toHaveBeenCalled();
   });
+  it.each([
+    [new Error('Connected account "mailbox" not found. Use list_connected_accounts to get valid account IDs.'), 'unknown'],
+    [new Error('Account "mailbox" is a drive account, not an email account.'), 'non-email'],
+  ])('returns 400 for mailbox input without contacting the vendor: %s', async (error) => {
+    mockResolve.mockRejectedValueOnce(error);
+    expect((await invoke('/init', { account_id: 'mailbox' }, `invalid-${error.message.length}`)).statusCode).toBe(400);
+    expect(mockEnsure).not.toHaveBeenCalled();
+    expect(mockInitiate).not.toHaveBeenCalled();
+  });
+  it('preserves 502 for mailbox lookup infrastructure failures', async () => {
+    mockResolve.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+    expect((await invoke('/init', { account_id: 'mailbox' }, 'infrastructure-user')).statusCode).toBe(502);
+    expect(mockEnsure).not.toHaveBeenCalled();
+    expect(mockInitiate).not.toHaveBeenCalled();
+  });
 
   it.each([undefined, 'afct_fixture', '0'.repeat(64), ['hostile']])('does not use vendor state as callback authentication: %j', async state => {
     const issued = await create('route-user', 'mailbox', 'gmail');
