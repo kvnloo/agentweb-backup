@@ -54,33 +54,6 @@ interface PlacidImageResponse {
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
- * A Placid failure in the form a log reader can act on: the HTTP status and the
- * vendor's own message, not just "Request failed with status code 403".
- *
- * That bare axios string cost three round-trips of investigation on ENG-1972 —
- * the answer turned out to be sitting in the response body all along
- * (`{"message":"Requires Subscription and Credits"}`: the account had no
- * subscription, so no render could ever succeed). Placid's error bodies carry no
- * credentials; the request headers, which do, are never touched here.
- */
-export function describePlacidError(error: unknown): string {
-  const res = (error as { response?: { status?: number; data?: unknown } })?.response;
-  const message = error instanceof Error ? error.message : String(error);
-  if (!res) return message;
-
-  let body: string;
-  try {
-    body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-  } catch {
-    body = '<unserializable response body>';
-  }
-  // Bounded: an HTML error page would otherwise flood the log.
-  if (body && body.length > 500) body = `${body.slice(0, 500)}…`;
-
-  return `HTTP ${res.status ?? '?'}${body ? `: ${body}` : ''} (${message})`;
-}
-
-/**
  * Whether `candidate` addresses the same scheme+host as `base`. Used to decide
  * if a URL handed back by the API may carry our private token.
  */
@@ -92,6 +65,52 @@ function isSameOrigin(candidate: string, base: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** One log record, bounded — see describePlacidError. */
+export const MAX_DESCRIBED_ERROR_CHARS = 600;
+
+/** Collapse newlines and runs of whitespace so one failure is one log line. */
+function toSingleLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * A Placid failure in the form a log reader can act on: the HTTP status and the
+ * vendor's own message, not just "Request failed with status code 403".
+ *
+ * That bare axios string cost three round-trips of investigation on ENG-1972 —
+ * the answer was sitting in the response body all along
+ * (`{"message":"Requires Subscription and Credits"}`: the account had no
+ * subscription, so no render could ever succeed). Placid's error bodies carry no
+ * credentials; the request headers, which do, are never touched here.
+ *
+ * The RESULT is what is bounded, on one line — not just the body. A vendor can
+ * put its megabyte in the status text or in a multiline message just as easily
+ * as in the body, and this repo has already had a disk-fill incident from
+ * oversized log records.
+ */
+export function describePlacidError(error: unknown): string {
+  const res = (error as { response?: { status?: number; data?: unknown } })?.response;
+  const message = error instanceof Error ? error.message : String(error);
+
+  let described: string;
+  if (!res) {
+    described = message;
+  } else {
+    let body: string;
+    try {
+      body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    } catch {
+      body = '<unserializable response body>';
+    }
+    described = `HTTP ${res.status ?? '?'}${body ? `: ${body}` : ''} (${message})`;
+  }
+
+  const flat = toSingleLine(described);
+  return flat.length > MAX_DESCRIBED_ERROR_CHARS
+    ? `${flat.slice(0, MAX_DESCRIBED_ERROR_CHARS)}…`
+    : flat;
 }
 
 /** Who a successful render is billed to (ENG-698 / ENG-1957). */

@@ -25,6 +25,7 @@ jest.mock('axios', () => ({
 import {
   renderPlacidImage,
   describePlacidError,
+  MAX_DESCRIBED_ERROR_CHARS,
   PlacidRenderError,
   PLACID_POLL_ATTEMPTS,
 } from '../services/placidRenderService';
@@ -284,13 +285,32 @@ describe('describePlacidError (ENG-1972)', () => {
     expect(describePlacidError(new Error('socket hang up'))).toBe('socket hang up');
   });
 
-  it('bounds a huge body so an HTML error page cannot flood the log', () => {
+  // Greptile + CodeRabbit, PR #2952: capping only the body still let the status
+  // text or a multiline axios message produce an oversized or multiline record —
+  // and this repo has had a disk-fill incident from exactly that.
+  it('bounds the WHOLE formatted record, not just the body', () => {
     const err = Object.assign(new Error('boom'), {
       response: { status: 500, data: '<html>' + 'x'.repeat(5000) + '</html>' },
     });
 
-    expect(describePlacidError(err).length).toBeLessThan(700);
-    expect(describePlacidError(err)).toContain('…');
+    const described = describePlacidError(err);
+    expect(described.length).toBeLessThanOrEqual(MAX_DESCRIBED_ERROR_CHARS + 1); // + the ellipsis
+    expect(described).toContain('…');
+  });
+
+  it('bounds a huge message even when there is no response body', () => {
+    const described = describePlacidError(new Error('x'.repeat(5000)));
+    expect(described.length).toBeLessThanOrEqual(MAX_DESCRIBED_ERROR_CHARS + 1);
+  });
+
+  it('emits one line, whatever the vendor sends', () => {
+    const err = Object.assign(new Error('line one\nline two'), {
+      response: { status: 502, data: 'first\n\nsecond\r\nthird' },
+    });
+
+    const described = describePlacidError(err);
+    expect(described).not.toMatch(/[\r\n]/);
+    expect(described).toContain('first second third');
   });
 
   it('does not throw on an unserializable body', () => {
