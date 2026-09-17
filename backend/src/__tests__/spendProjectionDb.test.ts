@@ -70,6 +70,18 @@ describe('putProjection', () => {
     await expect(putProjection(aProjection({ billingMonth: bad }))).rejects.toThrow(/bad month/);
     expect(mockDynamoDB.put).not.toHaveBeenCalled();
   });
+
+  it('canonicalises a valid computedAt to a UTC ISO instant', async () => {
+    const result = await putProjection(aProjection(), '2026-09-17T10:00:00+01:00');
+    // +01:00 normalises to 09:00Z
+    expect(result.computedAt).toBe('2026-09-17T09:00:00.000Z');
+    expect(mockDynamoDB.put.mock.calls[0][0].Item.computedAt).toBe('2026-09-17T09:00:00.000Z');
+  });
+
+  it.each(['', 'not-a-date'])('refuses an unparseable computedAt %p', async (bad) => {
+    await expect(putProjection(aProjection(), bad)).rejects.toThrow(/ISO-8601 instant/);
+    expect(mockDynamoDB.put).not.toHaveBeenCalled();
+  });
 });
 
 describe('getProjection', () => {

@@ -54,7 +54,15 @@ export async function putProjection(projection: MonthlyProjection, computedAt: s
         `${JSON.stringify({ billingUserId: projection.billingUserId, billingMonth: projection.billingMonth })}`,
     );
   }
-  const item: PersistedProjection = { ...projection, computedAt };
+  // computedAt is documented as an ISO-8601 instant. A caller-supplied value is
+  // otherwise written unchanged (CodeRabbit, PR #2951), so a garbage string
+  // would silently violate the contract a reader relies on for freshness.
+  // Canonicalise a valid instant; reject anything unparseable.
+  const parsed = Date.parse(computedAt);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`computedAt must be an ISO-8601 instant, got ${JSON.stringify(computedAt)}`);
+  }
+  const item: PersistedProjection = { ...projection, computedAt: new Date(parsed).toISOString() };
   await db().put({ TableName: SPEND_PROJECTION_TABLE, Item: item }).promise();
   return item;
 }
