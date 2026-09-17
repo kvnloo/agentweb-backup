@@ -315,6 +315,7 @@ app.use((req, res, next) => {
 });
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
+app.use("/api/slack/events", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 // Stripe Connect webhook needs its own raw-body handler — also before express.json().
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
