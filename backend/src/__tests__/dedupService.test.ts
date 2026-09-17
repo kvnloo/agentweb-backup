@@ -48,3 +48,35 @@ describe('dedupService.findDuplicate', () => {
     expect(await findDuplicate({ type: 'bug', title: 'x', description: 'y' }, CANDS)).toBeNull();
   });
 });
+
+// ENG-1961: the judge is an LLM call the caller triggered. It used to run with no
+// usage context at all, so its spend booked to the `system` placeholder —
+// recorded, but charged to nobody.
+describe('dedupService.findDuplicate attribution (ENG-1961)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('bills the triggering user and tags the feature', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0, reason: 'different' }));
+    await findDuplicate(
+      { type: 'bug', title: 'crash on save', description: 'x' },
+      CANDS,
+      { userId: 'user-7', sessionId: 'sess-7' },
+    );
+
+    const options = (agentModeService.callLLM as jest.Mock).mock.calls[0][2];
+    expect(options.usageContext).toEqual({
+      userId: 'user-7',
+      sessionId: 'sess-7',
+      feature: 'intake_dedup',
+    });
+  });
+
+  it('meters feature-only rather than inventing a user when none is in scope', async () => {
+    mockJudge(JSON.stringify({ matchedIndex: null, confidence: 0, reason: 'different' }));
+    await findDuplicate({ type: 'bug', title: 'crash', description: 'x' }, CANDS);
+
+    const options = (agentModeService.callLLM as jest.Mock).mock.calls[0][2];
+    expect(options.usageContext).toEqual({ feature: 'intake_dedup' });
+    expect(options.usageContext.userId).toBeUndefined();
+  });
+});

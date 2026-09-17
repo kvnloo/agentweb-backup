@@ -71,7 +71,7 @@ import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3450,7 +3450,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -4587,6 +4587,33 @@ export class AgentModeService {
                 `unavailable-capability notice so the answer cannot read as that tool's output`
               );
               content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          /*
+           * ENG-1899: same shape as the unavailable-capability notice directly above — UNCONDITIONAL
+           * on `coding_agent`'s own deterministic acceptance-check result, not on detecting a false
+           * claim in the prose, and PREPENDED so the true state is seen before the model's own
+           * possibly-false claim rather than after it. Own kill switch per this block's convention:
+           * a false positive here prepends a scary banner to an otherwise-correct answer, so standing
+           * it down must be a config change, not a revert-and-redeploy.
+           *
+           * `content` is passed through as `currentContent` so a turn that echoes an EARLIER turn's
+           * already-decorated response from conversation history (live env1 finding: two consecutive
+           * failed coding_agent calls in one session — the original incident's own shape — can produce
+           * exactly this) does not get a second, duplicated banner prepended on top.
+           */
+          const codingAgentAcceptanceNoticeEnabled =
+            process.env.AGENT_CODING_AGENT_ACCEPTANCE_NOTICE !== 'false';
+          if (codingAgentAcceptanceNoticeEnabled && content) {
+            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls, content);
+            if (acceptanceNotice) {
+              console.warn(
+                `AgentMode: coding_agent's acceptance check failed in session ${sessionId} — ` +
+                `prepending a verification notice so the answer cannot read as a passed check`
+              );
+              content = `${acceptanceNotice}\n\n${content}`;
               if (responseMessage) responseMessage.content = content;
             }
           }
@@ -5748,6 +5775,40 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1974. "Keep chatting" on a workplan recommendation card leaves no
+   * trace anywhere in the conversation — the recommendation's tool-call
+   * result just sits in session.messages as permanent context, so Emma has
+   * no signal the user declined, and any vaguely on-topic next message could
+   * get her to self-launch it via launch_predefined_work_plan (live-confirmed
+   * on env1, twice: neither an accept click nor a suggested reply, just an
+   * ordinary continuation). This states the real fact — a declined
+   * recommendation exists — directly in context, before Emma's own read of
+   * the conversation forms, same discipline as the ENG-1899 acceptance
+   * notice: a ledger fact stated unconditionally beats hoping the model
+   * infers it from an absence of signal.
+   *
+   * Returns [] when nothing has been declined this session, so a session
+   * that never hit this path carries zero extra tokens.
+   */
+  public static buildDeclinedWorkPlanRecommendationContextMessages(
+    declined?: Record<string, { planId: string; planTitle: string; declinedAt: string }>,
+  ): any[] {
+    const entries = declined ? Object.values(declined) : [];
+    if (entries.length === 0) return [];
+
+    const titles = entries.map((e) => `"${e.planTitle}"`).join(', ');
+    const plural = entries.length > 1;
+    const content =
+      `[SYSTEM] The user already declined the following recommended work plan${plural ? 's' : ''} by clicking ` +
+      `"Keep chatting" on ${plural ? 'their' : 'its'} recommendation card: ${titles}. Do not call ` +
+      `launch_predefined_work_plan for ${plural ? 'any of these plans' : 'this plan'} on the strength of an ` +
+      `ordinary, ambiguous, or on-topic message — treat the next message as a genuinely new request. Only launch ` +
+      `${plural ? 'one of them' : 'it'} if the user explicitly says they want to start ${plural ? 'that plan' : 'it'} now.`;
+
+    return [{ role: 'user', content }];
+  }
+
+  /**
    * Extract the filenames of images already generated in this session by scanning
    * the "Image generated: <filename>" system messages that generateImage persists
    * (see generateImage -> addMessageToSession). De-duplicated, order-preserving.
@@ -5810,7 +5871,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5982,6 +6043,12 @@ export class AgentModeService {
         messages.push({ role: 'assistant', content: assetAwarenessText });
       }
     }
+
+    // ENG-1974: declined-recommendation notice is independent of whether an
+    // active work plan exists — a session can have declined one plan and
+    // still be mid-way through an unrelated one, or have declined a plan and
+    // have nothing active at all.
+    messages.push(...AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(declinedWorkPlanRecommendations));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
@@ -9385,6 +9452,8 @@ export class AgentModeService {
       end_time?: string;
       /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
       userId?: string;
+      /** Chat session the analysis belongs to, so the ledger row is traceable (ENG-1961). */
+      sessionId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -9597,8 +9666,17 @@ export class AgentModeService {
 
       // Charge (record + deduct when a userId is present; absorb under "system"
       // otherwise). The client above is un-metered, so this is the single meter.
+      // ENG-1961: named `describe_video` rather than the catch-all `agent_task`,
+      // and carrying the session, so this spend is attributable the same way
+      // describeImage's is. The user was already correct (ENG-200).
       meterUsageFromResponse(
-        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        {
+          userId: options?.userId,
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          model: modelName,
+          provider: 'gemini',
+          feature: 'describe_video',
+        },
         response
       );
 
@@ -16928,8 +17006,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * error) — the guard then delivers the message unchanged and records a loud
    * claim_check_error (see core/finalizeGuard.ts).
    *
-   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
-   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (a cheap/fast classification
+   * model) instead of the run's own llmModel: this is a bounded
    * classification task, not conversational generation, and every flagged
    * reply pays for this call, so keeping it cheap directly reduces the
    * guard's latency/cost footprint at scale (PR #2005 left this as a
@@ -17008,37 +17086,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       throw new Error('finalize-guard correction returned no content');
     }
     return text.trim();
-  }
-
-  /**
-   * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
-   * Returns true if the message needs to be handled, false otherwise.
-   */
-  public async triageSlackMessage(message: string): Promise<boolean> {
-    try {
-      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
-
-Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
-Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
-
-      const response = await this.callLLM(DIAGNOSIS_MODEL, [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message },
-      ], {
-        max_completion_tokens: 10,
-        temperature: 0,
-        taskClass: 'mcp_api',
-      });
-
-      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
-      const needsHandling = content.startsWith('yes');
-      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
-      return needsHandling;
-    } catch (error) {
-      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
-      return true; // default to handling on error to avoid missing client questions
-    }
   }
 
   public async listMetaAdsCampaigns(userId: string): Promise<any> {
@@ -31774,7 +31821,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       // Upload to S3 with the same path as the original file
       const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+      // ENG-1997 — this is the shared upload sink for BOTH updateHtmlFile's
+      // part/full replacements and updateHtmlFileCss's selector-based edits.
+      // The latter's `setAttribute` operation lets the model set an arbitrary
+      // attribute name/value pair directly (e.g. onerror/onclick), and its
+      // replace/append/etc. actions splice raw HTML with no escaping — same
+      // "LLM-authored HTML reaches a public S3 file unsanitized" trust gap
+      // createHtmlFile had, one step more direct since there's no need to even
+      // reproduce untrusted quoted text, the tool call arguments ARE the payload.
+      const sanitizedContent = sanitizeGeneratedHtml(content);
+      const uploadResult = await uploadFileToS3WithPath(sanitizedContent, filename, 'text/html', path);
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload updated file');
@@ -32312,8 +32369,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
         const filename = buildHtmlArtifactFilename(title);
-        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        // ENG-1997 — the passthrough uploads the model's own draft verbatim with no
+        // render step in between, so if it faithfully reproduced markup from
+        // untrusted quoted content (a CRM note, a client quote), nothing else in
+        // this path would ever catch it. Sanitize before it ever reaches S3.
+        const sanitizedContent = sanitizeGeneratedHtml(contentDraft);
+        const uploadableHtml = await this.inlinePrivateS3Images(sanitizedContent, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
           const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -32548,8 +32611,15 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const filename = buildHtmlArtifactFilename(title);
-      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      // ENG-1997 — the render step has no {{variable}} boundary to escape values
+      // into (unlike createHtmlFromTemplate/ENG-1877): it's told to copy names,
+      // quotes, and numbers from the draft verbatim, so any markup embedded in
+      // untrusted quoted content can survive the render unchanged. Sanitize the
+      // finished document before it reaches S3.
+      const sanitizedHtmlContent = sanitizeGeneratedHtml(htmlContent);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedHtmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
@@ -32719,8 +32789,13 @@ Return the HTML body fragment for this section only.`;
     try {
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
-      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
+      // ENG-1997 — renderMarkdownReportDocumentAsync already escapes text nodes,
+      // but sanitize defensively here too so this path never silently becomes the
+      // odd one out if that changes.
+      const sanitizedFallbackHtml = sanitizeGeneratedHtml(fallbackHtml);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedFallbackHtml, documentType, userId);
       const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
@@ -33279,7 +33354,7 @@ ${strippedHtml}`;
    *
    * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
    */
-  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean }): Promise<any> {
     try {
       const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
@@ -33352,6 +33427,31 @@ ${strippedHtml}`;
           return {
             success: false,
             message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
+      }
+
+      // ENG-1974: the user already declined this exact plan via "Keep chatting"
+      // on its recommendation card. recommendationId is a deterministic hash
+      // of (sessionId, planId) — recompute it here for the RESOLVED planId
+      // (not the raw planTitleOrId argument) so this correlates exactly
+      // whether launch_predefined_work_plan was called with a title or an id;
+      // no fuzzy title matching needed. `accept` always passes
+      // skipDeclineGate — the user's own explicit accept click must never be
+      // blocked by an earlier decline of any recommendation. Same risk tier
+      // as the force:true retry above (reversible, conversational), not the
+      // harder human-attributed tier checkQuestionGate exists for.
+      if (!options?.skipDeclineGate && !options?.confirmedDeclinedPlan) {
+        const declinedRecommendationId = createHash('sha256')
+          .update(`${sessionId}:${predefinedPlan.planId}`)
+          .digest('hex')
+          .slice(0, 32);
+        const declined = session.declinedWorkPlanRecommendations?.[declinedRecommendationId];
+        if (declined) {
+          return {
+            success: false,
+            message: `The user already declined "${declined.planTitle}" (clicked "Keep chatting" on its recommendation). Ask the user to confirm they want to start it now, then call launch_predefined_work_plan again with confirmedDeclinedPlan=true to proceed.`,
             requiresConfirmation: true,
           };
         }
@@ -33638,6 +33738,96 @@ ${strippedHtml}`;
     }
   }
 
+  // ENG-1875: LLM-judge check for whether the user's most recent REAL message
+  // explicitly authorized removing the scope named in `candidates`, so a
+  // `modify_work_plan removeStepCounts` call that would otherwise create new
+  // ENG-1811 debt doesn't ledger it when the user genuinely asked for the cut.
+  // Sibling to ENG-1819's userExplicitlyRequestedStop (agentModeController.ts)
+  // -- same model/timeout/parse shape, reusing that ticket's live-tested
+  // finding that gemini-3.1-flash-lite needs headroom for an internal
+  // reasoning trace before it emits "yes"/"no". Deliberately a separate
+  // function rather than a shared refactor: the two fail in different
+  // directions on purpose (see below), and this codebase already accepts
+  // duplicating debt-check logic outright (workPlanCompletedWithoutDebt's own
+  // comment, ~line 3735 in agentModeController.ts) rather than risk a shared
+  // path used by ~150 mocking test files.
+  //
+  // Fails SAFE toward "not authorized": any error/timeout/no-message returns
+  // `false`, so the debt is ledgered exactly as before this fix existed. This
+  // is the opposite bias from ENG-1819 (which fails toward NOT suppressing a
+  // continuation) because the risk here is asymmetric the other way -- a
+  // false "yes" would silently reopen the exact ENG-1811 gaming hole this
+  // ledger exists to close, while a false "no" only costs one harmless extra
+  // attempt at already-removed scope.
+  //
+  // Known, accepted limitation (fresh-eyes review, PR #2959): the judge only
+  // sees the user's raw message text, not the assistant's preceding turn. A
+  // common real flow -- assistant proposes "I'll skip step 2 since X, sound
+  // good?" and the user replies with a bare "yes"/"go ahead" -- won't mention
+  // the scope by name and will likely be judged "no", ledgering debt even
+  // though the removal was genuinely authorized. This under-covers the fix's
+  // own motivating scenario, but fails in the SAFE direction (extra debt, not
+  // a reopened gaming hole) -- not fixed here because doing so needs the
+  // assistant's own preceding message as judge context too, a real scope
+  // increase for a Low-priority, narrowly-scoped ticket, not a copy of an
+  // existing pattern the way the rest of this fix is.
+  private readonly STEP_REMOVAL_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+  private readonly STEP_REMOVAL_JUDGE_TIMEOUT_MS = 8000;
+
+  private async wasStepRemovalUserAuthorized(
+    sessionId: string,
+    candidates: Array<{ fn: string; stepTitle: string }>,
+  ): Promise<boolean> {
+    try {
+      const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+      if (!recent?.content) return false;
+      const scopeList = candidates
+        .map((c) => `- step "${c.stepTitle}" (still needs to call: ${c.fn})`)
+        .join('\n');
+      const system = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+The assistant is about to remove one or more steps from the plan before completing required actions those steps call for. Decide whether the user's message EXPLICITLY instructs removing, skipping, or dropping this specific scope -- as opposed to a general instruction, unrelated request, or the assistant's own unprompted decision.
+
+The steps being removed:
+${scopeList}
+
+Answer "yes" only if the user's message clearly and explicitly authorizes skipping this scope (even if phrased casually -- "skip step 2", "don't bother with the export", "we don't need that anymore").
+
+Answer "no" for everything else, including messages that don't mention this scope at all, or only vaguely relate to it.
+
+Reply with ONLY one word: yes or no.`;
+      const llmPromise = this.callLLM(
+        this.STEP_REMOVAL_JUDGE_MODEL,
+        [
+          { role: 'system', content: system },
+          { role: 'user', content: recent.content.slice(0, 2500) },
+        ],
+        {
+          temperature: 0,
+          max_completion_tokens: 500,
+          taskClass: 'scheduled_background',
+          usageContext: { feature: 'step_removal_authorization_judge' },
+        },
+      );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('step-removal judge timed out')), this.STEP_REMOVAL_JUDGE_TIMEOUT_MS)
+      );
+      const res: any = await Promise.race([llmPromise, timeoutPromise]);
+      if (res?.choices?.[0]?.finish_reason === 'length') {
+        console.warn(
+          `AgentMode: work-plan step-removal authorization judge for session ${sessionId} was ` +
+          `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+          `this may be silently missing a real authorization.`
+        );
+      }
+      const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+      return raw.startsWith('yes');
+    } catch (err) {
+      console.error(`AgentMode: work-plan step-removal authorization judge failed for session ${sessionId}:`, err);
+      return false; // fail-safe: never skip debt on judge failure
+    }
+  }
+
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       // ENG-1793: consistentRead=true so this read of session.workPlan /
@@ -33695,15 +33885,54 @@ ${strippedHtml}`;
       const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
       if (removeStepCounts && removeStepCounts.length > 0) {
         const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const priorSet = new Set(priorPendingRequiredFunctionCalls);
         const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        // ENG-1875: only functions NEWLY going into debt by this call are
+        // candidates for the authorization judge below -- debt already
+        // standing from an earlier, unauthorized removal is never re-judged
+        // or revoked here, only ever added to.
+        //
+        // Judged PER REMOVED STEP, not once for the whole call: a single
+        // removeStepCounts batch can mix a step the user genuinely authorized
+        // with one the model is removing for its own unrelated reason (or to
+        // dodge a required call). A single call-wide yes/no would let one
+        // authorized step's "yes" spare an unrelated, unauthorized step in
+        // the same batch -- reopening ENG-1811's gaming hole through a
+        // batching side door (found by fresh-eyes review of the original
+        // single-verdict version). Each step's own requiredFunctionCalls are
+        // still judged together as one unit -- they're removed as one
+        // decision, not gameable by splitting further.
+        const candidateNewDebtByStep = new Map<number, { stepTitle: string; fns: string[] }>();
         for (const step of workPlan.steps) {
           if (!removeStepCounts.includes(step.stepCount)) continue;
           for (const fn of step.requiredFunctionCalls || []) {
             if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
-              newlyUnresolved.add(fn);
+              if (!priorSet.has(fn)) {
+                if (!candidateNewDebtByStep.has(step.stepCount)) {
+                  candidateNewDebtByStep.set(step.stepCount, { stepTitle: step.title, fns: [] });
+                }
+                candidateNewDebtByStep.get(step.stepCount)!.fns.push(fn);
+              } else {
+                newlyUnresolved.add(fn);
+              }
             }
           }
         }
+        await Promise.all(
+          Array.from(candidateNewDebtByStep.values()).map(async ({ stepTitle, fns }) => {
+            const authorized = await this.wasStepRemovalUserAuthorized(
+              sessionId,
+              fns.map((fn) => ({ fn, stepTitle })),
+            );
+            for (const fn of fns) {
+              if (authorized) {
+                console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }),
+        );
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
@@ -40060,12 +40289,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsReportingApi(userId: string, args: {
     customer_id: string;
-    mode: 'raw' | 'dashboard';
+    mode: 'raw' | 'dashboard' | 'serving_chain';
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
   }): Promise<any> {
     try {
+      if (args.mode === 'serving_chain') {
+        const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
+        const success = report.state === 'READY' || report.state === 'DELIVERING';
+        return { success, report, ...(success ? {} : { error: JSON.stringify(report) }) };
+      }
+
       if (args.mode === 'dashboard') {
         const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
           campaignIds: args.campaign_ids,
@@ -40085,7 +40320,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: true, results, totalRows: results.length };
       }
 
-      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+      return { success: false, error: 'mode must be "raw", "dashboard", or "serving_chain"' };
     } catch (error: any) {
       // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
       // error.response.status specifically, never a Google Ads business code.

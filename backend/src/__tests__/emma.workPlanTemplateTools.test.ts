@@ -38,7 +38,7 @@ describe('launch_predefined_work_plan Emma tool', () => {
     expect((tool?.definition.inputSchema as any)?.required).toContain('planTitle');
   });
 
-  it('delegates to applyPredefinedWorkPlan with session, user, and default force=false', async () => {
+  it('delegates to applyPredefinedWorkPlan with session, user, and default force=false, confirmedDeclinedPlan=false', async () => {
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error('tool not found');
 
@@ -47,7 +47,7 @@ describe('launch_predefined_work_plan Emma tool', () => {
     await tool.execute({ planTitle: 'Client Onboarding' }, { userId: 'user-1', sessionId: 'sess-1' });
 
     expect(agentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith(
-      'Client Onboarding', 'sess-1', 'user-1', { force: false }
+      'Client Onboarding', 'sess-1', 'user-1', { force: false, confirmedDeclinedPlan: false }
     );
   });
 
@@ -60,7 +60,21 @@ describe('launch_predefined_work_plan Emma tool', () => {
     await tool.execute({ planTitle: 'X', force: true }, { userId: 'user-1', sessionId: 'sess-1' });
 
     expect(agentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith(
-      'X', 'sess-1', 'user-1', { force: true }
+      'X', 'sess-1', 'user-1', { force: true, confirmedDeclinedPlan: false }
+    );
+  });
+
+  // ENG-1974: the deterministic decline-gate confirmation flag.
+  it('forwards confirmedDeclinedPlan=true when provided', async () => {
+    const tool = emmaToolRegistry.getTool(toolName);
+    if (!tool) throw new Error('tool not found');
+
+    (agentModeService.applyPredefinedWorkPlan as jest.Mock).mockResolvedValue({ success: true });
+
+    await tool.execute({ planTitle: 'X', confirmedDeclinedPlan: true }, { userId: 'user-1', sessionId: 'sess-1' });
+
+    expect(agentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith(
+      'X', 'sess-1', 'user-1', { force: false, confirmedDeclinedPlan: true }
     );
   });
 });

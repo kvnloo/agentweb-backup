@@ -165,6 +165,17 @@ export interface FileUserIssueParams {
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
   /**
+   * Who TRIGGERED this filing — the account whose action ran it, which is not
+   * necessarily who it is filed for. ENG-1961: the dedup judge is an LLM call
+   * that used to book to the `system` placeholder; it is now charged here.
+   *
+   * Deliberately distinct from `userEmail`. Under ENG-939 `userEmail` is the
+   * AFFECTED user of a cross-user telemetry review, who asked for nothing — so
+   * metering against them would charge a customer for an admin's triage. The
+   * actor is the one who spent the tokens.
+   */
+  actingUserId?: string;
+  /**
    * Stable identity of THIS report by THIS reporter (`utils/reportIntake.reportFingerprint`).
    * ENG-529 AC5 / ENG-598 option A: stamped on the created Featurebase ticket and looked up before
    * creating another, so a retry that outlives the in-process replay guard replays instead of
@@ -253,6 +264,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
   const dup = await findDuplicate(
     { type: 'feature_request', title: p.title, description: p.description },
     posts.map((x) => ({ ref: x.id, title: x.title, description: x.description })),
+    { userId: p.actingUserId, sessionId: p.sessionId },
   );
 
   if (dup) {
@@ -371,6 +383,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     : await findDuplicate(
         { type: 'bug', title: p.title, description: p.description },
         cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+        { userId: p.actingUserId, sessionId: p.sessionId },
       );
 
   // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
@@ -388,6 +401,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         const rdup = await findDuplicate(
           { type: 'bug', title: p.title, description: p.description },
           resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+          { userId: p.actingUserId, sessionId: p.sessionId },
         );
         reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
       }

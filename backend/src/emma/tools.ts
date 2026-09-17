@@ -4975,7 +4975,8 @@ emmaToolRegistry.register({
       return_scenes: args.return_scenes,
       start_time: args.start_time,
       end_time: args.end_time,
-      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
+      userId: context?.userId, // charge this describe_video spend to the caller (ENG-200)
+      sessionId: context?.sessionId, // ENG-1961: trace the row back to the chat
     });
   }
 });
@@ -6395,7 +6396,7 @@ emmaToolRegistry.register({
   name: 'launch_predefined_work_plan',
   definition: {
     name: 'launch_predefined_work_plan',
-    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Two distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously.',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Three distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously; (3) the user already declined this exact plan by clicking "Keep chatting" on its recommendation card — confirm the user actually wants to start it now, then call again with confirmedDeclinedPlan=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6406,13 +6407,20 @@ emmaToolRegistry.register({
         force: {
           type: 'boolean',
           description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        },
+        confirmedDeclinedPlan: {
+          type: 'boolean',
+          description: 'Set to true to launch a plan the user previously declined via "Keep chatting". Only do this after the user explicitly confirms they want to start it now.'
         }
       },
       required: ['planTitle']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+      force: args.force === true,
+      confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
+    });
   }
 });
 
@@ -8312,6 +8320,10 @@ emmaToolRegistry.register({
               ? user.email
               : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
             sessionId: affectedSessionId ?? context?.sessionId,
+            // ENG-1961: who PAYS for the dedup judge is the caller running this
+            // tool, never `userEmail` — under ENG-939 that is the affected user
+            // of a cross-user review, who did not ask for the analysis.
+            actingUserId: userId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
@@ -9387,12 +9399,18 @@ emmaToolRegistry.register({
     name: 'call_google_ads_reporting_api',
     description: `Fetch Google Ads performance data.
 
-TWO MODES:
+THREE MODES:
+- mode="serving_chain": Verify Search serving-chain readiness and today's delivery evidence; optional campaign_ids.
 - mode="dashboard": Pre-formatted markdown table (spend, impressions, clicks, CTR, conversions, avg CPC). Use for "how are my campaigns doing?" questions.
 - mode="raw": Custom GAQL query, returns structured results. Use for keyword-level data, custom breakdowns, or specific fields.
 
 COST: cost_micros from API ÷ 1,000,000 = spend in account currency. Check the currency field in response.
 NEVER fabricate metrics — only report what tools return.
+Before any customer-facing Search launch/status assertion, call call_google_ads_reporting_api mode="serving_chain".
+Never claim ads are live, serving, or spending from campaign or keyword status alone. READY is not evidence of delivery.
+Only DELIVERING supports observed delivery in the returned window; spending additionally requires costMicros > 0 on that eligible path.
+Cite campaign, budget, ad-group, ad creative, keyword eligibility, telemetry, account timezone, window, and checkedAt timestamp. Include every blocked sibling path.
+UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry can lag and does not prove ads are serving at this instant. Performance Max and Display are unsupported by this verifier.
 
 GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
@@ -9401,10 +9419,10 @@ GAQL EXAMPLES:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field (NOT the "id" field).' },
-        mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
+        mode: { type: 'string', enum: ['raw', 'dashboard', 'serving_chain'], description: '"serving_chain" required for Search launch/status assertions. "dashboard" for formatted summary. "raw" for custom GAQL.' },
         query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
-        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
-        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard or serving_chain mode). Omit for all.' },
+        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Dashboard only; defaults to LAST_30_DAYS. serving_chain always uses TODAY in the account timezone.' },
       },
       required: ['customer_id', 'mode'],
     },

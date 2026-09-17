@@ -58,6 +58,31 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
       'you can still complete a one-time-code login without the user'
     );
   });
+
+  // ENG-1953 follow-up: the original guidance only offered CSV once a
+  // bot-protection gate wouldn't clear, even though Browser Sessions manual
+  // import exists specifically for sites Emma can't log into automatically —
+  // it just was never mentioned as an option on a domain's FIRST such failure
+  // (only after a later re-check of an already-imported cookie died, covered
+  // by the "Manually-imported sessions" guidance below). A first-time Luma-style
+  // Cloudflare block should offer this path too, not just CSV.
+  it('offers Browser Sessions manual import, with a direct link, as an option alongside CSV when a bot-protection gate will not clear', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'manually import a session cookie for this domain, which skips this gate entirely on the next run'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
+  });
+
+  // ENG-1953 follow-up: a second review round flagged that offering this option
+  // as a bare backward-reference ("exactly like the re-import flow above") risks
+  // the model compressing it down to just "log in" under load — the same failure
+  // mode the sibling bullet above exists to prevent. Both steps must be spelled
+  // out here too, not just pointed at.
+  it('spells out both re-import steps here too, rather than only pointing back at the guidance above', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      "log into the site in their own browser to get a fresh authenticated session, AND (b) copy that session's cookie into **Settings > Browser Sessions** themselves"
+    );
+  });
 });
 
 // ENG-494 follow-up: a manually-imported Browser Sessions cookie can die
@@ -96,5 +121,32 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
   it('biases against false positives — an incorrect failure report is treated as worse than an occasional missed one', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Be conservative before calling it');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('worse outcome than an occasional missed report');
+  });
+
+  // ENG-1953 follow-up: a manually-imported Browser Sessions cookie only exists
+  // because credentialed auto-login already failed for that domain. Without this
+  // guidance, Emma reported a dead session and then offered "save your Login
+  // Credentials" as an equally-weighted fix — a path that was already known not
+  // to work for that domain, wasting a turn before the user got useful direction.
+  it('does not offer saving Login Credentials as an equally-weighted fix after reporting a manually-imported session failed', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      "Don't offer \"save your Login Credentials\" as the recommended fix in the same breath as this report"
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'A domain usually ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
+    );
+  });
+
+  // ENG-1953 follow-up: the reported bug was literally this misunderstanding —
+  // the user read "log into Luma" as the complete fix and expected the session
+  // to reach Emma on its own. Emma's own instructions must make the second,
+  // actually-load-bearing step (copying the cookie into Settings) impossible to
+  // miss, with a direct link so there's no ambiguity about where that happens.
+  it('requires both re-import steps to be stated together, with a direct link to the Browser Sessions settings page', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('logging into the site is not enough on its own');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'copy that session\'s cookie into **Settings > Browser Sessions** themselves'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
   });
 });
