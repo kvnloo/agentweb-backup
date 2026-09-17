@@ -40297,7 +40297,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     try {
       if (args.mode === 'serving_chain') {
         const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
-        return { success: report.state === 'READY' || report.state === 'DELIVERING', report };
+        const success = report.state === 'READY' || report.state === 'DELIVERING';
+        return { success, report, ...(success ? {} : { error: JSON.stringify(report) }) };
       }
 
       if (args.mode === 'dashboard') {

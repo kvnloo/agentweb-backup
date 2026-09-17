@@ -639,6 +639,23 @@ describe('handleCallGoogleAdsApi', () => {
 });
 
 describe('handleCallGoogleAdsReportingApi', () => {
+  it('preserves blocked serving-chain evidence at the tool-error boundary', async () => {
+    const report = {
+      state: 'BLOCKED_BY_AD',
+      checkedAt: '2026-09-17T02:00:00.000Z',
+      blockers: [{ state: 'BLOCKED_BY_AD', entityId: '3' }],
+    };
+    (googleAdsService.getServingChainStatus as jest.Mock).mockResolvedValueOnce(report);
+
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'serving_chain',
+    });
+
+    expect(result).toEqual({ success: false, report, error: JSON.stringify(report) });
+    expect(toolResultError(result)?.message).toBe(JSON.stringify(report));
+  });
+
   it('handles dashboard mode', async () => {
     const result = await service.handleCallGoogleAdsReportingApi('user-123', {
       customer_id: '1234567890',
@@ -1320,7 +1337,9 @@ describe('Search serving-chain Emma dispatch', () => {
     expect(googleAdsService.getServingChainStatus).toHaveBeenCalledWith('user-123', '123', ['1']);
     expect(googleAdsService.queryReporting).not.toHaveBeenCalled();
     expect(googleAdsService.getQuickMetrics).not.toHaveBeenCalled();
-    expect(result).toEqual({ success: state === 'READY' || state === 'DELIVERING', report });
+    const success = state === 'READY' || state === 'DELIVERING';
+    expect(result).toEqual({ success, report, ...(success ? {} : { error: JSON.stringify(report) }) });
+    expect(toolResultError(result)?.message).toBe(success ? undefined : JSON.stringify(report));
     expect(tool.definition.inputSchema.properties!.mode.enum).toContain('serving_chain');
     expect(tool.definition.description).toContain('READY is not evidence of delivery');
   });
