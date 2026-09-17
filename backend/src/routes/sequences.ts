@@ -685,7 +685,8 @@ router.post('/load-from-url', authenticateToken, async (req: Request, res: Respo
 
     // Convert class-based CSS to inline styles now so the stored HTML is email-client-safe.
     // Doing this at import time avoids the LLM call at every test-send or real send.
-    const { html: inlinedContent } = await inlineEmailStyles(bodyContent);
+    // ENG-1961: the inlining LLM call is this user's import, not "system".
+    const { html: inlinedContent } = await inlineEmailStyles(bodyContent, { userId });
 
     return res.json({
       success: true,
