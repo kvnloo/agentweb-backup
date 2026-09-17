@@ -24,6 +24,8 @@ jest.mock('axios', () => ({
 
 import {
   renderPlacidImage,
+  describePlacidError,
+  MAX_DESCRIBED_ERROR_CHARS,
   PlacidRenderError,
   PLACID_POLL_ATTEMPTS,
 } from '../services/placidRenderService';
@@ -262,5 +264,61 @@ describe('renderPlacidImage (ENG-1972)', () => {
     await expect(
       renderPlacidImage({ token: 'tok', templateUuid: 'tpl', layers: {}, billing: BILLING, sleep: noSleep }),
     ).rejects.toThrow(/403/);
+  });
+});
+
+// ENG-1972: the bare axios string ("Request failed with status code 403") sent
+// this investigation down a wrong path for three rounds; the real answer was in
+// the response body the whole time.
+describe('describePlacidError (ENG-1972)', () => {
+  it('surfaces the vendor status and message', () => {
+    const err = Object.assign(new Error('Request failed with status code 403'), {
+      response: { status: 403, data: { message: 'Requires Subscription and Credits' } },
+    });
+
+    const described = describePlacidError(err);
+    expect(described).toContain('403');
+    expect(described).toContain('Requires Subscription and Credits');
+  });
+
+  it('passes a non-HTTP failure through unchanged', () => {
+    expect(describePlacidError(new Error('socket hang up'))).toBe('socket hang up');
+  });
+
+  // Greptile + CodeRabbit, PR #2952: capping only the body still let the status
+  // text or a multiline axios message produce an oversized or multiline record —
+  // and this repo has had a disk-fill incident from exactly that.
+  it('bounds the WHOLE formatted record, not just the body', () => {
+    const err = Object.assign(new Error('boom'), {
+      response: { status: 500, data: '<html>' + 'x'.repeat(5000) + '</html>' },
+    });
+
+    const described = describePlacidError(err);
+    expect(described.length).toBeLessThanOrEqual(MAX_DESCRIBED_ERROR_CHARS + 1); // + the ellipsis
+    expect(described).toContain('…');
+  });
+
+  it('bounds a huge message even when there is no response body', () => {
+    const described = describePlacidError(new Error('x'.repeat(5000)));
+    expect(described.length).toBeLessThanOrEqual(MAX_DESCRIBED_ERROR_CHARS + 1);
+  });
+
+  it('emits one line, whatever the vendor sends', () => {
+    const err = Object.assign(new Error('line one\nline two'), {
+      response: { status: 502, data: 'first\n\nsecond\r\nthird' },
+    });
+
+    const described = describePlacidError(err);
+    expect(described).not.toMatch(/[\r\n]/);
+    expect(described).toContain('first second third');
+  });
+
+  it('does not throw on an unserializable body', () => {
+    const circular: any = {};
+    circular.self = circular;
+    const err = Object.assign(new Error('boom'), { response: { status: 502, data: circular } });
+
+    expect(() => describePlacidError(err)).not.toThrow();
+    expect(describePlacidError(err)).toContain('502');
   });
 });
