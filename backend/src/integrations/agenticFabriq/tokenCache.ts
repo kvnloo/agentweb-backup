@@ -3,8 +3,7 @@
  * tokens CANNOT be refreshed in place — a caller sees AuthenticationError on
  * expiry and must mint a new one. So this cache re-mints proactively ~60s
  * before the 900s expiry rather than waiting to be told the token is dead,
- * and NEVER persists, logs, or returns the raw token to a caller that might
- * log it — only `withFreshToken()` sees it, scoped to one call.
+ * and never persists or logs tokens. Only adapter internals receive tokens.
  */
 
 import { AgenticFabriqClient, agenticFabriqClient } from './client';
@@ -39,22 +38,23 @@ export class AgenticFabriqTokenCache {
   ): Promise<CachedUserToken> {
     const connectionId = typeof connectionIdOrNow === 'string' ? connectionIdOrNow : 'default';
     const nowMs = typeof connectionIdOrNow === 'number' ? connectionIdOrNow : (explicitNowMs ?? Date.now());
-    const cacheKey = `${rawUserId}\u0000${connectionId}`;
+    const cacheKey = JSON.stringify([rawUserId, appId, connectionId]);
     const cached = this.cache.get(cacheKey);
     if (cached && this.isFresh(cached, nowMs)) return cached;
 
     const existingMint = this.inFlight.get(cacheKey);
     if (existingMint) return existingMint;
 
-    const mintPromise = (async () => {
+    const mintPromise: Promise<CachedUserToken> = Promise.resolve().then(async () => {
       try {
         await this.client.ensureExternalUser(appId, rawUserId);
         const tokenResponse = await this.client.mintUserToken(appId, rawUserId);
-        if (!tokenResponse.access_token || !tokenResponse.expires_in) {
-          throw new AgenticFabriqAuthenticationError(
-            `Agentic Fabriq token mint for user ${rawUserId} returned an incomplete response ` +
-            `(missing access_token or expires_in).`,
-          );
+        if (!tokenResponse || typeof tokenResponse !== 'object' || Array.isArray(tokenResponse) ||
+          typeof tokenResponse.access_token !== 'string' ||
+          !/^[A-Za-z0-9._~+\/-]+=*$/.test(tokenResponse.access_token) || tokenResponse.access_token.length > 16_384 ||
+          !Number.isInteger(tokenResponse.expires_in) || tokenResponse.expires_in <= 60 || tokenResponse.expires_in > 900 ||
+          (tokenResponse.mcp_url != null && (typeof tokenResponse.mcp_url !== 'string' || !tokenResponse.mcp_url || tokenResponse.mcp_url.length > 2048))) {
+          throw new AgenticFabriqAuthenticationError('Agentic Fabriq token mint returned an invalid response.');
         }
         // mcp_url from the token response is authoritative when present — see mcpBridge.ts,
         // which is the ONLY place this field is interpreted (never defaulted here).
@@ -64,12 +64,15 @@ export class AgenticFabriqTokenCache {
           mintedAtMs: nowMs,
           expiresAtMs: nowMs + tokenResponse.expires_in * 1000,
         };
+        if (this.inFlight.get(cacheKey) !== mintPromise) {
+          throw new AgenticFabriqAuthenticationError('Agentic Fabriq token mint was invalidated.');
+        }
         this.cache.set(cacheKey, entry);
         return entry;
       } finally {
-        this.inFlight.delete(cacheKey);
+        if (this.inFlight.get(cacheKey) === mintPromise) this.inFlight.delete(cacheKey);
       }
-    })();
+    });
 
     this.inFlight.set(cacheKey, mintPromise);
     return mintPromise;
@@ -77,15 +80,17 @@ export class AgenticFabriqTokenCache {
 
   /** Drops the cached token for one user — called on invalidate_user() and connection.needs_reauth. */
   invalidateUser(rawUserId: string): void {
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(`${rawUserId}\u0000`)) this.cache.delete(key);
+    for (const entries of [this.cache, this.inFlight]) {
+      for (const key of entries.keys()) {
+        if ((JSON.parse(key) as string[])[0] === rawUserId) entries.delete(key);
+      }
     }
   }
 
   /** Test/diagnostic only — never exposes the token value itself. */
   hasCachedToken(rawUserId: string): boolean {
     for (const key of this.cache.keys()) {
-      if (key.startsWith(`${rawUserId}\u0000`)) return true;
+      if ((JSON.parse(key) as string[])[0] === rawUserId) return true;
     }
     return false;
   }

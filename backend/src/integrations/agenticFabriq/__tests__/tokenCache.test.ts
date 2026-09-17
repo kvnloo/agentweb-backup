@@ -108,3 +108,58 @@ describe('AgenticFabriqTokenCache', () => {
     expect(cache.hasCachedToken('user_8412')).toBe(false);
   });
 });
+
+
+describe('hostile token responses', () => {
+  it.each([null, [], {},
+    { access_token: ['secret'], expires_in: 900 },
+    { access_token: 'secret\r\nX-Header: injected', expires_in: 900 },
+    { access_token: 'secret', expires_in: '900' },
+    { access_token: 'secret', expires_in: Infinity },
+    { access_token: 'secret', expires_in: -1 },
+    { access_token: 'secret', expires_in: 60 },
+    { access_token: 'secret', expires_in: 901 },
+    { access_token: 'secret', expires_in: 900, mcp_url: {} },
+    { access_token: 'secret', expires_in: 900, mcp_url: '' },
+  ])('never caches malformed token response %#', async (response) => {
+    const cache = new AgenticFabriqTokenCache(fakeClient({ mintUserToken: jest.fn().mockResolvedValue(response) }));
+    await expect(cache.getFreshToken('app', 'sensitive-user')).rejects.toThrow();
+    expect(cache.hasCachedToken('sensitive-user')).toBe(false);
+  });
+  it('redacts the user identifier from token failures', async () => {
+    const cache = new AgenticFabriqTokenCache(fakeClient({ mintUserToken: jest.fn().mockResolvedValue({}) }));
+    await expect(cache.getFreshToken('app', 'sensitive-user')).rejects.not.toThrow('sensitive-user');
+  });
+  it('isolates tokens across apps as well as users and connections', async () => {
+    const client = fakeClient();
+    const cache = new AgenticFabriqTokenCache(client);
+    await cache.getFreshToken('app-1', 'user', 'connection');
+    await cache.getFreshToken('app-2', 'user', 'connection');
+    expect(client.mintUserToken).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('revocation during token mint', () => {
+  it('does not resurrect a token after invalidation or share its in-flight mint', async () => {
+    let complete!: (value: unknown) => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>(resolve => { signalStarted = resolve; });
+    const client = fakeClient({ mintUserToken: jest.fn().mockImplementationOnce(() => new Promise(resolve => { complete = resolve; signalStarted(); })).mockResolvedValue({ access_token: 'new_token', expires_in: 900 }) });
+    const cache = new AgenticFabriqTokenCache(client);
+    const oldMint = cache.getFreshToken('app', 'user');
+    await started;
+    cache.invalidateUser('user');
+    const nextMint = cache.getFreshToken('app', 'user');
+    complete({ access_token: 'old_token', expires_in: 900 });
+    await expect(oldMint).rejects.toThrow();
+    await expect(nextMint).resolves.toMatchObject({ accessToken: 'new_token' });
+    await expect(cache.getFreshToken('app', 'user')).resolves.toMatchObject({ accessToken: 'new_token' });
+  });
+});
+it('clears single-flight state even when dependency throws synchronously', async () => {
+  const client = fakeClient({ ensureExternalUser: jest.fn().mockImplementationOnce(() => { throw new Error('failure'); }).mockResolvedValue(undefined) });
+  const cache = new AgenticFabriqTokenCache(client);
+  await expect(cache.getFreshToken('app','user')).rejects.toThrow();
+  await expect(cache.getFreshToken('app','user')).resolves.toHaveProperty('accessToken');
+});

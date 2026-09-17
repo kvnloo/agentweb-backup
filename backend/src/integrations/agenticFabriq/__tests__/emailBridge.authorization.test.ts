@@ -40,7 +40,7 @@ describe('Agentic Fabriq mailbox authorization', () => {
     mockGetFreshToken.mockResolvedValue({ accessToken: 'token', mcpUrl: '', expiresAtMs: 1, mintedAtMs: 0 });
     mockListTools.mockResolvedValue([{ name: 'google_gmail_search_messages' }]);
     mockCallTool.mockResolvedValue({ emails: [] });
-    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('account-1'), status: 'connected' }]);
+    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('account-1', 'user-1'), status: 'connected' }]);
   });
 
   it('requires account_id before any provider lookup', async () => {
@@ -54,29 +54,31 @@ describe('Agentic Fabriq mailbox authorization', () => {
     expect(mockListConnections).not.toHaveBeenCalled();
   });
 
-  it('resolves sends with send authorization before contacting Fabriq', async () => {
-    mockResolveEmailAccount.mockRejectedValue(new Error('shared mailboxes are read-only'));
-    await expect(runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'send', to: 'x@y.test', subject: 's', body: 'b' }, 'user-1')).rejects.toThrow(/read-only/);
-    expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-1', 'account-1', 'send');
+  it.each(['send', 'reply', 'delete', 'search_and_delete'])('rejects %s before any vendor or token call', async (action) => {
+    await expect(runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action } as any, 'user-1')).rejects.toThrow(/read-only/);
+    expect(mockResolveEmailAccount).not.toHaveBeenCalled();
     expect(mockListConnections).not.toHaveBeenCalled();
+    expect(mockGetFreshToken).not.toHaveBeenCalled();
+    expect(mockCallTool).not.toHaveBeenCalled();
   });
 
   it('does not select a different Gmail connection when the exact binding is absent', async () => {
-    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('other-account'), status: 'connected' }]);
+    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('other-account', 'user-1'), status: 'connected' }]);
     const result = await runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'search', query: 'x' }, 'user-1');
     expect(result.outcome).toMatchObject({ error: expect.stringContaining('No connected Gmail account') });
     expect(mockListTools).not.toHaveBeenCalled();
   });
 
-  it('passes the exact account and connection binding and guards result delivery', async () => {
-    const result = await runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'search', query: 'x', max_results: 500 }, 'user-1');
-    expect(result.outcome).toEqual({ emails: [] });
-    expect(mockWithAccessGuard).toHaveBeenCalledWith('user-1', OWN, 'read', expect.any(Function));
-    expect(mockCallTool).toHaveBeenCalledWith(
-      expect.any(String),
-      'token',
-      'google_gmail_search_messages',
-      expect.objectContaining({ account_id: 'account-1', connection_id: connectionIdForAccount('account-1'), max_results: 50 }),
-    );
+  it('fails closed for an unreviewed discovered tool without a tool call', async () => {
+    const result = await runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'search', query: 'x' }, 'user-1');
+    expect(result.outcome).toMatchObject({ error: expect.stringContaining('reviewed') });
+    expect(mockCallTool).not.toHaveBeenCalled();
   });
+  it.each(['account', 'connections', 'token', 'discovery'])('redacts hostile %s failures at the exported bridge boundary', async (stage) => {
+    const mocks = { account: mockResolveEmailAccount, connections: mockListConnections, token: mockGetFreshToken, discovery: mockListTools };
+    mocks[stage as keyof typeof mocks].mockRejectedValueOnce(new Error('user-1 account-1 /api/private/user-1 bearer-secret'));
+    await expect(runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'search', query: 'x' }, 'user-1'))
+      .rejects.toThrow('Agentic Fabriq canary request failed.');
+  });
+
 });

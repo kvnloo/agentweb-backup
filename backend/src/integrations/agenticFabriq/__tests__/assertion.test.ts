@@ -67,3 +67,7 @@ describe('signAgenticFabriqAssertion', () => {
     );
   });
 });
+it('never includes raw identifiers in assertion errors', () => {
+  expect(() => signAgenticFabriqAssertion({appId:'app',rawUserId:'ext:private-user',privateKeyPem:'unused'})).toThrow();
+  expect(() => signAgenticFabriqAssertion({appId:'app',rawUserId:'ext:private-user',privateKeyPem:'unused'})).not.toThrow(/private-user/);
+});

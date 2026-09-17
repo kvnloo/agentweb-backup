@@ -25,6 +25,12 @@ jest.mock('../../../../integrations/agenticFabriq', () => ({
   runEmailToolThroughAgenticFabriq: (...args: unknown[]) => mockRunEmailToolThroughAgenticFabriq(...args),
 }));
 
+const mockStartSpan = jest.fn(() => ({}));
+jest.mock('../../../../observability/tracing', () => ({
+  startRunChildSpan: (...args: unknown[]) => (mockStartSpan as any)(...args),
+  endExecuteToolSpan: jest.fn(),
+}));
+
 function toolCall(id: string, name: string, args: string) {
   return { id, type: 'function', function: { name, arguments: args } };
 }
@@ -106,6 +112,21 @@ describe('ENG-1685 Agentic Fabriq spike gate in toolDispatch.ts', () => {
     expect((input.toolCallsLedger[0] as any).error).toBeUndefined(); // completed successfully via the direct path
   });
 
+  it('mock mode preserves direct mock isolation even for an eligible user', async () => {
+    mockIsEligible.mockReturnValue(true);
+    const ports = makePorts();
+    const input = makeInput(
+      [toolCall('t1', 'email', JSON.stringify({ action: 'search', query: 'invoice' }))],
+      ports,
+      { mockMode: true },
+    );
+
+    await executePreparedTools(input);
+
+    expect(ports.executePreparedAgentTool).toHaveBeenCalledTimes(1);
+    expect(mockRunEmailToolThroughAgenticFabriq).not.toHaveBeenCalled();
+  });
+
   it('flag/allowlist ON + eligible user: the email tool routes through the AF bridge instead of executePreparedAgentTool', async () => {
     mockIsEligible.mockReturnValue(true);
     mockRunEmailToolThroughAgenticFabriq.mockResolvedValue({
@@ -138,12 +159,44 @@ describe('ENG-1685 Agentic Fabriq spike gate in toolDispatch.ts', () => {
     mockIsEligible.mockReturnValue(true);
     mockRunEmailToolThroughAgenticFabriq.mockRejectedValue(new Error('agentic fabriq unavailable'));
     const ports = makePorts();
-    const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action: 'send', to: 'a@b.com', subject: 's', body: 'b' }))], ports);
+    const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action: 'search', query: 'x' }))], ports);
 
     await executePreparedTools(input);
 
     expect(ports.executePreparedAgentTool).not.toHaveBeenCalled();
     const ledgerEntry = input.toolCallsLedger[0] as any;
-    expect(String(ledgerEntry.error ?? '')).toMatch(/agentic fabriq unavailable/i);
+    expect(String(ledgerEntry.error ?? '')).toMatch(/Agentic Fabriq canary request failed/);
   });
+});
+
+
+describe('hostile canary dispatch', () => {
+  beforeEach(() => { mockIsEligible.mockReturnValue(true); mockRunEmailToolThroughAgenticFabriq.mockReset(); });
+  it.each(['send', 'reply', 'delete', '/private/user-1/account-1'])('blocks %s before bridge dispatch without direct fallback', async (action) => {
+    const ports = makePorts();
+    const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action }))], ports);
+    await executePreparedTools(input);
+    expect(mockRunEmailToolThroughAgenticFabriq).not.toHaveBeenCalled();
+    expect(ports.executePreparedAgentTool).not.toHaveBeenCalled();
+    expect(String((input.toolCallsLedger[0] as any).error)).toContain('read-only');
+  });
+  it('redacts arbitrary bridge failures from ledger output', async () => {
+    mockRunEmailToolThroughAgenticFabriq.mockRejectedValue(new Error('user-1 account-1 /api/users/user-1 token-secret'));
+    const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action: 'search' }))], makePorts());
+    await executePreparedTools(input);
+    const error = String((input.toolCallsLedger[0] as any).error);
+    expect(error).toContain('Agentic Fabriq canary request failed');
+    expect(error).not.toMatch(/user-1|account-1|api\/users|token-secret/);
+  });
+});
+
+
+it('omits raw identifiers and argument content from the canary execution span', async () => {
+  mockStartSpan.mockClear();
+  mockIsEligible.mockReturnValue(true);
+  mockRunEmailToolThroughAgenticFabriq.mockRejectedValue(new Error('sensitive-account /api/private'));
+  const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action: 'search', account_id: 'sensitive-account', query: 'private-content' }))], makePorts());
+  await executePreparedTools(input);
+  const attributes = JSON.stringify((mockStartSpan.mock.calls as any)[0][2]);
+  expect(attributes).not.toMatch(/sess-1|user-1|sensitive-account|private-content|api\/private/);
 });

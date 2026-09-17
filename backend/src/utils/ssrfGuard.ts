@@ -73,7 +73,8 @@ function isPrivateIPv4(ip: string): boolean {
 }
 
 function isPrivateIPv6(ip: string): boolean {
-  const lower = ip.toLowerCase();
+  // Canonicalize expanded/mixed notation before prefix checks (including mapped IPv4).
+  const lower = new URL(`http://[${ip}]/`).hostname.slice(1, -1).toLowerCase();
 
   // ::1 (loopback)
   if (lower === '::1') return true;

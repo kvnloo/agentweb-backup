@@ -4,6 +4,7 @@
  * param on delete (AF 422s without it because connection_id defaults to
  * "default" for every provider — omitting it is genuinely ambiguous).
  */
+jest.mock('dns/promises', () => ({ lookup: jest.fn(async () => [{ address: '93.184.216.34', family: 4 }]) }));
 import { AgenticFabriqClient } from '../client';
 import { AgenticFabriqApiError } from '../errors';
 import * as config from '../config';
@@ -17,12 +18,7 @@ beforeEach(() => {
 afterEach(() => jest.restoreAllMocks());
 
 function fakeFetch(status: number, body: unknown): jest.Mock<Promise<any>, [string, any]> {
-  return jest.fn(async (_url: string, _init: any) => ({
-    ok: status < 300,
-    status,
-    headers: { get: () => null },
-    text: async () => JSON.stringify(body),
-  }));
+  return jest.fn(async (_url: string, _init: any) => Response.json(body, {status}));
 }
 
 describe('AgenticFabriqClient', () => {
@@ -63,17 +59,17 @@ describe('AgenticFabriqClient', () => {
   });
 
   it('initiateOAuth defaults connection_id to "default" when not supplied', async () => {
-    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider/authorize', state: 's1', connection_id: 'default' });
+    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'a'.repeat(64), connection_id: 'default' });
     const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
-    await client.initiateOAuth('app_1', 'user_8412', 'gmail');
+    await client.initiateOAuth('app_1', 'user_8412', 'gmail', { state: 'a'.repeat(64) });
     const [, init] = fetchImpl.mock.calls[0];
-    expect(JSON.parse(init.body)).toEqual({ connection_id: 'default' });
+    expect(JSON.parse(init.body)).toEqual({ connection_id: 'default', state: 'a'.repeat(64) });
   });
 
   it('initiateOAuth passes a custom connection_id through unchanged', async () => {
-    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider/authorize', state: 's1', connection_id: 'work' });
+    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'a'.repeat(64), connection_id: 'work' });
     const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
-    await client.initiateOAuth('app_1', 'user_8412', 'gmail', { connectionId: 'work' });
+    await client.initiateOAuth('app_1', 'user_8412', 'gmail', { connectionId: 'work', state: 'a'.repeat(64) });
     const [, init] = fetchImpl.mock.calls[0];
     expect(JSON.parse(init.body).connection_id).toBe('work');
   });
@@ -83,7 +79,7 @@ describe('AgenticFabriqClient', () => {
     const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
     await expect(client.getProviderCapabilities('app_1')).rejects.toMatchObject({
       status: 403,
-      endpoint: expect.stringContaining('/providers/capabilities'),
+      endpoint: 'rest',
     });
   });
 

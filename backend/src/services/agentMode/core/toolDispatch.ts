@@ -1032,15 +1032,23 @@ export async function executePreparedTools(
     toolName: string,
     functionArgs: any,
   ): Promise<{ handled: true; result: unknown } | { handled: false }> => {
-    if (toolName !== AGENTIC_FABRIQ_SPIKE_TOOL_NAME) return { handled: false };
+    // Mock sessions must never escape to a real external connector. Preserve
+    // the existing executePreparedAgentTool mock path before even evaluating
+    // the canary allowlist.
+    if (mockMode || toolName !== AGENTIC_FABRIQ_SPIKE_TOOL_NAME) return { handled: false };
     if (!isUserEligibleForAgenticFabriqSpike(userId)) return { handled: false };
 
+    if (!functionArgs || !['search', 'list', 'get'].includes(functionArgs.action)) {
+      throw new Error('Agentic Fabriq canary is read-only.');
+    }
     const directStartMs = Date.now(); // reference point only; the direct path itself is not re-run here
     try {
       const { outcome, spikeMeta } = await runEmailToolThroughAgenticFabriq(functionArgs, userId);
       console.log('[ENG-1685 spike] agentic_fabriq_email_tool_call', JSON.stringify({
         action: functionArgs?.action,
-        ...spikeMeta,
+        latencyMs: spikeMeta.latencyMs,
+        discoveredToolCount: spikeMeta.discoveredToolCount,
+        connected: spikeMeta.connectionStatus === 'connected',
         dispatchOverheadMs: Date.now() - directStartMs,
       }));
       return { handled: true, result: outcome };
@@ -1049,7 +1057,7 @@ export async function executePreparedTools(
       // to the direct path (that would hide exactly the failure mode the spike
       // exists to measure) and never retry under a different identity.
       console.error('[ENG-1685 spike] agentic_fabriq_email_tool_call_error');
-      throw error;
+      throw new Error('Agentic Fabriq canary request failed.');
     }
   };
 
@@ -1066,7 +1074,8 @@ export async function executePreparedTools(
     const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
       [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
       [ATTR_GEN_AI_TOOL_NAME]: toolCall.function.name,
-      [ATTR_SESSION_ID]: sessionId,
+      ...(toolCall.function.name === AGENTIC_FABRIQ_SPIKE_TOOL_NAME && isUserEligibleForAgenticFabriqSpike(userId)
+        ? {} : { [ATTR_SESSION_ID]: sessionId }),
     });
     try {
       const outcome = await ports.executeAgentToolThroughGateway({

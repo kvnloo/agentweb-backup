@@ -1,3 +1,9 @@
+jest.mock('dns/promises', () => ({ lookup: jest.fn(async () => [{ address: '93.184.216.34', family: 4 }]) }));
+beforeEach(() => {
+ process.env.AGENTIC_FABRIQ_API_BASE_URL = 'https://api.example.com';
+ process.env.AGENTIC_FABRIQ_MCP_ALLOWED_ORIGINS = 'https://mcp.example.com';
+});
+afterEach(() => { delete process.env.AGENTIC_FABRIQ_MCP_ALLOWED_ORIGINS; });
 /**
  * Protects the vendor's own TRAP #1, verified against their live API: `/mcp`
  * and `/mcp/external` both return 200 for an external-user token, so calling
@@ -37,24 +43,19 @@ describe('resolveMcpExternalUrl', () => {
 describe('AgenticFabriqMcpBridge', () => {
   function fakeFetch(responses: Array<{ status: number; body: unknown }>): any {
     let call = 0;
-    return jest.fn(async () => {
+    return jest.fn(async (_url: string, init: any) => {
       const r = responses[Math.min(call, responses.length - 1)];
       call += 1;
-      return {
-        ok: r.status < 300,
-        status: r.status,
-        headers: { get: () => null },
-        text: async () => JSON.stringify(r.body),
-      };
+      return Response.json({...r.body as object, id: JSON.parse(init.body).id}, {status:r.status});
     });
   }
 
   it('listTools calls the given URL exactly, never rewriting it', async () => {
-    const fetchImpl = fakeFetch([{ status: 200, body: { jsonrpc: '2.0', id: '1', result: { tools: [{ name: 'google_gmail_search' }] } } }]);
+    const fetchImpl = fakeFetch([{ status: 200, body: { jsonrpc: '2.0', id: '1', result: { tools: [{ name: 'google_gmail_search', inputSchema: {type:'object'} }] } } }]);
     const bridge = new AgenticFabriqMcpBridge(fetchImpl);
     const tools = await bridge.listTools('https://api.example.com/mcp/external', 'tok');
     expect(fetchImpl).toHaveBeenCalledWith('https://api.example.com/mcp/external', expect.any(Object));
-    expect(tools).toEqual([{ name: 'google_gmail_search' }]);
+    expect(tools).toEqual([{ name: 'google_gmail_search', inputSchema: {type:'object'} }]);
   });
 
   it('throws AgenticFabriqAuthenticationError on 401 — never silently returns empty', async () => {

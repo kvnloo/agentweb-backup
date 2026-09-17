@@ -17,6 +17,7 @@
  * inventing a new flag mechanism for a one-connector spike.
  */
 
+import { httpsOrigin } from './transport';
 import { getSecret, secretExists } from '../../utils/secretsManager';
 
 let cachedCreds: { appId: string; appSecret: string } | null = null;
@@ -61,7 +62,7 @@ export function getAgenticFabriqApiBaseUrl(): string {
       'Agentic Fabriq dashboard (app-scoped REST + /mcp/external base) — never guessed or hardcoded.',
     );
   }
-  return base.replace(/\/+$/, '');
+  return httpsOrigin(base);
 }
 
 /**

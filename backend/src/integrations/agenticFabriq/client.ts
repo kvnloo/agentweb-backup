@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'crypto';
 /**
  * App-scoped REST client for Agentic Fabriq's DEVELOPER-edition B2B2C surface.
  *
@@ -19,7 +20,9 @@
 
 import { getAgenticFabriqApiBaseUrl, getAgenticFabriqAppCredentials, getAgenticFabriqPrivateKeyPem } from './config';
 import { signAgenticFabriqAssertion } from './assertion';
-import { AgenticFabriqApiError, AgenticFabriqResponseTooLargeError, AgenticFabriqTimeoutError } from './errors';
+import { AgenticFabriqApiError, AgenticFabriqError } from './errors';
+import { boundedJsonRequest, record, boundedString, invalidShape, httpsOrigin, httpsUrl } from './transport';
+import { resolveMcpExternalUrl } from './mcpBridge';
 import type {
   AgenticFabriqCapabilitiesResponse,
   AgenticFabriqConnectionRow,
@@ -39,19 +42,6 @@ export interface AgenticFabriqClientOptions {
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
-
-async function readJsonSafely(res: Response, maxBytes: number, operation: string): Promise<unknown> {
-  const declaredLength = Number(res.headers?.get('content-length') ?? 0);
-  if (declaredLength > maxBytes) throw new AgenticFabriqResponseTooLargeError(operation);
-  const text = await res.text().catch(() => '');
-  if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new AgenticFabriqResponseTooLargeError(operation);
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
-}
 
 export class AgenticFabriqClient {
   private readonly fetchImpl: FetchLike;
@@ -90,32 +80,13 @@ export class AgenticFabriqClient {
     path: string,
     opts: { body?: unknown; rawUserIdForAssertion?: string } = {},
   ): Promise<T> {
-    const base = getAgenticFabriqApiBaseUrl();
-    const url = `${base}${path}`;
-    const headers = await this.appHeaders(opts.rawUserIdForAssertion);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const res = await this.fetchImpl(url, {
-        method,
-        headers,
-        signal: controller.signal,
-        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      });
-      if (!res.ok) {
-        // Drain only a bounded body and never retain or expose provider content.
-        await readJsonSafely(res, this.maxResponseBytes, path);
-        throw new AgenticFabriqApiError(res.status, path);
-      }
-      return (await readJsonSafely(res, this.maxResponseBytes, path)) as T;
-    } catch (error: any) {
-      if (controller.signal.aborted || error?.name === 'AbortError') {
-        throw new AgenticFabriqTimeoutError(path);
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-    }
+    const base = httpsOrigin(getAgenticFabriqApiBaseUrl());
+    let headers: Record<string, string>;
+    try { headers = await this.appHeaders(opts.rawUserIdForAssertion); }
+    catch { throw new AgenticFabriqError('Vendor authentication setup failed'); }
+    return await boundedJsonRequest(this.fetchImpl, `${base}${path}`, {
+      method, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    }, this.timeoutMs, this.maxResponseBytes, 'rest') as T;
   }
 
   /**
@@ -125,9 +96,10 @@ export class AgenticFabriqClient {
    */
   async ensureExternalUser(appId: string, rawUserId: string): Promise<void> {
     try {
-      await this.request('POST', `/api/v1/apps/${appId}/external-users`, {
+      const result = await this.request('POST', `/api/v1/apps/${encodeURIComponent(appId)}/external-users`, {
         body: { external_user_id: rawUserId },
       });
+      if (result !== undefined && (!record(result) || 'error' in result || result.success === false)) invalidShape();
     } catch (err) {
       if (err instanceof AgenticFabriqApiError && err.status === 409) return; // documented "exists, fine"
       throw err;
@@ -136,21 +108,32 @@ export class AgenticFabriqClient {
 
   /** Mints a short-lived token scoped to one external user. */
   async mintUserToken(appId: string, rawUserId: string): Promise<AgenticFabriqTokenResponse> {
-    return this.request<AgenticFabriqTokenResponse>(
+    const result = await this.request<AgenticFabriqTokenResponse>(
       'POST',
-      `/api/v1/apps/${appId}/external-users/${encodeURIComponent(rawUserId)}/token`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/token`,
       { body: {}, rawUserIdForAssertion: rawUserId },
     );
+    if (!record(result) || !boundedString(result.access_token, 16_384) || !/^[A-Za-z0-9._~+\/-]+=*$/.test(result.access_token) ||
+        !Number.isInteger(result.expires_in) || result.expires_in <= 60 || result.expires_in > 900 ||
+        result.mcp_url !== undefined && result.mcp_url !== null && !boundedString(result.mcp_url, 4096)) invalidShape();
+    resolveMcpExternalUrl(getAgenticFabriqApiBaseUrl(), result.mcp_url);
+    return result;
   }
 
   /** Lists the named external user's provider connections. */
   async listConnections(appId: string, rawUserId: string): Promise<AgenticFabriqConnectionRow[]> {
     const result = await this.request<AgenticFabriqConnectionRow[] | { connections: AgenticFabriqConnectionRow[] }>(
       'GET',
-      `/api/v1/apps/${appId}/external-users/${encodeURIComponent(rawUserId)}/connections`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/connections`,
       { rawUserIdForAssertion: rawUserId },
     );
-    return Array.isArray(result) ? result : result.connections;
+    const rows = Array.isArray(result) ? result : record(result) ? result.connections : null;
+    if (!Array.isArray(rows) || rows.length > 100 || rows.some(row => !record(row) ||
+        !boundedString(row.tool) || !boundedString(row.connection_id) ||
+        !['configured', 'connected', 'disconnected', 'needs_reauth', 'error'].includes(row.status as string) ||
+        row.granted_scopes !== undefined && (!Array.isArray(row.granted_scopes) || row.granted_scopes.length > 100 ||
+          row.granted_scopes.some(scope => !boundedString(scope, 500))))) invalidShape();
+    return rows;
   }
 
   /**
@@ -166,11 +149,12 @@ export class AgenticFabriqClient {
     if (!tool) {
       throw new TypeError('deleteConnection: `tool` is required — AF 422s without it (ambiguous connection_id).');
     }
-    await this.request(
+    const result = await this.request(
       'DELETE',
-      `/api/v1/apps/${appId}/external-users/${encodeURIComponent(rawUserId)}/connections/${encodeURIComponent(connectionId)}?tool=${encodeURIComponent(tool)}`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/connections/${encodeURIComponent(connectionId)}?tool=${encodeURIComponent(tool)}`,
       { rawUserIdForAssertion: rawUserId },
     );
+    if (result !== undefined && (!record(result) || 'error' in result || result.success === false)) invalidShape();
   }
 
   /** Starts OAuth with an explicit caller-owned connection binding. */
@@ -178,16 +162,22 @@ export class AgenticFabriqClient {
     appId: string,
     rawUserId: string,
     provider: string,
-    opts: { connectionId?: string; scopes?: string[] } = {},
+    opts: { connectionId?: string; scopes?: string[]; state?: string } = {},
   ): Promise<AgenticFabriqOAuthInitiateResponse> {
-    return this.request<AgenticFabriqOAuthInitiateResponse>(
+    if (!opts.state || !/^[a-f0-9]{64}$/.test(opts.state)) invalidShape();
+    const result = await this.request<AgenticFabriqOAuthInitiateResponse>(
       'POST',
-      `/api/v1/apps/${appId}/external-users/${encodeURIComponent(rawUserId)}/oauth/${encodeURIComponent(provider)}/initiate`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/oauth/${encodeURIComponent(provider)}/initiate`,
       {
-        body: { connection_id: opts.connectionId ?? 'default', ...(opts.scopes ? { scopes: opts.scopes } : {}) },
+        body: { connection_id: opts.connectionId ?? 'default', ...(opts.scopes ? { scopes: opts.scopes } : {}), ...(opts.state ? { state: opts.state } : {}) },
         rawUserIdForAssertion: rawUserId,
       },
     );
+    if (!record(result) || !boundedString(result.oauth_url, 4096) || !boundedString(result.state, 512) ||
+        result.connection_id !== (opts.connectionId ?? 'default') || !/^[a-f0-9]{64}$/.test(result.state) ||
+        !timingSafeEqual(Buffer.from(result.state, 'hex'), Buffer.from(opts.state, 'hex'))) invalidShape();
+    httpsUrl(result.oauth_url);
+    return result;
   }
 
   /** Starts the vendor's credential-entry flow for non-OAuth providers. */
@@ -197,11 +187,15 @@ export class AgenticFabriqClient {
     provider: string,
     opts: { connectionId?: string } = {},
   ): Promise<AgenticFabriqCredentialsInitiateResponse> {
-    return this.request<AgenticFabriqCredentialsInitiateResponse>(
+    const result = await this.request<AgenticFabriqCredentialsInitiateResponse>(
       'POST',
-      `/api/v1/apps/${appId}/external-users/${encodeURIComponent(rawUserId)}/credentials/${encodeURIComponent(provider)}/initiate`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/credentials/${encodeURIComponent(provider)}/initiate`,
       { body: { connection_id: opts.connectionId ?? 'default' }, rawUserIdForAssertion: rawUserId },
     );
+    if (!record(result) || !boundedString(result.connect_url, 4096) || result.connection_id !== (opts.connectionId ?? 'default') ||
+        !Number.isInteger(result.expires_in) || result.expires_in < 1 || result.expires_in > 900) invalidShape();
+    httpsUrl(result.connect_url);
+    return result;
   }
 
   /**
@@ -210,10 +204,14 @@ export class AgenticFabriqClient {
    * warning, and this is a low-traffic admin-y call for a single-connector spike.
    */
   async getProviderCapabilities(appId: string): Promise<AgenticFabriqCapabilitiesResponse> {
-    return this.request<AgenticFabriqCapabilitiesResponse>(
+    const result = await this.request<AgenticFabriqCapabilitiesResponse>(
       'GET',
-      `/api/v1/apps/${appId}/external-users/providers/capabilities`,
+      `/api/v1/apps/${encodeURIComponent(appId)}/external-users/providers/capabilities`,
     );
+    if (!record(result) || Object.keys(result).length > 100 || Object.entries(result).some(([name, value]) =>
+      !boundedString(name) || !record(value) || ['oauth', 'af_app_configured', 'org_app_supported', 'key_connect', 'instance_required']
+        .some(key => typeof value[key] !== 'boolean'))) invalidShape();
+    return result;
   }
 }
 

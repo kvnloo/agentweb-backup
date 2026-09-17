@@ -58,7 +58,7 @@ export function signAgenticFabriqAssertion(params: {
     // The token uses the ext: prefix, the assertion does not — copying it across
     // is the exact documented trap. Fail loudly rather than send a wrong sub.
     throw new TypeError(
-      `signAgenticFabriqAssertion: rawUserId "${rawUserId}" looks like the token's "ext:"-prefixed ` +
+      `signAgenticFabriqAssertion: rawUserId looks like the token's "ext:"-prefixed ` +
       `sub claim, not a raw user id. The assertion's sub must be the raw id without that prefix.`,
     );
   }
