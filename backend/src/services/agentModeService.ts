@@ -3451,7 +3451,16 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
+      let effectiveMessageContent = messageContent;
+      if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+        try {
+          const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
+          effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
+        } catch (voiceInjectErr) {
+          console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
+        }
+      }
+      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -35949,6 +35958,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // refusal, not a platform failure — the run was stopped deliberately.
       if (result.success === false) {
         return { success: false, message: result.message };
+      }
+
+      // H-VOICE: when the UI passes the Emma draft alongside the approved text,
+      // persist a session Voice Card observation (fail-open).
+      try {
+        const sessionId = toolContext?.sessionId as string | undefined;
+        const draftContent = toolContext?.voiceCapture?.draft as string | undefined;
+        if (sessionId && draftContent) {
+          const { captureVoiceEditOnPublish } = await import('./voiceProfileHooks');
+          const { chatbotDb } = await import('./chatbotService');
+          const session = await chatbotDb.getChatSession(sessionId);
+          await captureVoiceEditOnPublish({
+            sessionId,
+            platform: account.platform,
+            draftContent,
+            approvedContent: content,
+            existingProfile: session?.sessionVoiceProfile,
+          });
+        }
+      } catch (voiceCaptureErr) {
+        console.warn('[AgentMode] H-VOICE capture skipped (non-fatal):', voiceCaptureErr);
       }
 
       return {
