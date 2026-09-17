@@ -421,29 +421,13 @@ async function handleMappedSlackThreadResponse(params: {
   const { agentModeService } = await import('../services/agentModeService');
   const { cronJobRegistry } = await import('../utils/cronJobRegistry');
   const session = await chatbotDb.getChatSession(sessionId);
-  if (!session || session.userId !== userId) return false;
-
-  const { userDb } = await import('../services/db');
-  const owner = await userDb.getUserById(userId);
-  const requesterEmail = await getSlackUserEmail(slackUserId);
-  const requester = requesterEmail ? await userDb.getUserByEmail(requesterEmail) : null;
-  const requesterOwnsSession = requester?.userId === userId;
-  const ownerAuthorizesChannel = owner?.userId === userId && userMatchesChannel(owner, channel);
-  const { settingsService } = await import('../services/settingsService');
-  const configuredAdminChannels = await settingsService.getSetting('slack_admin_channels');
-  let adminChannelIds: string[] = [];
-  try {
-    const parsed = JSON.parse(configuredAdminChannels?.settingValue || '[]');
-    if (Array.isArray(parsed)) adminChannelIds = parsed.filter((id): id is string => typeof id === 'string');
-  } catch {
-    // Fall through to the legacy single-channel setting.
+  if (!session || session.userId !== userId) {
+    console.warn('Slack mapped thread rejected: session owner mismatch', {
+      channel, threadTs, slackUserId, sessionId, mappedUserId: userId,
+      actualUserId: session?.userId,
+    });
+    return false;
   }
-  if (adminChannelIds.length === 0) {
-    const legacyAdminChannel = await settingsService.getSetting('slack_admin_channel');
-    if (legacyAdminChannel?.settingValue) adminChannelIds = [legacyAdminChannel.settingValue];
-  }
-  const requesterUsesAdminChannel = adminChannelIds.includes(channel);
-  if (!requesterOwnsSession && !ownerAuthorizesChannel && !requesterUsesAdminChannel) return true;
 
   const attachments: any[] = [];
   for (const file of files || []) {
@@ -639,6 +623,18 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
       if (event.type === 'app_mention') {
         const { text, user: slackUserId, channel, ts, thread_ts: threadTs, files, user_team: userTeam, source_team: sourceTeam } = event;
         const responseThreadTs = threadTs ?? ts;
+
+        const emmaBotUserId = process.env.SLACK_BOT_USER_ID || await getEmmaBotUserId();
+        if (!emmaBotUserId) {
+          console.warn('Ignoring Slack app_mention because Emma bot identity is unavailable', {
+            channel, threadTs: responseThreadTs, slackUserId,
+          });
+          return;
+        }
+        if (slackUserId && slackUserId === emmaBotUserId) {
+          console.warn('Ignoring Slack app_mention emitted by Emma', { channel, threadTs: responseThreadTs, slackUserId });
+          return;
+        }
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
