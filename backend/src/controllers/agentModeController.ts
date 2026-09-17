@@ -7997,6 +7997,10 @@ export async function generateSessionResponse(
   // single live pendingApprovalDeck slot; the moment a NEWER deck opens, this one's
   // card has no way to know it was answered and falls back to plain text forever.
   approvalDeckAnswerMeta?: { deckId: string; answers: any[] },
+  // ENG-1635/1644: which deck this reply cancelled, if any — same rationale as
+  // approvalDeckAnswerMeta, mirrored for the cancel path so the card can render
+  // a real "Cancelled" state instead of the generic superseded fallback.
+  approvalDeckCancelledMeta?: { deckId: string },
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -8090,6 +8094,9 @@ export async function generateSessionResponse(
       // ENG-1635/1644: same rationale, generalized to a whole deck's answer set —
       // see approvalDeckAnswerMeta's own comment above.
       ...(approvalDeckAnswerMeta ? { approvalDeckAnswer: approvalDeckAnswerMeta } : {}),
+      // ENG-1635/1644: same rationale, for the cancel path — see
+      // approvalDeckCancelledMeta's own comment above.
+      ...(approvalDeckCancelledMeta ? { approvalDeckCancelled: approvalDeckCancelledMeta } : {}),
       // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.
@@ -8902,6 +8909,11 @@ export const agentModeController = {
     // cleared to null server-side, not answered, so answeredApprovalDeck's
     // "flip to locked view" shape doesn't apply here).
     let deckCancelled = false;
+    // ENG-1635/1644: which deck this turn cancelled, stamped onto the reply
+    // message so the deck's own card can show a real "Cancelled" state — not
+    // just the generic "Superseded — not answered" a deck that was silently
+    // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
+    let approvalDeckCancelledMeta: { deckId: string } | undefined;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
@@ -9151,6 +9163,7 @@ export const agentModeController = {
           return res.status(409).json({ error: 'This approval deck was already answered or cancelled by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
         }
         deckCancelled = true;
+        approvalDeckCancelledMeta = { deckId: deckCancel.deckId };
         // ENG-1635/1644 Phase 2b/1b: a write-deck can carry droppedQuestionDeckPayload
         // (questions dropped because a write halted in the same turn and won
         // priority — see buildApprovalDeckForIteration). The answer path already
@@ -9392,6 +9405,7 @@ export const agentModeController = {
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
         approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
+        approvalDeckCancelledMeta, // ENG-1635/1644: which deck this reply cancelled, if any
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
