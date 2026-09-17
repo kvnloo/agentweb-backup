@@ -44,6 +44,7 @@ jest.mock('../services/googleAdsService', () => ({
     createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
     retagAdUtm: jest.fn().mockResolvedValue({ success: true }),
     retagAssetGroupUtm: jest.fn().mockResolvedValue({ success: true }),
+    getServingChainStatus: jest.fn(),
     queryReporting: jest.fn().mockResolvedValue([
       { campaign: { id: '1' }, metrics: { clicks: '100' } },
     ]),
@@ -1173,7 +1174,7 @@ describe('handleCallGoogleAdsReportingApi — error handling', () => {
       mode: 'sideways' as any,
     });
     expect(result.success).toBe(false);
-    expect(result.error).toBe('mode must be "raw" or "dashboard"');
+    expect(result.error).toBe('mode must be "raw", "dashboard", or "serving_chain"');
   });
 
   it('ENG-1300: a 403 (error.response.status) classifies as auth/config end-to-end', async () => {
@@ -1305,5 +1306,22 @@ describe('call_google_ads_api tool schema — per-field description coverage (EN
 
   it('documents criterion_resource_name as required for KEYWORD UPDATE', () => {
     expect(properties.criterion_resource_name.description).toMatch(/KEYWORD UPDATE/);
+  });
+});
+
+// ENG-1922: the registered Emma tool must preserve verifier evidence, including
+// refusal to certify incomplete data, rather than falling back to raw metrics.
+describe('Search serving-chain Emma dispatch', () => {
+  it.each(['BLOCKED_BY_AD', 'READY', 'DELIVERING', 'UNVERIFIED'])('preserves %s without inventing a live/spending claim', async state => {
+    const report = { state, campaigns: [{ campaignId: '1', state, adGroups: [{ adGroupId: '2', state }] }] };
+    (googleAdsService.getServingChainStatus as jest.Mock).mockResolvedValue(report);
+    const tool = emmaToolRegistry.getTool('call_google_ads_reporting_api')!;
+    const result = await tool.execute({ customer_id: '123', mode: 'serving_chain', campaign_ids: ['1'] }, { userId: 'user-123' });
+    expect(googleAdsService.getServingChainStatus).toHaveBeenCalledWith('user-123', '123', ['1']);
+    expect(googleAdsService.queryReporting).not.toHaveBeenCalled();
+    expect(googleAdsService.getQuickMetrics).not.toHaveBeenCalled();
+    expect(result).toEqual({ success: state === 'READY' || state === 'DELIVERING', report });
+    expect(tool.definition.inputSchema.properties!.mode.enum).toContain('serving_chain');
+    expect(tool.definition.description).toContain('READY is not evidence of delivery');
   });
 });
