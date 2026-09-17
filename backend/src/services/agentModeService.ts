@@ -9412,6 +9412,8 @@ export class AgentModeService {
       end_time?: string;
       /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
       userId?: string;
+      /** Chat session the analysis belongs to, so the ledger row is traceable (ENG-1961). */
+      sessionId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -9624,8 +9626,17 @@ export class AgentModeService {
 
       // Charge (record + deduct when a userId is present; absorb under "system"
       // otherwise). The client above is un-metered, so this is the single meter.
+      // ENG-1961: named `describe_video` rather than the catch-all `agent_task`,
+      // and carrying the session, so this spend is attributable the same way
+      // describeImage's is. The user was already correct (ENG-200).
       meterUsageFromResponse(
-        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        {
+          userId: options?.userId,
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          model: modelName,
+          provider: 'gemini',
+          feature: 'describe_video',
+        },
         response
       );
 
@@ -16955,8 +16966,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * error) — the guard then delivers the message unchanged and records a loud
    * claim_check_error (see core/finalizeGuard.ts).
    *
-   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
-   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (a cheap/fast classification
+   * model) instead of the run's own llmModel: this is a bounded
    * classification task, not conversational generation, and every flagged
    * reply pays for this call, so keeping it cheap directly reduces the
    * guard's latency/cost footprint at scale (PR #2005 left this as a
@@ -17035,37 +17046,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       throw new Error('finalize-guard correction returned no content');
     }
     return text.trim();
-  }
-
-  /**
-   * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
-   * Returns true if the message needs to be handled, false otherwise.
-   */
-  public async triageSlackMessage(message: string): Promise<boolean> {
-    try {
-      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
-
-Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
-Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
-
-      const response = await this.callLLM(DIAGNOSIS_MODEL, [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message },
-      ], {
-        max_completion_tokens: 10,
-        temperature: 0,
-        taskClass: 'mcp_api',
-      });
-
-      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
-      const needsHandling = content.startsWith('yes');
-      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
-      return needsHandling;
-    } catch (error) {
-      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
-      return true; // default to handling on error to avoid missing client questions
-    }
   }
 
   public async listMetaAdsCampaigns(userId: string): Promise<any> {
