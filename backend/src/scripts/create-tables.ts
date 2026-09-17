@@ -1938,6 +1938,24 @@ const createSpendEventsTable = async () => {
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
 };
 
+const createSpendProjectionTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SpendProjection`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'billingMonth', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'billingMonth', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true, // ENG-1250 §3b — admission projection, guard it
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
 // ENG-1217 AC9: append-only audit for customer-confirmed model switches, so a
 // change can be explained and undone. Sort key is `{changedAt}#{changeId}` —
 // timestamp FIRST, so a date-range query works on the base table and this needs
@@ -2586,6 +2604,7 @@ const main = async () => {
     await createUsageRecordsTable();
     await createLlmChargeEventsTable();
     await createSpendEventsTable();
+    await createSpendProjectionTable();
     await createModelChangeAuditTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
