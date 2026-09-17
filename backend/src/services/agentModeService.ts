@@ -40289,12 +40289,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsReportingApi(userId: string, args: {
     customer_id: string;
-    mode: 'raw' | 'dashboard';
+    mode: 'raw' | 'dashboard' | 'serving_chain';
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
   }): Promise<any> {
     try {
+      if (args.mode === 'serving_chain') {
+        const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
+        const success = report.state === 'READY' || report.state === 'DELIVERING';
+        return { success, report, ...(success ? {} : { error: JSON.stringify(report) }) };
+      }
+
       if (args.mode === 'dashboard') {
         const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
           campaignIds: args.campaign_ids,
@@ -40314,7 +40320,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: true, results, totalRows: results.length };
       }
 
-      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+      return { success: false, error: 'mode must be "raw", "dashboard", or "serving_chain"' };
     } catch (error: any) {
       // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
       // error.response.status specifically, never a Google Ads business code.

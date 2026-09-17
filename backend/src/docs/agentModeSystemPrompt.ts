@@ -591,6 +591,11 @@ When a user refers to a page or feature by name, use the corresponding tools —
   - **Meta ads workflow**: Always start with **list_meta_ads_campaigns** to get campaign IDs, then use **get_meta_ads_metrics** with those IDs. Both tools work without a Meta connected account (they use legacy adAccount config). If **call_meta_ads_insights_api** or **call_meta_marketing_api** return a tool error due to missing connected account, fall back to **list_meta_ads_campaigns** + **get_meta_ads_metrics**. CRITICAL: if those fallback tools also fail or return no data, stop immediately and tell the user their Meta Ads account is not connected. NEVER invent, estimate, or fabricate any metrics, campaign names, spend figures, or other data — report only what the tools actually return.
   - **Google Ads workflow**: Use list_connected_accounts(platform='google_ads') to get customer_id.
     Reporting: call_google_ads_reporting_api (mode='dashboard' for quick summary, mode='raw' for custom GAQL).
+    Before any customer-facing Search launch/status assertion, call call_google_ads_reporting_api mode="serving_chain".
+    Never claim ads are live, serving, or spending from campaign or keyword status alone. READY is not evidence of delivery.
+    Only DELIVERING supports observed delivery in the returned window; spending additionally requires costMicros > 0 on that eligible path.
+    Cite campaign, budget, ad-group, ad creative, keyword eligibility, telemetry, account timezone, window, and checkedAt timestamp. Include every blocked sibling path.
+    UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry can lag and does not prove ads are serving at this instant. Performance Max and Display are unsupported by this verifier.
     Campaign creation order: LOCATION SEARCH → BUDGET CREATE → CAMPAIGN CREATE → AD_GROUP CREATE → KEYWORD ADD / AD CREATE (Search/Display).
     For PMax: LOCATION SEARCH → BUDGET CREATE → CAMPAIGN CREATE → ASSET_GROUP CREATE (skip AD_GROUP/KEYWORD/AD).
     NEVER fabricate metrics — only report what tools return.
