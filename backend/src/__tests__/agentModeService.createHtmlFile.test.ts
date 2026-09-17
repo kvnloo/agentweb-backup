@@ -1,3 +1,4 @@
+import { sanitizeGeneratedHtml } from '../utils/htmlSanitizer';
 import { AgentModeService, agentModeService as singletonAgentService } from '../services/agentModeService';
 
 // Mock AWS SDK
@@ -718,12 +719,47 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
+      // ENG-1997: the rendered HTML is sanitized before upload. This fixture has
+      // nothing dangerous in it, so sanitization only normalizes it (e.g. void
+      // elements gain a self-closing slash) — assert against the real
+      // sanitizer's output rather than the raw LLM mock response.
       expect(mockUploadFileToS3).toHaveBeenCalledWith(
-        mockHtmlContent,
+        sanitizeGeneratedHtml(mockHtmlContent),
         expect.stringMatching(/^html_\d+_Test_Title\.html$/),
         'user123',
         'text/html'
       );
+    });
+
+    // ENG-1997 — this tool has no {{variable}} boundary to escape values into
+    // (unlike createHtmlFromTemplate/ENG-1877), since the render step is told
+    // to copy names/quotes/numbers from the draft verbatim. Prove the RENDER
+    // path specifically (not just the complete-HTML passthrough) neutralizes
+    // markup the model faithfully reproduced from untrusted quoted content.
+    it('neutralizes a script tag and an event-handler payload the render LLM reproduced verbatim', async () => {
+      // No <img> tag here on purpose — this file's real (unmocked)
+      // inlinePrivateS3Images would try to resolve any <img src> against S3
+      // and this file's s3Utils mock doesn't stub extractS3KeyFromUrl, which
+      // is an unrelated, pre-existing gap in this test file, not something
+      // this sanitizer fix should paper over. <div onclick> proves the same
+      // on*-attribute stripping without touching that path.
+      mockGenerateHTML.mockResolvedValue(
+        '<html><body><p>Feedback: <script>alert(1)</script> and <div onclick="alert(1)">click</div></p></body></html>',
+      );
+
+      const result = await (agentModeService as any).createHtmlFile(
+        'Client Feedback',
+        'Quote the client feedback verbatim.',
+        '',
+        'user123',
+        'session123',
+      );
+
+      expect(result.success).toBe(true);
+      const [uploaded] = mockUploadFileToS3.mock.calls[0];
+      expect(uploaded).not.toContain('<script');
+      expect(uploaded).not.toMatch(/onclick/i);
+      expect(uploaded).toContain('Feedback:');
     });
 
     it('caps very long titles at 150 chars, still bounded (ENG-1686: was 50, too aggressive)', async () => {
