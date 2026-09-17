@@ -11225,11 +11225,20 @@ export const agentModeController = {
         });
       }
 
-      await chatbotDb.recordDeclinedWorkPlanRecommendation(sessionId, recommendationId, {
+      // Independent review finding: this return value was previously discarded, so the
+      // endpoint always answered 200 even when the write never actually happened (e.g. the
+      // session was deleted/purged in the window between the getChatSession check above and
+      // this write — the only path that returns false). A silently-unrecorded decline is
+      // exactly the "the model has no idea this was declined" defect this whole PR exists to
+      // close, so a failed write must surface as a real error, not a false-positive success.
+      const recorded = await chatbotDb.recordDeclinedWorkPlanRecommendation(sessionId, recommendationId, {
         planId: recommendation.plan.id,
         planTitle: recommendation.plan.title,
         declinedAt: new Date().toISOString(),
       });
+      if (!recorded) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
 
       return res.status(200).json({ success: true });
     } catch (error) {
