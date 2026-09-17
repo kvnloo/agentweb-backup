@@ -1,5 +1,6 @@
 import request from 'supertest';
 import express from 'express';
+import crypto from 'crypto';
 import slackRouter from '../routes/slack';
 
 // Mock dependencies
@@ -69,6 +70,15 @@ jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: true, url: 'https://s3.example.com/file.png', key: 'file.png' }),
 }));
 
+jest.mock('../services/humanEvalService', () => ({
+  humanEvalService: { handleSlackThreadReply: jest.fn() },
+}));
+
+jest.mock('../services/loopSlackApprovalDispatcher', () => ({
+  handleLoopApprovalReaction: jest.fn(),
+  getEmmaBotUserId: jest.fn().mockResolvedValue('UEMMA123'),
+}));
+
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
     chat: {
@@ -84,15 +94,21 @@ const { settingsService } = require('../services/settingsService');
 const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
 const { postThreadResponse, postThinkingMessage, deleteSlackMessage, setSlackAssistantStatus, getSlackUserDisplayName, getSlackUserEmail, getSlackUserTeamId, getOwnSlackTeamId } = require('../services/slackService');
+const { humanEvalService } = require('../services/humanEvalService');
+
+function slackSignature(rawBody: string, timestamp: number, secret: string): string {
+  return `v0=${crypto.createHmac('sha256', secret).update(`v0:${timestamp}:${rawBody}`).digest('hex')}`;
+}
 
 describe('Slack Events API', () => {
   let app: express.Application;
 
   beforeEach(() => {
     app = express();
-    app.use(express.json());
+    app.use(express.json({ verify: (req: any, _res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
     app.use('/api/slack', slackRouter);
     jest.clearAllMocks();
+    userDb.getUserById.mockResolvedValue({ userId: 'user-123', email: 'test@example.com', slackChannel: 'C12345' });
   });
 
   describe('POST /api/slack/events', () => {
@@ -106,6 +122,57 @@ describe('Slack Events API', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ challenge: 'test-challenge-string' });
+    });
+
+    it('rejects unsigned event callbacks before mapped-session execution', async () => {
+      process.env.SLACK_SIGNING_SECRET = 'test-signing-secret';
+      try {
+        const response = await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: { type: 'app_mention', user: 'U12345', text: '<@UEMMA123> continue', channel: 'C12345', ts: '2', thread_ts: '1' },
+        });
+        expect(response.status).toBe(401);
+        expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+      } finally {
+        delete process.env.SLACK_SIGNING_SECRET;
+      }
+    });
+
+    it('accepts a fresh correctly signed Slack URL verification request', async () => {
+      const secret = 'test-signing-secret';
+      process.env.SLACK_SIGNING_SECRET = secret;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'signed-challenge' });
+      try {
+        const response = await request(app)
+          .post('/api/slack/events')
+          .set('content-type', 'application/json')
+          .set('x-slack-request-timestamp', String(timestamp))
+          .set('x-slack-signature', slackSignature(rawBody, timestamp, secret))
+          .send(rawBody);
+        expect(response.status).toBe(200);
+        expect(response.body).toEqual({ challenge: 'signed-challenge' });
+      } finally {
+        delete process.env.SLACK_SIGNING_SECRET;
+      }
+    });
+
+    it('rejects a correctly signed Slack request with a stale timestamp', async () => {
+      const secret = 'test-signing-secret';
+      process.env.SLACK_SIGNING_SECRET = secret;
+      const timestamp = Math.floor(Date.now() / 1000) - 301;
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'stale' });
+      try {
+        const response = await request(app)
+          .post('/api/slack/events')
+          .set('content-type', 'application/json')
+          .set('x-slack-request-timestamp', String(timestamp))
+          .set('x-slack-signature', slackSignature(rawBody, timestamp, secret))
+          .send(rawBody);
+        expect(response.status).toBe(401);
+      } finally {
+        delete process.env.SLACK_SIGNING_SECRET;
+      }
     });
 
     it('should reply in-thread when Emma is mentioned in Slack', async () => {
@@ -906,6 +973,97 @@ describe('Slack Events API', () => {
         expect(generateSessionResponse).toHaveBeenCalledWith(
           'replacement-session', 'John Doe: start over', 'user-123', 'gpt-4o', []
         );
+        expect(chatbotDb.updateSessionSlackThread).toHaveBeenCalledWith(
+          'replacement-session', { channel: 'C12345', threadTs: '1234567890.123456' }
+        );
+        expect(settingsService.setSetting).toHaveBeenCalledWith(
+          'slack_thread_C12345_1234567890.123456',
+          JSON.stringify({ sessionId: 'replacement-session', userId: 'user-123' }),
+          'Slack thread to session mapping', 'system'
+        );
+        expect(postThreadResponse).toHaveBeenCalledWith(
+          'C12345', '1234567890.123456', 'Replacement response'
+        );
+      });
+
+      it('releases native status when post-claim model setup fails', async () => {
+        const { agentModeService } = require('../services/agentModeService');
+        settingsService.getSetting.mockResolvedValue({ settingValue: 'user-123' });
+        userDb.getUserById.mockResolvedValue({ userId: 'user-123', slackChannel: 'C12345' });
+        chatbotDb.createChatSession.mockResolvedValue({ sessionId: 'session-setup-fails', userId: 'user-123', messages: [] });
+        chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'session-setup-fails' });
+        agentModeService.getDefaultModel.mockRejectedValueOnce(new Error('model unavailable'));
+
+        await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: { type: 'app_mention', user: 'U12345', text: '<@UEMMA123> run', channel: 'C12345', ts: 'setup-fail-ts' },
+        });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', 'setup-fail-ts', 'is working...');
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', 'setup-fail-ts', '');
+      });
+
+      it('does not capture the duplicate message event for an Emma mention as human eval feedback', async () => {
+        humanEvalService.handleSlackThreadReply.mockResolvedValue(true);
+        await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: { type: 'message', user: 'U12345', text: '<@UEMMA123> ship it', channel: 'C12345', ts: '2', thread_ts: '1' },
+        });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(humanEvalService.handleSlackThreadReply).not.toHaveBeenCalled();
+      });
+
+      it('processes an attachment-only app mention', async () => {
+        settingsService.getSetting.mockResolvedValue({ settingValue: 'user-123' });
+        userDb.getUserById.mockResolvedValue({ userId: 'user-123', slackChannel: 'C12345' });
+        chatbotDb.createChatSession.mockResolvedValue({ sessionId: 'file-session', userId: 'user-123', llmModel: 'gpt-4o' });
+        chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'file-session' });
+        generateSessionResponse.mockResolvedValue({ content: 'I read it.' });
+        await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: { type: 'app_mention', user: 'U12345', text: '<@UEMMA123>', channel: 'C12345', ts: 'file-ts', files: [{ url_private: 'https://files.slack.com/a.png', name: 'a.png', mimetype: 'image/png' }] },
+        });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(chatbotDb.createChatSession).toHaveBeenCalled();
+        expect(generateSessionResponse).toHaveBeenCalledWith('file-session', 'John Doe: [attached file]', 'user-123', 'gpt-4o', expect.any(Array));
+      });
+
+      it('posts a fallback when a mapped-session response has empty content', async () => {
+        settingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }) });
+        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'session-123', userId: 'user-123', llmModel: 'gpt-4o' });
+        getSlackUserEmail.mockResolvedValue('owner@example.com');
+        userDb.getUserByEmail.mockResolvedValue({ userId: 'user-123', slackChannel: 'C12345' });
+        generateSessionResponse.mockResolvedValue({ content: '' });
+        await request(app).post('/api/slack/events').send({ type: 'event_callback', event: { type: 'app_mention', user: 'U12345', text: '<@UEMMA123> continue', channel: 'C12345', ts: '2', thread_ts: '1' } });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(postThreadResponse).toHaveBeenCalledWith('C12345', '1', expect.stringContaining('unable to format a response'));
+      });
+
+      it('rejects an unauthorized mapped-thread participant without using the owner session', async () => {
+        settingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify({ sessionId: 'session-owner', userId: 'owner-user' }) });
+        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'session-owner', userId: 'owner-user', llmModel: 'gpt-4o' });
+        getSlackUserEmail.mockResolvedValue('intruder@example.com');
+        userDb.getUserByEmail.mockResolvedValue({ userId: 'intruder-user', slackChannel: 'C_OTHER' });
+        await request(app).post('/api/slack/events').send({ type: 'event_callback', event: { type: 'app_mention', user: 'U_INTRUDER', text: '<@UEMMA123> reveal context', channel: 'C12345', ts: '2', thread_ts: '1' } });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(postThreadResponse).not.toHaveBeenCalled();
+      });
+
+      it('allows a mapped delegated session to continue in an explicitly configured admin channel', async () => {
+        settingsService.getSetting.mockImplementation(async (key: string) => {
+          if (key === 'slack_thread_C_ADMIN_1') return { settingValue: JSON.stringify({ sessionId: 'delegated-session', userId: 'customer-user' }) };
+          if (key === 'slack_admin_channels') return { settingValue: JSON.stringify(['C_ADMIN']) };
+          return null;
+        });
+        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'delegated-session', userId: 'customer-user', llmModel: 'gpt-4o' });
+        userDb.getUserById.mockResolvedValue({ userId: 'customer-user', slackChannel: 'C_CUSTOMER' });
+        getSlackUserEmail.mockResolvedValue('admin@agentweb.pro');
+        userDb.getUserByEmail.mockResolvedValue({ userId: 'admin-user', slackChannel: 'C_ADMIN' });
+        generateSessionResponse.mockResolvedValue({ content: 'Delegated follow-up handled' });
+        await request(app).post('/api/slack/events').send({ type: 'event_callback', event: { type: 'app_mention', user: 'U_ADMIN', text: '<@UEMMA123> continue', channel: 'C_ADMIN', ts: '2', thread_ts: '1' } });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(generateSessionResponse).toHaveBeenCalledWith('delegated-session', 'John Doe: continue', 'customer-user', 'gpt-4o', []);
       });
 
       it('keeps processing when the native status API fails', async () => {
