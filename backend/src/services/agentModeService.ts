@@ -71,7 +71,7 @@ import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -4587,6 +4587,33 @@ export class AgentModeService {
                 `unavailable-capability notice so the answer cannot read as that tool's output`
               );
               content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          /*
+           * ENG-1899: same shape as the unavailable-capability notice directly above — UNCONDITIONAL
+           * on `coding_agent`'s own deterministic acceptance-check result, not on detecting a false
+           * claim in the prose, and PREPENDED so the true state is seen before the model's own
+           * possibly-false claim rather than after it. Own kill switch per this block's convention:
+           * a false positive here prepends a scary banner to an otherwise-correct answer, so standing
+           * it down must be a config change, not a revert-and-redeploy.
+           *
+           * `content` is passed through as `currentContent` so a turn that echoes an EARLIER turn's
+           * already-decorated response from conversation history (live env1 finding: two consecutive
+           * failed coding_agent calls in one session — the original incident's own shape — can produce
+           * exactly this) does not get a second, duplicated banner prepended on top.
+           */
+          const codingAgentAcceptanceNoticeEnabled =
+            process.env.AGENT_CODING_AGENT_ACCEPTANCE_NOTICE !== 'false';
+          if (codingAgentAcceptanceNoticeEnabled && content) {
+            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls, content);
+            if (acceptanceNotice) {
+              console.warn(
+                `AgentMode: coding_agent's acceptance check failed in session ${sessionId} — ` +
+                `prepending a verification notice so the answer cannot read as a passed check`
+              );
+              content = `${acceptanceNotice}\n\n${content}`;
               if (responseMessage) responseMessage.content = content;
             }
           }
