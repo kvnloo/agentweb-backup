@@ -3130,6 +3130,160 @@ describe('AgentModeService - Work Plan', () => {
         expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
       });
 
+      describe('ENG-1875: judge-gated debt for a step removal the user explicitly authorized', () => {
+        function buildMockSession(overrides: any = {}) {
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+            ...overrides,
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+          return mockSession;
+        }
+
+        it('judge says "yes" against a real authorizing message -- debt is NOT ledgered for the removed step', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: "skip step 2, we don't need that email sent",
+          });
+          const callLLMSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls || []).not.toContain('send_report_email');
+          expect(callLLMSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('judge says "no" -- debt is ledgered exactly as before this fix (regression guard)', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'looks good, keep going',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'no' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+        });
+
+        it('judge throws/times out -- fails safe, debt is still ledgered', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 2',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('LLM gateway down'));
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+        });
+
+        it('no real user message at all -- fails safe, debt is still ledgered, judge LLM is never called', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue(null);
+          const callLLMSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+          expect(callLLMSpy).not.toHaveBeenCalled();
+        });
+
+        it('an authorized-judged removal never clears already-standing debt from an EARLIER, unauthorized removal', async () => {
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+              {
+                stepCount: 3,
+                title: 'Publish landing page',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['publish_landing_page'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+
+          // First call: step 2 removed with no authorizing message at all --
+          // its required call goes into debt exactly as before this fix.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue(null);
+          const firstResult = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+          expect(firstResult.workPlan.pendingRequiredFunctionCalls).toEqual(['send_report_email']);
+
+          // Second, SEPARATE call: step 3 removed WITH an explicit authorizing
+          // message and a "yes" judge -- only step 3's function is spared.
+          // Step 2's already-standing debt must remain untouched.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 3, we already published manually',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+          const secondResult = await (agentModeService as any).modifyWorkPlan([], [3], mockSessionId);
+
+          expect(secondResult.workPlan.pendingRequiredFunctionCalls).toEqual(['send_report_email']);
+          expect(secondResult.workPlan.pendingRequiredFunctionCalls).not.toContain('publish_landing_page');
+        });
+      });
+
       it('ENG-1811: deleting the last pending step(s) WITHOUT re-adding them (never calling set_work_plan_status again) must not report the plan as done while debt is outstanding', async () => {
         // Round-3 fresh-eyes review of PR #2808 found: the ledger's ONLY
         // enforcement point is setWorkPlanStatusAttempt, which nothing calls
