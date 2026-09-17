@@ -27,6 +27,15 @@ describe('hostile Fabriq OAuth routes', () => {
     expect(mockResolve).toHaveBeenCalledWith('route-user', 'mailbox', 'read');
     expect(mockInitiate).toHaveBeenCalledWith('app', 'route-user', 'gmail', { connectionId: expect.stringMatching(/^[a-f0-9]{32}$/), state: expect.stringMatching(/^[a-f0-9]{64}$/) });
   });
+  it('lets the same user restart an abandoned init and invalidates only the old attempt', async () => {
+    expect((await invoke('/init', { account_id: 'mailbox' })).statusCode).toBe(200);
+    const firstChallenge = mockInitiate.mock.calls[0][3];
+    expect((await invoke('/init', { account_id: 'mailbox' })).statusCode).toBe(200);
+    const secondChallenge = mockInitiate.mock.calls[1][3];
+    expect(secondChallenge.connectionId).toBe(firstChallenge.connectionId);
+    expect(secondChallenge.state).not.toBe(firstChallenge.state);
+    expect(await consume(firstChallenge.connectionId, firstChallenge.state)).toBeNull();
+  });
   it.each([{ tool: 'outlook' }, { status: 'connected' }, { status: 'nonsense' }, { state: undefined }, { state: ['a', 'b'] }, { connection_id: ['x'] }])('rejects invalid callback without vendor contact: %j', async bad => {
     const issued = await create('route-user', 'mailbox', 'gmail');
     const res = await invoke('/callback', { connection_id: issued.connectionId, state: issued.state, tool: 'gmail', status: 'success', ...bad });
@@ -50,6 +59,17 @@ describe('hostile Fabriq OAuth routes', () => {
     expect(mockResolve).toHaveBeenCalledWith('route-user', 'mailbox', 'read');
     expect((await invoke('/callback', query)).statusCode).toBe(400);
     expect(mockList).toHaveBeenCalledTimes(1);
+  });
+  it('preserves bounded callback retries for configured status and temporary vendor failure', async () => {
+    const issued = await create('route-user', 'mailbox', 'gmail');
+    const query = { ...issued, connection_id: issued.connectionId, tool: 'gmail', status: 'success' };
+    mockList.mockResolvedValueOnce([{ tool: 'gmail', connection_id: issued.connectionId, status: 'configured' }]);
+    expect((await invoke('/callback', query)).statusCode).toBe(200);
+    mockList.mockRejectedValueOnce(new Error('temporary'));
+    expect((await invoke('/callback', query)).statusCode).toBe(502);
+    mockList.mockResolvedValueOnce([{ tool: 'gmail', connection_id: issued.connectionId, status: 'connected' }]);
+    expect((await invoke('/callback', query)).send).toHaveBeenCalledWith(expect.stringContaining('Gmail connected'));
+    expect((await invoke('/callback', query)).statusCode).toBe(400);
   });
   it('fails closed when ownership changed or eligibility was revoked', async () => {
     const issued = await create('route-user', 'mailbox', 'gmail');

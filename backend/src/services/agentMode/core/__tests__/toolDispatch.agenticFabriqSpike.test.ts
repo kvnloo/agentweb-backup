@@ -172,13 +172,13 @@ describe('ENG-1685 Agentic Fabriq spike gate in toolDispatch.ts', () => {
 
 describe('hostile canary dispatch', () => {
   beforeEach(() => { mockIsEligible.mockReturnValue(true); mockRunEmailToolThroughAgenticFabriq.mockReset(); });
-  it.each(['send', 'reply', 'delete', '/private/user-1/account-1'])('blocks %s before bridge dispatch without direct fallback', async (action) => {
+  it.each(['send', 'reply', 'delete', '/private/user-1/account-1'])('keeps %s on the unchanged direct path', async (action) => {
     const ports = makePorts();
     const input = makeInput([toolCall('t1', 'email', JSON.stringify({ action }))], ports);
     await executePreparedTools(input);
     expect(mockRunEmailToolThroughAgenticFabriq).not.toHaveBeenCalled();
-    expect(ports.executePreparedAgentTool).not.toHaveBeenCalled();
-    expect(String((input.toolCallsLedger[0] as any).error)).toContain('read-only');
+    expect(ports.executePreparedAgentTool).toHaveBeenCalledTimes(1);
+    expect((input.toolCallsLedger[0] as any).error).toBeUndefined();
   });
   it('redacts arbitrary bridge failures from ledger output', async () => {
     mockRunEmailToolThroughAgenticFabriq.mockRejectedValue(new Error('user-1 account-1 /api/users/user-1 token-secret'));

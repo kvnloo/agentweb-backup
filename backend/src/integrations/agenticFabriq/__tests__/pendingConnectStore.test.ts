@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { clearPendingConnectsForTest, connectionIdForAccount, consumePendingConnect, createPendingConnect, deletePendingConnect } from '../pendingConnectStore';
+import { beginPendingConnectVerification, clearPendingConnectsForTest, connectionIdForAccount, consumePendingConnect, createPendingConnect, deletePendingConnect, finishPendingConnectVerification } from '../pendingConnectStore';
 const create = createPendingConnect as (...args: any[]) => Promise<any>;
 const consume = consumePendingConnect as (...args: any[]) => Promise<any>;
 const binding = connectionIdForAccount as (...args: any[]) => string;
@@ -31,10 +31,32 @@ describe('bounded single-use OAuth state', () => {
     expect(results.find(Boolean)).toMatchObject({ userId: 'user-a', accountId: 'mailbox-a', provider: 'gmail', connectionId: issued.connectionId });
     expect(compare).toHaveBeenCalled();
   });
-  it('does not overwrite an outstanding attempt', async () => {
+  it('allows at most three serialized verification attempts and consumes terminal outcomes', async () => {
     const issued = await create('user-a', 'mailbox-a', 'gmail', 1000);
-    await expect(create('user-a', 'mailbox-a', 'gmail', 1001)).rejects.toThrow();
-    expect(await consume(issued.connectionId, issued.state, 1002)).not.toBeNull();
+    const first = await beginPendingConnectVerification(issued.connectionId, issued.state, 1001);
+    expect(first).not.toBeNull();
+    expect(await beginPendingConnectVerification(issued.connectionId, issued.state, 1001)).toBeNull();
+    await finishPendingConnectVerification(issued.connectionId, first!.verificationId, 'retry');
+    const second = await beginPendingConnectVerification(issued.connectionId, issued.state, 1002);
+    await finishPendingConnectVerification(issued.connectionId, second!.verificationId, 'retry');
+    const third = await beginPendingConnectVerification(issued.connectionId, issued.state, 1003);
+    await finishPendingConnectVerification(issued.connectionId, third!.verificationId, 'retry');
+    expect(await beginPendingConnectVerification(issued.connectionId, issued.state, 1004)).toBeNull();
+
+    const terminal = await create('user-a', 'mailbox-a', 'gmail', 2000);
+    const reserved = await beginPendingConnectVerification(terminal.connectionId, terminal.state, 2001);
+    await finishPendingConnectVerification(terminal.connectionId, reserved!.verificationId, 'terminal');
+    expect(await beginPendingConnectVerification(terminal.connectionId, terminal.state, 2002)).toBeNull();
+  });
+  it('replaces only the same user and mailbox attempt and invalidates its old state', async () => {
+    const issued = await create('user-a', 'mailbox-a', 'gmail', 1000);
+    const otherUser = await create('user-b', 'mailbox-a', 'gmail', 1000);
+    const replacement = await create('user-a', 'mailbox-a', 'gmail', 1001);
+    expect(replacement.connectionId).toBe(issued.connectionId);
+    expect(replacement.state).not.toBe(issued.state);
+    expect(await consume(issued.connectionId, issued.state, 1002)).toBeNull();
+    expect(await consume(replacement.connectionId, replacement.state, 1002)).not.toBeNull();
+    expect(await consume(otherUser.connectionId, otherUser.state, 1002)).not.toBeNull();
   });
   it('does not delete valid state on forged state or crossed user binding', async () => {
     const a = await create('user-a', 'mailbox-a', 'gmail', 1000);

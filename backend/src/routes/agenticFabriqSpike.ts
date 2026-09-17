@@ -16,7 +16,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { isUserEligibleForAgenticFabriqSpike, agenticFabriqClient, getAgenticFabriqAppCredentials } from '../integrations/agenticFabriq';
-import { createPendingConnect, consumePendingConnect, deletePendingConnect, PendingConnectChallenge } from '../integrations/agenticFabriq/pendingConnectStore';
+import { beginPendingConnectVerification, createPendingConnect, deletePendingConnect, finishPendingConnectVerification, PendingConnectChallenge } from '../integrations/agenticFabriq/pendingConnectStore';
 import { bootstrapEmailProviders, resolveEmailAccount } from '../services/emailProviderService';
 
 const router = express.Router();
@@ -91,21 +91,24 @@ router.get('/callback', async (req, res) => {
     return res.status(400).send('Invalid Agentic Fabriq callback.');
   }
 
-  let pending;
+  let verification;
   try {
-    pending = await consumePendingConnect(connectionId, state);
+    verification = await beginPendingConnectVerification(connectionId, state);
   } catch {
     console.error('[ENG-1685 spike] callback state lookup failed');
     return res.status(502).send('Could not verify the Agentic Fabriq callback.');
   }
-  if (!pending) {
-    // Expired, already consumed, or never issued by us — a forged/replayed
-    // callback lands here too. Log and stop; never guess an identity.
+  if (!verification) {
+    // Expired, already terminal, forged, replayed, or currently being verified.
     console.warn('[ENG-1685 spike] callback state was unknown or expired');
     return res.status(400).send('This connect link has expired or was already used. Start a new connect.');
   }
+  const pending = verification.binding;
+  const finish = (outcome: 'terminal' | 'retry') =>
+    finishPendingConnectVerification(connectionId, verification.verificationId, outcome);
 
   if (status === 'error') {
+    await finish('terminal');
     console.warn('[ENG-1685 spike] provider callback reported failure');
     return res.status(200).send('Agentic Fabriq reported the connect attempt failed. You can retry the connect.');
   }
@@ -113,21 +116,28 @@ router.get('/callback', async (req, res) => {
   // Never render success from the query string alone, and never report success
   // for a "configured" (not yet "connected") row — re-read the source of truth.
   try {
-    if (!isUserEligibleForAgenticFabriqSpike(pending.userId)) return eligibilityRefusal(res);
+    if (!isUserEligibleForAgenticFabriqSpike(pending.userId)) {
+      await finish('terminal');
+      return eligibilityRefusal(res);
+    }
     await bootstrapEmailProviders();
     const resolved = await resolveEmailAccount(pending.userId, pending.accountId, 'read');
     if (resolved.platform !== PROVIDER || resolved.ownerUserId !== pending.userId || resolved.accountId !== pending.accountId) {
+      await finish('terminal');
       return res.status(403).send('Could not verify the Agentic Fabriq connection.');
     }
     const { appId } = await getAgenticFabriqAppCredentials();
     const connections = await agenticFabriqClient.listConnections(appId, pending.userId);
     const gmailConnections = connections.filter((c) => c.tool === PROVIDER && c.connection_id === pending.connectionId);
     if (gmailConnections.length === 1 && gmailConnections[0].status === 'connected') {
+      await finish('terminal');
       return res.status(200).send('Gmail connected via the Agentic Fabriq spike. You can close this tab.');
     }
+    await finish('retry');
     console.warn('[ENG-1685 spike] callback connection was not connected');
     return res.status(200).send('Connect did not complete (status is not yet "connected"). Try connecting again.');
   } catch {
+    await finish('retry');
     console.error('[ENG-1685 spike] callback verification failed');
     return res.status(502).send('Could not verify the Agentic Fabriq connection. Try connecting again.');
   }

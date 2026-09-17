@@ -1039,7 +1039,7 @@ export async function executePreparedTools(
     if (!isUserEligibleForAgenticFabriqSpike(userId)) return { handled: false };
 
     if (!functionArgs || !['search', 'list', 'get'].includes(functionArgs.action)) {
-      throw new Error('Agentic Fabriq canary is read-only.');
+      return { handled: false };
     }
     const directStartMs = Date.now(); // reference point only; the direct path itself is not re-run here
     try {

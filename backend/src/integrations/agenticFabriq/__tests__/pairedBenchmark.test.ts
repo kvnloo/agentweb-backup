@@ -31,6 +31,14 @@ test('keeps failures and stage times without serializing payloads, errors, IDs o
   expect(JSON.stringify(result)).not.toMatch(/private|secret|bearer|messages|accounts/);
   expect(result.summaries.every((r: any) => r.p99.status === 'inconclusive')).toBe(true);
 });
+test('records the innermost stage when instrumented stages are nested', async () => {
+  const opts = options();
+  opts.adapters.vendor.execute.mockImplementation(async (...args: any[]) => {
+    await args[1].stage('transport', () => args[1].stage('normalize', async () => { throw new Error('private'); }));
+  });
+  const result = await load().runPairedBenchmark(opts);
+  expect(result.attempts.filter((r: any) => r.arm === 'vendor' && r.executed).every((r: any) => r.failedStage === 'normalize')).toBe(true);
+});
 test('percentiles use all attempts and require 100 p99 samples', () => {
   expect(load().summarizeDurations(Array.from({ length: 100 }, (_, i) => i + 1))).toEqual({ attempts: 100, p50: 50, p95: 95, p99: { status: 'measured', value: 99 } });
   expect(load().summarizeDurations([1, 2]).p99).toEqual({ status: 'inconclusive', minimumSamples: 100 });

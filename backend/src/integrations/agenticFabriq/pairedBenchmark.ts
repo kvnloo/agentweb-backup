@@ -84,7 +84,7 @@ export async function runPairedBenchmark(options: BenchmarkOptions) {
               if (!STAGES.includes(name)) throw new Error('Invalid benchmark stage');
               const start = now();
               try { return await work(); }
-              catch (error) { record.failedStage = name; throw error; }
+              catch (error) { record.failedStage ??= name; throw error; }
               finally { record.stages[name] = (record.stages[name] ?? 0) + Math.max(0, now() - start); }
             },
           };

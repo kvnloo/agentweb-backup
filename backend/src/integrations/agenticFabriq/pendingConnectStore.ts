@@ -15,8 +15,16 @@ interface PendingConnectRecord {
   connectionId: string;
   createdAt: number;
 }
-interface StoredConnect extends PendingConnectRecord { stateDigest: Buffer }
+interface StoredConnect extends PendingConnectRecord {
+  stateDigest: Buffer;
+  verificationAttempts: number;
+  verificationId?: string;
+}
 export interface PendingConnectChallenge { connectionId: string; state: string }
+export interface PendingConnectVerification {
+  binding: PendingConnectRecord;
+  verificationId: string;
+}
 const pending = new Map<string, StoredConnect>();
 
 function validIdentity(value: string): boolean {
@@ -43,10 +51,11 @@ export async function createPendingConnect(
   if (provider !== 'gmail' || !Number.isFinite(nowMs)) throw new Error('Invalid connect request');
   const connectionId = connectionIdForAccount(accountId, userId);
   for (const [id, record] of pending) if (expired(record, nowMs)) pending.delete(id);
-  if (pending.has(connectionId)) throw new Error('Connect already pending');
-  if (pending.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
+  // This deterministic key binds replacement to exactly this user/mailbox.
+  // Other users and accounts have different keys and cannot be overwritten.
+  if (!pending.has(connectionId) && pending.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
   const state = crypto.randomBytes(32).toString('hex');
-  pending.set(connectionId, { userId, accountId, provider, connectionId, createdAt: nowMs, stateDigest: crypto.createHash('sha256').update(state).digest() });
+  pending.set(connectionId, { userId, accountId, provider, connectionId, createdAt: nowMs, stateDigest: crypto.createHash('sha256').update(state).digest(), verificationAttempts: 0 });
   return { connectionId, state };
 }
 
@@ -65,8 +74,36 @@ export async function consumePendingConnect(
   if (expired(record, nowMs)) { pending.delete(connectionId); return null; }
   if (!matches(record, state)) return null;
   pending.delete(connectionId);
-  const { stateDigest: _secret, ...binding } = record;
+  const { stateDigest: _secret, verificationAttempts: _attempts, verificationId: _verification, ...binding } = record;
   return binding;
+}
+
+/** Atomically reserves one of three callback-verification attempts. */
+export async function beginPendingConnectVerification(
+  connectionId: string, state: string, nowMs: number = Date.now(),
+): Promise<PendingConnectVerification | null> {
+  const record = pending.get(connectionId);
+  if (!record) return null;
+  if (expired(record, nowMs) || record.verificationAttempts >= 3) {
+    pending.delete(connectionId);
+    return null;
+  }
+  if (!matches(record, state) || record.verificationId) return null;
+  const verificationId = crypto.randomBytes(16).toString('hex');
+  record.verificationAttempts += 1;
+  record.verificationId = verificationId;
+  const { stateDigest: _secret, verificationAttempts: _attempts, verificationId: _verification, ...binding } = record;
+  return { binding, verificationId };
+}
+
+/** Terminal outcomes consume state; retryable outcomes release its reservation. */
+export async function finishPendingConnectVerification(
+  connectionId: string, verificationId: string, outcome: 'terminal' | 'retry',
+): Promise<void> {
+  const record = pending.get(connectionId);
+  if (!record || record.verificationId !== verificationId) return;
+  if (outcome === 'terminal' || record.verificationAttempts >= 3) pending.delete(connectionId);
+  else delete record.verificationId;
 }
 
 export function clearPendingConnectsForTest(): void { pending.clear(); }
