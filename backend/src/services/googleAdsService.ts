@@ -327,7 +327,7 @@ export class GoogleAdsService {
                 assert(id(a.ad?.id) && a.resourceName === `customers/${customerId}/adGroupAds/${groupId}~${a.ad.id}`, 'Missing ad identity');
                 status(a.status, ['ENABLED', 'PAUSED', 'REMOVED']);
                 status(a.policySummary?.approvalStatus, ['APPROVED', 'APPROVED_LIMITED', 'DISAPPROVED', 'AREA_OF_INTEREST_ONLY']);
-                status(a.policySummary?.reviewStatus, ['REVIEWED', 'REVIEW_IN_PROGRESS', 'UNDER_REVIEW', 'ELIGIBLE_MAY_SERVE']);
+                status(a.policySummary?.reviewStatus, ['REVIEWED', 'REVIEW_IN_PROGRESS', 'UNDER_APPEAL', 'ELIGIBLE_MAY_SERVE']);
               }
               const enabledAds = path.ads.filter((a: any) => a.status === 'ENABLED');
               if (!enabledAds.length) {
@@ -480,11 +480,14 @@ export class GoogleAdsService {
         throw new Error('Incomplete or malformed Google Ads search response');
       }
       if (completeness) {
-        if (data.totalResultsCount === undefined) {
+        const rawCount = data.totalResultsCount === undefined && (data.results === undefined || data.results.length === 0)
+          ? 0
+          : data.totalResultsCount;
+        if (rawCount === undefined) {
           throw new Error('Missing Google Ads result count');
         }
-        const count = Number(data.totalResultsCount);
-        if (!/^\d+$/.test(String(data.totalResultsCount)) || !Number.isSafeInteger(count)) {
+        const count = Number(rawCount);
+        if (!/^\d+$/.test(String(rawCount)) || !Number.isSafeInteger(count)) {
           throw new Error('Malformed Google Ads result count');
         }
         if (expectedCount !== undefined && expectedCount !== count) completeness.truncated = true;

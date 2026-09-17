@@ -34,8 +34,8 @@ test('SmartWaterHeater replay: paused creative blocks enabled campaign/group/key
   expect(result.state).toBe('BLOCKED_BY_AD');
   expect(result.adGroups[0].blockers).toContainEqual(expect.objectContaining({ state: 'BLOCKED_BY_AD', entityId: '3' }));
 });
-test.each(['DISAPPROVED', 'UNDER_REVIEW'])('enabled creative with %s policy blocks', async policy => {
-  if (policy === 'UNDER_REVIEW') rows.ad_group_ad[0].adGroupAd.policySummary.reviewStatus = policy;
+test.each(['DISAPPROVED', 'UNDER_APPEAL'])('enabled creative with %s policy blocks', async policy => {
+  if (policy === 'UNDER_APPEAL') rows.ad_group_ad[0].adGroupAd.policySummary.reviewStatus = policy;
   else rows.ad_group_ad[0].adGroupAd.policySummary.approvalStatus = policy;
   expect((await state()).state).toBe('BLOCKED_BY_POLICY');
 });
@@ -104,6 +104,12 @@ test('missing completeness count fails closed', async () => {
     return result;
   });
   expect((await verify()).state).toBe('UNVERIFIED');
+});
+test('omitted completeness count on an empty result page is accepted as zero', async () => {
+  api.mockResolvedValue({ results: [] });
+  const completeness = {};
+  await expect(service.search('123', 'token', 'SELECT ad_group.id FROM ad_group', undefined, completeness)).resolves.toEqual([]);
+  expect(completeness).toEqual({});
 });
 test.each(['PERFORMANCE_MAX', 'DISPLAY'])('unsupported %s is unverified', async channel => {
   rows.campaign[0].campaign.advertisingChannelType = channel;
