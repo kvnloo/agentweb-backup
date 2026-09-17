@@ -58,6 +58,20 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
       'you can still complete a one-time-code login without the user'
     );
   });
+
+  // ENG-1953 follow-up: the original guidance only offered CSV once a
+  // bot-protection gate wouldn't clear, even though Browser Sessions manual
+  // import exists specifically for sites Emma can't log into automatically —
+  // it just was never mentioned as an option on a domain's FIRST such failure
+  // (only after a later re-check of an already-imported cookie died, covered
+  // by the "Manually-imported sessions" guidance below). A first-time Luma-style
+  // Cloudflare block should offer this path too, not just CSV.
+  it('offers Browser Sessions manual import, with a direct link, as an option alongside CSV when a bot-protection gate will not clear', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'manually import a session cookie for this domain in **Settings > Browser Sessions**'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
+  });
 });
 
 // ENG-494 follow-up: a manually-imported Browser Sessions cookie can die
