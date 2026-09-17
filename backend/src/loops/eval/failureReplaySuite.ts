@@ -83,9 +83,12 @@ export async function runFailureReplaySuite<TInput, TOutput>({
   );
   const failures = results.filter((result) => !result.passed);
   let deduped = 0;
+  let filedCount = 0;
 
   for (const failure of failures) {
-    const filed = await fileIssue({
+    let filed: FiledAutoResult;
+    try {
+      filed = await fileIssue({
       title: `fix(failure-replay): ${failure.incident} contract regressed`,
       description: [
         `**Detected by the scheduled failure replay suite on ${now().toISOString()}.**`,
@@ -104,13 +107,26 @@ export async function runFailureReplaySuite<TInput, TOutput>({
         'Historical Incident': failure.incident,
       },
     });
+    } catch (error) {
+      // An intake outage must not abort the sweep: later regressions still
+      // get filed and the run still reports its counts. Record the failure
+      // on the result so the schedule owner can see which case went unfiled.
+      const failureResult = results.find((result) => result.caseId === failure.caseId);
+      if (failureResult) {
+        failureResult.error = [failureResult.error, `intake filing failed: ${error instanceof Error ? error.message : String(error)}`]
+          .filter(Boolean)
+          .join('; ');
+      }
+      continue;
+    }
     if (filed.deduped) deduped += 1;
+    filedCount += 1;
   }
 
   return {
     checked: uniqueCases.length,
     failed: failures.length,
-    filed: failures.length,
+    filed: filedCount,
     deduped,
     results,
   };

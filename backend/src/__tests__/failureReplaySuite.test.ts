@@ -74,4 +74,31 @@ describe('failure replay suite', () => {
     expect(fileIssue).not.toHaveBeenCalled();
     expect(result).toMatchObject({ checked: 1, failed: 0, filed: 0, deduped: 0 });
   });
+
+  it('continues the sweep and reports counts when an intake filing rejects', async () => {
+    const secondCase: FailureReplayCase<{ ceiling?: number }, { targetSpend: { cpcBidCeilingMicros?: string }; updateMask: string[] }> = {
+      ...eng286Case,
+      id: 'eng-286-second-case',
+    };
+    const fileIssue = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('Linear API unavailable'))
+      .mockResolvedValueOnce({
+        pageId: 'ENG-240',
+        url: 'https://linear/ENG-240',
+        deduped: true,
+        tracker: 'Linear',
+      });
+
+    const result = await runFailureReplaySuite({
+      cases: [eng286Case, secondCase],
+      contract: preFixContract,
+      fileIssue,
+    });
+
+    expect(fileIssue).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ checked: 2, failed: 2, filed: 1, deduped: 1 });
+    const unfiled = result.results.find((entry) => entry.caseId === eng286Case.id);
+    expect(unfiled?.error).toContain('intake filing failed: Linear API unavailable');
+  });
 });
