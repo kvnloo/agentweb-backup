@@ -1963,6 +1963,19 @@ describe('ENG-1015 durable session polling', () => {
       .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
     expect((await poll('r1')).completion_confirmed).toBe(false);
   });
+  it('does not call a task complete while the session awaits work-plan input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingWorkPlanInput: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it.each(['timeout_partial_media', 'timeout_partial_work'])(
+    'does not confirm partial timeout finish reason %s',
+    async finishReason => {
+      mockMcpFetch.mockResolvedValueOnce(session)
+        .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed', finishReason });
+      expect((await poll('r1')).completion_confirmed).toBe(false);
+    }
+  );
   it('withholds confirmation if the run endpoint fails', async () => {
     mockMcpFetch.mockResolvedValueOnce(session).mockRejectedValueOnce(new Error('404'));
     expect((await poll('r1')).completion_confirmed).toBe(false);

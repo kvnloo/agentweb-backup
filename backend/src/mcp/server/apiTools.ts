@@ -308,10 +308,10 @@ mcpToolRegistry.register({
     return jsonResult({
       ...data,
       run,
-      // Terminal means the run ended, not that it succeeded. Detached handoff ends
-      // the HTTP request while the build continues, so that reason is not completion.
+      // Terminal means the request ended, not that all detached or continuation work did.
       completion_confirmed: run !== null && run.status !== 'running' &&
-        run.finishReason !== 'detached_still_building' && data?.pendingUserQuestion?.status !== 'awaiting',
+        !['detached_still_building', 'timeout_partial_media', 'timeout_partial_work'].includes(run.finishReason ?? '') &&
+        data?.pendingUserQuestion?.status !== 'awaiting' && data?.pendingWorkPlanInput?.status !== 'awaiting',
     });
   }
 });
