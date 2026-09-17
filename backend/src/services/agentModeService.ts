@@ -31774,7 +31774,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       // Upload to S3 with the same path as the original file
       const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+      // ENG-1997 — this is the shared upload sink for BOTH updateHtmlFile's
+      // part/full replacements and updateHtmlFileCss's selector-based edits.
+      // The latter's `setAttribute` operation lets the model set an arbitrary
+      // attribute name/value pair directly (e.g. onerror/onclick), and its
+      // replace/append/etc. actions splice raw HTML with no escaping — same
+      // "LLM-authored HTML reaches a public S3 file unsanitized" trust gap
+      // createHtmlFile had, one step more direct since there's no need to even
+      // reproduce untrusted quoted text, the tool call arguments ARE the payload.
+      const sanitizedContent = sanitizeGeneratedHtml(content);
+      const uploadResult = await uploadFileToS3WithPath(sanitizedContent, filename, 'text/html', path);
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload updated file');
@@ -32312,8 +32322,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
         const filename = buildHtmlArtifactFilename(title);
-        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        // ENG-1997 — the passthrough uploads the model's own draft verbatim with no
+        // render step in between, so if it faithfully reproduced markup from
+        // untrusted quoted content (a CRM note, a client quote), nothing else in
+        // this path would ever catch it. Sanitize before it ever reaches S3.
+        const sanitizedContent = sanitizeGeneratedHtml(contentDraft);
+        const uploadableHtml = await this.inlinePrivateS3Images(sanitizedContent, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
           const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -32548,8 +32564,15 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const filename = buildHtmlArtifactFilename(title);
-      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      // ENG-1997 — the render step has no {{variable}} boundary to escape values
+      // into (unlike createHtmlFromTemplate/ENG-1877): it's told to copy names,
+      // quotes, and numbers from the draft verbatim, so any markup embedded in
+      // untrusted quoted content can survive the render unchanged. Sanitize the
+      // finished document before it reaches S3.
+      const sanitizedHtmlContent = sanitizeGeneratedHtml(htmlContent);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedHtmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
@@ -32719,8 +32742,13 @@ Return the HTML body fragment for this section only.`;
     try {
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
-      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
+      // ENG-1997 — renderMarkdownReportDocumentAsync already escapes text nodes,
+      // but sanitize defensively here too so this path never silently becomes the
+      // odd one out if that changes.
+      const sanitizedFallbackHtml = sanitizeGeneratedHtml(fallbackHtml);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedFallbackHtml, documentType, userId);
       const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
