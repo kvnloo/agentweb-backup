@@ -59,6 +59,8 @@ describe('putProjection', () => {
     expect(arg.Item.billingMonth).toBe('2026-09');
     expect(arg.Item.computedAt).toBe('2026-09-17T10:00:00.000Z');
     expect(result.settledMicroUsd).toBe(12500);
+    // §4 seeds the admission balance unfloored: usable − settled − reserved.
+    expect(result.availableMicroUsd).toBe(200_000_000 - 12500 - 0);
   });
 
   it('refuses an empty subject — a keyless snapshot would poison admission reads', async () => {
@@ -97,7 +99,7 @@ describe('getProjection', () => {
   });
 
   it('returns the stored snapshot when present', async () => {
-    const stored: PersistedProjection = { ...aProjection(), computedAt: '2026-09-17T10:00:00.000Z' };
+    const stored: PersistedProjection = { ...aProjection(), computedAt: '2026-09-17T10:00:00.000Z', availableMicroUsd: 0 };
     mockDynamoDB.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: stored }) });
 
     const got = await getProjection('owner-1', '2026-09');
@@ -110,7 +112,7 @@ describe('reconcilePersistedProjection — §3 invariant at the persistence laye
   const derived = aProjection({ settledMicroUsd: 12500 });
 
   it('agrees when the snapshot matches a fresh derivation', () => {
-    const persisted: PersistedProjection = { ...derived, computedAt: 'x' };
+    const persisted: PersistedProjection = { ...derived, computedAt: 'x', availableMicroUsd: 0 };
     const r = reconcilePersistedProjection(persisted, derived);
     expect(r).toMatchObject({ ok: true, missing: false, driftMicroUsd: 0 });
   });
@@ -124,7 +126,7 @@ describe('reconcilePersistedProjection — §3 invariant at the persistence laye
   });
 
   it('detects a drifting snapshot', () => {
-    const stale: PersistedProjection = { ...derived, settledMicroUsd: 10000, computedAt: 'x' };
+    const stale: PersistedProjection = { ...derived, settledMicroUsd: 10000, computedAt: 'x', availableMicroUsd: 0 };
     const r = reconcilePersistedProjection(stale, derived);
     expect(r.ok).toBe(false);
     expect(r.missing).toBe(false);
@@ -132,8 +134,8 @@ describe('reconcilePersistedProjection — §3 invariant at the persistence laye
   });
 
   it('tolerates one micro-dollar and fails just past it', () => {
-    const within: PersistedProjection = { ...derived, settledMicroUsd: 12501, computedAt: 'x' };
-    const beyond: PersistedProjection = { ...derived, settledMicroUsd: 12502, computedAt: 'x' };
+    const within: PersistedProjection = { ...derived, settledMicroUsd: 12501, computedAt: 'x', availableMicroUsd: 0 };
+    const beyond: PersistedProjection = { ...derived, settledMicroUsd: 12502, computedAt: 'x', availableMicroUsd: 0 };
     expect(reconcilePersistedProjection(within, derived).ok).toBe(true);
     expect(reconcilePersistedProjection(beyond, derived).ok).toBe(false);
   });
