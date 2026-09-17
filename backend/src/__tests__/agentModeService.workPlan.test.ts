@@ -3282,6 +3282,71 @@ describe('AgentModeService - Work Plan', () => {
           expect(secondResult.workPlan.pendingRequiredFunctionCalls).toEqual(['send_report_email']);
           expect(secondResult.workPlan.pendingRequiredFunctionCalls).not.toContain('publish_landing_page');
         });
+
+        it('a single removeStepCounts call mixing an authorized step with an unauthorized step only spares the authorized one', async () => {
+          // Fresh-eyes review of PR #2959 found: an earlier version of this fix
+          // asked the judge ONE yes/no for the whole modifyWorkPlan call, so a
+          // "yes" covering one genuinely-authorized step would silently spare
+          // every OTHER step removed in the same call too -- a batching side
+          // door back into the exact ENG-1811 gaming hole this ledger exists
+          // to close. The judge must be asked per removed step.
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+              {
+                stepCount: 3,
+                title: 'Publish landing page',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['publish_landing_page'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+
+          // The user only authorized dropping step 2's scope. The judge is
+          // asked once per removed step, so the step-3 call must independently
+          // come back "no" even though the same message authorized step 2.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 2, we do not need that email sent -- keep step 3 though',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockImplementation((...args: any[]) => {
+            const messages = args[1];
+            const systemContent = messages?.[0]?.content ?? '';
+            const isStep2Judge = systemContent.includes('Send report email');
+            return Promise.resolve({
+              choices: [{ message: { content: isStep2Judge ? 'yes' : 'no' }, finish_reason: 'stop' }],
+            });
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2, 3], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).not.toContain('send_report_email');
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['publish_landing_page'])
+          );
+        });
       });
 
       it('ENG-1811: deleting the last pending step(s) WITHOUT re-adding them (never calling set_work_plan_status again) must not report the plan as done while debt is outstanding', async () => {

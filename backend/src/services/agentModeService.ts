@@ -33759,6 +33759,18 @@ ${strippedHtml}`;
   // false "yes" would silently reopen the exact ENG-1811 gaming hole this
   // ledger exists to close, while a false "no" only costs one harmless extra
   // attempt at already-removed scope.
+  //
+  // Known, accepted limitation (fresh-eyes review, PR #2959): the judge only
+  // sees the user's raw message text, not the assistant's preceding turn. A
+  // common real flow -- assistant proposes "I'll skip step 2 since X, sound
+  // good?" and the user replies with a bare "yes"/"go ahead" -- won't mention
+  // the scope by name and will likely be judged "no", ledgering debt even
+  // though the removal was genuinely authorized. This under-covers the fix's
+  // own motivating scenario, but fails in the SAFE direction (extra debt, not
+  // a reopened gaming hole) -- not fixed here because doing so needs the
+  // assistant's own preceding message as judge context too, a real scope
+  // increase for a Low-priority, narrowly-scoped ticket, not a copy of an
+  // existing pattern the way the rest of this fix is.
   private readonly STEP_REMOVAL_JUDGE_MODEL = 'gemini-3.1-flash-lite';
   private readonly STEP_REMOVAL_JUDGE_TIMEOUT_MS = 8000;
 
@@ -33879,29 +33891,48 @@ Reply with ONLY one word: yes or no.`;
         // candidates for the authorization judge below -- debt already
         // standing from an earlier, unauthorized removal is never re-judged
         // or revoked here, only ever added to.
-        const candidateNewDebt: Array<{ fn: string; stepTitle: string }> = [];
+        //
+        // Judged PER REMOVED STEP, not once for the whole call: a single
+        // removeStepCounts batch can mix a step the user genuinely authorized
+        // with one the model is removing for its own unrelated reason (or to
+        // dodge a required call). A single call-wide yes/no would let one
+        // authorized step's "yes" spare an unrelated, unauthorized step in
+        // the same batch -- reopening ENG-1811's gaming hole through a
+        // batching side door (found by fresh-eyes review of the original
+        // single-verdict version). Each step's own requiredFunctionCalls are
+        // still judged together as one unit -- they're removed as one
+        // decision, not gameable by splitting further.
+        const candidateNewDebtByStep = new Map<number, { stepTitle: string; fns: string[] }>();
         for (const step of workPlan.steps) {
           if (!removeStepCounts.includes(step.stepCount)) continue;
           for (const fn of step.requiredFunctionCalls || []) {
             if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
               if (!priorSet.has(fn)) {
-                candidateNewDebt.push({ fn, stepTitle: step.title });
+                if (!candidateNewDebtByStep.has(step.stepCount)) {
+                  candidateNewDebtByStep.set(step.stepCount, { stepTitle: step.title, fns: [] });
+                }
+                candidateNewDebtByStep.get(step.stepCount)!.fns.push(fn);
               } else {
                 newlyUnresolved.add(fn);
               }
             }
           }
         }
-        const authorized = candidateNewDebt.length > 0
-          ? await this.wasStepRemovalUserAuthorized(sessionId, candidateNewDebt)
-          : false;
-        for (const { fn } of candidateNewDebt) {
-          if (authorized) {
-            console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
-          } else {
-            newlyUnresolved.add(fn);
-          }
-        }
+        await Promise.all(
+          Array.from(candidateNewDebtByStep.values()).map(async ({ stepTitle, fns }) => {
+            const authorized = await this.wasStepRemovalUserAuthorized(
+              sessionId,
+              fns.map((fn) => ({ fn, stepTitle })),
+            );
+            for (const fn of fns) {
+              if (authorized) {
+                console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }),
+        );
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
