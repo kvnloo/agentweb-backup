@@ -7991,6 +7991,12 @@ export async function generateSessionResponse(
   // message and echoed back nowhere else needed -- the caller already knows its
   // own clientId, only messageIndex (assigned server-side) needs to come back.
   clientId?: string,
+  // ENG-1635/1644: the structured, server-resolved answer set for this reply's deck
+  // submission, stamped onto the reply's own metadata — mirrors answeredQuestionMeta
+  // above exactly. Without this, a deck's card can only ever reflect the session's
+  // single live pendingApprovalDeck slot; the moment a NEWER deck opens, this one's
+  // card has no way to know it was answered and falls back to plain text forever.
+  approvalDeckAnswerMeta?: { deckId: string; answers: any[] },
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -8081,6 +8087,9 @@ export async function generateSessionResponse(
       // ENG-396: structured record of the card selection this reply answered (from a
       // click, not the text). The card reads this to show which option was chosen.
       ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {}),
+      // ENG-1635/1644: same rationale, generalized to a whole deck's answer set —
+      // see approvalDeckAnswerMeta's own comment above.
+      ...(approvalDeckAnswerMeta ? { approvalDeckAnswer: approvalDeckAnswerMeta } : {}),
       // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.
@@ -8883,6 +8892,11 @@ export const agentModeController = {
     // build, so the optimistic ApprovalDeckCard flips to its locked/answered
     // view immediately instead of only after a page reload.
     let answeredApprovalDeck: PendingApprovalDeck | undefined;
+    // ENG-1635/1644: the server-resolved answer set for this turn's deck submission,
+    // stamped onto the reply message so the deck's own card stays self-contained once
+    // a newer deck rolls session.pendingApprovalDeck past it — see the comment on
+    // generateSessionResponse's approvalDeckAnswerMeta param for the full rationale.
+    let approvalDeckAnswerMeta: { deckId: string; answers: any[] } | undefined;
     // ENG-1635/1644 Phase 1b: true when this turn cancelled a deck — tells the
     // frontend to clear its own copy of pendingApprovalDeck (the deck was
     // cleared to null server-side, not answered, so answeredApprovalDeck's
@@ -9073,6 +9087,13 @@ export const agentModeController = {
           return res.status(409).json({ error: 'This approval deck was already answered by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
         }
         answeredApprovalDeck = result.answeredDeck;
+        // ENG-1635/1644: server-resolved answers (delegation already resolved to the
+        // recommended option) — NOT the raw client-submitted deckAnswer.answers — so a
+        // reconstructed historical card shows the true resolved verdict, same guarantee
+        // askUserQuestionAnswer already gives for a single question.
+        if (answeredApprovalDeck?.answers) {
+          approvalDeckAnswerMeta = { deckId: deckAnswer.deckId, answers: answeredApprovalDeck.answers };
+        }
         const rejections = (deckAnswer.answers || [])
           .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
           .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
@@ -9370,6 +9391,7 @@ export const agentModeController = {
         undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
+        approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;

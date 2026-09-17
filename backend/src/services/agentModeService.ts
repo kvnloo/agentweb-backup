@@ -4956,7 +4956,14 @@ export class AgentModeService {
               // Applies identically regardless of which deck kind this is (Phase 2) —
               // the frontend only ever branches on pendingApprovalDeckId matching, never
               // on deck contents.
-              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId }
+              //
+              // approvalDeckItems: the full structured items array, stamped here so this
+              // message is self-contained for rendering once it's no longer the session's
+              // live slot (a later deck overwrites session.pendingApprovalDeck entirely —
+              // without its own copy, THIS message would have no way to reconstruct its
+              // card and would fall back to plain text forever, even after being answered).
+              // Mirrors ask_user_question's toolCall.result carrying its own question/options.
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId, approvalDeckItems: approvalDeck.items }
             });
             if (onProgress) {
               runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
