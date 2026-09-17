@@ -47,6 +47,28 @@ const router = express.Router();
 
 const activeSlackTurns = new Map<string, number>();
 const SLACK_REQUEST_MAX_AGE_SECONDS = 60 * 5;
+const SLACK_ASSISTANT_STATUS_TIMEOUT_MS = 1_500;
+
+async function setSlackAssistantStatusWithDeadline(
+  channel: string,
+  threadTs: string,
+  status: string,
+): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      setSlackAssistantStatus(channel, threadTs, status),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Slack assistant status request timed out')),
+          SLACK_ASSISTANT_STATUS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 function verifySlackRequest(req: Request): boolean {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
@@ -80,7 +102,7 @@ async function claimSlackAssistantStatus(channel: string, threadTs: string): Pro
   activeSlackTurns.set(key, activeTurns + 1);
   if (activeTurns === 0) {
     try {
-      await setSlackAssistantStatus(channel, threadTs, 'is working...');
+      await setSlackAssistantStatusWithDeadline(channel, threadTs, 'is working...');
     } catch (error) {
       console.error('Non-blocking: failed to set Slack assistant thread status:', error);
     }
@@ -96,7 +118,7 @@ async function releaseSlackAssistantStatus(channel: string, threadTs: string): P
   }
   activeSlackTurns.delete(key);
   try {
-    await setSlackAssistantStatus(channel, threadTs, '');
+    await setSlackAssistantStatusWithDeadline(channel, threadTs, '');
   } catch (error) {
     console.error('Non-blocking: failed to clear Slack assistant thread status:', error);
   }
@@ -616,6 +638,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
       // Handle app mention events
       if (event.type === 'app_mention') {
         const { text, user: slackUserId, channel, ts, thread_ts: threadTs, files, user_team: userTeam, source_team: sourceTeam } = event;
+        const responseThreadTs = threadTs ?? ts;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -641,7 +664,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
             await slackClient.chat.postMessage({
               channel,
               text: '👋 Hi! Please include a message after mentioning me. For example: @Emma help me create a social media post',
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
             return;
           }
@@ -742,7 +765,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text: 'Only AgentWeb admins or the target account owner can link this channel.',
-                thread_ts: ts
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -752,7 +775,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text: `User not found: ${targetEmail}`,
-                thread_ts: ts
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -771,7 +794,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
             await slackClient.chat.postMessage({
               channel,
               text: `✅ Linked this channel to ${targetEmail}.`,
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
             return;
           }
@@ -790,7 +813,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
                 await slackClient.chat.postMessage({
                   channel,
                   text: `User not found: ${targetEmail}`,
-                  thread_ts: ts
+                  thread_ts: responseThreadTs
                 });
                 return;
               }
@@ -813,7 +836,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               pageIdentifier = 'slack-bot-admin';
 
               // Post confirmation
-              await postThreadResponse(channel, ts, `Starting session for ${targetEmail}`);
+              await postThreadResponse(channel, responseThreadTs, `Starting session for ${targetEmail}`);
               console.log(`📝 Admin channel: creating delegated session for ${targetEmail} (admin: ${delegateInfo.adminEmail})`);
             } else {
               // No "for email" prefix — fall through to regular user lookup below
@@ -882,7 +905,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
               await slackClient.chat.postMessage({
                 channel,
                 text,
-                thread_ts: ts
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -933,7 +956,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
             await slackClient.chat.postMessage({
               channel,
               text: '❌ Sorry, something went wrong while processing your request. Please try again or contact support.',
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
           } catch (slackError) {
             console.error('❌ Error sending error message to Slack:', slackError);

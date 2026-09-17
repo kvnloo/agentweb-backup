@@ -292,6 +292,42 @@ describe('Slack Events API', () => {
       );
     });
 
+    it('uses the root thread timestamp for threaded empty-message validation', async () => {
+      const response = await request(app).post('/api/slack/events').send({
+        type: 'event_callback',
+        event: {
+          type: 'app_mention', user: 'U12345', text: '<@UEMMA123>',
+          channel: 'C12345', ts: 'reply-ts', thread_ts: 'root-ts',
+        },
+      });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C12345', thread_ts: 'root-ts',
+        text: expect.stringContaining('Please include a message'),
+      }));
+    });
+
+    it('uses the root thread timestamp for threaded app-mention errors', async () => {
+      settingsService.getSetting.mockRejectedValueOnce(new Error('settings unavailable'));
+
+      const response = await request(app).post('/api/slack/events').send({
+        type: 'event_callback',
+        event: {
+          type: 'app_mention', user: 'U12345', text: '<@UEMMA123> help',
+          channel: 'C12345', ts: 'reply-ts', thread_ts: 'root-ts',
+        },
+      });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        channel: 'C12345', thread_ts: 'root-ts',
+        text: expect.stringContaining('something went wrong'),
+      }));
+    });
+
     it('should pass file attachments to Emma when app_mention includes files', async () => {
       const { uploadFileToS3 } = require('../utils/s3Utils');
       const { downloadSlackFile } = require('../services/slackService');
@@ -1093,6 +1129,37 @@ describe('Slack Events API', () => {
           'C12345', '1234567890.123456', 'Still handled'
         );
       });
+      it('does not let a never-resolving native status call block generation or retain the active turn', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+        setSlackAssistantStatus.mockImplementationOnce(() => new Promise(() => {}));
+        generateSessionResponse.mockResolvedValue({ content: 'Handled after timeout', toolCalls: [] });
+
+        const event = (ts: string) => request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: 'U12345', text: '<@UEMMA123> continue',
+            channel: 'C12345', ts, thread_ts: 'root-ts',
+          },
+        });
+
+        await event('reply-1');
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', 'root-ts', 'is working...');
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+
+        await new Promise(resolve => setTimeout(resolve, 1_600));
+        expect(generateSessionResponse).toHaveBeenCalledTimes(1);
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', 'root-ts', '');
+
+        await event('reply-2');
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(setSlackAssistantStatus.mock.calls.filter((call: any[]) => call[2] === 'is working...')).toHaveLength(2);
+      });
+
       it('keeps native status active until all concurrent mapped turns in a thread finish', async () => {
         settingsService.getSetting.mockResolvedValue({
           settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),

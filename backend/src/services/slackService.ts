@@ -29,12 +29,18 @@ export function resolveSlackApiUrl(
 
 // Initialize Slack Web API client
 let slackClient: WebClient | null = null;
+let slackAssistantStatusClient: WebClient | null = null;
 
 if (process.env.SLACK_BOT_TOKEN) {
   const slackApiUrl = resolveSlackApiUrl();
   slackClient = slackApiUrl
     ? new WebClient(process.env.SLACK_BOT_TOKEN, { slackApiUrl })
     : new WebClient(process.env.SLACK_BOT_TOKEN);
+  slackAssistantStatusClient = new WebClient(process.env.SLACK_BOT_TOKEN, {
+    ...(slackApiUrl ? { slackApiUrl } : {}),
+    timeout: 1_500,
+    retryConfig: { retries: 0 },
+  });
 } else {
   console.warn("⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.");
 }
@@ -1342,10 +1348,10 @@ export async function setSlackAssistantStatus(
   threadTs: string,
   status: string
 ): Promise<void> {
-  if (!slackClient) return;
+  if (!slackAssistantStatusClient) return;
 
   try {
-    await slackClient.apiCall('assistant.threads.setStatus', {
+    await slackAssistantStatusClient.apiCall('assistant.threads.setStatus', {
       channel_id: channel,
       thread_ts: threadTs,
       status,
