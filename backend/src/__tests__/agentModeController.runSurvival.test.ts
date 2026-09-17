@@ -285,7 +285,7 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       delete process.env.DURABLE_LANDING_GENERATION;
     });
 
-    it('pre-generation reconnect (build already in flight) → run record marked terminal with finishReason detached_still_building, locks released', async () => {
+    it('pre-generation reconnect with no durable run linkage → omits runId and closes only this request record', async () => {
       process.env.DURABLE_LANDING_GENERATION = 'true';
       (findInFlightJobForSession as jest.Mock).mockResolvedValueOnce({
         id: 'page-1',
@@ -296,9 +296,7 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       await agentModeController.generateResponse(makeReq(mockSessionId), res);
 
       expect((res.json as jest.Mock).mock.calls[0][0].stillBuilding).toBe(true);
-      expect((res.json as jest.Mock).mock.calls[0][0].runId).toBe(
-        (mockRunStore.createRunRecord as jest.Mock).mock.calls[0][0].runId
-      );
+      expect((res.json as jest.Mock).mock.calls[0][0].runId).toBeUndefined();
       expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
       expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
         expect.any(String),
@@ -309,7 +307,7 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
     });
 
-    it('generation timeout with a build still in flight (detach path) → run record marked terminal with finishReason detached_still_building, locks released', async () => {
+    it('generation timeout with a build still in flight → returns runId and lets the completion hook terminal-mark it', async () => {
       // Not gated on DURABLE_LANDING_GENERATION (see controller comment) —
       // trigger via a generation rejection tagged isGenerationTimeout.
       const timeoutErr: any = new Error('Generation timed out');
@@ -330,8 +328,8 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       );
       expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
         expect.any(String),
-        'completed',
-        expect.objectContaining({ finishReason: 'detached_still_building' })
+        'failed',
+        { finishReason: 'detached_failed' },
       );
       expect(mockRunStore.releaseIdempotency).toHaveBeenCalledTimes(1);
       expect(activeSessionGenerations.has(mockSessionId)).toBe(false);

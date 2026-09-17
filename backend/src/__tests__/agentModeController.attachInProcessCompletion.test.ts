@@ -11,9 +11,14 @@
  */
 import { attachInProcessCompletion } from '../controllers/agentModeController';
 import { claimCompletion } from '../services/durableLandingService';
+import { markRunTerminal } from '../services/agentMode/runStore';
 
 jest.mock('../services/durableLandingService', () => ({
   claimCompletion: jest.fn(),
+}));
+jest.mock('../services/agentMode/runStore', () => ({
+  ...jest.requireActual('../services/agentMode/runStore'),
+  markRunTerminal: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockIoEmit = jest.fn();
@@ -23,6 +28,7 @@ jest.mock('../server', () => ({
 }));
 
 const mockClaimCompletion = claimCompletion as jest.Mock;
+const mockMarkRunTerminal = markRunTerminal as jest.Mock;
 
 describe('attachInProcessCompletion (ENG-1495)', () => {
   beforeEach(() => {
@@ -96,5 +102,35 @@ describe('attachInProcessCompletion (ENG-1495)', () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(mockIoEmit).not.toHaveBeenCalled();
+  });
+
+  it('terminal-marks the returned run only after detached success', async () => {
+    mockClaimCompletion.mockResolvedValue(true);
+    const genPromise = Promise.resolve({ content: 'ready', responseMessages: [] });
+
+    attachInProcessCompletion(genPromise, 'page-in-flight', 'user-lp', 'session-lp', 'run-1');
+    expect(mockMarkRunTerminal).not.toHaveBeenCalled();
+    await genPromise;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockMarkRunTerminal).toHaveBeenCalledWith(
+      'run-1',
+      'completed',
+      { finishReason: 'detached_completed' },
+    );
+  });
+
+  it('terminal-marks the returned run failed when detached work rejects', async () => {
+    const genPromise = Promise.reject(new Error('build failed'));
+
+    attachInProcessCompletion(genPromise, 'page-in-flight', 'user-lp', 'session-lp', 'run-2');
+    await expect(genPromise).rejects.toThrow('build failed');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockMarkRunTerminal).toHaveBeenCalledWith(
+      'run-2',
+      'failed',
+      { finishReason: 'detached_failed' },
+    );
   });
 });
