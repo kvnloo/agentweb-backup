@@ -39010,6 +39010,74 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * turning them on — is legitimate, so this informs rather than blocks. A lookup failure
    * here must not fail an otherwise-successful launch, so it degrades to no warning.
    */
+  private makeGoogleAdsAuthError(message: string): Error {
+    const err = new Error(message) as any;
+    err.isGoogleAdsAuthError = true;
+    return err;
+  }
+
+  /**
+   * ENG-1944: mirrors resolveMetaCredentialScope. Google Ads tools had no equivalent —
+   * a delegated/admin session's call always resolved against the CALLER's own connected
+   * Google identity, never the requested client's, so a staff member auditing a client's
+   * account got "not found in your connected accounts" for an account that plainly exists
+   * on the client's own record. Unscoped (clientId undefined/null) is a no-op — zero
+   * behavior change for the ordinary customer-session path. Scoped calls fail loud, same
+   * as Meta: never silently substitute the caller's own account.
+   *
+   * Deliberately read-only in effect: only wired into the two reporting/list surfaces
+   * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
+   * A client-scoped WRITE would let an admin session mutate a client's live campaign
+   * without that client's own fresh authorization decision — the same risk ENG-1801
+   * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
+   * non-read action rather than pass it here.
+   */
+  private async resolveGoogleAdsCredentialScope(
+    callerUserId: string,
+    clientId: unknown,
+    callerIsAdminHint: boolean | undefined,
+    toolName: string
+  ): Promise<{ effectiveUserId: string; strict: boolean }> {
+    if (clientId === undefined || clientId === null) {
+      return { effectiveUserId: callerUserId, strict: false };
+    }
+    if (typeof clientId !== 'string' || !clientId.trim()) {
+      throw this.makeGoogleAdsAuthError(
+        `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+      );
+    }
+
+    const { userDb } = await import('./db');
+    const caller = await userDb.getUserById(callerUserId);
+    const isAdmin = callerIsAdminHint !== undefined ? callerIsAdminHint : caller?.isAdmin === true;
+    if (!isAdmin) {
+      throw this.makeGoogleAdsAuthError('client_id is admin-only — this account is not an admin.');
+    }
+
+    const trimmed = clientId.trim();
+    const target = trimmed.includes('@')
+      ? await userDb.getUserByEmail(trimmed)
+      : await userDb.getUserById(trimmed);
+    if (!target) {
+      throw this.makeGoogleAdsAuthError(`No client account found for "${trimmed}".`);
+    }
+    if (!(target as any).roles?.includes('customer')) {
+      throw this.makeGoogleAdsAuthError(`"${trimmed}" does not have customer portal access — cannot scope Google Ads tools to it.`);
+    }
+
+    const { recordAdminAudit } = await import('./adminAuditLog');
+    recordAdminAudit({
+      actorUserId: callerUserId,
+      actorEmail: caller?.email,
+      action: 'google_ads_client_scope',
+      tool: toolName,
+      targetUserId: (target as any).userId,
+      targetEmail: (target as any).email,
+    });
+
+    return { effectiveUserId: (target as any).userId, strict: true };
+  }
+
   private async checkGoogleAdsPausedChildren(
     userId: string,
     customerId: string,
@@ -39257,9 +39325,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
-  }, opts?: { sessionId?: string }): Promise<any> {
+  }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      // ENG-1944: client_id is admin-only and read-only-scoped here (see
+      // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
+      // session mutate a client's live campaign without that client's own authorization.
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        if (action !== 'LIST' && action !== 'SEARCH') {
+          return {
+            success: false,
+            error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
+          };
+        }
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
+        );
+        userId = scope.effectiveUserId;
+      }
       /*
        * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
        *
@@ -39978,8 +40061,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
-  }): Promise<any> {
+  }, opts?: { clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
+      // ENG-1944: fully read-only tool, so client_id is always safe to honor here —
+      // no write-scope restriction needed (see handleCallGoogleAdsApi for why that
+      // restriction exists on the mixed read/write tool).
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_reporting_api'
+        );
+        userId = scope.effectiveUserId;
+      }
       if (args.mode === 'dashboard') {
         const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
           campaignIds: args.campaign_ids,

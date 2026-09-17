@@ -9326,12 +9326,16 @@ ACTION MATRIX:
         landscape_image_assets: { type: 'array', items: { type: 'string' }, description: 'Landscape image asset resource names for ASSET_GROUP CREATE.' },
         logo_assets: { type: 'array', items: { type: 'string' }, description: 'Logo asset resource names for ASSET_GROUP CREATE.' },
         video_assets: { type: 'array', items: { type: 'string' }, description: 'Video asset resource names for ASSET_GROUP CREATE. Optional.' },
+        client_id: { ...CLIENT_ID_SCHEMA_PROPERTY, description: `${CLIENT_ID_SCHEMA_PROPERTY.description} Read-only here: only honored for action=LIST or action=SEARCH — a client-scoped write is refused, since that would mutate a client's live campaign without their own authorization.` },
       },
       required: ['customer_id', 'entity_type', 'action'],
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, { sessionId: context?.sessionId });
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
+      sessionId: context?.sessionId,
+      ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_api' } } : {}),
+    });
   },
 });
 
@@ -9359,12 +9363,15 @@ GAQL EXAMPLES:
         query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
         campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
         date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: ['customer_id', 'mode'],
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
+    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
+      ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_reporting_api' } } : {}),
+    });
   },
   // ENG-1276 follow-up: only fetches metrics/GAQL results (getQuickMetrics,
   // queryReporting) — no write-capable action in this tool's schema at all,
