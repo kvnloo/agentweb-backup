@@ -38,6 +38,14 @@ test('daily totals reconcile and deterministic breakdowns preserve metrics and a
 test('rejects period totals that disagree with daily rows', () => {
   fixture('2.01,11,3,2,1,1,0'); expect(() => compileSandboxDataset(packet, config)).toThrow(/reconcil/i);
 });
+test('one delivered impression has one reachable person in the simulated metrics (ENG-2024)', () => {
+  const one = '0.02,1,1,1,0,0,0';
+  fixture(one, {
+    'performance_daily.csv': `date,period,account_id,campaign_id,adset_id,ad_id,currency,${metrics}\n2026-04-09,A,ACCOUNT_A,CAMPAIGN_01,ADSET_01,AD_01,USD,${one}\n`,
+  });
+  const d = compileSandboxDataset(packet, config);
+  expect(d.insightsDaily[0]).toMatchObject({ impressions: 1, reach: 1 });
+});
 test('rejects changed files before compiling', () => {
   fixture(); writeFileSync(join(packet, 'settings.csv'), 'tampered'); expect(() => compileSandboxDataset(packet, config)).toThrow(/manifest/i);
 });

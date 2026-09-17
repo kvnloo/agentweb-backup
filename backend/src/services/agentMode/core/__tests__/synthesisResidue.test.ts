@@ -373,6 +373,17 @@ describe('buildExecutedActionsFooter', () => {
 // content and compares it against the ledger's actual successful asset-producing
 // tool calls.
 describe('detectFalseCompletionClaim', () => {
+  it('still verifies a production claim with a success adverb', () => {
+    expect(detectFalseCompletionClaim('All 12 sizes were successfully rendered.', [])).toEqual({ claimed: 12, actual: 0 });
+  });
+  it.each([
+    'All 4 ads were reviewed across the reporting windows.',
+    '4 of 4 ads generated leads in the reporting period.',
+    '4/4 creatives have delivery. The account generated 20 leads.',
+  ])('does not turn read-only analysis into a production claim: %s', content => {
+    expect(detectFalseCompletionClaim(content, [{ name: 'get_meta_ads', result: { success: true } }])).toBeNull();
+  });
+
   const fourScreenshots = Array.from({ length: 4 }, (_, i) => ({
     name: 'playwright_browser_take_screenshot',
     result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },

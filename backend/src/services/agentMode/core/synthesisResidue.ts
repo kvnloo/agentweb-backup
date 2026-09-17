@@ -690,6 +690,15 @@ export function detectFalseCompletionClaim(
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(content)) !== null) {
+      // A count of existing ads is not a claim that this turn produced them.
+      // Require a production predicate attached to the count, not a word such
+      // as "generated" elsewhere in an analytics answer ("generated leads").
+      const before = content.slice(0, match.index).split(/[.!?\n]/).pop() || '';
+      const after = content.slice(match.index + match[0].length).split(/[.!?\n]/)[0];
+      const producedBefore = /\b(?:generated|created|rendered|delivered|produced|exported|saved)\s*$/i.test(before);
+      const producedAfter = /^\s*(?:(?:have|has)\s+been\s+|(?:were|was|are|is)\s+)?(?:successfully\s+)?(?:generated|created|rendered|delivered|produced|exported|saved)(?=\s*(?:$|[,;]|and\b|for\b))/i.test(after)
+        || /^\s+for\b[^.!?\n]{0,120}\b(?:were|was|have been)\s+(?:generated|created|rendered|delivered|produced|exported|saved)\b/i.test(after);
+      if (!producedBefore && !producedAfter) continue;
       const n = parseInt(match[1], 10);
       if (Number.isFinite(n) && n > 0) claims.add(n);
     }

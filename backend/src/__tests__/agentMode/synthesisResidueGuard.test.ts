@@ -42,6 +42,19 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
     installStandardMockDeps();
   });
 
+  it('preserves a read-only ad analysis without appending an asset-production correction (ENG-2029)', async () => {
+    const content = 'All 4 ads were reviewed. They generated 20 leads across 4 reporting windows.';
+    const snapshot = await runScenario(service, {
+      message: 'Analyze the existing ads; do not create or change anything.',
+      transcript: [
+        { tool_calls: [{ id: 'analysis-read', name: 'read_brand_guidelines', arguments: '{}' }] },
+        { content },
+      ],
+    });
+    expect(snapshot.content).toBe(content);
+    expect(snapshot.llmTurnsConsumed).toBe(2);
+  });
+
   it('re-asks for the synthesis instead of shipping a "}]" final turn', async () => {
     const snapshot = await runScenario(service, {
       message: 'Pause both new campaigns, then show me the brand guidelines.',

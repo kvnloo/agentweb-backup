@@ -271,7 +271,7 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
   for (const row of [...daily].sort((a, b) => a.date.localeCompare(b.date) || a.ad_id.localeCompare(b.ad_id))) {
     const mapping = creativeByAd.get(row.ad_id);
     if (!mapping || mapping.campaign_id !== row.campaign_id || mapping.adset_id !== row.adset_id) fail('daily/creative hierarchy mismatch');
-    const insight: SandboxInsightsDaily = { date: row.date, ad_id: id(row.ad_id), adset_id: id(row.adset_id), campaign_id: id(row.campaign_id), impressions: number(row.impressions), reach: Math.floor(number(row.impressions) * 0.8), clicks: number(row.clicks), inline_link_clicks: number(row.inline_link_clicks), spend: number(row.spend, true), actions: [
+    const insight: SandboxInsightsDaily = { date: row.date, ad_id: id(row.ad_id), adset_id: id(row.adset_id), campaign_id: id(row.campaign_id), impressions: number(row.impressions), reach: Math.ceil(number(row.impressions) * 0.8), clicks: number(row.clicks), inline_link_clicks: number(row.inline_link_clicks), spend: number(row.spend, true), actions: [
       { action_type: 'link_click', value: number(row.inline_link_clicks) }, { action_type: 'landing_page_view', value: number(row.inline_link_clicks) }, { action_type: 'lead', value: number(row.reported_leads) }, { action_type: 'offsite_conversion.fb_pixel_lead', value: number(row.reported_leads) }, { action_type: 'complete_registration', value: number(row.reported_complete_registrations) },
       { action_type: 'offsite_conversion.fb_pixel_complete_registration', value: number(row.reported_complete_registrations) }, { action_type: 'purchase', value: number(row.reported_purchases) },
     ] };
