@@ -11,6 +11,7 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -275,16 +276,43 @@ mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID. Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
     inputSchema: {
       type: 'object',
-      properties: { session_id: { type: 'string', description: 'The session ID' } },
+      properties: {
+        session_id: { type: 'string', description: 'The session ID' },
+        run_id: { type: 'string', description: 'The run_id returned by a detached task (runId from emma_send_message). Pass it to check durable terminal status.' },
+      },
       required: ['session_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${args.session_id}`, context: ctx(context) });
-    return jsonResult(data);
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}`, context: ctx(context) });
+    let run: AgentRunStatus | null = null;
+    if (typeof args.run_id === 'string' && args.run_id) {
+      try {
+        const record: any = await mcpFetch({
+          method: 'GET', path: `/api/agent-mode/runs/${encodeURIComponent(args.run_id)}`, context: ctx(context),
+        });
+        // This is a network boundary: validate identity and every field used as evidence.
+        if (record && record.runId === args.run_id && record.sessionId === args.session_id &&
+            ['running', 'completed', 'failed', 'interrupted'].includes(record.status) &&
+            (record.finishReason == null || typeof record.finishReason === 'string')) {
+          run = { runId: record.runId, sessionId: record.sessionId, status: record.status,
+            finishReason: record.finishReason ?? null };
+        }
+      } catch {
+        // A refusal, missing record or operational failure is never completion evidence.
+      }
+    }
+    return jsonResult({
+      ...data,
+      run,
+      // Terminal means the request ended, not that all detached or continuation work did.
+      completion_confirmed: run !== null && run.status !== 'running' &&
+        !['detached_still_building', 'timeout_partial_media', 'timeout_partial_work'].includes(run.finishReason ?? '') &&
+        data?.pendingUserQuestion?.status !== 'awaiting' && data?.pendingWorkPlanInput?.status !== 'awaiting',
+    });
   }
 });
 
