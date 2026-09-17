@@ -1,0 +1,14 @@
+{
+  "state": "Customer asks to reset a forgotten password and says the reset email never arrived.",
+  "questions": {
+    "queue": {
+      "type": "choice",
+      "instructions": "Which support queue should handle this request?",
+      "criteria": {
+        "account_access": "Account access and authentication support.",
+        "billing": "Billing and payment support.",
+        "sales": "Sales and product evaluation."
+      }
+    }
+  }
+}
