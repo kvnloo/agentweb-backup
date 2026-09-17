@@ -111,4 +111,17 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
       'A domain only ever ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
     );
   });
+
+  // ENG-1953 follow-up: the reported bug was literally this misunderstanding —
+  // the user read "log into Luma" as the complete fix and expected the session
+  // to reach Emma on its own. Emma's own instructions must make the second,
+  // actually-load-bearing step (copying the cookie into Settings) impossible to
+  // miss, with a direct link so there's no ambiguity about where that happens.
+  it('requires both re-import steps to be stated together, with a direct link to the Browser Sessions settings page', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('logging into the site is not enough on its own');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'copy that session\'s cookie into **Settings > Browser Sessions** themselves'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
+  });
 });
