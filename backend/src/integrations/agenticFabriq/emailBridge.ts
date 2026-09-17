@@ -15,8 +15,10 @@ import { getAgenticFabriqApiBaseUrl, getAgenticFabriqAppCredentials } from './co
 import { agenticFabriqTokenCache } from './tokenCache';
 import { agenticFabriqClient } from './client';
 import { agenticFabriqMcpBridge, resolveMcpExternalUrl } from './mcpBridge';
-import { AgenticFabriqError } from './errors';
+import { AgenticFabriqError, AgenticFabriqUnsupportedMailboxError } from './errors';
 import type { McpToolDescriptor } from './types';
+import { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } from '../../services/emailProviderService';
+import { connectionIdForAccount } from './pendingConnectStore';
 
 export interface AgenticFabriqEmailToolArgs {
   account_id?: string;
@@ -76,30 +78,37 @@ export function pickGmailToolForAction(
   tools: McpToolDescriptor[],
   action: AgenticFabriqEmailToolArgs['action'],
 ): McpToolDescriptor | null {
-  const gmailTools = tools.filter((t) => toolBelongsToGmail(t.name));
-  if (gmailTools.length === 0) return null;
-
   const keywords = ACTION_KEYWORDS[action];
-  const scored = gmailTools
-    .map((t) => ({ tool: t, score: keywords.filter((k) => t.name.toLowerCase().includes(k)).length }))
-    .sort((a, b) => b.score - a.score);
-
-  // Refuse a zero-score "best" match — that's a genuine coverage gap (AC4d),
-  // not a guess worth acting on. A send action must never silently fall
-  // through to whatever gmail tool happened to sort first.
-  if (scored[0].score === 0) return null;
-  return scored[0].tool;
+  let best: { tool: McpToolDescriptor; score: number } | null = null;
+  for (const tool of tools) {
+    if (!toolBelongsToGmail(tool.name)) continue;
+    const score = keywords.filter((keyword) => tool.name.toLowerCase().includes(keyword)).length;
+    if (score > 0 && (!best || score > best.score)) best = { tool, score };
+  }
+  return best?.tool ?? null;
 }
 
+/** Executes one email action only after exact owner-mailbox authorization. */
 export async function runEmailToolThroughAgenticFabriq(
   args: AgenticFabriqEmailToolArgs,
   rawUserId: string,
 ): Promise<AgenticFabriqEmailBridgeResult> {
   const startedAtMs = Date.now();
+  if (!args.account_id || args.account_id.length > 200) throw new AgenticFabriqUnsupportedMailboxError();
+  await bootstrapEmailProviders();
+  const operation = args.action === 'send' ? 'send' : 'read';
+  const resolved = await resolveEmailAccount(rawUserId, args.account_id, operation);
+  // Shared mailboxes are unsupported in this spike. Fail closed for reads as
+  // well as sends because Fabriq tokens are scoped to the caller, not owner.
+  if (resolved.platform !== 'gmail' || resolved.ownerUserId !== rawUserId) {
+    throw new AgenticFabriqUnsupportedMailboxError();
+  }
+  const connectionId = connectionIdForAccount(resolved.accountId);
   const { appId } = await getAgenticFabriqAppCredentials();
 
   const connections = await agenticFabriqClient.listConnections(appId, rawUserId);
-  const gmailConnection = connections.find((c) => c.tool === 'gmail');
+  const matchingConnections = connections.filter((c) => c.tool === 'gmail' && c.connection_id === connectionId);
+  const gmailConnection = matchingConnections.length === 1 ? matchingConnections[0] : undefined;
   // "A LISTED CONNECTION IS NOT A WORKING ONE" — key every user-facing state
   // off status === 'connected', never off the row merely existing.
   if (!gmailConnection || gmailConnection.status !== 'connected') {
@@ -118,7 +127,7 @@ export async function runEmailToolThroughAgenticFabriq(
     };
   }
 
-  const token = await agenticFabriqTokenCache.getFreshToken(appId, rawUserId);
+  const token = await agenticFabriqTokenCache.getFreshToken(appId, rawUserId, connectionId);
   const mcpUrl = resolveMcpExternalUrl(getAgenticFabriqApiBaseUrl(), token.mcpUrl);
 
   const tools = await agenticFabriqMcpBridge.listTools(mcpUrl, token.accessToken);
@@ -127,17 +136,17 @@ export async function runEmailToolThroughAgenticFabriq(
     return {
       outcome: {
         error:
-          `No Agentic Fabriq Gmail tool matched action "${args.action}" among ${tools.length} discovered tools ` +
-          `(${tools.map((t) => t.name).join(', ') || 'none'}). This is a real coverage gap for the spike, not a bug to paper over.`,
+          `No Agentic Fabriq Gmail tool matched action "${args.action}" among ${tools.length} discovered tools.`,
       },
       spikeMeta: { matchedToolName: null, latencyMs: Date.now() - startedAtMs, discoveredToolCount: tools.length, connectionStatus: gmailConnection.status },
     };
   }
 
-  const mcpArgs = mapEmailArgsToMcpArgs(args);
+  const mcpArgs = mapEmailArgsToMcpArgs(args, connectionId);
   let outcome: unknown;
   try {
-    outcome = await agenticFabriqMcpBridge.callTool(mcpUrl, token.accessToken, matched.name, mcpArgs);
+    outcome = await withAccessGuard(rawUserId, resolved, operation, () =>
+      agenticFabriqMcpBridge.callTool(mcpUrl, token.accessToken, matched.name, mcpArgs));
   } catch (err) {
     if (err instanceof AgenticFabriqError) throw err; // surfaced, never retried under a different identity
     throw err;
@@ -161,16 +170,19 @@ export async function runEmailToolThroughAgenticFabriq(
  * live run surfaces real schema mismatches (a genuine AC4d coverage gap)
  * instead of this bridge silently swallowing them.
  */
-function mapEmailArgsToMcpArgs(args: AgenticFabriqEmailToolArgs): Record<string, unknown> {
+function mapEmailArgsToMcpArgs(args: AgenticFabriqEmailToolArgs, connectionId: string): Record<string, unknown> {
+  const binding = { account_id: args.account_id, connection_id: connectionId };
+  const maxResults = Math.max(1, Math.min(Number(args.max_results) || 10, 50));
   switch (args.action) {
     case 'search':
-      return { query: args.query, max_results: args.max_results ?? 10 };
+      return { ...binding, query: args.query, max_results: maxResults };
     case 'list':
-      return { folder: args.folder ?? 'INBOX', max_results: args.max_results ?? 20 };
+      return { ...binding, folder: args.folder ?? 'INBOX', max_results: maxResults };
     case 'get':
-      return { message_ids: args.message_ids };
+      return { ...binding, message_ids: Array.isArray(args.message_ids) ? args.message_ids.slice(0, 50) : [] };
     case 'send':
       return {
+        ...binding,
         to: args.to,
         subject: args.subject,
         body: args.body,

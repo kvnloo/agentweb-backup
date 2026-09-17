@@ -1,78 +1,72 @@
 /**
- * Bridges the unauthenticated OAuth callback (a browser redirect from AF,
- * carrying no bearer token) back to the AgentWeb user who started the connect
- * flow — WITHOUT trusting the callback's own `external_user_id` query param,
- * which the vendor's own docs call out as unsigned and attacker-controllable.
- *
- * Same shape as the existing `mcp/client/mcpOAuthClientProvider.ts`'s
- * `PendingSessionRecord`/`PENDING_SETTING` pattern (settingsService-backed,
- * short TTL) — reused here rather than invented fresh, and durable across an
- * EB process restart mid-flow (an in-memory Map would not survive that).
- *
- * The AF `connection_id` we send at initiate-time IS the opaque pending id:
- * AF documents connection_id as "any label you invent," and it's the one
- * field the vendor's callback reliably echoes back. 16 random bytes — nothing
- * guessable, nothing an attacker could forge to redirect a real user's
- * completed consent onto their own account.
+ * Process-local, bounded OAuth callback state for the default-off ENG-1685
+ * spike. It intentionally avoids a new persistent settings key: persistent
+ * data-plane changes require separate approval. A process restart invalidates
+ * an outstanding link, which is safe and acceptable for this draft spike.
  */
 
 import crypto from 'crypto';
-import { settingsService } from '../../services/settingsService';
 
-const SETTING_KEY = 'agentic_fabriq_spike_pending_connects';
 const PENDING_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_CONNECTS = 1_000;
 
 interface PendingConnectRecord {
-  pendingId: string;
   userId: string;
+  accountId: string;
   provider: string;
   createdAt: number;
 }
 
-async function loadAll(): Promise<PendingConnectRecord[]> {
-  const setting = await settingsService.getSetting(SETTING_KEY);
-  if (!setting) return [];
-  try {
-    const parsed = JSON.parse(setting.settingValue);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+const pending = new Map<string, PendingConnectRecord>();
+
+/** Derives the stable, opaque 32-hex Fabriq connection binding for a mailbox. */
+export function connectionIdForAccount(accountId: string): string {
+  return crypto.createHash('sha256').update(`agentic-fabriq:gmail:${accountId}`, 'utf8').digest('hex').slice(0, 32);
+}
+
+function prune(nowMs: number): void {
+  for (const [id, record] of pending) {
+    if (nowMs - record.createdAt > PENDING_TTL_MS) pending.delete(id);
   }
 }
 
-async function saveAll(records: PendingConnectRecord[]): Promise<void> {
-  await settingsService.setSetting(
-    SETTING_KEY,
-    JSON.stringify(records),
-    'Agentic Fabriq spike (ENG-1685) pending OAuth connect bridge — safe to clear, regenerated per connect attempt',
-    'agentic-fabriq-spike',
-  );
+/**
+ * Atomically records one bounded callback state keyed by the exact mailbox
+ * connection binding. Throws when the process-local cap is exhausted.
+ */
+export async function createPendingConnect(
+  userId: string,
+  accountId: string,
+  provider: string,
+  nowMs: number = Date.now(),
+): Promise<string> {
+  prune(nowMs);
+  if (pending.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
+  const connectionId = connectionIdForAccount(accountId);
+  pending.set(connectionId, { userId, accountId, provider, createdAt: nowMs });
+  return connectionId;
 }
 
-function isExpired(record: PendingConnectRecord, nowMs: number): boolean {
-  return nowMs - record.createdAt > PENDING_TTL_MS;
-}
-
-/** Called from /init, while the caller is authenticated. Returns the opaque connection_id to send to AF. */
-export async function createPendingConnect(userId: string, provider: string, nowMs: number = Date.now()): Promise<string> {
-  const pendingId = crypto.randomBytes(16).toString('hex');
-  const records = (await loadAll()).filter((r) => !isExpired(r, nowMs));
-  records.push({ pendingId, userId, provider, createdAt: nowMs });
-  await saveAll(records);
-  return pendingId;
+/** Deletes a pending state after a failed initiation attempt. */
+export async function deletePendingConnect(connectionId: string): Promise<void> {
+  pending.delete(connectionId);
 }
 
 /**
- * Called from the unauthenticated /callback route. Consumes (single-use) and
- * returns the userId this connection_id was minted for, or null if unknown/
- * expired/already consumed — the ONLY caller-facing signal, deliberately with
- * no distinction between those cases so a probing attacker learns nothing.
+ * Atomically consumes a callback state. Deleting before returning guarantees a
+ * second concurrent callback cannot observe the same state.
  */
-export async function consumePendingConnect(pendingId: string, nowMs: number = Date.now()): Promise<string | null> {
-  const records = await loadAll();
-  const match = records.find((r) => r.pendingId === pendingId);
-  const remaining = records.filter((r) => r.pendingId !== pendingId && !isExpired(r, nowMs));
-  await saveAll(remaining); // single-use: consumed (or expired) entries never persist
-  if (!match || isExpired(match, nowMs)) return null;
-  return match.userId;
+export async function consumePendingConnect(
+  connectionId: string,
+  nowMs: number = Date.now(),
+): Promise<PendingConnectRecord | null> {
+  const record = pending.get(connectionId);
+  pending.delete(connectionId);
+  if (!record || nowMs - record.createdAt > PENDING_TTL_MS) return null;
+  return record;
+}
+
+/** Clears process-local state for isolated tests only. */
+export function clearPendingConnectsForTest(): void {
+  pending.clear();
 }

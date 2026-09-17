@@ -1039,22 +1039,16 @@ export async function executePreparedTools(
     try {
       const { outcome, spikeMeta } = await runEmailToolThroughAgenticFabriq(functionArgs, userId);
       console.log('[ENG-1685 spike] agentic_fabriq_email_tool_call', JSON.stringify({
-        userId,
-        sessionId,
         action: functionArgs?.action,
         ...spikeMeta,
-        directPathSkippedAtMs: directStartMs,
+        dispatchOverheadMs: Date.now() - directStartMs,
       }));
       return { handled: true, result: outcome };
     } catch (error) {
       // Per the vendor's own RULES: surface the error, never silently fall back
       // to the direct path (that would hide exactly the failure mode the spike
       // exists to measure) and never retry under a different identity.
-      console.error('[ENG-1685 spike] agentic_fabriq_email_tool_call_error', {
-        userId,
-        sessionId,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      console.error('[ENG-1685 spike] agentic_fabriq_email_tool_call_error');
       throw error;
     }
   };

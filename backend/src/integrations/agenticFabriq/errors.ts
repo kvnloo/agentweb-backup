@@ -17,25 +17,38 @@ export class AgenticFabriqError extends Error {
   }
 }
 
-/** A REST call to Fabriq returned a non-2xx. Carries the status + a redacted body for diagnosis. */
+/** A REST call returned a non-2xx response without exposing its body. */
 export class AgenticFabriqApiError extends AgenticFabriqError {
   constructor(
     readonly status: number,
     readonly endpoint: string,
-    readonly body: unknown,
   ) {
-    super(`Agentic Fabriq API error ${status} on ${endpoint}: ${AgenticFabriqApiError.summarize(body)}`);
+    super(`Agentic Fabriq API error ${status} on ${endpoint}`);
     this.name = 'AgenticFabriqApiError';
   }
+}
 
-  private static summarize(body: unknown): string {
-    if (body === null || body === undefined) return '(no body)';
-    if (typeof body === 'string') return body.slice(0, 500);
-    try {
-      return JSON.stringify(body).slice(0, 500);
-    } catch {
-      return '(unserializable body)';
-    }
+/** A provider request exceeded its bounded deadline. */
+export class AgenticFabriqTimeoutError extends AgenticFabriqError {
+  constructor(readonly operation: string) {
+    super(`Agentic Fabriq request timed out during ${operation}`);
+    this.name = 'AgenticFabriqTimeoutError';
+  }
+}
+
+/** A provider response exceeded the maximum safe buffering size. */
+export class AgenticFabriqResponseTooLargeError extends AgenticFabriqError {
+  constructor(readonly operation: string) {
+    super(`Agentic Fabriq response exceeded the size limit during ${operation}`);
+    this.name = 'AgenticFabriqResponseTooLargeError';
+  }
+}
+
+/** The requested mailbox cannot be bound safely to one Fabriq connection. */
+export class AgenticFabriqUnsupportedMailboxError extends AgenticFabriqError {
+  constructor() {
+    super('This mailbox is not supported by the Agentic Fabriq spike; use the direct email path.');
+    this.name = 'AgenticFabriqUnsupportedMailboxError';
   }
 }
 

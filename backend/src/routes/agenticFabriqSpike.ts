@@ -16,11 +16,24 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { isUserEligibleForAgenticFabriqSpike, agenticFabriqClient, getAgenticFabriqAppCredentials } from '../integrations/agenticFabriq';
-import { createPendingConnect, consumePendingConnect } from '../integrations/agenticFabriq/pendingConnectStore';
+import { createPendingConnect, consumePendingConnect, deletePendingConnect } from '../integrations/agenticFabriq/pendingConnectStore';
+import { bootstrapEmailProviders, resolveEmailAccount } from '../services/emailProviderService';
 
 const router = express.Router();
 
 const PROVIDER = 'gmail';
+const INIT_WINDOW_MS = 10 * 60 * 1000;
+const INIT_LIMIT = 5;
+const initAttempts = new Map<string, number[]>();
+
+/** Applies a small process-local limit; the allowlist already bounds key cardinality. */
+function consumeInitAllowance(userId: string, nowMs = Date.now()): boolean {
+  const recent = (initAttempts.get(userId) ?? []).filter((at) => nowMs - at < INIT_WINDOW_MS);
+  if (recent.length >= INIT_LIMIT) return false;
+  recent.push(nowMs);
+  initAttempts.set(userId, recent);
+  return true;
+}
 
 function eligibilityRefusal(res: express.Response): void {
   res.status(403).json({
@@ -40,15 +53,25 @@ router.get('/init', authenticateToken, async (req: any, res) => {
   if (!isUserEligibleForAgenticFabriqSpike(userId)) {
     return eligibilityRefusal(res);
   }
+  const accountId = typeof req.query?.account_id === 'string' ? req.query.account_id : '';
+  if (!accountId || accountId.length > 200) return res.status(400).json({ error: 'invalid_account_id' });
+  if (!consumeInitAllowance(userId)) return res.status(429).json({ error: 'rate_limited' });
 
+  let pendingId: string | undefined;
   try {
+    await bootstrapEmailProviders();
+    const resolved = await resolveEmailAccount(userId, accountId, 'send');
+    if (resolved.platform !== 'gmail' || resolved.ownerUserId !== userId) {
+      return res.status(400).json({ error: 'unsupported_mailbox' });
+    }
     const { appId } = await getAgenticFabriqAppCredentials();
-    const pendingId = await createPendingConnect(userId, PROVIDER);
+    pendingId = await createPendingConnect(userId, accountId, PROVIDER);
     await agenticFabriqClient.ensureExternalUser(appId, userId); // idempotent — 409 tolerated internally
     const initiated = await agenticFabriqClient.initiateOAuth(appId, userId, PROVIDER, { connectionId: pendingId });
     res.json({ success: true, oauth_url: initiated.oauth_url });
-  } catch (error: any) {
-    console.error('[ENG-1685 spike] /init error', error?.message ?? error);
+  } catch {
+    if (pendingId) await deletePendingConnect(pendingId);
+    console.error('[ENG-1685 spike] /init failed');
     res.status(502).json({ error: 'agentic_fabriq_initiate_failed', message: 'Could not start the Agentic Fabriq connect flow.' });
   }
 });
@@ -58,22 +81,30 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 //    keyed by our own opaque connection_id — NEVER from external_user_id or
 //    any other query param, which the vendor's own docs mark unsigned. ─────
 router.get('/callback', async (req, res) => {
-  const { status, tool, connection_id: connectionId } = req.query as Record<string, string | undefined>;
-
-  if (!connectionId) {
-    return res.status(400).send('Missing connection_id on Agentic Fabriq callback.');
+  const connectionId = req.query.connection_id;
+  const status = req.query.status;
+  const tool = req.query.tool;
+  if (typeof connectionId !== 'string' || !/^[a-f0-9]{32}$/.test(connectionId) ||
+      typeof status !== 'string' || typeof tool !== 'string') {
+    return res.status(400).send('Invalid Agentic Fabriq callback.');
   }
 
-  const userId = await consumePendingConnect(connectionId);
-  if (!userId) {
+  let pending;
+  try {
+    pending = await consumePendingConnect(connectionId);
+  } catch {
+    console.error('[ENG-1685 spike] callback state lookup failed');
+    return res.status(502).send('Could not verify the Agentic Fabriq callback.');
+  }
+  if (!pending) {
     // Expired, already consumed, or never issued by us — a forged/replayed
     // callback lands here too. Log and stop; never guess an identity.
-    console.warn('[ENG-1685 spike] callback with unknown/expired connection_id', { connectionId, tool });
+    console.warn('[ENG-1685 spike] callback state was unknown or expired');
     return res.status(400).send('This connect link has expired or was already used. Start a new connect from /init.');
   }
 
   if (status === 'error') {
-    console.warn('[ENG-1685 spike] AF callback reported error', { userId, tool, query: req.query });
+    console.warn('[ENG-1685 spike] provider callback reported failure');
     return res.status(200).send('Agentic Fabriq reported the connect attempt failed. You can retry from /init.');
   }
 
@@ -81,18 +112,15 @@ router.get('/callback', async (req, res) => {
   // for a "configured" (not yet "connected") row — re-read the source of truth.
   try {
     const { appId } = await getAgenticFabriqAppCredentials();
-    const connections = await agenticFabriqClient.listConnections(appId, userId);
-    const gmailConnection = connections.find((c) => c.tool === PROVIDER);
+    const connections = await agenticFabriqClient.listConnections(appId, pending.userId);
+    const gmailConnection = connections.find((c) => c.tool === PROVIDER && c.connection_id === connectionId);
     if (gmailConnection?.status === 'connected') {
       return res.status(200).send('Gmail connected via the Agentic Fabriq spike. You can close this tab.');
     }
-    console.warn('[ENG-1685 spike] callback fired but connection is not yet "connected"', {
-      userId,
-      status: gmailConnection?.status ?? 'no_row',
-    });
+    console.warn('[ENG-1685 spike] callback connection was not connected');
     return res.status(200).send('Connect did not complete (status is not yet "connected"). Try again from /init.');
-  } catch (error: any) {
-    console.error('[ENG-1685 spike] /callback verification error', error?.message ?? error);
+  } catch {
+    console.error('[ENG-1685 spike] callback verification failed');
     return res.status(502).send('Could not verify the Agentic Fabriq connection. Try again from /init.');
   }
 });

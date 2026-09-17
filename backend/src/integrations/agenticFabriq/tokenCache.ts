@@ -17,8 +17,10 @@ export class AgenticFabriqTokenCache {
   private readonly cache = new Map<string, CachedUserToken>();
   private readonly inFlight = new Map<string, Promise<CachedUserToken>>();
 
+  /** Creates an in-memory cache backed by the supplied REST client. */
   constructor(private readonly client: AgenticFabriqClient = agenticFabriqClient) {}
 
+  /** Returns true only while the token retains the configured safety buffer. */
   private isFresh(entry: CachedUserToken, nowMs: number): boolean {
     return nowMs < entry.expiresAtMs - REMINT_BUFFER_MS;
   }
@@ -29,11 +31,19 @@ export class AgenticFabriqTokenCache {
    * concurrent callers for the same user so a burst of tool calls doesn't mint
    * N tokens for one user in the same instant.
    */
-  async getFreshToken(appId: string, rawUserId: string, nowMs: number = Date.now()): Promise<CachedUserToken> {
-    const cached = this.cache.get(rawUserId);
+  async getFreshToken(
+    appId: string,
+    rawUserId: string,
+    connectionIdOrNow: string | number = 'default',
+    explicitNowMs?: number,
+  ): Promise<CachedUserToken> {
+    const connectionId = typeof connectionIdOrNow === 'string' ? connectionIdOrNow : 'default';
+    const nowMs = typeof connectionIdOrNow === 'number' ? connectionIdOrNow : (explicitNowMs ?? Date.now());
+    const cacheKey = `${rawUserId}\u0000${connectionId}`;
+    const cached = this.cache.get(cacheKey);
     if (cached && this.isFresh(cached, nowMs)) return cached;
 
-    const existingMint = this.inFlight.get(rawUserId);
+    const existingMint = this.inFlight.get(cacheKey);
     if (existingMint) return existingMint;
 
     const mintPromise = (async () => {
@@ -54,25 +64,30 @@ export class AgenticFabriqTokenCache {
           mintedAtMs: nowMs,
           expiresAtMs: nowMs + tokenResponse.expires_in * 1000,
         };
-        this.cache.set(rawUserId, entry);
+        this.cache.set(cacheKey, entry);
         return entry;
       } finally {
-        this.inFlight.delete(rawUserId);
+        this.inFlight.delete(cacheKey);
       }
     })();
 
-    this.inFlight.set(rawUserId, mintPromise);
+    this.inFlight.set(cacheKey, mintPromise);
     return mintPromise;
   }
 
   /** Drops the cached token for one user — called on invalidate_user() and connection.needs_reauth. */
   invalidateUser(rawUserId: string): void {
-    this.cache.delete(rawUserId);
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(`${rawUserId}\u0000`)) this.cache.delete(key);
+    }
   }
 
   /** Test/diagnostic only — never exposes the token value itself. */
   hasCachedToken(rawUserId: string): boolean {
-    return this.cache.has(rawUserId);
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(`${rawUserId}\u0000`)) return true;
+    }
+    return false;
   }
 }
 

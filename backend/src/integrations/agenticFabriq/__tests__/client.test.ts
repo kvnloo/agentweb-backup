@@ -20,6 +20,7 @@ function fakeFetch(status: number, body: unknown): jest.Mock<Promise<any>, [stri
   return jest.fn(async (_url: string, _init: any) => ({
     ok: status < 300,
     status,
+    headers: { get: () => null },
     text: async () => JSON.stringify(body),
   }));
 }
@@ -84,5 +85,25 @@ describe('AgenticFabriqClient', () => {
       status: 403,
       endpoint: expect.stringContaining('/providers/capabilities'),
     });
+  });
+
+  it('does not expose a vendor response body in the thrown error', async () => {
+    const fetchImpl = fakeFetch(403, { access_token: 'secret-token', email: 'private@example.com' });
+    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
+    await expect(client.getProviderCapabilities('app_1')).rejects.not.toThrow(/secret-token|private@example/);
+  });
+
+  it('aborts a stalled request at the configured deadline', async () => {
+    const fetchImpl = jest.fn((_url: string, init: any) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    }));
+    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any, timeoutMs: 5 });
+    await expect(client.getProviderCapabilities('app_1')).rejects.toMatchObject({ name: 'AgenticFabriqTimeoutError' });
+  });
+
+  it('rejects responses larger than the configured byte cap', async () => {
+    const fetchImpl = fakeFetch(200, { value: 'x'.repeat(100) });
+    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any, maxResponseBytes: 20 });
+    await expect(client.getProviderCapabilities('app_1')).rejects.toMatchObject({ name: 'AgenticFabriqResponseTooLargeError' });
   });
 });

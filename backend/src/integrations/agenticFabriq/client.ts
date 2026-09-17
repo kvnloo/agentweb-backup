@@ -19,7 +19,7 @@
 
 import { getAgenticFabriqApiBaseUrl, getAgenticFabriqAppCredentials, getAgenticFabriqPrivateKeyPem } from './config';
 import { signAgenticFabriqAssertion } from './assertion';
-import { AgenticFabriqApiError } from './errors';
+import { AgenticFabriqApiError, AgenticFabriqResponseTooLargeError, AgenticFabriqTimeoutError } from './errors';
 import type {
   AgenticFabriqCapabilitiesResponse,
   AgenticFabriqConnectionRow,
@@ -33,10 +33,18 @@ export type FetchLike = typeof fetch;
 
 export interface AgenticFabriqClientOptions {
   fetchImpl?: FetchLike;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
 }
 
-async function readJsonSafely(res: Response): Promise<unknown> {
+const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
+
+async function readJsonSafely(res: Response, maxBytes: number, operation: string): Promise<unknown> {
+  const declaredLength = Number(res.headers?.get('content-length') ?? 0);
+  if (declaredLength > maxBytes) throw new AgenticFabriqResponseTooLargeError(operation);
   const text = await res.text().catch(() => '');
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new AgenticFabriqResponseTooLargeError(operation);
   if (!text) return null;
   try {
     return JSON.parse(text);
@@ -47,9 +55,14 @@ async function readJsonSafely(res: Response): Promise<unknown> {
 
 export class AgenticFabriqClient {
   private readonly fetchImpl: FetchLike;
+  private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
 
+  /** Creates a client with injectable transport and hard request bounds. */
   constructor(options: AgenticFabriqClientOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   }
 
   /** Builds the app-scoped auth headers, signing an assertion when a private key is configured. */
@@ -71,6 +84,7 @@ export class AgenticFabriqClient {
     return headers;
   }
 
+  /** Sends one bounded app-authenticated request and sanitizes all failures. */
   private async request<T>(
     method: 'GET' | 'POST' | 'DELETE',
     path: string,
@@ -79,16 +93,29 @@ export class AgenticFabriqClient {
     const base = getAgenticFabriqApiBaseUrl();
     const url = `${base}${path}`;
     const headers = await this.appHeaders(opts.rawUserIdForAssertion);
-    const res = await this.fetchImpl(url, {
-      method,
-      headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    });
-    if (!res.ok) {
-      const body = await readJsonSafely(res);
-      throw new AgenticFabriqApiError(res.status, path, body);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(url, {
+        method,
+        headers,
+        signal: controller.signal,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      });
+      if (!res.ok) {
+        // Drain only a bounded body and never retain or expose provider content.
+        await readJsonSafely(res, this.maxResponseBytes, path);
+        throw new AgenticFabriqApiError(res.status, path);
+      }
+      return (await readJsonSafely(res, this.maxResponseBytes, path)) as T;
+    } catch (error: any) {
+      if (controller.signal.aborted || error?.name === 'AbortError') {
+        throw new AgenticFabriqTimeoutError(path);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-    return (await readJsonSafely(res)) as T;
   }
 
   /**
@@ -107,6 +134,7 @@ export class AgenticFabriqClient {
     }
   }
 
+  /** Mints a short-lived token scoped to one external user. */
   async mintUserToken(appId: string, rawUserId: string): Promise<AgenticFabriqTokenResponse> {
     return this.request<AgenticFabriqTokenResponse>(
       'POST',
@@ -115,6 +143,7 @@ export class AgenticFabriqClient {
     );
   }
 
+  /** Lists the named external user's provider connections. */
   async listConnections(appId: string, rawUserId: string): Promise<AgenticFabriqConnectionRow[]> {
     const result = await this.request<AgenticFabriqConnectionRow[] | { connections: AgenticFabriqConnectionRow[] }>(
       'GET',
@@ -144,6 +173,7 @@ export class AgenticFabriqClient {
     );
   }
 
+  /** Starts OAuth with an explicit caller-owned connection binding. */
   async initiateOAuth(
     appId: string,
     rawUserId: string,
@@ -160,6 +190,7 @@ export class AgenticFabriqClient {
     );
   }
 
+  /** Starts the vendor's credential-entry flow for non-OAuth providers. */
   async initiateCredentials(
     appId: string,
     rawUserId: string,

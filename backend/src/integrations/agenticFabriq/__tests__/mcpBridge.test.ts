@@ -43,7 +43,8 @@ describe('AgenticFabriqMcpBridge', () => {
       return {
         ok: r.status < 300,
         status: r.status,
-        json: async () => r.body,
+        headers: { get: () => null },
+        text: async () => JSON.stringify(r.body),
       };
     });
   }
@@ -67,6 +68,12 @@ describe('AgenticFabriqMcpBridge', () => {
   it('surfaces a JSON-RPC-level error rather than returning undefined', async () => {
     const fetchImpl = fakeFetch([{ status: 200, body: { jsonrpc: '2.0', id: '1', error: { code: -32000, message: 'boom' } } }]);
     const bridge = new AgenticFabriqMcpBridge(fetchImpl);
-    await expect(bridge.callTool('https://api.example.com/mcp/external', 'tok', 'google_gmail_send', {})).rejects.toThrow(/boom/);
+    await expect(bridge.callTool('https://api.example.com/mcp/external', 'tok', 'google_gmail_send', {})).rejects.toThrow(/redacted RPC error/);
+  });
+
+  it('caps the number of discovered tools', async () => {
+    const tools = Array.from({ length: 101 }, (_, i) => ({ name: `gmail_tool_${i}` }));
+    const bridge = new AgenticFabriqMcpBridge(fakeFetch([{ status: 200, body: { jsonrpc: '2.0', id: '1', result: { tools } } }]));
+    await expect(bridge.listTools('https://api.example.com/mcp/external', 'tok')).rejects.toMatchObject({ name: 'AgenticFabriqResponseTooLargeError' });
   });
 });

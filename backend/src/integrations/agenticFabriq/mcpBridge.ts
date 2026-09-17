@@ -21,11 +21,17 @@
  */
 
 import { randomUUID } from 'crypto';
-import { AgenticFabriqAuthenticationError } from './errors';
+import { AgenticFabriqAuthenticationError, AgenticFabriqResponseTooLargeError, AgenticFabriqTimeoutError } from './errors';
 import type { JsonRpcRequest, JsonRpcResponse, McpToolDescriptor } from './types';
 
 export type FetchLike = typeof fetch;
 
+const MCP_TIMEOUT_MS = 20_000;
+const MCP_MAX_RESPONSE_BYTES = 1_000_000;
+const MCP_MAX_TOOLS = 100;
+const MCP_MAX_TOOL_DESCRIPTOR_BYTES = 16_000;
+
+/** Resolves only the external-user MCP endpoint, rejecting internal endpoints. */
 export function resolveMcpExternalUrl(apiBaseUrl: string, tokenMcpUrl: string | undefined | null): string {
   if (tokenMcpUrl && tokenMcpUrl.trim()) {
     const trimmed = tokenMcpUrl.trim();
@@ -42,36 +48,47 @@ export function resolveMcpExternalUrl(apiBaseUrl: string, tokenMcpUrl: string | 
 
 export class AgenticFabriqMcpBridge {
   private readonly fetchImpl: FetchLike;
+  private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
 
-  constructor(fetchImpl: FetchLike = fetch) {
+  /** Creates a bridge with injectable transport and hard request bounds. */
+  constructor(fetchImpl: FetchLike = fetch, timeoutMs = MCP_TIMEOUT_MS, maxResponseBytes = MCP_MAX_RESPONSE_BYTES) {
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
+    this.maxResponseBytes = maxResponseBytes;
   }
 
+  /** Executes one bounded JSON-RPC request without exposing provider error text. */
   private async call<T>(mcpExternalUrl: string, accessToken: string, method: string, params?: unknown): Promise<T> {
     const request: JsonRpcRequest = { jsonrpc: '2.0', id: randomUUID(), method, params };
-    const res = await this.fetchImpl(mcpExternalUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify(request),
-    });
-    if (res.status === 401 || res.status === 403) {
-      // Documented divergence: a B2B2C token can't be refreshed in place.
-      // Surface this distinctly so the caller re-mints rather than retries as-is.
-      throw new AgenticFabriqAuthenticationError(
-        `Agentic Fabriq MCP call "${method}" got ${res.status} — token is invalid/expired; mint a new one.`,
-      );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(mcpExternalUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: ['Bearer', accessToken].join(' ') },
+        signal: controller.signal,
+        body: JSON.stringify(request),
+      });
+      if (res.status === 401 || res.status === 403) {
+        throw new AgenticFabriqAuthenticationError(
+          `Agentic Fabriq MCP call "${method}" got ${res.status} — token is invalid/expired; mint a new one.`,
+        );
+      }
+      if (!res.ok) throw new Error(`Agentic Fabriq MCP call "${method}" failed: HTTP ${res.status}`);
+      const declaredLength = Number(res.headers?.get('content-length') ?? 0);
+      if (declaredLength > this.maxResponseBytes) throw new AgenticFabriqResponseTooLargeError(method);
+      const text = await res.text();
+      if (Buffer.byteLength(text, 'utf8') > this.maxResponseBytes) throw new AgenticFabriqResponseTooLargeError(method);
+      const body = JSON.parse(text) as JsonRpcResponse<T>;
+      if (body.error) throw new Error(`Agentic Fabriq MCP call "${method}" returned a redacted RPC error`);
+      return body.result as T;
+    } catch (error: any) {
+      if (controller.signal.aborted || error?.name === 'AbortError') throw new AgenticFabriqTimeoutError(method);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-    if (!res.ok) {
-      throw new Error(`Agentic Fabriq MCP call "${method}" failed: HTTP ${res.status}`);
-    }
-    const body = (await res.json()) as JsonRpcResponse<T>;
-    if (body.error) {
-      throw new Error(`Agentic Fabriq MCP call "${method}" returned an RPC error: ${body.error.message}`);
-    }
-    return body.result as T;
   }
 
   /**
@@ -80,9 +97,19 @@ export class AgenticFabriqMcpBridge {
    */
   async listTools(mcpExternalUrl: string, accessToken: string): Promise<McpToolDescriptor[]> {
     const result = await this.call<{ tools: McpToolDescriptor[] }>(mcpExternalUrl, accessToken, 'tools/list');
-    return result?.tools ?? [];
+    const tools = result?.tools ?? [];
+    if (!Array.isArray(tools) || tools.length > MCP_MAX_TOOLS) {
+      throw new AgenticFabriqResponseTooLargeError('tools/list');
+    }
+    for (const tool of tools) {
+      if (typeof tool?.name !== 'string' || tool.name.length > 200 || Buffer.byteLength(JSON.stringify(tool), 'utf8') > MCP_MAX_TOOL_DESCRIPTOR_BYTES) {
+        throw new AgenticFabriqResponseTooLargeError('tools/list descriptor');
+      }
+    }
+    return tools;
   }
 
+  /** Calls one discovered tool with caller-supplied, boundary-validated args. */
   async callTool(mcpExternalUrl: string, accessToken: string, toolName: string, args: unknown): Promise<unknown> {
     return this.call(mcpExternalUrl, accessToken, 'tools/call', { name: toolName, arguments: args });
   }
