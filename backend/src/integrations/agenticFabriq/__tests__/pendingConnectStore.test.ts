@@ -15,11 +15,11 @@ describe('bounded single-use OAuth state', () => {
     expect(random).toHaveBeenCalledWith(16);
     expect(second.connectionId).not.toBe(first.connectionId);
   });
-  it('bounds pending challenges without letting completed bindings exhaust admission', async () => {
+  it('bounds pending and completed bindings together while preserving reconnects at capacity', async () => {
     const first = await create('u', 'mailbox-0', 'gmail', 1000);
     const verification = await beginPendingConnectVerification(first.connectionId, 1001);
     await finishPendingConnectVerification(first.connectionId, verification!.verificationId, 'connected');
-    for (let i = 1; i <= 1000; i++) await create('u', `mailbox-${i}`, 'gmail', 1000);
+    for (let i = 1; i < 1000; i++) await create('u', `mailbox-${i}`, 'gmail', 1000);
     await expect(create('u', 'new-mailbox', 'gmail', 1002)).rejects.toThrow(/capacity/);
 
     const replacement = await create('u', 'mailbox-0', 'gmail', 1002);
