@@ -6961,7 +6961,11 @@ export class AgentModeService {
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
-      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+      // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
+      // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
+      // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
+      // make the single most important signal in the 2-week analysis the one nobody can act on.
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -10943,12 +10947,18 @@ export class AgentModeService {
       }
 
       // Prepare market strategy data - merge with existing if available
+      const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
-        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: existingMarketStrategy?.createdAt || updateTimestamp,
+        updatedAt: updateTimestamp,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): Emma is
+        // explicitly told to send only the fields that changed, so a
+        // competitors-only tool call must not look like an ICP correction to
+        // routes/crm.ts's staleness check.
+        icpUpdatedAt: icp !== undefined ? updateTimestamp : existingMarketStrategy?.icpUpdatedAt,
       };
 
       // Update org-level or personal market strategy

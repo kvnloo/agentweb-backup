@@ -15,6 +15,7 @@ jest.mock('../services/usageRecordDb', () => {
       ...actual.usageRecordDb,
       incrementUsage: jest.fn(),
       incrementUsageWithSpendEvent: jest.fn(),
+      incrementUsageWithDedupeMarker: jest.fn(),
     },
   };
 });
@@ -34,6 +35,7 @@ import { mirrorVendorUsage } from '../services/spendLedgerDualWrite';
 
 const mockTxn = usageRecordDb.incrementUsageWithSpendEvent as jest.Mock;
 const mockPlain = usageRecordDb.incrementUsage as jest.Mock;
+const mockMarker = usageRecordDb.incrementUsageWithDedupeMarker as jest.Mock;
 const mockMirror = mirrorVendorUsage as jest.Mock;
 
 // Cast: RecordVendorUsageContext is a union (rateKey XOR costSource, ENG-1929),
@@ -58,6 +60,7 @@ describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
     setDroppedWriteAlertSink(() => {});
     mockTxn.mockResolvedValue('applied');
     mockPlain.mockResolvedValue(undefined);
+    mockMarker.mockResolvedValue('applied');
     mockMirror.mockResolvedValue({ status: 'written' });
   });
 
@@ -113,13 +116,38 @@ describe('recordVendorUsage — idempotent vendor writes (ENG-702 AC1)', () => {
       await expect(recordVendorUsage(ctx({ idempotencyKey: 'k' }))).resolves.toBeUndefined();
     });
 
-    it('falls back to the plain write for an unpriced call', async () => {
-      // The billing boundary forbids an unpriced unit becoming a $0 spend
-      // event, so there is no event to make the aggregate idempotent against.
+    it('a KEYED unpriced call dedupes via the marker, not a plain ADD (ENG-1958)', async () => {
+      // No spend event may exist for an unpriced call, but a keyed one can still
+      // be replayed, so the aggregate write must be guarded by a marker.
       await recordVendorUsage(ctx({ idempotencyKey: 'k', costSource: 'unpriced', costUsd: undefined }));
 
+      expect(mockMarker).toHaveBeenCalledTimes(1);
+      expect(mockMarker.mock.calls[0][2]).toBe('k'); // idempotencyKey threaded through
       expect(mockTxn).not.toHaveBeenCalled();
+      expect(mockPlain).not.toHaveBeenCalled();
+    });
+
+    it('a replayed keyed unpriced call is a no-op (marker reports duplicate), never throws', async () => {
+      mockMarker.mockResolvedValue('duplicate');
+      await expect(
+        recordVendorUsage(ctx({ idempotencyKey: 'k', costSource: 'unpriced', costUsd: undefined })),
+      ).resolves.toBeUndefined();
+      expect(mockMarker).toHaveBeenCalledTimes(1);
+      expect(mockPlain).not.toHaveBeenCalled();
+    });
+
+    it('retries a marker transaction conflict', async () => {
+      mockMarker.mockResolvedValueOnce('conflict').mockResolvedValue('applied');
+      await recordVendorUsage(ctx({ idempotencyKey: 'k', costSource: 'unpriced', costUsd: undefined }));
+      expect(mockMarker).toHaveBeenCalledTimes(2);
+    });
+
+    it('an UNKEYED unpriced call keeps the plain write — a replay is undetectable anyway (AC3)', async () => {
+      await recordVendorUsage(ctx({ costSource: 'unpriced', costUsd: undefined }));
+
       expect(mockPlain).toHaveBeenCalledTimes(1);
+      expect(mockMarker).not.toHaveBeenCalled();
+      expect(mockTxn).not.toHaveBeenCalled();
     });
   });
 

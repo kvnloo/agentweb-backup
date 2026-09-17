@@ -376,6 +376,7 @@ describe('Organization routes', () => {
           meta_targeting_brief: 'VP Sales and RevOps leaders at B2B SaaS companies',
         },
       ];
+      mockUsers['user-1'].icpCompletedAt = '2026-06-20T00:00:00.000Z';
 
       const res = await request(app).post('/api/org/org-1/copy-profile').send({});
 
@@ -389,6 +390,48 @@ describe('Organization routes', () => {
           buyerPersonas: ['VP Sales and RevOps leaders at B2B SaaS companies'],
         },
       ]);
+      // ENG-1955 follow-up (Greptile P1): this is a system copy of the
+      // owner's own icpResult generation, not a fresh manual edit — must be
+      // backdated to icpCompletedAt, not stamped with copy-time `now()`, or
+      // the org's very first "Use my ICP" click after copy-profile would
+      // wrongly look like a genuine correction and skip the icpResult cache
+      // for every member forever.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-20T00:00:00.000Z');
+    });
+
+    it('falls back to copy-time now() for icpUpdatedAt when the owner has no icpCompletedAt (defensive — should not normally happen)', async () => {
+      mockUsers['user-1'].icpResult = [
+        { name: 'A', pain: 'p', desire: 'd', objection: 'o', meta_targeting_brief: 'm' },
+      ];
+      delete mockUsers['user-1'].icpCompletedAt;
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(typeof mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('string');
+    });
+
+    it('preserves the existing icpUpdatedAt when icp is already populated (this copy only fills competitors)', async () => {
+      mockUsers['user-1'].marketStrategy = {
+        businessOverview: 'Existing overview.',
+        competitors: [],
+        icp: [{ title: 'Existing ICP', description: '', valueProposition: '', buyerPersonas: [] }],
+        createdAt: '2026-06-20T00:00:00.000Z',
+        updatedAt: '2026-06-20T00:00:00.000Z',
+        icpUpdatedAt: '2026-06-19T00:00:00.000Z',
+      };
+      mockUsers['user-1'].competitorResult = {
+        per_icp: [
+          { icp_id: 'icp-1', competitor_names: ['Some Competitor'], offer_angles: ['Angle'], meta_targeting_brief: 'brief' },
+        ],
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockOrgs['org-1'].marketStrategy.competitors.length).toBeGreaterThan(0);
+      // icp content untouched by this copy — icpUpdatedAt must not move either.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-19T00:00:00.000Z');
     });
 
     it('copies competitors from onboarding results when marketStrategy is missing', async () => {
