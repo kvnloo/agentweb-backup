@@ -138,7 +138,7 @@ describe('ENG-982: one call completes the job', () => {
   it('emma_run_marketing_task reports a detached run as unconfirmed and points at a tool that exists', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ sessionId: 'task-42' })
-      .mockResolvedValueOnce({ content: 'still building…', stillBuilding: true });
+      .mockResolvedValueOnce({ content: 'still building…', stillBuilding: true, runId: 'run-42' });
 
     const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
     const body = JSON.parse(res.content[0].text);
@@ -146,10 +146,10 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.status).toBe('running');
     expect(body.completion_confirmed).toBe(false);
     // Points at emma_get_session, which is registered. The dedicated polling
-    // tool is deliberately gone: the only case it served was the detached run,
-    // and that is exactly the case nothing can confirm until ENG-1015.
+    // tool stays removed; the session tool now accepts the durable run ID.
     expect(body.next).toMatch(/emma_get_session/);
-    expect(body.next).toMatch(/ENG-1015/);
+    expect(body.run_id).toBe('run-42');
+    expect(body.next).toMatch(/run_id/);
   });
 
   it('guidance naming another tool also names that tool\'s real parameter', () => {

@@ -9210,7 +9210,7 @@ export const agentModeController = {
           const inFlight = await findInFlightJobForSession(session.userId, sessionId);
           if (inFlight) {
             markProgressComplete(sessionId);
-            res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+            res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true, ...(runSurvivalRunId ? { runId: runSurvivalRunId } : {}) });
             // This request's lifecycle is over (it handed off to the detached
             // build) — without a terminal mark the run record would sit
             // status='running' for its whole 30d ttl. Best-effort by design.
@@ -9288,7 +9288,7 @@ export const agentModeController = {
                 timestamp: new Date().toISOString(),
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
-              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true, ...(runSurvivalRunId ? { runId: runSurvivalRunId } : {}) });
               // Same as the pre-generation reconnect above: the request ended
               // by detaching — mark the run record terminal or it stays
               // 'running' for 30d. Best-effort by design.

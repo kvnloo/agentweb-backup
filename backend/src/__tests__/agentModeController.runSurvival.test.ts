@@ -296,6 +296,9 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       await agentModeController.generateResponse(makeReq(mockSessionId), res);
 
       expect((res.json as jest.Mock).mock.calls[0][0].stillBuilding).toBe(true);
+      expect((res.json as jest.Mock).mock.calls[0][0].runId).toBe(
+        (mockRunStore.createRunRecord as jest.Mock).mock.calls[0][0].runId
+      );
       expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
       expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
         expect.any(String),
@@ -322,6 +325,9 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
 
       expect(markAwaitingReconnect).toHaveBeenCalledWith('page-2');
       expect((res.json as jest.Mock).mock.calls[0][0].stillBuilding).toBe(true);
+      expect((res.json as jest.Mock).mock.calls[0][0].runId).toBe(
+        (mockRunStore.createRunRecord as jest.Mock).mock.calls[0][0].runId
+      );
       expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
         expect.any(String),
         'completed',
