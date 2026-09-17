@@ -1195,13 +1195,9 @@ export function attachInProcessCompletion(
   pageId: string,
   userId: string,
   sessionId: string,
-  runId?: string,
 ): void {
   genPromise
     .then(async (resolved: any) => {
-      if (runId) {
-        await markRunTerminal(runId, 'completed', { finishReason: 'detached_completed' }).catch(() => {});
-      }
       const claimed = await claimCompletion(pageId);
       if (!claimed) return; // the poller already delivered this one
       const { io } = await import('../server');
@@ -1221,12 +1217,20 @@ export function attachInProcessCompletion(
         },
       });
     })
-    .catch(async (err: any) => {
-      if (runId) {
-        await markRunTerminal(runId, 'failed', { finishReason: 'detached_failed' }).catch(() => {});
-      }
+    .catch((err: any) => {
       console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err);
     });
+}
+
+/** Track only the underlying detached generation for the request's durable run.
+ * Delivery/claim failures must not rewrite a successfully completed generation as failed.
+ */
+export function attachDetachedRunTerminalStatus(genPromise: Promise<any>, runId?: string): void {
+  if (!runId) return;
+  genPromise.then(
+    () => markRunTerminal(runId, 'completed', { finishReason: 'detached_completed' }).catch(() => {}),
+    () => markRunTerminal(runId, 'failed', { finishReason: 'detached_failed' }).catch(() => {}),
+  );
 }
 
 // ENG-1239: cap on consecutive automatic continuations for one deferred media batch, so a
@@ -9286,8 +9290,12 @@ export const agentModeController = {
               // (there is no backstop poller when DURABLE_LANDING_GENERATION is off).
               if (!inFlight.awaitingReconnect) {
                 await markAwaitingReconnect(inFlight.id);
-                attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId, runSurvivalRunId);
+                attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
               }
+              // Every request returns its own run ID, including later requests that find
+              // awaitingReconnect already set. Track that request's generation without
+              // competing for shared page delivery.
+              attachDetachedRunTerminalStatus(genPromise, runSurvivalRunId);
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',

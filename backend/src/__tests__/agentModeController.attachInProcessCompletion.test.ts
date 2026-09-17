@@ -9,7 +9,10 @@
  * matching this file's existing convention (activeSessionGenerations,
  * AUTO_WORK_PLAN_CONTINUATION_MAX_ROUNDS are exported the same way).
  */
-import { attachInProcessCompletion } from '../controllers/agentModeController';
+import {
+  attachDetachedRunTerminalStatus,
+  attachInProcessCompletion,
+} from '../controllers/agentModeController';
 import { claimCompletion } from '../services/durableLandingService';
 import { markRunTerminal } from '../services/agentMode/runStore';
 
@@ -105,10 +108,9 @@ describe('attachInProcessCompletion (ENG-1495)', () => {
   });
 
   it('terminal-marks the returned run only after detached success', async () => {
-    mockClaimCompletion.mockResolvedValue(true);
     const genPromise = Promise.resolve({ content: 'ready', responseMessages: [] });
 
-    attachInProcessCompletion(genPromise, 'page-in-flight', 'user-lp', 'session-lp', 'run-1');
+    attachDetachedRunTerminalStatus(genPromise, 'run-1');
     expect(mockMarkRunTerminal).not.toHaveBeenCalled();
     await genPromise;
     await new Promise((resolve) => setImmediate(resolve));
@@ -123,7 +125,7 @@ describe('attachInProcessCompletion (ENG-1495)', () => {
   it('terminal-marks the returned run failed when detached work rejects', async () => {
     const genPromise = Promise.reject(new Error('build failed'));
 
-    attachInProcessCompletion(genPromise, 'page-in-flight', 'user-lp', 'session-lp', 'run-2');
+    attachDetachedRunTerminalStatus(genPromise, 'run-2');
     await expect(genPromise).rejects.toThrow('build failed');
     await new Promise((resolve) => setImmediate(resolve));
 
@@ -131,6 +133,23 @@ describe('attachInProcessCompletion (ENG-1495)', () => {
       'run-2',
       'failed',
       { finishReason: 'detached_failed' },
+    );
+  });
+
+  it('does not rewrite a completed run when shared completion delivery fails', async () => {
+    mockClaimCompletion.mockRejectedValueOnce(new Error('delivery claim unavailable'));
+    const genPromise = Promise.resolve({ content: 'ready', responseMessages: [] });
+
+    attachDetachedRunTerminalStatus(genPromise, 'run-3');
+    attachInProcessCompletion(genPromise, 'page-in-flight', 'user-lp', 'session-lp');
+    await genPromise;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockMarkRunTerminal).toHaveBeenCalledTimes(1);
+    expect(mockMarkRunTerminal).toHaveBeenCalledWith(
+      'run-3',
+      'completed',
+      { finishReason: 'detached_completed' },
     );
   });
 });

@@ -334,6 +334,30 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
       expect(mockRunStore.releaseIdempotency).toHaveBeenCalledTimes(1);
       expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
     });
+
+    it('generation timeout after reconnect is already awaited still terminal-marks this request run', async () => {
+      const timeoutErr: any = new Error('Generation timed out');
+      timeoutErr.isGenerationTimeout = true;
+      mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutErr);
+      (findInFlightJobForSession as jest.Mock).mockResolvedValueOnce({
+        id: 'page-3',
+        awaitingReconnect: true,
+      });
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(mockSessionId), res);
+
+      const runId = (mockRunStore.createRunRecord as jest.Mock).mock.calls[0][0].runId;
+      expect(markAwaitingReconnect).not.toHaveBeenCalled();
+      expect((res.json as jest.Mock).mock.calls[0][0]).toEqual(
+        expect.objectContaining({ stillBuilding: true, runId }),
+      );
+      expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
+        runId,
+        'failed',
+        { finishReason: 'detached_failed' },
+      );
+    });
   });
 
   it('BEHAVIOR-PRESERVING: flag off → zero run-store calls, normal response (today\'s exact behavior)', async () => {
