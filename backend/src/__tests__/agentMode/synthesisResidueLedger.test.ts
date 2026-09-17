@@ -275,4 +275,97 @@ describe('buildAcceptanceFailureNotice (ENG-1899)', () => {
     expect(notice).toContain('attempt 1 check');
     expect(notice).toContain('attempt 2 check');
   });
+
+  // Live env1 finding: two consecutive failing coding_agent calls in the SAME chat
+  // session (the original incident's own shape) can have the model echo its own
+  // prior, already-decorated turn from conversation history — this function still
+  // ran exactly once per HTTP request (confirmed via container logs), the model
+  // supplied the duplicate. Passing the in-progress `content` lets the caller skip
+  // prepending a second copy when one is already present, regardless of who echoed it.
+  it('does not duplicate the notice when content already carries one', () => {
+    const toolCalls = [
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+        ] } },
+      },
+    ];
+    const firstNotice = buildAcceptanceFailureNotice(toolCalls);
+    expect(firstNotice).not.toBeNull();
+
+    const contentAlreadyDecorated = `${firstNotice}\n\nSome earlier turn's echoed text.`;
+    const secondNotice = buildAcceptanceFailureNotice(toolCalls, contentAlreadyDecorated);
+    expect(secondNotice).toBeNull();
+  });
+
+  // Independent-review finding: a retry within the SAME turn that later PASSED must
+  // supersede an earlier failed attempt's report — acceptance.checks re-verifies the
+  // full set fresh each call, so the later 'passed' is the complete current truth.
+  it('does not surface a superseded failure once a later retry in the same turn passed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          message: 'Attempt 1: applied the fix.',
+          acceptanceStatus: 'failed',
+          acceptance: { status: 'failed', summary: '1 of 1 checks failed', checks: [
+            { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+          ] },
+        },
+      },
+      {
+        name: 'coding_agent',
+        result: {
+          success: true,
+          message: 'Attempt 2 (retry): fixed the form, all checks now pass.',
+          acceptanceStatus: 'passed',
+          acceptance: { status: 'passed', summary: 'all checks passed', checks: [
+            { label: 'form selector', status: 'passed', message: "selector 'form' found" },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('still reports an earlier failure when no later call in the turn passed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+        ] } },
+      },
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'blocked', acceptance: { status: 'blocked', summary: 's', checks: [
+          { label: 'deploy check', status: 'blocked', message: 'preview deploy did not complete' },
+        ] } },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('form selector');
+    expect(notice).toContain('deploy check');
+  });
+
+  it('still fires normally when currentContent has no prior notice', () => {
+    const notice = buildAcceptanceFailureNotice(
+      [
+        {
+          name: 'coding_agent',
+          result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+            { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+          ] } },
+        },
+      ],
+      'Fixed the CTA button styling.',
+    );
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('VERIFICATION FAILED');
+  });
 });
