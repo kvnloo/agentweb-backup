@@ -33738,6 +33738,96 @@ ${strippedHtml}`;
     }
   }
 
+  // ENG-1875: LLM-judge check for whether the user's most recent REAL message
+  // explicitly authorized removing the scope named in `candidates`, so a
+  // `modify_work_plan removeStepCounts` call that would otherwise create new
+  // ENG-1811 debt doesn't ledger it when the user genuinely asked for the cut.
+  // Sibling to ENG-1819's userExplicitlyRequestedStop (agentModeController.ts)
+  // -- same model/timeout/parse shape, reusing that ticket's live-tested
+  // finding that gemini-3.1-flash-lite needs headroom for an internal
+  // reasoning trace before it emits "yes"/"no". Deliberately a separate
+  // function rather than a shared refactor: the two fail in different
+  // directions on purpose (see below), and this codebase already accepts
+  // duplicating debt-check logic outright (workPlanCompletedWithoutDebt's own
+  // comment, ~line 3735 in agentModeController.ts) rather than risk a shared
+  // path used by ~150 mocking test files.
+  //
+  // Fails SAFE toward "not authorized": any error/timeout/no-message returns
+  // `false`, so the debt is ledgered exactly as before this fix existed. This
+  // is the opposite bias from ENG-1819 (which fails toward NOT suppressing a
+  // continuation) because the risk here is asymmetric the other way -- a
+  // false "yes" would silently reopen the exact ENG-1811 gaming hole this
+  // ledger exists to close, while a false "no" only costs one harmless extra
+  // attempt at already-removed scope.
+  //
+  // Known, accepted limitation (fresh-eyes review, PR #2959): the judge only
+  // sees the user's raw message text, not the assistant's preceding turn. A
+  // common real flow -- assistant proposes "I'll skip step 2 since X, sound
+  // good?" and the user replies with a bare "yes"/"go ahead" -- won't mention
+  // the scope by name and will likely be judged "no", ledgering debt even
+  // though the removal was genuinely authorized. This under-covers the fix's
+  // own motivating scenario, but fails in the SAFE direction (extra debt, not
+  // a reopened gaming hole) -- not fixed here because doing so needs the
+  // assistant's own preceding message as judge context too, a real scope
+  // increase for a Low-priority, narrowly-scoped ticket, not a copy of an
+  // existing pattern the way the rest of this fix is.
+  private readonly STEP_REMOVAL_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+  private readonly STEP_REMOVAL_JUDGE_TIMEOUT_MS = 8000;
+
+  private async wasStepRemovalUserAuthorized(
+    sessionId: string,
+    candidates: Array<{ fn: string; stepTitle: string }>,
+  ): Promise<boolean> {
+    try {
+      const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+      if (!recent?.content) return false;
+      const scopeList = candidates
+        .map((c) => `- step "${c.stepTitle}" (still needs to call: ${c.fn})`)
+        .join('\n');
+      const system = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+The assistant is about to remove one or more steps from the plan before completing required actions those steps call for. Decide whether the user's message EXPLICITLY instructs removing, skipping, or dropping this specific scope -- as opposed to a general instruction, unrelated request, or the assistant's own unprompted decision.
+
+The steps being removed:
+${scopeList}
+
+Answer "yes" only if the user's message clearly and explicitly authorizes skipping this scope (even if phrased casually -- "skip step 2", "don't bother with the export", "we don't need that anymore").
+
+Answer "no" for everything else, including messages that don't mention this scope at all, or only vaguely relate to it.
+
+Reply with ONLY one word: yes or no.`;
+      const llmPromise = this.callLLM(
+        this.STEP_REMOVAL_JUDGE_MODEL,
+        [
+          { role: 'system', content: system },
+          { role: 'user', content: recent.content.slice(0, 2500) },
+        ],
+        {
+          temperature: 0,
+          max_completion_tokens: 500,
+          taskClass: 'scheduled_background',
+          usageContext: { feature: 'step_removal_authorization_judge' },
+        },
+      );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('step-removal judge timed out')), this.STEP_REMOVAL_JUDGE_TIMEOUT_MS)
+      );
+      const res: any = await Promise.race([llmPromise, timeoutPromise]);
+      if (res?.choices?.[0]?.finish_reason === 'length') {
+        console.warn(
+          `AgentMode: work-plan step-removal authorization judge for session ${sessionId} was ` +
+          `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+          `this may be silently missing a real authorization.`
+        );
+      }
+      const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+      return raw.startsWith('yes');
+    } catch (err) {
+      console.error(`AgentMode: work-plan step-removal authorization judge failed for session ${sessionId}:`, err);
+      return false; // fail-safe: never skip debt on judge failure
+    }
+  }
+
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       // ENG-1793: consistentRead=true so this read of session.workPlan /
@@ -33795,15 +33885,54 @@ ${strippedHtml}`;
       const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
       if (removeStepCounts && removeStepCounts.length > 0) {
         const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const priorSet = new Set(priorPendingRequiredFunctionCalls);
         const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        // ENG-1875: only functions NEWLY going into debt by this call are
+        // candidates for the authorization judge below -- debt already
+        // standing from an earlier, unauthorized removal is never re-judged
+        // or revoked here, only ever added to.
+        //
+        // Judged PER REMOVED STEP, not once for the whole call: a single
+        // removeStepCounts batch can mix a step the user genuinely authorized
+        // with one the model is removing for its own unrelated reason (or to
+        // dodge a required call). A single call-wide yes/no would let one
+        // authorized step's "yes" spare an unrelated, unauthorized step in
+        // the same batch -- reopening ENG-1811's gaming hole through a
+        // batching side door (found by fresh-eyes review of the original
+        // single-verdict version). Each step's own requiredFunctionCalls are
+        // still judged together as one unit -- they're removed as one
+        // decision, not gameable by splitting further.
+        const candidateNewDebtByStep = new Map<number, { stepTitle: string; fns: string[] }>();
         for (const step of workPlan.steps) {
           if (!removeStepCounts.includes(step.stepCount)) continue;
           for (const fn of step.requiredFunctionCalls || []) {
             if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
-              newlyUnresolved.add(fn);
+              if (!priorSet.has(fn)) {
+                if (!candidateNewDebtByStep.has(step.stepCount)) {
+                  candidateNewDebtByStep.set(step.stepCount, { stepTitle: step.title, fns: [] });
+                }
+                candidateNewDebtByStep.get(step.stepCount)!.fns.push(fn);
+              } else {
+                newlyUnresolved.add(fn);
+              }
             }
           }
         }
+        await Promise.all(
+          Array.from(candidateNewDebtByStep.values()).map(async ({ stepTitle, fns }) => {
+            const authorized = await this.wasStepRemovalUserAuthorized(
+              sessionId,
+              fns.map((fn) => ({ fn, stepTitle })),
+            );
+            for (const fn of fns) {
+              if (authorized) {
+                console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }),
+        );
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
