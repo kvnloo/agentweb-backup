@@ -374,3 +374,41 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     });
   });
 });
+
+/**
+ * ENG-1974: "Keep chatting" leaves no backend/model signal that a
+ * recommendation was declined -- this states the real fact directly in
+ * context, before the model's own read of the conversation forms, same
+ * discipline as ENG-1899's acceptance notice.
+ */
+describe('AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages', () => {
+  it('returns [] when nothing has been declined', () => {
+    expect(AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(undefined)).toEqual([]);
+    expect(AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({})).toEqual([]);
+  });
+
+  it('names the declined plan and instructs not to launch it without a fresh explicit instruction', () => {
+    const messages = AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({
+      'reco-1': { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe('user');
+    expect(messages[0].content).toContain('"Client Onboarding"');
+    expect(messages[0].content).toContain('Keep chatting');
+    expect(messages[0].content).toContain('launch_predefined_work_plan');
+    expect(messages[0].content).toMatch(/explicitly says/i);
+  });
+
+  it('names every declined plan when multiple exist, with plural phrasing', () => {
+    const messages = AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({
+      'reco-1': { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+      'reco-2': { planId: 'plan-linkedin', planTitle: 'LinkedIn Lead Gen', declinedAt: '2026-09-17T00:05:00.000Z' },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain('"Client Onboarding"');
+    expect(messages[0].content).toContain('"LinkedIn Lead Gen"');
+    expect(messages[0].content).toContain('plans');
+  });
+});
