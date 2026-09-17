@@ -182,6 +182,10 @@ test('cleared end_date_time means an indefinite campaign (ENG-2031)', async () =
   rows.campaign[0].campaign.endDateTime = '';
   expect((await state()).state).toBe('READY');
 });
+test.each([[undefined], [null]])('omitted end_date_time (%s) means an indefinite campaign (ENG-2031)', async (value) => {
+  rows.campaign[0].campaign.endDateTime = value;
+  expect((await state()).state).toBe('READY');
+});
 test('malformed start_date_time fails closed (ENG-2031)', async () => {
   rows.campaign[0].campaign.startDateTime = 'not-a-date';
   expect((await state()).state).toBe('UNVERIFIED');

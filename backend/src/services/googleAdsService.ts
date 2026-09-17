@@ -295,7 +295,7 @@ export class GoogleAdsService {
             && Number.isFinite(Date.parse(day)) && new Date(day).toISOString().slice(0, 10) === day;
           const startDay = campaignDay(campaign.startDateTime);
           const endDay = campaignDay(campaign.endDateTime);
-          assert(validDay(startDay) && (campaign.endDateTime === '' || validDay(endDay)), 'Missing or malformed campaign dates');
+          assert(validDay(startDay) && (campaign.endDateTime == null || campaign.endDateTime === '' || validDay(endDay)), 'Missing or malformed campaign dates');
           if (campaign.status !== 'ENABLED' || (startDay as string) > date || (endDay !== null && endDay < date)) {
             parentBlockers.push(blocker('BLOCKED_BY_CAMPAIGN', campaign.id, `${campaign.status}; dates=${startDay}..${endDay ?? 'indefinite'}`));
           }
