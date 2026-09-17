@@ -4,7 +4,7 @@ jest.mock('../utils/secretsManager', () => ({ getGoogleAdsCredentials: jest.fn()
 jest.mock('../services/connectedAccountsDb', () => ({ updateAccountTokens: jest.fn() }));
 import { GoogleAdsService } from '../services/googleAdsService';
 
-const campaign = () => ({ campaign: { id: '1', resourceName: 'customers/123/campaigns/1', status: 'ENABLED', startDate: '2026-01-01', endDate: '2037-12-30', advertisingChannelType: 'SEARCH', campaignBudget: 'customers/123/campaignBudgets/5' }, campaignBudget: { id: '5', resourceName: 'customers/123/campaignBudgets/5', status: 'ENABLED', amountMicros: '10000000', explicitlyShared: true } });
+const campaign = () => ({ campaign: { id: '1', resourceName: 'customers/123/campaigns/1', status: 'ENABLED', startDateTime: '2026-01-01 00:00:00', endDateTime: '2037-12-30 23:59:59', advertisingChannelType: 'SEARCH', campaignBudget: 'customers/123/campaignBudgets/5' }, campaignBudget: { id: '5', resourceName: 'customers/123/campaignBudgets/5', status: 'ENABLED', amountMicros: '10000000', explicitlyShared: true } });
 const group = (id = '2') => ({ campaign: { id: '1' }, adGroup: { id, resourceName: `customers/123/adGroups/${id}`, status: 'ENABLED' } });
 const ad = (id = '2') => ({ adGroup: { id }, adGroupAd: { resourceName: `customers/123/adGroupAds/${id}~3`, ad: { id: '3' }, status: 'ENABLED', policySummary: { approvalStatus: 'APPROVED', reviewStatus: 'REVIEWED' } } });
 const keyword = (id = '2') => ({ adGroup: { id }, adGroupCriterion: { criterionId: '4', resourceName: `customers/123/adGroupCriteria/${id}~4`, status: 'ENABLED', negative: false, approvalStatus: 'APPROVED', primaryStatus: 'ELIGIBLE' } });
@@ -167,9 +167,24 @@ test('unknown sibling prevents campaign certification while keeping verified sib
   expect(result.state).toBe('UNVERIFIED');
   expect(result.adGroups.map((g: any) => g.state)).toEqual(['READY', 'UNVERIFIED']);
 });
-test.each([['startDate', '2026-09-17'], ['endDate', '2026-09-15']])('enabled but outside %s does not imply readiness', async (field, value) => {
+test.each([['startDateTime', '2026-09-17 00:00:00'], ['endDateTime', '2026-09-15 23:59:59']])('enabled but outside %s does not imply readiness', async (field, value) => {
   rows.campaign[0].campaign[field] = value;
   expect((await state()).state).toBe('BLOCKED_BY_CAMPAIGN');
+});
+test('legacy campaign.start_date/end_date fields are rejected as unsupported (ENG-2031)', async () => {
+  await verify();
+  const campaignQuery = api.mock.calls.find(c => c[3].query.includes('FROM campaign'))![3].query;
+  expect(campaignQuery).toContain('campaign.start_date_time');
+  expect(campaignQuery).toContain('campaign.end_date_time');
+  expect(campaignQuery).not.toMatch(/campaign\.(start_date|end_date)(?!_)/);
+});
+test('cleared end_date_time means an indefinite campaign (ENG-2031)', async () => {
+  rows.campaign[0].campaign.endDateTime = '';
+  expect((await state()).state).toBe('READY');
+});
+test('malformed start_date_time fails closed (ENG-2031)', async () => {
+  rows.campaign[0].campaign.startDateTime = 'not-a-date';
+  expect((await state()).state).toBe('UNVERIFIED');
 });
 test('blocked rollup follows chain priority independent of API row order', async () => {
   rows.ad_group.push(group('6')); rows.ad_group_ad.push(ad('6')); rows.ad_group_criterion.push(keyword('6'));

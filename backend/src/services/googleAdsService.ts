@@ -268,7 +268,7 @@ export class GoogleAdsService {
       const date = ['year', 'month', 'day'].map(key => parts.find(p => p.type === key)!.value).join('-');
       report.window = { preset: 'TODAY', startDate: date, endDate: date };
       const filter = campaignIds ? `campaign.id IN (${campaignIds.join(',')})` : "campaign.status != 'REMOVED'";
-      const campaigns = await read(`SELECT campaign.id, campaign.resource_name, campaign.status, campaign.start_date, campaign.end_date, campaign.advertising_channel_type, campaign.campaign_budget, campaign_budget.id, campaign_budget.resource_name, campaign_budget.status, campaign_budget.amount_micros, campaign_budget.explicitly_shared FROM campaign WHERE ${filter}`);
+      const campaigns = await read(`SELECT campaign.id, campaign.resource_name, campaign.status, campaign.start_date_time, campaign.end_date_time, campaign.advertising_channel_type, campaign.campaign_budget, campaign_budget.id, campaign_budget.resource_name, campaign_budget.status, campaign_budget.amount_micros, campaign_budget.explicitly_shared FROM campaign WHERE ${filter}`);
       const seen = new Set<string>();
       for (const row of campaigns) {
         assert(id(row.campaign?.id) && !seen.has(row.campaign.id) && (!campaignIds || campaignIds.includes(row.campaign.id)), 'Missing, duplicate or unexpected campaign');
@@ -285,11 +285,19 @@ export class GoogleAdsService {
           status(budget.status, ['ENABLED', 'PAUSED', 'REMOVED']);
           const amount = number(budget.amountMicros);
           const parentBlockers: GoogleAdsServingBlocker[] = [];
-          const validDate = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
-            && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
-          assert(validDate(campaign.startDate) && validDate(campaign.endDate), 'Missing or malformed campaign dates');
-          if (campaign.status !== 'ENABLED' || campaign.startDate > date || campaign.endDate < date) {
-            parentBlockers.push(blocker('BLOCKED_BY_CAMPAIGN', campaign.id, `${campaign.status}; dates=${campaign.startDate}..${campaign.endDate}`));
+          // ENG-2031: v23+ renamed campaign.start_date/end_date to start_date_time/end_date_time
+          // ("yyyy-MM-dd HH:mm:ss" in the serving customer's timezone). GAQL returns the raw
+          // string; compare on the date prefix so a set-to-midnight start and a 23:59:59 end
+          // behave exactly like the old YYYY-MM-DD window check.
+          const campaignDay = (value: unknown): string | null => typeof value === 'string'
+            && /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : null;
+          const validDay = (day: string | null): day is string => day !== null
+            && Number.isFinite(Date.parse(day)) && new Date(day).toISOString().slice(0, 10) === day;
+          const startDay = campaignDay(campaign.startDateTime);
+          const endDay = campaignDay(campaign.endDateTime);
+          assert(validDay(startDay) && (campaign.endDateTime === '' || validDay(endDay)), 'Missing or malformed campaign dates');
+          if (campaign.status !== 'ENABLED' || (startDay as string) > date || (endDay !== null && endDay < date)) {
+            parentBlockers.push(blocker('BLOCKED_BY_CAMPAIGN', campaign.id, `${campaign.status}; dates=${startDay}..${endDay ?? 'indefinite'}`));
           }
           if (budget.status !== 'ENABLED' || amount === 0) parentBlockers.push(blocker('BLOCKED_BY_BUDGET', budget.id, `${budget.status}; amountMicros=${budget.amountMicros}`));
           const groups = await read(`SELECT campaign.id, ad_group.id, ad_group.resource_name, ad_group.status FROM ad_group WHERE campaign.id = ${campaign.id} AND ad_group.status != 'REMOVED'`);
