@@ -99,7 +99,15 @@ export class WorkPlanThumbnailService {
         prompt,
         filename: `workplan-thumbnail-${this.versionHash()}.png`,
         size: '1024x1024',
+        // Not a user id — the S3 folder these thumbnails live in, which is
+        // exactly why it cannot also carry the charge (ENG-1961). Left as-is so
+        // existing objects and their URLs stay where they are.
         userId: 'workplans',
+        // Platform-funded: a workplan thumbnail is AgentWeb's own artwork, not
+        // work a customer asked for. `null` books no user, and the feature names
+        // the path so the spend is identifiable instead of anonymous.
+        meterUserId: null,
+        meterFeature: 'platform:workplan_thumbnail',
         removeC2PA: true,
       });
 

@@ -56,6 +56,8 @@ jest.mock('../services/agentModeService', () => ({
     // Kept present (rather than omitted) so that IF a regression reintroduced a call to the
     // deleted triage step, the test would fail on the assertion below instead of on an unrelated
     // "triageSlackMessage is not a function" crash swallowed by a try/catch that no longer exists.
+    // ENG-1961 deleted the method itself (it had no callers); this stays a trap for the CALL
+    // SITE, which is what ENG-1613 removed and what must not come back.
     triageSlackMessage: jest.fn(),
   },
 }));
