@@ -8722,9 +8722,10 @@ export const agentModeController = {
       // exists (auth already completed above), then append the rendered first
       // turn. A skill without an openingAction costs nothing — no dispatch.
       let prefetchMessages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] = [];
-      if (skillId && (skill as any)?.openingAction) {
+      if (skillId && skill && (skill as any)?.openingAction) {
         try {
-          const applied = await agentModeService.applyOpeningAction(skill, user.userId, session.sessionId);
+          const authorizedSkill = skill as NonNullable<typeof skill>;
+          const applied = await agentModeService.applyOpeningAction(authorizedSkill, user.userId, session.sessionId);
           prefetchMessages = applied.messages as typeof prefetchMessages;
           for (const msg of prefetchMessages) {
             await chatbotDb.addMessageToSession(session.sessionId, msg as any);
