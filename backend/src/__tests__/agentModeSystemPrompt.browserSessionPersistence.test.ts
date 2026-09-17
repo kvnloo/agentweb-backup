@@ -108,7 +108,7 @@ describe('AgentMode system prompt - manually-imported session failure reporting 
       "Don't offer \"save your Login Credentials\" as the recommended fix in the same breath as this report"
     );
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'A domain only ever ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
+      'A domain usually ends up as a manually-imported Browser Sessions cookie because credentialed auto-login already didn\'t work for it'
     );
   });
 
