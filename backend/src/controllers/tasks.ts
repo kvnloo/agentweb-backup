@@ -14,7 +14,7 @@ import { canViewItem, canEditItem } from '../services/orgShareService';
 import { getPlacidPrivateToken } from '../utils/secretsManager';
 import { parseAgentModeImageIds } from '../utils/agentModeAssetIds';
 import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
-import { renderPlacidImage } from '../services/placidRenderService';
+import { renderPlacidImage, describePlacidError } from '../services/placidRenderService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -1524,7 +1524,9 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
 
     return res.status(200).json({ message: 'Generated image from template', resultFile: newResultFile });
   } catch (err: any) {
-    console.error('Error in generateFromTemplateToExecution:', err?.message || err);
+    // describePlacidError surfaces the vendor's own message (ENG-1972); for any
+    // other failure it falls back to the error's message unchanged.
+    console.error('Error in generateFromTemplateToExecution:', describePlacidError(err));
     return res.status(500).json({ message: 'Error generating image' });
   }
 };
