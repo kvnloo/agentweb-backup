@@ -39001,6 +39001,51 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   /**
+   * ENG-1944: enabling a CAMPAIGN never touches its ad groups, keywords, or ads — those
+   * default to PAUSED on creation (RULE 11) and nothing else ever flips them. A campaign can
+   * read back ENABLED while every ad group/keyword/ad beneath it is still PAUSED, delivering
+   * zero traffic with no signal anything is wrong — this is exactly what happened to a live
+   * $250/day launch for days before anyone noticed. Advisory only (like the tracking gate's
+   * own warning path): a real staged rollout — enable the campaign, review ad groups before
+   * turning them on — is legitimate, so this informs rather than blocks. A lookup failure
+   * here must not fail an otherwise-successful launch, so it degrades to no warning.
+   */
+  private async checkGoogleAdsPausedChildren(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+  ): Promise<string | undefined> {
+    try {
+      const adGroups = await googleAdsService.listAdGroups(userId, customerId, campaignResourceName);
+      if (adGroups.length === 0) return undefined;
+      const pausedAdGroups = adGroups.filter((g: any) => g.status === 'PAUSED');
+
+      let totalKeywords = 0, pausedKeywords = 0, totalAds = 0, pausedAds = 0;
+      await Promise.all(adGroups.map(async (group: any) => {
+        const [keywords, ads] = await Promise.all([
+          googleAdsService.listKeywords(userId, customerId, group.resourceName).catch(() => []),
+          googleAdsService.listAds(userId, customerId, group.resourceName).catch(() => []),
+        ]);
+        totalKeywords += keywords.length;
+        pausedKeywords += keywords.filter((k: any) => k.status === 'PAUSED').length;
+        totalAds += ads.length;
+        pausedAds += ads.filter((a: any) => a.status === 'PAUSED').length;
+      }));
+
+      const problems: string[] = [];
+      if (pausedAdGroups.length > 0) problems.push(`${pausedAdGroups.length}/${adGroups.length} ad group(s)`);
+      if (pausedKeywords > 0) problems.push(`${pausedKeywords}/${totalKeywords} keyword(s)`);
+      if (pausedAds > 0) problems.push(`${pausedAds}/${totalAds} ad(s)`);
+      if (problems.length === 0) return undefined;
+
+      return `Campaign is ENABLED, but ${problems.join(', ')} underneath it are still PAUSED — this campaign will deliver ZERO traffic until those are also explicitly enabled (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED). Do not report this launch as live until they are.`;
+    } catch (err) {
+      console.error('[ENG-1944] paused-child-entity check failed (non-fatal, launch still proceeds):', err);
+      return undefined;
+    }
+  }
+
+  /**
    * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
    * serves paid traffic to its final URL instantly — the same exposure as a launch.
    * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
@@ -39318,7 +39363,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           // Relayed, not swallowed: the launch is permitted, but the operator has to be
           // told the page proves only that SOME Google tag is present (ENG-1358).
-          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
+          const resumePausedChildrenWarning = await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name);
+          return {
+            success: true, message: 'Campaign resumed',
+            ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}),
+            ...(resumePausedChildrenWarning ? { pausedChildEntitiesWarning: resumePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -39379,7 +39429,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be
           // verified rather than reading a bare success (ENG-1358).
-          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
+          const updatePausedChildrenWarning = args.status === 'ENABLED'
+            ? await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name)
+            : undefined;
+          return {
+            success: true, message: 'Campaign updated',
+            ...(trackingWarning ? { trackingWarning } : {}),
+            ...(updatePausedChildrenWarning ? { pausedChildEntitiesWarning: updatePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
