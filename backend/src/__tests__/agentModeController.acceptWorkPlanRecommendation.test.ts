@@ -137,8 +137,10 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     await agentModeController.acceptWorkPlanRecommendation(req, res);
 
     // Never trusts a planId from the request body — only what the persisted
-    // recommendation itself named.
-    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1');
+    // recommendation itself named. ENG-1974: always passes skipDeclineGate —
+    // the user's own explicit accept click must never be blocked by an
+    // earlier decline of any recommendation.
+    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1', { skipDeclineGate: true });
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       success: true,

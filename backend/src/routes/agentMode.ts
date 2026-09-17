@@ -251,6 +251,10 @@ router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAut
 // Owner-only: instantiate a previously-recommended predefined work plan (ENG-1472)
 router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/accept', asyncHandlerAuth(agentModeController.acceptWorkPlanRecommendation));
 
+// POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/decline
+// Owner-only: record that the user declined a recommendation via "Keep chatting" (ENG-1974)
+router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/decline', asyncHandlerAuth(agentModeController.declineWorkPlanRecommendation));
+
 // POST /api/agent-mode/share
 // Create shareable link for conversation
 router.post('/share', asyncHandler(agentModeController.createShareLink));

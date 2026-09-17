@@ -301,6 +301,105 @@ describe('AgentModeService - predefined work plan templates', () => {
       expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
     });
 
+    // ENG-1974: "Keep chatting" leaves no backend signal at all that a
+    // recommendation was declined, so the LLM could self-launch it via
+    // launch_predefined_work_plan on an ordinary next message (live-confirmed
+    // on env1, twice). This is the deterministic backstop — recommendationId
+    // is sha256(sessionId:planId), so it's recomputed here for the RESOLVED
+    // planId and checked against the session's declinedWorkPlanRecommendations
+    // map, correlating exactly regardless of whether the tool call used a
+    // title or a planId.
+    describe('ENG-1974: declined-recommendation gate', () => {
+      // sha256('sess-1:plan-onboard').slice(0, 32) — the exact value
+      // recommendPredefinedWorkPlan computes for this sessionId/planId pair.
+      const declinedRecommendationId = '3f2882e76b0fdaca653d4df08fc53874';
+
+      beforeEach(() => {
+        mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+          v === 'system' ? [systemTemplate] : []
+        );
+      });
+
+      it('blocks launching a plan the user already declined, asking for confirmation instead', async () => {
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+          sessionId,
+          messages: [],
+          declinedWorkPlanRecommendations: {
+            [declinedRecommendationId]: { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+          },
+        });
+
+        const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('the SAME declined plan resolved by planId (not title) is blocked identically — the hash correlates on the resolved planId, not the tool argument form', async () => {
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+          sessionId,
+          messages: [],
+          declinedWorkPlanRecommendations: {
+            [declinedRecommendationId]: { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+          },
+        });
+
+        const result = await service.applyPredefinedWorkPlan('plan-onboard', sessionId, 'user-1');
+
+        expect(result.success).toBe(false);
+        expect(result.requiresConfirmation).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
+      it('unblocked when confirmedDeclinedPlan=true', async () => {
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+          sessionId,
+          messages: [],
+          declinedWorkPlanRecommendations: {
+            [declinedRecommendationId]: { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+          },
+        });
+
+        const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1', { confirmedDeclinedPlan: true });
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      // The accept endpoint's own explicit click must never be blocked by an
+      // earlier decline of any recommendation.
+      it('unaffected when skipDeclineGate=true (the accept-endpoint path)', async () => {
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+          sessionId,
+          messages: [],
+          declinedWorkPlanRecommendations: {
+            [declinedRecommendationId]: { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+          },
+        });
+
+        const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1', { skipDeclineGate: true });
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+
+      it('a genuinely undeclined plan launches normally even when the map has an unrelated entry', async () => {
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+          sessionId,
+          messages: [],
+          declinedWorkPlanRecommendations: {
+            'some-other-hash': { planId: 'plan-other', planTitle: 'Some Other Plan', declinedAt: '2026-09-17T00:00:00.000Z' },
+          },
+        });
+
+        const result = await service.applyPredefinedWorkPlan('Client Onboarding', sessionId, 'user-1');
+
+        expect(result.success).toBe(true);
+        expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
+      });
+    });
+
     it('blocks anonymous users from applying a private plan', async () => {
       const privatePlan = { ...systemTemplate, planId: 'priv-1', visibility: 'private' };
       // Anonymous: only system/public are searched; force a private plan into the public list
