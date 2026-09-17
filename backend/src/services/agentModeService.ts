@@ -6961,7 +6961,11 @@ export class AgentModeService {
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
-      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+      // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
+      // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
+      // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
+      // make the single most important signal in the 2-week analysis the one nobody can act on.
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
