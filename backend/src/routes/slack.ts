@@ -11,8 +11,7 @@ import {
   openRejectModal,
   openTestEmailModal,
   postThreadResponse,
-  postThinkingMessage,
-  deleteSlackMessage,
+  setSlackAssistantStatus,
   getSlackUserDisplayName,
   getSlackUserEmail,
   getSlackUserTeamId,
@@ -28,7 +27,7 @@ import { emailService } from "../services/emailService";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
-import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
+import { handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { renderCitationMarkers } from "../utils/citations";
 import { agentModeService } from '../services/agentModeService';
 
@@ -199,8 +198,7 @@ async function handleSlackSessionResponse(params: {
   const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
   console.log('🔗 iShare link created for Slack session:', ishareLink);
 
-  // Post a "thinking" message while we generate the response
-  const thinkingTs = await postThinkingMessage(channel, ts);
+  await setSlackAssistantStatus(channel, ts, 'is working...');
 
   // Generate the response
   const { generateSessionResponse } = await import('../controllers/agentModeController');
@@ -256,10 +254,7 @@ async function handleSlackSessionResponse(params: {
       attachments
     ));
 
-    // Remove the thinking message
-    if (thinkingTs) {
-      await deleteSlackMessage(channel, thinkingTs);
-    }
+    await setSlackAssistantStatus(channel, ts, '');
 
     // Post Emma's response to the Slack thread
     if (response.content) {
@@ -316,9 +311,7 @@ async function handleSlackSessionResponse(params: {
       }
     }
 
-    if (thinkingTs) {
-      await deleteSlackMessage(channel, thinkingTs);
-    }
+    await setSlackAssistantStatus(channel, ts, '');
     await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
 
     // Save error message to session so ishare viewers see the failure rather than an orphaned user message
@@ -333,6 +326,65 @@ async function handleSlackSessionResponse(params: {
     } catch (saveError) {
       console.error('❌ Error saving error message to session:', saveError);
     }
+  }
+}
+
+async function handleMappedSlackThreadResponse(params: {
+  channel: string;
+  threadTs: string;
+  slackUserId: string;
+  text: string;
+  files?: any[];
+  sessionId: string;
+  userId: string;
+}) {
+  const { channel, threadTs, slackUserId, text, files, sessionId, userId } = params;
+  const { chatbotDb } = await import('../services/chatbotService');
+  const { generateSessionResponse } = await import('../controllers/agentModeController');
+  const { agentModeService } = await import('../services/agentModeService');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+  const session = await chatbotDb.getChatSession(sessionId);
+  if (!session) return;
+
+  const attachments: any[] = [];
+  for (const file of files || []) {
+    try {
+      const fileUrl = await resolveSlackFileUrl(file);
+      const fileBuffer = await downloadSlackFile(fileUrl);
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3(fileBuffer, file.name || 'attachment', userId, file.mimetype || 'application/octet-stream');
+      if (uploadResult.success && uploadResult.url) {
+        attachments.push({ url: uploadResult.url, filename: file.name || 'attachment', size: file.size, mimetype: file.mimetype || 'application/octet-stream' });
+      }
+    } catch (fileError) {
+      console.error('❌ Error downloading Slack file:', fileError);
+    }
+  }
+
+  let messageText = text;
+  if (!messageText && files?.length) messageText = attachments.length ? '[attached file]' : '[attachment could not be read]';
+  const displayName = await getSlackUserDisplayName(slackUserId);
+  const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
+  const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+  await setSlackAssistantStatus(channel, threadTs, 'is working...');
+  try {
+    const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
+    if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
+  } catch (genError) {
+    console.error('❌ Error generating thread response:', genError);
+    await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+    try {
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: 'assistant',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        timestamp: new Date().toISOString(),
+        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+      });
+    } catch (saveError) {
+      console.error('❌ Error saving error message to session:', saveError);
+    }
+  } finally {
+    await setSlackAssistantStatus(channel, threadTs, '');
   }
 }
 
@@ -482,7 +534,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files, user_team: userTeam, source_team: sourceTeam } = event;
+        const { text, user: slackUserId, channel, ts, thread_ts: threadTs, files, user_team: userTeam, source_team: sourceTeam } = event;
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -510,6 +562,25 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               thread_ts: ts
             });
             return;
+          }
+
+          // An explicit mention inside an existing Emma thread continues that
+          // thread's mapped session and always replies at the root thread.
+          if (threadTs) {
+            const mapping = await settingsService.getSetting(`slack_thread_${channel}_${threadTs}`);
+            if (mapping?.settingValue) {
+              const { sessionId, userId } = JSON.parse(mapping.settingValue);
+              await handleMappedSlackThreadResponse({
+                channel,
+                threadTs,
+                slackUserId,
+                text: rawMessage,
+                files,
+                sessionId,
+                userId,
+              });
+              return;
+            }
           }
 
           // Check if this is an admin Slack channel (supports multiple channels via slack_admin_channels JSON array)
@@ -788,15 +859,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
       // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
       // directly, so processing them here too would cause Emma to answer twice.
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
-        const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs, files } = event;
-
-        if (text) {
-          const botId = await getEmmaBotUserId();
-          if (botId && text.includes(`<@${botId}>`)) {
-            console.log('📨 Skipping thread message handler for Emma @mention (app_mention handler will process):', { channel, threadTs, user: slackUserId });
-            return;
-          }
-        }
+        const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs } = event;
 
         if (text) {
           const { humanEvalService } = await import('../services/humanEvalService');
@@ -813,105 +876,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           }
         }
 
-        // Look up if this thread is associated with an Emma session
-        const threadMappingKey = `slack_thread_${channel}_${threadTs}`;
-        const mapping = await settingsService.getSetting(threadMappingKey);
-
-        if (mapping?.settingValue) {
-          try {
-            const parsed = JSON.parse(mapping.settingValue);
-            const { sessionId, userId } = parsed;
-
-            // Emma @mention session — existing behavior: post response directly to Slack
-            console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
-            const { chatbotDb } = await import('../services/chatbotService');
-            const { generateSessionResponse } = await import('../controllers/agentModeController');
-            const { agentModeService } = await import('../services/agentModeService');
-            const { cronJobRegistry } = await import('../utils/cronJobRegistry');
-
-            const session = await chatbotDb.getChatSession(sessionId);
-            if (!session) {
-              console.log('❌ Session not found for Slack thread:', sessionId);
-              return;
-            }
-
-            const displayName = await getSlackUserDisplayName(slackUserId);
-
-            const attachments: any[] = [];
-            if (files && files.length > 0) {
-              for (const file of files) {
-                try {
-                  // Slack Connect / ext-shared channels omit url_private and send a stub
-                  // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
-                  const fileUrl = await resolveSlackFileUrl(file);
-                  const fileBuffer = await downloadSlackFile(fileUrl);
-                  const { uploadFileToS3 } = await import('../utils/s3Utils');
-                  const uploadResult = await uploadFileToS3(
-                    fileBuffer,
-                    file.name || 'attachment',
-                    userId,
-                    file.mimetype || 'application/octet-stream'
-                  );
-                  if (!uploadResult.success || !uploadResult.url) {
-                    console.error('❌ Failed to upload Slack file to S3');
-                    continue;
-                  }
-                  attachments.push({
-                    url: uploadResult.url,
-                    filename: file.name || 'attachment',
-                    size: file.size,
-                    mimetype: file.mimetype || 'application/octet-stream',
-                  });
-                } catch (fileError) {
-                  console.error('❌ Error downloading Slack file:', fileError);
-                }
-              }
-            }
-
-            // When the user sent only a file (no text), give Emma a placeholder so it knows
-            // a file was shared — but only claim '[attached file]' if an attachment actually
-            // reached the agent. If ingestion failed and attachments is empty, an honest
-            // marker keeps the model from calling read_file_content('[attached file]') on a
-            // non-URL and returning 'Invalid URL format' to the user (ENG-323).
-            let messageText = text;
-            if (!messageText && files && files.length > 0) {
-              messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
-            }
-            const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
-
-            const thinkingTs = await postThinkingMessage(channel, threadTs);
-            const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-
-            try {
-              // ENG-1189: this turn's tool calls self-call back into this
-              // process via mcpFetch — tracked so a deploy mid-run waits for
-              // it instead of abandoning it against a closed listener.
-              const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
-              if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-              if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
-            } catch (genError) {
-              console.error('❌ Error generating thread response:', genError);
-              if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-              await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
-              // Save error message to session so ishare viewers see the failure rather than an orphaned user message
-              try {
-                const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
-                await chatbotDbForError.addMessageToSession(sessionId, {
-                  role: 'assistant',
-                  content: 'Sorry, I encountered an error processing your request. Please try again.',
-                  timestamp: new Date().toISOString(),
-                  metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
-                });
-              } catch (saveError) {
-                console.error('❌ Error saving error message to session:', saveError);
-              }
-            }
-          } catch (parseError) {
-            console.error('❌ Error processing thread reply:', parseError);
-          }
-        }
-        // ENG-1613: an untracked thread (no mapping) no longer starts a new monitored
-        // conversation — only an explicit @-mention (app_mention) starts anything.
+        // Human-eval replies are captured silently above. All other message
+        // events are ignored; Emma turns are driven only by app_mention.
+        return;
       }
 
       return;

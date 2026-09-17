@@ -47,6 +47,7 @@ jest.mock('../utils/sseProgress', () => ({
 
 const mockPostMessage = jest.fn().mockResolvedValue({ ok: true, ts: 'thinking-msg-ts' });
 const mockChatDelete = jest.fn().mockResolvedValue({ ok: true });
+const mockApiCall = jest.fn().mockResolvedValue({ ok: true });
 
 jest.mock('../services/slackService', () => {
   const actual = jest.requireActual('../services/slackService');
@@ -55,6 +56,7 @@ jest.mock('../services/slackService', () => {
     postThreadResponse: jest.fn().mockResolvedValue(undefined),
     postThinkingMessage: jest.fn().mockResolvedValue('thinking-msg-ts'),
     deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
+    setSlackAssistantStatus: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
     getSlackUserEmail: jest.fn().mockResolvedValue('operator@agentweb.pro'),
     getSlackUserTeamId: jest.fn().mockResolvedValue(null),
@@ -73,6 +75,7 @@ jest.mock('@slack/web-api', () => ({
       postMessage: mockPostMessage,
       delete: mockChatDelete,
     },
+    apiCall: mockApiCall,
   })),
 }));
 
@@ -80,7 +83,7 @@ const { userDb } = require('../services/db');
 const { settingsService } = require('../services/settingsService');
 const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
-const { postThreadResponse, postThinkingMessage, deleteSlackMessage, getSlackUserDisplayName, getSlackUserEmail, getSlackUserTeamId, getOwnSlackTeamId } = require('../services/slackService');
+const { postThreadResponse, postThinkingMessage, deleteSlackMessage, setSlackAssistantStatus, getSlackUserDisplayName, getSlackUserEmail, getSlackUserTeamId, getOwnSlackTeamId } = require('../services/slackService');
 
 describe('Slack Events API', () => {
   let app: express.Application;
@@ -190,8 +193,7 @@ describe('Slack Events API', () => {
         'system'
       );
 
-      // Verify thinking message posted
-      expect(postThinkingMessage).toHaveBeenCalledWith('C12345', '1234567890.123456');
+      expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', '1234567890.123456', 'is working...');
 
       // Verify response generation (message prefixed with display name)
       expect(generateSessionResponse).toHaveBeenCalledWith(
@@ -202,8 +204,9 @@ describe('Slack Events API', () => {
         []
       );
 
-      // Verify thinking message deleted
-      expect(deleteSlackMessage).toHaveBeenCalledWith('C12345', 'thinking-msg-ts');
+      expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', '1234567890.123456', '');
+      expect(postThinkingMessage).not.toHaveBeenCalled();
+      expect(deleteSlackMessage).not.toHaveBeenCalled();
 
       // Verify response posted to thread
       expect(postThreadResponse).toHaveBeenCalledWith(
@@ -867,7 +870,7 @@ describe('Slack Events API', () => {
     });
 
     describe('Thread message handling', () => {
-      it('should forward thread replies to existing Emma session', async () => {
+      it('continues the mapped session at the root thread when Emma is explicitly mentioned in a thread', async () => {
         // Mock thread-to-session mapping exists
         settingsService.getSetting.mockResolvedValue({
           settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
@@ -890,9 +893,9 @@ describe('Slack Events API', () => {
           .send({
             type: 'event_callback',
             event: {
-              type: 'message',
+              type: 'app_mention',
               user: 'U12345',
-              text: 'Can you also add some images?',
+              text: '<@UEMMA123> Can you also add some images?',
               channel: 'C12345',
               ts: '1234567891.000000',
               thread_ts: '1234567890.123456',
@@ -915,8 +918,8 @@ describe('Slack Events API', () => {
         // Verify user display name fetched
         expect(getSlackUserDisplayName).toHaveBeenCalledWith('U12345');
 
-        // Verify thinking message posted
-        expect(postThinkingMessage).toHaveBeenCalledWith('C12345', '1234567890.123456');
+        expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', '1234567890.123456', 'is working...');
 
         // Verify message forwarded with username prefix
         expect(generateSessionResponse).toHaveBeenCalledWith(
@@ -933,9 +936,12 @@ describe('Slack Events API', () => {
           '1234567890.123456',
           'Here is my follow-up response.'
         );
+        expect(setSlackAssistantStatus).toHaveBeenCalledWith('C12345', '1234567890.123456', '');
+        expect(postThinkingMessage).not.toHaveBeenCalled();
+        expect(deleteSlackMessage).not.toHaveBeenCalled();
       });
 
-      it('sends "[attached file]" and the S3 attachment when a file-only thread reply is ingested', async () => {
+      it('ignores an unmentioned file-only reply in a tracked Emma thread', async () => {
         settingsService.getSetting.mockResolvedValue({
           settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
         });
@@ -965,17 +971,10 @@ describe('Slack Events API', () => {
         expect(response.status).toBe(200);
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // The attachment reached the agent, so the placeholder truthfully says "[attached file]".
-        expect(generateSessionResponse).toHaveBeenCalledWith(
-          'session-123',
-          'John Doe: [attached file]',
-          'user-123',
-          'gpt-4o',
-          [expect.objectContaining({ url: 'https://s3.example.com/file.png', filename: 'logo.svg' })],
-        );
+        expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
-      it('sends "[attachment could not be read]" (not "[attached file]") when an ext-shared stub fails to hydrate', async () => {
+      it('ignores an unreadable unmentioned file reply in a tracked Emma thread', async () => {
         settingsService.getSetting.mockResolvedValue({
           settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
         });
@@ -1003,15 +1002,7 @@ describe('Slack Events API', () => {
         expect(response.status).toBe(200);
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // Ingestion failed → no attachment, and the model must NOT be baited into
-        // read_file_content('[attached file]') on a non-URL (ENG-323).
-        expect(generateSessionResponse).toHaveBeenCalledWith(
-          'session-123',
-          'John Doe: [attachment could not be read]',
-          'user-123',
-          'gpt-4o',
-          [],
-        );
+        expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
       it('should ignore messages not in a tracked thread', async () => {
@@ -1065,7 +1056,7 @@ describe('Slack Events API', () => {
         expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
-      it('should process file_share thread replies with text and files', async () => {
+      it('should ignore unmentioned file_share thread replies with text and files', async () => {
         const { uploadFileToS3 } = require('../utils/s3Utils');
         const { downloadSlackFile } = require('../services/slackService');
 
@@ -1112,33 +1103,12 @@ describe('Slack Events API', () => {
 
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // Verify file was downloaded from Slack and uploaded to S3
-        expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/video.mp4');
-        expect(uploadFileToS3).toHaveBeenCalledWith(
-          Buffer.from('file-content'),
-          'video.mp4',
-          'user-123',
-          'video/mp4'
-        );
-
-        // Verify Emma received the message with the attachment
-        expect(generateSessionResponse).toHaveBeenCalledWith(
-          'session-123',
-          'John Doe: Checkout the video and make again',
-          'user-123',
-          'gpt-4o',
-          [
-            {
-              url: 'https://s3.example.com/file.png',
-              filename: 'video.mp4',
-              size: 1024000,
-              mimetype: 'video/mp4',
-            },
-          ]
-        );
+        expect(downloadSlackFile).not.toHaveBeenCalled();
+        expect(uploadFileToS3).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
-      it('should process file_share thread replies with files but no text', async () => {
+      it('should ignore unmentioned file_share thread replies with files but no text', async () => {
         const { downloadSlackFile } = require('../services/slackService');
 
         settingsService.getSetting.mockResolvedValue({
@@ -1184,19 +1154,8 @@ describe('Slack Events API', () => {
 
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // Verify file was downloaded
-        expect(downloadSlackFile).toHaveBeenCalledWith('https://files.slack.com/image.png');
-
-        // Verify Emma received a placeholder message text when no text was provided
-        expect(generateSessionResponse).toHaveBeenCalledWith(
-          'session-123',
-          'John Doe: [attached file]',
-          'user-123',
-          'gpt-4o',
-          expect.arrayContaining([
-            expect.objectContaining({ filename: 'image.png', mimetype: 'image/png' }),
-          ])
-        );
+        expect(downloadSlackFile).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
       it('should ignore file_share messages in untracked threads', async () => {

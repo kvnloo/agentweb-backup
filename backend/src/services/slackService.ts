@@ -1336,6 +1336,25 @@ export async function postThinkingMessage(
   }
 }
 
+/** Set or clear Slack's native assistant working status for a thread. */
+export async function setSlackAssistantStatus(
+  channel: string,
+  threadTs: string,
+  status: string
+): Promise<void> {
+  if (!slackClient) return;
+
+  try {
+    await slackClient.apiCall('assistant.threads.setStatus', {
+      channel_id: channel,
+      thread_ts: threadTs,
+      status,
+    });
+  } catch (error) {
+    console.error('Non-blocking: failed to set Slack assistant thread status:', error);
+  }
+}
+
 /**
  * Delete a Slack message (used to remove "thinking" message after response is ready)
  */
