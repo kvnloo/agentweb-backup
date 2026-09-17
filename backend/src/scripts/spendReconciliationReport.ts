@@ -12,12 +12,17 @@
  * actually existed. Without it, every row predating the mirror reads as "not
  * mirrored" and the check can never go green — see FidelityOptions.
  *
+ * SPEND_LEDGER_LLM_MIRROR_STARTED_AT does the same for LLM events (ENG-1934). It
+ * defaults to LLM_SPEND_LEDGER_STARTED_ON, the day they began in production;
+ * set it to `off` to reconcile the vendor rail alone.
+ *
  * With no billingUserId it reports every subject that has spend events in the
  * month, which is what you want while the ledger is small.
  */
 import { SpendEvent, SPEND_EVENTS_TABLE } from "../services/spendEventDb";
 import { UsageRecordRow, usageRecordDb } from "../services/usageRecordDb";
 import { reconcileMonth, selectReconcilableSubjects } from "../services/spendReconciliation";
+import { LLM_SPEND_LEDGER_STARTED_ON } from "../services/spendLedgerDualWrite";
 import AWS from "aws-sdk";
 
 const usd = (micro: number) => `$${(micro / 1e6).toFixed(6)}`;
@@ -52,6 +57,9 @@ async function main(): Promise<void> {
   const month = process.argv[2] || new Date().toISOString().slice(0, 7);
   const only = process.argv[3];
   const mirrorStartedAt = process.env.SPEND_LEDGER_MIRROR_STARTED_AT;
+  const llmSetting = process.env.SPEND_LEDGER_LLM_MIRROR_STARTED_AT;
+  const llmMirrorStartedAt =
+    llmSetting === "off" ? undefined : llmSetting || `${LLM_SPEND_LEDGER_STARTED_ON}T00:00:00.000Z`;
 
   const events = await scanAllSpendEvents(month);
   const liveRowsForMonth = await usageRecordDb.scanByDateRange(`${month}-01`, `${month}-31`);
@@ -62,7 +70,9 @@ async function main(): Promise<void> {
   // events, so it would be absent from the list, never loaded, and its
   // unmirrored spend would be invisible -- the report would print clean
   // precisely when the mirror had failed hardest.
-  const { reconcilable, llmOnly } = selectReconcilableSubjects(events, liveRowsForMonth);
+  const { reconcilable, llmOnly } = selectReconcilableSubjects(events, liveRowsForMonth, {
+    includeLlm: !!llmMirrorStartedAt,
+  });
   const subjects = only ? [only] : reconcilable;
 
   console.log(`\nENG-1250 §8 internal reconciliation — ${month}`);
@@ -72,9 +82,14 @@ async function main(): Promise<void> {
       ? `fidelity scoped to days after the mirror started (${mirrorStartedAt})`
       : "fidelity UNSCOPED — set SPEND_LEDGER_MIRROR_STARTED_AT or every pre-mirror row reads as a failure",
   );
+  console.log(
+    llmMirrorStartedAt
+      ? `LLM fidelity from ${llmMirrorStartedAt} (LLM groups print as llm:<model>)`
+      : "LLM fidelity OFF — vendor rail only",
+  );
 
   if (!only && llmOnly.length > 0) {
-    console.log(`${llmOnly.length} subject(s) with LLM spend only — nothing to reconcile, not listed`);
+    console.log(`${llmOnly.length} subject(s) with LLM spend only — not reconciled with LLM fidelity off, not listed`);
   }
 
   if (subjects.length === 0) {
@@ -93,7 +108,7 @@ async function main(): Promise<void> {
 
   for (const billingUserId of subjects) {
     const liveRows: UsageRecordRow[] = liveRowsBySubject.get(billingUserId) ?? [];
-    const report = reconcileMonth(billingUserId, month, events, liveRows, { mirrorStartedAt });
+    const report = reconcileMonth(billingUserId, month, events, liveRows, { mirrorStartedAt, llmMirrorStartedAt });
     const f = report.fidelity;
     const d = report.divergence;
 

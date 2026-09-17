@@ -141,7 +141,11 @@ describe('withdrawStaleInvitations', () => {
   it('AC #2: checkpoints on a pacer refusal instead of failing or retrying', async () => {
     let calls = 0;
     const deps = makeDeps([row('a', 40), row('b', 30), row('c', 20)], {
-      pace: jest.fn(async () => (++calls > 1 ? 'LinkedIn write actions are being paced' : null)),
+      // ENG-1873: a structured write-pacer refusal. This test used to assert
+      // "write-pacing limit" from a bare, unidentified refusal string — which is the
+      // exact assumption that made a drain refused by a DIFFERENT gate misreport
+      // itself. The wording is only right when the write pacer is what refused.
+      pace: jest.fn(async () => (++calls > 1 ? { gate: 'write_pacer' as const, reason: 'LinkedIn write actions are being paced' } : null)),
     });
 
     const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps });
@@ -152,6 +156,64 @@ describe('withdrawStaleInvitations', () => {
     expect(result.remainingStale).toBe(2);
     expect(result.notice).toContain('at its write-pacing limit');
     expect(result.notice).toContain('not a LinkedIn rejection');
+  });
+
+  // ENG-1873 AC2: the result and its notice name the gate that ACTUALLY refused.
+  describe('a paced stop names the refusing gate (ENG-1873)', () => {
+    const refusedBy = (gate: any, reason: string) =>
+      makeDeps([row('a', 40), row('b', 30)], { pace: jest.fn(async () => ({ gate, reason })) });
+
+    it('daily volume: reports it, and never claims a write-pacing limit', async () => {
+      const result = await withdrawStaleInvitations({
+        accountId: 'acc-1', olderThanDays: 14,
+        deps: refusedBy('daily_volume', 'This LinkedIn account has already sent 10 connection requests in the last 24 hours.\n\nDo NOT retry.'),
+      });
+      expect(result.stopReason).toBe('paced');
+      expect(result.pacedGate).toBe('daily_volume');
+      expect(result.pacedReason).toContain('already sent 10 connection requests');
+      expect(result.notice).toContain('daily connection-request limit');
+      expect(result.notice).not.toContain('write-pacing');
+      // The gate's own first line is relayed, not the whole multi-line block.
+      expect(result.notice).toContain('already sent 10 connection requests');
+      expect(result.notice).not.toContain('Do NOT retry');
+    });
+
+    it('reservation persistence: reports that the reservation could not be saved', async () => {
+      const result = await withdrawStaleInvitations({
+        accountId: 'acc-1', olderThanDays: 14,
+        deps: refusedBy('reservation_persistence', 'The LinkedIn write was not attempted because its daily safety reservation could not be persisted.'),
+      });
+      expect(result.pacedGate).toBe('reservation_persistence');
+      expect(result.notice).toContain('could not be saved');
+      expect(result.notice).not.toContain('write-pacing');
+    });
+
+    it('write pacer: the write-pacing wording is used only here', async () => {
+      const result = await withdrawStaleInvitations({
+        accountId: 'acc-1', olderThanDays: 14,
+        deps: refusedBy('write_pacer', 'hourly ceiling reached'),
+      });
+      expect(result.pacedGate).toBe('write_pacer');
+      expect(result.notice).toContain('write-pacing limit');
+    });
+
+    it('a bare string refusal is reported as unknown and asserts no specific gate', async () => {
+      const result = await withdrawStaleInvitations({
+        accountId: 'acc-1', olderThanDays: 14,
+        deps: makeDeps([row('a', 40)], { pace: jest.fn(async () => 'something refused') }),
+      });
+      expect(result.pacedGate).toBe('unknown');
+      expect(result.pacedReason).toBe('something refused');
+      expect(result.notice).not.toContain('write-pacing');
+      expect(result.notice).toContain('something refused');
+    });
+
+    it('a run that was not paced carries no gate fields', async () => {
+      const result = await withdrawStaleInvitations({ accountId: 'acc-1', olderThanDays: 14, deps: makeDeps([row('a', 40)]) });
+      expect(result.stopReason).toBe('completed');
+      expect(result).not.toHaveProperty('pacedGate');
+      expect(result).not.toHaveProperty('pacedReason');
+    });
   });
 
   it('refused on the very first slot is a clean no-op report, not an error', async () => {

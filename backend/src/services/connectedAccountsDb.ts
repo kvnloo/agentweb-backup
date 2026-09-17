@@ -755,6 +755,27 @@ export type AccountConfigMutation =
       skip?: boolean;
     });
 
+/**
+ * How many times `updateAccountConfig` retries a write that collided with an
+ * in-flight DynamoDB transaction on the same user item, and how long it waits.
+ *
+ * ENG-1873. `TransactionConflictException` means another request holds a
+ * transaction on this item right now — on the users table that is, in practice,
+ * `applyMonthlyChargeAtomic`, which `tokenUsageService` runs for each LLM
+ * completion. A tool call executes the moment its completion returns, often
+ * while that completion's charge transaction is still committing, so the tool's
+ * config write lost the race and was treated as fatal. AWS documents the error
+ * as transient; `paymentHistoryDb` and `usageRecordDb` already classify it so.
+ *
+ * Kept separate from the CAS attempt budget below so it cannot change when a
+ * genuine concurrent overwrite gives up with `ConnectedAccountChanged`.
+ */
+export const TRANSACTION_CONFLICT_RETRIES = 4;
+export const transactionConflictBackoffMs = (retry: number): number =>
+  25 * 2 ** retry + Math.floor(Math.random() * 25);
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
@@ -773,7 +794,9 @@ export const updateAccountConfig = async (
   // so a fresh read followed by the same merge is exactly the right answer —
   // provided the merge itself is recomputed from that fresh read when it needs
   // to be (see AccountConfigMutation above).
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let casAttempts = 0;
+  let transactionConflictRetries = 0;
+  for (;;) {
     const user = await userDb.getUserByIdConsistent(userId);
     if (!user) {
       throw new Error('User not found');
@@ -827,8 +850,21 @@ export const updateAccountConfig = async (
       });
       return;
     } catch (error: any) {
+      // ENG-1873: an in-flight transaction on this item (see
+      // TRANSACTION_CONFLICT_RETRIES). Back off briefly, then re-read and
+      // re-apply exactly as the CAS path does — the merge is recomputed from the
+      // fresh read, so a retry can never write a stale snapshot.
+      if (
+        error?.code === 'TransactionConflictException'
+        && transactionConflictRetries < TRANSACTION_CONFLICT_RETRIES
+      ) {
+        transactionConflictRetries++;
+        await sleep(transactionConflictBackoffMs(transactionConflictRetries));
+        continue;
+      }
       if (error?.code !== 'ConditionalCheckFailedException') throw error;
-      if (attempt === 2) {
+      casAttempts++;
+      if (casAttempts >= 3) {
         throw Object.assign(
           new Error(`Connected account "${accountId}" changed while updating its config; retry`),
           { code: 'ConnectedAccountChanged' },

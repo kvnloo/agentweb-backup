@@ -190,8 +190,12 @@ describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
 
     await run({ status: 'ACTIVE' }, { override_tracking_check: true }).catch(() => undefined);
 
+    // ENG-1909: a 6th arg is now always passed — `buildSandboxFetchHtml(userId)`, which
+    // resolves to `undefined` for this test's non-sandbox userId (it short-circuits on
+    // `isEvaluationUser` before touching anything else), so the gate call is otherwise
+    // unchanged from before that field existed.
     expect(runMetaTrackingGate).toHaveBeenCalledWith(
-      expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1',
+      expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1', { fetchHtml: undefined },
     );
   });
 });

@@ -26,8 +26,9 @@ import InfoIcon from "@mui/icons-material/InfoOutlined";
  *
  * `CostBreakdownBody` (LLM) and `XCostBreakdownBody` (X) both read the daily
  * aggregate table. This one reads the immutable `AW-SpendEvents` ledger, so it
- * is per-call rather than per-day, spans every metered vendor at once, and can
- * show reservations — which the aggregate has no concept of.
+ * is per-call rather than per-day, spans LLM providers and every metered vendor
+ * at once (LLM since ENG-1934), and can show reservations — which the aggregate
+ * has no concept of.
  *
  * ## Three rules this component exists to keep
  *
@@ -104,6 +105,25 @@ export interface PauseExplanation {
   topProviders: SpendSlice[];
 }
 
+/**
+ * How much of the month's LLM spend the ledger holds (ENG-1934). Mirrors
+ * spendReconciliation.LlmLedgerCoverage: measured against the aggregate rail,
+ * so a kill-switch gap or a fallback write shows up as `partial`.
+ */
+export interface LlmLedgerCoverage {
+  /** Whether the backend's kill switch currently lets LLM events through. */
+  recording: boolean;
+  /** YYYY-MM-DD, the day LLM events began reaching the ledger. */
+  startedOn: string;
+  month: "none" | "partial" | "full";
+  ledgerLlmMicroUsd: number;
+  aggregateLlmMicroUsd: number | null;
+  /** LLM spend missing from the ledger; null when it could not be measured. */
+  missingLlmMicroUsd: number | null;
+  /** LLM spend the ledger holds beyond the aggregate rail; null when not measured. */
+  excessLlmMicroUsd?: number | null;
+}
+
 /** The GET /api/admin/users/:billingUserId/spend/breakdown payload. */
 export interface SpendLedgerPayload {
   billingUserId: string;
@@ -121,7 +141,46 @@ export interface SpendLedgerPayload {
   eventCount: number;
   projection: MonthlyProjection;
   pause: PauseExplanation;
+  /** Absent from a backend that predates ENG-1934 — read as vendor-only. */
+  llmLedger?: LlmLedgerCoverage;
+  /** Absent from a backend that predates ENG-1886. */
+  enforcement?: EnforcementState;
+  /**
+   * ENG-1841: detail rows the server left out of each bounded cut. Totals are
+   * always over the whole month; this only says how many rows are not listed.
+   * Absent from a backend that predates the bound.
+   */
+  omitted?: Partial<Record<"byProvider" | "byFeature" | "byMember" | "bySession" | "inFlight", OmittedRows>>;
 }
+
+/** Mirrors backend spendReadModel.OmittedRows. */
+export interface OmittedRows {
+  rows: number;
+  eventCount: number;
+  settledMicroUsd: number;
+  reservedMicroUsd: number;
+}
+
+/**
+ * The enforcer's own admission decision (ENG-1886). Mirrors
+ * backend enforcementStateView.EnforcementState — a re-labelling of what
+ * checkTokenUsage returned, never a recomputation.
+ */
+export type EnforcementState =
+  | {
+      available: true;
+      month: string;
+      paused: boolean;
+      usageMode: string | null;
+      gatedBy: "cost" | "tokens" | "none";
+      used: number;
+      limit: number | null;
+      percentUsed: number;
+      resetsOn: string;
+      usagePolicyVersion: string | null;
+    }
+  | { available: false; reason: "not-current-month"; currentMonth: string }
+  | { available: false; reason: "unreadable"; message: string };
 
 // ── Pure helpers, exported for unit tests ────────────────────────────────────
 
@@ -159,6 +218,69 @@ export function committedPercent(projection: MonthlyProjection): number | null {
   return (committedMicroUsd(projection) / projection.usableAllowanceMicroUsd) * 100;
 }
 
+/**
+ * Whether the allowance comparison may be shown, and how it must be qualified.
+ *
+ * `withheld` whenever the total cannot include LLM spend — a backend without
+ * ENG-1934, or a month that ended before LLM events existed. That is ENG-1874's
+ * defect: a vendor-only total against a cap sized for LLM spend reads as "0% of
+ * the allowance used" for an account that has used most of it.
+ *
+ * `partial` when the backend measured LLM spend missing from the ledger (the
+ * days before recording began, a kill-switch gap, a fallback write) or could
+ * not measure it: the figures are shown, but the qualifier sits IN the
+ * figure's own caption. ENG-1874 found that a footnote under a confident
+ * number is not read.
+ */
+export function allowanceComparison(data: Pick<SpendLedgerPayload, "llmLedger">): "withheld" | "partial" | "full" {
+  const coverage = data.llmLedger;
+  if (!coverage || coverage.month === "none") return "withheld";
+  return coverage.month;
+}
+
+/**
+ * The partial-coverage qualifier, stating the gap when it was measured — in
+ * whichever direction it runs. A shortfall understates spend; an excess (a
+ * duplicate or orphan event) overstates it.
+ */
+export function partialCoverageCaption(coverage: LlmLedgerCoverage): string {
+  if (coverage.missingLlmMicroUsd == null) return "Unverified: LLM spend in this total could not be checked";
+  if ((coverage.excessLlmMicroUsd ?? 0) > coverage.missingLlmMicroUsd) {
+    return `Overstated: the ledger holds ${usdFromMicro(coverage.excessLlmMicroUsd!)} more LLM spend than usage records`;
+  }
+  return `Understated: ${usdFromMicro(coverage.missingLlmMicroUsd)} of LLM spend is not in the ledger`;
+}
+
+type LiveEnforcement = Extract<EnforcementState, { available: true }>;
+type PastMonthEnforcement = Extract<EnforcementState, { reason: "not-current-month" }>;
+
+/** Type guards: this project's compiler settings do not narrow the union on `available`. */
+export function isLiveEnforcement(state: EnforcementState): state is LiveEnforcement {
+  return state.available === true;
+}
+function isPastMonthEnforcement(state: EnforcementState): state is PastMonthEnforcement {
+  return state.available === false && (state as PastMonthEnforcement).reason === "not-current-month";
+}
+
+/**
+ * The enforcer's counter in its own unit: dollars when the cost cap gates,
+ * token counts otherwise.
+ */
+export function enforcementCounter(state: LiveEnforcement): string {
+  if (state.gatedBy === "none") return "no cap configured";
+  const fmt = (n: number) =>
+    state.gatedBy === "cost" ? `$${n.toFixed(2)}` : `${Math.round(n).toLocaleString()} tokens`;
+  const limit = state.limit == null ? "no limit" : fmt(state.limit);
+  return `${fmt(state.used)} of ${limit} (${state.percentUsed.toFixed(1)}%)`;
+}
+
+/** `2026-09-14` → `Sep 14`. */
+export function shortDay(day: string): string {
+  const d = new Date(`${day}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return day;
+  return `${d.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${d.getUTCDate()}`;
+}
+
 /** `2026-09-04T10:00:00.000Z` → `Sep 4, 10:00 UTC`. */
 export function shortInstant(iso: string): string {
   const d = new Date(iso);
@@ -170,7 +292,7 @@ export function shortInstant(iso: string): string {
 }
 
 const SLICE_TITLES: Record<string, { title: string; caption: string }> = {
-  byProvider: { title: "By vendor", caption: "Which upstream the money went to" },
+  byProvider: { title: "By provider", caption: "Which upstream the money went to — an LLM provider or a vendor" },
   byFeature: { title: "By feature", caption: "Which product surface spent it" },
   byMember: { title: "By member", caption: "Who triggered the calls — the acting user, not the payer" },
   bySession: { title: "By session", caption: "Which run or chat it belonged to" },
@@ -188,11 +310,14 @@ const SLICE_TITLES: Record<string, { title: string; caption: string }> = {
  */
 export const MAX_ROWS_PER_CUT = 25;
 
-const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) => {
+const SliceTable: React.FC<{ id: string; rows: SpendSlice[]; omitted?: OmittedRows }> = ({ id, rows, omitted }) => {
   const meta = SLICE_TITLES[id];
   const max = Math.max(...rows.map((r) => r.settledMicroUsd + r.reservedMicroUsd), 0);
   const shown = rows.slice(0, MAX_ROWS_PER_CUT);
-  const hidden = rows.length - shown.length;
+  // Rows the server already left out (ENG-1841) are just as unlisted as rows
+  // cut here, so both count toward "of N" and "more not shown".
+  const totalRows = rows.length + (omitted?.rows ?? 0);
+  const hidden = totalRows - shown.length;
 
   return (
     <Box sx={{ mb: 2 }} data-testid={`spend-slice-${id}`}>
@@ -249,7 +374,7 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
       )}
       {hidden > 0 && (
         <Typography variant="caption" color="text.secondary" data-testid={`spend-slice-${id}-more`}>
-          Showing the {MAX_ROWS_PER_CUT} largest of {rows.length.toLocaleString()} — {hidden.toLocaleString()} more
+          Showing the {shown.length.toLocaleString()} largest of {totalRows.toLocaleString()} — {hidden.toLocaleString()} more
           not shown, but included in every total above.
         </Typography>
       )}
@@ -260,7 +385,9 @@ const SliceTable: React.FC<{ id: string; rows: SpendSlice[] }> = ({ id, rows }) 
 export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({ data }) => {
   if (!data) return null;
 
-  const { projection, pause } = data;
+  const { projection } = data;
+  const comparison = allowanceComparison(data);
+  const pct = committedPercent(projection);
   const openedAMember = !!data.requestedUserId && data.requestedUserId !== data.billingUserId;
   const nothingRecorded = data.eventCount === 0;
 
@@ -292,15 +419,57 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
         </Alert>
       )}
 
-      {/* ENG-1874. The pause explanation is WITHHELD, not merely hidden.
-          `explainPause` compares committed spend against the usable allowance,
-          and those two have different bases today: the ledger holds vendor
-          spend only (no LLM row has ever been written to AW-SpendEvents — both
-          writers sit inside recordVendorUsage), while the allowance is the
-          tier's LLM cost cap. A pause claim built on that is not a weaker
-          answer, it is a wrong one, and this screen exists precisely to be
-          trusted about pauses. Restore it with ENG-1250 §6, when LLM rows reach
-          the ledger and the two sides finally describe the same thing. */}
+      {/* Whether the account is ACTUALLY paused — ENG-1886.
+
+          This is the enforcer's own decision (checkTokenUsage), re-labelled, not
+          a recomputation. The ledger's `pause` (explainPause) stays withheld: it
+          judges a pause from this ledger's total, which counts LLM and vendor
+          spend, while the live gate counts LLM spend only — a pause claim built
+          there could name a pause that never happened (ENG-1874).
+
+          The card says which counter it read, because that counter
+          (AW-Users.tokenUsage) can differ from the ledger total below
+          (ENG-1247). It reports what the enforcer decided — the customer's
+          actual experience — not what the account spent. */}
+      {data.enforcement && (
+        <Alert
+          severity={isLiveEnforcement(data.enforcement) ? (data.enforcement.paused ? "error" : "success") : "info"}
+          sx={{ mb: 2 }}
+          data-testid="spend-ledger-enforcement"
+        >
+          {isLiveEnforcement(data.enforcement) ? (
+            <>
+              <Typography variant="body2" fontWeight={600}>
+                {/* A pause always wins the heading; an uncapped account must not
+                    read as "the usage cap is admitting work" beside "no cap
+                    configured" (CodeRabbit, PR #2922). */}
+                {data.enforcement.paused
+                  ? "Paused now by the usage cap"
+                  : data.enforcement.gatedBy === "none"
+                  ? "Not paused: no usage cap is configured"
+                  : "Not paused: the usage cap is admitting work"}
+                {data.enforcement.usageMode ? ` (mode: ${data.enforcement.usageMode})` : ""}
+              </Typography>
+              <Typography variant="body2">
+                Enforcer's counter
+                {data.enforcement.gatedBy === "cost" ? " (LLM cost)" : data.enforcement.gatedBy === "tokens" ? " (token count)" : ""}:{" "}
+                {enforcementCounter(data.enforcement)} · resets {shortDay(data.enforcement.resetsOn)}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" component="div">
+                This is the counter that decides admission (AW-Users), not the ledger total below. The two can
+                differ.
+              </Typography>
+            </>
+          ) : isPastMonthEnforcement(data.enforcement) ? (
+            <Typography variant="body2">
+              Pause state is only known for the current month ({data.enforcement.currentMonth}); the enforcer's
+              counter resets monthly.
+            </Typography>
+          ) : (
+            <Typography variant="body2">Could not read whether this account is paused right now.</Typography>
+          )}
+        </Alert>
+      )}
 
       {/* Raw spend, what is committed but unresolved, and what the account may
           actually spend — three figures, never netted into one (ENG-1250 §3). */}
@@ -339,35 +508,138 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
             </Typography>
           </Box>
         </Grid>
+        {comparison !== "withheld" && (
+          <>
+            <Grid item xs={12} md={3}>
+              <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                <Typography variant="caption" color="text.secondary">
+                  Usable allowance
+                </Typography>
+                <Typography variant="h6" data-testid="spend-ledger-allowance" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                  {projection.unlimited ? "Uncapped" : usdFromMicro(projection.usableAllowanceMicroUsd)}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {projection.unlimited ? "no configured cap" : `${usdFromMicro(projection.includedAllowanceMicroUsd)} included`}
+                </Typography>
+              </Box>
+            </Grid>
+            <Grid item xs={12} md={3}>
+              <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                <Typography variant="caption" color="text.secondary">
+                  {projection.overspentMicroUsd > 0 ? "Overspent" : "Remaining"}
+                </Typography>
+                <Typography
+                  variant="h6"
+                  data-testid="spend-ledger-remaining"
+                  sx={{
+                    fontVariantNumeric: "tabular-nums",
+                    color: projection.overspentMicroUsd > 0 ? "error.main" : undefined,
+                  }}
+                >
+                  {projection.unlimited
+                    ? "—"
+                    : projection.overspentMicroUsd > 0
+                    ? usdFromMicro(projection.overspentMicroUsd)
+                    : usdFromMicro(projection.remainingMicroUsd)}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" component="div">
+                  {pct == null ? "not applicable" : `${pct.toFixed(1)}% of allowance committed`}
+                </Typography>
+                {/* In the figure's own caption, not a footnote (ENG-1874) — and
+                    whenever coverage is partial, not only when a percentage is
+                    shown: an uncapped tier's settled total is just as incomplete
+                    (CodeRabbit, PR #2904). */}
+                {comparison === "partial" && (
+                  <Typography
+                    variant="caption"
+                    color="warning.main"
+                    component="div"
+                    data-testid="spend-ledger-partial-coverage"
+                  >
+                    {partialCoverageCaption(data.llmLedger!)}
+                  </Typography>
+                )}
+              </Box>
+            </Grid>
+          </>
+        )}
       </Grid>
 
-      {/* What is NOT shown here, and why — ENG-1874.
+      {comparison === "withheld" ? (
+        // ENG-1874. Saying nothing would leave an admin to assume the missing
+        // allowance figures are a bug; saying why costs one line and is true.
+        <Alert severity="info" sx={{ mb: 2 }} data-testid="spend-ledger-basis-note">
+          {data.llmLedger ? (
+            <>
+              {data.billingMonth} ended before LLM spend was recorded here (from{" "}
+              {shortDay(data.llmLedger.startedOn)}), so this total is <strong>vendor spend only</strong>.
+            </>
+          ) : (
+            <>
+              This ledger records <strong>vendor spend only</strong> — LLM usage does not appear here.
+            </>
+          )}{" "}
+          Allowance and remaining-balance figures are withheld: comparing this total against a cap
+          that also covers LLM spend would understate how much of the cap is used.
+        </Alert>
+      ) : (
+        <Alert severity="info" sx={{ mb: 2 }} data-testid="spend-ledger-basis-note">
+          This total counts <strong>LLM and vendor spend</strong> against the tier's allowance. The live
+          cap still counts LLM spend only, so these figures show what an all-in cap would read — they do
+          not explain a pause.
+        </Alert>
+      )}
 
-          Usable allowance, remaining, and "% of allowance committed" used to
-          sit beside the two figures above. They were removed because the
-          comparison is invalid, not because it is unavailable: the numerator
-          (this ledger) is vendor spend only, and the denominator (the tier's
-          cost cap) is sized for LLM spend too. The result rendered "0.0% of
-          allowance committed" for accounts that had consumed most of that cap.
+      {data.llmLedger && !data.llmLedger.recording && (
+        <Alert severity="warning" sx={{ mb: 2 }} data-testid="spend-ledger-llm-recording-off">
+          LLM spend recording is switched off on the backend (SPEND_LEDGER_LLM_DUAL_WRITE=false). LLM calls
+          made while it is off are missing from these figures.
+        </Alert>
+      )}
 
-          Saying nothing would leave an admin to assume the omission is a bug.
-          Saying this costs one line and is true. */}
-      <Alert severity="info" sx={{ mb: 2 }} data-testid="spend-ledger-basis-note">
-        This ledger currently records <strong>vendor spend only</strong> — LLM usage is metered on
-        a separate rail and does not appear here. Allowance and remaining-balance figures are
-        withheld for that reason: comparing this total against a cap that also covers LLM spend
-        would understate how much of the cap is used.
-      </Alert>
-
-      {/* Allowance adjustments (purchased credits, admin grants, migration
-          offset) were rendered here until ENG-1874 and are withheld with the
-          allowance itself: an adjustment shown next to no balance invites the
-          reader to reconstruct the very comparison this change removes.
-
-          The principle they encode survives for whoever restores them — they
-          raise what the account MAY spend and never reduce what it HAS spent
-          (ENG-1250 §3), so a single net figure would make those two
-          indistinguishable. */}
+      {/* Adjustments, itemised. They raise what the account MAY spend; they
+          never reduce what it HAS spent (ENG-1250 §3), and a single net
+          allowance would make those indistinguishable. Withheld with the
+          allowance itself: an adjustment beside no balance invites
+          reconstructing the comparison that was withheld. */}
+      {comparison !== "withheld" &&
+        (projection.purchasedCreditsMicroUsd !== 0 ||
+          projection.adminAdjustmentMicroUsd !== 0 ||
+          projection.migrationAdjustmentMicroUsd !== 0) && (
+          <Box sx={{ mb: 2 }} data-testid="spend-ledger-adjustments">
+            <Typography variant="caption" color="text.secondary">
+              Allowance adjustments (these change what may be spent — never what was spent)
+            </Typography>
+            <Table size="small">
+              <TableBody>
+                {projection.purchasedCreditsMicroUsd !== 0 && (
+                  <TableRow>
+                    <TableCell>Purchased credits</TableCell>
+                    <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                      {usdFromMicro(projection.purchasedCreditsMicroUsd)}
+                    </TableCell>
+                  </TableRow>
+                )}
+                {projection.adminAdjustmentMicroUsd !== 0 && (
+                  <TableRow>
+                    <TableCell>Admin grants and reversals</TableCell>
+                    <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                      {usdFromMicro(projection.adminAdjustmentMicroUsd)}
+                    </TableCell>
+                  </TableRow>
+                )}
+                {projection.migrationAdjustmentMicroUsd !== 0 && (
+                  <TableRow>
+                    <TableCell>Migration adjustment</TableCell>
+                    <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                      {usdFromMicro(projection.migrationAdjustmentMicroUsd)}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Box>
+        )}
 
       {nothingRecorded ? (
         // "No events" and "$0.00 spent" are different claims and only one of
@@ -393,7 +665,7 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                 <TableHead>
                   <TableRow>
                     <TableCell>When</TableCell>
-                    <TableCell>Vendor / operation</TableCell>
+                    <TableCell>Provider / operation</TableCell>
                     <TableCell>Acting user</TableCell>
                     <TableCell align="right">Amount</TableCell>
                   </TableRow>
@@ -417,21 +689,21 @@ export const SpendLedgerBody: React.FC<{ data: SpendLedgerPayload | null }> = ({
                   ))}
                 </TableBody>
               </Table>
-              {data.inFlight.length > MAX_ROWS_PER_CUT && (
+              {data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) > MAX_ROWS_PER_CUT && (
                 <Typography variant="caption" color="text.secondary" data-testid="spend-ledger-inflight-more">
-                  Showing the {MAX_ROWS_PER_CUT} most recent of{" "}
-                  {data.inFlight.length.toLocaleString()} open reservations —{" "}
-                  {(data.inFlight.length - MAX_ROWS_PER_CUT).toLocaleString()} more not shown, but the
+                  Showing the {Math.min(MAX_ROWS_PER_CUT, data.inFlight.length).toLocaleString()} most recent of{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0)).toLocaleString()} open reservations —{" "}
+                  {(data.inFlight.length + (data.omitted?.inFlight?.rows ?? 0) - Math.min(MAX_ROWS_PER_CUT, data.inFlight.length)).toLocaleString()} more not shown, but the
                   in-flight total above counts all of them.
                 </Typography>
               )}
             </Box>
           )}
 
-          <SliceTable id="byProvider" rows={data.byProvider} />
-          <SliceTable id="byFeature" rows={data.byFeature} />
-          <SliceTable id="byMember" rows={data.byMember} />
-          <SliceTable id="bySession" rows={data.bySession} />
+          <SliceTable id="byProvider" rows={data.byProvider} omitted={data.omitted?.byProvider} />
+          <SliceTable id="byFeature" rows={data.byFeature} omitted={data.omitted?.byFeature} />
+          <SliceTable id="byMember" rows={data.byMember} omitted={data.omitted?.byMember} />
+          <SliceTable id="bySession" rows={data.bySession} omitted={data.omitted?.bySession} />
 
           {data.daily.length > 0 && (
             <Box data-testid="spend-ledger-daily">

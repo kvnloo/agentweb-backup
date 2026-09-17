@@ -2246,10 +2246,14 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
  *       an angle (broad vs. region-focused, etc.) before clicking Find
  *       & Import.
  *
- *       Results are cached per persona on `user.icpResult[i].extractedFilters`
- *       keyed by a hash of the persona content + a code-bumped version.
- *       Cache hits skip the LLM entirely; cache misses regenerate and
- *       persist via userDb.updateUser.
+ *       Results are cached per persona, keyed by a hash of the persona
+ *       content + a code-bumped version, on whichever store the persona
+ *       came from: `user.icpResult[i].extractedFilters` for onboarding
+ *       personas, or `marketStrategy.icp[i].extractedFilters` (on the org
+ *       record for org members, the user record for solo users) for
+ *       Market-Strategy-sourced ones — except the org-owner-fallback case,
+ *       which is never cached (see the write-back comment below). Cache
+ *       hits skip the LLM entirely; cache misses regenerate and persist.
  * @access Private
  */
 router.get('/icp/filters', async (req: Request, res: Response) => {
@@ -2270,26 +2274,64 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
     // Resolve the persona list. Three stores hold ICP data and a user may
     // have ICPs in only one of them:
     //   1. user.icpResult — personas generated during onboarding / mirrored
-    //      from Emma's brand build. Carries the extractedFilters cache.
+    //      from Emma's brand build. Carries an extractedFilters cache.
     //   2. marketStrategy.icp — personas authored on the /market-strategy
     //      page or by Emma's update_market_strategy tool. For org members
     //      this lives on the ORG (see routes/marketStrategy.ts: "If user is
     //      in an org, always read market strategy from the org"), so an org
-    //      owner can have 5 ICPs the user record never sees.
+    //      owner can have 5 ICPs the user record never sees. Also carries
+    //      its own per-entry extractedFilters cache (see the write-back
+    //      comment below) — except the org-owner-fallback case, which is
+    //      never cached.
     // Prefer icpResult (it has the cache); otherwise fall back to the
     // marketStrategy.icp store, converting to the icpResult shape with the
     // same mapping Emma's brand-build mirror uses.
+    //
+    // marketStrategy.icp edits are never mirrored back onto icpResult (see
+    // the write-back comment below), so if the user corrects their ICPs on
+    // the Market Strategy page after onboarding, a plain "icpResult wins
+    // when non-empty" rule would serve the stale onboarding personas
+    // forever (ENG-1955). Resolve marketStrategy once up front and use it
+    // whenever it was saved more recently than icpResult was last
+    // generated.
+    let marketStrategy: any = user?.marketStrategy;
+    // True when resolveOrgProfileField had to fall back to the org OWNER's
+    // user record (org has no marketStrategy of its own and the caller isn't
+    // the owner). That fallback's updatedAt belongs to the owner's timeline,
+    // not the calling member's — comparing it against the caller's own
+    // icpCompletedAt would pit two unrelated users' clocks against each
+    // other, so the staleness override below must not apply (ENG-1955).
+    let marketStrategyFromOwnerFallback = false;
+    if (user?.orgId) {
+      const org: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
+      if (org) {
+        marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        marketStrategyFromOwnerFallback =
+          !org.marketStrategy && !!org.ownerUserId && org.ownerUserId !== user.userId;
+      }
+    }
+    const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    // Prefer icpUpdatedAt — bumped only by a write that actually touches
+    // `icp` — over the whole-object updatedAt, which every marketStrategy
+    // write bumps regardless of which field changed (businessOverview- or
+    // competitors-only saves included). Falling back to updatedAt when
+    // icpUpdatedAt is absent keeps existing records (saved before this field
+    // existed) working exactly as before; it only stops applying once a
+    // write path that sets icpUpdatedAt touches the record (ENG-1955
+    // follow-up — a competitors edit or an Emma "update the competitors"
+    // tool call was otherwise silently and permanently switching the org
+    // off its cached, richer icpResult-derived ICP filters).
+    const marketStrategyIcpTimestamp = marketStrategy?.icpUpdatedAt || marketStrategy?.updatedAt;
+    const marketStrategyIsNewer =
+      !marketStrategyFromOwnerFallback &&
+      marketIcp.length > 0 &&
+      !!marketStrategyIcpTimestamp &&
+      !!user?.icpCompletedAt &&
+      new Date(marketStrategyIcpTimestamp).getTime() > new Date(user.icpCompletedAt).getTime();
+
     let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     let fromMarketStrategy = false;
-    if (personas.length === 0) {
-      let marketStrategy: any = user?.marketStrategy;
-      if (user?.orgId) {
-        const org: any = await orgDb.getOrgById(user.orgId);
-        if (org) {
-          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
-        }
-      }
-      const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    if (personas.length === 0 || marketStrategyIsNewer) {
       if (marketIcp.length > 0) {
         const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
         personas = mapMarketIcpToResult(marketIcp);
@@ -2339,14 +2381,36 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       });
     }
 
-    // Persist the extracted filters as a cache — but ONLY for personas that
-    // came from user.icpResult. We deliberately do NOT write back when the
-    // personas were derived from marketStrategy.icp: materializing them onto
-    // user.icpResult would make the user record take precedence over the
-    // (possibly org-level) marketStrategy on the next click, so later edits
-    // to the org's ICPs would be masked by a stale user-level snapshot. The
-    // marketStrategy store stays the source of truth; we just re-run the LLM
-    // on each click there (rare, explicit, ~3s).
+    // Persist the extracted filters as a cache. Which store gets the write
+    // mirrors where `persona` actually came from:
+    //   - icpResult (fromMarketStrategy === false): write onto the user's
+    //     own icpResult, as before.
+    //   - marketStrategy.icp, solo user: write onto the user's own
+    //     marketStrategy so the next click for this user is instant.
+    //   - marketStrategy.icp, org member reading the ORG's own
+    //     marketStrategy: write onto the ORG record so every member
+    //     benefits, not just the one who clicked.
+    //   - marketStrategy.icp via the org-owner-fallback (org has no
+    //     marketStrategy of its own, so we're reading the OWNER's personal
+    //     record instead): never write. The write target would be a
+    //     different user's record than the caller's, driven solely by the
+    //     caller's click — not a call this route should make on someone
+    //     else's behalf. This narrow case just keeps re-running the LLM on
+    //     every click, as it did before this caching existed.
+    // All paths re-read before persisting and re-check the content hash, so
+    // a concurrent edit during the ~3s LLM window is never clobbered. The
+    // marketStrategy paths additionally preserve `marketStrategy.updatedAt`
+    // untouched (via spread — never set explicitly): a cache write must
+    // never look like a fresh user edit, which is exactly the failure mode
+    // mirrorIcpsToMarketStrategy's backdating above fixes for the mirror
+    // write (ENG-1955).
+    const extractedFilters = {
+      cacheKey: currentKey,
+      cacheVersion: ICP_FILTER_CACHE_VERSION,
+      variants,
+      generatedAt: new Date().toISOString(),
+    };
+
     if (!fromMarketStrategy) {
       // Re-read user before persisting so we don't clobber concurrent edits
       // made during the ~3s LLM window (e.g., onboarding regenerating
@@ -2366,19 +2430,92 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
 
       if (cacheStillApplies) {
         const nextIcpResult = freshPersonas.map((p: any, i: number) =>
-          i === icpIndex
-            ? {
-                ...p,
-                extractedFilters: {
-                  cacheKey: currentKey,
-                  cacheVersion: ICP_FILTER_CACHE_VERSION,
-                  variants,
-                  generatedAt: new Date().toISOString(),
-                },
-              }
-            : p,
+          i === icpIndex ? { ...p, extractedFilters } : p,
         );
         await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      }
+    } else if (!marketStrategyFromOwnerFallback) {
+      const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
+
+      // mapMarketIcpToResult filters out non-object entries BEFORE mapping,
+      // so `icpIndex` (an index into that filtered+mapped array, same as
+      // the read path above) does NOT necessarily equal the matching
+      // entry's index in the raw `icp` array whenever a malformed entry
+      // (e.g. `null`) precedes it — POST /market-strategy stores `icp`
+      // verbatim with no shape validation. Match by object identity against
+      // the same filter instead of by raw index, so the write always lands
+      // on the entry the cache was actually computed for.
+      const rawIcpEntryFor = (freshIcp: any[]) => {
+        const filtered = freshIcp.filter((p: any) => p && typeof p === 'object');
+        return filtered[icpIndex];
+      };
+
+      // The hash check above only guards the ONE persona's content — it says
+      // nothing about competitors, businessOverview, or any OTHER icp entry.
+      // Those can still change between this fresh re-read and the write
+      // below (another org member's edit, the Market Strategy route, Emma),
+      // and a blind `{ ...freshSnapshot, icp: nextIcp }` replace would
+      // silently clobber that concurrent change with the now-stale snapshot.
+      // Condition the write on marketStrategy.updatedAt still matching what
+      // we just read: if anything else wrote in between, updatedAt moved and
+      // the condition fails, so we skip this cache write rather than lose
+      // someone else's edit. Self-healing — the next click regenerates and
+      // retries against whatever is current.
+      const conditionOnUnchangedSnapshot = (snapshotUpdatedAt: string | undefined) =>
+        snapshotUpdatedAt === undefined
+          ? undefined
+          : {
+              condition: {
+                expression: '#marketStrategy.#msUpdatedAt = :expectedMsUpdatedAt',
+                names: { '#marketStrategy': 'marketStrategy', '#msUpdatedAt': 'updatedAt' },
+                values: { ':expectedMsUpdatedAt': snapshotUpdatedAt },
+              },
+            };
+
+      if (user.orgId) {
+        const freshOrg: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
+        const freshIcp: any[] = Array.isArray(freshOrg?.marketStrategy?.icp) ? freshOrg.marketStrategy.icp : [];
+        const freshMapped = mapMarketIcpToResult(freshIcp);
+        const cacheStillApplies =
+          freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
+
+        if (cacheStillApplies) {
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
+          );
+          try {
+            await orgDb.updateOrg(
+              user.orgId,
+              { marketStrategy: { ...freshOrg.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshOrg?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
+        }
+      } else {
+        const freshUser: any = await userDb.getUserById(userId);
+        const freshIcp: any[] = Array.isArray(freshUser?.marketStrategy?.icp) ? freshUser.marketStrategy.icp : [];
+        const freshMapped = mapMarketIcpToResult(freshIcp);
+        const cacheStillApplies =
+          freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
+
+        if (cacheStillApplies) {
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
+          );
+          try {
+            await userDb.updateUser(
+              userId,
+              { marketStrategy: { ...freshUser.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshUser?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
+        }
       }
     }
 

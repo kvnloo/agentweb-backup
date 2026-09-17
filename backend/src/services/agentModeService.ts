@@ -1,4 +1,6 @@
+import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
 import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
@@ -54,6 +56,17 @@ import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
 } from './agentMode/openRouterMetadata';
+import {
+  assertOpenRouterToolsSupported,
+  openRouterIgnoredProviders,
+  selectOpenRouterSamplingParams,
+} from './agentMode/openRouterRequestParams';
+import {
+  createLlmModelRegistry,
+  type LLMModelConfig,
+  type ModelProvider,
+  type ModelTier,
+} from './agentMode/llmModelRegistry';
 import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
@@ -129,6 +142,7 @@ import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
+import { meterWithResolvedBilling } from './agentMode/deferredBillingMetering';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -448,12 +462,13 @@ import {
   computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
+import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -970,98 +985,7 @@ function pdfPageRender(pageData: any): Promise<string> {
     });
 }
 
-// Type for LLM model configuration
-interface LLMModelConfig extends GatewayReasoningConfig {
-  client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
-  supportsTemperature: boolean;
-  /**
-   * False when the model's OpenRouter entry omits `tool_choice` from
-   * `supported_parameters`. Optional and defaulting to TRUE: every other model in
-   * this registry accepts it, so only the exceptions carry the flag.
-   *
-   * This is the same class of defect as `supportsTemperature`, one parameter
-   * over, and it fails LOUDER: an unsupported `tool_choice` makes OpenRouter's
-   * provider router find no endpoint at all and return
-   * `404 No endpoints found that can handle the requested parameters`, so every
-   * agent-mode turn on that model 500s. Mirror the model page rather than
-   * assuming parity with a sibling — Claude Fable 5.1 omits `tool_choice` while
-   * Claude Fable 5 and both `:batch` variants support it.
-   */
-  supportsToolChoice?: boolean;
-  /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
-  isLive?: boolean;
-  /**
-   * True if the model can be used as the describe_image vision model — i.e. it is
-   * multimodal AND reachable/provisioned in this deployment. Verified empirically
-   * (see getVisionModelOptions). Models that are text/voice-only, return 404 from
-   * their provider, or aren't provisioned on the account are intentionally omitted.
-   */
-  supportsVision?: boolean;
-  /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
-  maxTools?: number;
-  /** True to restrict model to admin users only */
-  adminOnly?: boolean;
-  /** Internal workload model: callable by services but never selectable in the customer picker. */
-  internalOnly?: boolean;
-  /**
-   * Usage/cost tier for the model picker UI. Only used as a fallback when
-   * getModelPrice() has no entry for this model — otherwise the picker's
-   * tier grouping is derived live from the computed cost score (see
-   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
-   */
-  tier?: ModelTier;
-  /** Short, user-facing one-line description shown next to the model name in the picker. */
-  description?: string;
-  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
-  name?: string;
-  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
-  provider?: ModelProvider;
-  /**
-   * True for a superseded version of a model family still kept selectable for
-   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
-   * this flag only affects picker visibility grouping, never generation). The picker
-   * UI tucks these behind a "Show more" row instead of hiding them from new selection
-   * entirely (that's what adminOnly is for).
-   *
-   * Hand-set here for models superseded for reasons other than pure
-   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
-   * ALSO computes legacy live for any model that a same-`family` model
-   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
-   * computation combine with OR, never override each other.
-   */
-  legacy?: boolean;
-  /**
-   * Groups models that are genuinely the same product line across
-   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
-   * Claude Opus release) for automatic same-family dominance detection.
-   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
-   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
-   * product tiers serving different jobs, not generations of the same
-   * model, so they must never share a family or a stronger sibling tier
-   * would wrongly hide a still-useful different-tier model. Omitted
-   * (no family) means this model is never auto-dominated.
-   */
-  family?: string;
-  /**
-   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
-   * entirely when there is insufficient benchmark evidence for this model —
-   * never estimated or invented. Does NOT get lowered merely because a
-   * model is `legacy`; legacy affects picker visibility grouping only, not
-   * how good the model actually is.
-   */
-  qualityScore?: number;
-  /** Methodology/source note for qualityScore — benchmark name, source
-   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
-   *  Index v4.2, snapshot 2026-09-05, max"). Surfaced in the picker's quality tooltip. */
-  qualityScoreSource?: string;
-  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
-  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
-  // so it is computed live rather than duplicated as a second hand-typed
-  // number that can drift from what we actually bill.
-}
-
-/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
-export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
 /**
  * Cost-score band boundaries backing the picker's tier buckets (Harsha's
@@ -1174,10 +1098,6 @@ export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<
   return dominated;
 }
 
-/** Underlying lab a model is from, for picking the right provider icon in the picker. */
-export type ModelProvider =
-  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
-
 /** Metadata for a model as returned to the frontend picker. */
 export interface SupportedModelInfo {
   id: string;
@@ -1202,6 +1122,7 @@ export interface SupportedModelInfo {
   costScore?: number;
   costScoreSource?: string;
 }
+
 
 // Type for LLM call options
 /**
@@ -1600,60 +1521,181 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
-  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
-  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
-  // no known code path that mutates the registry in between (see the brain node).
-  // The one remaining live hypothesis is that more than one AgentModeService instance
-  // is answering requests inside the same forked worker process (e.g. the per-message
-  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
-  // worker after all). Stamping each instance at construction settles it directly: if
-  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
-  // reads on the same pid, that's a second instance, proven, not inferred.
-  private readonly instanceId = Math.random().toString(36).slice(2, 10);
-
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
-    // instanceId alone proved a second, empty-registry instance answers requests
-    // inside the same worker process, but every known construction site (module
-    // singleton, the worker's own instance, chatbotService.ts's per-message
-    // throwaway) traces to a call graph that shouldn't reach the worker a second
-    // time. Capturing the actual construction stack settles which site it really
-    // is instead of continuing to reason about it from the outside.
-    // Stack goes inside the same JSON blob (not a second console.log argument) so a
-    // log shipper that splits on newline can't separate it from its pid/instanceId —
-    // a raw multi-line stack string passed alongside would risk exactly that.
-    console.log('[ENG-1852-CTOR]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      stack: new Error('construction site').stack,
-    }));
   }
 
-  public async initialize() {
+  // ENG-1852 follow-up: the EXPENSIVE half of initialize() runs once per
+  // instance; the cheap half still runs on every call.
+  //
+  // Why a guard at all: server.ts kicks boot init off deliberately NON-blocking
+  // ("Initialize Agent Mode tools in background - don't block server startup ...
+  // prevents health check timeouts during deployment"), so a request can land
+  // mid-init. chatbotService's widget path then calls initialize() again per
+  // message on the same shared module singleton. Unguarded, that re-runs a full
+  // registerTools()/initializeMcp()/ensureBuiltInSkills() pass over shared state
+  // on every message, or races boot init and reads a half-populated registry —
+  // the same empty-registry symptom ENG-1852 turned out to be.
+  //
+  // Why loadFoundationTools() stays OUTSIDE the latch: it writes the
+  // process-global static AgentModeService.FOUNDATION_TOOLS, which the admin
+  // route `PUT /foundation-tools` (routes/agentMode.ts) mutates only in the
+  // process that served the request. Before this change, every gate-open widget
+  // message re-read the `foundation_tools` row and refreshed that static. Latching
+  // it would mean an added foundation tool never reaches a process until restart,
+  // surfacing as "tool not available" — the ENG-280/ENG-404 class this very
+  // function's own comment warns about. It is one settings read that swallows its
+  // own errors and always leaves the set populated, so per-call is cheap and safe;
+  // the registration pass is what actually cost anything.
+  //
+  // Why the latch is NOT just "didn't throw": every step of runInitialize()
+  // swallows its own errors (loadFoundationTools, both halves of registerTools,
+  // initializeMcp, ensureBuiltInSkills all catch-and-log; downstream singletons
+  // are void-ed), so runInitialize() is effectively incapable of rejecting.
+  // Latching on mere completion would make a silently-degraded init — e.g. a
+  // transient throw inside registerTools leaving an empty registry — PERMANENT
+  // for the process lifetime, with no reset. That is strictly worse than the bug
+  // this branch fixes: before it, the per-message fresh instance re-ran
+  // registration and self-healed on the next message. So we latch only on signals
+  // that can observably be false, and leave `initialized` false otherwise so the
+  // next caller retries.
+  //
+  // The flag is per-INSTANCE, not module-level, so tests that construct their own
+  // AgentModeService in beforeEach still initialize normally.
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+  // Set true only when registerTools()'s emmaToolRegistry copy actually completes.
+  //
+  // A registry-size check alone is NOT a success signal, and an earlier version of this
+  // latch that used one was a tautology. registerTools() registers four built-ins
+  // (search_tool_response, read_tool_response, notify_session, wait_seconds)
+  // UNCONDITIONALLY, after both of its try/catch blocks, and ToolRegistry.register is a
+  // Map.set that cannot throw — so getAllTools().length > 0 is always true no matter how
+  // badly registration went. initializeMcp() then adds more afterwards. Confirmed twice:
+  // by fault injection on test-env-1 (the size check latched a fully degraded init, with
+  // "Error registering tools to instance" logged one line earlier) and by an independent
+  // review that ran registerTools() with an empty emmaToolRegistry and observed
+  // initialized=true with a 4-tool registry.
+  //
+  // Both halves of registerTools() have to be checked, because they fail independently:
+  // step 1 (sixteen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
+  // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
+  // without error — so the flag below alone would latch a degraded init too.
+  private emmaToolsRegistered = false;
+  // Not a latch signal — only prevents the retry path from re-scanning every skill and
+  // re-updating each built-in on every failed attempt.
+  private builtInSkillsSeeded = false;
+  // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
+  // that could never report failure:
+  //
+  //   initializeMcp() — McpClientService.initialize() cannot reject in practice. Its two
+  //   statements before the try (startSessionCleanup, a setInterval+unref; and
+  //   sweepStalePlaywrightConfigs, which has its own outer try/catch) cannot throw, the
+  //   rest of the body is inside try/catch, per-server failures are swallowed deeper
+  //   still in safeConnectToServer, and the config read has its own catch. A flag
+  //   set on its success path is therefore constant true. A tool-count check would be
+  //   wrong too: this deployment's only non-internal MCP server carries secret
+  //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
+  //   There is no signal here to gate on, and shipping one that always reads true is
+  //   worse than none — it reads as coverage.
+  //
+  //   CAVEAT, because this is an operational fact rather than a code invariant: that
+  //   zero-tools property holds for mcp_config.ts AND for the current `mcp_servers`
+  //   settings row, which mcpClientService also reads at every boot. If an operator adds
+  //   a placeholder-free server there, a healthy boot registers a non-zero count and a
+  //   transient outage registers zero — and with no MCP signal in the latch, that outage
+  //   latches for the process lifetime rather than retrying on the next message. If that
+  //   day comes, the fix is a real signal (e.g. a getFailedServers() next to
+  //   serversWithSecretPlaceholders: "every server we actually attempted connected"),
+  //   NOT a tool count.
+  //
+  //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
+  //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
+  //   row failing welcome-message validation) silently reverted this whole optimization
+  //   to per-message registration PLUS a full skills-table scan per chat message,
+  //   surfaced only by one console.error per message.
+  //
+  // The latch gates on what ENG-1852 was actually about: whether this instance's tool
+  // registry is usable.
+  // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
+  // its five inits replace live singletons unconditionally. The latch's retry path
+  // would otherwise swap them under in-flight tool calls on every failed attempt.
+  private downstreamSingletonsStarted = false;
+
+  /**
+   * Whether the last initialize() completed with every step reporting success. False
+   * means a degraded init that the next caller will retry — see initialize().
+   */
+  public get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  public async initialize(): Promise<void> {
+    // Deliberately before and outside the latch — see the note above.
     await this.loadFoundationTools();
+
+    if (this.initialized) return;
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = this.runInitialize();
+    try {
+      await this.initializationPromise;
+      // Two conjuncts, both of which can observably be false. A third,
+      // `this.toolRegistry.getAllTools().length > 0`, was here and is deliberately gone:
+      // registerTools() registers four built-ins unconditionally after both of its
+      // try/catch blocks and ToolRegistry.register is a Map.set that cannot throw, so it
+      // could never report failure. That is the same defect this file deleted mcpStepOk
+      // for, and an inert conjunct in an && chain is worse than no conjunct — it reads as
+      // coverage. It also carried a FALSE coverage claim: mutating it to `true` fails no
+      // test, because no test can distinguish it.
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered;
+      if (!this.initialized) {
+        console.error(
+          'AgentMode: initialize() completed but tool registration did not succeed ' +
+          `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
+          `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
+          'treating init as failed so the next caller retries.',
+        );
+      }
+    } finally {
+      this.initializationPromise = null;
+    }
+  }
+
+  private async runInitialize(): Promise<void> {
     await this.registerTools();
+
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
-    // Ensure built-in skills exist in the database
-    await this.ensureBuiltInSkills();
+    // Skipped once it has succeeded: it re-scans every skill and issues an update per
+    // built-in, which the retry path would otherwise repeat on every failed attempt.
+    // Its outcome does NOT gate the latch — see the note on the fields above.
+    if (!this.builtInSkillsSeeded) {
+      await this.ensureBuiltInSkills();
+    }
 
     // Bootstrap downstream service singletons. Server boot also calls these
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
     // (generateMarketingResponseWorker) doesn't run that path — so any tool
     // that resolves a singleton via getEnrichSoService / getUnipile*Service
-    // would throw "service not initialized" inside the worker. Each init is
-    // idempotent and wrapped in try/catch so a single failure (e.g. missing
-    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // would throw "service not initialized" inside the worker. Each is wrapped in
+    // try/catch so a single failure (e.g. a missing enrich.so secret in dev) doesn't
+    // block the rest — but they are NOT all idempotent: initEnrichSoService,
+    // initApolloService and initUnipileSearchParamService each replace their singleton
+    // unconditionally, which is why the guard below runs this once. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
-    void this.initializeDownstreamSingletons();
+    if (!this.downstreamSingletonsStarted) {
+      this.downstreamSingletonsStarted = true;
+      void this.initializeDownstreamSingletons();
+    }
 
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
@@ -1733,6 +1775,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
+    this.builtInSkillsSeeded = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1765,6 +1808,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
+      this.builtInSkillsSeeded = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1805,6 +1849,13 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
+    // Idempotent. On origin/main a fresh instance per widget message meant each call
+    // started an interval on an object that then leaked — the bug this branch fixes. On
+    // the shared singleton a repeat call is no longer hypothetical: the latch's retry
+    // path runs the whole initialization body again whenever init was degraded, and
+    // unguarded each pass would assign a new interval and orphan the previous one, every
+    // orphan retaining this instance through its closure.
+    if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
     }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
@@ -1934,6 +1985,7 @@ export class AgentModeService {
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
+    this.emmaToolsRegistered = false;
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
@@ -1961,6 +2013,24 @@ export class AgentModeService {
             requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
+      }
+      // "Didn't throw" is not success. Every statement in this try is non-throwing
+      // (Array.from, Map.get, Map.set), so an empty or unresolvable emmaToolRegistry
+      // copies ZERO tools and completes cleanly — which an earlier version of this
+      // latch accepted, leaving an instance live with only the four built-ins
+      // registered below. That is the ENG-1852 symptom exactly. Require the copy to
+      // be complete and non-empty.
+      // `copied === toolNames.length` was here and is deliberately gone: against the real
+      // McpToolRegistry (a synchronous Map — getToolNames() is Array.from(keys),
+      // getTool() is Map.get) it can never be false, and a condition that cannot fail is
+      // the exact thing three prior rounds shipped by accident. `toolNames.length > 0` is
+      // the term that does real work: it catches an emmaToolRegistry that was never
+      // populated, which is the ENG-1852 state.
+      this.emmaToolsRegistered = toolNames.length > 0;
+      if (!this.emmaToolsRegistered) {
+        console.error(
+          'AgentMode: emmaToolRegistry was empty — no Emma tools copied into this instance.',
+        );
       }
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
@@ -2524,253 +2594,7 @@ export class AgentModeService {
     }
   }
 
-  private llmModels: Record<string, LLMModelConfig> = {
-    // ENG-1786: all quality scores use AA Intelligence Index v4.2, snapshot
-    // 2026-09-05 (32-row research table in Linear). Sources name the canonical
-    // AA page variant; benchmark effort need not match the provider runtime default.
-    // Logical model metadata only. `callLLM` resolves every text/tool request
-    // through OpenRouter; no provider client is constructed from this registry.
-    // supportsVision flags below were verified empirically against the describe_image
-    // path (probe against a real image). All GPT-5 deployments handle vision.
-    // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
-    // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
-    // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
-    // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
-    // no working deployment possible on any resource). Both were already
-    // legacy:true and the two lowest-quality entries in the gpt5-chat family.
-    // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
-    // to gpt-5.5 (see below) — a paused schedule/session still holding the old
-    // id resolves forward instead of throwing "Invalid model". Do not delete a
-    // registry entry without an alias first; that was exactly the caution the
-    // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4, xhigh' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.4 Nano, xhigh (AA estimate)' },
-    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.5, xhigh' },
-    // List gemini models - client will be lazy-loaded
-    // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
-    // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
-    // so picking it was a guaranteed failure. llmPricing.ts already carried the
-    // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
-    // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
-    // Its price entry is intentionally left in place — a rate for a removed model is
-    // harmless, a missing rate for a live one is not.
-    // 2026-08-19: Harsha — "the preview gemini models should be moved to
-    // legacy asap." Static legacy: true (not dominance-derived — "preview"
-    // status isn't something a cost/quality comparison would ever catch on
-    // its own; this is a policy call that preview builds shouldn't be a
-    // default-visible pick regardless of how they benchmark).
-    // resolveGenerationModel/resolveFallbackModel are untouched — an
-    // existing session or schedule pinned to either id is unaffected.
-    // Google accepts at most 128 function declarations per request. This limit
-    // applies whether Gemini is reached directly or through OpenRouter: the
-    // gateway can fail over transports, but it cannot make an invalid upstream
-    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
-    // catalog, so omitting this cap made Gemini fail deterministically with 400.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 21, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3 Flash Preview, Non-reasoning (AA estimate)' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Pro Preview, reasoning' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.1 Flash Lite, reasoning' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.5 Flash, high' },
-    // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
-    // live against three independent sources (ai.google.dev/deepmind.google/
-    // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
-    // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
-    // of it — 3.6 is deliberately skipped (never added to this registry) since
-    // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
-    // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
-    // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
-    // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
-    // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
-    // Flash is now correctly auto-flagged legacy.
-    // ENG-1713: gemini-3.6-flash (band predecessor, not itself in this registry),
-    // 3.7, and 3.8 all deprecate temperature/top_p/top_k per Google's migration
-    // guide (ai.google.dev/gemini-api/docs/latest-model — "Remove deprecated
-    // sampling parameters" — confirmed live 2026-09-03 for both ids). Google
-    // currently ignores the param on these models (soft no-op) but states a
-    // future generation will hard-400 on it, so this is set ahead of that.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.7 Flash, high' },
-    'gemini-3.8-flash': { name: 'Gemini 3.8 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Gemini 3.8 Flash, high' },
-    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
-    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
-    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
-    // the suffix after the prefix passed straight through as OpenRouter's own model
-    // string, so a new upstream model is one registry line, not new routing code.
-    //
-    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
-    // (2026-08-17), not guessed:
-    // - supportsTemperature: mirrors each model's `supported_parameters` value.
-    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
-    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
-    //   endpoints APIs expose no numeric tool-call limit for any model (checked
-    //   both), so setting a number here would be a guess, not evidence. (The
-    //   128 previously on this line was exactly that guess, copied from the Azure
-    //   convention without verification — removed.)
-    // - supportsVision: deliberately OMITTED even where `architecture.modality`
-    //   reports image/video input — this codebase's own convention for the flag
-    //   (see LLMModelConfig.supportsVision above) requires empirical verification
-    //   against the real describe_image path, which none of these have had yet.
-    //   Metadata-only vision support is not the bar this flag uses elsewhere.
-    // - adminOnly: OMITTED for every OpenRouter entry below (2026-08-19: was
-    //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
-    //   include open source / open router stuff for all users not just
-    //   isadmin". Client construction is the same lazy-loaded OpenRouter path
-    //   already used successfully by gpt-4o-mini above.) This does NOT apply
-    //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
-    //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 1, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-4o Mini, non-reasoning (AA estimate)' },
-    // Workload-specific research agent. It is intentionally callable only from
-    // DeepResearchService, not exposed as a general chat-picker model.
-    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
-    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
-    // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
-    // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
-    // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
-    // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
-    // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
-    // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
-    // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
-    // score; Meta shipped Llama 5 in April 2026, making this a full generation
-    // behind), llama-3.1-8b-instruct (older sibling of the same superseded
-    // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
-    // not a coding model — and its pricing tiers up sharply past 32K-token
-    // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
-    // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
-    // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
-    // lab/family redundancy, not because it's the top pick in its tier.
-    // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
-    // reused from the third pass).
-    //
-    // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
-    // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
-    // live) — this is a real, currently-unfillable gap, not an oversight.
-    // ENG-199/ENG-1685: Claude Fable 5.1 (Anthropic, released 2026-09-01) —
-    // routed through OpenRouter, same convention as every other OpenRouter
-    // entry in this block (id = openrouter/<upstream-provider>/<upstream-model>,
-    // one registry line, no new routing code). This is ENG-199's actual wire-in:
-    // llmPricing.ts had a Fable 5 pricing stub staged since ENG-200 for exactly
-    // this moment, but Fable 5 itself was NEVER added to this llmModels
-    // registry — so there is no existing Fable entry to compare against yet.
-    // Going straight to 5.1 (the current model; Fable 5 is already superseded
-    // as of 2026-09-01) rather than also backfilling the now-superseded 5.
-    // AA Intelligence Index v4.2 (2026-09-05): 57, Adaptive Reasoning,
-    // Max Effort — #1, 3pts above Claude Opus 5 (54). Quality and cost plug into the
-    // EXISTING dominance rule (getSupportedModelsWithMetadata) automatically —
-    // no dominance action needed today since there's no sibling family member,
-    // but the very next same-family add (e.g. a future Fable 5.2) will
-    // auto-flag whichever one loses on both cost and quality, same as every
-    // other family in this registry.
-    // supportsVision/supportsTemperature per OpenRouter's live model page
-    // (architecture.modality includes image+file input; reasoning-capable).
-    // ENG-199's cost-control blocker (ENG-200) is closed — org/per-user LLM
-    // cost caps already exist and apply automatically to every model priced
-    // in llmPricing.ts, this one included.
-    'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsToolChoice: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
-    // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
-    // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
-    // this benchmark snapshot does not change the OpenRouter id or pricing.
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Flash 0731, Reasoning, Max Effort' },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 Max, reasoning' },
-    // 2026-08-26 (ENG-1604): added after live cost+quality research — AA
-    // Intelligence Index 52 (v4.1.1, measured, not estimated), #1 of 138
-    // models in its size class, roughly matching DeepSeek V4 Pro's quality
-    // (53) at about half the input price. Skipped sibling candidates:
-    // qwen3-coder-next (AA 21, coding-only, deferred by Harsha this pass),
-    // qwen3-max/qwen3-max-thinking/qwen3-vl-235b (AA "estimated", not
-    // measured, or AA-flagged deprecated).
-    'openrouter/qwen/qwen3.8-27b': { name: 'Qwen3.8 27B', provider: 'qwen', tier: 'medium', description: 'Alibaba\'s efficient open-weight model, leading in its size class', client: null, supportsTemperature: true, qualityScore: 41, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Qwen3.8 27B, xhigh' },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 13, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Mistral Small 4, reasoning' },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 50, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K3, max' },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 34, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Kimi K2.7 Code, reasoning' },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 5.2, max' },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GLM 4.7 Flash, reasoning' },
-    // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
-    // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
-    // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
-    // existing convention for unverified-in-our-stack OpenRouter entries.
-    // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
-    // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
-    // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
-    // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
-    // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
-    // 2026-08-19: NOT in the 'gpt5-chat' family (unlike Terra/5.5/5.4/etc) —
-    // its own description marks it as a distinct specialized/premium
-    // positioning ("Frontier coding and agentic work"), not a generation of
-    // the "Balanced general-purpose model" line the rest of that family
-    // shares verbatim in their description text. Lumping it in wrongly
-    // flagged GPT-5.6 Terra as legacy: Sol's OpenRouter price is currently
-    // on a promotional discount that happens to land it in the same cost
-    // band as Terra, so same-family dominance concluded Terra was
-    // redundant — a coincidence of a volatile promo price, not a real
-    // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
-    // a family with Kimi K2.7-Code (a coding-specialized sibling).
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Sol, max' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 47, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Terra, max' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-5.6 Luna, max' },
-    // ENG-1769 (2026-09-05): GPT-6 Astra — OpenAI's frontier release of
-    // 2026-09-03, added the day Harsha asked ("is it possible to launch astra
-    // on agentweb now? ... go ahead"). Same one-line OpenRouter convention as
-    // the GPT-5.6 trio above and Fable 5.1 (ENG-199): id =
-    // openrouter/<upstream-provider>/<upstream-model>, no new routing code.
-    // Transport: OpenRouter BYOK → our own Azure resource
-    // (agentweb-openrouter-byok, westus3, deployment `gpt-6-astra` version
-    // 2026-09-03, GlobalStandard, created 2026-09-05). Live-confirmed the same
-    // day: response provider "Azure", usage.is_byok true, and an exact
-    // upstream inference cost. AgentMode meters that upstream value for BYOK
-    // calls so OpenRouter's long-context pricing overrides remain accurate.
-    // Quality: AA Intelligence Index v4.2 (2026-09-05), max effort: Astra 55,
-    // below Fable 5.1 (57), above Sol (51). Canonical benchmark variants only.
-    // Deliberately NO `family`: Astra and Sol are distinct product lines;
-    // sharing a family could auto-retire one after a price move, like the
-    // Terra false-positive documented above. Same treatment as Sol and Kimi K3.
-    // supportsVision: verified EMPIRICALLY 2026-09-05 against the exact shape
-    // describeImage sends (a `data:image/png;base64,…` image_url, ~8 KB PNG)
-    // through this OpenRouter→Azure BYOK path: correct answer, and the same
-    // image via an https URL also correct — the bar LLMModelConfig.supportsVision
-    // sets, not just OpenRouter's architecture metadata (which also lists
-    // file+image+text). Curiosity recorded, not a blocker: a 64x64 two-color
-    // synthetic PNG was misread by Astra ("can't see the image" / wrong
-    // colors) while GPT-5.5 and Sol read it correctly on the same path — real
-    // images are what describe_image sends. supportsTemperature false: a
-    // reasoning model — `temperature` is not in its supported_parameters
-    // (Azure's reasoning-models doc says the same).
-    // maxTools 128: the upstream is Azure OpenAI (live-confirmed above), and
-    // Azure's 128-tool cap is a recorded production failure in this repo, not a
-    // doc claim — ce154d09c / dev.md 2026-04-26: gpt-5.4 returned HTTP 400
-    // "Invalid 'tools': array too long. Expected an array with maximum length
-    // 128, but got an array with length 143" once skills pushed the registry
-    // past 128, which is what introduced maxTools + callLLM's truncation. The
-    // OpenRouter block header omits maxTools because OpenRouter's APIs expose
-    // no limit for ARBITRARY upstreams; that rationale does not apply when the
-    // upstream is known to be Azure. (The GPT-5.6 trio above omit it and have
-    // run since 2026-08-19 — the same gap, not evidence of a higher cap.)
-    // `tier` is the no-price fallback only; the picker derives ultra_premium
-    // live from MODEL_PRICING.
-    // ENG-1788: OpenRouter reasoning.supported_efforts, verified in the issue 2026-09-05.
-    'openrouter/openai/gpt-6-astra': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'GPT-6 Astra', provider: 'openai', tier: 'ultra_premium', description: 'OpenAI\'s frontier model for coding and agentic work', client: null, supportsTemperature: false, supportsVision: true, maxTools: 128, qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, GPT-6 Astra, max' },
-    // List Claude models via AWS Bedrock - client will be lazy-loaded
-    // 2026-08-19: all four below are `legacy` (picker-grouping only, see
-    // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
-    // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
-    // have active schedules touching them the same day this was written), so
-    // NOT deleted and NOT adminOnly — customers can still select them via
-    // "Show more", they're just no longer the default row per tier.
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.5, Non-reasoning' },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 38, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 4.6, Adaptive Reasoning, Max Effort' },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 31, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.6, Non-reasoning, High Effort' },
-    // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
-    // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 4.8, Adaptive Reasoning, Max Effort (AA estimate)' },
-    // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
-    // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
-    // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
-    // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
-    // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 54, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Opus 5, Adaptive Reasoning, Max Effort' },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Sonnet 5, Adaptive Reasoning, Max Effort' },
-    // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 17, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Haiku 4.5, Non-reasoning' },
-  };
+  private llmModels: Record<string, LLMModelConfig> = createLlmModelRegistry();
 
   async getSupportedModels(isAdmin: boolean = false) {
     const models = Object.keys(this.llmModels).filter(
@@ -3019,7 +2843,8 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
-    if (upstreamModel.startsWith('google/gemini-')) {
+    const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
+    if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
       // a legacy Standard API key hitting Google's Sept 2026 Standard-key
       // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
@@ -3039,7 +2864,7 @@ export class AgentModeService {
       // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
       // proposed the slug form once already and was reverted for this reason
       // — verify empirically against live traffic before changing this line.
-      params.provider.ignore = ['Google'];
+      params.provider.ignore = ignoredProviders;
     }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
@@ -3103,35 +2928,35 @@ export class AgentModeService {
     const requestTools = webSearch
       ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
       : normalizedCallerTools;
+    // ENG-1831: every chain member receives the same parameter set, and
+    // require_parameters makes one unsupported field unroutable (ENG-199 404).
+    const paramChain = [
+      { modelId: model, upstreamModel, capabilities: this.llmModels[model] },
+      ...(fallbackModels ?? []).map((fallbackModel) => {
+        const normalizedFallback = this.normalizeModelId(fallbackModel);
+        return {
+          modelId: normalizedFallback,
+          upstreamModel: resolveOpenRouterUpstreamModelId(normalizedFallback),
+          capabilities: this.llmModels[normalizedFallback],
+        };
+      }),
+    ];
+    assertOpenRouterToolsSupported(paramChain, requestTools.length);
     if (requestTools.length > 0) {
       params.tools = requestTools;
     }
-    // A server-only tool is selected by OpenRouter. Preserve the historical
-    // `auto` default only for caller-supplied function tools.
-    //
-    // ENG-199: gated on `supportsToolChoice` because a model whose OpenRouter
-    // entry omits `tool_choice` cannot be routed AT ALL when we send it — the
-    // gateway answers `404 No endpoints found that can handle the requested
-    // parameters` rather than ignoring the field. Agent mode always supplies
-    // caller tools, so for such a model every turn failed. Defaults to true, so
-    // this changes nothing for the rest of the registry.
-    if (callerTools.length > 0 && this.llmModels[model].supportsToolChoice !== false) {
-      params.tool_choice = tool_choice || 'auto';
-    }
+    Object.assign(params, selectOpenRouterSamplingParams({
+      upstreamModel,
+      capabilities: this.llmModels[model],
+      fallbacks: paramChain.slice(1),
+      hasCallerTools: callerTools.length > 0,
+      toolChoice: tool_choice,
+      temperature,
+    }));
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
       params.max_tokens = max_completion_tokens;
-    }
-
-    // OpenRouter's metadata marks GPT-5.x temperature unsupported.
-    const gatewaySupportsTemperature = !upstreamModel.startsWith('openai/gpt-5.');
-    if (
-      this.llmModels[model].supportsTemperature &&
-      gatewaySupportsTemperature &&
-      temperature !== null
-    ) {
-      params.temperature = temperature;
     }
 
     const reasoningEffort = resolveGatewayReasoningEffort(
@@ -3212,7 +3037,7 @@ export class AgentModeService {
           const usage: any = (res as any)?.usage;
           if (usage) {
             const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            meterUserUsage({
+            meterWithResolvedBilling({
               userId: usageContext?.userId,
               billingUserId: usageContext?.billingUserId,
               sessionId: usageContext?.sessionId,
@@ -4844,7 +4669,13 @@ export class AgentModeService {
               .filter((m: any) => typeof m.content === 'string')
               .slice(-6);
             try {
-              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              // ENG-1858: reuse the loop's resolved billing subject.
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs, {
+                userId,
+                billingUserId,
+                sessionId,
+                feature: meteringFeature('suggested_replies', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+              });
               if (suggestions && suggestions.length > 0) {
                 // Stamp into the last assistant responseMessage's metadata so it persists
                 // in DynamoDB and survives page refresh. The message index in the persisted
@@ -5144,10 +4975,21 @@ export class AgentModeService {
             finalText: content,
             ledger: finalizeLedger,
             ports: {
+              // ENG-1858: attributed to this run's user/billing subject.
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses),
+                this.judgeFinalizeClaims(text, candidateClasses, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               requestCorrection: ({ finalText, systemNote }) =>
-                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_correction', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               toolResultError,
               mediaGenProducedAsset,
               recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
@@ -6224,6 +6066,16 @@ export class AgentModeService {
     // available" and Emma had to ask them to type out what was on screen (ENG-260).
     'describe_image',
 
+    // PDF export — converts a previously generated HTML file to a PDF. Same
+    // ENG-152/ENG-260 class of bug: this is a basic, universally-useful utility
+    // (there is even a plain HTTP export-pdf endpoint alongside it), not a
+    // gated capability, but it was left in the __other_skills__ catch-all pool.
+    // That pool's membership depends on which OTHER skills happen to be
+    // installed for a given subscription tier, so a fully-entitled account
+    // could still have install_skills(["__other_skills__"]) refused with
+    // "these skills are currently unavailable to install" (ENG-1867).
+    'convert_to_pdf',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -6360,6 +6212,12 @@ export class AgentModeService {
     // happened to be on the `images` page — Emma returned "describe_image not
     // available" and had to ask the user to type out what was on screen (ENG-260).
     'describe_image',
+    // PDF export. Force-merged for the same reason as read_file_content/
+    // describe_image: the prod `foundation_tools` AW-Settings override omits
+    // DEFAULT-only additions, so without this convert_to_pdf falls back to
+    // the __other_skills__ catch-all pool and can be refused as "currently
+    // unavailable to install" even on a fully-entitled account (ENG-1867).
+    'convert_to_pdf',
     // Meeting Intelligence (Fathom). Force-merged because the prod
     // `foundation_tools` AW-Settings override predates these tools and omits
     // them — without force-merging, loadFoundationTools strips them in prod so
@@ -6431,32 +6289,6 @@ export class AgentModeService {
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
-
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
-    // across 5 calls within a single 6-second window of ONE user turn, all bearing
-    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
-    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
-    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
-    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
-    // this.toolRegistry is somehow being read as empty intermittently (no code path
-    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
-    // pure/synchronous, and registerTools() is called exactly once in this file), or
-    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
-    // restart/still draining, a new one still initializing) and both happen to log
-    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
-    // across all lines confirms (a); differing pids confirms (b).
-    console.log('[ENG-1852-DIAG]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      allToolsCount: allTools.length,
-      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
-      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
-      associatedToolNamesCount: associatedToolNames.size,
-      excludedToolsCount: excludedTools.size,
-      publishedSkillsCount: publishedSkills.length,
-    }));
 
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
@@ -6889,6 +6721,19 @@ export class AgentModeService {
         installedSkills: installedNames
       };
 
+      /*
+       * ENG-1945: the actual tool names this call just unlocked, resolved the same way
+       * `rejectedToolNames` already is below. toolDispatch's same-batch preview call
+       * (a model very commonly asks for a tool in the SAME response it installs the
+       * skill that gates it) reads this field to fold the newly-allowed names into
+       * `allowedToolNames` before the rest of that batch is gated — without it, that
+       * sibling call has no way to learn what this install just granted.
+       */
+      const installedToolNames = Array.from(
+        new Set(validSkillIds.flatMap((id) => availableById.get(id)?.toolNames || [])),
+      );
+      if (installedToolNames.length > 0) result.installedToolNames = installedToolNames;
+
       if (rejectedSkillIds.length > 0) {
         /*
          * ENG-1795. This path returns `success: true` — something DID install — so
@@ -7116,7 +6961,11 @@ export class AgentModeService {
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
-      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+      // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
+      // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
+      // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
+      // make the single most important signal in the 2-week analysis the one nobody can act on.
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -8838,11 +8687,21 @@ export class AgentModeService {
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
+    agentRuntimeRunId?: string;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
+    // within — never something the model supplies or can even see elsewhere, unlike the
+    // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
+    // already-completed run — e.g. a reviewer analysing another session, ENG-939). Threading
+    // the real value through as ground truth lets a tool verify a same-turn claim against
+    // the run it is ACTUALLY in, instead of requiring the model to correctly type back an
+    // opaque id it was never given — which live testing showed it cannot do (it guessed the
+    // literal string "current-run").
+    if (input.agentRuntimeRunId) toolOptions.currentRunId = input.agentRuntimeRunId;
     // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
     // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
     // ENG-123). Scoping it here keeps every other tool's context unchanged.
@@ -9335,7 +9194,7 @@ export class AgentModeService {
    *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
    *   runs on its own dedicated vision model — independent of the chat/default model.
    */
-  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string, usageContext?: LLMUsageContext): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -9486,6 +9345,8 @@ export class AgentModeService {
       // gateway, so AgentWeb never makes a second vision completion itself.
       const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
         max_completion_tokens: 2000,
+        // ENG-1858: vision analysis is the requesting user's work, not "system".
+        usageContext: usageContext ?? { feature: 'describe_image' },
       });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
@@ -11086,12 +10947,18 @@ export class AgentModeService {
       }
 
       // Prepare market strategy data - merge with existing if available
+      const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
-        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: existingMarketStrategy?.createdAt || updateTimestamp,
+        updatedAt: updateTimestamp,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): Emma is
+        // explicitly told to send only the fields that changed, so a
+        // competitors-only tool call must not look like an ICP correction to
+        // routes/crm.ts's staleness check.
+        icpUpdatedAt: icp !== undefined ? updateTimestamp : existingMarketStrategy?.icpUpdatedAt,
       };
 
       // Update org-level or personal market strategy
@@ -15509,7 +15376,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
       let competitorResult: any = { per_icp: [] };
       if (Array.isArray(personas) && personas.length > 0) {
-        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+        // ENG-1858: attribute and charge the regeneration to the requesting user.
+        competitorResult = await generateCompetitorStrategyForUser(
+          brand,
+          personas,
+          deps,
+          { userId, feature: 'onboarding_competitors' },
+        );
       }
 
       const icp = mapIcpResultToMarketStrategy(personas);
@@ -16726,7 +16599,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     }
   }
 
-  async generateSessionTitle(userMessage: string): Promise<string> {
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -16739,7 +16612,12 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
+      ], {
+        response_format: { type: 'json_object' },
+        taskClass: 'interactive_chat',
+        // ENG-1858: attribute to the requesting user, not "system".
+        usageContext: usageContext ?? { feature: 'session_title' },
+      });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -16780,7 +16658,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * to produce a context-aware error message instead of the generic fallback.
    * Returns null if diagnosis fails (caller should use the generic message).
    */
-  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+  async generateDiagnosticMessage(context: DiagnosisContext, usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-971: the truthfulness rules exist because this agent wrote "the system
       // timed out ... so your changes were not saved. Please try your request again"
@@ -16835,6 +16713,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 200,
         temperature: 0.3,
         taskClass: 'nonstandard_consumer',
+        // ENG-1858: the failed run's user pays for explaining its failure.
+        usageContext: usageContext ?? { feature: 'diagnostic_message' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16860,7 +16740,7 @@ TRUTHFULNESS RULES (these override tone):
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[], usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-803: the summary becomes the run's title suffix, so it must describe
       // what the run DID, not what its prose claimed. Previously this saw only the
@@ -16884,6 +16764,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 20,
         temperature: 0.3,
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_summary' },
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16920,7 +16802,7 @@ TRUTHFULNESS RULES (these override tone):
     lastRunStatus: string | null;
     lastRunSummary: string | null;
     consecutiveNoOutputRuns: number;
-  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+  }, usageContext?: LLMUsageContext): Promise<ScheduledRunPreCheckLLMResult | null> {
     try {
       const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
 
@@ -16948,6 +16830,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0,
         response_format: { type: 'json_object' },
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_precheck' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16985,7 +16869,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   async generateSuggestedReplies(
     lastAssistantMessage: string,
-    recentMessages: Array<{ role: string; content: string }>
+    recentMessages: Array<{ role: string; content: string }>,
+    usageContext?: LLMUsageContext,
   ): Promise<string[] | null> {
     const SUGGESTION_TIMEOUT_MS = 5_000;
     try {
@@ -17008,6 +16893,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0.7,
         response_format: { type: 'text' },
         taskClass: 'interactive_chat',
+        // ENG-1858: chips are part of the user's turn.
+        usageContext: usageContext ?? { feature: 'suggested_replies' },
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -17052,6 +16939,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   private async judgeFinalizeClaims(
     finalText: string,
     candidateClasses: readonly ClaimClass[],
+    usageContext?: LLMUsageContext,
   ): Promise<JudgedClaim[]> {
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
@@ -17065,7 +16953,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      max_completion_tokens: 500,
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: the guard audits the user's own reply, so the user's run pays.
+      usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -17092,6 +16986,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     finalText: string,
     systemNote: string,
     llmModel: string,
+    usageContext?: LLMUsageContext,
   ): Promise<string> {
     const response = await this.callLLM(llmModel, [
       {
@@ -17101,7 +16996,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: see judgeFinalizeClaims.
+      usageContext: usageContext ?? { feature: 'finalize_guard_correction' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -17798,9 +17698,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Polling Engine
         let attempts = 0;
         const maxAttempts = 60;
+        // ENG-1908: see sandboxAwarePollDelayMs — a sandbox account's report is
+        // already complete the instant it's created, so it never waits the real delay.
+        const pollDelayMs = sandboxAwarePollDelayMs(accessToken, 10000);
         while (attempts < maxAttempts) {
           attempts++;
-          await new Promise((resolve) => setTimeout(resolve, 10000));
+          await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
           const statusRes = await axios.get(`${baseUrl}/${rid}`, {
             params: { access_token: accessToken },
           });
@@ -18007,7 +17910,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST': {
         // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
@@ -18090,6 +17993,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           creative,
         };
       }
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+        MetaService.assertOwnedByAccount(creative?.account_id, params.creative_id, 'Ad creative', accountId);
+        const previews = await metaService.generateAdPreview(accessToken, params.creative_id, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
@@ -18103,13 +18018,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
         // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
         // from the top-level argument or from params, since callers have used both spellings.
         return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        await metaService.getAd(accessToken, ad_id!, accountId);
+        const previews = await metaService.generateAdPreview(accessToken, ad_id!, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -19414,6 +19340,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
+        await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -19428,7 +19355,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        const result = await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        if (result.success === true && result.verified === true && result.new_creative_id) {
+          await recordCreativeLearningReceipt(userId, accountId, adId, result.new_creative_id, true);
+        }
+        return result;
       }
 
       // Standard ad-level update (status, name, etc.)
@@ -20316,6 +20247,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // message whichever layer sees it first. A GET with no id must never
           // fall through to something account-wide.
           throw new Error('AD_CREATIVE GET requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.creative_id) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -20330,6 +20265,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'PREVIEW' && !ad_id) {
+          throw new Error('AD PREVIEW requires "ad_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -21276,13 +21215,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         accountId: gateCreds.accountId,
         resolver: metaService,
       });
+      // ENG-1909: undefined for any real account (byte-for-byte unchanged gate call —
+      // `preflightMetaTrackingGate`'s `deps.fetchHtml ?? defaultFetchHtml` falls back to the
+      // real fetcher); for a sandbox account, answers destination checks from its own frozen
+      // dataset instead of making a real outbound fetch to a fictional/example.invalid URL.
+      const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
       const gate = await runMetaTrackingGate(
         gateCreds,
         gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
-        {},
+        { fetchHtml: sandboxFetchHtml },
         // Activating one ad is judged on that ad's own destination, not its siblings'.
         entity_type === 'AD' ? ad_id : undefined,
         /*
@@ -22237,12 +22181,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        */
       if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
         const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        // ENG-1909: see the comment at the callMetaMarketingApi call site above — undefined
+        // (real fetch, unchanged) for any real account, dataset-backed for a sandbox one.
+        const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
         const gate = await runMetaTrackingGate(
           gateCreds,
           args.campaign_id,
           `${workflow.toUpperCase()}_LAUNCH`,
           args?.override_tracking_check === true,
           args?.session_id,
+          { fetchHtml: sandboxFetchHtml },
         );
         if (!gate.proceed) return gate.blockResult;
       }
@@ -26402,7 +26350,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   private static escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Decodes the 5 entities `escapeHtml` produces, back to their plain characters. Order
+   * matters: `&amp;` must be decoded LAST, since decoding it first would turn a literal
+   * `&amp;lt;` (an already-escaped `&lt;` that was itself escaped again) into `&lt;`,
+   * silently re-introducing a markup-meaningful character into a plain-text field.
+   */
+  private static unescapeHtml(s: string): string {
+    return s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+  }
+
+  /**
+   * Escapes every string leaf of an arbitrarily-nested value while preserving its
+   * structure — unlike `String(value)`, which collapses an object/array to
+   * "[object Object]" and turns `null`/`undefined` into the literal text "null"/
+   * "undefined". Needed because caller-supplied template variable values are not
+   * contractually flat strings (existing callers pass array-of-object items), and
+   * this feeds `JSON.stringify` afterward, which already renders `null`/numbers/
+   * booleans correctly on its own — only string leaves need escaping.
+   */
+  private static deepEscapeHtmlValues(value: any): any {
+    if (typeof value === 'string') return AgentModeService.escapeHtml(value);
+    if (Array.isArray(value)) return value.map((v) => AgentModeService.deepEscapeHtmlValues(v));
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, AgentModeService.deepEscapeHtmlValues(v)])
+      );
+    }
+    return value;
+  }
+
+  /** Escapes every regex metacharacter so a value can be used as a literal match. */
+  private static escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>`,
+   * mapped to its escaped form — so the LLM's OUTPUT can be corrected if it decoded
+   * either back to raw HTML. Escaping the PROMPT proves nothing about the RESPONSE:
+   * substitution is LLM-driven, not a deterministic string-replace, so nothing
+   * guarantees the model reproduces an escaped entity as-is rather than "cleaning up"
+   * what looks like a stray HTML entity mid-generation.
+   *
+   * Deliberately narrower than the 5-character escape set (& < > " ') applied on the way
+   * IN: `<`/`>` can construct a genuinely new element regardless of surrounding markup,
+   * so a raw one resurfacing is unambiguously dangerous. `&`, `"`, and `'` alone cannot —
+   * they only matter for breaking out of an ALREADY-quoted attribute using that exact
+   * quote character, a narrower, template-structure-dependent risk the live template
+   * doesn't even have today (text-node placeholders only). Including them here caused a
+   * real false-positive class: an ordinary apostrophe in a real name ("O'Brien's Q3")
+   * could trip this check if that short substring coincidentally reappeared anywhere
+   * else in the output, failing a legitimate report for no real security benefit.
+   */
+  private static collectRawToEscapedMap(value: any, out: Map<string, string>): void {
+    if (typeof value === 'string') {
+      if (/[<>]/.test(value)) out.set(value, AgentModeService.escapeHtml(value));
+    } else if (Array.isArray(value)) {
+      value.forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    } else if (value !== null && typeof value === 'object') {
+      Object.values(value).forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    }
   }
 
   /** Convert inline markdown to HTML string. */
@@ -28600,6 +28616,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error('source_url must be an HTTP or HTTPS URL');
       }
 
+      // SSRF guard: convert_to_pdf is a foundation tool reachable by every
+      // session by default, and renderHtmlToPdf navigates a real browser to
+      // sourceUrl server-side. Without this, a user could point it at an
+      // internal address (e.g. the cloud metadata endpoint) and get the
+      // response rendered back to them as a downloadable PDF. renderHtmlToPdf
+      // also re-validates on every navigation request (including redirect
+      // hops), so this call fails fast for the common case without spinning
+      // up a browser first.
+      await assertPublicHostname(sourceUrl);
+
       // Shared render path: orientation is auto-detected (16:9 decks print
       // landscape) unless the caller forces it, and wide content is scaled to
       // fit so the right side is never clipped.
@@ -29188,7 +29214,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
           try {
             const visionCheck = await withTimeoutOrReject(
-              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT),
+              // ENG-1858: the check is part of this user's image generation.
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT, { userId, sessionId, feature: 'describe_image' }),
               FABRICATED_METRICS_CHECK_TIMEOUT_MS,
               'generate_image data-fabrication check'
             );
@@ -32000,6 +32027,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-1877: variable values come from campaign names, CRM data, and other
+      // caller-supplied strings — none of it trusted HTML. The LLM is instructed below
+      // to copy values through verbatim ("EXACT REPLACEMENT"), so an unescaped `<script>`
+      // or `<img onerror=...>` in a value reaches the rendered report unchanged. Escaping
+      // here (not on the LLM's output afterward) is the only point where "this came from
+      // a value" and "this is the template's own static markup" are still distinguishable
+      // — post-hoc sanitizing final_html can't tell the two apart.
+      const escapedVariableValuesObj = Object.fromEntries(
+        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.deepEscapeHtmlValues(value)])
+      );
+      const escapedArrayVariableValuesObj = Object.fromEntries(
+        Object.entries(arrayVariableValuesObj).map(([key, values]) => [
+          key,
+          AgentModeService.deepEscapeHtmlValues(values),
+        ])
+      );
+
+      // Raw (pre-escape) values that actually contained a dangerous character, mapped to
+      // their escaped form — used to CORRECT the LLM's OUTPUT below if it resurfaces.
+      // Escaping the prompt only proves the request was safe; it does not prove the
+      // model didn't decode an entity back to raw HTML.
+      const rawToEscapedMap = new Map<string, string>();
+      AgentModeService.collectRawToEscapedMap(variableValuesObj, rawToEscapedMap);
+      AgentModeService.collectRawToEscapedMap(arrayVariableValuesObj, rawToEscapedMap);
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -32010,10 +32062,10 @@ TEMPLATE SUBJECT:
 ${template.subject}
 
 VARIABLE VALUES:
-${JSON.stringify(variableValuesObj, null, 2)}
+${JSON.stringify(escapedVariableValuesObj, null, 2)}
 
 ARRAY VARIABLE VALUES:
-${JSON.stringify(arrayVariableValuesObj, null, 2)}
+${JSON.stringify(escapedArrayVariableValuesObj, null, 2)}
 
 CRITICAL INSTRUCTIONS:
 1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
@@ -32051,6 +32103,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           response_format: { type: 'json_object' },
           max_completion_tokens: maxTokens,
           taskClass: 'content_generation',
+          // ENG-1858: the user's template work — attribute it to them, not "system".
+          usageContext: { userId, sessionId, feature: 'html_template' },
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -32095,8 +32149,52 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
-      const finalHtml = substitutionData.final_html;
-      const finalSubject = substitutionData.final_subject;
+      let finalHtml = substitutionData.final_html;
+      let finalSubject = substitutionData.final_subject;
+
+      // ENG-1877: correct the output if the model reproduced a value's RAW, unescaped
+      // form instead of the escaped one we sent it — escaping the prompt only proves the
+      // REQUEST was safe, not that the model preserved it through generation. Auto-
+      // correcting (rather than rejecting outright) means a model that imperfectly
+      // handles escaping on some OTHER template degrades to "silently corrected", not
+      // "report generation hard-fails" — this function is shared by ~35 existing
+      // templates across the platform, most never tested against this change, and a
+      // reject-on-detect design would turn any of their LLM's occasional imperfect
+      // escaping into a customer-visible outage for reasons unrelated to security.
+      //
+      // Applied to finalHtml ONLY, never finalSubject — per docs/html-templates.md,
+      // `subject` is a real email subject line (round-4 review finding), never rendered
+      // as HTML, so it has no injection surface to correct in the first place; escaping
+      // it at all just corrupts a real customer-visible field with literal entity text.
+      //
+      // Two more round-4 findings fixed here: (1) longest-value-first ordering — when one
+      // flagged value is a literal substring of another (plausible with real HTML-snippet
+      // data), correcting the shorter one first destroys the exact string the longer one's
+      // pattern needs, silently no-oping its own correction. (2) a replacer FUNCTION, not
+      // a plain string — `String.replace` treats `$&`, `$$`, etc. in a plain replacement
+      // string as special patterns; an escaped value that happens to contain `$` next to
+      // certain characters could reinject the raw matched text, un-doing the very
+      // escaping this loop exists to enforce. A function's return value is used literally,
+      // with no `$`-pattern interpretation.
+      //
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still a
+      // browser-executable tag — an exact-case match would let that trivial reformatting
+      // evade correction entirely. A false correction is possible if a raw dangerous
+      // substring coincidentally already existed in the template's own static markup, but
+      // replacing that one occurrence with its escaped form is a far safer failure mode
+      // than either a silently reopened injection or a hard failure.
+      const correctionsByLengthDesc = [...rawToEscapedMap.entries()].sort(
+        ([a], [b]) => b.length - a.length
+      );
+      for (const [rawValue, escapedValue] of correctionsByLengthDesc) {
+        const pattern = new RegExp(AgentModeService.escapeRegExp(rawValue), 'gi');
+        finalHtml = finalHtml.replace(pattern, () => escapedValue);
+      }
+
+      // finalSubject is plain text (never HTML-rendered), so any HTML entity that leaked
+      // through from the escaped prompt values doesn't protect anything — it just shows
+      // literal "&amp;"/"&#39;" etc. in a real customer's email subject. Decode them back.
+      finalSubject = AgentModeService.unescapeHtml(finalSubject);
 
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
@@ -37489,7 +37587,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
                 // resolvedLinkedInAccount is non-null here: this action is in the
                 // ownership gate above, which returns early when it cannot resolve.
-                return paced.refusal ? paced.refusal.error : null;
+                if (!paced.refusal) return null;
+                // ENG-1873: hand back WHICH gate refused, not just its prose, so the
+                // drain result and its notice can say so truthfully.
+                console.log(
+                  `[AgentMode] withdraw-stale-invitations stopped on ${acc}: gate=${paced.refusal.gate} — `
+                  + `${paced.refusal.message}`,
+                );
+                return { gate: paced.refusal.gate, reason: paced.refusal.error };
               },
               cancel: async (invitationId, acc) => {
                 await linkedInOutreachService.cancelInvitation(invitationId, acc);
@@ -39409,6 +39514,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
             finalUrlSuffix: args.final_url_suffix,
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+            targetPartnerSearchNetwork: args.target_partner_search_network,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be

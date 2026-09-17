@@ -32,6 +32,14 @@ import { PlatformType } from '../services/connectedAccountsDb';
 import { isTokenNotExpired } from '../services/connectedAccountsDb';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { isEvaluationUser } from '../services/evaluationPolicy';
+import {
+  getAccountCapabilityRequirement,
+  upsertAccountCapabilityStatus,
+  isSuppressed,
+  type AccountCapabilityStatus,
+  type AccountCapabilitySourceDetail,
+  type AccountCapabilityRequirement,
+} from '../services/accountCapabilityRequirementsDb';
 
 const TAG = '[renewalIntegrationHealthCron]';
 
@@ -46,9 +54,20 @@ const DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface RenewalIntegrationHealthSummary {
   scannedUsers: number;
+  /** Decided `would_flag` this run — NOT the same as "an alert fired" once suppression exists
+   *  (ENG-1541). Kept meaning what it always has (backward compatible with existing dashboards);
+   *  see `suppressedByCorrection` for the count of `would_flag` decisions an active correction
+   *  suppressed before ever reaching the alert-send step. */
   flagged: number;
+  /** `would_flag` decisions suppressed by an active, unexpired correction (ENG-1541 item 2) —
+   *  the gap between `flagged` and an alert actually being sent. */
+  suppressedByCorrection: number;
   alertFailed: number;
   evaluationFailed: number;
+  /** Failures reading/writing `AW-AccountCapabilityRequirements`, isolated the same way
+   *  evaluation and alert-send failures already are (ENG-1541 item 1) — one user's tracking
+   *  failure must never abort the rest of the scan. */
+  trackingFailed: number;
 }
 
 /**
@@ -222,8 +241,10 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
   const summary: RenewalIntegrationHealthSummary = {
     scannedUsers: 0,
     flagged: 0,
+    suppressedByCorrection: 0,
     alertFailed: 0,
     evaluationFailed: 0,
+    trackingFailed: 0,
   };
 
   const now = Date.now();
@@ -261,9 +282,64 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
       console.error(`${TAG} Failed to evaluate user ${user?.userId ?? 'unknown'}:`, error);
       continue;
     }
+    // ENG-1541 items 1-2: persist this run's status for every decision branch, before the
+    // would_flag gate below — every branch needs the same symmetric read-compare-write, not
+    // just the one that alerts. Isolated the same way evaluation/alert-send already are: an
+    // uncaught throw here must not abort the scan for every remaining user. `updatedRow` (not
+    // the pre-write read) is what the suppression check below must use — see
+    // `upsertAccountCapabilityStatus`'s own doc comment for why the stale row would be wrong.
+    let updatedRow: AccountCapabilityRequirement | null = null;
+    try {
+      const capabilityRow = await getAccountCapabilityRequirement(user.userId, 'ad_platform_integration');
+      const statusForDecision: Record<RenewalIntegrationHealthDecision, AccountCapabilityStatus> = {
+        would_flag: 'unhealthy',
+        skipped_healthy_integration: 'healthy',
+        skipped_no_ad_entitlement: 'not_entitled',
+        skipped_no_paid_ads_intent: 'not_required',
+      };
+      if (evaluation.decision === 'skipped_no_paid_ads_intent') {
+        // Only ever write not_required onto a row that already exists (intent has lapsed) —
+        // a user who has never expressed paid-ads intent never gets a row created for them.
+        if (capabilityRow) {
+          updatedRow = await upsertAccountCapabilityStatus(
+            capabilityRow,
+            user.userId,
+            'ad_platform_integration',
+            'not_required',
+            null,
+          );
+        }
+      } else {
+        updatedRow = await upsertAccountCapabilityStatus(
+          capabilityRow,
+          user.userId,
+          'ad_platform_integration',
+          statusForDecision[evaluation.decision],
+          paidAdsIntentReason(user) as AccountCapabilitySourceDetail, // non-null: this branch only runs when hasPaidAdsIntent is true
+        );
+      }
+    } catch (error) {
+      summary.trackingFailed++;
+      console.error(`${TAG} Failed to update capability tracking for user ${user?.userId ?? 'unknown'}:`, error);
+      // Deliberately continue to the would_flag gate below rather than `continue`-ing past this
+      // user entirely: a tracking failure must not also suppress a real alert for them.
+    }
+
     if (evaluation.decision !== 'would_flag') continue;
 
     summary.flagged++;
+
+    // ENG-1541 item 2: a human correction, if still active and unexpired, short-circuits
+    // before the existing in-memory dedupe below — a stronger, earlier suppression for the
+    // specific case this mechanism exists for. If not suppressed, falls through to today's
+    // 24h timer unchanged. `updatedRow` can be null only if the tracking write itself failed
+    // above (already counted as trackingFailed) — fail open here, same as the rest of this
+    // loop's isolation philosophy: a tracking failure must not also suppress a real alert.
+    if (isSuppressed(updatedRow)) {
+      summary.suppressedByCorrection++;
+      continue;
+    }
+
     try {
       // ENG-1541 Build item 4: state customer outcome, capability, last known signal,
       // next actor, and confidence explicitly, rather than leaving the oncall reader to
@@ -313,7 +389,8 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
 
   console.log(
     `${TAG} Run complete — scannedUsers=${summary.scannedUsers} flagged=${summary.flagged} ` +
-    `alertFailed=${summary.alertFailed} evaluationFailed=${summary.evaluationFailed}`
+    `suppressedByCorrection=${summary.suppressedByCorrection} alertFailed=${summary.alertFailed} ` +
+    `evaluationFailed=${summary.evaluationFailed} trackingFailed=${summary.trackingFailed}`
   );
   return summary;
 }

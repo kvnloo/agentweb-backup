@@ -3,7 +3,7 @@ import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage, meterUserUsage } from "./usageRecorderService";
-import { imageGenerationCostUsd } from "../utils/llmPricing";
+import { imageGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -560,6 +560,7 @@ export class ImageService {
             inputTokens: 0,
             outputTokens: 0,
             costUsdOverride: imageGenerationCostUsd(modelToUse),
+            costProvenance: LLM_PRICE_BOOK_PROVENANCE,
           });
           // Check if it's a data URL (base64) and convert to buffer
           let imageBuffer: Buffer;

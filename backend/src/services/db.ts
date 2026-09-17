@@ -1,3 +1,4 @@
+import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
@@ -66,6 +67,44 @@ const handleDynamoDbError = (error: any, operation: string) => {
     );
   }
   throw error;
+};
+
+/**
+ * A plain UpdateItem on a user/org row can lose a race against a
+ * TransactWriteItems call touching the SAME item — e.g. onboarding's
+ * marketStrategy mirror (updateUser) landing at the exact moment the LLM
+ * usage-credit ledger (transactWrite) meters the ICP generation call that
+ * just completed on that same user row. DynamoDB throws
+ * TransactionConflictException in that case; AWS documents this as an
+ * expected, transient condition to retry, not a permanent failure. Without
+ * this, a caller like mirrorIcpsToMarketStrategy — which treats the write
+ * as best-effort and only logs on failure — silently loses the write
+ * outright (observed live: a fresh onboarding's marketStrategy.icp ended up
+ * empty because of exactly this race) (ENG-1955 follow-up).
+ *
+ * Bounded retries with a short backoff: these conflicts clear in
+ * milliseconds once the competing transaction commits, so there's no
+ * reason to wait long — and no reason to retry anything else, since every
+ * other error here is either permanent or the caller's own guard
+ * (e.g. ConditionalCheckFailedException) firing correctly.
+ */
+const withTransactionConflictRetry = async <T>(
+  fn: () => Promise<T>,
+  maxAttempts = 4,
+): Promise<T> => {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      if (error?.code !== "TransactionConflictException" || attempt === maxAttempts) {
+        throw error;
+      }
+      const delayMs = 50 * Math.pow(2, attempt - 1); // 50ms, 100ms, 200ms
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  // Unreachable — the loop above always returns or throws.
+  throw new Error("withTransactionConflictRetry: exhausted attempts without a result");
 };
 
 /**
@@ -443,9 +482,25 @@ export interface User {
       description: string;
       valueProposition: string;
       buyerPersonas: string[];
+      // Per-persona LLM-extracted lead-search filter cache (ENG-1955
+      // follow-up) — see routes/crm.ts's GET /icp/filters.
+      extractedFilters?: {
+        cacheKey: string;
+        cacheVersion: number;
+        variants: unknown[];
+        generatedAt: string;
+      };
     }>;
     createdAt: string;
     updatedAt: string;
+    // Bumped only by a write that actually changes `icp` (ENG-1955 follow-up)
+    // — kept distinct from `updatedAt`, which every marketStrategy write
+    // bumps regardless of which field changed. routes/crm.ts's staleness
+    // check relies on this to avoid treating an unrelated competitors/
+    // businessOverview edit (or a system copy/mirror of icpResult) as a
+    // genuine ICP correction. Optional because records written before this
+    // field existed won't have it — callers must fall back to `updatedAt`.
+    icpUpdatedAt?: string;
   };
   startupProfiles?: Array<{
     id: string;
@@ -1667,7 +1722,9 @@ export class UserDB {
     }
 
     try {
-      const result = await this.docClient.update(params).promise();
+      const result = await withTransactionConflictRetry(() =>
+        this.docClient.update(params).promise()
+      );
       return result.Attributes as User;
     } catch (error: any) {
       // An unmet condition is the caller's own guard firing, not a fault —
@@ -3486,7 +3543,7 @@ export const scheduleDb = {
         Item: schedule,
       };
 
-      await dynamodb.put(params).promise();
+      await writeWithEvaluationGuard(dynamodb, schedule.userId, TABLE_PREFIX, { Put: params });
       return schedule;
     } catch (error) {
       handleDynamoDbError(error, "createSchedule");
@@ -10080,6 +10137,39 @@ export const browserCookieDb = {
   },
 };
 
+/** Keep structured ads lessons out of generic relevance injection, without consuming its
+ * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed. */
+async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.QueryInput): Promise<any[]> {
+  const rows: any[] = [];
+  let query = { ...params };
+  let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+  for (let page = 0; page < 10; page++) {
+    const result = await dynamodb.query({ ...query, ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      ...(params.Limit ? { Limit: params.Limit - rows.length } : {}) }).promise();
+    if (result.Items !== undefined && !Array.isArray(result.Items)) throw new Error('Malformed account memory page');
+    for (const item of result.Items ?? []) {
+      if (!item || typeof item !== 'object' || typeof item.memoryId !== 'string' || typeof item.content !== 'string') {
+        throw new Error('Malformed account memory item');
+      }
+      if (!item.memoryId.startsWith('ads-learning#')) rows.push(item);
+    }
+    cursor = result.LastEvaluatedKey;
+    if (!params.IndexName && typeof cursor?.memoryId === 'string' && cursor.memoryId.startsWith('ads-learning#')) {
+      // Learning IDs form one contiguous range. Jump over it rather than consuming an
+      // arbitrary number of pages (or starving ordinary ULID memories in descending reads).
+      const descending = params.ScanIndexForward === false;
+      query = { ...params, KeyConditionExpression: `${params.KeyConditionExpression} AND memoryId ${descending ? '<' : '>'} :learningBoundary`,
+        ExpressionAttributeValues: { ...params.ExpressionAttributeValues,
+          ':learningBoundary': descending ? 'ads-learning#' : 'ads-learning#\uffff' } };
+      cursor = undefined;
+      if (params.Limit && rows.length >= params.Limit) return rows.slice(0, params.Limit);
+      continue;
+    }
+    if (!cursor || (params.Limit ? rows.length >= params.Limit : rows.length > 0)) return params.Limit ? rows.slice(0, params.Limit) : rows;
+  }
+  throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
+}
+
 export const accountMemoryDb = {
   async addMemory(
     userId: string,
@@ -10151,8 +10241,7 @@ export const accountMemoryDb = {
           ...(limit ? { Limit: limit } : {}),
         };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await queryOrdinaryAccountMemories(params);
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
       throw error;
@@ -10169,8 +10258,7 @@ export const accountMemoryDb = {
         Limit: limit,
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await queryOrdinaryAccountMemories(params);
     } catch (error) {
       handleDynamoDbError(error, 'getRecentMemories');
       throw error;
@@ -10198,6 +10286,7 @@ export const accountMemoryDb = {
     memoryId: string,
     updates: { content?: string; category?: string }
   ) {
+    if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     if (updates.category && !VALID_MEMORY_CATEGORIES.includes(updates.category as MemoryCategory)) {
       throw new Error(`Invalid category: ${updates.category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
     }
@@ -10240,6 +10329,7 @@ export const accountMemoryDb = {
   },
 
   async deleteMemory(userId: string, memoryId: string) {
+    if (memoryId.startsWith('ads-learning#')) throw new Error('Use learning review to preserve audit history');
     try {
       await dynamodb.delete({
         TableName: ACCOUNT_MEMORY_TABLE,
@@ -10755,11 +10845,26 @@ export const orgDb = {
     return org;
   },
 
-  async getOrgById(orgId: string): Promise<Organization | null> {
-    const params = {
+  // `fields` trims the read to just the listed top-level attributes (via
+  // ProjectionExpression) for call sites that only need a few fields off an
+  // otherwise large org record (brandGuidelines, competitors, etc). Omit it
+  // to fetch the full item as before — every existing caller is unaffected.
+  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
     };
+    if (fields && fields.length > 0) {
+      const names: Record<string, string> = {};
+      params.ProjectionExpression = fields
+        .map((f, i) => {
+          const alias = `#p${i}`;
+          names[alias] = f;
+          return alias;
+        })
+        .join(', ');
+      params.ExpressionAttributeNames = names;
+    }
     const result = await dynamodb.get(params).promise();
     return (result.Item as Organization) || null;
   },
@@ -10876,7 +10981,9 @@ export const orgDb = {
       Object.assign(expressionAttributeValues, options.condition.values || {});
     }
 
-    const result = await dynamodb.update(params).promise();
+    const result = await withTransactionConflictRetry(() =>
+      dynamodb.update(params).promise()
+    );
     return result.Attributes as Organization;
   },
 
@@ -11402,7 +11509,7 @@ export const scheduleTemplateDb = {
     }
   },
 
-  async incrementUsageCount(templateId: string) {
+  async incrementUsageCount(templateId: string, userId?: string) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
@@ -11415,6 +11522,12 @@ export const scheduleTemplateDb = {
         },
         ReturnValues: 'ALL_NEW' as const,
       };
+      if (isEvaluationUser(userId)) {
+        const { ReturnValues: _returnValues, ...update } = params;
+        await writeWithEvaluationGuard(dynamodb, userId, TABLE_PREFIX, { Update: update });
+        const result = await dynamodb.get({ TableName: params.TableName, Key: params.Key, ConsistentRead: true }).promise();
+        return result.Item;
+      }
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {

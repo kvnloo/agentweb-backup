@@ -22,6 +22,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
@@ -183,7 +184,8 @@ export async function generateCreativeDirectionForUser(
   brand: IcpBrandContext,
   personas: ICPPersona[],
   competitor: CompetitorResult,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
+  usageContext?: LLMUsageContext
 ): Promise<CreativeDirResult> {
   const llm =
     deps.llm ??
@@ -191,7 +193,13 @@ export async function generateCreativeDirectionForUser(
   const system = CREATIVE_DIR_SYSTEM_PROMPT;
   const user = buildUserPrompt(brand, personas, competitor);
   // generateJsonRobust: retries once with a strict suffix on parse failure.
-  const raw = await llm.generateJsonRobust<LlmResponse>(system, user);
+  // ENG-1858: metered to the onboarding user (was feature "unknown" / "system").
+  const raw = await llm.generateJsonRobust<LlmResponse>(
+    system,
+    user,
+    undefined,
+    usageContext ?? { feature: "onboarding_creative_direction" }
+  );
   const result = sanitizeCreativeDirResult(raw);
   if (
     result.concepts.length === 0 &&
@@ -225,11 +233,14 @@ export async function triggerCreativeDirForUser(
       : { per_icp: [] };
   const brand = extractIcpBrandContext(user as any);
   try {
+    // ENG-1858: attribute and charge the creative direction to this user.
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_creative_direction" };
     const result = await generateCreativeDirectionForUser(
       brand,
       personas,
       competitor,
-      deps
+      deps,
+      usageContext
     );
     const current = await userDb.getUserById(userId);
     const patch = creativeDirReadyPatch((current as any) || {}, result);

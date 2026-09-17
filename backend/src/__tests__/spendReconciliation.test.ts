@@ -14,6 +14,7 @@ import {
   reconcileVendorFidelity,
   selectReconcilableSubjects,
   splitVendorModel,
+  measureLlmLedgerCoverage,
 } from '../services/spendReconciliation';
 import { SpendEvent } from '../services/spendEventDb';
 import { UsageRecordRow } from '../services/usageRecordDb';
@@ -401,5 +402,197 @@ describe('reconcileMonth', () => {
     const report = reconcileMonth('owner-1', '2026-09', [], [aVendorRow()]);
 
     expect(report.readyForCutoverEvidence).toBe(false);
+  });
+});
+
+// ── ENG-1934: LLM events on the ledger ──────────────────────────────────────
+
+const anLlmEvent = (over: Partial<SpendEvent> = {}): SpendEvent =>
+  anEvent({
+    eventId: 'llm:msg-1',
+    provider: 'bedrock',
+    operation: 'anthropic.claude-opus-4-8',
+    feature: 'agent_task',
+    unit: 'llm_token',
+    quantity: 1200,
+    costMicroUsd: 3_954_436,
+    rateCardVersion: 'llm-price-book:2026-09-10',
+    ...over,
+  });
+
+describe('LLM fidelity (ENG-1934)', () => {
+  const llmMirrorStartedAt = '2026-09-05T00:00:00.000Z';
+
+  it('without an LLM start, LLM events are ignored — never reported as orphans on the vendor rail', () => {
+    const report = reconcileVendorFidelity([anLlmEvent()], [anLlmRow()]);
+
+    expect(report.orphanGroups).toEqual([]);
+    expect(report.groupCount).toBe(0);
+    expect(report.ok).toBe(true);
+  });
+
+  it('with an LLM start, a matching event and aggregate row reconcile clean', () => {
+    const report = reconcileVendorFidelity([anLlmEvent()], [anLlmRow()], { llmMirrorStartedAt });
+
+    expect(report.assessedGroupCount).toBe(1);
+    expect(report.ok).toBe(true);
+    expect(report.ledgerMicroUsd).toBe(report.liveMicroUsd);
+  });
+
+  it('keys LLM groups on model, not provider — a pre-ENG-693 row with no provider still matches', () => {
+    const report = reconcileVendorFidelity([anLlmEvent({ provider: 'bedrock' })], [anLlmRow({ provider: undefined })], {
+      llmMirrorStartedAt,
+    });
+
+    expect(report.ok).toBe(true);
+    expect(report.unmirroredGroups).toEqual([]);
+    expect(report.orphanGroups).toEqual([]);
+  });
+
+  it('an LLM aggregate row with no event after the start is UNMIRRORED — the failure this check exists for', () => {
+    const report = reconcileVendorFidelity([], [anLlmRow()], { llmMirrorStartedAt });
+
+    expect(report.ok).toBe(false);
+    expect(report.unmirroredGroups).toHaveLength(1);
+    expect(report.unmirroredGroups[0]).toMatchObject({ rail: 'llm', provider: 'llm', operation: 'anthropic.claude-opus-4-8' });
+  });
+
+  it('LLM drift beyond a cent is reported per model', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent({ costMicroUsd: 3_954_436 - DRIFT_TOLERANCE_MICRO_USD - 1 })],
+      [anLlmRow()],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.driftingGroups).toHaveLength(1);
+  });
+
+  it('uses the LLM start for LLM groups and the vendor start for vendor groups, independently', () => {
+    const report = reconcileVendorFidelity(
+      [],
+      [anLlmRow({ date: '2026-09-04' }), aVendorRow({ date: '2026-09-04' })],
+      { mirrorStartedAt: '2026-09-01T00:00:00.000Z', llmMirrorStartedAt },
+    );
+
+    // Same day: before the LLM mirror (not a finding), after the vendor mirror (a finding).
+    expect(report.preMirrorGroups.map((g) => g.rail)).toEqual(['llm']);
+    expect(report.unmirroredGroups.map((g) => g.rail)).toEqual(['vendor']);
+  });
+
+  it('the LLM changeover day is partial, not a failure', () => {
+    const report = reconcileVendorFidelity([], [anLlmRow({ date: '2026-09-05' })], { llmMirrorStartedAt });
+
+    expect(report.partialGroups).toHaveLength(1);
+    expect(report.ok).toBe(true);
+  });
+
+  it('an aggregate row labelled unpriced is not counted as unmirrored spend', () => {
+    const report = reconcileVendorFidelity(
+      [],
+      [anLlmRow({ model: 'model-nobody-priced', costSource: 'unpriced', costMicroUsd: 0 })],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.unmirroredGroups).toEqual([]);
+    expect(report.groupCount).toBe(0);
+  });
+
+  it('trusts an ALLOCATED $0 row for an unknown model — its $0 event is matched, not orphaned (CodeRabbit, PR #2904)', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent({ operation: 'model-nobody-priced', costMicroUsd: 0 })],
+      [anLlmRow({ model: 'model-nobody-priced', costSource: 'allocated', costMicroUsd: 0 })],
+      { llmMirrorStartedAt },
+    );
+
+    expect(report.orphanGroups).toEqual([]);
+    expect(report.assessedGroupCount).toBe(1);
+    expect(report.ok).toBe(true);
+  });
+
+  it('a vendor and an LLM group can never collide into one', () => {
+    const report = reconcileVendorFidelity(
+      [anLlmEvent(), anEvent()],
+      [anLlmRow(), aVendorRow()],
+      { mirrorStartedAt: '2026-09-01T00:00:00.000Z', llmMirrorStartedAt },
+    );
+
+    expect(report.groupCount).toBe(2);
+    expect(report.ok).toBe(true);
+  });
+
+  describe('selectReconcilableSubjects with includeLlm', () => {
+    it('without it, an LLM-only subject stays llmOnly even when it has LLM events', () => {
+      const { reconcilable, llmOnly } = selectReconcilableSubjects([anLlmEvent()], [anLlmRow()]);
+
+      expect(reconcilable).toEqual([]);
+      expect(llmOnly).toEqual(['owner-1']);
+    });
+
+    it('with it, LLM activity on the live rail alone makes a subject reconcilable — so a total mirror failure is examined', () => {
+      const { reconcilable, llmOnly } = selectReconcilableSubjects([], [anLlmRow({ billingUserId: 'all-llm-failed' })], {
+        includeLlm: true,
+      });
+
+      expect(reconcilable).toEqual(['all-llm-failed']);
+      expect(llmOnly).toEqual([]);
+    });
+  });
+});
+
+describe('measureLlmLedgerCoverage (ENG-1934)', () => {
+  const original = process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
+  afterEach(() => {
+    if (original === undefined) delete process.env.SPEND_LEDGER_LLM_DUAL_WRITE;
+    else process.env.SPEND_LEDGER_LLM_DUAL_WRITE = original;
+  });
+
+  it('a month that ended before LLM events existed is "none", and is not measured', () => {
+    const c = measureLlmLedgerCoverage('2026-08', [], [anLlmRow({ date: '2026-08-20' })]);
+
+    expect(c).toMatchObject({ month: 'none', aggregateLlmMicroUsd: null, missingLlmMicroUsd: null });
+  });
+
+  it('is "full" when the ledger holds the aggregate rail\'s LLM spend within a cent', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent()], [anLlmRow(), aVendorRow()]);
+
+    // The vendor row is not LLM spend and must not count against coverage.
+    expect(c).toMatchObject({ month: 'full', ledgerLlmMicroUsd: 3_954_436, aggregateLlmMicroUsd: 3_954_436, missingLlmMicroUsd: 0 });
+  });
+
+  it('is "partial" with the missing amount when LLM spend has no events — a switch-off week, a fallback write, or the days before recording began', () => {
+    const c = measureLlmLedgerCoverage(
+      '2026-09',
+      [anLlmEvent()],
+      [anLlmRow(), anLlmRow({ date: '2026-09-02', costMicroUsd: 2_000_000 })],
+    );
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: 2_000_000 });
+  });
+
+  it('a ledger holding MORE than the aggregate beyond a cent is "partial" too — a duplicate or orphan overstates spend', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent(), anLlmEvent({ eventId: 'dup', costMicroUsd: 2_000_000 })], [anLlmRow()]);
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: 0, excessLlmMicroUsd: 2_000_000 });
+  });
+
+  it('an unmeasurable month is "partial", never assumed complete', () => {
+    const c = measureLlmLedgerCoverage('2026-09', [anLlmEvent()], null);
+
+    expect(c).toMatchObject({ month: 'partial', missingLlmMicroUsd: null });
+  });
+
+  it('ignores vendor events, unsettled events and unpriced rows on either side', () => {
+    const c = measureLlmLedgerCoverage(
+      '2026-09',
+      [anLlmEvent(), anEvent({ costMicroUsd: 9_999_999 }), anLlmEvent({ eventId: 'r', lifecycle: 'reserved' })],
+      [anLlmRow(), anLlmRow({ model: 'x', costSource: 'unpriced', costMicroUsd: 0 })],
+    );
+
+    expect(c).toMatchObject({ month: 'full', ledgerLlmMicroUsd: 3_954_436 });
+  });
+
+  it('reports the kill switch as it is right now', () => {
+    process.env.SPEND_LEDGER_LLM_DUAL_WRITE = 'false';
+    expect(measureLlmLedgerCoverage('2026-10', [], []).recording).toBe(false);
   });
 });

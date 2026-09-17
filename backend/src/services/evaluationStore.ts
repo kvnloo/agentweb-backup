@@ -1,7 +1,11 @@
 import AWS from 'aws-sdk';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import type { SandboxDataset } from './sandbox/types';
+import { SandboxStateStore } from './sandbox/sandboxStateStore';
+import { buildOverlayDiff, orderSandboxAudit, renderSandboxReviewMarkdown } from './sandbox/review';
 import bcrypt from 'bcryptjs';
 import { EvaluationDenied, isEvaluationUser, SANDBOX_TOOL_CLASS_NAMES } from './evaluationPolicy';
+import { mintSandboxToken, sandboxAdAccountId } from './sandbox/sentinel';
 
 /** The sandbox policy: one row per principal, authoritative for every gate. */
 export interface EvaluationRecord {
@@ -17,17 +21,20 @@ export interface EvaluationRecord {
   deniedToolClasses: string[];
   provisionedBy?: string;
   reviewerUserIds?: string[];
+  lifecycleState?: 'resetting' | 'purging' | 'purged';
 }
+
 export interface ProvisionEvaluation {
   email: string;
   displayName: string;
   password: string;
   expiresAt: number;
   brandGuidelines: { brandName: string; website?: string; description?: string };
+  /** The frozen dataset the simulated Meta connection serves (ENG-1908). Required: an account with no data is not a sandbox. */
+  datasetId: string;
+  datasetVersion: number;
   reviewerUserIds?: string[];
   label?: string;
-  datasetId?: string;
-  datasetVersion?: number;
   deniedToolClasses?: string[];
 }
 
@@ -40,14 +47,63 @@ export class SandboxTierMissing extends Error {
   }
 }
 
+/** The pinned dataset must already be loaded; a connection pointing at nothing would read as a broken Meta account. */
+export class SandboxDatasetMissing extends Error {
+  constructor(datasetId: string, version: number) {
+    super(`Sandbox dataset ${datasetId}@${version} is not loaded; compile and load it before provisioning.`);
+  }
+}
+
+/** What provisioning needs to know about a dataset: just enough to write a believable connection row. */
+export interface SandboxDatasetSummary {
+  account: { account_id: string; currency: string; name: string; timezone_name: string };
+}
+export interface SandboxProvisionDeps {
+  loadDatasetSummary(datasetId: string, version: number): Promise<SandboxDatasetSummary | null>;
+}
+let provisionDeps: SandboxProvisionDeps = {
+  // Lazy: the dataset store pulls in the whole simulator module graph, which the policy
+  // read path (every request) must never pay for.
+  loadDatasetSummary: (datasetId, version) => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getSandboxDatasetStore } = require('./sandbox/sandboxDatasetStore');
+    return getSandboxDatasetStore().loadDatasetSummary(datasetId, version);
+  },
+};
+/** Test seam (and future alternate dataset sources). */
+export function setSandboxProvisionDeps(deps: SandboxProvisionDeps): void { provisionDeps = deps; }
+
+/** The simulated token must outlive the account by a wide margin so no refresh path ever fires. */
+const SANDBOX_TOKEN_GRACE_MS = 90 * 86400000;
+const SANDBOX_REQUESTED_SCOPES = ['ads_management', 'ads_read', 'business_management', 'pages_show_list'];
+const SANDBOX_GRANTED_SCOPES = ['ads_management', 'ads_read'];
+
 const ID_PATTERN = /^[a-zA-Z0-9-]{1,100}$/;
+
+export interface SandboxLifecycleDeps {
+  datasets: { loadDataset(datasetId: string, version: number): Promise<SandboxDataset> };
+  cleanup: {
+    assertQuiescent(userId: string): Promise<void>;
+    preparePurge(userId: string): Promise<() => Promise<Record<string, number>>>;
+  };
+}
 
 /** Sandbox policy, audit and (from phase 2) dataset/overlay rows live only in AW-Evaluations. */
 export class EvaluationStore {
   private prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
   private table = `${this.prefix}AW-Evaluations`;
   private users = `${this.prefix}AW-Users`;
-  constructor(private db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' })) {}
+  constructor(private db = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' }), private lifecycleDeps?: SandboxLifecycleDeps) {}
+
+  private async lifecycle(): Promise<SandboxLifecycleDeps> {
+    if (!this.lifecycleDeps) {
+      const [{ getSandboxDatasetStore }, { SandboxArtifactCleanup }] = await Promise.all([
+        import('./sandbox/sandboxDatasetStore'), import('./sandbox/artifactCleanup'),
+      ]);
+      this.lifecycleDeps = { datasets: getSandboxDatasetStore(), cleanup: new SandboxArtifactCleanup({ db: this.db }) };
+    }
+    return this.lifecycleDeps;
+  }
 
   private key(userId: string) {
     if (!isEvaluationUser(userId) || !/^eval_[a-zA-Z0-9-]+$/.test(userId)) throw new EvaluationDenied();
@@ -55,10 +111,7 @@ export class EvaluationStore {
   }
 
   /** Normalizes legacy ENG-1870 rows (budget, materials, artifacts, toy simulation) into the policy shape. */
-  async get(userId: string): Promise<EvaluationRecord | null> {
-    const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
-    if (!result.Item) return null;
-    const item = result.Item as Record<string, unknown>;
+  private normalize(userId: string, item: Record<string, unknown>): EvaluationRecord {
     if (item.userId !== userId) throw new EvaluationDenied();
     const persistedDeniedToolClasses = Array.isArray(item.deniedToolClasses)
       ? item.deniedToolClasses.filter((c): c is string => typeof c === 'string' && SANDBOX_TOOL_CLASS_NAMES.includes(c))
@@ -79,7 +132,55 @@ export class EvaluationStore {
     if (typeof item.datasetVersion === 'number') record.datasetVersion = item.datasetVersion;
     if (typeof item.provisionedBy === 'string') record.provisionedBy = item.provisionedBy;
     if (Array.isArray(item.reviewerUserIds)) record.reviewerUserIds = item.reviewerUserIds.filter((id): id is string => typeof id === 'string');
+    if (item.lifecycleState !== undefined) {
+      if (!['resetting', 'purging', 'purged'].includes(item.lifecycleState as string)) throw new EvaluationDenied();
+      record.lifecycleState = item.lifecycleState as EvaluationRecord['lifecycleState'];
+    }
     return record;
+  }
+
+  async get(userId: string): Promise<EvaluationRecord | null> {
+    const result = await this.db.get({ TableName: this.table, Key: this.key(userId), ConsistentRead: true }).promise();
+    if (!result.Item) return null;
+    return this.normalize(userId, result.Item as Record<string, unknown>);
+  }
+
+  /**
+   * Every provisioned sandbox principal's policy record — root rows only, never audit/dataset/
+   * overlay rows. Admin-only and low-cardinality by design (the same shape
+   * SandboxArtifactCleanup already scans for cleanup), so a full table scan is the right tool
+   * here, not a new index. Unlike get() — which fails closed on a malformed row because it
+   * gates access — this is a visibility feature: one bad row must never take the whole admin
+   * list down, so it is skipped (and logged) instead of thrown. Sorted by email for a stable list.
+   */
+  async listAll(): Promise<EvaluationRecord[]> {
+    const rows: EvaluationRecord[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const page = await this.db.scan({
+        TableName: this.table,
+        FilterExpression: 'attribute_exists(email)',
+        ConsistentRead: true,
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      }).promise();
+      for (const item of page.Items ?? []) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        const userId = record.userId;
+        if (typeof userId !== 'string' || record.evaluationKey !== `evaluation/${userId}`) continue; // not a root record
+        // A non-string email would otherwise reach the final rows.sort(...localeCompare...) below and
+        // throw for the WHOLE list, not just this row — check it here, before normalize(), so it is
+        // skipped-and-logged like any other malformed row instead of crashing every admin's request.
+        if (typeof record.email !== 'string' || !record.email) {
+          console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}: email is not a non-empty string`);
+          continue;
+        }
+        try { rows.push(this.normalize(userId, record)); }
+        catch (error) { console.error(`[evaluationStore] listAll skipped a malformed row for ${userId}:`, error instanceof Error ? error.message : error); }
+      }
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+    return rows.sort((a, b) => a.email.localeCompare(b.email));
   }
 
   private audit(userId: string, actor: string, action: string, details: Record<string, unknown> = {}) {
@@ -101,13 +202,15 @@ export class EvaluationStore {
     if (input.reviewerUserIds !== undefined && (!Array.isArray(input.reviewerUserIds) || input.reviewerUserIds.length > 5 ||
       input.reviewerUserIds.some(id => typeof id !== 'string' || !ID_PATTERN.test(id)))) throw new EvaluationDenied();
     if (input.label !== undefined && (typeof input.label !== 'string' || !input.label.trim() || input.label.length > 40)) throw new EvaluationDenied();
-    if (input.datasetId !== undefined && (typeof input.datasetId !== 'string' || !ID_PATTERN.test(input.datasetId))) throw new EvaluationDenied();
-    if (input.datasetVersion !== undefined && (!Number.isSafeInteger(input.datasetVersion) || input.datasetVersion < 1)) throw new EvaluationDenied();
+    if (typeof input.datasetId !== 'string' || !ID_PATTERN.test(input.datasetId)) throw new EvaluationDenied();
+    if (!Number.isSafeInteger(input.datasetVersion) || input.datasetVersion < 1) throw new EvaluationDenied();
     if (input.deniedToolClasses !== undefined && (!Array.isArray(input.deniedToolClasses) ||
       input.deniedToolClasses.some(c => typeof c !== 'string' || !SANDBOX_TOOL_CLASS_NAMES.includes(c)))) throw new EvaluationDenied();
 
     const { getSubscriptionTypeConfig } = await import('./subscriptionService');
     if (!(await getSubscriptionTypeConfig(SANDBOX_TIER_NAME))) throw new SandboxTierMissing();
+    const dataset = await provisionDeps.loadDatasetSummary(input.datasetId, input.datasetVersion);
+    if (!dataset) throw new SandboxDatasetMissing(input.datasetId, input.datasetVersion);
 
     const userId = `eval_${randomUUID()}`;
     const email = input.email.toLowerCase();
@@ -118,10 +221,24 @@ export class EvaluationStore {
       userId, email, status: 'active', expiresAt: input.expiresAt, mode: 'sandbox',
       label: input.label?.trim() || 'Sandbox', connectors: { meta: 'simulated' }, deniedToolClasses,
       provisionedBy: actor, reviewerUserIds: input.reviewerUserIds || [],
-      ...(input.datasetId !== undefined ? { datasetId: input.datasetId } : {}),
-      ...(input.datasetVersion !== undefined ? { datasetVersion: input.datasetVersion } : {}),
+      datasetId: input.datasetId, datasetVersion: input.datasetVersion,
     };
     const now = new Date().toISOString();
+    // The simulated Meta connection (ENG-1908 AC 1). Same shape routes/metaAuth.ts writes for a
+    // real ad account, so Settings → Connected accounts, list_connected_accounts and every
+    // credential resolver treat it as Connected + ads-capable. The token is a sentinel the Graph
+    // interceptor recognizes; it is never sent to Meta and never refreshed (metaTokenRefresh.ts).
+    // The ad account id is derived from the principal, not copied from the dataset, so two
+    // sandboxes on one dataset never share an id.
+    const adAccountId = sandboxAdAccountId(userId);
+    const connectedAccounts = [{
+      platform: 'meta', account_id: adAccountId, account_name: dataset.account.name, created_at: now, updated_at: now,
+      config: {
+        account_type: 'ad_account', ad_account_id: adAccountId, currency: dataset.account.currency, account_status: 1,
+        access_token: mintSandboxToken(userId), token_expires_at: input.expiresAt + SANDBOX_TOKEN_GRACE_MS,
+        scopes: SANDBOX_REQUESTED_SCOPES, granted_scopes: SANDBOX_GRANTED_SCOPES,
+      },
+    }];
     // The full brandGuidelines shape (services/db.ts User.brandGuidelines): the portal keys onboarding
     // off brandData.brandName and the brand page reads every array field.
     const brandGuidelines = {
@@ -133,13 +250,13 @@ export class EvaluationStore {
       },
       attachments: [], createdAt: now, updatedAt: now,
     };
-    const audit = this.audit(userId, actor, 'provision', { label: record.label, datasetId: record.datasetId ?? null, deniedToolClasses });
+    const audit = this.audit(userId, actor, 'provision', { label: record.label, datasetId: record.datasetId, datasetVersion: record.datasetVersion, deniedToolClasses });
     await this.db.transactWrite({ TransactItems: [
       { Put: { TableName: this.users, Item: {
         email, userId, displayName: input.displayName.trim(), password: await bcrypt.hash(input.password, 12),
         isOAuthUser: false, isAdmin: false, isActive: true, roles: ['customer'],
         subscriptionType: SANDBOX_TIER_NAME, subscription_status: 'active', sessionVersion: 0,
-        signupSource: 'evaluation', createdAt: now, brandGuidelines,
+        signupSource: 'evaluation', createdAt: now, brandGuidelines, connected_accounts: connectedAccounts,
         memoryEnabled: false, emailNotificationsEnabled: false, emmaTipsEnabled: false,
       }, ConditionExpression: 'attribute_not_exists(email)' } },
       { Put: { TableName: this.table, Item: { ...this.key(userId), ...record }, ConditionExpression: 'attribute_not_exists(evaluationKey)' } },
@@ -158,23 +275,120 @@ export class EvaluationStore {
 
   async review(actor: string, userId: string) {
     const record = await this.requireReview(actor, userId);
-    const audit: Record<string, unknown>[] = [];
-    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-    let pages = 0;
-    do {
-      const page = await this.db.scan({ TableName: this.table, ConsistentRead: true, Limit: 100,
-        FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
-        ExpressionAttributeValues: { ':user': userId, ':prefix': `evaluation/${userId}/audit/` },
-        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-      }).promise();
-      if (!Array.isArray(page.Items)) throw new EvaluationDenied();
-      for (const item of page.Items) {
-        if (!item || item.userId !== userId || typeof item.evaluationKey !== 'string' || !item.evaluationKey.startsWith(`evaluation/${userId}/audit/`)) throw new EvaluationDenied();
-        audit.push(item);
+    const audit = await this.inventory({ TableName: this.table,
+      FilterExpression: 'userId = :user AND begins_with(evaluationKey, :prefix)',
+      ExpressionAttributeValues: { ':user': userId, ':prefix': `evaluation/${userId}/audit/` },
+    }, item => item.userId === userId && typeof item.evaluationKey === 'string' &&
+      item.evaluationKey.startsWith(`evaluation/${userId}/audit/`));
+    const orderedAudit = orderSandboxAudit(audit);
+    const overlay = await new SandboxStateStore(this.db).loadOverlay(userId);
+    const dataset = record.datasetId && record.datasetVersion
+      ? await (await this.lifecycle()).datasets.loadDataset(record.datasetId, record.datasetVersion) : null;
+    const result = { userId, status: record.status, audit: orderedAudit,
+      timeline: orderedAudit.filter(item => item.action === 'meta'),
+      overlayDiff: dataset ? buildOverlayDiff(dataset, overlay) : [], truncated: false };
+    return { ...result, markdown: renderSandboxReviewMarkdown(result) };
+  }
+
+  /** A short lease serializes cleanup. Failed operations retain the deny marker but release the lease for retry. */
+  private async beginLifecycle(actor: string, userId: string, state: 'resetting' | 'purging') {
+    const lease = randomUUID();
+    await this.db.transactWrite({ TransactItems: [
+      { Update: { TableName: this.table, Key: this.key(userId),
+        UpdateExpression: 'SET lifecycleState = :state, lifecycleLease = :lease, lifecycleLeaseUntil = :until',
+        ConditionExpression: 'userId = :user AND (attribute_not_exists(lifecycleLeaseUntil) OR lifecycleLeaseUntil < :now) AND (attribute_not_exists(lifecycleState) OR lifecycleState = :state OR lifecycleState = :resetting)',
+        ExpressionAttributeValues: { ':user': userId, ':state': state, ':resetting': 'resetting', ':lease': lease, ':until': Date.now() + 300000, ':now': Date.now() },
+      } }, this.audit(userId, actor, `${state}-started`),
+    ] }).promise();
+    return lease;
+  }
+
+  private async failLifecycle(actor: string, userId: string, lease: string, action: string) {
+    // The original pending marker remains authoritative even if this audit write fails.
+    try { await this.db.transactWrite({ TransactItems: [
+      { Update: { TableName: this.table, Key: this.key(userId),
+        UpdateExpression: 'REMOVE lifecycleLease, lifecycleLeaseUntil',
+        ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+        ExpressionAttributeValues: { ':user': userId, ':lease': lease },
+      } }, this.audit(userId, actor, `${action}-failed`),
+    ] }).promise(); } catch { /* fail closed */ }
+  }
+
+  /**
+   * Restores a sandbox account to a pristine, reusable state: the dataset overlay
+   * returns to the exact immutable seed, and every piece of candidate-produced content
+   * (chat sessions/messages, tasks, work plans, generated files) is cleared via the same
+   * cleanup engine purge() uses — minus purge()'s account-deletion step, so the account
+   * itself, its credentials, and its policy/audit trail all survive. This is the one-click
+   * "make it fresh for the next run" admin action; purge() is for permanently disposing
+   * of the account instead.
+   */
+  async reset(actor: string, userId: string) {
+    const record = await this.get(userId);
+    if (!record?.datasetId || !record.datasetVersion || record.lifecycleState === 'purged') throw new EvaluationDenied();
+    const { datasets, cleanup } = await this.lifecycle();
+    const seed = await datasets.loadDataset(record.datasetId, record.datasetVersion);
+    const seedSha256 = createHash('sha256').update(JSON.stringify(seed)).digest('hex');
+    const lease = await this.beginLifecycle(actor, userId, 'resetting');
+    try {
+      await cleanup.assertQuiescent(userId);
+      const cleanupCounts = await (await cleanup.preparePurge(userId))();
+      // The immutable seed never needs rewriting. Removing sim makes the next read load it exactly.
+      await this.db.transactWrite({ TransactItems: [
+        { Delete: { TableName: this.table, Key: { evaluationKey: `evaluation/${userId}/sim` } } },
+        { Update: { TableName: this.table, Key: this.key(userId),
+          UpdateExpression: 'REMOVE lifecycleState, lifecycleLease, lifecycleLeaseUntil',
+          ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+          ExpressionAttributeValues: { ':user': userId, ':lease': lease },
+        } }, this.audit(userId, actor, 'reset', { seedSha256, cleanup: cleanupCounts }),
+      ] }).promise();
+      return { userId, seedSha256, cleanup: cleanupCounts };
+    } catch (error) { await this.failLifecycle(actor, userId, lease, 'reset'); throw error; }
+  }
+
+  async purge(actor: string, userId: string) {
+    const record = await this.get(userId);
+    if (!record || typeof record.email !== 'string') throw new EvaluationDenied();
+    if (record.lifecycleState === 'purged') return { userId, status: 'revoked', cleanup: {} };
+    const lease = await this.beginLifecycle(actor, userId, 'purging');
+    try {
+      // Complete every inventory before deleting anything. Primary-table reads also
+      // include newly issued credentials absent from eventually consistent GSIs.
+      const material = await this.inventory({ TableName: this.table,
+        FilterExpression: 'begins_with(evaluationKey, :prefix)',
+        ProjectionExpression: 'evaluationKey, userId',
+        ExpressionAttributeValues: { ':prefix': `evaluation/${userId}/` },
+      }, item => typeof item.evaluationKey === 'string' && item.evaluationKey.startsWith(`evaluation/${userId}/`) &&
+        (item.userId === undefined || item.userId === userId));
+      const materialKeys = material.map(item => item.evaluationKey as string)
+        .filter(key => !key.startsWith(`evaluation/${userId}/audit/`));
+      const deleteCredentials = await this.prepareCredentialCleanup(userId);
+      const { cleanup } = await this.lifecycle();
+      const deleteArtifacts = await cleanup.preparePurge(userId);
+      const revocation = await this.revokeWithCleanup(actor, userId, deleteCredentials);
+      // A credential request can pass its first active-policy check before the
+      // lifecycle lease, then persist after the initial inventory.
+      const lateCredentials = await (await this.prepareCredentialCleanup(userId))();
+      const counts = await deleteArtifacts();
+      for (const [table, count] of Object.entries(revocation.cleanup)) counts[table] = (counts[table] ?? 0) + count;
+      for (const [table, count] of Object.entries(lateCredentials)) counts[table] = (counts[table] ?? 0) + count;
+      for (const evaluationKey of materialKeys) {
+        await this.db.delete({ TableName: this.table, Key: { evaluationKey },
+          ConditionExpression: 'attribute_not_exists(userId) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
+        }).promise();
       }
-      cursor = page.LastEvaluatedKey; pages++;
-    } while (cursor && audit.length < 1000 && pages < 100);
-    return { userId, status: record.status, audit, truncated: !!cursor };
+      await this.db.transactWrite({ TransactItems: [
+        { Delete: { TableName: this.users, Key: { email: record.email },
+          ConditionExpression: 'attribute_not_exists(email) OR userId = :user', ExpressionAttributeValues: { ':user': userId },
+        } },
+        { Update: { TableName: this.table, Key: this.key(userId),
+          UpdateExpression: 'SET lifecycleState = :state REMOVE lifecycleLease, lifecycleLeaseUntil',
+          ConditionExpression: 'userId = :user AND lifecycleLease = :lease',
+          ExpressionAttributeValues: { ':user': userId, ':lease': lease, ':state': 'purged' },
+        } }, this.audit(userId, actor, 'purge', { cleanup: counts }),
+      ] }).promise();
+      return { userId, status: 'revoked', cleanup: counts };
+    } catch (error) { await this.failLifecycle(actor, userId, lease, 'purge'); throw error; }
   }
 
   async discardJob(userId: string, scheduleId: string) {
@@ -188,6 +402,10 @@ export class EvaluationStore {
   }
 
   async revoke(actor: string, userId: string) {
+    return this.revokeWithCleanup(actor, userId);
+  }
+
+  private async revokeWithCleanup(actor: string, userId: string, deleteCredentials?: () => Promise<Record<string, number>>) {
     const record = await this.get(userId);
     if (!record || record.userId !== userId || typeof record.email !== 'string') throw new EvaluationDenied();
     const audit = this.audit(userId, actor, 'revoke', { cleanupStatus: 'pending' });
@@ -213,7 +431,7 @@ export class EvaluationStore {
       await this.db.transactWrite({ TransactItems: [writes[0], writes[2]] }).promise();
     }
     let cleanup: Record<string, number>;
-    try { cleanup = await this.cleanupCredentials(userId); } catch (error) {
+    try { cleanup = await (deleteCredentials ?? await this.prepareCredentialCleanup(userId))(); } catch (error) {
       try { await this.db.transactWrite({ TransactItems: [this.audit(userId, actor, 'revocation-cleanup-failed')] }).promise(); } catch {
         // The original revoke audit is already committed. Keep the cleanup failure.
       }
@@ -224,33 +442,60 @@ export class EvaluationStore {
     return { userId, status: 'revoked', audit: audit.Put.Item, cleanup, cleanupAudit: cleanupAudit.Put.Item };
   }
 
-  private async cleanupCredentials(userId: string) {
-    const counts: Record<string, number> = {};
-    // Primary-table scans avoid stale identity indexes during revocation. Only key + owner
-    // are read for conditional deletion; row keys and credential values are never logged.
+  /** DynamoDB Limit applies before filtering. Exhaust even empty pages; never
+   * treat a budget, malformed page or repeated cursor as a complete inventory. */
+  private async inventory(params: AWS.DynamoDB.DocumentClient.ScanInput,
+    owns: (item: Record<string, unknown>) => boolean, optional = false): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = [];
+    let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
+    const seen = new Set<string>();
+    do {
+      let page: AWS.DynamoDB.DocumentClient.ScanOutput;
+      try {
+        page = await this.db.scan({ ...params, ConsistentRead: true,
+          ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+        }).promise();
+      } catch (error: any) {
+        // Only an absent optional table on the first page means an empty inventory.
+        if (optional && !cursor && error?.code === 'ResourceNotFoundException') return [];
+        throw error;
+      }
+      if (!page || !Array.isArray(page.Items)) throw new EvaluationDenied();
+      for (const item of page.Items) {
+        if (!item || typeof item !== 'object' || Array.isArray(item) || !owns(item)) throw new EvaluationDenied();
+        rows.push(item);
+      }
+      cursor = page.LastEvaluatedKey;
+      if (cursor !== undefined) {
+        if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor) || !Object.keys(cursor).length) throw new EvaluationDenied();
+        const token = JSON.stringify(Object.entries(cursor).sort(([a], [b]) => a.localeCompare(b)));
+        if (seen.has(token)) throw new EvaluationDenied();
+        seen.add(token);
+      }
+    } while (cursor);
+    return rows;
+  }
+
+  private async prepareCredentialCleanup(userId: string): Promise<() => Promise<Record<string, number>>> {
+    // No GSI can provide a complete revocation inventory under index lag. Read
+    // primary tables consistently, projecting only key and owner (never secrets).
+    const inventories: Array<{ table: string; key: string; owner: string; rows: Record<string, unknown>[] }> = [];
     for (const [table, key, owner] of [
       ['AW-AgentApiKeys', 'keyId', 'userId'], ['AW-MCPOAuthTokens', 'tokenHash', 'userId'],
       ['AW-MCPOAuthCodes', 'code', 'userId'], ['AW-MCPSessions', 'sessionId', 'agentUserId'],
       ['AW-TaskSchedules', 'scheduleId', 'userId'],
     ]) {
-      counts[table] = 0;
-      let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
-      do {
-        let page: AWS.DynamoDB.DocumentClient.ScanOutput;
-        try {
-          page = await this.db.scan({ TableName: `${this.prefix}${table}`, ConsistentRead: true, Limit: 100,
-            FilterExpression: '#owner = :user', ProjectionExpression: '#key, #owner',
-            ExpressionAttributeNames: { '#key': key, '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
-            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-          }).promise();
-        } catch (error: any) {
-          // Some environments use only the in-memory MCP store; absent tables hold no grants.
-          if (error?.code === 'ResourceNotFoundException') break;
-          throw error;
-        }
-        if (!Array.isArray(page.Items)) throw new EvaluationDenied();
-        for (const item of page.Items) {
-          if (!item || item[owner] !== userId || typeof item[key] !== 'string') throw new EvaluationDenied();
+      const rows = await this.inventory({ TableName: `${this.prefix}${table}`,
+        FilterExpression: '#owner = :user', ProjectionExpression: '#key, #owner',
+        ExpressionAttributeNames: { '#key': key, '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
+      }, item => item[owner] === userId && typeof item[key] === 'string' && !!item[key], true);
+      inventories.push({ table, key, owner, rows });
+    }
+    return async () => {
+      const counts: Record<string, number> = {};
+      for (const { table, key, owner, rows } of inventories) {
+        counts[table] = 0;
+        for (const item of rows) {
           try {
             await this.db.delete({ TableName: `${this.prefix}${table}`, Key: { [key]: item[key] },
               ConditionExpression: '#owner = :user', ExpressionAttributeNames: { '#owner': owner }, ExpressionAttributeValues: { ':user': userId },
@@ -258,10 +503,9 @@ export class EvaluationStore {
             counts[table]++;
           } catch (error: any) { if (error?.code !== 'ConditionalCheckFailedException') throw error; }
         }
-        cursor = page.LastEvaluatedKey;
-      } while (cursor);
-    }
-    return counts;
+      }
+      return counts;
+    };
   }
 }
 

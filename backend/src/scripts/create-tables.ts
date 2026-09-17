@@ -1930,6 +1930,9 @@ const createSpendEventsTable = async () => {
       },
     ],
     BillingMode: 'PAY_PER_REQUEST',
+    // Immutable no-TTL money ledger: guard against an accidental delete
+    // (matches ensureCriticalTables.ts).
+    DeletionProtectionEnabled: true,
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
@@ -2623,6 +2626,8 @@ const main = async () => {
     await createLeadMagnetConfigsTable();
     await createOnboardingLoopRunsTable();
     await createPromptSignalsTable();
+    await createEvaluationsTable();
+    await createAccountCapabilityRequirementsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3255,6 +3260,38 @@ const createV0UsageTable = async () => {
   }
 };
 
+// Create Account Capability Requirements table (ENG-1541 remainder — persisted per-account
+// capability tracking so the renewal-integration-health cron remembers state across runs
+// instead of re-deriving everything from scratch, and so a human correction can suppress a
+// specific occurrence without silencing the mechanism permanently). Only ever created for
+// users whose paid-ads intent is or was true; a user who has never needed the capability
+// never gets a row. No GSI — nothing queries across users by capability today.
+const createAccountCapabilityRequirementsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AccountCapabilityRequirements`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'capability', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'capability', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Run if this script is called directly
 if (require.main === module) {
   main();
@@ -3520,6 +3557,37 @@ const createPromptSignalsTable = async () => {
         ],
         Projection: { ProjectionType: 'ALL' },
       },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Evaluations table (sandbox policy/audit rows + dataset overlay, ENG-1870/ENG-1908).
+// Registered here for inventory/dev-environment completeness only — the production table
+// already exists and this call is a no-op against it (ResourceInUseException, caught below);
+// no schema, data, or IAM change. Single flat PK, no SK/GSI: `evaluationStore.ts` keys every
+// row `evaluation/<userId>` (policy) or `evaluation/<userId>/audit/<uuid>` (audit trail) and
+// finds the audit rows for one user with a table-wide Scan+FilterExpression, which is fine at
+// this table's low cardinality (one sandbox account at a time).
+const createEvaluationsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Evaluations`,
+    AttributeDefinitions: [
+      { AttributeName: 'evaluationKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'evaluationKey', KeyType: 'HASH' },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   };

@@ -26,15 +26,77 @@ import {
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
-import { listSpendEvents } from "../services/spendEventDb";
-import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
+import { listSpendEventsBounded } from "../services/spendEventDb";
+import { boundBreakdownRows, buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
 import { projectMonth } from "../services/spendProjection";
+import { LLM_SPEND_LEDGER_STARTED_ON } from "../services/spendLedgerDualWrite";
+import { measureLlmLedgerCoverage } from "../services/spendReconciliation";
+import { UsageRecordRow, usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
-import { userDb } from "../services/db";
-import { resolveBillingUserId } from "../services/tokenUsageService";
+import { orgDb, userDb } from "../services/db";
+import { checkTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
+import { describeEnforcement } from "../services/enforcementStateView";
 
 const router = express.Router();
+
+/**
+ * ENG-1841 bounds on the interactive spend breakdown.
+ *
+ * MAX_EVENTS caps the read. The largest subject-month on production was 542
+ * events on 2026-09-15 (2,450 across every subject for the whole of September),
+ * so this leaves ~90x headroom while making the work bounded by construction.
+ * ROWS_PER_CUT caps each detail list in the response; the portal renders 25.
+ */
+export const SPEND_BREAKDOWN_MAX_EVENTS = 50_000;
+export const SPEND_BREAKDOWN_ROWS_PER_CUT = 100;
+
+/**
+ * Every aggregate row billed to `billingUserId` in `month`, by keyed query.
+ *
+ * The aggregate table is partitioned by the ACTING user, so the rows billed to
+ * an org owner live under each member's partition. Rather than scanning the
+ * table for `billingUserId` (CodeRabbit, PR #2904 — scans are not allowed on
+ * a per-request path, and a billingUserId GSI is a data-plane change, ENG-1273),
+ * this queries the partitions that can hold them: the owner, the org's current
+ * members, and every acting user the ledger itself saw this month.
+ *
+ * A former member with aggregate rows but no ledger events is the one actor
+ * this cannot see. That can only make the aggregate side SMALLER than the
+ * ledger, which the coverage check reports as drift — `partial`, never a false
+ * `full`.
+ */
+/** Aggregate-partition queries run at once by the coverage read. */
+export const AGGREGATE_READ_CONCURRENCY = 8;
+
+async function readAggregateRowsForBillingSubject(
+  billingUserId: string,
+  month: string,
+  events: ReadonlyArray<{ actingUserId: string }>,
+) {
+  const actors = new Set<string>([billingUserId, ...events.map((e) => e.actingUserId).filter(Boolean)]);
+  const owner = await userDb.getUserById(billingUserId);
+  if (owner?.orgId) {
+    for (const member of await orgDb.getOrgMembers(owner.orgId)) actors.add(member.userId);
+  }
+
+  // Bounded fan-out: a large org must not burst one query per member at once
+  // (CodeRabbit, PR #2904). Batches keep an admin read from contributing to
+  // throttling on the table every LLM call writes to.
+  const rows: UsageRecordRow[] = [];
+  const queue = [...actors];
+  for (let i = 0; i < queue.length; i += AGGREGATE_READ_CONCURRENCY) {
+    const batch = await Promise.all(
+      queue
+        .slice(i, i + AGGREGATE_READ_CONCURRENCY)
+        .map((actor) => usageRecordDb.queryByUserDateRange(actor, `${month}-01`, `${month}-31`)),
+    );
+    rows.push(...batch.flat());
+  }
+  // A member's partition also holds rows billed to someone else (their own
+  // subscription, or before they pooled), so keep only this subject's.
+  return rows.filter((row) => row.billingUserId === billingUserId);
+}
 
 /**
  * ENG-1250 §7: the spend breakdown for one billing subject and month, built
@@ -84,7 +146,24 @@ router.get(
       // The GSI is keyed on occurredAt, so the range is the calendar month.
       // `-31` is safe for every month: it is an upper bound on a string
       // comparison, not a date that has to exist.
-      const events = await listSpendEvents(billingUserId, `${month}-01`, `${month}-31`);
+      // ENG-1841: bounded read. Past the ceiling the events are incomplete and
+      // every total built from them would be understated, so the endpoint says
+      // so instead of answering with a confident wrong number.
+      const { events, exceeded } = await listSpendEventsBounded(
+        billingUserId,
+        `${month}-01`,
+        `${month}-31`,
+        SPEND_BREAKDOWN_MAX_EVENTS,
+      );
+      if (exceeded) {
+        return res.status(422).json({
+          error:
+            `This billing subject has more than ${SPEND_BREAKDOWN_MAX_EVENTS.toLocaleString()} spend events in ${month} — ` +
+            "too many to summarise exactly here. Use the reconciliation report for this month.",
+          code: "spend_breakdown_too_large",
+          eventLimit: SPEND_BREAKDOWN_MAX_EVENTS,
+        });
+      }
       const breakdown = buildSpendBreakdown(billingUserId, month, events);
 
       const allowance = await resolveAllowanceInputs(billingUserId, month, {
@@ -100,16 +179,44 @@ router.get(
       // explained — the opposite of what this endpoint exists for.
       const projection = projectMonth(billingUserId, month, events, allowance, allowance.policy as any);
 
+      // ENG-1934: the aggregate rail for the same subject and month, read only
+      // when the month can hold LLM events at all. A failed read degrades the
+      // coverage to "partial" rather than failing the breakdown.
+      const aggregateRows =
+        month >= LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7)
+          ? await readAggregateRowsForBillingSubject(billingUserId, month, events).catch((error: any) => {
+              console.error("[adminUsage] LLM coverage read failed:", error?.message || error);
+              return null;
+            })
+          : null;
+
       return res.json({
-        ...breakdown,
+        // Totals are over the whole month; only the detail row lists are
+        // bounded, with what was left out counted in `omitted` (ENG-1841).
+        ...boundBreakdownRows(breakdown, SPEND_BREAKDOWN_ROWS_PER_CUT),
         // Echoed so the UI can say WHOSE ledger this is when the two differ —
         // an admin who opened a member must see they are reading the org's
         // spend, not that member's.
         requestedUserId,
         allowance,
         projection,
-        // §7: "no admin should need direct DynamoDB inspection to explain a pause"
+        // SHADOW (spendProjection): the ledger's hypothetical pause, which
+        // nothing enforces. Not rendered as a pause (ENG-1874) — `enforcement`
+        // below is the real decision.
         pause: explainPause(projection, breakdown),
+        // ENG-1886: whether the account is ACTUALLY paused — the enforcer's own
+        // result, not a recomputation. Current month only; a failed read is
+        // reported as unreadable rather than failing the breakdown.
+        enforcement: await checkTokenUsage(billingUserId)
+          .then((status) => describeEnforcement(status, month))
+          .catch((error: any) => {
+            console.error("[adminUsage] enforcement state read failed:", error?.message || error);
+            return { available: false as const, reason: "unreadable" as const, message: "Could not read the enforcer's state" };
+          }),
+        // ENG-1934: how much of this month's LLM spend the total includes,
+        // measured against the aggregate rail. The allowance comparison is only
+        // meaningful beside it.
+        llmLedger: measureLlmLedgerCoverage(month, events, aggregateRows),
       });
     } catch (error: any) {
       console.error("[adminUsage] spend breakdown failed:", error?.message || error);

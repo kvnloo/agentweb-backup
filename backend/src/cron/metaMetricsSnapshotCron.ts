@@ -51,10 +51,12 @@ const PLATFORM: AdsPlatform = "meta";
 // ("stored figures reconcile with Meta Ads Manager to within 1%") in the flattering direction:
 // reconcile inside 3 days and it passes, reconcile at day 10 and the gap has opened.
 //
-// Cost is one Graph call per day per account, so 28 is trivial at this card's Haven-only scope.
-// If this ever covers the fleet, TIER it (daily for the recent tail, weekly for days 8-28) —
-// the cost multiplies by accounts and by pagination, not just by days.
-const SETTLING_WINDOW_DAYS = 28;
+// Cost is one Graph call per date per account plus pagination. The final two
+// refresh dates add a bounded two calls per account to the existing daily pass.
+// Keep two additional reporting dates: at the 09:00 UTC run, today-30
+// has passed its reporting-day end + 28 elapsed days even at UTC-12.
+// This supplies the final settled refresh consumed by ENG-502; no backfill.
+const REFRESH_WINDOW_DAYS = 30;
 
 /**
  * The spellings a campaign name can legitimately arrive as in a `utm_campaign` value.
@@ -93,7 +95,7 @@ function toDateStr(d: Date): string {
  *
  * ONE walk of each list serves the WHOLE settling window. The per-date helper below must scan
  * every page (see its comment — ordering is by `leadId`, not `createdAt`, so it cannot early-stop),
- * so calling it once per day meant SETTLING_WINDOW_DAYS full walks of every list on every run.
+ * so calling it once per day meant REFRESH_WINDOW_DAYS full walks of every list on every run.
  * At a 28-day window that is ~9x the DynamoDB read load of the original 3-day version for no extra
  * information: the pages are identical each time, only the date filter differs. Bucketing once and
  * indexing by date is strictly less work and changes no behaviour — a date with no leads simply has
@@ -255,7 +257,7 @@ export async function snapshotMetaMetricsForDate(
 ): Promise<SnapshotResult> {
   // Credentials are resolved ONCE PER RUN by runMetaMetricsSnapshot and passed in, because
   // getMetaAccountCredentials reads the user record and can refresh + PERSIST the Meta token
-  // inline (fb_exchange_token). Resolving per day meant SETTLING_WINDOW_DAYS redundant reads
+  // inline (fb_exchange_token). Resolving per day meant REFRESH_WINDOW_DAYS redundant reads
   // against a live managed client's record every run, and — once a token finally expires —
   // that many identical CRITICAL ERRORs instead of one. The parameter stays optional so this
   // function is still usable standalone (a future backfill script) without duplicating the
@@ -582,7 +584,7 @@ export async function enumerateDistinctMetaAdAccounts(): Promise<DistinctMetaAdA
 /**
  * Cron entry point — for every distinct Meta ad account (see
  * `enumerateDistinctMetaAdAccounts`), re-pulls and overwrites the last
- * SETTLING_WINDOW_DAYS days (excluding today, which is never complete) every run. Each
+ * REFRESH_WINDOW_DAYS days (excluding today, which is never complete) every run. Each
  * ACCOUNT is isolated (one account's credential/CRM failure does not stop the others), and
  * within an account each DAY is isolated the same way it always was.
  */
@@ -621,7 +623,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
       continue;
     }
 
-    // One walk of every list serves all SETTLING_WINDOW_DAYS days for this account's
+    // One walk of every list serves all REFRESH_WINDOW_DAYS days for this account's
     // canonical user. A failure here is fatal to this account for the same reason a
     // credential failure is, but does not affect any other account.
     let leadsByDate: Map<string, any[]>;
@@ -636,7 +638,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     }
 
     const today = new Date();
-    for (let daysAgo = 1; daysAgo <= SETTLING_WINDOW_DAYS; daysAgo++) {
+    for (let daysAgo = 1; daysAgo <= REFRESH_WINDOW_DAYS; daysAgo++) {
       const target = new Date(today);
       target.setUTCDate(target.getUTCDate() - daysAgo);
       const dateStr = toDateStr(target);

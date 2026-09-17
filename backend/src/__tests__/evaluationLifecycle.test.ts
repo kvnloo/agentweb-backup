@@ -1,7 +1,9 @@
-// Human contract (ENG-1907 AC 4/5, ENG-1870 AC 1/2/7): tier-gated isolated provision, no production Meta path, full revoke.
-import { EvaluationStore, SandboxTierMissing } from '../services/evaluationStore';
+// Human contract (ENG-1907 AC 4/5, ENG-1870 AC 1/2/7, ENG-1908 AC 1): tier- and dataset-gated isolated provision, simulated Meta connection, no production Meta path, full revoke.
+import { EvaluationStore, SandboxTierMissing, SandboxDatasetMissing, setSandboxProvisionDeps } from '../services/evaluationStore';
 import { SANDBOX_TOOL_CLASS_NAMES } from '../services/evaluationPolicy';
 import { getSubscriptionTypeConfig } from '../services/subscriptionService';
+import { isSandboxToken, sandboxAdAccountId, sandboxTokenUserId } from '../services/sandbox/sentinel';
+import { describeMetaAdsCapability } from '../utils/metaAdsScope';
 
 jest.mock('../services/subscriptionService', () => ({ getSubscriptionTypeConfig: jest.fn() }));
 
@@ -12,12 +14,46 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
   const update = jest.fn((_request: any) => ({ promise: async () => ({}) }));
   const remove = jest.fn((_request: any) => ({ promise: async () => ({}) }));
   const store = new EvaluationStore({ transactWrite, get, scan, update, delete: remove } as any);
-  const request = { email: 'Candidate@Example.invalid', displayName: 'Test candidate', password: 'Synthetic-password-123!', expiresAt: Date.now() + 3600000, brandGuidelines: { brandName: 'Synthetic Co', website: 'https://synthetic.invalid', description: 'A synthetic case' } };
+  const loadDatasetSummary = jest.fn();
+  const summary = { account: { account_id: 'ignored-by-provision', currency: 'USD', name: 'AgentWeb (sandbox)', timezone_name: 'UTC' } };
+  const request = { email: 'Candidate@Example.invalid', displayName: 'Test candidate', password: 'Synthetic-password-123!', expiresAt: Date.now() + 3600000, brandGuidelines: { brandName: 'Synthetic Co', website: 'https://synthetic.invalid', description: 'A synthetic case' }, datasetId: 'agentweb-2026q2', datasetVersion: 1 };
   const userPut = () => transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.TableName.endsWith('AW-Users')).Put;
   const policyPut = () => transactWrite.mock.calls[0][0].TransactItems.find((w: any) => w.Put?.Item?.evaluationKey?.startsWith('evaluation/eval_') && w.Put?.Item?.mode).Put;
   beforeEach(() => {
     jest.clearAllMocks();
     (getSubscriptionTypeConfig as jest.Mock).mockResolvedValue({ name: 'Sandbox', allowedPages: ['*'], allowedSkills: ['*'] });
+    loadDatasetSummary.mockResolvedValue(summary);
+    setSandboxProvisionDeps({ loadDatasetSummary });
+  });
+
+  it('refuses to provision when the pinned dataset does not exist, before any write (ENG-1908)', async () => {
+    loadDatasetSummary.mockResolvedValue(null);
+    await expect(store.provision('admin', request)).rejects.toBeInstanceOf(SandboxDatasetMissing);
+    await expect(store.provision('admin', request)).rejects.toThrow('agentweb-2026q2@1');
+    expect(loadDatasetSummary).toHaveBeenCalledWith('agentweb-2026q2', 1);
+    expect(transactWrite).not.toHaveBeenCalled();
+  });
+
+  it('writes exactly one Meta connection carrying a sentinel token that the portal reads as Connected + ads-capable (ENG-1908 AC 1)', async () => {
+    const result = await store.provision('admin', request);
+    const item = userPut().Item;
+    expect(item.connected_accounts).toHaveLength(1);
+    const row = item.connected_accounts[0];
+    expect(row).toMatchObject({ platform: 'meta', account_id: sandboxAdAccountId(result.userId), account_name: 'AgentWeb (sandbox)' });
+    expect(typeof row.created_at).toBe('string');
+    expect(typeof row.updated_at).toBe('string');
+    expect(row.config).toMatchObject({ account_type: 'ad_account', ad_account_id: sandboxAdAccountId(result.userId), currency: 'USD', account_status: 1, scopes: expect.arrayContaining(['ads_management', 'ads_read']), granted_scopes: ['ads_management', 'ads_read'] });
+    expect(isSandboxToken(row.config.access_token)).toBe(true);
+    expect(sandboxTokenUserId(row.config.access_token)).toBe(result.userId);
+    expect(row.config.token_expires_at).toBeGreaterThanOrEqual(request.expiresAt + 90 * 86400000);
+    expect(describeMetaAdsCapability(row)).toEqual({ ads_capable: true });
+    expect(policyPut().Item).toMatchObject({ datasetId: 'agentweb-2026q2', datasetVersion: 1 });
+  });
+
+  it.each([{ datasetId: undefined }, { datasetId: 'bad id' }, { datasetVersion: undefined }, { datasetVersion: 0 }, { datasetVersion: 1.5 }])('rejects a missing or malformed dataset pin %p before persisting', async override => {
+    await expect(store.provision('admin', { ...request, ...override } as any)).rejects.toThrow();
+    expect(transactWrite).not.toHaveBeenCalled();
+    expect(loadDatasetSummary).not.toHaveBeenCalled();
   });
 
   it('refuses to provision when the Sandbox tier row does not exist (AC 4)', async () => {
@@ -56,7 +92,11 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
   it('never writes the legacy adAccount field (the shared-production-token path)', async () => {
     await store.provision('admin', { ...request, adAccount: '123456789' } as any);
     expect(Object.keys(userPut().Item)).not.toContain('adAccount');
-    expect(userPut().Item.connected_accounts).toBeUndefined();
+    // The only connection is the simulated one; nothing real can be smuggled in through the request.
+    await store.provision('admin', { ...request, connected_accounts: [{ platform: 'meta', account_id: '1', config: { access_token: 'EAAreal' } }] } as any);
+    const rows = transactWrite.mock.calls[1][0].TransactItems.find((w: any) => w.Put?.TableName.endsWith('AW-Users')).Put.Item.connected_accounts;
+    expect(rows).toHaveLength(1);
+    expect(isSandboxToken(rows[0].config.access_token)).toBe(true);
   });
 
   it('writes the sandbox policy record with simulated Meta and every tool class denied by default', async () => {
@@ -67,9 +107,10 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
   });
 
   it('honors an explicit subset of denied classes, label, and dataset pin, but always keeps lifecycle denied', async () => {
-    await store.provision('admin', { ...request, label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 1, deniedToolClasses: ['sends'], reviewerUserIds: ['reviewer-1'] });
-    expect(policyPut().Item).toMatchObject({ label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 1, reviewerUserIds: ['reviewer-1'] });
+    await store.provision('admin', { ...request, label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 2, deniedToolClasses: ['sends'], reviewerUserIds: ['reviewer-1'] });
+    expect(policyPut().Item).toMatchObject({ label: 'Practice account', datasetId: 'agentweb-2026q2', datasetVersion: 2, reviewerUserIds: ['reviewer-1'] });
     expect(policyPut().Item.deniedToolClasses).toEqual(['sends', 'lifecycle']);
+    expect(loadDatasetSummary).toHaveBeenCalledWith('agentweb-2026q2', 2);
   });
 
   it.each([
@@ -162,9 +203,10 @@ describe('ENG-1907 sandbox lifecycle persistence invariants', () => {
 
   it('review is limited to the provisioning admin and explicitly assigned reviewers and returns only status + audit', async () => {
     get.mockReturnValue({ promise: async () => ({ Item: { userId: 'eval_test', status: 'revoked', provisionedBy: 'admin', reviewerUserIds: ['matt'], materials: [{ title: 'x', text: 'y' }] } }) });
+    get.mockImplementation(({ Key }: any) => ({ promise: async () => ({ Item: Key.evaluationKey.endsWith('/sim') ? undefined : { userId: 'eval_test', status: 'revoked', provisionedBy: 'admin', reviewerUserIds: ['matt'] } }) }));
     scan.mockImplementation(() => ({ promise: async () => ({ Items: [{ evaluationKey: 'evaluation/eval_test/audit/1', userId: 'eval_test', action: 'provision' }], LastEvaluatedKey: undefined }) }));
     const result = await store.review('matt', 'eval_test');
-    expect(result).toEqual({ userId: 'eval_test', status: 'revoked', audit: [expect.objectContaining({ action: 'provision' })], truncated: false });
+    expect(result).toEqual(expect.objectContaining({ userId: 'eval_test', status: 'revoked', audit: [expect.objectContaining({ action: 'provision' })], truncated: false }));
     await expect(store.review('stranger', 'eval_test')).rejects.toThrow();
   });
 });

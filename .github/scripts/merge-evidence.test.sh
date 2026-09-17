@@ -963,6 +963,39 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'ENG-1453: a similarly-named but distinct check is NOT swallowed by the allowlist' 1 'Require Greptile Review (extended) (failure)'
 
+# ENG-502: the retired integration still emits pending check-runs on ready PRs.
+for conclusion in pending failure success; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  if [ "${conclusion}" = pending ]; then
+    review='"status":"in_progress","conclusion":null'
+  else
+    review="\"status\":\"completed\",\"conclusion\":\"${conclusion}\""
+  fi
+  checkruns "${d}" '[
+    {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+    {"name":"Greptile Review",'"${review}"'}
+  ]'
+  run_gate "${d}"
+  check "retired Greptile integration ${conclusion} is excluded" 0 'VERDICT: PASS'
+done
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Greptile Review","status":"in_progress","conclusion":null}
+]'
+run_gate "${d}"
+check 'active failure still blocks beside retired integration' 1 'CI script tests (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[{"name":"Greptile Review","status":"completed","conclusion":"success"}]'
+run_gate "${d}"
+check 'retired integration success is not execution evidence' 3 'NO_EVIDENCE'
+
 # ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
 # ---------------------------------------------------------------------------

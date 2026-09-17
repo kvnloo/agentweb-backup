@@ -2,15 +2,16 @@
  * Tests for the shadow-metering price book.
  *
  * The "registry coverage" suite is the CI guard: every model id in
- * agentModeService's llmModels registry MUST have a price entry. It parses the
- * registry out of the source file (rather than importing the 470KB module with
- * its construction side effects) so the guard stays cheap and side-effect free.
+ * the LLM model registry MUST have a price entry. It imports the registry from
+ * agentMode/llmModelRegistry.ts (ENG-1831), which has no runtime dependencies,
+ * so the guard stays cheap and side-effect free.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
+  LLM_PRICE_BOOK_VERSION,
+  LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
   getModelPrice,
@@ -22,20 +23,44 @@ import {
 import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
 
 function parseLlmModelsRegistryKeys(): string[] {
-  const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
-  const src = fs.readFileSync(srcPath, 'utf8');
-  const blockMatch = src.match(
-    /private llmModels: Record<string, LLMModelConfig> = \{([\s\S]*?)\n {2}\};/
-  );
-  if (!blockMatch) {
-    throw new Error('Could not locate the llmModels registry in agentModeService.ts');
-  }
-  const keys = [...blockMatch[1].matchAll(/^\s*'([^']+)':\s*\{/gm)].map((m) => m[1]);
-  if (keys.length === 0) {
-    throw new Error('Parsed zero model ids from the llmModels registry');
-  }
-  return keys;
+  return Object.keys(LLM_MODEL_REGISTRY);
 }
+
+/**
+ * ENG-1934: every LLM spend event carries LLM_PRICE_BOOK_VERSION, so a price
+ * edit that forgets to bump it would leave two different prices under one
+ * version and make historical events impossible to re-derive. A fingerprint of
+ * the tables is pinned to the version; changing a price fails this test until
+ * BOTH are updated in the same commit.
+ */
+describe('price book version (ENG-1250 §5, ENG-1934)', () => {
+  const canonical = (value: unknown): string =>
+    value && typeof value === 'object'
+      ? `{${Object.keys(value as object)
+          .sort()
+          .map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`)
+          .join(',')}}`
+      : JSON.stringify(value);
+
+  const fingerprint = () =>
+    require('crypto')
+      .createHash('sha256')
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .digest('hex')
+      .slice(0, 16);
+
+  it('is a dated version string', () => {
+    expect(LLM_PRICE_BOOK_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(LLM_PRICE_BOOK_PROVENANCE).toBe(`llm-price-book:${LLM_PRICE_BOOK_VERSION}`);
+  });
+
+  it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
+    expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
+      version: '2026-09-10',
+      fingerprint: 'a271b4b8838a9308',
+    });
+  });
+});
 
 describe('llmPricing', () => {
   beforeEach(() => {

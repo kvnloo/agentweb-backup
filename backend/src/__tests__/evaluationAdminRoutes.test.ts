@@ -2,7 +2,7 @@ import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import { evaluationAdminRoutes } from '../routes/evaluation';
-import { evaluationStore, SandboxTierMissing } from '../services/evaluationStore';
+import { evaluationStore, SandboxTierMissing, SandboxDatasetMissing } from '../services/evaluationStore';
 import { userDb } from '../services/db';
 
 jest.mock('../config/jwt', () => ({ getJwtSecret: () => 'synthetic-route-signing-secret' }));
@@ -14,8 +14,11 @@ jest.mock('../services/db', () => ({ userDb: {
 jest.mock('../services/evaluationStore', () => {
   // Mirrors the real class: the route forwards its message, which names the fix.
   class SandboxTierMissing extends Error { constructor() { super('The "Sandbox" subscription tier is not defined; run scripts/ensure-sandbox-tier.ts before provisioning.'); } }
-  return { SandboxTierMissing, evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn() } };
+  class SandboxDatasetMissing extends Error { constructor(id = 'agentweb-2026q2', version = 1) { super(`Sandbox dataset ${id}@${version} is not loaded; compile and load it before provisioning.`); } }
+  return { SandboxTierMissing, SandboxDatasetMissing, evaluationStore: { get: jest.fn(), provision: jest.fn(), revoke: jest.fn(), review: jest.fn(), listAll: jest.fn() } };
 });
+const mockListDatasets = jest.fn();
+jest.mock('../services/sandbox/sandboxDatasetStore', () => ({ getSandboxDatasetStore: () => ({ listDatasets: mockListDatasets }) }));
 
 describe('ENG-1907 sandbox admin routes', () => {
   const app = express();
@@ -41,6 +44,12 @@ describe('ENG-1907 sandbox admin routes', () => {
     const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
     expect(result.status).toBe(412);
     expect(result.body.error).toContain('ensure-sandbox-tier');
+  });
+  it('a missing pinned dataset is reported as a precondition failure too (ENG-1908)', async () => {
+    (evaluationStore.provision as jest.Mock).mockRejectedValueOnce(new SandboxDatasetMissing('agentweb-2026q2', 1));
+    const result = await request(app).post('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`).send(provision);
+    expect(result.status).toBe(412);
+    expect(result.body.error).toContain('agentweb-2026q2@1');
   });
   it('a stale admin session cannot provision after administrator deactivation', async () => {
     (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValueOnce({ userId: 'admin', isAdmin: true, isActive: false });
@@ -80,5 +89,33 @@ describe('ENG-1907 sandbox admin routes', () => {
   it('the candidate artifact download route no longer exists', async () => {
     const result = await request(app).get('/api/admin/evaluations/eval_test/artifacts/file').set('Authorization', `Bearer ${token('admin')}`);
     expect(result.status).toBe(404);
+  });
+
+  it('admin lists every sandbox account without a terminal', async () => {
+    (evaluationStore.listAll as jest.Mock).mockResolvedValue([{ userId: 'eval_a', email: 'a@example.invalid', status: 'active' }]);
+    const result = await request(app).get('/api/admin/evaluations').set('Authorization', `Bearer ${token('admin')}`);
+    expect(result.status).toBe(200);
+    expect(result.body).toEqual({ accounts: [{ userId: 'eval_a', email: 'a@example.invalid', status: 'active' }] });
+    expect(result.headers['cache-control']).toBe('no-store');
+  });
+
+  it('a non-admin cannot list sandbox accounts', async () => {
+    const result = await request(app).get('/api/admin/evaluations').set('Authorization', `Bearer ${token('customer')}`);
+    expect(result.status).toBe(403);
+    expect(evaluationStore.listAll).not.toHaveBeenCalled();
+  });
+
+  it('admin lists available datasets for the create-account picker, and it never gets swallowed as a :userId lookup', async () => {
+    mockListDatasets.mockResolvedValue([{ datasetId: 'agentweb-2026q2', version: 1 }]);
+    const result = await request(app).get('/api/admin/evaluations/datasets').set('Authorization', `Bearer ${token('admin')}`);
+    expect(result.status).toBe(200);
+    expect(result.body).toEqual({ datasets: [{ datasetId: 'agentweb-2026q2', version: 1 }] });
+    expect(evaluationStore.review).not.toHaveBeenCalled();
+  });
+
+  it('a non-admin cannot list datasets', async () => {
+    const result = await request(app).get('/api/admin/evaluations/datasets').set('Authorization', `Bearer ${token('customer')}`);
+    expect(result.status).toBe(403);
+    expect(mockListDatasets).not.toHaveBeenCalled();
   });
 });

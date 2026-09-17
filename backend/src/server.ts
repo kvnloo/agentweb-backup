@@ -1,5 +1,6 @@
 import { requireActiveEvaluation } from './services/evaluationPolicy';
 import { evaluationSocketDecision } from './utils/socketEvaluationAuth';
+import { installSandboxMetaInterceptorAtBoot } from './services/sandbox/bootstrap';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -578,6 +579,19 @@ createTestAccount().then(async () => {
       return;
     }
 
+    // ENG-1908: install the sandbox Meta interceptor once, here, in every real runtime
+    // (dev/staging/prod) but never under the Jest test-boot path above — same reasoning as
+    // the ENG-1286 guard: metaInterceptor.test.ts manages its own install/uninstall lifecycle
+    // against the same module-level singleton, and this call is synchronous with no timer or
+    // dynamic import, so it carries none of the risk that guard exists for; it just needs to
+    // stay on this side of the same line so it doesn't fire during an incidental test boot.
+    try {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[server] Sandbox Meta interceptor installed');
+    } catch (error) {
+      console.error('[server] Failed to install sandbox Meta interceptor:', (error as Error).message);
+    }
+
     // ENG-764: an EB deploy terminates this instance without waiting for the
     // drain, killing any in-flight scheduled run. Watch for the ASG's termination
     // signal, drain first, then release the instance. Self-disables off-ASG (local
@@ -606,7 +620,18 @@ createTestAccount().then(async () => {
     console.log('Initializing Agent Mode Tools (non-blocking)...');
     agentModeService.initialize()
       .then(() => {
-        console.log('Agent Mode Tools initialized successfully');
+        // initialize() resolves even when a step failed — every step swallows its own
+        // errors — so this must report the actual outcome. Logging unconditional success
+        // directly beneath the latch's own failure line is how a degraded boot reads as a
+        // healthy one, which cost real debugging time on ENG-1852.
+        if (agentModeService.isInitialized) {
+          console.log('Agent Mode Tools initialized successfully');
+        } else {
+          console.error(
+            'Agent Mode Tools initialization DEGRADED — a later request will retry. ' +
+            'See the AgentMode latch error above for which step failed.',
+          );
+        }
         // Pre-start the worker process so MCP servers are ready before the first chat message
         console.log('Pre-starting worker process...');
         generateMarketingResponseWorkerService.ensureWorkerReady()
@@ -730,10 +755,18 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
+      const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
+      setInterval(() => {
+        if (!isCronEnabled()) return;
+        cronJobRegistry.track('AdsLearningEvaluation', runAdsLearningEvaluation())
+          .catch(e => console.error('[AdsLearning] due evaluation failed:', e));
+      }, 15 * 60 * 1000).unref();
+      console.info('[AdsLearning] evaluation scheduled every 15 minutes');
+
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
-      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
-      // (28, sized against Meta's documented insights-mutability window) so a stored row
-      // doesn't freeze while Meta is still revising it.
+      // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
+      // final refresh occurs after reporting-day end plus 28 elapsed days.
       try {
         const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
         const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
