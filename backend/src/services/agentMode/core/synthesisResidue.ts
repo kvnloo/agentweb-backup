@@ -898,23 +898,27 @@ const ACCEPTANCE_FAILURE_MARKER = 'VERIFICATION FAILED — coding_agent';
  * ORIGINAL ENG-1899 incident's own shape — can have the model's second completion echo its own
  * prior (already-decorated) turn from conversation history, so the banner appears twice: once
  * copied by the model, once freshly prepended here. This function still ran exactly once per call
- * (confirmed live via container logs); the model supplied the duplicate. Skipping when the marker
- * is already present fixes the user-visible result regardless of which side produced the copy —
- * a real duplicate banner is a UX defect even when every word in it is true.
+ * (confirmed live via container logs); the model supplied the duplicate.
+ *
+ * Independent-review finding: an earlier revision suppressed on any occurrence of the bare marker
+ * PHRASE anywhere in `currentContent` — which also fires when the model's prose merely recaps an
+ * OLDER, different failure (e.g. "last time you saw: ⚠️ VERIFICATION FAILED..."), silently
+ * swallowing a genuinely new, currently-real failure this same turn. That is the expensive
+ * direction to be wrong — a live problem going unreported — not the cheap one. Fixed by computing
+ * the full notice text FIRST and only suppressing when `currentContent` already contains that
+ * EXACT string: a real echo of this turn's own notice reproduces it verbatim (same failed checks,
+ * same messages), while a different or new failure produces different text that won't match.
  *
  * Returns null when no `coding_agent` call this turn has a real failure — a `'passed'` result, a
  * `'not_run'` result (no acceptance checks configured), or no `coding_agent` call at all — or when
- * `currentContent` already shows this notice. Redundant when the model was already honest about
- * it (or already showing it); that is the cheap direction to be wrong.
+ * `currentContent` already contains this exact notice verbatim. Redundant when the model was
+ * already honest about it (or already showing this exact notice); that is the cheap direction to
+ * be wrong.
  */
 export function buildAcceptanceFailureNotice(
   toolCalls: ExecutedToolCall[],
   currentContent?: string,
 ): string | null {
-  if (typeof currentContent === 'string' && currentContent.includes(ACCEPTANCE_FAILURE_MARKER)) {
-    return null;
-  }
-
   const calls = toolCalls ?? [];
   const failures: Array<{ summaryLine: string }> = [];
 
@@ -951,7 +955,7 @@ export function buildAcceptanceFailureNotice(
   if (failures.length === 0) return null;
 
   const plural = failures.length > 1;
-  return (
+  const notice = (
     `⚠️ ${ACCEPTANCE_FAILURE_MARKER}'s own acceptance check${plural ? 's did' : ' did'} not ` +
     `pass this turn, so the change below may not actually be live or correct even if it is ` +
     `described as done:\n` +
@@ -959,6 +963,12 @@ export function buildAcceptanceFailureNotice(
     `\n\nTreat the summary that follows as the model's own unverified account of what it did, not ` +
     `as confirmed fact — it may describe a state that does not match what is actually deployed.`
   );
+
+  if (typeof currentContent === 'string' && currentContent.includes(notice)) {
+    return null;
+  }
+
+  return notice;
 }
 
 export function buildFalseClaimCorrectionFooter(
