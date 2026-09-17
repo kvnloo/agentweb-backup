@@ -869,6 +869,13 @@ function codingAgentResult(call: ExecutedToolCall): CodingAgentResultShape | nul
 }
 
 /**
+ * Stable, unique substring identifying this notice — used both to build the banner and, below, to
+ * detect one already present in `content` before prepending another. Kept as one constant so the
+ * two can never drift apart.
+ */
+const ACCEPTANCE_FAILURE_MARKER = 'VERIFICATION FAILED — coding_agent';
+
+/**
  * ENG-1899. `coding_agent`'s own deterministic acceptance checks are real — they run against the
  * actual preview URL, not the model's opinion of it — and `codingAgentService.ts` already forces
  * `success: false` when they fail. But the human-readable `message` it returns is built as
@@ -886,18 +893,53 @@ function codingAgentResult(call: ExecutedToolCall): CodingAgentResultShape | nul
  * state must be seen before the model's own possibly-false claim, not after it, or the same
  * anchoring effect that produced the original incident this module exists for repeats here.
  *
+ * `currentContent` (optional) is the text this notice is about to be prepended to. Found live on
+ * env1 (not a hypothetical): a session that hits two consecutive coding_agent failures — the
+ * ORIGINAL ENG-1899 incident's own shape — can have the model's second completion echo its own
+ * prior (already-decorated) turn from conversation history, so the banner appears twice: once
+ * copied by the model, once freshly prepended here. This function still ran exactly once per call
+ * (confirmed live via container logs); the model supplied the duplicate. Skipping when the marker
+ * is already present fixes the user-visible result regardless of which side produced the copy —
+ * a real duplicate banner is a UX defect even when every word in it is true.
+ *
  * Returns null when no `coding_agent` call this turn has a real failure — a `'passed'` result, a
- * `'not_run'` result (no acceptance checks configured), or no `coding_agent` call at all. Redundant
- * when the model was already honest about it; that is the cheap direction to be wrong.
+ * `'not_run'` result (no acceptance checks configured), or no `coding_agent` call at all — or when
+ * `currentContent` already shows this notice. Redundant when the model was already honest about
+ * it (or already showing it); that is the cheap direction to be wrong.
  */
-export function buildAcceptanceFailureNotice(toolCalls: ExecutedToolCall[]): string | null {
+export function buildAcceptanceFailureNotice(
+  toolCalls: ExecutedToolCall[],
+  currentContent?: string,
+): string | null {
+  if (typeof currentContent === 'string' && currentContent.includes(ACCEPTANCE_FAILURE_MARKER)) {
+    return null;
+  }
+
   const calls = toolCalls ?? [];
   const failures: Array<{ summaryLine: string }> = [];
 
-  calls.forEach((call) => {
+  // Independent review finding (ENG-1899): a failure isn't still true once a LATER
+  // coding_agent call in the same turn passed. The tool's own contract ("call
+  // coding_agent ONCE per user request unless it explicitly fails") means a second
+  // call in the same turn is a retry of the same request, and `acceptance.checks`
+  // re-verifies the full configured set fresh each call, not incrementally — so a
+  // later 'passed' result is a complete, current statement that nothing is broken
+  // anymore. Reporting the earlier, now-superseded failure would itself be exactly
+  // the "stale claim contradicts current true state" defect this notice exists to
+  // prevent. No per-call target id (e.g. page_id) is threaded onto the ledger, so
+  // this can't distinguish "retried the same page" from "edited a different page
+  // that happens to pass" — accepted, since the tool's contract treats same-turn
+  // calls as sequential attempts at one request, not independent parallel targets.
+  calls.forEach((call, index) => {
     const result = codingAgentResult(call);
     if (!result) return;
     if (result.acceptanceStatus !== 'failed' && result.acceptanceStatus !== 'blocked') return;
+
+    const supersededByLaterPass = calls.slice(index + 1).some((laterCall) => {
+      const laterResult = codingAgentResult(laterCall);
+      return laterResult?.acceptanceStatus === 'passed';
+    });
+    if (supersededByLaterPass) return;
 
     const failedChecks = (result.acceptance?.checks ?? []).filter((c) => c.status !== 'passed');
     const checkLines = failedChecks.length > 0
@@ -910,7 +952,7 @@ export function buildAcceptanceFailureNotice(toolCalls: ExecutedToolCall[]): str
 
   const plural = failures.length > 1;
   return (
-    `⚠️ VERIFICATION FAILED — coding_agent's own acceptance check${plural ? 's did' : ' did'} not ` +
+    `⚠️ ${ACCEPTANCE_FAILURE_MARKER}'s own acceptance check${plural ? 's did' : ' did'} not ` +
     `pass this turn, so the change below may not actually be live or correct even if it is ` +
     `described as done:\n` +
     failures.map((f) => f.summaryLine).join('\n') +

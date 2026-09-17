@@ -4598,11 +4598,16 @@ export class AgentModeService {
            * possibly-false claim rather than after it. Own kill switch per this block's convention:
            * a false positive here prepends a scary banner to an otherwise-correct answer, so standing
            * it down must be a config change, not a revert-and-redeploy.
+           *
+           * `content` is passed through as `currentContent` so a turn that echoes an EARLIER turn's
+           * already-decorated response from conversation history (live env1 finding: two consecutive
+           * failed coding_agent calls in one session — the original incident's own shape — can produce
+           * exactly this) does not get a second, duplicated banner prepended on top.
            */
           const codingAgentAcceptanceNoticeEnabled =
             process.env.AGENT_CODING_AGENT_ACCEPTANCE_NOTICE !== 'false';
           if (codingAgentAcceptanceNoticeEnabled && content) {
-            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls);
+            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls, content);
             if (acceptanceNotice) {
               console.warn(
                 `AgentMode: coding_agent's acceptance check failed in session ${sessionId} — ` +
