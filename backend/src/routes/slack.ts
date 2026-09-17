@@ -44,6 +44,38 @@ function citeForSlack(response: any): string {
 
 const router = express.Router();
 
+const activeSlackTurns = new Map<string, number>();
+
+async function claimSlackAssistantStatus(channel: string, threadTs: string): Promise<void> {
+  const key = `${channel}:${threadTs}`;
+  const activeTurns = activeSlackTurns.get(key) || 0;
+  // Claim synchronously before awaiting Slack so concurrent turns cannot both
+  // observe the thread as idle while the first status request is in flight.
+  activeSlackTurns.set(key, activeTurns + 1);
+  if (activeTurns === 0) {
+    try {
+      await setSlackAssistantStatus(channel, threadTs, 'is working...');
+    } catch (error) {
+      console.error('Non-blocking: failed to set Slack assistant thread status:', error);
+    }
+  }
+}
+
+async function releaseSlackAssistantStatus(channel: string, threadTs: string): Promise<void> {
+  const key = `${channel}:${threadTs}`;
+  const remainingTurns = Math.max((activeSlackTurns.get(key) || 1) - 1, 0);
+  if (remainingTurns > 0) {
+    activeSlackTurns.set(key, remainingTurns);
+    return;
+  }
+  activeSlackTurns.delete(key);
+  try {
+    await setSlackAssistantStatus(channel, threadTs, '');
+  } catch (error) {
+    console.error('Non-blocking: failed to clear Slack assistant thread status:', error);
+  }
+}
+
 // ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
 // can never share our own workspace's team_id — that's what Slack Connect means — so neither the
 // email-domain check nor the own-team_id fallback below can ever authorize them, even though
@@ -198,7 +230,7 @@ async function handleSlackSessionResponse(params: {
   const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
   console.log('🔗 iShare link created for Slack session:', ishareLink);
 
-  await setSlackAssistantStatus(channel, ts, 'is working...');
+  await claimSlackAssistantStatus(channel, ts);
 
   // Generate the response
   const { generateSessionResponse } = await import('../controllers/agentModeController');
@@ -253,8 +285,6 @@ async function handleSlackSessionResponse(params: {
       llmModel,
       attachments
     ));
-
-    await setSlackAssistantStatus(channel, ts, '');
 
     // Post Emma's response to the Slack thread
     if (response.content) {
@@ -311,7 +341,6 @@ async function handleSlackSessionResponse(params: {
       }
     }
 
-    await setSlackAssistantStatus(channel, ts, '');
     await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
 
     // Save error message to session so ishare viewers see the failure rather than an orphaned user message
@@ -326,6 +355,8 @@ async function handleSlackSessionResponse(params: {
     } catch (saveError) {
       console.error('❌ Error saving error message to session:', saveError);
     }
+  } finally {
+    await releaseSlackAssistantStatus(channel, ts);
   }
 }
 
@@ -337,14 +368,14 @@ async function handleMappedSlackThreadResponse(params: {
   files?: any[];
   sessionId: string;
   userId: string;
-}) {
+}): Promise<boolean> {
   const { channel, threadTs, slackUserId, text, files, sessionId, userId } = params;
   const { chatbotDb } = await import('../services/chatbotService');
   const { generateSessionResponse } = await import('../controllers/agentModeController');
   const { agentModeService } = await import('../services/agentModeService');
   const { cronJobRegistry } = await import('../utils/cronJobRegistry');
   const session = await chatbotDb.getChatSession(sessionId);
-  if (!session) return;
+  if (!session) return false;
 
   const attachments: any[] = [];
   for (const file of files || []) {
@@ -366,7 +397,7 @@ async function handleMappedSlackThreadResponse(params: {
   const displayName = await getSlackUserDisplayName(slackUserId);
   const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
   const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-  await setSlackAssistantStatus(channel, threadTs, 'is working...');
+  await claimSlackAssistantStatus(channel, threadTs);
   try {
     const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
     if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
@@ -384,8 +415,9 @@ async function handleMappedSlackThreadResponse(params: {
       console.error('❌ Error saving error message to session:', saveError);
     }
   } finally {
-    await setSlackAssistantStatus(channel, threadTs, '');
+    await releaseSlackAssistantStatus(channel, threadTs);
   }
+  return true;
 }
 
 /**
@@ -569,17 +601,28 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (threadTs) {
             const mapping = await settingsService.getSetting(`slack_thread_${channel}_${threadTs}`);
             if (mapping?.settingValue) {
-              const { sessionId, userId } = JSON.parse(mapping.settingValue);
-              await handleMappedSlackThreadResponse({
-                channel,
-                threadTs,
-                slackUserId,
-                text: rawMessage,
-                files,
-                sessionId,
-                userId,
-              });
-              return;
+              let mappedSession: { sessionId: string; userId: string } | null = null;
+              try {
+                const parsed = JSON.parse(mapping.settingValue);
+                if (typeof parsed?.sessionId === 'string' && parsed.sessionId
+                  && typeof parsed?.userId === 'string' && parsed.userId) {
+                  mappedSession = parsed;
+                }
+              } catch {
+                // A malformed/stale mapping must not consume an explicit mention.
+              }
+              if (mappedSession) {
+                const handled = await handleMappedSlackThreadResponse({
+                  channel,
+                  threadTs,
+                  slackUserId,
+                  text: rawMessage,
+                  files,
+                  sessionId: mappedSession.sessionId,
+                  userId: mappedSession.userId,
+                });
+                if (handled) return;
+              }
             }
           }
 

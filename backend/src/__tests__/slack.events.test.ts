@@ -870,6 +870,115 @@ describe('Slack Events API', () => {
     });
 
     describe('Thread message handling', () => {
+      it.each([
+        ['missing mapped session', JSON.stringify({ sessionId: 'stale-session', userId: 'user-123' })],
+        ['malformed mapping', '{not-json'],
+      ])('falls back to normal app mention handling for a %s', async (_case, settingValue) => {
+        settingsService.getSetting.mockImplementation(async (key: string) => {
+          if (key === 'slack_thread_C12345_1234567890.123456') return { settingValue };
+          if (key === 'slack_channel_mapping_C12345') return { settingValue: 'user-123' };
+          return null;
+        });
+        userDb.getUserById.mockResolvedValue({
+          userId: 'user-123', email: 'test@example.com', slackChannel: 'C12345',
+        });
+        chatbotDb.getChatSession.mockResolvedValue(null);
+        chatbotDb.createChatSession.mockResolvedValue({
+          sessionId: 'replacement-session', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+        chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'replacement-session' });
+        generateSessionResponse.mockResolvedValue({ content: 'Replacement response', toolCalls: [] });
+
+        const response = await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: 'U12345', text: '<@UEMMA123> start over',
+            channel: 'C12345', ts: '1234567891.000000', thread_ts: '1234567890.123456',
+          },
+        });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
+          'user-123', undefined, 'agent', 'slack-bot', undefined, undefined,
+          undefined, undefined, 'regular', undefined
+        );
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'replacement-session', 'John Doe: start over', 'user-123', 'gpt-4o', []
+        );
+      });
+
+      it('keeps processing when the native status API fails', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+        setSlackAssistantStatus
+          .mockRejectedValueOnce(new Error('status unavailable'))
+          .mockRejectedValueOnce(new Error('status unavailable'));
+        generateSessionResponse.mockResolvedValue({ content: 'Still handled', toolCalls: [] });
+        const response = await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: 'U12345', text: '<@UEMMA123> continue',
+            channel: 'C12345', ts: '1234567891.000000', thread_ts: '1234567890.123456',
+          },
+        });
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-123', 'John Doe: continue', 'user-123', 'gpt-4o', []
+        );
+        expect(postThreadResponse).toHaveBeenCalledWith(
+          'C12345', '1234567890.123456', 'Still handled'
+        );
+      });
+      it('keeps native status active until all concurrent mapped turns in a thread finish', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+
+        let resolveFirst!: (value: any) => void;
+        let resolveSecond!: (value: any) => void;
+        generateSessionResponse
+          .mockImplementationOnce(() => new Promise(resolve => { resolveFirst = resolve; }))
+          .mockImplementationOnce(() => new Promise(resolve => { resolveSecond = resolve; }));
+
+        const event = (ts: string, text: string) => request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: 'U12345', text: `<@UEMMA123> ${text}`,
+            channel: 'C12345', ts, thread_ts: '1234567890.123456',
+          },
+        });
+
+        await Promise.all([event('1234567891.000000', 'first'), event('1234567892.000000', 'second')]);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(generateSessionResponse).toHaveBeenCalledTimes(2);
+        expect(setSlackAssistantStatus).toHaveBeenCalledTimes(1);
+        expect(setSlackAssistantStatus).toHaveBeenLastCalledWith(
+          'C12345', '1234567890.123456', 'is working...'
+        );
+
+        resolveFirst({ content: 'First response', toolCalls: [] });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(setSlackAssistantStatus).not.toHaveBeenCalledWith(
+          'C12345', '1234567890.123456', ''
+        );
+
+        resolveSecond({ content: 'Second response', toolCalls: [] });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(setSlackAssistantStatus).toHaveBeenCalledTimes(2);
+        expect(setSlackAssistantStatus).toHaveBeenLastCalledWith(
+          'C12345', '1234567890.123456', ''
+        );
+      });
+
       it('continues the mapped session at the root thread when Emma is explicitly mentioned in a thread', async () => {
         // Mock thread-to-session mapping exists
         settingsService.getSetting.mockResolvedValue({
