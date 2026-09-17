@@ -35,6 +35,16 @@ const db = () => (client ||= new AWS.DynamoDB.DocumentClient());
 export type PersistedProjection = MonthlyProjection & {
   /** ISO-8601 instant this snapshot was computed. */
   computedAt: string;
+  /**
+   * The UNFLOORED admission balance: usableAllowance − settled − reserved.
+   *
+   * Distinct from `remainingMicroUsd`, which floors at 0 for display. Admission
+   * (§4) needs the true signed value and a SINGLE attribute to condition on,
+   * because DynamoDB condition expressions cannot do arithmetic across
+   * attributes — so `available >= :est` is the concurrency-safe gate, and it
+   * must be able to go negative to represent an overrun honestly.
+   */
+  availableMicroUsd: number;
 };
 
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -62,7 +72,13 @@ export async function putProjection(projection: MonthlyProjection, computedAt: s
   if (Number.isNaN(parsed)) {
     throw new Error(`computedAt must be an ISO-8601 instant, got ${JSON.stringify(computedAt)}`);
   }
-  const item: PersistedProjection = { ...projection, computedAt: new Date(parsed).toISOString() };
+  const item: PersistedProjection = {
+    ...projection,
+    computedAt: new Date(parsed).toISOString(),
+    // Seed the admission balance unfloored, so §4 can condition and decrement it
+    // atomically. usable − settled − reserved; negative means already over cap.
+    availableMicroUsd: projection.usableAllowanceMicroUsd - projection.settledMicroUsd - projection.reservedMicroUsd,
+  };
   await db().put({ TableName: SPEND_PROJECTION_TABLE, Item: item }).promise();
   return item;
 }
