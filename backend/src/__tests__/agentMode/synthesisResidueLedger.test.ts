@@ -352,6 +352,37 @@ describe('buildAcceptanceFailureNotice (ENG-1899)', () => {
     expect(notice).toContain('deploy check');
   });
 
+  // Independent-review finding: an earlier revision suppressed on any occurrence of the
+  // bare marker PHRASE anywhere in currentContent — which also fires when the model's
+  // prose merely recaps an OLDER, different failure, silently swallowing a genuinely new,
+  // currently-real failure this same turn. That's the expensive direction to be wrong (a
+  // live problem going unreported), not the cheap one.
+  it('does NOT suppress a new, different failure just because the marker phrase appears elsewhere in content', () => {
+    const contentRecappingAnOlderFailure =
+      "Last time you saw: ⚠️ VERIFICATION FAILED — coding_agent's own acceptance check " +
+      'did not pass. Since then I made more changes.';
+
+    const notice = buildAcceptanceFailureNotice(
+      [
+        {
+          name: 'coding_agent',
+          result: {
+            success: false,
+            acceptanceStatus: 'failed',
+            acceptance: { status: 'failed', summary: 's', checks: [
+              { label: 'a brand new distinct check', status: 'failed', message: 'still broken, different reason' },
+            ] },
+          },
+        },
+      ],
+      contentRecappingAnOlderFailure,
+    );
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('a brand new distinct check');
+    expect(notice).toContain('still broken, different reason');
+  });
+
   it('still fires normally when currentContent has no prior notice', () => {
     const notice = buildAcceptanceFailureNotice(
       [
