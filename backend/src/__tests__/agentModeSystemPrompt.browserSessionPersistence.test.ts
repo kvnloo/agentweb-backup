@@ -68,9 +68,20 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
   // Cloudflare block should offer this path too, not just CSV.
   it('offers Browser Sessions manual import, with a direct link, as an option alongside CSV when a bot-protection gate will not clear', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'manually import a session cookie for this domain in **Settings > Browser Sessions**'
+      'manually import a session cookie for this domain, which skips this gate entirely on the next run'
     );
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('/settings/browser-sessions');
+  });
+
+  // ENG-1953 follow-up: a second review round flagged that offering this option
+  // as a bare backward-reference ("exactly like the re-import flow above") risks
+  // the model compressing it down to just "log in" under load — the same failure
+  // mode the sibling bullet above exists to prevent. Both steps must be spelled
+  // out here too, not just pointed at.
+  it('spells out both re-import steps here too, rather than only pointing back at the guidance above', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      "log into the site in their own browser to get a fresh authenticated session, AND (b) copy that session's cookie into **Settings > Browser Sessions** themselves"
+    );
   });
 });
 
