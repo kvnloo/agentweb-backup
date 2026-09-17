@@ -1,10 +1,9 @@
 /**
  * ENG-1685 spike — Gmail-via-Agentic-Fabriq connect flow.
  *
- * Mounted ONLY when the spike flag is enabled (see app.ts) — when it isn't,
- * these routes don't exist at all, which is the strongest form of "no
- * production traffic routes through Fabriq" (AC5): there's no code path to
- * accidentally hit, not just a runtime check inside one.
+ * The callback landing route is always mounted so completed vendor OAuth cannot
+ * end at a 404. It accepts only a process-local, single-use binding issued by
+ * the flag-gated /init route; /init and tool traffic remain absent while off.
  *
  * Deliberately has NO portal UI wiring — the acceptance criteria ask for a
  * flag-gated spike with comparison numbers, not a customer-facing feature.
@@ -20,6 +19,7 @@ import { beginPendingConnectVerification, createPendingConnect, deletePendingCon
 import { bootstrapEmailProviders, resolveEmailAccount } from '../services/emailProviderService';
 
 const router = express.Router();
+export const agenticFabriqCallbackRouter = express.Router();
 
 const PROVIDER = 'gmail';
 const INIT_WINDOW_MS = 10 * 60 * 1000;
@@ -98,7 +98,7 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 //    identity comes ONLY from the pending-connect record created at /init,
 //    bound to our random, single-use connection_id — NEVER from external_user_id or
 //    any other query param, which the vendor's own docs mark unsigned. ─────
-router.get('/callback', async (req, res) => {
+const callbackHandler: express.RequestHandler = async (req, res) => {
   const connectionId = req.query.connection_id;
   const status = req.query.status;
   const tool = req.query.tool;
@@ -157,6 +157,9 @@ router.get('/callback', async (req, res) => {
     console.error('[ENG-1685 spike] callback verification failed');
     return res.status(502).send('Could not verify the Agentic Fabriq connection. Try connecting again.');
   }
-});
+};
+
+router.get('/callback', callbackHandler);
+agenticFabriqCallbackRouter.get('/callback', callbackHandler);
 
 export default router;

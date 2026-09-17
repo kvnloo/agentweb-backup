@@ -55,15 +55,66 @@ export interface ReviewedGmailContract {
   mapArgs: (args: AgenticFabriqEmailToolArgs, connectionId: string) => Record<string, unknown>;
 }
 
-// No live identity/schema/argument mapping has been reviewed yet. Keep empty:
-// discovery is evidence to review, never permission to execute guessed tools.
-const REVIEWED_GMAIL_CONTRACTS: Readonly<Partial<Record<ReadAction, ReviewedGmailContract>>> = Object.freeze({});
+const CONNECTION_ID_SCHEMA = { type: 'string', description: 'Specific Gmail connection to use (optional)' } as const;
+const REVIEWED_GMAIL_CONTRACTS: Readonly<Record<ReadAction, ReviewedGmailContract>> = Object.freeze({
+  search: {
+    name: 'google_gmail_list_threads',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', description: "Gmail search query (e.g., 'is:unread', 'from:user@example.com')" },
+        max_results: { type: 'integer', minimum: 1, maximum: 500, default: 100, description: 'Maximum number of threads to return (1-500)' },
+        include_spam_trash: { type: 'boolean', description: 'Include threads from SPAM and TRASH (default: false)' },
+        connection_id: CONNECTION_ID_SCHEMA,
+      },
+      additionalProperties: false,
+    },
+    mapArgs: (args, connectionId) => ({
+      ...(typeof args.query === 'string' && args.query ? { q: args.query } : {}),
+      ...(Number.isInteger(args.max_results) ? { max_results: Math.min(500, Math.max(1, args.max_results!)) } : {}),
+      connection_id: connectionId,
+    }),
+  },
+  list: {
+    name: 'google_gmail_list_messages',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        max_results: { type: 'integer', minimum: 1, maximum: 100, default: 10, description: 'Maximum number of messages to return (1-100)' },
+        connection_id: CONNECTION_ID_SCHEMA,
+      },
+      additionalProperties: false,
+    },
+    mapArgs: (args, connectionId) => ({
+      ...(Number.isInteger(args.max_results) ? { max_results: Math.min(100, Math.max(1, args.max_results!)) } : {}),
+      connection_id: connectionId,
+    }),
+  },
+  get: {
+    name: 'google_gmail_read_message',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: "REQUIRED: The actual message ID from google_gmail_list_messages (e.g., '18d4f2e3a7b9c0d1'). Do NOT use '1' or other placeholders." },
+        connection_id: CONNECTION_ID_SCHEMA,
+      },
+      required: ['message_id'],
+      additionalProperties: false,
+    },
+    mapArgs: (args, connectionId) => {
+      if (!Array.isArray(args.message_ids) || args.message_ids.length !== 1 || typeof args.message_ids[0] !== 'string' || !args.message_ids[0]) {
+        throw new AgenticFabriqError('The reviewed Gmail read contract requires exactly one message id.');
+      }
+      return { message_id: args.message_ids[0], connection_id: connectionId };
+    },
+  },
+});
 
 /** Exact identity and schema pinning. Duplicate identities fail closed. */
 export function pickGmailToolForAction(
   tools: McpToolDescriptor[],
   action: AgenticFabriqEmailToolArgs['action'],
-  contracts = REVIEWED_GMAIL_CONTRACTS,
+  contracts: Readonly<Partial<Record<ReadAction, ReviewedGmailContract>>> = REVIEWED_GMAIL_CONTRACTS,
 ): McpToolDescriptor | null {
   if (!['search', 'list', 'get'].includes(action)) return null;
   const contract = contracts[action as ReadAction];
