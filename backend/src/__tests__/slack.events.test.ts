@@ -95,6 +95,7 @@ const { chatbotDb } = require('../services/chatbotService');
 const { generateSessionResponse } = require('../controllers/agentModeController');
 const { postThreadResponse, postThinkingMessage, deleteSlackMessage, setSlackAssistantStatus, getSlackUserDisplayName, getSlackUserEmail, getSlackUserTeamId, getOwnSlackTeamId } = require('../services/slackService');
 const { humanEvalService } = require('../services/humanEvalService');
+const { getEmmaBotUserId } = require('../services/loopSlackApprovalDispatcher');
 
 function slackSignature(rawBody: string, timestamp: number, secret: string): string {
   return `v0=${crypto.createHmac('sha256', secret).update(`v0:${timestamp}:${rawBody}`).digest('hex')}`;
@@ -108,6 +109,7 @@ describe('Slack Events API', () => {
     app.use(express.json({ verify: (req: any, _res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
     app.use('/api/slack', slackRouter);
     jest.clearAllMocks();
+    getEmmaBotUserId.mockResolvedValue('UEMMA123');
     userDb.getUserById.mockResolvedValue({ userId: 'user-123', email: 'test@example.com', slackChannel: 'C12345' });
   });
 
@@ -1075,15 +1077,54 @@ describe('Slack Events API', () => {
         expect(postThreadResponse).toHaveBeenCalledWith('C12345', '1', expect.stringContaining('unable to format a response'));
       });
 
-      it('rejects an unauthorized mapped-thread participant without using the owner session', async () => {
-        settingsService.getSetting.mockResolvedValue({ settingValue: JSON.stringify({ sessionId: 'session-owner', userId: 'owner-user' }) });
-        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'session-owner', userId: 'owner-user', llmModel: 'gpt-4o' });
-        getSlackUserEmail.mockResolvedValue('intruder@example.com');
-        userDb.getUserByEmail.mockResolvedValue({ userId: 'intruder-user', slackChannel: 'C_OTHER' });
-        await request(app).post('/api/slack/events').send({ type: 'event_callback', event: { type: 'app_mention', user: 'U_INTRUDER', text: '<@UEMMA123> reveal context', channel: 'C12345', ts: '2', thread_ts: '1' } });
+      it.each([
+        ['internal AgentWeb human', 'U08TM4QFQ1L', undefined],
+        ['external Slack Connect human', 'U_EXTERNAL', undefined],
+        ['external Slack Connect bot', 'U_EXTERNAL_BOT', 'B_EXTERNAL'],
+      ])('allows an %s to explicitly mention Emma and continue Fangfang\'s mapped session', async (_participant, slackUserId, botId) => {
+        settingsService.getSetting.mockImplementation(async (key: string) => {
+          if (key === 'slack_thread_C0C1H9H5QVC_1789598550.553809') {
+            return { settingValue: JSON.stringify({ sessionId: 'session-fangfang', userId: 'user-fangfang' }) };
+          }
+          return null;
+        });
+        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'session-fangfang', userId: 'user-fangfang', llmModel: 'gpt-4o' });
+        generateSessionResponse.mockResolvedValue({ content: 'Follow-up handled' });
+
+        await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: slackUserId, bot_id: botId,
+            text: '<@UEMMA123> continue', channel: 'C0C1H9H5QVC', ts: '1789598925.000000', thread_ts: '1789598550.553809',
+          },
+        });
         await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-fangfang', 'John Doe: continue', 'user-fangfang', 'gpt-4o', []
+        );
+      });
+
+      it.each([
+        ['Emma herself', 'UEMMA123'],
+        ['an event whose Emma identity lookup fails closed', null],
+      ])('ignores an app_mention emitted by %s', async (_case, emmaBotUserId) => {
+        getEmmaBotUserId.mockResolvedValue(emmaBotUserId);
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-fangfang', userId: 'user-fangfang' }),
+        });
+
+        await request(app).post('/api/slack/events').send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention', user: 'UEMMA123', bot_id: 'B_EMMA',
+            text: '<@UEMMA123> loop', channel: 'C0C1H9H5QVC', ts: '3', thread_ts: '1',
+          },
+        });
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(settingsService.getSetting).not.toHaveBeenCalledWith('slack_thread_C0C1H9H5QVC_1');
         expect(generateSessionResponse).not.toHaveBeenCalled();
-        expect(postThreadResponse).not.toHaveBeenCalled();
       });
 
       it('allows a mapped delegated session to continue in an explicitly configured admin channel', async () => {
@@ -1366,15 +1407,19 @@ describe('Slack Events API', () => {
         expect(generateSessionResponse).not.toHaveBeenCalled();
       });
 
-      it('should ignore bot messages in threads', async () => {
+      it('ignores an external bot\'s unmentioned message in a mapped thread', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
         const response = await request(app)
           .post('/api/slack/events')
           .send({
             type: 'event_callback',
             event: {
               type: 'message',
-              bot_id: 'B12345',
-              text: 'Bot reply',
+              user: 'U_EXTERNAL_BOT',
+              bot_id: 'B_EXTERNAL',
+              text: 'Bot reply without an Emma mention',
               channel: 'C12345',
               ts: '1234567891.000000',
               thread_ts: '1234567890.123456',
