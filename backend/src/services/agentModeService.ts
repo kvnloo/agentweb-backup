@@ -6493,6 +6493,53 @@ export class AgentModeService {
     return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
   }
 
+  /**
+   * ENG-1107: run a skill's bounded `openingAction.prefetch` after canonical
+   * authenticated authorization, using the canonical tool gateway
+   * (`executeTool` — never raw dispatch). Read tools only: every call must
+   * name a tool in the skill's own `toolNames`, and validation rejects
+   * anything persisted outside that set before execution. Bounded call count,
+   * deadline, and rendered output; any failure degrades LOUDLY — a plain
+   * failure statement, never a silent blank, never fabricated material.
+   * No LLM narration: results are rendered deterministically.
+   */
+  public async applyOpeningAction(
+    skill: Skill,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ messages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] }> {
+    const action = skill.openingAction;
+    if (!action) return { messages: [] };
+    const { validateOpeningAction, OPENING_ACTION_MAX_CHARS } = await import('../utils/openingActionValidation');
+    const invalid = validateOpeningAction(action, skill.toolNames || []);
+    if (invalid) {
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material (${invalid}). Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    const timeoutMs = action.timeoutMs ?? 15000;
+    const maxChars = action.maxChars ?? 4000;
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    const rendered: string[] = [];
+    const failures: string[] = [];
+    const llmModel = await this.getDefaultModel();
+    for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
+      if (Date.now() > deadline) { failures.push('deadline exceeded'); break; }
+      try {
+        const result = await this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false);
+        const text = typeof result === 'string' ? result : JSON.stringify(result);
+        rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
+      } catch (err) {
+        failures.push(`${call.tool}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (rendered.length === 0) {
+      const reason = failures.length ? ` (${failures.join('; ')})` : '';
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material${reason}. Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    const body = rendered.join('\n\n').slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
+    const tail = failures.length ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).` : '';
+    return { messages: [{ role: 'assistant', content: `${body}${tail}`, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
+  }
+
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);

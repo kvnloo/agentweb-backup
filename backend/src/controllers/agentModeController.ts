@@ -95,6 +95,7 @@ import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
+import { validateOpeningAction } from '../utils/openingActionValidation';
 import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
@@ -8624,6 +8625,8 @@ export const agentModeController = {
         }
         const validationError = validateWelcomeMessage(skill.welcomeMessage);
         if (validationError) return res.status(400).json({ error: validationError });
+        const openingActionError = validateOpeningAction((skill as any).openingAction, skill.toolNames || []);
+        if (openingActionError) return res.status(400).json({ error: openingActionError });
       }
       const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
@@ -8713,6 +8716,24 @@ export const agentModeController = {
       // on failure losers 409 until the 10m ttl bounds the staleness).
       if (createIdemKeyHeld) {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
+      }
+
+      // ENG-1107: run the authorized skill's bounded prefetch AFTER the session
+      // exists (auth already completed above), then append the rendered first
+      // turn. A skill without an openingAction costs nothing — no dispatch.
+      let prefetchMessages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] = [];
+      if (skillId && (skill as any)?.openingAction) {
+        try {
+          const applied = await agentModeService.applyOpeningAction(skill, user.userId, session.sessionId);
+          prefetchMessages = applied.messages as typeof prefetchMessages;
+          for (const msg of prefetchMessages) {
+            await chatbotDb.addMessageToSession(session.sessionId, msg as any);
+          }
+        } catch (prefetchError) {
+          console.error('AgentMode: opening-action prefetch failed loudly:', prefetchError);
+          prefetchMessages = [{ role: 'assistant', content: 'I could not fetch the opening material. Tell me what to work on and we will start from there.', metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }];
+          await chatbotDb.addMessageToSession(session.sessionId, prefetchMessages[0] as any);
+        }
       }
 
       res.status(201).json(skillId ? {
