@@ -3450,7 +3450,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -5775,6 +5775,40 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1974. "Keep chatting" on a workplan recommendation card leaves no
+   * trace anywhere in the conversation — the recommendation's tool-call
+   * result just sits in session.messages as permanent context, so Emma has
+   * no signal the user declined, and any vaguely on-topic next message could
+   * get her to self-launch it via launch_predefined_work_plan (live-confirmed
+   * on env1, twice: neither an accept click nor a suggested reply, just an
+   * ordinary continuation). This states the real fact — a declined
+   * recommendation exists — directly in context, before Emma's own read of
+   * the conversation forms, same discipline as the ENG-1899 acceptance
+   * notice: a ledger fact stated unconditionally beats hoping the model
+   * infers it from an absence of signal.
+   *
+   * Returns [] when nothing has been declined this session, so a session
+   * that never hit this path carries zero extra tokens.
+   */
+  public static buildDeclinedWorkPlanRecommendationContextMessages(
+    declined?: Record<string, { planId: string; planTitle: string; declinedAt: string }>,
+  ): any[] {
+    const entries = declined ? Object.values(declined) : [];
+    if (entries.length === 0) return [];
+
+    const titles = entries.map((e) => `"${e.planTitle}"`).join(', ');
+    const plural = entries.length > 1;
+    const content =
+      `[SYSTEM] The user already declined the following recommended work plan${plural ? 's' : ''} by clicking ` +
+      `"Keep chatting" on ${plural ? 'their' : 'its'} recommendation card: ${titles}. Do not call ` +
+      `launch_predefined_work_plan for ${plural ? 'any of these plans' : 'this plan'} on the strength of an ` +
+      `ordinary, ambiguous, or on-topic message — treat the next message as a genuinely new request. Only launch ` +
+      `${plural ? 'one of them' : 'it'} if the user explicitly says they want to start ${plural ? 'that plan' : 'it'} now.`;
+
+    return [{ role: 'user', content }];
+  }
+
+  /**
    * Extract the filenames of images already generated in this session by scanning
    * the "Image generated: <filename>" system messages that generateImage persists
    * (see generateImage -> addMessageToSession). De-duplicated, order-preserving.
@@ -5837,7 +5871,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6009,6 +6043,12 @@ export class AgentModeService {
         messages.push({ role: 'assistant', content: assetAwarenessText });
       }
     }
+
+    // ENG-1974: declined-recommendation notice is independent of whether an
+    // active work plan exists — a session can have declined one plan and
+    // still be mid-way through an unrelated one, or have declined a plan and
+    // have nothing active at all.
+    messages.push(...AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(declinedWorkPlanRecommendations));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
@@ -33314,7 +33354,7 @@ ${strippedHtml}`;
    *
    * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
    */
-  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean }): Promise<any> {
     try {
       const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
@@ -33387,6 +33427,31 @@ ${strippedHtml}`;
           return {
             success: false,
             message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
+      }
+
+      // ENG-1974: the user already declined this exact plan via "Keep chatting"
+      // on its recommendation card. recommendationId is a deterministic hash
+      // of (sessionId, planId) — recompute it here for the RESOLVED planId
+      // (not the raw planTitleOrId argument) so this correlates exactly
+      // whether launch_predefined_work_plan was called with a title or an id;
+      // no fuzzy title matching needed. `accept` always passes
+      // skipDeclineGate — the user's own explicit accept click must never be
+      // blocked by an earlier decline of any recommendation. Same risk tier
+      // as the force:true retry above (reversible, conversational), not the
+      // harder human-attributed tier checkQuestionGate exists for.
+      if (!options?.skipDeclineGate && !options?.confirmedDeclinedPlan) {
+        const declinedRecommendationId = createHash('sha256')
+          .update(`${sessionId}:${predefinedPlan.planId}`)
+          .digest('hex')
+          .slice(0, 32);
+        const declined = session.declinedWorkPlanRecommendations?.[declinedRecommendationId];
+        if (declined) {
+          return {
+            success: false,
+            message: `The user already declined "${declined.planTitle}" (clicked "Keep chatting" on its recommendation). Ask the user to confirm they want to start it now, then call launch_predefined_work_plan again with confirmedDeclinedPlan=true to proceed.`,
             requiresConfirmation: true,
           };
         }
