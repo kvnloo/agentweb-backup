@@ -61,7 +61,9 @@ export async function createPendingConnect(
   // Never overwrite a live or completed binding, even if the RNG collides.
   if (pending.has(connectionId) || [...connected.values()].includes(connectionId)) throw new Error('Connection collision');
   const previous = [...pending.values()].find(record => record.userId === userId && record.accountId === accountId);
-  if (!previous && !connected.has(accountKey) && pending.size + connected.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
+  // The cap protects short-lived OAuth challenges. Verified bindings are
+  // separate, non-expiring lookup state and must not consume challenge slots.
+  if (!previous && !connected.has(accountKey) && pending.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
   const state = crypto.randomBytes(32).toString('hex');
   if (previous) pending.delete(previous.connectionId);
   // Preserve a completed slot until the replacement is verified. A failed
