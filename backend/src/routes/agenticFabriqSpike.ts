@@ -78,22 +78,20 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 
 // ── GET /callback — AF's redirect target. UNAUTHENTICATED (browser redirect):
 //    identity comes ONLY from the pending-connect record created at /init,
-//    bound to our random, single-use state and opaque connection_id — NEVER from external_user_id or
+//    bound to our random, single-use connection_id — NEVER from external_user_id or
 //    any other query param, which the vendor's own docs mark unsigned. ─────
 router.get('/callback', async (req, res) => {
   const connectionId = req.query.connection_id;
   const status = req.query.status;
   const tool = req.query.tool;
-  const state = req.query.state;
   if (typeof connectionId !== 'string' || !/^[a-f0-9]{32}$/.test(connectionId) ||
-      (status !== 'success' && status !== 'error') || tool !== PROVIDER ||
-      typeof state !== 'string' || !/^[a-f0-9]{64}$/.test(state)) {
+      (status !== 'success' && status !== 'error') || tool !== PROVIDER) {
     return res.status(400).send('Invalid Agentic Fabriq callback.');
   }
 
   let verification;
   try {
-    verification = await beginPendingConnectVerification(connectionId, state);
+    verification = await beginPendingConnectVerification(connectionId);
   } catch {
     console.error('[ENG-1685 spike] callback state lookup failed');
     return res.status(502).send('Could not verify the Agentic Fabriq callback.');
@@ -104,7 +102,7 @@ router.get('/callback', async (req, res) => {
     return res.status(400).send('This connect link has expired or was already used. Start a new connect.');
   }
   const pending = verification.binding;
-  const finish = (outcome: 'terminal' | 'retry') =>
+  const finish = (outcome: 'terminal' | 'retry' | 'connected') =>
     finishPendingConnectVerification(connectionId, verification.verificationId, outcome);
 
   if (status === 'error') {
@@ -130,7 +128,7 @@ router.get('/callback', async (req, res) => {
     const connections = await agenticFabriqClient.listConnections(appId, pending.userId);
     const gmailConnections = connections.filter((c) => c.tool === PROVIDER && c.connection_id === pending.connectionId);
     if (gmailConnections.length === 1 && gmailConnections[0].status === 'connected') {
-      await finish('terminal');
+      if (!await finish('connected')) return res.status(400).send('This connect link has expired or was already used. Start a new connect.');
       return res.status(200).send('Gmail connected via the Agentic Fabriq spike. You can close this tab.');
     }
     await finish('retry');

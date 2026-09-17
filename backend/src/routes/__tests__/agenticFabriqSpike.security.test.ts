@@ -21,6 +21,15 @@ async function invoke(path: string, query: Record<string, unknown>, userId = 'ro
   return res;
 }
 describe('hostile Fabriq OAuth routes', () => {
+  it('accepts the documented callback without state and consumes it only once', async () => {
+    const issued = await create('route-user', 'mailbox', 'gmail');
+    mockList.mockResolvedValue([{ tool: 'gmail', connection_id: issued.connectionId, status: 'connected' }]);
+    const query = { connection_id: issued.connectionId, tool: 'gmail', status: 'success', external_user_id: 'attacker' };
+    expect((await invoke('/callback', query)).send).toHaveBeenCalledWith(expect.stringContaining('Gmail connected'));
+    expect(mockList).toHaveBeenCalledWith('app', 'route-user');
+    expect((await invoke('/callback', query)).statusCode).toBe(400);
+  });
+
   beforeEach(() => { clearPendingConnectsForTest(); jest.clearAllMocks(); mockEligible.mockReturnValue(true); mockResolve.mockResolvedValue({ platform: 'gmail', ownerUserId: 'route-user', accountId: 'mailbox' }); mockInitiate.mockResolvedValue({ oauth_url: 'https://vendor.test/consent' }); });
   it('initiates with read authorization and a random separate state', async () => {
     await invoke('/init', { account_id: 'mailbox' });
@@ -32,20 +41,20 @@ describe('hostile Fabriq OAuth routes', () => {
     const firstChallenge = mockInitiate.mock.calls[0][3];
     expect((await invoke('/init', { account_id: 'mailbox' })).statusCode).toBe(200);
     const secondChallenge = mockInitiate.mock.calls[1][3];
-    expect(secondChallenge.connectionId).toBe(firstChallenge.connectionId);
+    expect(secondChallenge.connectionId).not.toBe(firstChallenge.connectionId);
     expect(secondChallenge.state).not.toBe(firstChallenge.state);
     expect(await consume(firstChallenge.connectionId, firstChallenge.state)).toBeNull();
   });
-  it.each([{ tool: 'outlook' }, { status: 'connected' }, { status: 'nonsense' }, { state: undefined }, { state: ['a', 'b'] }, { connection_id: ['x'] }])('rejects invalid callback without vendor contact: %j', async bad => {
+  it.each([{ tool: 'outlook' }, { status: 'connected' }, { status: 'nonsense' }, { connection_id: ['x'] }])('rejects invalid callback without vendor contact: %j', async bad => {
     const issued = await create('route-user', 'mailbox', 'gmail');
     const res = await invoke('/callback', { connection_id: issued.connectionId, state: issued.state, tool: 'gmail', status: 'success', ...bad });
     expect(res.statusCode).toBe(400);
     expect(mockList).not.toHaveBeenCalled();
     expect(await consume(issued.connectionId, issued.state)).not.toBeNull();
   });
-  it('rejects forged state without deleting the real attempt', async () => {
+  it('rejects forged connection challenge even with the real local state', async () => {
     const issued = await create('route-user', 'mailbox', 'gmail');
-    expect((await invoke('/callback', { connection_id: issued.connectionId, state: '0'.repeat(64), tool: 'gmail', status: 'success' })).statusCode).toBe(400);
+    expect((await invoke('/callback', { connection_id: '0'.repeat(32), state: issued.state, tool: 'gmail', status: 'success' })).statusCode).toBe(400);
     expect(mockList).not.toHaveBeenCalled();
     expect(await consume(issued.connectionId, issued.state)).not.toBeNull();
   });
@@ -105,6 +114,26 @@ describe('hostile Fabriq OAuth routes', () => {
     expect((await invoke('/init', { account_id: ['mailbox'] })).statusCode).toBe(400);
     expect(mockEnsure).not.toHaveBeenCalled();
     expect(mockInitiate).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'afct_fixture', '0'.repeat(64), ['hostile']])('does not use vendor state as callback authentication: %j', async state => {
+    const issued = await create('route-user', 'mailbox', 'gmail');
+    mockList.mockResolvedValue([{ tool: 'gmail', connection_id: issued.connectionId, status: 'connected' }]);
+    expect((await invoke('/callback', { connection_id: issued.connectionId, state, tool: 'gmail', status: 'success' })).send).toHaveBeenCalledWith(expect.stringContaining('Gmail connected'));
+  });
+  it('fails closed on the documented unbound error callback without consuming an attempt', async () => {
+    const issued = await create('route-user', 'mailbox', 'gmail');
+    expect((await invoke('/callback', { tool: 'gmail', status: 'error', reason: 'denied' })).statusCode).toBe(400);
+    expect(await consume(issued.connectionId, issued.state)).not.toBeNull();
+    expect(mockList).not.toHaveBeenCalled();
+  });
+  it('exhausts retries after three nonterminal vendor reads', async () => {
+    const issued = await create('route-user', 'mailbox', 'gmail');
+    mockList.mockResolvedValue([]);
+    const q = { connection_id: issued.connectionId, tool: 'gmail', status: 'success' };
+    for (let i = 0; i < 3; i++) expect((await invoke('/callback', q)).statusCode).toBe(200);
+    expect((await invoke('/callback', q)).statusCode).toBe(400);
+    expect(mockList).toHaveBeenCalledTimes(3);
   });
 
 });

@@ -26,6 +26,12 @@ export interface PendingConnectVerification {
   verificationId: string;
 }
 const pending = new Map<string, StoredConnect>();
+// Only a callback with a freshly re-read connected row can populate this map.
+const connected = new Map<string, string>();
+
+export function verifiedConnectionIdForAccount(accountId: string, userId: string): string | undefined {
+  return connected.get(connectionIdForAccount(accountId, userId));
+}
 
 function validIdentity(value: string): boolean {
   return typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x20\x7f]/.test(value);
@@ -49,12 +55,18 @@ export async function createPendingConnect(
   userId: string, accountId: string, provider: string, nowMs: number = Date.now(),
 ): Promise<PendingConnectChallenge> {
   if (provider !== 'gmail' || !Number.isFinite(nowMs)) throw new Error('Invalid connect request');
-  const connectionId = connectionIdForAccount(accountId, userId);
+  const accountKey = connectionIdForAccount(accountId, userId); // Validate before allocating.
   for (const [id, record] of pending) if (expired(record, nowMs)) pending.delete(id);
-  // This deterministic key binds replacement to exactly this user/mailbox.
-  // Other users and accounts have different keys and cannot be overwritten.
-  if (!pending.has(connectionId) && pending.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
+  const connectionId = crypto.randomBytes(16).toString('hex');
+  // Never overwrite a live or completed binding, even if the RNG collides.
+  if (pending.has(connectionId) || [...connected.values()].includes(connectionId)) throw new Error('Connection collision');
+  const previous = [...pending.values()].find(record => record.userId === userId && record.accountId === accountId);
+  if (!previous && !connected.has(accountKey) && pending.size + connected.size >= MAX_PENDING_CONNECTS) throw new Error('Pending connect capacity reached');
   const state = crypto.randomBytes(32).toString('hex');
+  if (previous) pending.delete(previous.connectionId);
+  // Replace this account's completed slot; reads require fresh verification.
+  // Allocate and check collisions first so failure preserves the old binding.
+  connected.delete(accountKey);
   pending.set(connectionId, { userId, accountId, provider, connectionId, createdAt: nowMs, stateDigest: crypto.createHash('sha256').update(state).digest(), verificationAttempts: 0 });
   return { connectionId, state };
 }
@@ -80,15 +92,17 @@ export async function consumePendingConnect(
 
 /** Atomically reserves one of three callback-verification attempts. */
 export async function beginPendingConnectVerification(
-  connectionId: string, state: string, nowMs: number = Date.now(),
+  connectionId: string, nowMs: number = Date.now(),
 ): Promise<PendingConnectVerification | null> {
   const record = pending.get(connectionId);
   if (!record) return null;
+  if (record.verificationId) return null;
   if (expired(record, nowMs) || record.verificationAttempts >= 3) {
     pending.delete(connectionId);
     return null;
   }
-  if (!matches(record, state) || record.verificationId) return null;
+  // The 128-bit caller-generated connection ID is the callback challenge.
+  // Vendor state and unsigned external_user_id never participate in binding.
   const verificationId = crypto.randomBytes(16).toString('hex');
   record.verificationAttempts += 1;
   record.verificationId = verificationId;
@@ -98,12 +112,15 @@ export async function beginPendingConnectVerification(
 
 /** Terminal outcomes consume state; retryable outcomes release its reservation. */
 export async function finishPendingConnectVerification(
-  connectionId: string, verificationId: string, outcome: 'terminal' | 'retry',
-): Promise<void> {
+  connectionId: string, verificationId: string, outcome: 'terminal' | 'retry' | 'connected',
+): Promise<boolean> {
   const record = pending.get(connectionId);
-  if (!record || record.verificationId !== verificationId) return;
-  if (outcome === 'terminal' || record.verificationAttempts >= 3) pending.delete(connectionId);
+  if (!record || record.verificationId !== verificationId) return false;
+  if (expired(record, Date.now())) { pending.delete(connectionId); return false; }
+  if (outcome === 'connected') connected.set(connectionIdForAccount(record.accountId, record.userId), connectionId);
+  if (outcome !== 'retry' || record.verificationAttempts >= 3) pending.delete(connectionId);
   else delete record.verificationId;
+  return true;
 }
 
-export function clearPendingConnectsForTest(): void { pending.clear(); }
+export function clearPendingConnectsForTest(): void { pending.clear(); connected.clear(); }

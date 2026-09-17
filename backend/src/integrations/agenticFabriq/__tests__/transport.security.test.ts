@@ -73,14 +73,14 @@ it('passes a DNS-pinned dispatcher for the validated public address', async () =
 it.each([null,[],{gmail:null},{gmail:{oauth:'yes'}}])('rejects malformed capabilities %j', async body => {
   await expect(new AgenticFabriqClient({fetchImpl:async () => Response.json(body)}).getProviderCapabilities('app')).rejects.toThrow();
 });
-it.each([null,{}, {oauth_url:'http://evil.example',state:'a'.repeat(64),connection_id:'bound'},
-  {oauth_url:'https://vendor.example/consent',state:'other',connection_id:'bound'},
+it.each([null,{}, {oauth_url:'http://evil.example',state:'a'.repeat(64),connection_id:'b'.repeat(32)},
+  {oauth_url:'https://vendor.example/consent',state:{ticket:'wrong-type'},connection_id:'b'.repeat(32)},
   {oauth_url:'https://vendor.example/consent',state:'a'.repeat(64),connection_id:'other'}])('rejects malformed OAuth response', async body => {
-  await expect(new AgenticFabriqClient({fetchImpl:async () => Response.json(body)}).initiateOAuth('app','user','gmail',{connectionId:'bound',state:'a'.repeat(64)})).rejects.toThrow();
+  await expect(new AgenticFabriqClient({fetchImpl:async () => Response.json(body)}).initiateOAuth('app','user','gmail',{connectionId:'b'.repeat(32),state:'a'.repeat(64)})).rejects.toThrow();
 });
-it.each([null,{}, {connect_url:'https://vendor.example',connection_id:'bound',expires_in:'900'},
+it.each([null,{}, {connect_url:'https://vendor.example',connection_id:'b'.repeat(32),expires_in:'900'},
   {connect_url:'https://vendor.example',connection_id:'other',expires_in:900}])('rejects malformed credentials response', async body => {
-  await expect(new AgenticFabriqClient({fetchImpl:async () => Response.json(body)}).initiateCredentials('app','user','gmail',{connectionId:'bound'})).rejects.toThrow();
+  await expect(new AgenticFabriqClient({fetchImpl:async () => Response.json(body)}).initiateCredentials('app','user','gmail',{connectionId:'b'.repeat(32)})).rejects.toThrow();
 });
 it.each([{}, {tools:null}, {tools:[null]}, {tools:[{name:'tool'}]}, {tools:[{name:'tool',inputSchema:[]}]},
   {tools:[{name:'tool',inputSchema:{type:'object'},description:32}]}, {tools:[],nextCursor:'more'},

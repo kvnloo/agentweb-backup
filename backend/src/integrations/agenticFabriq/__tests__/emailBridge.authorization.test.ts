@@ -29,18 +29,22 @@ jest.mock('../mcpBridge', () => ({
 }));
 
 import { runEmailToolThroughAgenticFabriq } from '../emailBridge';
-import { connectionIdForAccount } from '../pendingConnectStore';
+import { createPendingConnect, beginPendingConnectVerification, finishPendingConnectVerification, clearPendingConnectsForTest, verifiedConnectionIdForAccount } from '../pendingConnectStore';
 
 const OWN = { platform: 'gmail', ownerUserId: 'user-1', accountId: 'account-1', provider: {} };
 
 describe('Agentic Fabriq mailbox authorization', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    clearPendingConnectsForTest();
+    const a = await createPendingConnect('user-1', 'account-1', 'gmail');
+    const v = await beginPendingConnectVerification(a.connectionId);
+    await finishPendingConnectVerification(a.connectionId, v!.verificationId, 'connected');
     jest.clearAllMocks();
     mockResolveEmailAccount.mockResolvedValue(OWN);
     mockGetFreshToken.mockResolvedValue({ accessToken: 'token', mcpUrl: '', expiresAtMs: 1, mintedAtMs: 0 });
     mockListTools.mockResolvedValue([{ name: 'google_gmail_search_messages' }]);
     mockCallTool.mockResolvedValue({ emails: [] });
-    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('account-1', 'user-1'), status: 'connected' }]);
+    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: verifiedConnectionIdForAccount('account-1', 'user-1'), status: 'connected' }]);
   });
 
   it('requires account_id before any provider lookup', async () => {
@@ -63,7 +67,7 @@ describe('Agentic Fabriq mailbox authorization', () => {
   });
 
   it('does not select a different Gmail connection when the exact binding is absent', async () => {
-    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: connectionIdForAccount('other-account', 'user-1'), status: 'connected' }]);
+    mockListConnections.mockResolvedValue([{ tool: 'gmail', connection_id: 'e'.repeat(32), status: 'connected' }]);
     const result = await runEmailToolThroughAgenticFabriq({ account_id: 'account-1', action: 'search', query: 'x' }, 'user-1');
     expect(result.outcome).toMatchObject({ error: expect.stringContaining('No connected Gmail account') });
     expect(mockListTools).not.toHaveBeenCalled();

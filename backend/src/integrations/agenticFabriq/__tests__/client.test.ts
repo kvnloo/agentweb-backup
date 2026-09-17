@@ -22,6 +22,39 @@ function fakeFetch(status: number, body: unknown): jest.Mock<Promise<any>, [stri
 }
 
 describe('AgenticFabriqClient', () => {
+  it('accepts live HTTP 200 vendor ticket state without treating it as caller CSRF', async () => {
+    const connectionId = 'b'.repeat(32);
+    const response = { oauth_url: 'https://provider.example/authorize?state=afct_fixture', state: 'afct_fixture', connection_id: connectionId, credential_source: 'af_app' };
+    const fetchImpl = fakeFetch(200, response);
+    await expect(new AgenticFabriqClient({ fetchImpl: fetchImpl as any }).initiateOAuth('app_1', 'user_8412', 'gmail', { connectionId, state: 'a'.repeat(64) })).resolves.toEqual(response);
+  });
+
+  it.each([101, 1000])('reads %i connections including abandoned attempts without mutation', async count => {
+    const rows = Array.from({ length: count }, (_, i) => ({
+      tool: 'gmail', connection_id: i.toString(16).padStart(32, '0'),
+      status: i === count - 1 ? 'connected' : 'configured',
+    }));
+    const fetchImpl = fakeFetch(200, count === 101 ? rows : { connections: rows });
+    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
+    await expect(client.listConnections('app_1', 'user_8412')).resolves.toEqual(rows);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls[0][1].method).toBe('GET');
+  });
+
+  it('rejects more than 1000 connections instead of truncating verification data', async () => {
+    const rows = Array.from({ length: 1001 }, (_, i) => ({ tool: 'gmail', connection_id: String(i), status: 'configured' }));
+    const client = new AgenticFabriqClient({ fetchImpl: fakeFetch(200, rows) as any });
+    await expect(client.listConnections('app', 'user')).rejects.toThrow();
+  });
+
+  it.each([null, { tool: 'gmail', connection_id: 'bad', status: 'connected', granted_scopes: [true] }])(
+    'validates rows beyond the old 100-row boundary: %j', async malformed => {
+      const rows = Array.from({ length: 100 }, (_, i) => ({ tool: 'gmail', connection_id: String(i), status: 'configured' }));
+      const client = new AgenticFabriqClient({ fetchImpl: fakeFetch(200, [...rows, malformed]) as any });
+      await expect(client.listConnections('app', 'user')).rejects.toThrow();
+    },
+  );
+
   it('sends X-App-Id and X-App-Secret headers on every app-scoped call', async () => {
     const fetchImpl = fakeFetch(200, { connections: [] });
     const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
@@ -58,20 +91,25 @@ describe('AgenticFabriqClient', () => {
     await expect((client.deleteConnection as any)('app_1', 'user_8412', 'default', '')).rejects.toThrow(TypeError);
   });
 
-  it('initiateOAuth defaults connection_id to "default" when not supplied', async () => {
-    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'a'.repeat(64), connection_id: 'default' });
-    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
-    await client.initiateOAuth('app_1', 'user_8412', 'gmail', { state: 'a'.repeat(64) });
-    const [, init] = fetchImpl.mock.calls[0];
-    expect(JSON.parse(init.body)).toEqual({ connection_id: 'default', state: 'a'.repeat(64) });
+  it('rejects missing connection challenges before contacting the vendor', async () => {
+    const fetchImpl = fakeFetch(200, {});
+    await expect(new AgenticFabriqClient({ fetchImpl: fetchImpl as any }).initiateOAuth('app_1', 'user_8412', 'gmail')).rejects.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
-
-  it('initiateOAuth passes a custom connection_id through unchanged', async () => {
-    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'a'.repeat(64), connection_id: 'work' });
-    const client = new AgenticFabriqClient({ fetchImpl: fetchImpl as any });
-    await client.initiateOAuth('app_1', 'user_8412', 'gmail', { connectionId: 'work', state: 'a'.repeat(64) });
-    const [, init] = fetchImpl.mock.calls[0];
-    expect(JSON.parse(init.body).connection_id).toBe('work');
+  it('sends the local connection challenge, not a caller state the vendor cannot echo', async () => {
+    const connectionId = 'b'.repeat(32);
+    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'afct_fixture', connection_id: connectionId });
+    await new AgenticFabriqClient({ fetchImpl: fetchImpl as any }).initiateOAuth('app_1', 'user_8412', 'gmail', { connectionId });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({ connection_id: connectionId });
+  });
+  it.each([undefined, null, {}, [], '', 'x'.repeat(513)])('rejects malformed vendor ticket state %j', async state => {
+    const connectionId = 'b'.repeat(32);
+    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state, connection_id: connectionId });
+    await expect(new AgenticFabriqClient({ fetchImpl: fetchImpl as any }).initiateOAuth('app', 'user', 'gmail', { connectionId })).rejects.toThrow();
+  });
+  it.each([undefined, null, {}, [], 'c'.repeat(32)])('rejects substituted or malformed vendor connection_id %j', async connection_id => {
+    const fetchImpl = fakeFetch(200, { oauth_url: 'https://provider.example/authorize', state: 'afct_fixture', connection_id });
+    await expect(new AgenticFabriqClient({ fetchImpl: fetchImpl as any }).initiateOAuth('app', 'user', 'gmail', { connectionId: 'b'.repeat(32) })).rejects.toThrow();
   });
 
   it('a non-2xx response throws AgenticFabriqApiError with the status and endpoint, never a generic Error', async () => {

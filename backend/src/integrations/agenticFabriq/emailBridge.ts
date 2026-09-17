@@ -19,7 +19,7 @@ import { agenticFabriqMcpBridge, resolveMcpExternalUrl } from './mcpBridge';
 import { AgenticFabriqError, AgenticFabriqUnsupportedMailboxError } from './errors';
 import type { McpToolDescriptor } from './types';
 import { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } from '../../services/emailProviderService';
-import { connectionIdForAccount } from './pendingConnectStore';
+import { verifiedConnectionIdForAccount } from './pendingConnectStore';
 
 export interface AgenticFabriqEmailToolArgs {
   account_id?: string;
@@ -92,15 +92,15 @@ export async function runEmailToolThroughAgenticFabriq(
     if (resolved.platform !== 'gmail' || resolved.ownerUserId !== rawUserId) {
       throw new AgenticFabriqUnsupportedMailboxError();
     }
-    const connectionId = connectionIdForAccount(resolved.accountId, rawUserId);
+    const connectionId = verifiedConnectionIdForAccount(resolved.accountId, rawUserId);
     const { appId } = await getAgenticFabriqAppCredentials();
 
     const connections = await agenticFabriqClient.listConnections(appId, rawUserId);
     const matchingConnections = connections.filter((c) => c.tool === 'gmail' && c.connection_id === connectionId);
-    const gmailConnection = matchingConnections.length === 1 ? matchingConnections[0] : undefined;
+    const gmailConnection = connectionId && matchingConnections.length === 1 ? matchingConnections[0] : undefined;
     // "A LISTED CONNECTION IS NOT A WORKING ONE" — key every user-facing state
     // off status === 'connected', never off the row merely existing.
-    if (!gmailConnection || gmailConnection.status !== 'connected') {
+    if (!connectionId || !gmailConnection || gmailConnection.status !== 'connected') {
       return {
         outcome: {
           error:

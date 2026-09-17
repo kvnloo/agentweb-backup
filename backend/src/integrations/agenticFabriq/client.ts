@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'crypto';
 /**
  * App-scoped REST client for Agentic Fabriq's DEVELOPER-edition B2B2C surface.
  *
@@ -128,7 +127,7 @@ export class AgenticFabriqClient {
       { rawUserIdForAssertion: rawUserId },
     );
     const rows = Array.isArray(result) ? result : record(result) ? result.connections : null;
-    if (!Array.isArray(rows) || rows.length > 100 || rows.some(row => !record(row) ||
+    if (!Array.isArray(rows) || rows.length > 1_000 || rows.some(row => !record(row) ||
         !boundedString(row.tool) || !boundedString(row.connection_id) ||
         !['configured', 'connected', 'disconnected', 'needs_reauth', 'error'].includes(row.status as string) ||
         row.granted_scopes !== undefined && (!Array.isArray(row.granted_scopes) || row.granted_scopes.length > 100 ||
@@ -164,18 +163,17 @@ export class AgenticFabriqClient {
     provider: string,
     opts: { connectionId?: string; scopes?: string[]; state?: string } = {},
   ): Promise<AgenticFabriqOAuthInitiateResponse> {
-    if (!opts.state || !/^[a-f0-9]{64}$/.test(opts.state)) invalidShape();
+    if (typeof opts.connectionId !== 'string' || !/^[a-f0-9]{32}$/.test(opts.connectionId)) invalidShape();
     const result = await this.request<AgenticFabriqOAuthInitiateResponse>(
       'POST',
       `/api/v1/apps/${encodeURIComponent(appId)}/external-users/${encodeURIComponent(rawUserId)}/oauth/${encodeURIComponent(provider)}/initiate`,
       {
-        body: { connection_id: opts.connectionId ?? 'default', ...(opts.scopes ? { scopes: opts.scopes } : {}), ...(opts.state ? { state: opts.state } : {}) },
+        body: { connection_id: opts.connectionId, ...(opts.scopes ? { scopes: opts.scopes } : {}) },
         rawUserIdForAssertion: rawUserId,
       },
     );
     if (!record(result) || !boundedString(result.oauth_url, 4096) || !boundedString(result.state, 512) ||
-        result.connection_id !== (opts.connectionId ?? 'default') || !/^[a-f0-9]{64}$/.test(result.state) ||
-        !timingSafeEqual(Buffer.from(result.state, 'hex'), Buffer.from(opts.state, 'hex'))) invalidShape();
+        result.connection_id !== opts.connectionId) invalidShape();
     httpsUrl(result.oauth_url);
     return result;
   }
