@@ -17,3 +17,11 @@ Generated social drafts read generic. Posts should sound like the author over ti
 ## Sub-issues
 
 #13 (capture), #14 (inject), #15 (durable profile, parked)
+
+## Phase 1 progress
+
+- [x] `voiceProfileService.ts` — diff summarizer + Voice Card builder (≤2k chars)
+- [x] Session metadata persistence (`sessionVoiceProfile` on ChatSession)
+- [x] Capture hook in `postOnConnectedAccount` when `toolContext.voiceCapture.draft` is supplied
+- [x] Prompt injection via `buildMarketingContext` message suffix
+- [ ] Frontend passes `voiceCapture.draft` on publish approval (wiring TBD)
