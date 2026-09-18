@@ -190,4 +190,54 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(attempt.skipReason).toBe('blocked-external');
     expect(mockCallLLM).not.toHaveBeenCalled();
   });
+
+  it('a complete request ("Write a haiku about winter") with a decline-to-guess stays scorable (positive fragment allowlist)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Write a haiku about winter' },
+      { role: 'assistant', content: 'I decline to guess which tone you want instead of guessing. Could you clarify what tone should I use?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a long generated incident-notice draft mentioning an outage stays scorable (not a terminal block report)', async () => {
+    const longDraft = 'Service is currently down. '.padEnd(700, 'Details of the incident follow. ') +
+      'Here is the customer notice draft you asked for: we apologize for the disruption. Next steps: our team will post updates hourly. Please review and approve.';
+    expect(longDraft.length).toBeGreaterThan(600);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft an incident notice for the outage' },
+      { role: 'assistant', content: longDraft },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('an interactive approval-held publish with saved draft is excluded (account-level hold, non-scheduled)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post this to LinkedIn now' },
+      { role: 'assistant', content: 'Publishing requires approval before publishing under your account-level setting, so I saved the draft and will not publish until approved.' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'regular' }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a scheduled run with approval-hold wording but no PUBLISH WITHHELD marker stays in the judged cohort', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Scheduled post' },
+      { role: 'assistant', content: 'Publishing requires approval before publishing, so I saved the draft.' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'scheduled' }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
 });
