@@ -6540,6 +6540,95 @@ export class AgentModeService {
     return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
   }
 
+  /**
+   * ENG-1107: run a skill's bounded `openingAction.prefetch` after canonical
+   * authenticated authorization, using the canonical tool gateway
+   * (`executeTool` — never raw dispatch). Read tools only: every call must
+   * name a tool in the skill's own `toolNames`, and validation rejects
+   * anything persisted outside that set before execution. Bounded call count,
+   * deadline, and rendered output; any failure degrades LOUDLY — a plain
+   * failure statement, never a silent blank, never fabricated material.
+   * No LLM narration: results are rendered deterministically.
+   */
+  public async applyOpeningAction(
+    skill: Skill,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ messages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] }> {
+    const action = skill.openingAction;
+    if (!action) return { messages: [] };
+    const { validateOpeningAction, OPENING_ACTION_MAX_CHARS } = await import('../utils/openingActionValidation');
+    const invalid = validateOpeningAction(action, skill.toolNames || []);
+    if (invalid) {
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material (${invalid}). Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    const timeoutMs = action.timeoutMs ?? 15000;
+    const maxChars = action.maxChars ?? 4000;
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    const rendered: string[] = [];
+    const failures: string[] = [];
+    const llmModel = await this.getDefaultModel();
+    // ENG-1107 CodeRabbit: scope gateway failure accounting to this opening
+    // run (per-session run id + session budget scope) so a repeatedly failing
+    // read tool trips the repeated-failure breaker instead of re-executing
+    // for every entry in action.calls.
+    const openingRunId = `opening-action:${sessionId}`;
+    for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
+      // ENG-1107 Greptile P1: membership in the skill tool set does not prove
+      // read-only — a skill may carry mutating tools (calendar create/update,
+      // etc.). Prefetch auto-executes on session open with no user instruction,
+      // so only gateway-classified `read` tools may run here; anything else
+      // degrades loudly instead of executing.
+      const policy = evaluateAgentToolPolicy({ toolName: call.tool, args: call.args ?? {} });
+      if (!policy.allowed || policy.effect !== 'read') {
+        failures.push(`${call.tool}: not a read tool (effect=${policy.effect}) — skipped`);
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) { failures.push('deadline exceeded'); break; }
+      try {
+        // ENG-1107 Greptile P1: race each call against the remaining deadline
+        // so a stalled tool cannot hold session creation open past the bound.
+        // Routed through the canonical gateway (budget/breaker accounting
+        // scoped to this opening run) rather than raw executeTool.
+        const outcome = await Promise.race([
+          executeAgentToolThroughGateway({
+            toolName: call.tool,
+            args: call.args ?? {},
+            runId: openingRunId,
+            budgetScopeId: sessionId,
+            execute: () => this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+          }),
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error(`opening-action deadline exceeded after ${Math.min(timeoutMs, 30_000)}ms`)),
+            remainingMs,
+          )),
+        ]);
+        if (outcome.status === 'error') throw outcome.error;
+        const result = outcome.result;
+        const text = typeof result === 'string' ? result : JSON.stringify(result);
+        rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
+      } catch (err) {
+        failures.push(`${call.tool}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (rendered.length === 0) {
+      const reason = failures.length ? ` (${failures.join('; ')})` : '';
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material${reason}. Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
+    // just the body — a long failure tail could otherwise exceed the bound.
+    // Reserve space for the failure note first so a large successful result
+    // cannot truncate the loud-failure signal away.
+    const contentLimit = Math.min(maxChars, OPENING_ACTION_MAX_CHARS);
+    const failureNote = failures.length
+      ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).`
+      : '';
+    const content = `${rendered.join('\n\n').slice(0, Math.max(0, contentLimit - failureNote.length))}${failureNote}`
+      .slice(0, contentLimit);
+    return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
+  }
+
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
@@ -39479,6 +39568,119 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   /**
+   * ENG-1944: enabling a CAMPAIGN never touches its ad groups, keywords, or ads — those
+   * default to PAUSED on creation (RULE 11) and nothing else ever flips them. A campaign can
+   * read back ENABLED while every ad group/keyword/ad beneath it is still PAUSED, delivering
+   * zero traffic with no signal anything is wrong — this is exactly what happened to a live
+   * $250/day launch for days before anyone noticed. Advisory only (like the tracking gate's
+   * own warning path): a real staged rollout — enable the campaign, review ad groups before
+   * turning them on — is legitimate, so this informs rather than blocks. A lookup failure
+   * here must not fail an otherwise-successful launch, so it degrades to no warning.
+   */
+  private makeGoogleAdsAuthError(message: string): Error {
+    const err = new Error(message) as any;
+    err.isGoogleAdsAuthError = true;
+    return err;
+  }
+
+  /**
+   * ENG-1944: mirrors resolveMetaCredentialScope. Google Ads tools had no equivalent —
+   * a delegated/admin session's call always resolved against the CALLER's own connected
+   * Google identity, never the requested client's, so a staff member auditing a client's
+   * account got "not found in your connected accounts" for an account that plainly exists
+   * on the client's own record. Unscoped (clientId undefined/null) is a no-op — zero
+   * behavior change for the ordinary customer-session path. Scoped calls fail loud, same
+   * as Meta: never silently substitute the caller's own account.
+   *
+   * Deliberately read-only in effect: only wired into the two reporting/list surfaces
+   * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
+   * A client-scoped WRITE would let an admin session mutate a client's live campaign
+   * without that client's own fresh authorization decision — the same risk ENG-1801
+   * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
+   * non-read action rather than pass it here.
+   */
+  private async resolveGoogleAdsCredentialScope(
+    callerUserId: string,
+    clientId: unknown,
+    callerIsAdminHint: boolean | undefined,
+    toolName: string
+  ): Promise<{ effectiveUserId: string; strict: boolean }> {
+    if (clientId === undefined || clientId === null) {
+      return { effectiveUserId: callerUserId, strict: false };
+    }
+    if (typeof clientId !== 'string' || !clientId.trim()) {
+      throw this.makeGoogleAdsAuthError(
+        `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+      );
+    }
+
+    const { userDb } = await import('./db');
+    const caller = await userDb.getUserById(callerUserId);
+    const isAdmin = callerIsAdminHint !== undefined ? callerIsAdminHint : caller?.isAdmin === true;
+    if (!isAdmin) {
+      throw this.makeGoogleAdsAuthError('client_id is admin-only — this account is not an admin.');
+    }
+
+    const trimmed = clientId.trim();
+    const target = trimmed.includes('@')
+      ? await userDb.getUserByEmail(trimmed)
+      : await userDb.getUserById(trimmed);
+    if (!target) {
+      throw this.makeGoogleAdsAuthError(`No client account found for "${trimmed}".`);
+    }
+    if (!(target as any).roles?.includes('customer')) {
+      throw this.makeGoogleAdsAuthError(`"${trimmed}" does not have customer portal access — cannot scope Google Ads tools to it.`);
+    }
+
+    const { recordAdminAudit } = await import('./adminAuditLog');
+    recordAdminAudit({
+      actorUserId: callerUserId,
+      actorEmail: caller?.email,
+      action: 'google_ads_client_scope',
+      tool: toolName,
+      targetUserId: (target as any).userId,
+      targetEmail: (target as any).email,
+    });
+
+    return { effectiveUserId: (target as any).userId, strict: true };
+  }
+
+  private async checkGoogleAdsPausedChildren(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+  ): Promise<string | undefined> {
+    try {
+      const adGroups = await googleAdsService.listAdGroups(userId, customerId, campaignResourceName);
+      if (adGroups.length === 0) return undefined;
+      const pausedAdGroups = adGroups.filter((g: any) => g.status === 'PAUSED');
+
+      let totalKeywords = 0, pausedKeywords = 0, totalAds = 0, pausedAds = 0;
+      await Promise.all(adGroups.map(async (group: any) => {
+        const [keywords, ads] = await Promise.all([
+          googleAdsService.listKeywords(userId, customerId, group.resourceName).catch(() => []),
+          googleAdsService.listAds(userId, customerId, group.resourceName).catch(() => []),
+        ]);
+        totalKeywords += keywords.length;
+        pausedKeywords += keywords.filter((k: any) => k.status === 'PAUSED').length;
+        totalAds += ads.length;
+        pausedAds += ads.filter((a: any) => a.status === 'PAUSED').length;
+      }));
+
+      const problems: string[] = [];
+      if (pausedAdGroups.length > 0) problems.push(`${pausedAdGroups.length}/${adGroups.length} ad group(s)`);
+      if (pausedKeywords > 0) problems.push(`${pausedKeywords}/${totalKeywords} keyword(s)`);
+      if (pausedAds > 0) problems.push(`${pausedAds}/${totalAds} ad(s)`);
+      if (problems.length === 0) return undefined;
+
+      return `Campaign is ENABLED, but ${problems.join(', ')} underneath it are still PAUSED — this campaign will deliver ZERO traffic until those are also explicitly enabled (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED). Do not report this launch as live until they are.`;
+    } catch (err) {
+      console.error('[ENG-1944] paused-child-entity check failed (non-fatal, launch still proceeds):', err);
+      return undefined;
+    }
+  }
+
+  /**
    * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
    * serves paid traffic to its final URL instantly — the same exposure as a launch.
    * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
@@ -39690,9 +39892,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
-  }, opts?: { sessionId?: string }): Promise<any> {
+  }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      // ENG-1944: client_id is admin-only and read-only-scoped here (see
+      // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
+      // session mutate a client's live campaign without that client's own authorization.
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        if (action !== 'LIST' && action !== 'SEARCH') {
+          return {
+            success: false,
+            error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
+          };
+        }
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
+        );
+        userId = scope.effectiveUserId;
+      }
       /*
        * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
        *
@@ -39796,7 +40013,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           // Relayed, not swallowed: the launch is permitted, but the operator has to be
           // told the page proves only that SOME Google tag is present (ENG-1358).
-          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
+          const resumePausedChildrenWarning = await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name);
+          return {
+            success: true, message: 'Campaign resumed',
+            ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}),
+            ...(resumePausedChildrenWarning ? { pausedChildEntitiesWarning: resumePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -39857,7 +40079,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be
           // verified rather than reading a bare success (ENG-1358).
-          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
+          const updatePausedChildrenWarning = args.status === 'ENABLED'
+            ? await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name)
+            : undefined;
+          return {
+            success: true, message: 'Campaign updated',
+            ...(trackingWarning ? { trackingWarning } : {}),
+            ...(updatePausedChildrenWarning ? { pausedChildEntitiesWarning: updatePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
@@ -40399,8 +40628,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
-  }): Promise<any> {
+  }, opts?: { clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
+      // ENG-1944: fully read-only tool, so client_id is always safe to honor here —
+      // no write-scope restriction needed (see handleCallGoogleAdsApi for why that
+      // restriction exists on the mixed read/write tool).
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_reporting_api'
+        );
+        userId = scope.effectiveUserId;
+      }
       if (args.mode === 'serving_chain') {
         const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
         const success = report.state === 'READY' || report.state === 'DELIVERING';

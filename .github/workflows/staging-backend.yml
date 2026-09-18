@@ -130,6 +130,11 @@ jobs:
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ needs.build.outputs.version_label }}.zip
           EB_TOTAL_TIMEOUT_SECONDS: '2700'
           EB_SETTLE_TIMEOUT_SECONDS: '1200'
+          # ENG-1749: apply the same 600s deregistration delay ENG-823 proved
+          # on prod. ensure_deregistration_delay() in eb-deploy.sh is a no-op
+          # unless this var is set, so staging previously deployed at the AWS
+          # default of 20s on target group 6c60f9c83d4b64e9.
+          EB_DEREGISTRATION_DELAY_SECONDS: '600'
         run: bash .github/scripts/eb-deploy.sh
 
       # The shared script retains its bounded recovery logic. Staging evidence
