@@ -204,12 +204,10 @@ export type ReportDeliveryState =
   | 'recipient_confirmed';
 
 export type ReportDeliveryReason =
-  | 'no_recipients_configured'
   | 'no_authorized_recipients'
   | 'empty_content'
   | 'provider_error'
-  | 'suppressed_nonprod'
-  | 'test_timed_out';
+  | 'suppressed_nonprod';
 
 export interface ReportDeliveryLogEntry {
   runId: string;
@@ -223,10 +221,7 @@ export interface ReportDeliveryLogEntry {
   at: string;
 }
 
-export type RecipientRemediationCode =
-  | 'no_authorized_recipients'
-  | 'no_recipients_configured'
-  | 'empty_report_content';
+export type RecipientRemediationCode = 'no_authorized_recipients';
 
 export interface RecipientRemediation {
   code: RecipientRemediationCode;
@@ -247,16 +242,10 @@ export interface RecipientRemediation {
 const REMEDIATION_SAFE_ACTION: Record<RecipientRemediationCode, string> = {
   no_authorized_recipients:
     'This report uses cross-account data, so it can only be sent to admin users. Add an admin recipient, or remove the cross-account tools from the schedule, then run it again.',
-  no_recipients_configured:
-    'Add at least one email recipient before activating this schedule.',
-  empty_report_content:
-    'The run produced no report content, so nothing was sent. Open the run to see why, then run the schedule again.',
 };
 
 const REMEDIATION_MISSING_PERMISSION: Record<RecipientRemediationCode, string> = {
   no_authorized_recipients: 'isAdmin',
-  no_recipients_configured: 'recipient',
-  empty_report_content: 'none',
 };
 
 export function buildRecipientRemediation(params: {
