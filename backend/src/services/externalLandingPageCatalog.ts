@@ -73,9 +73,9 @@ export function normalizeCanonicalUrl(raw: string): string {
   if (!parsed.hostname.includes(".")) {
     throw new ExternalLandingPageValidationError("canonicalUrl host is not valid");
   }
-  // Normalize: lowercase host, drop trailing slash (root) only for dedup.
+  // Normalize: lowercase host (preserve non-default port), drop trailing slash (root) only for dedup.
   const normalized =
-    `${parsed.protocol}//${parsed.hostname.toLowerCase()}` +
+    `${parsed.protocol}//${parsed.hostname.toLowerCase()}${parsed.port ? `:${parsed.port}` : ""}` +
     (parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "")) +
     (parsed.search || "") +
     (parsed.hash || "");
@@ -112,11 +112,12 @@ export function buildExternalLandingPageRecord(
 ): Record<string, any> {
   const name = normalizeExternalPageName(input.name);
   const canonicalUrl = normalizeCanonicalUrl(input.canonicalUrl);
+  const boundedContext = input.context?.trim().slice(0, 2000);
   const record: Record<string, any> = {
     id,
     userId: input.userId,
     name,
-    prompt: input.context ? `Imported externally-deployed page: ${input.context}` : "Imported externally-deployed page",
+    prompt: boundedContext ? `Imported externally-deployed page: ${boundedContext}` : "Imported externally-deployed page",
     status: "deployed",
     sourceType: "external",
     canonicalUrl,

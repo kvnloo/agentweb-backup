@@ -64,6 +64,26 @@ describe("ENG-1238 external lander catalog (TDD RED first)", () => {
     ).toThrow(ExternalLandingPageValidationError);
   });
 
+  test("PASS-port: non-default https port is preserved in normalized canonical URL", () => {
+    expect(normalizeCanonicalUrl("https://example.com:8443/page")).toBe(
+      "https://example.com:8443/page"
+    );
+  });
+
+  test("PASS-context-bound: prompt is built from bounded context, not raw input", () => {
+    const long = "x".repeat(5000);
+    const record = buildExternalLandingPageRecord(
+      { userId: "u1", name: "x", canonicalUrl: "https://example.com/p", context: long },
+      "page-3",
+      "2026-09-18T00:00:00.000Z"
+    );
+    expect(record.context).toHaveLength(2000);
+    expect(record.prompt.length).toBeLessThanOrEqual(
+      "Imported externally-deployed page: ".length + 2000
+    );
+    expect(record.prompt).not.toContain("x".repeat(2001));
+  });
+
   test("PASS-unchanged: external-record predicate is false for builder pages", () => {
     expect(isExternalLandingPageRecord({})).toBe(false);
     expect(isExternalLandingPageRecord({ sourceType: "external" })).toBe(true);
