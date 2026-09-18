@@ -57,6 +57,7 @@ import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjec
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { isExternalLandingPageRecord } from "../services/externalLandingPageCatalog";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
 
@@ -939,7 +940,10 @@ router.get("/generated", async (req, res: Response) => {
     // calls. Owner fast-paths to true; otherwise canEditItem gates on
     // editor/owner role.
     const annotated = pages.map((p) => ({
-      ...p,
+      ...(isExternalLandingPageRecord(p)
+        ? { ...p, customDomainUrl: p.customDomainUrl || p.canonicalUrl || p.deployedUrl }
+        : p),
+      isExternalImport: isExternalLandingPageRecord(p),
       editable: canEditItem(
         { userId: p.userId },
         { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
