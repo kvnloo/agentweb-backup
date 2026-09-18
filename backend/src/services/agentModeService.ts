@@ -6537,7 +6537,7 @@ export class AgentModeService {
     }
     // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
     // just the body — a long failure tail could otherwise exceed the bound.
-    const content = `${body}${tail}`.slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
+    const content = `${rendered.join('\n\n').slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS))}${failures.length ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).` : ''}`.slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
     return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
   }
 
