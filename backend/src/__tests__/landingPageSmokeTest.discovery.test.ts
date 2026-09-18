@@ -20,6 +20,17 @@ type Discovered = {
   fields: { selector: string; hint: string; kind: string }[];
   selects: { selector: string; options: string[] }[];
   checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+  submitSelector: string | null;
+};
+
+/** Cases default to discoverSmokeFields; `fn` selects another exported page-side function. */
+const SUBMIT_CASES: Record<string, string> = {
+  submitMarked: `
+    <form id="newsletter"><input type="email" name="EMAIL"><button type="submit">Join</button></form>
+    <form id="lead" data-agentweb-smoke-form="1"><input type="email" name="email"><button type="submit">Send</button></form>`,
+  submitNoMarkedForm: `
+    <form id="newsletter"><input type="email" name="EMAIL"><button type="submit">Join</button></form>
+    <div><input type="email" name="email"><button>Send</button></div>`,
 };
 
 const CASES: Record<string, string> = {
@@ -48,8 +59,39 @@ const CASES: Record<string, string> = {
       <input type="text" name="bot-field">
       <input type="text" name="_gotcha">
       <input type="text" name="honeypot">
-      <input type="text" name="b_1234">
+      <input type="text" name="b_36c4fd991d0dfc11_2a5c1f0d">
     </form>`,
+  honeypotLookalikes: `
+    <form>
+      <input type="email" name="email" required>
+      <input type="email" name="confirm_email" required>
+      <input type="text" name="honeymoon_destination" required>
+      <input type="text" name="hp_model" required>
+      <input type="text" name="b_2b_leads">
+    </form>`,
+  requiredTrapName: `
+    <form>
+      <input type="email" name="email" required>
+      <input type="text" name="honeypot" required>
+    </form>`,
+  newsletterVsLead: `
+    <form id="lead">
+      <input type="text" name="full_name" required>
+      <input type="text" name="phone_number" required>
+      <input type="text" name="zip" required>
+      <button type="submit">Get estimate</button>
+    </form>
+    <form id="newsletter"><input type="email" name="EMAIL" required><button type="submit">Join</button></form>`,
+  loginForm: `
+    <form id="login"><input type="email" name="email" required><input type="password" name="password" required></form>
+    <form id="lead"><input type="text" name="full_name" required><input type="text" name="phone" required></form>`,
+  formAssociated: `
+    <form id="lead"><input type="email" name="email" required></form>
+    <input form="lead" name="zip" required>
+    <button form="lead" type="submit" id="sticky-submit">Send</button>`,
+  preMarked: `
+    <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
+    <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
   belowFold: `
     <form>
       <input type="email" name="email">
@@ -86,10 +128,16 @@ const CASES: Record<string, string> = {
   noForm: `<div><input type="email" name="email"><input type="tel" name="phone"></div>`,
 };
 
-let out: Record<string, { result?: Discovered; markedFormIds?: string[]; error?: string }> = {};
+let out: Record<
+  string,
+  { result?: any; markedFormIds?: string[]; submitted?: string[]; error?: string }
+> = {};
 
 beforeAll(() => {
-  const cases = Object.entries(CASES).map(([name, html]) => ({ name, html }));
+  const cases = [
+    ...Object.entries(CASES).map(([name, html]) => ({ name, html })),
+    ...Object.entries(SUBMIT_CASES).map(([name, html]) => ({ name, html, fn: "submitMarkedForm" })),
+  ];
   const child = spawnSync(process.execPath, [HELPER], {
     input: JSON.stringify({ cases }),
     encoding: "utf8",
@@ -185,8 +233,68 @@ describe("discoverSmokeFields", () => {
     ]);
   });
 
+  it("drives the lead form even when the only type=email control is a footer newsletter", () => {
+    // Regression: weighting `input[type=email|tel]` heavily made a one-field subscribe box
+    // outrank a real lead form whose phone/zip/name controls are all type="text" — which is
+    // the shape of the landers this path was written for (they often have no email field).
+    expect(out.newsletterVsLead.markedFormIds).toEqual(["lead"]);
+    expect(selectorsOf(got("newsletterVsLead")).length).toBe(3);
+  });
+
+  it("never drives an authentication form", () => {
+    expect(out.loginForm.markedFormIds).toEqual(["lead"]);
+  });
+
+  it("keeps legitimate fields whose names merely look like honeypots", () => {
+    // `confirm_email`, `honeymoon_destination` and `hp_model` are ordinary required fields.
+    // Skipping them left client-side validation blocking submit — a false FAIL, and the
+    // diagnostics then reported a 100% fill rate because skipped controls were not counted.
+    expect(selectorsOf(got("honeypotLookalikes"))).toEqual([
+      `${SCOPE}[name="email"]`,
+      `${SCOPE}[name="confirm_email"]`,
+      `${SCOPE}[name="honeymoon_destination"]`,
+      `${SCOPE}[name="hp_model"]`,
+      `${SCOPE}[name="b_2b_leads"]`,
+    ]);
+  });
+
+  it("required beats a honeypot-looking name — a real trap is never required", () => {
+    expect(selectorsOf(got("requiredTrapName"))).toEqual([
+      `${SCOPE}[name="email"]`,
+      `${SCOPE}[name="honeypot"]`,
+    ]);
+  });
+
+  it("sees controls associated by the form= attribute, and the submit button outside the form", () => {
+    // form.elements, not querySelectorAll: a required control outside the form's subtree
+    // still blocks submit, and a sticky-footer submit button still submits it.
+    expect(selectorsOf(got("formAssociated"))).toEqual([
+      `${SCOPE}[name="email"]`,
+      `${SCOPE}[name="zip"]`,
+    ]);
+    expect(got("formAssociated").submitSelector).toBe('[id="sticky-submit"]');
+  });
+
+  it("clears a stale marker so only one form is ever marked", () => {
+    expect(out.preMarked.markedFormIds).toEqual(["lead"]);
+  });
+
   it("a page with no <form> at all yields an empty scope and unscoped selectors", () => {
     expect(got("noForm").scope).toBe("");
     expect(selectorsOf(got("noForm"))).toEqual(['[name="email"]', '[name="phone"]']);
+  });
+
+  it("submitMarkedForm submits ONLY the marked form", () => {
+    expect(out.submitMarked.submitted).toEqual(["lead"]);
+    expect(out.submitMarked.result).toBe(true);
+  });
+
+  it("submitMarkedForm reports false rather than falling back to the first form on the page", () => {
+    // The regression this pins: `querySelector("form")?.requestSubmit()` RESOLVES when the
+    // marker is missing, and a `|| document.querySelector("form")` fallback would submit the
+    // newsletter form — exactly when we least understand the page. Reporting false is what
+    // lets the caller reach the Enter fallback instead.
+    expect(out.submitNoMarkedForm.submitted).toEqual([]);
+    expect(out.submitNoMarkedForm.result).toBe(false);
   });
 });

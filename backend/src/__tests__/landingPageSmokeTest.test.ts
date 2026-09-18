@@ -17,16 +17,26 @@ let exposedFbqReporter: ((event: string) => void) | undefined;
 // the evidence the implementation requires before trusting a handoff redirect.
 let responseListener: ((response: any) => void) | undefined;
 
-/** Simulate one response arriving on the page (defaults to a successful same-origin POST). */
+/** Every value the run has typed into the page so far. */
+const filledValues = () => (mockPage.fill as jest.Mock).mock.calls.map((c) => c[1]);
+/** A request body carrying the run's own synthetic data — what real capture evidence looks like. */
+const ourPayload = () => JSON.stringify({ values: filledValues() });
+
+/**
+ * Simulate one response arriving on the page. Defaults to what a genuine capture looks
+ * like: a same-origin POST, final 2xx, body carrying this run's synthetic data.
+ */
 function emitResponse({
   url = "https://test-page.vercel.app/api/capture",
   status = 200,
   method = "POST",
-}: { url?: string; status?: number; method?: string } = {}) {
+  body,
+}: { url?: string; status?: number; method?: string; body?: string | null } = {}) {
+  const postData = body === undefined ? ourPayload() : body;
   responseListener?.({
     url: () => url,
     status: () => status,
-    request: () => ({ method: () => method }),
+    request: () => ({ method: () => method, postData: () => postData }),
   });
 }
 
@@ -42,6 +52,7 @@ const SINGLE_EMAIL_FIELD = {
   ],
   selects: [],
   checkables: [],
+  submitSelector: null,
 };
 
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
@@ -346,6 +357,7 @@ describe("runGenerationSmokeTest", () => {
         { selector: "#plan-plus", type: "radio", name: "plan", required: true },
         { selector: "#opt-news", type: "checkbox", name: "news", required: false },
       ],
+      submitSelector: null,
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -377,11 +389,15 @@ describe("runGenerationSmokeTest", () => {
     );
     expect(checked).not.toContain("#plan-plus");
     expect(checked).not.toContain("#opt-news");
-    // No email field on this form, so there is nothing to poll the CRM by.
-    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
+    // The poll runs even though this form has no email-keyed field: it is the cleanup path,
+    // and a lander that received "Smoke Test" in an untyped contact field still creates a
+    // real row that isSmokeTestEmail() would never match. Here the row exists, so it is
+    // found and deleted rather than left behind forever.
+    expect(mockGetLeadByEmail).toHaveBeenCalled();
+    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(false);
-    expect(result.leadCaptured).toBe(false);
+    expect(result.ok).toBe(true);
+    expect(result.leadCaptured).toBe(true);
   });
 
   it("VALUES: a name-based selector no longer drags every field into the person-name branch", () => {
@@ -417,6 +433,7 @@ describe("runGenerationSmokeTest", () => {
       ],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
@@ -429,6 +446,8 @@ describe("runGenerationSmokeTest", () => {
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
+    // Polled anyway — a handoff form that ALSO writes a row must still get it cleaned up.
+    expect(mockGetLeadByEmail).toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
@@ -445,6 +464,7 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
@@ -468,6 +488,7 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
@@ -488,6 +509,7 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -508,6 +530,7 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -528,6 +551,7 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
       selects: [],
       checkables: [],
+      submitSelector: null,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -559,6 +583,106 @@ describe("runGenerationSmokeTest", () => {
     expect(mockGetLeadByEmail).toHaveBeenCalled();
     expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
+  });
+
+  // Each case below kills a mutant that survived the previous revision of this suite: the
+  // handoff gate was only ever exercised at 200-vs-500 on a single response, so the non-GET
+  // filter, the 3xx boundary and the attribution check were all untested.
+  const handoffRun = async (emit: () => void) => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+      submitSelector: null,
+    });
+    mockPage.click.mockImplementationOnce(async () => emit());
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+    return mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+  };
+
+  it("EVIDENCE: a redirect hop is not acceptance — POST 308 then 500 must fail", async () => {
+    // Playwright raises a response event per redirect hop, and for a 307/308 the method is
+    // still POST. Accepting any status < 400 therefore passed a capture endpoint that 308'd
+    // and then 500'd — verbatim the swallowed-500 case the handoff gate exists to catch.
+    const result = await handoffRun(() => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 308 });
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 500 });
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("EVIDENCE: a GET is not acceptance, however successful", async () => {
+    const result = await handoffRun(() => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200, method: "GET" });
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("EVIDENCE: a same-origin POST that did not carry our data is not acceptance", async () => {
+    // Vercel Speed Insights POSTs to /_vercel/speed-insights/vitals on pagehide — i.e.
+    // exactly at the handoff redirect. Same origin, non-GET, 200, and nothing to do with us.
+    const result = await handoffRun(() => {
+      emitResponse({
+        url: "https://campaign.waterheater.app/_vercel/speed-insights/vitals",
+        status: 200,
+        body: '{"event":"vitals"}',
+      });
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("EVIDENCE: a 2xx POST carrying our synthetic data IS acceptance", async () => {
+    const result = await handoffRun(() => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
+    });
+    expect(result.ok).toBe(true);
+    expect(result.handoffId).toBe("abc123");
+  });
+
+  it("NAVIGATION: the waitForURL predicate actually distinguishes a moved URL from a still one", async () => {
+    // The predicate was never executed by any test — inverting it to `===` used to leave
+    // the whole suite green.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const predicate = (mockPage.waitForURL as jest.Mock).mock.calls[0][0];
+    expect(predicate(new URL("https://test-page.vercel.app/thanks"))).toBe(true);
+    expect(predicate(new URL("https://test-page.vercel.app"))).toBe(false);
+  });
+
+  it("SUBMIT: a page-resolved submit control (form= button outside the form) is used as-is", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      submitSelector: '[id="sticky-submit"]',
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.click).toHaveBeenCalledWith(
+      '[id="sticky-submit"]',
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
+  });
+
+  it("DIAGNOSTICS: a hostile redirect URL is flattened and truncated before it reaches Slack", async () => {
+    const longUrl = `https://evil.test/${"a".repeat(400)}`;
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://test-page.vercel.app")
+      .mockReturnValueOnce(longUrl);
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).not.toContain("\n");
+    expect(reason).toContain("...");
+    expect(reason.length).toBeLessThan(longUrl.length);
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {

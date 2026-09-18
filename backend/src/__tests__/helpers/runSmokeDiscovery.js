@@ -21,15 +21,15 @@ const ts = require("typescript");
 const { JSDOM } = require("jsdom");
 
 const SERVICE = path.join(__dirname, "..", "..", "services", "landingPageSmokeTest.ts");
-const FN_NAME = "discoverSmokeFields";
+const DEFAULT_FN = "discoverSmokeFields";
 
-function extractFunctionJs() {
+function extractFunctionJs(fnName) {
   const source = fs.readFileSync(SERVICE, "utf8");
   const sourceFile = ts.createSourceFile(SERVICE, source, ts.ScriptTarget.ES2018, true);
   const declaration = sourceFile.statements.find(
-    (statement) => ts.isFunctionDeclaration(statement) && statement.name && statement.name.text === FN_NAME
+    (statement) => ts.isFunctionDeclaration(statement) && statement.name && statement.name.text === fnName
   );
-  if (!declaration) throw new Error(`${FN_NAME} not found in ${SERVICE}`);
+  if (!declaration) throw new Error(`${fnName} not found in ${SERVICE}`);
   // Drop the `export` modifier: with it, transpileModule emits `exports.<name> = ...`,
   // which has no meaning inside a browser window realm.
   const tsText = source
@@ -40,7 +40,7 @@ function extractFunctionJs() {
   }).outputText;
 }
 
-function runCase(fnJs, html) {
+function runCase(fnJs, html, fnName) {
   const dom = new JSDOM(`<!doctype html><html><body>${html}</body></html>`, {
     runScripts: "outside-only",
   });
@@ -59,21 +59,26 @@ function runCase(fnJs, html) {
       toJSON() { return {}; },
     };
   };
+  // jsdom does not implement requestSubmit; record calls so a submit case can assert on it.
+  const submitted = [];
+  win.HTMLFormElement.prototype.requestSubmit = function () { submitted.push(this.id || "(unnamed)"); };
   win.eval(fnJs);
-  const result = win.eval(`${FN_NAME}()`);
+  const result = win.eval(`${fnName}()`);
   const markedFormIds = Array.prototype.slice
     .call(win.document.querySelectorAll("form[data-agentweb-smoke-form]"))
     .map((form) => form.id || "(unnamed)");
-  return { result: JSON.parse(JSON.stringify(result)), markedFormIds };
+  return { result: JSON.parse(JSON.stringify(result)), markedFormIds, submitted };
 }
 
 function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8"));
-  const fnJs = extractFunctionJs();
   const results = {};
+  const cache = {};
   for (const testCase of input.cases) {
+    const fnName = testCase.fn || DEFAULT_FN;
     try {
-      results[testCase.name] = runCase(fnJs, testCase.html);
+      if (!cache[fnName]) cache[fnName] = extractFunctionJs(fnName);
+      results[testCase.name] = runCase(cache[fnName], testCase.html, fnName);
     } catch (err) {
       results[testCase.name] = { error: err && err.message ? err.message : String(err) };
     }
