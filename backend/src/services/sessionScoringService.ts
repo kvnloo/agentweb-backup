@@ -1127,7 +1127,16 @@ const INTERACTIVE_PUBLISH_HANDLING_PATTERNS: RegExp[] = [
  * its own longer allowance via the fragment shapes above; this cap applies
  * to the outage/auth/token patterns matched against the full final turn.
  */
-const MAX_BLOCK_REPORT_CHARS = 600;
+// A block REPORT, not a passing mention inside generated content (CodeRabbit
+// local review on #2983): the final assistant turn must READ as a terminal
+// block report — it must OPEN by naming the block or OPEN/CLOSE with the
+// handling (stopped/refused/withheld + fix/next step). A draft or explainer
+// that mentions "provider error" mid-body and "next steps" at the end stays
+// scorable: neither the opening nor the closing is the block report.
+const BLOCK_REPORT_OPEN_PATTERN: RegExp =
+  /^(sorry|i (can't|cannot|won't|am unable)|unable to|stopped|holding|saved the draft|draft saved|please sign in|sign in|once signed in|your .* was revoked|reconnect|linked(in)? search is (currently down|down)|service is (currently down|down)|.*\boutage, so i stopped\b|.*could you clarify|.*could you let me know|.*publish.*(approval|authorization|withheld))/i;
+const BLOCK_REPORT_CLOSE_PATTERN: RegExp =
+  /(say retry|once (signed in|reconnected)|takes ~?60 seconds|settings → integrations|filed .* (as )?a product issue|reported via the appropriate tool|which [a-z']+\?|what [a-z']+.*\?|whether .*\.?\s*$|please sign in|will not (publish|post|proceed|make)|stopped (before|that path)|saved the draft|draft saved)\s*(<[^>]+>\s*)*$/i;
 
 const BLOCKED_EXTERNAL_HANDLING_PATTERNS: RegExp[] = [
   // Stopped before acting without authority + explained.
@@ -1164,10 +1173,17 @@ export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean 
   // focused question, and the PRECEDING user request must be a genuinely
   // ambiguous fragment from the positive allowlist.
   if (matchesClarificationBlock(messages ?? [], text)) return true;
-  // Non-clarification blocks: the final turn must be a SHORT terminal block
-  // report (CodeRabbit local review on #2983) — a long deliverable that
-  // merely mentions an outage in passing stays scorable.
-  if (text.length > MAX_BLOCK_REPORT_CHARS) return false;
+  // Non-clarification blocks: the final turn must READ as a terminal block
+  // report (CodeRabbit local review on #2983) — it must open on the block
+  // (or the handling) and close on the handling. A draft/explainer that
+  // merely mentions an outage mid-body stays scorable even when short.
+  const trimmed = text.trim();
+  const opensOnBlock = BLOCK_REPORT_OPEN_PATTERN.test(trimmed);
+  const closesOnHandling = BLOCK_REPORT_CLOSE_PATTERN.test(trimmed);
+  // Either edge must carry the report shape: a turn that neither opens on
+  // the block/handling nor closes on the handling is generated content with
+  // a passing mention, not a terminal block report.
+  if (!opensOnBlock && !closesOnHandling) return false;
   const namesBlock = BLOCKED_EXTERNAL_PATTERNS.some((re) => re.test(text));
   if (!namesBlock) return false;
   return BLOCKED_EXTERNAL_HANDLING_PATTERNS.some((re) => re.test(text));
@@ -1186,7 +1202,13 @@ export function isBlockedExternalSessionForSession(session: {
   if (isBlockedExternalSession(session?.messages)) return true;
   if (session?.sessionType === 'scheduled') return false;
   const text = lastAssistantText(session?.messages ?? []);
-  if (!text || text.length > MAX_BLOCK_REPORT_CHARS) return false;
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (
+    !BLOCK_REPORT_OPEN_PATTERN.test(trimmed) &&
+    !BLOCK_REPORT_CLOSE_PATTERN.test(trimmed)
+  )
+    return false;
   return (
     INTERACTIVE_PUBLISH_HOLD_PATTERNS.some((re) => re.test(text)) &&
     INTERACTIVE_PUBLISH_HANDLING_PATTERNS.some((re) => re.test(text))
@@ -1831,6 +1853,13 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // Manual "Test this schedule" runs sort before blocked-external (CodeRabbit
+  // local review on #2983): a Test: QA run that ends in a block report is a
+  // test run, not a platform gap.
+  if (isTestScheduledSession(session)) {
+    return null;
+  }
+
   // ENG-1165: blocked by something outside the agent's control (unsigned-in
   // gate, revoked integration, upstream outage, unanswered legitimate
   // question, approval-held publish) with correct handling — a neutral
@@ -2007,7 +2036,13 @@ export async function attemptSessionScore(
 
   // ENG-1165: same neutral EXCLUDED state for the general satisfaction score.
   // The skip reason keeps the platform-gap cohort countable in reporting
-  // without charging it to the agent's headline metric.
+  // without charging it to the agent's headline metric. Test-run ordering:
+  // the isTestScheduledSession check below (ENG-499) already sits above the
+  // already-scored return but below this block — move the test-run check
+  // above so a Test: QA block report counts as a test run, not a gap.
+  if (isTestScheduledSession(session)) {
+    return skip("test-run");
+  }
   if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
     await retractSatisfactionScore(session);
     return skip("blocked-external");

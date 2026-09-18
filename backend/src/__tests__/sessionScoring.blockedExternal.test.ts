@@ -204,9 +204,12 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
   });
 
   it('a long generated incident-notice draft mentioning an outage stays scorable (not a terminal block report)', async () => {
-    const longDraft = 'Service is currently down. '.padEnd(700, 'Details of the incident follow. ') +
-      'Here is the customer notice draft you asked for: we apologize for the disruption. Next steps: our team will post updates hourly. Please review and approve.';
-    expect(longDraft.length).toBeGreaterThan(600);
+    const longDraft = 'Here is the customer notice draft you asked for regarding the event. ' +
+      'Service is currently down across the region and our status page reflects the outage. ' +
+      'Details of the incident follow in the next paragraph for your review. ' +
+      'We apologize for the disruption and appreciate your patience. ' +
+      'Next steps: our team will post updates hourly until service is restored. Please review and approve.';
+    expect(longDraft.length).toBeGreaterThan(300);
     const messages: ChatMessage[] = [
       { role: 'user', content: 'Draft an incident notice for the outage' },
       { role: 'assistant', content: longDraft },
