@@ -4734,6 +4734,8 @@ describe('runScheduledChat recipient preflight (ENG-1552)', () => {
     expect(mockEmailService.notifyScheduledReportWithheld).toHaveBeenCalledWith(
       expect.objectContaining({ scheduleId: 'sched-1552', stage: 'before_generation', ownerEmail: 'owner@customer.example' })
     );
+    // Oncall only — the customer is sent nothing new during the review period.
+    expect((mockEmailService.notifyScheduledReportWithheld as jest.Mock).mock.calls[0][0].emailOwner).toBeFalsy();
   });
 
   it('skips generation on the FIRST run when the schedule requires a cross-account tool (no breadcrumb yet)', async () => {

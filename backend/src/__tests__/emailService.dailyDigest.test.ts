@@ -265,6 +265,7 @@ describe('Daily Digest Email Service', () => {
       expect(emailService.sendEmail).not.toHaveBeenCalled();
       expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
       expect(notify).toHaveBeenCalledWith(expect.objectContaining({ scheduleId: 'schedule-1', stage: 'after_generation' }));
+      expect(notify.mock.calls[0][0].emailOwner).toBeFalsy(); // oncall only, nothing to the customer
       expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
         'schedule-1',
         expect.objectContaining({ state: 'withheld', reason: 'no_authorized_recipients' }),

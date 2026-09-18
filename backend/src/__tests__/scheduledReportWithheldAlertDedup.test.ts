@@ -103,7 +103,7 @@ describe('withheld scheduled report → one canonical Linear defect (ENG-1825)',
 
     expect(linearState.issues[0].description).not.toContain('SECRET');
     expect(linearState.issues[0].description).toContain('iShare Link: N/A');
-    // The owner still gets the delivery-blocked status notice.
+    // The single-report path keeps its pre-ENG-1552 owner status notice.
     const sends = (emailService.sendEmail as jest.Mock).mock.calls;
     expect(sends.some(c => Array.isArray(c[0]) && c[0].includes('owner@example.com'))).toBe(true);
   });

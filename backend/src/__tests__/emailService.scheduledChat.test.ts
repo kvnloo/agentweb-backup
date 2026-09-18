@@ -626,12 +626,10 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
 describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: 'schedule-123', userId: 'owner-id' });
-    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com' });
   });
 
   it.each([['empty', ''], ['whitespace-only', '  \n\t ']])(
-    'never sends a %s report to recipients; records withheld/empty_content and notifies only the owner',
+    'never sends a %s report — to recipients or anyone else; records withheld/empty_content',
     async (_label, body) => {
       const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
@@ -642,11 +640,9 @@ describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)'
         'schedule-123'
       );
 
-      const recipientSends = spy.mock.calls.filter(c => c[0].includes('a@example.com') || c[0].includes('b@example.com'));
-      expect(recipientSends).toHaveLength(0);
-      expect(spy).toHaveBeenCalledTimes(1);
-      expect(spy.mock.calls[0][0]).toEqual(['owner@example.com']);
-      expect(spy.mock.calls[0][1]).toContain('not delivered');
+      // Nothing goes to the customer during the review period (2026-09-18) — not the
+      // empty report, and not a new "not delivered" notice either.
+      expect(spy).not.toHaveBeenCalled();
       expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
         'schedule-123',
         expect.objectContaining({ runId: 'run-9', state: 'withheld', reason: 'empty_content', withheldRecipients: ['a@example.com', 'b@example.com'] }),
