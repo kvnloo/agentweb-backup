@@ -19,9 +19,22 @@ const mockPage = {
   }),
   addInitScript: jest.fn().mockResolvedValue(undefined),
   goto: jest.fn().mockResolvedValue(undefined),
+  // No navigation after submit by default — exercises the CRM-poll path.
+  url: jest.fn().mockReturnValue("https://test-page.vercel.app"),
+  waitForURL: jest.fn().mockRejectedValue(new Error("no navigation")),
   fill: jest.fn().mockResolvedValue(undefined),
   click: jest.fn().mockResolvedValue(undefined),
   press: jest.fn().mockResolvedValue(undefined),
+  selectOption: jest.fn().mockResolvedValue(undefined),
+  check: jest.fn().mockResolvedValue(undefined),
+  // Minimal single-email-field lander by default — mirrors the original tests.
+  evaluate: jest.fn().mockResolvedValue({
+    textInputs: ['input[type="email"]'],
+    telInputs: [],
+    otherTexts: [],
+    selects: [],
+    checkables: [],
+  }),
 };
 const mockBrowser = {
   newPage: jest.fn().mockResolvedValue(mockPage),
@@ -210,9 +223,80 @@ describe("runGenerationSmokeTest", () => {
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockPage.press).toHaveBeenCalledWith('input[type="email"]', "Enter");
+    expect(mockPage.press).toHaveBeenCalledWith("input, select, textarea", "Enter");
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
+  });
+
+  it("SUCCESS: React multi-field form (name/phone/zip + selects + checkbox) → fills all fields, lead lands → ok:true", async () => {
+    // Mirrors campaign.waterheater.app root 2026-09-18: the old fill-email-only path
+    // left client-side validation failing so submit never fired (false-negative FAIL).
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      textInputs: [],
+      telInputs: ["phone"],
+      otherTexts: ["full_name", "zip"],
+      selects: [
+        { selector: "urgency", options: ["emergency", "tomorrow"] },
+        { selector: "heater_type", options: ["gas", "electric"] },
+      ],
+      checkables: ["symptom-no_hot_water"],
+    });
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.fill).toHaveBeenCalledWith("#phone", expect.stringMatching(/^555\d{7}$/));
+    expect(mockPage.fill).toHaveBeenCalledWith("#full_name", "Smoke");
+    expect(mockPage.fill).toHaveBeenCalledWith("#zip", "94025");
+    expect(mockPage.selectOption).toHaveBeenCalledWith("#urgency", "emergency");
+    expect(mockPage.selectOption).toHaveBeenCalledWith("#heater_type", "gas");
+    expect(mockPage.check).toHaveBeenCalledWith("#symptom-no_hot_water");
+    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
+    expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+    expect(result.leadCaptured).toBe(true);
+  });
+
+  it("SUCCESS: chat-handoff form redirects with handoff_id instead of a CRM row → ok:true without polling", async () => {
+    // Mirrors campaign.waterheater.app root 2026-09-18: POST /api/hero-estimate returns
+    // { handoff_id } and redirects to chat.waterheater.app/text — no CRM lead row exists
+    // to poll for, so pollForLead would always miss even though the pipeline worked.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      textInputs: [],
+      telInputs: ["phone"],
+      otherTexts: ["full_name", "zip"],
+      selects: [],
+      checkables: [],
+    });
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
+    expect(mockDeleteLead).not.toHaveBeenCalled();
+    expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+    expect(result.leadCaptured).toBe(true);
+  });
+
+  it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://test-page.vercel.app")
+      .mockReturnValueOnce("https://test-page.vercel.app#pricing");
+    mockGetLeadByEmail.mockResolvedValue(null); // never found
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadByEmail).toHaveBeenCalled();
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(false);
+    expect(result.leadCaptured).toBe(false);
   });
 
   it("SUCCESS (concurrency cap): with max=1, a second smoke test never launches Chrome until the first one's browser closes", async () => {
