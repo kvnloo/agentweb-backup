@@ -1085,8 +1085,10 @@ const BLOCKED_EXTERNAL_HANDLING_PATTERNS: RegExp[] = [
   /stopped before|will not (proceed|post|make)|saved the draft|draft saved/i,
   // Gave the fix / next step.
   /reconnect|takes ~?60 seconds|once (signed in|reconnected)|say retry|settings → integrations|next steps/i,
-  // Asked a focused question instead of guessing.
-  /could you clarify|which (one|option)|let me know/i,
+  // Asked a focused question instead of guessing. Narrow: "let me know" alone
+  // is a generic closing, not handling evidence (CodeRabbit PR review) — it
+  // only counts paired with the clarification decline above.
+  /could you clarify|which (one|option)|let me know.{0,80}(which|what|whether|clarify|details?)|(which|what|whether|clarify).{0,80}let me know/i,
   // Filed the platform issue.
   /filed .* (product issue|as a product issue)|reported via the appropriate tool/i,
   // Asked to sign in.

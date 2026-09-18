@@ -153,4 +153,18 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(attempt.score).not.toBeNull();
     expect(attempt.skipReason).toBeUndefined();
   });
+
+  it('a completed outage fallback ending in a bare "let me know" stays scorable (generic closing is not handling evidence)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: 'LinkedIn search had an upstream outage. I already pulled an equivalent list another way — here it is. Let me know if you need anything else.' },
+    ];
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ score: 4, reason: 'done via fallback', dimensions: { goalCompletion: 4, dataAccuracy: 5, outputQuality: 4 } }) } }],
+    } as any);
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
 });
