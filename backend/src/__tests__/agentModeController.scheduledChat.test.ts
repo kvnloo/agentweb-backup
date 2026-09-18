@@ -4909,7 +4909,7 @@ describe('scheduled-chat activation gates (ENG-1552)', () => {
 
     it('an edit to the tools or prompt clears a stale sensitivity flag, so the schedule can recover', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue({
-        ...activeSensitive, status: 'paused', requiredFunctionCalls: [], lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+        ...activeSensitive, status: 'paused', requiredFunctionCalls: ['list_all_clients'], lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
       } as any);
       await agentModeController.updateScheduledChat(updateReq({ requiredFunctionCalls: [] }), res());
       expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
@@ -4917,6 +4917,21 @@ describe('scheduled-chat activation gates (ENG-1552)', () => {
       (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
       await agentModeController.updateScheduledChat(updateReq({ startingMessage: 'A different prompt' }), res());
       expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
+    });
+
+    it('a whole-form portal save that changes nothing is neither gated nor clears the flag', async () => {
+      // The customer portal submits every field on every save — same tools, same
+      // recipients, new name — on an active schedule that is already misconfigured.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+      } as any);
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({
+        scheduleName: 'Renamed', requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['Analyst@Customer.example'],
+      }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toBeUndefined();
     });
 
     it('a rename leaves the sensitivity flag alone', async () => {
@@ -5131,7 +5146,7 @@ describe('ENG-1552 shadow mode (enforcement flag unset)', () => {
     expect(row).not.toHaveProperty('runResults');
   });
 
-  it('a test-email resend is recorded against its run, not the session', async () => {
+  it('a test-email resend to a typed address is NOT recorded as the run\'s delivery', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue({ ...sensitive, frequency: 'weekly' } as any);
     (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([
       { runId: 'run-7', sessionId: 'sess-7', passed: true, actualResponse: 'Report', createdAt: new Date().toISOString() },
@@ -5141,7 +5156,8 @@ describe('ENG-1552 shadow mode (enforcement flag unset)', () => {
       user: { userId: ownerId }, params: { scheduleId: 'sched-shadow', runId: 'run-7' }, body: { toEmail: 'me@customer.example' },
     } as unknown as Request, r);
     expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
-      ['me@customer.example'], expect.any(String), expect.objectContaining({ runId: 'run-7', sessionId: 'sess-7' }), 'sched-shadow', undefined,
+      ['me@customer.example'], expect.any(String), expect.objectContaining({ sessionId: 'sess-7' }), 'sched-shadow', undefined,
+      { recordDelivery: false },
     );
   });
 

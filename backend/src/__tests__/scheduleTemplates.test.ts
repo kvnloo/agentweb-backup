@@ -57,7 +57,7 @@ jest.mock('../services/db', () => ({
     deleteTemplate: jest.fn(),
     incrementUsageCount: jest.fn(),
   },
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByEmail: jest.fn() },
   taskDb: { getTaskExecutionById: jest.fn(), createTaskExecution: jest.fn(), updateTaskExecution: jest.fn() },
 }));
 
@@ -504,6 +504,38 @@ describe('Schedule Templates', () => {
       dailyDigest: false,
       llmModel: '',
     };
+
+    // ENG-1552: a template-created schedule goes live immediately, so it gets the same
+    // authorized-recipient gate as createScheduledChat — enforced only with the flag on.
+    describe('authorized-recipient gate (ENG-1552)', () => {
+      const crossAccount = { ...baseTemplate, variables: [], startingMessage: 'Summarize all clients',
+        requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['analyst@customer.example'] };
+      const nonAdminOwner = { userId: 'user-2', email: 'owner@customer.example', isAdmin: false };
+      beforeEach(() => {
+        (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(crossAccount);
+        (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+        (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+        const { userDb } = jest.requireMock('../services/db');
+        (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+      });
+      afterEach(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+      it('refuses with the remediation when enforcement is on — nothing is written', async () => {
+        process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true';
+        const res = mockRes();
+        await agentModeController.createScheduleFromTemplate(mockReq({ user: nonAdminOwner, params: { templateId: 't1' }, body: {} }) as any, res);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect((res.json as jest.Mock).mock.calls[0][0].remediation.code).toBe('no_authorized_recipients');
+        expect(scheduleDb.createSchedule).not.toHaveBeenCalled();
+      });
+
+      it('creates it unchanged in shadow mode (flag unset)', async () => {
+        const res = mockRes();
+        await agentModeController.createScheduleFromTemplate(mockReq({ user: nonAdminOwner, params: { templateId: 't1' }, body: {} }) as any, res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        expect(scheduleDb.createSchedule).toHaveBeenCalled();
+      });
+    });
 
     it('should return 404 for non-existent template', async () => {
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(null);

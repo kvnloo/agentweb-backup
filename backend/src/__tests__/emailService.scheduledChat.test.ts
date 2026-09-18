@@ -706,3 +706,18 @@ describe('ENG-1552 shadow mode — empty report is sent exactly as before (enfor
   });
 });
 
+describe('ENG-1552 manual resend is never recorded as a delivery', () => {
+  beforeEach(() => { jest.clearAllMocks(); process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterEach(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+  it.each([['a report with content', 'Report body'], ['an empty report', '']])('%s: records nothing', async (_l, body) => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue('sent' as any);
+
+    await emailService.sendScheduledChatResultEmail(['me@example.com'], 'Weekly', { ...GUARD_BASE_RESULT, actualResponse: body, runId: 'run-5' }, 'schedule-123', undefined, { recordDelivery: false });
+
+    expect(scheduleDb.appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+});
+
