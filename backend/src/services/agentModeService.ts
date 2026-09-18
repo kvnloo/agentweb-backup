@@ -6522,9 +6522,28 @@ export class AgentModeService {
     const failures: string[] = [];
     const llmModel = await this.getDefaultModel();
     for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
-      if (Date.now() > deadline) { failures.push('deadline exceeded'); break; }
+      // ENG-1107 Greptile P1: membership in the skill tool set does not prove
+      // read-only — a skill may carry mutating tools (calendar create/update,
+      // etc.). Prefetch auto-executes on session open with no user instruction,
+      // so only gateway-classified `read` tools may run here; anything else
+      // degrades loudly instead of executing.
+      const policy = evaluateAgentToolPolicy({ toolName: call.tool, args: call.args ?? {} });
+      if (!policy.allowed || policy.effect !== 'read') {
+        failures.push(`${call.tool}: not a read tool (effect=${policy.effect}) — skipped`);
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) { failures.push('deadline exceeded'); break; }
       try {
-        const result = await this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false);
+        // ENG-1107 Greptile P1: race each call against the remaining deadline
+        // so a stalled tool cannot hold session creation open past the bound.
+        const result = await Promise.race([
+          this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error(`opening-action deadline exceeded after ${Math.min(timeoutMs, 30_000)}ms`)),
+            remainingMs,
+          )),
+        ]);
         const text = typeof result === 'string' ? result : JSON.stringify(result);
         rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
       } catch (err) {

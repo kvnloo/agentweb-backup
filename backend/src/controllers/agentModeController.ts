@@ -8685,9 +8685,15 @@ export const agentModeController = {
         if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
       }
       const welcomeMessage = skill?.welcomeMessage?.trim();
+      // ENG-1107 Greptile P1: when a skill carries an openingAction, the
+      // prefetch result must be the first assistant turn (contract clause 2).
+      // Seeding the welcome here would put it ahead of the prefetch, so skip
+      // the seed in that case — the welcome text is folded into the prefetch
+      // first turn below instead of being lost.
+      const hasOpeningAction = Boolean(skillId && skill && (skill as any)?.openingAction);
       const initialSkillState = skillId ? {
         llmModel: modelToUse, associatedSkills: [skillId],
-        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+        messages: (welcomeMessage && !hasOpeningAction) ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
       } : undefined;
       const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
@@ -8727,6 +8733,9 @@ export const agentModeController = {
           const authorizedSkill = skill as NonNullable<typeof skill>;
           const applied = await agentModeService.applyOpeningAction(authorizedSkill, user.userId, session.sessionId);
           prefetchMessages = applied.messages as typeof prefetchMessages;
+          if (welcomeMessage && prefetchMessages.length > 0) {
+            prefetchMessages = [{ ...prefetchMessages[0], content: `${welcomeMessage}\n\n${prefetchMessages[0].content}` }, ...prefetchMessages.slice(1)];
+          }
           await chatbotDb.addMessagesToSession(session.sessionId, prefetchMessages as any);
         } catch (prefetchError) {
           // ENG-1107 CodeRabbit: the session already exists and must still be
