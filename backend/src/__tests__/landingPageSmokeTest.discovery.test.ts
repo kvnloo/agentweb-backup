@@ -89,6 +89,17 @@ const CASES: Record<string, string> = {
     <form id="lead"><input type="email" name="email" required></form>
     <input form="lead" name="zip" required>
     <button form="lead" type="submit" id="sticky-submit">Send</button>`,
+  collapsedDuplicateForm: `
+    <form id="mobile-variant">
+      <input type="text" name="firstName" required data-rect="0,0,0,0">
+      <input type="email" name="email" required data-rect="0,0,0,0">
+      <input type="tel" name="phone" required data-rect="0,0,0,0">
+    </form>
+    <form id="desktop-variant">
+      <input type="text" name="firstName" required>
+      <input type="email" name="email" required>
+      <input type="tel" name="phone" required>
+    </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -273,6 +284,15 @@ describe("discoverSmokeFields", () => {
       `${SCOPE}[name="zip"]`,
     ]);
     expect(got("formAssociated").submitSelector).toBe('[id="sticky-submit"]');
+  });
+
+  it("skips a collapsed responsive duplicate and drives the form that is actually usable", () => {
+    // Observed live: v0 landers ship the same form two or three times for mobile/desktop and
+    // collapse the inactive ones to a 0x0 box. Scoring every control made the duplicates tie,
+    // so the dead one won on DOM order and discovery returned zero fields — nothing was
+    // filled and the page failed its own smoke test.
+    expect(out.collapsedDuplicateForm.markedFormIds).toEqual(["desktop-variant"]);
+    expect(selectorsOf(got("collapsedDuplicateForm")).length).toBe(3);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

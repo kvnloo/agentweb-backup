@@ -223,8 +223,12 @@ export function discoverSmokeFields(): SmokeFields {
   // outrank a real lead form whose phone/zip/name controls are all type=text — which is
   // the shape of the landers this whole path was written for.
   const scoreOf = (candidate: HTMLFormElement): number => {
+    // Score only controls we could actually fill. Responsive v0 landers ship the same form
+    // two or three times (mobile/desktop variants) and collapse the inactive ones to a 0x0
+    // box — counting every control made the duplicates tie, so the dead one won on DOM
+    // order and discovery returned zero fields. Observed live on a deployed lander.
     const controls = controlsOf(candidate).filter(
-      (c) => !/^(?:submit|button|reset|image|hidden)$/i.test(c.type || "")
+      (c) => !/^(?:submit|button|reset|image|hidden)$/i.test(c.type || "") && usable(c)
     );
     // A password field means authentication, never lead capture.
     if (candidate.querySelector('input[type="password"]')) return -1000;
