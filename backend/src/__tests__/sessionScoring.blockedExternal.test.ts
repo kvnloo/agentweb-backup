@@ -302,6 +302,28 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(mockCallLLM).not.toHaveBeenCalled();
   });
 
+  it('an over-600-character interactive publish-hold response stays scorable (length guard)', async () => {
+    // Same hold + handling patterns as the short excluded case, but padded
+    // past the documented 600-char cap — a long deliverable that mentions the
+    // approval hold stays scorable (CodeRabbit PR #2983).
+    const longHold = 'Publishing requires approval before publishing under your account-level setting, so I saved the draft and will not publish until approved. ' +
+      'Here is the extended campaign summary for your review with additional background context on the launch plan and audience. ' +
+      'The draft covers messaging pillars, creative variants, budget allocation, and the measurement framework in detail. ' +
+      'Additional context follows for downstream review: timeline, owners, risks, mitigations, and rollout sequencing notes. ' +
+      'Please review this extended status summary and confirm the next steps for approval when ready next week. ' +
+      'Further scheduling details and stakeholder sign-off notes are appended here for completeness today.';
+    expect(longHold.length).toBeGreaterThan(600);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post this to LinkedIn now' },
+      { role: 'assistant', content: longHold },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'regular' }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
   it('a scheduled run with approval-hold wording but no PUBLISH WITHHELD marker stays in the judged cohort', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', content: 'Scheduled post' },

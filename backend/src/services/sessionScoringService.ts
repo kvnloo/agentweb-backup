@@ -1218,6 +1218,10 @@ export function isBlockedExternalSessionForSession(session: {
   const text = lastAssistantText(session?.messages ?? []);
   if (!text) return false;
   const trimmed = text.trim();
+  // Length guard (CodeRabbit PR review on #2983): the documented <= 600-char
+  // cap applies to the interactive publish-hold path too — a long deliverable
+  // that mentions the approval hold stays scorable.
+  if (trimmed.length > 600) return false;
   if (
     !BLOCK_REPORT_OPEN_PATTERN.test(trimmed) &&
     !BLOCK_REPORT_CLOSE_PATTERN.test(trimmed)
