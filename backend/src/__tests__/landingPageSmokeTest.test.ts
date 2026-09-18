@@ -750,7 +750,8 @@ describe("runGenerationSmokeTest", () => {
         skippedRequired: 0,
         noFormOnPage: false,
         checkables: [
-          { selector: 'label:has([id="s1"])', type: "checkbox", name: "symptoms", required: true, viaLabel: true },
+          { selector: '[data-agentweb-smoke-click="0"]', type: "checkbox", name: "symptoms",
+            required: true, viaLabel: true, checked: false },
         ],
       });
 
@@ -759,9 +760,47 @@ describe("runGenerationSmokeTest", () => {
     const clicks = (mockPage.click as jest.Mock).mock.calls.map((c) => c[0]);
     // opened, then closed again so the popover cannot overlay the submit button
     expect(clicks.filter((c) => c === "#symptoms-trigger").length).toBe(2);
-    // a label target is CLICKED, never check()ed — check() asserts the target is a checkbox
-    expect(clicks).toContain('label:has([id="s1"])');
-    expect(mockPage.check).not.toHaveBeenCalledWith('label:has([id="s1"])', expect.anything());
+    // A label target goes through check(), which Playwright retargets to the control and
+    // which is idempotent; click() would toggle and is only the fallback.
+    expect(mockPage.check).toHaveBeenCalledWith(
+      '[data-agentweb-smoke-click="0"]',
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
+    expect(clicks).not.toContain('[data-agentweb-smoke-click="0"]');
+  });
+
+  it("CHECKABLES: an already-checked required control is left alone, never toggled off", async () => {
+    // click() is not idempotent. A pre-checked required consent box — common on GDPR/TCPA
+    // landers — would be UNCHECKED, blocking submit on a page that was fine.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      checkables: [
+        { selector: "#consent", type: "checkbox", name: "consent", required: true,
+          viaLabel: false, checked: true },
+      ],
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.check).not.toHaveBeenCalledWith("#consent", expect.anything());
+    expect((mockPage.click as jest.Mock).mock.calls.map((c) => c[0])).not.toContain("#consent");
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
+  });
+
+  it("CHECKABLES: click() is the fallback when check() cannot resolve the widget", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      checkables: [
+        { selector: "#odd", type: "checkbox", name: "x", required: true, viaLabel: true, checked: false },
+      ],
+    });
+    (mockPage.check as jest.Mock).mockRejectedValueOnce(new Error("not a checkbox"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect((mockPage.click as jest.Mock).mock.calls.map((c) => c[0])).toContain("#odd");
   });
 
   it("DISCLOSURE: a trigger that will not open is not retried and does not block the run", async () => {
@@ -838,6 +877,11 @@ describe("runGenerationSmokeTest", () => {
     expect(v({ selector: "#b", hint: "budget", kind: "number", min: "1000" })).toBe("1000");
     expect(v({ selector: "#q", hint: "quantity", kind: "number", max: "3" })).toBe("3");
     expect(v({ selector: "#d", hint: "preferred date", kind: "date", max: "2026-12-31" })).toBe("2026-12-31");
+    expect(v({ selector: "#d2", hint: "preferred date", kind: "date", min: "2031-01-01" })).toBe("2031-01-01");
+    // A non-ISO bound is ignored, not written into the field: "2030-01-01" > "12/31/2026" by
+    // string compare, and Chromium rejects any non-ISO value outright — which would drop a
+    // required date that previously filled fine.
+    expect(v({ selector: "#d3", hint: "preferred date", kind: "date", max: "12/31/2026" })).toBe("2030-01-01");
     expect(v({ selector: "#n", hint: "full name", kind: "text", maxLength: 5 })).toBe("Smoke");
   });
 

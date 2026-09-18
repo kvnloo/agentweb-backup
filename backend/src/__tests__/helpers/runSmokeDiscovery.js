@@ -64,10 +64,39 @@ function runCase(fnJs, html, fnName) {
   win.HTMLFormElement.prototype.requestSubmit = function () { submitted.push(this.id || "(unnamed)"); };
   win.eval(fnJs);
   const result = win.eval(`${fnName}()`);
+  // Resolve every selector discovery emitted against the real DOM. Asserting the selector
+  // STRING is what let a `label:has([id=x])` — which matches nothing on shadcn's sibling
+  // `<label for=x>` markup — pass as correct through three rounds of testing.
+  const resolveCount = (selector) => {
+    try {
+      let nodes = null;
+      for (const part of String(selector).split(">>").map((x) => x.trim())) {
+        const nth = /^nth=(\d+)$/.exec(part);
+        if (nth) {
+          const i = Number(nth[1]);
+          nodes = nodes && nodes[i] ? [nodes[i]] : [];
+          continue;
+        }
+        nodes = Array.prototype.slice.call(win.document.querySelectorAll(part));
+      }
+      return nodes ? nodes.length : 0;
+    } catch (err) {
+      return `UNSUPPORTED: ${err.message.split("\n")[0].slice(0, 60)}`;
+    }
+  };
+  const selectorMatches = {};
+  if (result && typeof result === "object") {
+    for (const f of result.fields || []) selectorMatches[f.selector] = resolveCount(f.selector);
+    for (const sel of result.selects || []) selectorMatches[sel.selector] = resolveCount(sel.selector);
+    for (const c of result.checkables || []) selectorMatches[c.selector] = resolveCount(c.selector);
+    for (const t of result.disclosureTriggers || []) selectorMatches[t] = resolveCount(t);
+    if (result.submitSelector) selectorMatches[result.submitSelector] = resolveCount(result.submitSelector);
+  }
+
   const markedFormIds = Array.prototype.slice
     .call(win.document.querySelectorAll("form[data-agentweb-smoke-form]"))
     .map((form) => form.id || "(unnamed)");
-  return { result: JSON.parse(JSON.stringify(result)), markedFormIds, submitted };
+  return { result: JSON.parse(JSON.stringify(result)), markedFormIds, submitted, selectorMatches };
 }
 
 function main() {

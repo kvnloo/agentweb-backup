@@ -141,6 +141,35 @@ const CASES: Record<string, string> = {
       <input type="date" name="slot" max="2026-12-31" required>
       <input type="text" name="code" maxlength="4" required>
     </form>`,
+  siblingLabelCheckbox: `
+    <form>
+      <input type="email" name="email" required>
+      <div>
+        <input type="checkbox" id="terms" name="terms" required data-rect="0,0,0,0">
+        <label for="terms" data-rect="0,0,200,24">Accept terms</label>
+      </div>
+    </form>`,
+  precheckedConsent: `
+    <form>
+      <input type="email" name="email" required>
+      <label data-rect="0,0,200,24">I agree<input type="checkbox" name="consent" required checked data-rect="0,0,0,0"></label>
+    </form>`,
+  typelessButtonTrigger: `
+    <form>
+      <input type="email" name="email" required>
+      <button aria-expanded="false" aria-controls="p1">Pick options</button>
+      <div id="p1"><input type="checkbox" name="opt"></div>
+    </form>`,
+  onlyLoginForm: `
+    <form id="login"><input type="email" name="email" required><input type="password" name="pw" required></form>`,
+  twoIdlessTriggers: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" aria-expanded="false" aria-controls="pa">A</button>
+      <div id="pa"><input type="checkbox" name="a"></div>
+      <button type="button" aria-expanded="false" aria-controls="pb">B</button>
+      <div id="pb"><input type="checkbox" name="b"></div>
+    </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -182,7 +211,13 @@ const CASES: Record<string, string> = {
 
 let out: Record<
   string,
-  { result?: any; markedFormIds?: string[]; submitted?: string[]; error?: string }
+  {
+    result?: any;
+    markedFormIds?: string[];
+    submitted?: string[];
+    selectorMatches?: Record<string, number | string>;
+    error?: string;
+  }
 > = {};
 
 beforeAll(() => {
@@ -271,10 +306,10 @@ describe("discoverSmokeFields", () => {
 
   it("reports checkbox/radio requiredness so every required box gets checked", () => {
     expect(got("checkables").checkables).toEqual([
-      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true, viaLabel: false },
-      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false, viaLabel: false },
-      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true, viaLabel: false },
-      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true, viaLabel: false },
+      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true, viaLabel: false, checked: false },
+      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false, viaLabel: false, checked: false },
+      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false },
+      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false },
     ]);
   });
 
@@ -322,9 +357,11 @@ describe("discoverSmokeFields", () => {
     // still blocks submit, and a sticky-footer submit button still submits it.
     expect(selectorsOf(got("formAssociated"))).toEqual([
       `${SCOPE}[name="email"]`,
-      `${SCOPE}[name="zip"]`,
+      '[name="zip"]',
     ]);
     expect(got("formAssociated").submitSelector).toBe('[id="sticky-submit"]');
+    // The out-of-subtree control must NOT carry the form scope, or it resolves to nothing.
+    expect(selectorsOf(got("formAssociated"))[1]).toBe('[name="zip"]');
   });
 
   it("skips a collapsed responsive duplicate and drives the form that is actually usable", () => {
@@ -341,14 +378,15 @@ describe("discoverSmokeFields", () => {
     // clickable surface. Judging the input by its own box skipped a control a visitor can
     // plainly use, so a required symptom group stayed unselected and submit stayed blocked.
     const boxes = got("labelProxyCheckbox").checkables;
-    expect(boxes.map((c) => c.viaLabel)).toEqual([true, true]);
-    expect(boxes[0].selector).toBe(`${SCOPE}label:has([id="sym-leak"])`);
+    expect(boxes.map((c: any) => c.viaLabel)).toEqual([true, true]);
+    // Selector targets a stamped marker, and it resolves to exactly one element.
+    expect(out.labelProxyCheckbox.selectorMatches![boxes[0].selector]).toBe(1);
   });
 
   it("opens a disclosure that holds a checkbox group", () => {
-    expect(got("disclosureWithCheckboxes").disclosureTriggers).toEqual([
-      `${SCOPE}[id="symptoms-trigger"]`,
-    ]);
+    const triggers = got("disclosureWithCheckboxes").disclosureTriggers;
+    expect(triggers).toHaveLength(1);
+    expect(out.disclosureWithCheckboxes.selectorMatches![triggers[0]]).toBe(1);
   });
 
   it("marks id-less disclosure triggers with a stable marker, not a stateful nth selector", () => {
@@ -384,6 +422,57 @@ describe("discoverSmokeFields", () => {
     expect(byName.budget.min).toBe("1000");
     expect(byName.slot.max).toBe("2026-12-31");
     expect(byName.code.maxLength).toBe(4);
+  });
+
+  it("every selector discovery emits resolves to exactly one element", () => {
+    // The assertion that was missing. Checking the selector STRING let a selector that
+    // matches nothing pass as correct through three rounds of testing.
+    const offenders: string[] = [];
+    for (const [name, entry] of Object.entries(out)) {
+      if (!entry || entry.error || !entry.selectorMatches) continue;
+      for (const [selector, count] of Object.entries(entry.selectorMatches)) {
+        if (count !== 1) offenders.push(`${name}: ${selector} -> ${count}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("reaches a sibling <label for=...> checkbox, which is how shadcn/ui ships one", () => {
+    // `label:has([id=x])` requires the label to CONTAIN the input; shadcn renders them as
+    // siblings, so the emitted selector matched nothing and the click timed out on a control
+    // discovery had just called reachable.
+    const boxes = got("siblingLabelCheckbox").checkables;
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0].viaLabel).toBe(true);
+    expect(out.siblingLabelCheckbox.selectorMatches![boxes[0].selector]).toBe(1);
+  });
+
+  it("reports an already-checked control so it is never toggled back off", () => {
+    expect(got("precheckedConsent").checkables[0].checked).toBe(true);
+  });
+
+  it("never treats a typeless <button> as a disclosure trigger — it submits the form", () => {
+    expect(got("typelessButtonTrigger").disclosureTriggers).toEqual([]);
+  });
+
+  it("refuses an authentication form even when it is the only form on the page", () => {
+    // A -1000 score still wins when nothing else competes; disqualification has to skip
+    // the candidate outright.
+    expect(out.onlyLoginForm.markedFormIds).toEqual([]);
+    expect(got("onlyLoginForm").scope).toBe("");
+  });
+
+  it("disclosure selectors do not depend on aria-expanded, which the opening click flips", () => {
+    // `>> nth=` over `[aria-expanded="false"]` is invalidated by the very click that opens
+    // the first trigger: the element leaves the matched set, so the close pass could land on
+    // a different still-collapsed element and OPEN it, right before submit.
+    const triggers = got("twoIdlessTriggers").disclosureTriggers;
+    expect(triggers).toHaveLength(2);
+    for (const t of triggers) {
+      expect(t).not.toMatch(/aria-expanded/);
+      expect(out.twoIdlessTriggers.selectorMatches![t]).toBe(1);
+    }
+    expect(new Set(triggers).size).toBe(2);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

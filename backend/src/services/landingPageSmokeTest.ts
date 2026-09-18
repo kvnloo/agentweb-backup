@@ -111,9 +111,11 @@ export type SmokeFields = {
     /**
      * True when `selector` targets the control's LABEL rather than the input itself. The
      * shadcn/Radix pattern renders a visually-hidden input with a visible label as its only
-     * clickable surface, so the input is permanently 0x0 and check() can never reach it.
+     * clickable surface, so the input is permanently 0x0.
      */
     viaLabel: boolean;
+    /** Already-checked controls must not be toggled back off. */
+    checked: boolean;
   }[];
   /** Submit control resolved page-side (handles a `form=`-associated button); null when none. */
   submitSelector: string | null;
@@ -157,6 +159,7 @@ const SUBMIT_TIMEOUT_MS = 10_000;
  */
 export function discoverSmokeFields(): SmokeFields {
   const MARK = "data-agentweb-smoke-form";
+  const CLICK_MARK = "data-agentweb-smoke-click";
   const SCOPE_PREFIX = `form[${MARK}="1"] `;
   // Honeypot names, anchored and exact. An earlier prefix-match version of this swallowed
   // `confirm_email`, `honeymoon_destination` and `hp_model` — all legitimate required
@@ -260,6 +263,13 @@ export function discoverSmokeFields(): SmokeFields {
     return hasBox(el);
   };
 
+  // Clear every marker this function stamps, so a second discovery pass cannot inherit
+  // stale targets from the first.
+  for (const stale of all(document, `[${CLICK_MARK}], [data-agentweb-smoke-disclosure]`)) {
+    stale.removeAttribute(CLICK_MARK);
+    stale.removeAttribute("data-agentweb-smoke-disclosure");
+  }
+
   const forms = all(document, "form") as HTMLFormElement[];
   // Clear any stale marker first: two marked forms would make every scoped selector resolve
   // into whichever comes first, which is not necessarily the one scored below.
@@ -278,8 +288,8 @@ export function discoverSmokeFields(): SmokeFields {
     const controls = controlsOf(candidate).filter(
       (c) => !/^(?:submit|button|reset|image|hidden)$/i.test(c.type || "") && usable(c)
     );
-    // A password field means authentication, never lead capture.
-    if (candidate.querySelector('input[type="password"]')) return -1000;
+    // (An auth form is rejected structurally in the selection loop, not by score: a score
+    // can always win when it is the only candidate.)
     const hints = controls.map(hintFor).join(" ");
     const distinctKinds = LEAD_HINTS.filter((re) => re.test(hints)).length;
     let score = controls.filter((c) => c.required).length * 3;
@@ -293,6 +303,11 @@ export function discoverSmokeFields(): SmokeFields {
   let form: HTMLFormElement | null = null;
   let bestScore = -Infinity;
   for (const candidate of forms) {
+    // A password field means authentication, never lead capture. This has to skip the
+    // candidate outright — scoring it -1000 still won when it was the only form on the page,
+    // and the smoke test then typed a synthetic address into a login box and clicked submit
+    // against a real auth endpoint on every deploy.
+    if (candidate.querySelector('input[type="password"]')) continue;
     const score = scoreOf(candidate);
     if (score > bestScore) {
       bestScore = score;
@@ -319,8 +334,11 @@ export function discoverSmokeFields(): SmokeFields {
   const addressableScoped = form ? all(form, "input, textarea") : all(document, "input, textarea");
   const selFor = (el: Element): string => {
     const input = el as HTMLInputElement;
-    if (input.id) return `${scope}[id="${esc(input.id)}"]`;
-    if (input.name) return `${scope}[name="${esc(input.name)}"]`;
+    // A control associated by `form="id"` submits with the form while living OUTSIDE its
+    // subtree, so a form-scoped descendant selector cannot reach it.
+    const prefix = form && !form.contains(el) ? "" : scope;
+    if (input.id) return `${prefix}[id="${esc(input.id)}"]`;
+    if (input.name) return `${prefix}[name="${esc(input.name)}"]`;
     // A form=-associated control living outside the form cannot be reached by a
     // form-scoped selector, and without an id or name there is nothing else to key on.
     const index = addressableScoped.indexOf(el);
@@ -363,6 +381,7 @@ export function discoverSmokeFields(): SmokeFields {
     });
   });
 
+  let clickTargets = 0;
   const checkables: SmokeFields["checkables"] = [];
   const checkableEls = controls.filter((el) =>
     matches(el, 'input[type="checkbox"], input[type="radio"]')
@@ -370,18 +389,18 @@ export function discoverSmokeFields(): SmokeFields {
   checkableEls.forEach((el) => {
     if (!usable(el, true)) return;
     const input = el as HTMLInputElement;
-    const viaLabel = !hasBox(el) && clickableLabel(el) !== null;
+    const label = hasBox(el) ? null : clickableLabel(el);
+    const viaLabel = label !== null;
     let selector: string;
     if (!viaLabel) {
       selector = selFor(el);
-    } else if (input.id) {
-      selector = `${scope}label:has([id="${esc(input.id)}"])`;
-    } else if (input.name) {
-      // Index within this name's group, so the label selector resolves to THIS control.
-      const sameName = checkableEls.filter((c) => (c as HTMLInputElement).name === input.name);
-      selector = `${scope}label:has([name="${esc(input.name)}"]) >> nth=${sameName.indexOf(el)}`;
     } else {
-      return; // nothing stable to key the label off
+      // Stamp the exact label we mean. A `label:has([id="x"])` selector only matches a label
+      // that CONTAINS the input, while shadcn/ui ships the two as siblings
+      // (`<Checkbox id="terms" /><label for="terms">`) — so the emitted selector matched
+      // nothing and the click timed out on a control discovery had called reachable.
+      label!.setAttribute(CLICK_MARK, String(clickTargets++));
+      selector = `[${CLICK_MARK}="${clickTargets - 1}"]`;
     }
     if (!selector) return;
     checkables.push({
@@ -390,6 +409,8 @@ export function discoverSmokeFields(): SmokeFields {
       name: input.name || null,
       required: input.required,
       viaLabel,
+      // Reported so an already-satisfied control is never toggled back off.
+      checked: !!input.checked,
     });
   });
 
@@ -408,6 +429,12 @@ export function discoverSmokeFields(): SmokeFields {
     let marked = 0;
     triggers.forEach((t) => {
       if (!hasBox(t)) return;
+      // A <button> with no type inside a form defaults to type="submit". Clicking one here
+      // would submit the form before a single field has been filled, and before the response
+      // listener even exists.
+      const tag = t.tagName.toUpperCase();
+      if (tag === "BUTTON" && ((t as HTMLButtonElement).type || "submit") !== "button") return;
+      if (tag === "INPUT" || tag === "A") return;
       // Only open a disclosure that actually holds a checkbox/radio group. aria-expanded
       // ALSO marks Radix Select triggers ("Select your issue"), and opening one of those
       // puts a listbox overlay over the page that swallows every later click, including the
@@ -435,11 +462,19 @@ export function discoverSmokeFields(): SmokeFields {
       (c) => /^(?:submit|image)$/i.test(c.type || "") && !c.disabled
     );
     if (submitControl) {
-      submitSelector = submitControl.id
-        ? `[id="${esc(submitControl.id)}"]`
-        : submitControl.name
+      if (submitControl.id) {
+        submitSelector = `[id="${esc(submitControl.id)}"]`;
+      } else if (submitControl.name) {
+        submitSelector = form.contains(submitControl)
           ? `${scope}[name="${esc(submitControl.name)}"]`
-          : `${scope}button[type="submit"], ${scope}input[type="submit"]`;
+          : `[name="${esc(submitControl.name)}"]`;
+      } else {
+        // Stamp it. `button[type="submit"]` does not match a <button> with no type
+        // attribute, even though that button IS the form's submit control — which cost the
+        // full submit timeout before falling back to requestSubmit.
+        submitControl.setAttribute(CLICK_MARK, String(clickTargets++));
+        submitSelector = `[${CLICK_MARK}="${clickTargets - 1}"]`;
+      }
     }
   }
 
@@ -492,8 +527,12 @@ export function syntheticValueFor(field: SmokeField, email: string, phone: strin
     return String(clamped);
   }
   if (field.kind === "date") {
-    if (field.max && value > field.max) return field.max;
-    if (field.min && value < field.min) return field.min;
+    // Compare only against a well-formed YYYY-MM-DD bound. String comparison against a
+    // `max="12/31/2026"` would "clamp" to that literal, and Chromium rejects any non-ISO
+    // value outright — dropping a required date that previously filled fine.
+    const isIsoDate = (v: string | null | undefined): v is string => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    if (isIsoDate(field.max) && value > field.max) return field.max;
+    if (isIsoDate(field.min) && value < field.min) return field.min;
     return value;
   }
   if (field.maxLength && field.maxLength > 0 && value.length > field.maxLength) {
@@ -648,24 +687,33 @@ async function fillAllRequiredFields(
     const key = radio.name ?? radio.selector;
     if (!radiosByGroup.has(key)) radiosByGroup.set(key, radio);
   }
-  const toCheck: { selector: string; viaLabel?: boolean }[] =
+  const toCheck: { selector: string; viaLabel?: boolean; checked?: boolean }[] =
     requiredBoxes.length > 0 || radiosByGroup.size > 0
       ? [...requiredBoxes, ...radiosByGroup.values()]
       : checkables.length > 0
         ? [checkables[0]]
         : [];
   for (const control of toCheck) {
+    // Already satisfied — leave it alone. A pre-checked required consent box is common, and
+    // toggling it off is a false FAIL manufactured out of a working page.
+    if (control.checked) {
+      filled++;
+      continue;
+    }
     try {
-      if ((control as { viaLabel?: boolean }).viaLabel) {
-        // check() asserts the target IS a checkbox/radio; a label is neither. Clicking the
-        // label is what a visitor does, and it toggles the control it wraps.
-        await browserPage.click(control.selector, { timeout: FIELD_TIMEOUT_MS });
-      } else {
-        await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
-      }
+      // check() first, even for a label target: Playwright retargets a label to its control
+      // ("follow-label" in dom.js) and is idempotent — it reads the checked state and returns
+      // early if it already matches. click() is neither, so it can UNCHECK a box. click()
+      // stays only as a fallback for widgets check() cannot resolve.
+      await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
       filled++;
     } catch {
-      // custom checkbox widgets without a reachable input or label — leave alone
+      try {
+        await browserPage.click(control.selector, { timeout: FIELD_TIMEOUT_MS });
+        filled++;
+      } catch {
+        // custom checkbox widget with no reachable input or label — leave alone
+      }
     }
   }
 
