@@ -588,10 +588,12 @@ describe("runGenerationSmokeTest", () => {
   // Each case below kills a mutant that survived the previous revision of this suite: the
   // handoff gate was only ever exercised at 200-vs-500 on a single response, so the non-GET
   // filter, the 3xx boundary and the attribution check were all untested.
-  const handoffRun = async (emit: () => void) => {
+  const PHONE_ONLY = [{ selector: "#phone", hint: "phone", kind: "tel" }];
+  const EMAIL_ONLY = [{ selector: "#email", hint: "email", kind: "email" }];
+  const handoffRun = async (emit: () => void, fields = PHONE_ONLY) => {
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
       scope: "",
-      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      fields,
       selects: [],
       checkables: [],
       submitSelector: null,
@@ -634,6 +636,29 @@ describe("runGenerationSmokeTest", () => {
       });
     });
     expect(result.ok).toBe(false);
+  });
+
+  it("EVIDENCE: a urlencoded form POST still attributes, despite %2B/%40 escaping", async () => {
+    // A native <form> POST sends application/x-www-form-urlencoded, where the synthetic
+    // email's "+" and "@" become %2B and %40. Matching the raw value missed exactly the
+    // plain HTML forms most likely to be on a lander, so a handoff page with an email
+    // field and no phone field failed attribution on every deploy.
+    let encodedBody = "";
+    const result = await handoffRun(() => {
+      encodedBody = new URLSearchParams(
+        Object.fromEntries(filledValues().map((v, i) => [`f${i}`, v]))
+      ).toString();
+      emitResponse({
+        url: "https://campaign.waterheater.app/api/x",
+        status: 200,
+        body: encodedBody,
+      });
+    }, EMAIL_ONLY);
+    // The escaping this case exists for — asserted out here, since a throw inside the
+    // click mock would be swallowed by the implementation's own catch.
+    expect(encodedBody).toContain("%40");
+    expect(encodedBody).not.toContain("@");
+    expect(result.ok).toBe(true);
   });
 
   it("EVIDENCE: a 2xx POST carrying our synthetic data IS acceptance", async () => {

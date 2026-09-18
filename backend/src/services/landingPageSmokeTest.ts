@@ -647,8 +647,23 @@ async function runGenerationSmokeTestNow(
     //     /_vercel/speed-insights/vitals on pagehide — i.e. exactly at the handoff redirect.
     //     The body must contain the synthetic email or phone for the response to count.
     const submitEvidence: { status: number; carriedOurData: boolean }[] = [];
-    const carriesOurData = (body: string | null): boolean =>
-      !!body && (body.includes(email) || body.includes(testPhone));
+    // Match on encoding-stable fingerprints, not the raw values. A native form POST sends
+    // application/x-www-form-urlencoded, where the synthetic email's "+" and "@" become
+    // %2B and %40 — so body.includes(email) is false for exactly the plain HTML forms most
+    // likely to be on a lander. The email's timestamp and the phone's digits survive every
+    // encoding, and both are unique to this run.
+    const emailFingerprint = email.replace(/\D/g, "");
+    const fingerprints = [emailFingerprint, testPhone].filter((f) => f.length >= 8);
+    const carriesOurData = (body: string | null): boolean => {
+      if (!body) return false;
+      let decoded = body;
+      try {
+        decoded = decodeURIComponent(body.replace(/\+/g, " "));
+      } catch {
+        // not percent-encoded (or malformed) — fall back to the raw body
+      }
+      return fingerprints.some((f) => body.includes(f) || decoded.includes(f));
+    };
     browserPage.on("response", (response) => {
       try {
         const request = response.request();
