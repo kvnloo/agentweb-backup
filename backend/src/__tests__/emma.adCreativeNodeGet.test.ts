@@ -65,6 +65,13 @@ afterEach(() => {
 });
 
 describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
+  it('exposes url_tags as a string at the call_meta_marketing_api boundary', () => {
+    const paramsSchema = emmaToolRegistry.getTool('call_meta_marketing_api')!
+      .definition.inputSchema.properties.params;
+
+    expect(paramsSchema.properties.url_tags).toEqual(expect.objectContaining({ type: 'string' }));
+  });
+
   describe('ENG-1641 — confirmation batching instruction', () => {
     const metaToolDescription = () =>
       emmaToolRegistry.getTool('call_meta_marketing_api')!.definition.description;

@@ -1276,6 +1276,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             body: { type: "string", description: "Ad body / primary text." },
             title: { type: "string", description: "Ad headline." },
             link_url: { type: "string", description: "Destination URL." },
+            lander_id: { type: "string", description: "Generated landing page ID. When provided, its UTM override is resolved over the customer default for Meta url_tags." },
+            url_tags: { type: "string", description: "Meta creative URL parameters as a query string. Validated as a string at the tool boundary; configured lander UTMs are resolved around it without overwriting gclid/fbclid." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
             ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
