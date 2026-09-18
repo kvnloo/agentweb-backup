@@ -13,6 +13,7 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import {
   buildRecipientRemediation,
+  checkScheduleActivationRecipients,
   recordReportDeliveryState,
   reportContainsCrossAccountData,
   resolveAuthorizedReportRecipients,
@@ -12017,6 +12018,18 @@ export const agentModeController = {
         scheduledChat.variableValuesUpdatedAt = now.toISOString();
       }
 
+      // ENG-1552: a new schedule is live the moment it is created, so the
+      // authorized-recipient gate applies here, before the row exists.
+      const createRemediation = await checkScheduleActivationRecipients({
+        scheduleId,
+        recipients: scheduledChat.emailNotifications,
+        ownerEmail: user.email,
+        schedule: scheduledChat,
+      });
+      if (createRemediation) {
+        return res.status(400).json({ error: createRemediation.safeAction, remediation: createRemediation });
+      }
+
       await scheduleDb.createSchedule(scheduledChat);
 
       res.status(201).json({
@@ -12298,6 +12311,31 @@ export const agentModeController = {
         normalizeEmailList(existingSchedule.emailNotifications || []).length > 0;
       if (effectiveEmailNotifications.length === 0 && hadEmailNotifications) {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
+      }
+
+      // ENG-1552: an edit to who receives an active schedule's report, or to the
+      // tools it must call, can leave a cross-account report with nobody allowed
+      // to read it. Checked only when the edit touches either — an unrelated edit
+      // (a rename) to an already-misconfigured schedule is not refused; the run-time
+      // preflight still holds that schedule's generation.
+      if (
+        existingSchedule.status === 'active' &&
+        (emailNotifications !== undefined || requiredFunctionCalls !== undefined)
+      ) {
+        const updateRemediation = await checkScheduleActivationRecipients({
+          scheduleId,
+          recipients: effectiveEmailNotifications,
+          ownerEmail: user.email,
+          schedule: {
+            // A changed tool list re-decides sensitivity from scratch; the
+            // breadcrumb describes the previous tools.
+            lastKnownSensitive: requiredFunctionCalls !== undefined ? undefined : (existingSchedule as any).lastKnownSensitive,
+            requiredFunctionCalls: updates.requiredFunctionCalls,
+          },
+        });
+        if (updateRemediation) {
+          return res.status(400).json({ error: updateRemediation.safeAction, remediation: updateRemediation });
+        }
       }
 
       const allUpdateVariablesPrefilled = normalizedVariables.length > 0
@@ -13052,6 +13090,19 @@ export const agentModeController = {
       const schedule = await scheduleDb.getScheduleById(scheduleId);
       if (!schedule || schedule.userId !== user.userId) {
         return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // ENG-1552: re-enabling is an activation like any other.
+      if (status === 'active') {
+        const toggleRemediation = await checkScheduleActivationRecipients({
+          scheduleId,
+          recipients: normalizeEmailList(schedule.emailNotifications || []),
+          ownerEmail: user.email,
+          schedule: schedule as any,
+        });
+        if (toggleRemediation) {
+          return res.status(400).json({ error: toggleRemediation.safeAction, remediation: toggleRemediation });
+        }
       }
 
       // Update the schedule status

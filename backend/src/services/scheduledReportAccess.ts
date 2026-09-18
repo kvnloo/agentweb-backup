@@ -290,3 +290,32 @@ export async function recordReportDeliveryState(
     console.error(`Failed to record delivery state "${entry.state}" for schedule ${scheduleId}:`, error);
   }
 }
+
+/**
+ * ENG-1552 activation gate: a schedule that will deliver a cross-account report
+ * must have at least one recipient allowed to receive it. Returns the remediation
+ * to send back, or null when the schedule may go live.
+ *
+ * Only the "authorized" half is checked here. "At least one recipient" is already
+ * held where it applies (create falls back to the requester's address; update
+ * refuses to clear the last one, ENG-1836), and a schedule with no recipients —
+ * a pre-filled silent run, an auto-created outreach schedule (ENG-1723) —
+ * delivers nothing externally, so there is nothing to authorize.
+ */
+export async function checkScheduleActivationRecipients(params: {
+  scheduleId: string;
+  recipients: string[];
+  ownerEmail?: string | null;
+  schedule: { lastKnownSensitive?: boolean; requiredFunctionCalls?: string[] | null };
+}): Promise<RecipientRemediation | null> {
+  const recipients = (params.recipients || []).filter(Boolean);
+  if (recipients.length === 0 || !scheduleLikelySensitive(params.schedule)) return null;
+  const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail: params.ownerEmail, isSensitive: true });
+  if (authz.authorized.length > 0) return null;
+  return buildRecipientRemediation({
+    code: 'no_authorized_recipients',
+    scheduleId: params.scheduleId,
+    owner: params.ownerEmail,
+    eligibleRecipients: authz.authorized,
+  });
+}
