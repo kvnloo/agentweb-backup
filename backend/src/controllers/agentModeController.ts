@@ -1194,7 +1194,7 @@ export function attachInProcessCompletion(
   genPromise: Promise<any>,
   pageId: string,
   userId: string,
-  sessionId: string
+  sessionId: string,
 ): void {
   genPromise
     .then(async (resolved: any) => {
@@ -1217,9 +1217,20 @@ export function attachInProcessCompletion(
         },
       });
     })
-    .catch((err: any) =>
-      console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err)
-    );
+    .catch((err: any) => {
+      console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err);
+    });
+}
+
+/** Track only the underlying detached generation for the request's durable run.
+ * Delivery/claim failures must not rewrite a successfully completed generation as failed.
+ */
+export function attachDetachedRunTerminalStatus(genPromise: Promise<any>, runId?: string): void {
+  if (!runId) return;
+  genPromise.then(
+    () => markRunTerminal(runId, 'completed', { finishReason: 'detached_completed' }).catch(() => {}),
+    () => markRunTerminal(runId, 'failed', { finishReason: 'detached_failed' }).catch(() => {}),
+  );
 }
 
 // ENG-1239: cap on consecutive automatic continuations for one deferred media batch, so a
@@ -9281,6 +9292,10 @@ export const agentModeController = {
                 await markAwaitingReconnect(inFlight.id);
                 attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
               }
+              // Every request returns its own run ID, including later requests that find
+              // awaitingReconnect already set. Track that request's generation without
+              // competing for shared page delivery.
+              attachDetachedRunTerminalStatus(genPromise, runSurvivalRunId);
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
@@ -9288,13 +9303,9 @@ export const agentModeController = {
                 timestamp: new Date().toISOString(),
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
-              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
-              // Same as the pre-generation reconnect above: the request ended
-              // by detaching — mark the run record terminal or it stays
-              // 'running' for 30d. Best-effort by design.
-              if (runSurvivalRunId) {
-                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
-              }
+              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true, ...(runSurvivalRunId ? { runId: runSurvivalRunId } : {}) });
+              // Keep the originating request run non-terminal until the detached
+              // completion hook records the actual success or failure.
               return;
             }
           } catch (durErr) {
