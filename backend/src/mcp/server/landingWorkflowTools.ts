@@ -125,31 +125,40 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const pageId = args?.page_id;
+    const encodedPageId = encodeURIComponent(pageId);
     if (args?.revert_last_publish === true) {
       const reverted: any = await mcpFetch({
         method: 'POST',
-        path: `/api/landing-pages/v0/generated/${pageId}/revert-publish`,
+        path: `/api/landing-pages/v0/generated/${encodedPageId}/revert-publish`,
         context: ctx(context),
       });
       return jsonResult({ reverted: true, page_id: pageId, message: reverted?.message ?? null });
     }
+    if (typeof args?.instructions !== 'string' || args.instructions.trim() === '') {
+      return jsonResult({
+        status: 'failed',
+        url: null,
+        page_id: pageId ?? null,
+        error: 'instructions is required unless revert_last_publish is true — nothing was revised.',
+      });
+    }
     await mcpFetch({
       method: 'POST',
-      path: `/api/landing-pages/v0/generated/${pageId}/iterate`,
+      path: `/api/landing-pages/v0/generated/${encodedPageId}/iterate`,
       context: ctx(context),
       body: { instructions: args?.instructions, branch: args?.branch ?? PREVIEW_BRANCH },
     });
     const branch = args?.branch ?? PREVIEW_BRANCH;
     const preview: any = await mcpFetch({
       method: 'GET',
-      path: `/api/landing-pages/v0/generated/${pageId}/preview-url?branch=${encodeURIComponent(branch)}`,
+      path: `/api/landing-pages/v0/generated/${encodedPageId}/preview-url?branch=${encodeURIComponent(branch)}`,
       context: ctx(context),
     });
     const previewUrl = preview?.previewUrl ?? preview?.preview_url ?? null;
     if (args?.publish === true) {
       const published: any = await mcpFetch({
         method: 'POST',
-        path: `/api/landing-pages/v0/generated/${pageId}/publish`,
+        path: `/api/landing-pages/v0/generated/${encodedPageId}/publish`,
         context: ctx(context),
         body: { branch },
       });

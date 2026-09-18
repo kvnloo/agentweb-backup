@@ -179,4 +179,31 @@ describe('ENG-1004: emma_edit_landing_page revises, previews, publishes only whe
       expect(call[0]?.context).toBeDefined();
     }
   });
+
+  it('edit without instructions fails loudly and calls nothing', async () => {
+    const res: any = await tool('emma_edit_landing_page').execute(
+      { page_id: 'page-9' },
+      CALLER,
+    );
+
+    expect(mockMcpFetch).not.toHaveBeenCalled();
+    const body = JSON.parse(res.content[0].text);
+    expect(body.status).toBe('failed');
+    expect(body.error).toMatch(/instructions is required/);
+  });
+
+  it('page_id is encoded in every generated path', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ previewUrl: 'https://preview-abc.vercel.app' });
+
+    await tool('emma_edit_landing_page').execute(
+      { page_id: 'page 9/x', instructions: 'tweak' },
+      CALLER,
+    );
+
+    for (const p of paths()) {
+      expect(p).toContain('/generated/page%209%2Fx/');
+    }
+  });
 });
