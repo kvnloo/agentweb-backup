@@ -44,7 +44,7 @@ export function validateOpeningAction(value: unknown, skillToolNames: string[] =
       return `openingAction tool "${(call as any).tool}" is not in the skill tool set`;
     }
   }
-  if (action.timeoutMs !== undefined && (typeof action.timeoutMs !== 'number' || action.timeoutMs <= 0 || action.timeoutMs > OPENING_ACTION_MAX_TIMEOUT_MS)) {
+  if (action.timeoutMs !== undefined && (typeof action.timeoutMs !== 'number' || !Number.isFinite(action.timeoutMs) || action.timeoutMs < 1 || action.timeoutMs > OPENING_ACTION_MAX_TIMEOUT_MS)) {
     return `openingAction.timeoutMs must be within 1..${OPENING_ACTION_MAX_TIMEOUT_MS}ms`;
   }
   if (action.maxChars !== undefined && (typeof action.maxChars !== 'number' || !Number.isInteger(action.maxChars) || action.maxChars <= 0 || action.maxChars > OPENING_ACTION_MAX_CHARS)) {

@@ -116,5 +116,22 @@ describe('createSessionFromSkill opening-action prefetch (ENG-1107)', () => {
     expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({
       content: expect.stringMatching(/Welcome aboard\.[\s\S]*could not fetch/i),
     }));
+    // Greptile P1: the fallback message must also reach the caller in the
+    // 201 body — otherwise a double persistence failure leaves a blank session.
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      openingAssistantMessage: expect.stringMatching(/could not fetch/i),
+    }));
+  });
+  it('caps a long welcome prepended to the prefetch first turn at the output bound', async () => {
+    const longWelcome = 'W'.repeat(9000);
+    (agent.getAuthorizedSkill as jest.Mock).mockResolvedValue({ ...PREFETCH_SKILL, welcomeMessage: longWelcome });
+    (agent.applyOpeningAction as jest.Mock).mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Holding 2 candidates: …', metadata: { kind: 'skill-prefetch' } }],
+    });
+    const res = response();
+    await agentModeController.createSession(request('skill-prefetch'), res);
+    expect(res.status).toHaveBeenCalledWith(201);
+    const persisted = db.addMessagesToSession.mock.calls[0][1] as any[];
+    expect(persisted[0].content.length).toBeLessThanOrEqual(4000);
   });
 });

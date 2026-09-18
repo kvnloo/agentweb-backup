@@ -8734,7 +8734,15 @@ export const agentModeController = {
           const applied = await agentModeService.applyOpeningAction(authorizedSkill, user.userId, session.sessionId);
           prefetchMessages = applied.messages as typeof prefetchMessages;
           if (welcomeMessage && prefetchMessages.length > 0) {
-            prefetchMessages = [{ ...prefetchMessages[0], content: `${welcomeMessage}\n\n${prefetchMessages[0].content}` }, ...prefetchMessages.slice(1)];
+            // ENG-1107 Greptile P1: cap the combined first turn — a long
+            // welcome prepended after applyOpeningAction's own cap could
+            // otherwise exceed maxChars / the global output bound.
+            const combinedLimit = Math.min(
+              ((skill as any)?.openingAction?.maxChars as number | undefined) ?? 4000,
+              8000,
+            );
+            const combined = `${welcomeMessage}\n\n${prefetchMessages[0].content}`.slice(0, combinedLimit);
+            prefetchMessages = [{ ...prefetchMessages[0], content: combined }, ...prefetchMessages.slice(1)];
           }
           await chatbotDb.addMessagesToSession(session.sessionId, prefetchMessages as any);
         } catch (prefetchError) {
@@ -8760,6 +8768,7 @@ export const agentModeController = {
       res.status(201).json(skillId ? {
         ...sessionWithModel,
         redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+        ...(prefetchMessages.length > 0 ? { openingAssistantMessage: prefetchMessages[0].content } : {}),
       } : {
         ...sessionWithModel,
         ...(initialModelPolicy ? {

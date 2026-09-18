@@ -16,6 +16,17 @@ describe('validateOpeningAction (ENG-1107)', () => {
   ])('rejects an unsafe persisted openingAction (%s) before any execution', (_label, openingAction, toolNames) => {
     expect(validateOpeningAction(openingAction as any, toolNames)).toMatch(/.+/);
   });
+  it.each([
+    ['sub-millisecond timeout', 0.5],
+    ['NaN timeout', NaN],
+    ['zero timeout', 0],
+    ['infinite timeout', Infinity],
+  ])('rejects a non-enforceable timeoutMs (%s)', (_label, timeoutMs) => {
+    expect(validateOpeningAction(
+      { type: 'prefetch', calls: [{ tool: 'search_posts' }], timeoutMs } as any,
+      ['search_posts'],
+    )).toMatch(/.+/);
+  });
   it('accepts undefined (no openingAction costs nothing)', () => {
     expect(validateOpeningAction(undefined, ['search_posts'])).toBeUndefined();
   });
