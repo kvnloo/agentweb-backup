@@ -43,7 +43,7 @@ import type { EnrichmentConfig } from '../services/crmEnrichmentServiceV3';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
-const found = (amountUsd: number | null, yoyGrowth: number | null = 1.1): EnigmaBrandLookupResult => ({
+const found = (amountUsd: number | null, yoyGrowth: number | null = 0.1): EnigmaBrandLookupResult => ({
   status: 'found',
   brandId: 'b1',
   brandName: 'Popup Bagels',
