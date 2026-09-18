@@ -79,186 +79,313 @@ async function pollForLead(listId: string, email: string): Promise<{ leadId: str
   return null;
 }
 
+/**
+ * Marker attribute stamped on the form the smoke test decided to drive. Every
+ * field/submit selector is scoped to it, so a page with a newsletter or search
+ * form above the lead form can't have its fields filled by one query and its
+ * submit button clicked by another.
+ */
+const SMOKE_FORM_ATTR = "data-agentweb-smoke-form";
+const SMOKE_FORM_SCOPE = `form[${SMOKE_FORM_ATTR}="1"]`;
+
+export type SmokeField = {
+  /** Playwright selector, already scoped to the chosen form. */
+  selector: string;
+  /** name/id/placeholder/autocomplete/aria-label/label text, lowercased — what the value choice keys off. */
+  hint: string;
+  /** input type, or "textarea". */
+  kind: string;
+};
+
+export type SmokeFields = {
+  /** Selector prefix for the chosen form ("" when the page has no form at all). */
+  scope: string;
+  fields: SmokeField[];
+  selects: { selector: string; options: string[] }[];
+  checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+};
+
 type SmokeTestPage = {
-  goto(url: string, opts?: any): Promise<unknown>;
+  goto(url: string, opts?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
   url(): string;
-  waitForURL(pred: (url: URL) => boolean, opts?: any): Promise<unknown>;
-  fill(selector: string, value: string): Promise<unknown>;
-  press(selector: string, key: string): Promise<unknown>;
-  click(selector: string): Promise<unknown>;
-  selectOption(selector: string, value: string): Promise<unknown>;
-  check(selector: string): Promise<unknown>;
+  waitForURL(pred: (url: URL) => boolean, opts?: { timeout?: number }): Promise<unknown>;
+  fill(selector: string, value: string, opts?: { timeout?: number }): Promise<unknown>;
+  press(selector: string, key: string, opts?: { timeout?: number }): Promise<unknown>;
+  click(selector: string, opts?: { timeout?: number }): Promise<unknown>;
+  selectOption(selector: string, value: string, opts?: { timeout?: number }): Promise<unknown>;
+  check(selector: string, opts?: { timeout?: number }): Promise<unknown>;
   evaluate<T>(fn: () => T): Promise<T>;
 };
 
+// Per-interaction cap. Playwright's default is 30s (DEFAULT_PLAYWRIGHT_TIMEOUT), and every
+// fill/selectOption/check auto-waits for actionability — so ONE unreachable control (a
+// display:none honeypot, a disabled cascading select, a Radix widget with no real input)
+// used to burn 30s of the smoke test's wall clock, silently, per field. Discovery already
+// filters most of those out; this bounds whatever slips through.
+const FIELD_TIMEOUT_MS = 3_000;
+// The submit button is the one control we WANT to wait on: client-side validation commonly
+// keeps it disabled until every field passes, so it needs longer than a plain field.
+const SUBMIT_TIMEOUT_MS = 10_000;
+
 /**
- * Fills every required field in the page's first form with synthetic but
- * format-valid data.
+ * Runs INSIDE the page (passed to page.evaluate) — must stay self-contained: no imports,
+ * no closure over module scope, only DOM globals. Exported so it can be unit-tested
+ * against a real DOM instead of only through a mock that never executes it.
  *
- * Why this exists: the old path filled only `input[type=email]` and clicked
- * submit. That worked for the single-email-field landers the test was built
- * against, but every modern v0 lander is a React-controlled multi-field form
- * (name/phone/zip + selects + checkboxes) whose client-side validation blocks
- * submit until ALL required fields pass — so the submit silently never fired and
- * the test reported "lead did not land in the CRM" on a page that worked fine
- * for real visitors (the 2026-09-18 WaterHeater.app root + voice-page failures).
+ * Picks the most lead-like form, stamps it with SMOKE_FORM_ATTR, and returns fully-formed,
+ * form-scoped selectors plus the hint text the caller needs to choose a value per field.
+ */
+export function discoverSmokeFields(): SmokeFields {
+  const MARK = "data-agentweb-smoke-form";
+  const SCOPE_PREFIX = `form[${MARK}="1"] `;
+  // Common honeypot field names (Netlify bot-field, Formspree _gotcha, Mailchimp b_*, and
+  // the generic ones). Filling one makes the lander's own spam filter drop the lead, which
+  // would read here as "the form is broken".
+  const HONEYPOT_NAME = /^(?:_?honey|hp$|hp[_-]|_gotcha|bot-?field|b_\d|url_check|confirm[_-]?email|leave[_-]?blank)/i;
+
+  const all = (root: ParentNode, sel: string): Element[] => Array.prototype.slice.call(root.querySelectorAll(sel));
+  const esc = (v: string): string => String(v).replace(/(["\\])/g, "\\$1");
+
+  const hintFor = (el: Element): string => {
+    const input = el as HTMLInputElement;
+    const labels = (input as any).labels as NodeListOf<HTMLElement> | undefined;
+    const labelText = labels && labels.length ? labels[0].textContent || "" : "";
+    return [
+      input.name,
+      input.id,
+      el.getAttribute("placeholder"),
+      el.getAttribute("autocomplete"),
+      el.getAttribute("aria-label"),
+      labelText,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+  };
+
+  // Skip anything a real visitor could not fill. Playwright counts an element as visible
+  // when it merely has a non-empty bounding box, so an off-canvas honeypot
+  // (position:absolute;left:-9999px) WOULD be filled, and a display:none control instead
+  // eats the full action timeout. Both are handled here, before we ever build a selector.
+  const usable = (el: Element): boolean => {
+    const input = el as HTMLInputElement;
+    if (input.disabled || input.readOnly) return false;
+    if (input.type === "hidden") return false;
+    if (el.getAttribute("aria-hidden") === "true") return false;
+    if (input.name && HONEYPOT_NAME.test(input.name)) return false;
+    if (input.id && HONEYPOT_NAME.test(input.id)) return false;
+    const style = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
+    if (style) {
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    // Absolute (document-space) position, so a legitimately below-the-fold field isn't
+    // mistaken for an off-canvas one.
+    const absLeft = rect.left + (window.scrollX || 0);
+    const absTop = rect.top + (window.scrollY || 0);
+    if (absLeft + rect.width <= 0 || absTop + rect.height <= 0) return false;
+    const docWidth = document.documentElement.scrollWidth;
+    if (docWidth > 0 && absLeft >= docWidth) return false;
+    return true;
+  };
+
+  const forms = all(document, "form") as HTMLFormElement[];
+  let form: HTMLFormElement | null = null;
+  let bestScore = -1;
+  for (const candidate of forms) {
+    const controls = all(candidate, "input, select, textarea") as HTMLInputElement[];
+    let score = controls.filter((c) => c.required).length;
+    if (candidate.querySelector('input[type="email"], input[type="tel"]')) score += 10;
+    if (/e-?mail|phone|tel|zip|postal|name/.test(controls.map(hintFor).join(" "))) score += 5;
+    if (score > bestScore) {
+      bestScore = score;
+      form = candidate;
+    }
+  }
+
+  let scope = "";
+  if (form) {
+    form.setAttribute(MARK, "1");
+    scope = SCOPE_PREFIX;
+  }
+  const root: ParentNode = form || document;
+
+  // Index over the form's inputs/textareas so a control with neither id nor name still gets
+  // a selector that resolves back to THAT control (`>> nth=` is resolved against the scoped
+  // set, so the index and the selector agree).
+  const addressable = all(root, "input, textarea");
+  const selFor = (el: Element): string => {
+    const input = el as HTMLInputElement;
+    if (input.id) return `${scope}[id="${esc(input.id)}"]`;
+    if (input.name) return `${scope}[name="${esc(input.name)}"]`;
+    return `${scope}:is(input, textarea) >> nth=${addressable.indexOf(el)}`;
+  };
+
+  const FILLABLE =
+    'input[type="email"], input[type="tel"], input[type="text"], input[type="url"], ' +
+    'input[type="number"], input[type="search"], input[type="date"], input:not([type]), textarea';
+  const fields: SmokeField[] = [];
+  for (const el of all(root, FILLABLE)) {
+    if (!usable(el)) continue;
+    const isTextarea = el.tagName.toUpperCase() === "TEXTAREA";
+    fields.push({
+      selector: selFor(el),
+      hint: hintFor(el),
+      kind: isTextarea ? "textarea" : (el as HTMLInputElement).type || "text",
+    });
+  }
+
+  const selects: { selector: string; options: string[] }[] = [];
+  const allSelects = all(root, "select") as HTMLSelectElement[];
+  allSelects.forEach((sel, index) => {
+    if (!usable(sel)) return;
+    selects.push({
+      selector: sel.id
+        ? `${scope}[id="${esc(sel.id)}"]`
+        : sel.name
+          ? `${scope}[name="${esc(sel.name)}"]`
+          : `${scope}select >> nth=${index}`,
+      options: Array.prototype.slice
+        .call(sel.options)
+        .filter((o: HTMLOptionElement) => o.value && !o.disabled)
+        .map((o: HTMLOptionElement) => o.value),
+    });
+  });
+
+  const checkables = (all(root, 'input[type="checkbox"], input[type="radio"]') as HTMLInputElement[])
+    .filter(usable)
+    .map((input) => ({
+      selector: selFor(input),
+      type: input.type,
+      name: input.name || null,
+      required: input.required,
+    }));
+
+  return { scope, fields, selects, checkables };
+}
+
+/**
+ * Chooses a format-valid synthetic value for one discovered field.
  *
- * Strategy per field, in order:
- *  1. email inputs → the smoke-test email (so pollForLead can find the row).
- *  2. tel inputs → a unique 555- number (fictional range, valid 10-digit format).
- *  3. Other text inputs → a generic "Smoke Test" value (first/last name fields get
- *     "Smoke"/"Test" so split-name validation passes).
- *  4. Required selects → first non-empty option (mirrors a visitor picking something).
- *  5. First checkbox/radio group → check the first box (e.g. symptom pickers that
- *     require ≥1 selection).
- * Fills are best-effort per field (a missing selector resolves, never throws) —
- * a form with NO fillable fields still proceeds to submit, preserving the old
- * behavior for minimal landers.
+ * Keys off the field's HINT (its name/id/placeholder/autocomplete/label), never off its
+ * SELECTOR: every name-based selector literally contains the substring "name", so matching
+ * on the selector sent `[name="zip"]` and `[name="company_website"]` down the person-name
+ * branch and filled them with "Smoke" — which then failed the lander's own pattern
+ * validation and produced exactly the false "lead did not land in the CRM" this whole
+ * code path exists to prevent.
+ *
+ * Exported for unit tests.
+ */
+export function syntheticValueFor(field: SmokeField, email: string, phone: string): string {
+  const hint = field.hint || "";
+  if (field.kind === "email" || /e-?mail/.test(hint)) return email;
+  if (field.kind === "tel" || /phone|\btel\b|mobile|cell/.test(hint)) return phone;
+  if (/zip|postal|postcode/.test(hint)) return "94025";
+  if (field.kind === "url" || /url|website|web[-_\s]*site|domain/.test(hint)) return "https://example.com";
+  if (/last[-_\s]*name|family[-_\s]*name|surname|lname/.test(hint)) return "Test";
+  if (/first[-_\s]*name|given[-_\s]*name|fname/.test(hint)) return "Smoke";
+  if (/name/.test(hint)) return "Smoke Test";
+  if (field.kind === "number") return "5";
+  if (field.kind === "date") return "2030-01-01";
+  return "Smoke Test";
+}
+
+export type FillOutcome = {
+  /** Last field successfully filled — the target for the Enter-key submit fallback. */
+  lastTextSelector: string | null;
+  /** True only if the smoke-test email actually went into a field; gates the CRM poll. */
+  emailFilled: boolean;
+  filled: number;
+  attempted: number;
+  /** Selector prefix for the form that was driven ("" when the page has no form). */
+  scope: string;
+};
+
+/**
+ * Fills every fillable field in the page's lead form with synthetic but format-valid data.
+ *
+ * Why this exists: the old path filled only `input[type=email]` and clicked submit. That
+ * worked for the single-email-field landers the test was built against, but every modern
+ * v0 lander is a React-controlled multi-field form (name/phone/zip + selects + checkboxes)
+ * whose client-side validation blocks submit until ALL required fields pass — so the submit
+ * silently never fired and the test reported "lead did not land in the CRM" on a page that
+ * worked fine for real visitors (the 2026-09-18 WaterHeater.app root + voice-page failures).
+ *
+ * Field selection and selector construction happen in discoverSmokeFields (page-side);
+ * this function only decides values and drives the interactions. Fills are best-effort per
+ * field (a missing or unfillable control is skipped, never thrown) — a form with NO fillable
+ * fields still proceeds to submit, preserving the old behavior for minimal landers.
  */
 async function fillAllRequiredFields(
   browserPage: SmokeTestPage,
   email: string,
   testPhone: string
-): Promise<{ lastTextSelector: string | null }> {
-  const fieldKinds = await browserPage
-    .evaluate(() => {
-      const form = document.querySelector("form") ?? document;
-      // Return complete selectors from discovery so the caller never has to guess
-      // whether a reference is an id or a name: a name-only control such as
-      // <input name="email"> must become [name="email"], not #email.
-      // Escape interpolated values: React-style ids (":r0:") and names with
-      // quotes/backslashes break Playwright's selector parser, throwing and
-      // leaving required controls empty (false negative). Fallbacks are static
-      // and already valid.
-      const esc = (s: string): string => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      const escId = (id: string): string =>
-        `#${id.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`)}`;
-      const selFor = (el: Element, fallback: string): string => {
-        const input = el as HTMLInputElement;
-        if (input.id) return escId(input.id);
-        if (input.name) return `[name="${esc(input.name)}"]`;
-        return fallback;
-      };
-      const textInputs = [...form.querySelectorAll('input[type="email"]')].map(
-        (el) => selFor(el, 'input[type="email"]')
-      );
-      const telInputs = [...form.querySelectorAll('input[type="tel"]')].map(
-        (el) => selFor(el, 'input[type="tel"]')
-      );
-      const otherTexts = [
-        ...form.querySelectorAll('input[type="text"], input:not([type])'),
-      ].map((el) => selFor(el, 'input[type="text"]'));
-      const selects = [...form.querySelectorAll("select")].map((el, i) => {
-        const sel = el as HTMLSelectElement;
-        return {
-          selector: sel.id
-            ? escId(sel.id)
-            : sel.name
-              ? `[name="${esc(sel.name)}"]`
-              : `select >> nth=${i}`,
-          options: [...sel.options].filter((o) => o.value).map((o) => o.value),
-        };
-      });
-      const checkables = [
-        ...form.querySelectorAll('input[type="checkbox"], input[type="radio"]'),
-      ].map((el) => {
-        const input = el as HTMLInputElement;
-        return {
-          selector: selFor(el, 'input[type="checkbox"]'),
-          type: input.type,
-          name: input.name || null,
-          required: input.required,
-        };
-      });
-      return { textInputs, telInputs, otherTexts, selects, checkables };
-    })
-    .catch(() => null);
-  if (!fieldKinds) return { lastTextSelector: null as string | null };
+): Promise<FillOutcome> {
+  const discovered = await browserPage.evaluate(discoverSmokeFields).catch(() => null);
+  if (!discovered) {
+    return { lastTextSelector: null, emailFilled: false, filled: 0, attempted: 0, scope: "" };
+  }
 
-  const toSelector = (ref: string): string => {
-    // Discovery already returns complete selectors (#id, [name="..."], or a
-    // positional fallback); pass them through untouched.
-    return ref;
-  };
+  const fields = discovered.fields || [];
+  const selects = discovered.selects || [];
+  const checkables = discovered.checkables || [];
 
   let lastTextSelector: string | null = null;
-  for (const ref of fieldKinds.textInputs) {
+  let emailFilled = false;
+  let filled = 0;
+
+  for (const field of fields) {
+    const value = syntheticValueFor(field, email, testPhone);
     try {
-      await browserPage.fill(toSelector(ref), email);
-      if (!lastTextSelector) lastTextSelector = toSelector(ref);
+      await browserPage.fill(field.selector, value, { timeout: FIELD_TIMEOUT_MS });
+      filled++;
+      lastTextSelector = field.selector;
+      if (value === email) emailFilled = true;
     } catch {
       // best-effort per field
     }
   }
-  for (const ref of fieldKinds.telInputs) {
+
+  for (const sel of selects) {
+    if (!sel.options || sel.options.length === 0) continue;
     try {
-      await browserPage.fill(toSelector(ref), testPhone);
-      if (!lastTextSelector) lastTextSelector = toSelector(ref);
+      await browserPage.selectOption(sel.selector, sel.options[0], { timeout: FIELD_TIMEOUT_MS });
+      filled++;
     } catch {
-      // best-effort per field
+      // custom/Radix comboboxes with valid defaults — leave alone
     }
   }
-  for (const ref of fieldKinds.otherTexts) {
-    const lower = ref.toLowerCase();
-    const value = lower.includes("last")
-      ? "Test"
-      : lower.includes("first") || lower.includes("name")
-        ? "Smoke"
-        : lower.includes("zip") || lower.includes("postal")
-          ? "94025"
-          : lower.includes("url") ||
-              lower.includes("website") ||
-              lower.includes("site") ||
-              lower.includes("link")
-            ? "https://example.com"
-            : "Smoke Test";
-    try {
-      await browserPage.fill(toSelector(ref), value);
-      lastTextSelector = toSelector(ref);
-    } catch {
-      // best-effort per field
-    }
-  }
-  for (const sel of fieldKinds.selects) {
-    if (sel.options.length === 0) continue;
-    try {
-      await browserPage.selectOption(toSelector(sel.selector), sel.options[0]);
-    } catch {
-      // hidden/custom selects (e.g. Radix comboboxes with valid defaults) — leave alone
-    }
-  }
-  // Check EVERY required checkbox and one radio per required group. The old path
-  // checked only the first control, so a form with multiple required checkboxes
-  // (or an optional control first) stayed validation-blocked and never submitted.
-  const requiredBoxes = fieldKinds.checkables.filter(
-    (c) => c.type === "checkbox" && c.required
-  );
-  const requiredRadios = fieldKinds.checkables.filter(
-    (c) => c.type === "radio" && c.required
-  );
+
+  // Check EVERY required checkbox and one radio per required group. The old path checked
+  // only the first control, so a form with multiple required checkboxes (or an optional
+  // control first) stayed validation-blocked and never submitted.
+  const requiredBoxes = checkables.filter((c) => c.type === "checkbox" && c.required);
+  const requiredRadios = checkables.filter((c) => c.type === "radio" && c.required);
   const radiosByGroup = new Map<string, { selector: string }>();
-  for (const r of requiredRadios) {
-    const key = r.name ?? r.selector;
-    if (!radiosByGroup.has(key)) radiosByGroup.set(key, r);
+  for (const radio of requiredRadios) {
+    const key = radio.name ?? radio.selector;
+    if (!radiosByGroup.has(key)) radiosByGroup.set(key, radio);
   }
-  const toCheck = requiredBoxes.length > 0 || radiosByGroup.size > 0
-    ? [...requiredBoxes, ...radiosByGroup.values()]
-    : fieldKinds.checkables.length > 0
-      ? [
-          typeof fieldKinds.checkables[0] === "string"
-            ? { selector: fieldKinds.checkables[0] as string }
-            : fieldKinds.checkables[0],
-        ] // no required info (e.g. older mock shape) — best-effort fallback
-      : [];
-  for (const c of toCheck) {
+  const toCheck: { selector: string }[] =
+    requiredBoxes.length > 0 || radiosByGroup.size > 0
+      ? [...requiredBoxes, ...radiosByGroup.values()]
+      : checkables.length > 0
+        ? [checkables[0]]
+        : [];
+  for (const control of toCheck) {
     try {
-      await browserPage.check(toSelector(c.selector));
+      await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
+      filled++;
     } catch {
       // custom checkbox widgets without a checkable input — leave alone
     }
   }
-  return { lastTextSelector };
+
+  const attempted = fields.length + selects.length + toCheck.length;
+  return { lastTextSelector, emailFilled, filled, attempted, scope: discovered.scope || "" };
 }
+
 
 /**
  * Runs the smoke test for a just-deployed page. NEVER throws — every failure mode (browser
@@ -291,6 +418,7 @@ async function runGenerationSmokeTestNow(
   let leadCaptured = false;
   let pixelFired = false;
   let error: string | undefined;
+  let diagnostics = "no submission attempted";
   let handoffId: string | null = null;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
@@ -354,7 +482,7 @@ async function runGenerationSmokeTestNow(
 
     await browserPage.goto(deployedUrl, { waitUntil: "networkidle", timeout: 30_000 });
 
-    // Fill EVERY required field, not just email. Modern landers are React-controlled
+    // Fill EVERY fillable field, not just email. Modern landers are React-controlled
     // multi-field forms (name/phone/zip + selects) with client-side validation that blocks
     // submit until all required fields pass — filling only input[type=email] leaves the
     // form unsubmittable and produces a false-negative "lead did not land in CRM".
@@ -364,104 +492,149 @@ async function runGenerationSmokeTestNow(
     // selects with valid defaults, POSTs /api/capture). Both submit fine with realistic
     // data; the old fill-email-only path failed on both while the forms worked for
     // real visitors.
-    const testPhone = `41555501${String(Date.now()).slice(-2)}`; // NANPA fictional block 555-0100–0199 with a real area code
+    //
+    // 415-555-0100..0199 is the NANP's officially reserved fictional range, inside a real
+    // area code — libphonenumber-style validators accept it and it is provably unroutable.
+    // Two things it is deliberately NOT: a bare "555" AREA code (the previous value —
+    // unassignable, and real validators reject it outright, which blocked submit on exactly
+    // the landers this fill path was added for), and an arbitrary 555-XXXX line (555-1212
+    // is live directory assistance). Only the low 2 digits vary, which is fine: the CRM
+    // lookup key is the email, never the phone.
+    const testPhone = `41555501${String(Date.now()).slice(-2)}`;
     const email = buildSmokeTestEmail();
-    const { lastTextSelector } = await fillAllRequiredFields(
-      browserPage,
-      email,
-      testPhone
-    );
+    const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
+    const { lastTextSelector, emailFilled, scope } = fillOutcome;
 
     // Capture the pre-submit URL BEFORE the submission action: if click/Enter
     // completes a same-instant handoff redirect, reading it after would already
     // see the handoff URL and waitForURL would time out on a success.
     const urlBeforeSubmit = browserPage.url();
-    // Scope the explicit submit click to the discovered first form: a page-wide
-    // click can hit another form's submit control, succeeding while the filled
-    // form stays unsubmitted. When a <form> exists, use only its submit control
-    // plus requestSubmit() — never a page-wide retry. The bare selector runs
-    // only when no <form> exists at all (button outside any form).
-    // Playwright's click() auto-waits for the button to become actionable, which
-    // covers client-side validation that enables submit only after all fields pass.
-    // Prefer an explicit submit button; fall back to requestSubmit() on the
-    // first form (pressing Enter on a broad 'input, select, textarea' selector
-    // can land on a checkbox/radio/hidden/select where Enter never submits).
-    if (
-      await browserPage.evaluate(() => document.querySelector("form") !== null)
-    ) {
+    let pageOrigin = "";
+    try {
+      pageOrigin = new URL(urlBeforeSubmit).origin;
+    } catch {
+      // non-URL page (about:blank etc.) — same-origin filtering below is then skipped
+    }
+
+    // Record the form's OWN submission responses. A handoff lander's success path is a
+    // redirect rather than a CRM row, and a redirect on its own is written by the page's
+    // JS — it proves nothing about whether the capture endpoint accepted anything. A
+    // same-origin non-GET response is the positive evidence that distinguishes "the
+    // pipeline worked" from "the client redirected anyway after its fetch() threw".
+    const submitResponseStatuses: number[] = [];
+    browserPage.on("response", (response) => {
       try {
-        await browserPage.click(
-          'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
-        );
+        if (response.request().method() === "GET") return;
+        if (pageOrigin && new URL(response.url()).origin !== pageOrigin) return;
+        submitResponseStatuses.push(response.status());
       } catch {
-        // No actionable submit control on the first form — submit it directly.
-        try {
-          await browserPage.evaluate(() => {
-            document.querySelector("form")?.requestSubmit();
-          });
-        } catch {
-          // requestSubmit threw (unsupported) — Enter in the last
-          // filled text field as a final fallback.
-          await browserPage.press(lastTextSelector ?? 'input[type="text"]', "Enter");
-        }
+        // malformed response URL — ignore
       }
-    } else {
-      try {
-        await browserPage.click('button[type="submit"], input[type="submit"]');
-      } catch {
-        // No form element — Enter in the last filled text field as final fallback.
-        await browserPage.press(lastTextSelector ?? 'input[type="text"]', "Enter");
+    });
+
+    const submitSelector = scope
+      ? `${scope}button[type="submit"], ${scope}input[type="submit"]`
+      : 'button[type="submit"], input[type="submit"]';
+    let submitPath: "click" | "requestSubmit" | "enter" | "none" = "none";
+    try {
+      // Prefer an explicit submit button, scoped to the form we actually filled.
+      // Playwright's click() auto-waits for the button to become actionable, which covers
+      // client-side validation that enables submit only after all fields pass.
+      await browserPage.click(submitSelector, { timeout: SUBMIT_TIMEOUT_MS });
+      submitPath = "click";
+    } catch {
+      // No usable submit button — submit the form directly, then fall back to Enter.
+      // requestSubmit() must REPORT whether it ran: `querySelector("form")?.requestSubmit()`
+      // resolves successfully on a page with no <form> at all (optional chaining returns
+      // undefined, it does not throw), so the old catch-based chain never reached the Enter
+      // fallback for the div-based React forms it was written for.
+      const submitted = await browserPage
+        .evaluate(() => {
+          const form =
+            document.querySelector('form[data-agentweb-smoke-form="1"]') ||
+            document.querySelector("form");
+          if (!form) return false;
+          (form as HTMLFormElement).requestSubmit();
+          return true;
+        })
+        .catch(() => false);
+      if (submitted) {
+        submitPath = "requestSubmit";
+      } else if (lastTextSelector) {
+        try {
+          await browserPage.press(lastTextSelector, "Enter", { timeout: SUBMIT_TIMEOUT_MS });
+          submitPath = "enter";
+        } catch {
+          // nothing left to try — reported in the failure diagnostics below
+        }
       }
     }
 
     // A React/chat-handoff form may legitimately redirect on success (e.g. to
     // chat.waterheater.app/text?handoff_id=...) INSTEAD of creating a CRM lead row —
-    // pollForLead would then always miss. A same-test navigation to a DIFFERENT origin
-    // (or the appearance of a handoff_id in the URL) right after submit is positive
-    // evidence the pipeline accepted the lead; treat it as captured. Only when the page
-    // stays put (no navigation) do we poll the CRM by email.
-    // A React/chat-handoff form may legitimately redirect on success (e.g. to
-    // chat.waterheater.app/text?handoff_id=...) INSTEAD of creating a CRM lead row —
-    // pollForLead would then always miss. Restrict the exception to a CROSS-ORIGIN
-    // navigation carrying a verifiable handoff_id: the redirect left the deployed
-    // origin entirely (an unrelated redirect or broken same-origin hop cannot fake
-    // this), and the handoff id itself is persisted on the result so a human can
-    // verify it against the handoff/chat backend. A same-origin handoff_id URL, or
-    // a cross-origin navigation without one, still falls through to the CRM poll.
+    // pollForLead would then always miss.
+    let navigatedAway = false;
     try {
-      await browserPage.waitForURL(
-        (url) => url.toString() !== urlBeforeSubmit,
-        { timeout: 8_000 }
-      );
+      await browserPage.waitForURL((url) => url.toString() !== urlBeforeSubmit, {
+        timeout: 8_000,
+      });
+      navigatedAway = true;
     } catch {
       // No navigation — form likely posts to a capture API and shows inline success.
     }
     const urlAfterSubmit = browserPage.url();
+    const submitAccepted = submitResponseStatuses.some((status) => status >= 200 && status < 400);
+    // A chat-handoff form's success path is a redirect carrying a handoff id rather than a
+    // CRM lead row, so pollForLead would always miss it. Accepting that as a capture needs
+    // ALL of:
+    //   - a cross-origin navigation (an anchor scroll or a same-origin rerender cannot fake it),
+    //   - handoff_id as an exact query parameter, read via searchParams rather than matched
+    //     as raw text (a regex also matches handoff_id nested inside another param's value),
+    //   - that the id was not already in the deployed URL before we submitted, and
+    //   - a successful same-origin non-GET response from the submit itself.
+    // The last one is the load-bearing condition: the redirect is written by the page's own
+    // JS, so on its own it proves nothing. A lander whose `fetch(...).catch(() => {})`
+    // swallows a 500 still redirects, and URL evidence alone would mark a silently-broken
+    // capture endpoint as passing on every deploy, forever — the exact silent-breakage this
+    // file exists to catch.
+    let handoffEvidence: string | null = null;
     try {
       const before = new URL(urlBeforeSubmit);
       const after = new URL(urlAfterSubmit);
-      // searchParams.get matches the parameter exactly — a regex on the raw URL
-      // can match handoff_id-looking text nested inside another param's value.
       const id = after.searchParams.get("handoff_id")?.trim();
-      if (after.origin !== before.origin && id) {
-        handoffId = id;
+      if (id && after.origin !== before.origin && !before.searchParams.get("handoff_id")) {
+        handoffEvidence = id;
       }
     } catch {
       // Unparseable URL — not a verifiable handoff; fall through to the CRM poll.
     }
-    const redirectedToHandoff = handoffId !== null;
+    const redirectedToHandoff = navigatedAway && handoffEvidence !== null && submitAccepted;
+    if (redirectedToHandoff) handoffId = handoffEvidence;
 
-    const lead = redirectedToHandoff ? null : await pollForLead(leadListId, email);
+    // Always poll when an email actually went into the form, even on the handoff path:
+    // a form that BOTH writes a CRM row and redirects would otherwise leave the synthetic
+    // lead behind on every single deploy. Only the PASS CONDITION branches on the redirect.
+    const lead = emailFilled ? await pollForLead(leadListId, email) : null;
     if (lead) {
       leadCaptured = true;
       await crmDb.deleteLead(leadListId, lead.leadId);
     } else if (redirectedToHandoff) {
       // The form accepted the submission and handed off (chat/agent redirect with a
-      // handoff id) — the lead pipeline worked end to end even though no CRM row
-      // exists to poll for. Mark captured without a row to delete.
+      // handoff id, backed by a successful capture response) — the lead pipeline worked
+      // end to end even though no CRM row exists to poll for.
       leadCaptured = true;
     }
 
+    // Every non-error failure used to report the same "lead did not land in the CRM"
+    // string, which is what made the 2026-09-18 false-negatives so hard to diagnose:
+    // it cannot distinguish "never submitted" from "submitted and the lead was lost".
+    diagnostics = [
+      `filled ${fillOutcome.filled}/${fillOutcome.attempted} field(s)`,
+      `submit=${submitPath}`,
+      emailFilled ? "email field filled" : "no email field to poll by",
+      navigatedAway ? `navigated to ${truncateForAlert(urlAfterSubmit)}` : "no navigation",
+      `capture response accepted=${submitAccepted}`,
+    ].join("; ");
   } catch (err: any) {
     error = err?.message || String(err);
   } finally {
@@ -482,9 +655,9 @@ async function runGenerationSmokeTestNow(
     ...(pixelExpected ? { pixelFired } : {}),
     checkedAt,
     ...(error ? { error } : {}),
-    // Persisted handoff evidence: the id extracted from the cross-origin redirect
-    // URL, so the handoff can be verified against the chat/handoff backend. Absent
-    // unless the redirect-with-handoff-id path fired.
+    // Persisted handoff evidence: the id extracted from the cross-origin redirect URL, so
+    // the handoff can be verified against the chat/handoff backend. Absent unless the
+    // redirect-with-handoff-id path fired.
     ...(handoffId ? { handoffId } : {}),
   };
 
@@ -494,8 +667,15 @@ async function runGenerationSmokeTestNow(
     const reason =
       error ||
       (!leadCaptured
-        ? "lead did not land in the CRM within the timeout"
-        : "Meta pixel Lead event did not fire (no facebook.com/tr request observed)");
+        ? `lead did not land in the CRM within the timeout (${diagnostics})`
+        : // Detection is the fbq() JS call, not a network sniff — see the pixel block above.
+          "Meta pixel Lead event did not fire (fbq('track','Lead') was never called)");
     await sendLandingPageSmokeTestAlert(page.id, deployedUrl, reason);
   }
+}
+
+/** Page-derived text reaches Slack and the portal-visible readiness reason — keep it short and single-line. */
+function truncateForAlert(value: string): string {
+  const flat = value.replace(/\s+/g, " ").trim();
+  return flat.length > 200 ? `${flat.slice(0, 197)}...` : flat;
 }

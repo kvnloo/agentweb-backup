@@ -1,0 +1,192 @@
+/**
+ * Unit tests for the PAGE-SIDE half of the smoke test (`discoverSmokeFields`).
+ *
+ * landingPageSmokeTest.test.ts mocks page.evaluate, so the discovery callback never runs
+ * there — the form choice, the honeypot/visibility filtering and every selector it builds
+ * were invisible to the suite. This file runs the real function against a real DOM (jsdom,
+ * in a child process — see helpers/runSmokeDiscovery.js for why), so a regression in any
+ * of them fails a test instead of only failing in production.
+ *
+ * All fixtures run in one child process in beforeAll; each `it` asserts on its slice.
+ */
+import { spawnSync } from "child_process";
+import path from "path";
+
+const HELPER = path.join(__dirname, "helpers", "runSmokeDiscovery.js");
+const SCOPE = 'form[data-agentweb-smoke-form="1"] ';
+
+type Discovered = {
+  scope: string;
+  fields: { selector: string; hint: string; kind: string }[];
+  selects: { selector: string; options: string[] }[];
+  checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+};
+
+const CASES: Record<string, string> = {
+  twoForms: `
+    <form id="newsletter"><input type="text" name="newsletter_email"><button type="submit">Join</button></form>
+    <form id="lead">
+      <input type="email" name="email" required>
+      <input type="tel" name="phone" required>
+      <button type="submit">Get estimate</button>
+    </form>`,
+  awkwardIdentifiers: `<form><input type="email" id=":r0:"><input type="text" name='a"b'></form>`,
+  unfillable: `
+    <form>
+      <input type="email" name="email">
+      <input type="text" name="disabled_field" disabled>
+      <input type="text" name="readonly_field" readonly>
+      <input type="hidden" name="hidden_field">
+      <input type="text" name="aria_hidden_field" aria-hidden="true">
+      <input type="text" name="zero_box" data-rect="0,0,0,0">
+    </form>`,
+  honeypots: `
+    <form>
+      <input type="email" name="email">
+      <input type="text" name="offcanvas_trap" data-rect="-9999,0,120,24">
+      <input type="text" name="above_viewport_trap" data-rect="0,-9999,120,24">
+      <input type="text" name="bot-field">
+      <input type="text" name="_gotcha">
+      <input type="text" name="honeypot">
+      <input type="text" name="b_1234">
+    </form>`,
+  belowFold: `
+    <form>
+      <input type="email" name="email">
+      <input type="text" name="below_fold" data-rect="0,4000,120,24">
+    </form>`,
+  fieldTypes: `
+    <form>
+      <textarea name="project_details" required></textarea>
+      <input type="number" name="headcount" required>
+      <input type="url" name="company_site" required>
+      <input type="date" name="preferred_date" required>
+      <input type="search" name="lookup">
+      <input name="untyped">
+    </form>`,
+  hints: `
+    <form>
+      <label for="z">ZIP code</label>
+      <input id="z" name="pc" autocomplete="postal-code" placeholder="94025">
+    </form>`,
+  selectOutsideForm: `
+    <select id="site-language"><option value="en">EN</option></select>
+    <form>
+      <input type="email" name="email">
+      <select><option value="">Pick…</option><option value="gas">Gas</option></select>
+    </form>`,
+  checkables: `
+    <form>
+      <input type="checkbox" name="terms" id="terms" required>
+      <input type="checkbox" name="news" id="news">
+      <input type="radio" name="plan" id="plan-a" required>
+      <input type="radio" name="plan" id="plan-b" required>
+    </form>`,
+  anonymousControls: `<form><input type="text"><input type="email"></form>`,
+  noForm: `<div><input type="email" name="email"><input type="tel" name="phone"></div>`,
+};
+
+let out: Record<string, { result?: Discovered; markedFormIds?: string[]; error?: string }> = {};
+
+beforeAll(() => {
+  const cases = Object.entries(CASES).map(([name, html]) => ({ name, html }));
+  const child = spawnSync(process.execPath, [HELPER], {
+    input: JSON.stringify({ cases }),
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (child.status !== 0) {
+    throw new Error(`discovery helper failed (status ${child.status}):\n${child.stderr}`);
+  }
+  out = JSON.parse(child.stdout).results;
+}, 60_000);
+
+/** Reads one fixture's result, surfacing a page-side throw as a test failure rather than undefined. */
+function got(name: keyof typeof CASES): Discovered {
+  const entry = out[name as string];
+  if (!entry || entry.error) throw new Error(`fixture "${name}" threw: ${entry?.error}`);
+  return entry.result!;
+}
+const selectorsOf = (d: Discovered) => d.fields.map((f) => f.selector);
+
+describe("discoverSmokeFields", () => {
+  it("drives the lead form, not a newsletter form that happens to come first in the DOM", () => {
+    // The fields that get filled and the submit button that gets clicked must belong to
+    // the SAME form: discovery used to scope to the first form while the submit click
+    // stayed page-global and non-strict, so it clicked whichever button matched first.
+    expect(out.twoForms.markedFormIds).toEqual(["lead"]);
+    expect(got("twoForms").scope).toBe(SCOPE);
+    expect(selectorsOf(got("twoForms"))).toEqual([
+      `${SCOPE}[name="email"]`,
+      `${SCOPE}[name="phone"]`,
+    ]);
+  });
+
+  it("addresses ids through [id=...] so a React useId value does not produce an invalid selector", () => {
+    // React 18's useId() emits ids like ":r0:" (shadcn/ui form primitives use it), and
+    // `#:r0:` is rejected outright by Playwright's CSS parser — the fill threw, the
+    // per-field catch swallowed it, and the form stayed empty with no diagnostic.
+    expect(selectorsOf(got("awkwardIdentifiers"))).toEqual([
+      `${SCOPE}[id=":r0:"]`,
+      `${SCOPE}[name="a\\"b"]`,
+    ]);
+  });
+
+  it("skips controls a real visitor cannot fill", () => {
+    expect(selectorsOf(got("unfillable"))).toEqual([`${SCOPE}[name="email"]`]);
+  });
+
+  it("skips honeypots — both the off-canvas kind and the named kind", () => {
+    // Playwright counts an element as visible when it merely has a non-empty bounding box,
+    // so an off-canvas honeypot WOULD be filled — and the lander's own spam filter would
+    // then drop the lead, which reads here as a broken form.
+    expect(selectorsOf(got("honeypots"))).toEqual([`${SCOPE}[name="email"]`]);
+  });
+
+  it("keeps a legitimately below-the-fold field (a large positive top is not off-canvas)", () => {
+    expect(selectorsOf(got("belowFold"))).toContain(`${SCOPE}[name="below_fold"]`);
+  });
+
+  it("covers the field types that block validation but were never filled", () => {
+    expect(got("fieldTypes").fields.map((f) => f.kind)).toEqual([
+      "textarea", "number", "url", "date", "search", "text",
+    ]);
+  });
+
+  it("builds the hint from name/id/placeholder/autocomplete/label text", () => {
+    const [field] = got("hints").fields;
+    for (const part of ["pc", "postal-code", "94025", "zip code"]) {
+      expect(field.hint).toContain(part);
+    }
+  });
+
+  it("indexes a nameless select against the scoped form, not the whole page", () => {
+    const [select] = got("selectOutsideForm").selects;
+    // `>> nth=` resolves against `form[...] select`, so index 0 is the form's first select,
+    // not the language switcher sitting above the form.
+    expect(select.selector).toBe(`${SCOPE}select >> nth=0`);
+    // Placeholder options (empty value) are never chosen.
+    expect(select.options).toEqual(["gas"]);
+  });
+
+  it("reports checkbox/radio requiredness so every required box gets checked", () => {
+    expect(got("checkables").checkables).toEqual([
+      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true },
+      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false },
+      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true },
+      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true },
+    ]);
+  });
+
+  it("falls back to an index selector for a control with neither id nor name", () => {
+    expect(selectorsOf(got("anonymousControls"))).toEqual([
+      `${SCOPE}:is(input, textarea) >> nth=0`,
+      `${SCOPE}:is(input, textarea) >> nth=1`,
+    ]);
+  });
+
+  it("a page with no <form> at all yields an empty scope and unscoped selectors", () => {
+    expect(got("noForm").scope).toBe("");
+    expect(selectorsOf(got("noForm"))).toEqual(['[name="email"]', '[name="phone"]']);
+  });
+});

@@ -2,16 +2,54 @@
  * ENG-449 gap #3: automated post-deploy Playwright smoke test.
  * Mocks `playwright` the same way cssExtractor.test.ts / linkedInService.test.ts already
  * mock `puppeteer-core` — established convention in this repo.
+ *
+ * NOTE: page.evaluate is mocked here, so the page-side field DISCOVERY never executes in
+ * this file — it is unit-tested against a real DOM in landingPageSmokeTest.discovery.test.ts.
+ * These tests cover the Node-side decisions: value choice, submit fallbacks, what counts
+ * as a capture, and what the failure reason says.
  */
 
 // Captures the callback passed to exposeFunction("__smokeTestReportFbqCall", cb) so tests
 // can simulate the page's JS calling fbq('track','Lead',...) by invoking it directly —
 // mirrors how the real implementation detects the call (see landingPageSmokeTest.ts).
 let exposedFbqReporter: ((event: string) => void) | undefined;
+// Captures page.on("response", cb) so tests can simulate the form's own submit response —
+// the evidence the implementation requires before trusting a handoff redirect.
+let responseListener: ((response: any) => void) | undefined;
+
+/** Simulate one response arriving on the page (defaults to a successful same-origin POST). */
+function emitResponse({
+  url = "https://test-page.vercel.app/api/capture",
+  status = 200,
+  method = "POST",
+}: { url?: string; status?: number; method?: string } = {}) {
+  responseListener?.({
+    url: () => url,
+    status: () => status,
+    request: () => ({ method: () => method }),
+  });
+}
+
+/** The default single-email-field lander shape returned by the mocked discovery. */
+const SINGLE_EMAIL_FIELD = {
+  scope: 'form[data-agentweb-smoke-form="1"] ',
+  fields: [
+    {
+      selector: 'form[data-agentweb-smoke-form="1"] [id="email"]',
+      hint: "email",
+      kind: "email",
+    },
+  ],
+  selects: [],
+  checkables: [],
+};
+
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
 const mockContext = { newCDPSession: jest.fn().mockResolvedValue(mockCdpSession) };
 const mockPage = {
-  on: jest.fn(),
+  on: jest.fn((event: string, fn: (response: any) => void) => {
+    if (event === "response") responseListener = fn;
+  }),
   context: jest.fn(() => mockContext),
   exposeFunction: jest.fn((name: string, fn: (event: string) => void) => {
     if (name === "__smokeTestReportFbqCall") exposedFbqReporter = fn;
@@ -27,14 +65,7 @@ const mockPage = {
   press: jest.fn().mockResolvedValue(undefined),
   selectOption: jest.fn().mockResolvedValue(undefined),
   check: jest.fn().mockResolvedValue(undefined),
-  // Minimal single-email-field lander by default — mirrors the original tests.
-  evaluate: jest.fn().mockResolvedValue({
-    textInputs: ['input[type="email"]'],
-    telInputs: [],
-    otherTexts: [],
-    selects: [],
-    checkables: [],
-  }),
+  evaluate: jest.fn().mockResolvedValue(SINGLE_EMAIL_FIELD),
 };
 const mockBrowser = {
   newPage: jest.fn().mockResolvedValue(mockPage),
@@ -70,7 +101,12 @@ jest.mock("../services/v0Service", () => ({
   updateLandingPageSmokeTestResult: (...args: any[]) => mockUpdateLandingPageSmokeTestResult(...args),
 }));
 
-import { runGenerationSmokeTest, setSmokeTestPollConfig, setSmokeTestConcurrency } from "../services/landingPageSmokeTest";
+import {
+  runGenerationSmokeTest,
+  setSmokeTestPollConfig,
+  setSmokeTestConcurrency,
+  syntheticValueFor,
+} from "../services/landingPageSmokeTest";
 
 const BASE_PAGE = {
   id: "page-1",
@@ -88,7 +124,13 @@ const BASE_PAGE = {
 describe("runGenerationSmokeTest", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetLeadByEmail.mockReset();
+    mockGetLeadByEmail.mockResolvedValue(null);
+    (mockPage.evaluate as jest.Mock).mockResolvedValue(SINGLE_EMAIL_FIELD);
+    (mockPage.url as jest.Mock).mockReturnValue("https://test-page.vercel.app");
+    (mockPage.waitForURL as jest.Mock).mockRejectedValue(new Error("no navigation"));
     exposedFbqReporter = undefined;
+    responseListener = undefined;
     setSmokeTestPollConfig(0, 3); // fast polling for tests
     setSmokeTestConcurrency(1); // prod's actual default — reset each test
   });
@@ -117,7 +159,11 @@ describe("runGenerationSmokeTest", () => {
       "https://test-page.vercel.app",
       expect.objectContaining({ waitUntil: "networkidle" })
     );
-    expect(mockPage.fill).toHaveBeenCalledWith('input[type="email"]', expect.stringContaining("smoke-test+"));
+    expect(mockPage.fill).toHaveBeenCalledWith(
+      'form[data-agentweb-smoke-form="1"] [id="email"]',
+      expect.stringContaining("smoke-test+"),
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
     // No pixel configured — never sets up the fbq-call interception or the beacon block.
     expect(mockPage.exposeFunction).not.toHaveBeenCalled();
     expect(mockPage.addInitScript).not.toHaveBeenCalled();
@@ -157,7 +203,7 @@ describe("runGenerationSmokeTest", () => {
     });
   });
 
-  it("FAIL: pixel configured but fbq('track','Lead',...) never observed → ok:false, Slack alert sent", async () => {
+  it("FAIL: pixel configured but fbq('track','Lead',...) never observed → ok:false, alert names the fbq call, not a network request", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
     // exposedFbqReporter is never invoked — pixel call never observed.
 
@@ -167,27 +213,28 @@ describe("runGenerationSmokeTest", () => {
     expect(result.ok).toBe(false);
     expect(result.pixelFired).toBe(false);
     expect(result.leadCaptured).toBe(true);
-    expect(mockSendLandingPageSmokeTestAlert).toHaveBeenCalledWith(
-      "page-1",
-      "https://test-page.vercel.app",
-      expect.stringContaining("pixel")
-    );
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("fbq('track','Lead')");
+    // Detection stopped being a network sniff; the alert must not send an engineer
+    // looking for a request this test never watches.
+    expect(reason).not.toContain("facebook.com/tr");
   });
 
-  it("FAIL: lead never lands in the CRM within the timeout → ok:false, Slack alert sent, lead-list untouched", async () => {
-    mockGetLeadByEmail.mockResolvedValue(null); // never found, every poll attempt
-
+  it("FAIL: lead never lands in the CRM → ok:false, alert carries submit diagnostics, lead-list untouched", async () => {
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockDeleteLead).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(false);
     expect(result.leadCaptured).toBe(false);
-    expect(mockSendLandingPageSmokeTestAlert).toHaveBeenCalledWith(
-      "page-1",
-      "https://test-page.vercel.app",
-      expect.stringContaining("CRM")
-    );
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("CRM");
+    // The diagnostics are the whole point: "never submitted" and "submitted, lead lost"
+    // used to produce the identical string.
+    expect(reason).toContain("filled 1/1 field(s)");
+    expect(reason).toContain("submit=click");
+    expect(reason).toContain("no navigation");
+    expect(reason).toContain("capture response accepted=false");
   });
 
   it("FAIL: browser launch itself throws → caught, ok:false, Slack alert sent, function still resolves", async () => {
@@ -217,87 +264,77 @@ describe("runGenerationSmokeTest", () => {
     expect(result.error).toMatch(/No Chrome executable found/);
   });
 
-  it("SUCCESS: form has no submit button in first form → requestSubmit on the first form (never a page-wide retry)", async () => {
+  it("SUBMIT: the submit button is scoped to the form that was filled", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // Scoped click misses (no actionable submit control on the first form);
-    // a <form> exists, so the code submits it directly — the unscoped
-    // page-wide click must NOT run (it could hit another form's button).
-    mockPage.click.mockRejectedValueOnce(new Error("no button in first form"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
+    // A newsletter/search form earlier in the DOM must not be the one we click.
     expect(mockPage.click).toHaveBeenCalledWith(
-      'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
+      'form[data-agentweb-smoke-form="1"] button[type="submit"], form[data-agentweb-smoke-form="1"] input[type="submit"]',
+      expect.objectContaining({ timeout: expect.any(Number) })
     );
-    expect(mockPage.click).toHaveBeenCalledTimes(1);
-    // Discovery evaluate ran during field-fill; one more evaluate checks for a
-    // <form> (exists → requestSubmit), then requestSubmit runs it directly.
-    expect(mockPage.evaluate).toHaveBeenCalledTimes(3);
-    expect(mockPage.press).not.toHaveBeenCalled();
-    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(true);
   });
 
-  it("SUCCESS: form has no submit button at all → submits the form directly", async () => {
+  it("SUCCESS: no submit button but a <form> exists → requestSubmit() reports true, Enter never pressed", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // Force the scoped click to miss. The shared default evaluate mock resolves
-    // the discovery object (truthy), so the <form>-exists branch runs
-    // requestSubmit directly and the Enter fallback never fires.
-    mockPage.click.mockRejectedValue(new Error("no button found"));
-
-    await runGenerationSmokeTest({ ...BASE_PAGE });
-
-    expect(mockPage.evaluate).toHaveBeenCalled();
-    expect(mockPage.press).not.toHaveBeenCalled();
-    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(true);
-  });
-
-  it("SUCCESS: submit click scoped to first form (second form's button ignored)", async () => {
-    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-
-    await runGenerationSmokeTest({ ...BASE_PAGE });
-
-    // The first click attempt targets the discovered first form, never a
-    // page-wide selector that could hit another form's submit control.
-    expect(mockPage.click).toHaveBeenNthCalledWith(
-      1,
-      'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
-    );
-    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(true);
-  });
-
-  it("SUCCESS: no form element either → bare click miss falls back to Enter in last filled text field", async () => {
-    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // Discovery resolves (records the email selector); the form-presence
-    // evaluate returns false (no <form>), so the else branch's bare click also
-    // misses and the fallback presses Enter in the last filled text field.
+    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
     (mockPage.evaluate as jest.Mock)
-      .mockResolvedValueOnce({
-        textInputs: ['input[type="email"]'],
-        telInputs: [],
-        otherTexts: [],
-        selects: [],
-        checkables: [],
-      })
-      .mockResolvedValueOnce(false);
-    mockPage.click
-      .mockRejectedValueOnce(new Error("no scoped button"))
-      .mockRejectedValueOnce(new Error("no bare button"));
+      .mockResolvedValueOnce(SINGLE_EMAIL_FIELD) // discovery
+      .mockResolvedValueOnce(true); // requestSubmit ran
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockPage.press).toHaveBeenCalledWith('input[type="email"]', "Enter");
+    expect(mockPage.press).not.toHaveBeenCalled();
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+  });
+
+  it("SUCCESS: div-based form with no <form> element → requestSubmit() reports false → Enter in the last filled field", async () => {
+    // The regression this covers: `document.querySelector("form")?.requestSubmit()` RESOLVES
+    // on a page with no form (optional chaining returns undefined rather than throwing), so
+    // a catch-based chain never reached this fallback — the click timed out, the evaluate
+    // no-opped, and nothing was ever submitted.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
+    (mockPage.evaluate as jest.Mock)
+      .mockResolvedValueOnce(SINGLE_EMAIL_FIELD) // discovery
+      .mockResolvedValueOnce(false); // no <form> to requestSubmit
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.press).toHaveBeenCalledWith(
+      'form[data-agentweb-smoke-form="1"] [id="email"]',
+      "Enter",
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
+  });
+
+  it("SUBMIT: nothing fillable and no submit button → submit=none is reported, not silently swallowed", async () => {
+    (mockPage.evaluate as jest.Mock)
+      .mockResolvedValueOnce({ scope: "", fields: [], selects: [], checkables: [] })
+      .mockResolvedValueOnce(false);
+    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.press).not.toHaveBeenCalled();
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("submit=none");
+    expect(reason).toContain("no email field to poll by");
   });
 
   it("SUCCESS: React multi-field form (name/phone/zip + selects + checkboxes) → fills all fields, lead lands → ok:true", async () => {
     // Mirrors campaign.waterheater.app root 2026-09-18: the old fill-email-only path
     // left client-side validation failing so submit never fired (false-negative FAIL).
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
-      textInputs: [],
-      telInputs: ["#phone"],
-      otherTexts: ['#full_name', '#zip'],
+      scope: 'form[data-agentweb-smoke-form="1"] ',
+      fields: [
+        { selector: "#phone", hint: "phone", kind: "tel" },
+        { selector: "#full_name", hint: "full_name your name", kind: "text" },
+        { selector: "#zip", hint: "zip postal-code", kind: "text" },
+        { selector: "#notes", hint: "notes tell us about the problem", kind: "textarea" },
+      ],
       selects: [
         { selector: "#urgency", options: ["emergency", "tomorrow"] },
         { selector: "#heater_type", options: ["gas", "electric"] },
@@ -314,67 +351,75 @@ describe("runGenerationSmokeTest", () => {
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockPage.fill).toHaveBeenCalledWith("#phone", expect.stringMatching(/^41555501\d{2}$/));
-    expect(mockPage.fill).toHaveBeenCalledWith("#full_name", "Smoke");
-    expect(mockPage.fill).toHaveBeenCalledWith("#zip", "94025");
-    expect(mockPage.selectOption).toHaveBeenCalledWith("#urgency", "emergency");
-    expect(mockPage.selectOption).toHaveBeenCalledWith("#heater_type", "gas");
+    const filled = (selector: string) =>
+      (mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === selector)?.[1];
+    // 415-555-0100..0199: the NANP's reserved fictional range inside a REAL area code.
+    // A bare 555 area code is unassignable and libphonenumber-style validators reject it;
+    // an arbitrary 555-XXXX line can be live (555-1212 is directory assistance).
+    expect(filled("#phone")).toMatch(/^41555501\d{2}$/);
+    expect(filled("#full_name")).toBe("Smoke Test");
+    expect(filled("#zip")).toBe("94025");
+    expect(filled("#notes")).toBe("Smoke Test");
+    expect(mockPage.selectOption).toHaveBeenCalledWith(
+      "#urgency",
+      "emergency",
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
+    expect(mockPage.selectOption).toHaveBeenCalledWith(
+      "#heater_type",
+      "gas",
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
     // Every required checkbox + one radio per required group; optional untouched.
-    expect(mockPage.check).toHaveBeenCalledWith("#symptom-no_hot_water");
-    expect(mockPage.check).toHaveBeenCalledWith("#symptom-leak");
-    expect(mockPage.check).toHaveBeenCalledWith("#plan-basic");
-    expect(mockPage.check).not.toHaveBeenCalledWith("#plan-plus");
-    expect(mockPage.check).not.toHaveBeenCalledWith("#opt-news");
-    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
-    expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
+    const checked = (mockPage.check as jest.Mock).mock.calls.map((c) => c[0]);
+    expect(checked).toEqual(
+      expect.arrayContaining(["#symptom-no_hot_water", "#symptom-leak", "#plan-basic"])
+    );
+    expect(checked).not.toContain("#plan-plus");
+    expect(checked).not.toContain("#opt-news");
+    // No email field on this form, so there is nothing to poll the CRM by.
+    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(true);
-    expect(result.leadCaptured).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.leadCaptured).toBe(false);
   });
 
-  it("SUCCESS: URL/website text field gets a URL-shaped value", async () => {
-    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
-      textInputs: [],
-      telInputs: [],
-      otherTexts: ['#company_website'],
-      selects: [],
-      checkables: [],
-    });
-    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-
-    await runGenerationSmokeTest({ ...BASE_PAGE });
-
-    expect(mockPage.fill).toHaveBeenCalledWith("#company_website", "https://example.com");
+  it("VALUES: a name-based selector no longer drags every field into the person-name branch", () => {
+    // The bug this locks out: the chooser matched on the SELECTOR, and every
+    // `[name="..."]` selector contains the substring "name", so `[name="zip"]` was filled
+    // with "Smoke" and failed the lander's own \d{5} pattern.
+    const v = (hint: string, kind = "text") =>
+      syntheticValueFor({ selector: `[name="${hint}"]`, hint, kind }, "smoke@x.test", "4155550100");
+    expect(v("zip")).toBe("94025");
+    expect(v("postal_code")).toBe("94025");
+    expect(v("company_website")).toBe("https://example.com");
+    expect(v("email")).toBe("smoke@x.test");
+    expect(v("phone")).toBe("4155550100");
+    expect(v("first_name")).toBe("Smoke");
+    expect(v("last_name")).toBe("Test");
+    expect(v("full_name")).toBe("Smoke Test");
+    expect(v("company")).toBe("Smoke Test");
+    // autocomplete tokens are part of the hint and must route the same way
+    expect(v("postal-code")).toBe("94025");
+    expect(v("family-name")).toBe("Test");
+    expect(v("given-name")).toBe("Smoke");
   });
 
-  it("SUCCESS: name-only control uses a [name=...] selector, not #name", async () => {
-    // A checkbox-only mock shape (plain strings, no required info) still works
-    // via the best-effort fallback.
-    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
-      textInputs: [],
-      telInputs: [],
-      otherTexts: ['[name="company"]'],
-      selects: [],
-      checkables: ["#legacy-box"],
-    });
-    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-
-    await runGenerationSmokeTest({ ...BASE_PAGE });
-
-    expect(mockPage.fill).toHaveBeenCalledWith('[name="company"]', "Smoke");
-    expect(mockPage.check).toHaveBeenCalledWith("#legacy-box");
-  });
-
-  it("SUCCESS: chat-handoff form redirects with handoff_id instead of a CRM row → ok:true without polling", async () => {
+  it("SUCCESS: chat-handoff redirect BACKED BY an accepted capture response → ok:true", async () => {
     // Mirrors campaign.waterheater.app root 2026-09-18: POST /api/hero-estimate returns
     // { handoff_id } and redirects to chat.waterheater.app/text — no CRM lead row exists
     // to poll for, so pollForLead would always miss even though the pipeline worked.
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
-      textInputs: [],
-      telInputs: ["phone"],
-      otherTexts: ["full_name", "zip"],
+      scope: "",
+      fields: [
+        { selector: "#phone", hint: "phone", kind: "tel" },
+        { selector: "#full_name", hint: "full_name", kind: "text" },
+      ],
       selects: [],
       checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
     });
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
     (mockPage.url as jest.Mock)
@@ -383,63 +428,137 @@ describe("runGenerationSmokeTest", () => {
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
-    expect(mockDeleteLead).not.toHaveBeenCalled();
     expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
-    // Handoff evidence is persisted so it can be verified against the chat backend.
+    // The id is persisted so the handoff can be checked against the chat backend by hand.
     expect(result.handoffId).toBe("abc123");
   });
 
-  it("FAIL: same-origin handoff_id URL still polls the CRM (no optimistic read of our own hop)", async () => {
+  it("FAIL (no false pass): handoff redirect with NO accepted capture response → ok:false", async () => {
+    // The dangerous case: a lander whose `await fetch(...).catch(() => {})` swallows a 500
+    // and redirects anyway. The URL still carries handoff_id, so URL evidence alone would
+    // mark a silently-broken capture endpoint as passing on every deploy, forever.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
+    });
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
     (mockPage.url as jest.Mock)
       .mockReturnValueOnce("https://campaign.waterheater.app/")
-      // Same origin with a REAL handoff_id param — still polls, because only a
-      // cross-origin hop proves the pipeline left the deployed origin.
-      .mockReturnValueOnce("https://campaign.waterheater.app/text?handoff_id=abc123");
-    mockGetLeadByEmail.mockResolvedValue(null); // never found
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(false);
-    expect(result.handoffId).toBeUndefined();
+    expect(result.leadCaptured).toBe(false);
+    expect(mockSendLandingPageSmokeTestAlert).toHaveBeenCalled();
   });
 
-  it("FAIL: handoff-looking text nested inside another param's value still polls the CRM (no regex false pass)", async () => {
+  it("FAIL (no false pass): a cross-origin analytics POST is not capture evidence", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
+    });
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
     (mockPage.url as jest.Mock)
       .mockReturnValueOnce("https://campaign.waterheater.app/")
-      // Cross-origin, but handoff_id appears only inside next's encoded value —
-      // searchParams.get("handoff_id") is null, so this must poll the CRM.
-      .mockReturnValueOnce("https://chat.waterheater.app/text?next=%2Ftext%3Fhandoff_id%3Dabc123");
-    mockGetLeadByEmail.mockResolvedValue(null); // never found
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
-    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(false);
-    expect(result.handoffId).toBeUndefined();
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
   });
 
-  it("FAIL: cross-origin navigation without handoff_id still polls the CRM", async () => {
+  it("FAIL (no false pass): a handoff_id already in the deployed URL can't pass on its own", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
+    });
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/?handoff_id=preexisting")
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=preexisting");
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
+  });
+
+  it("FAIL (no false pass): handoff_id as a bare substring, not a real query param, is ignored", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
+    });
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://chat.waterheater.app/thanks?utm_content=handoff_id%3D1");
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
+  });
+
+  it("FAIL (no false pass): a SAME-origin redirect carrying handoff_id is not a handoff", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
+    });
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://campaign.waterheater.app/thanks?handoff_id=abc123");
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
+  });
+
+  it("CLEANUP: a handoff form that ALSO writes a CRM row still gets its synthetic lead deleted", async () => {
+    // Skipping the poll on the handoff path left one smoke-test lead in the customer's
+    // list per deploy, forever.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://test-page.vercel.app/api/capture", status: 200 });
+    });
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
     (mockPage.url as jest.Mock)
       .mockReturnValueOnce("https://test-page.vercel.app")
-      .mockReturnValueOnce("https://other.example.com/thanks");
-    mockGetLeadByEmail.mockResolvedValue(null); // never found
+      .mockReturnValueOnce("https://chat.test-page.app/text?handoff_id=abc123");
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
-    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(false);
-    expect(result.handoffId).toBeUndefined();
+    expect(mockGetLeadByEmail).toHaveBeenCalled();
+    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {
@@ -447,7 +566,6 @@ describe("runGenerationSmokeTest", () => {
     (mockPage.url as jest.Mock)
       .mockReturnValueOnce("https://test-page.vercel.app")
       .mockReturnValueOnce("https://test-page.vercel.app#pricing");
-    mockGetLeadByEmail.mockResolvedValue(null); // never found
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
