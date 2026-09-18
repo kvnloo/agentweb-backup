@@ -6,7 +6,7 @@ import { AuthenticatedRequest } from '../middleware/auth';
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(), addAssociatedSkills: jest.fn().mockResolvedValue(undefined),
-    updateSessionLlmModel: jest.fn().mockResolvedValue({}), addMessageToSession: jest.fn().mockResolvedValue({}),
+    updateSessionLlmModel: jest.fn().mockResolvedValue({}), addMessageToSession: jest.fn().mockResolvedValue({}), addMessagesToSession: jest.fn().mockResolvedValue({}),
     deleteSession: jest.fn().mockResolvedValue(undefined),
   },
 }));
@@ -61,7 +61,7 @@ describe('createSessionFromSkill opening-action prefetch (ENG-1107)', () => {
     const res = response();
     await agentModeController.createSession(request('skill-prefetch'), res);
     expect(agent.applyOpeningAction).toHaveBeenCalledWith(PREFETCH_SKILL, 'user-1', 'session-1');
-    expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({ role: 'assistant', content: 'Holding 2 candidates: …' }));
+    expect(db.addMessagesToSession).toHaveBeenCalledWith('session-1', expect.arrayContaining([expect.objectContaining({ role: 'assistant', content: 'Holding 2 candidates: …' })]));
     expect(res.status).toHaveBeenCalledWith(201);
   });
   it('degrades loudly on prefetch failure: plain failure statement, session usable, no fabrication', async () => {
@@ -71,7 +71,7 @@ describe('createSessionFromSkill opening-action prefetch (ENG-1107)', () => {
     const res = response();
     await agentModeController.createSession(request('skill-prefetch'), res);
     expect(res.status).toHaveBeenCalledWith(201);
-    expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({ content: expect.stringMatching(/could not fetch/i) }));
+    expect(db.addMessagesToSession).toHaveBeenCalledWith('session-1', expect.arrayContaining([expect.objectContaining({ content: expect.stringMatching(/could not fetch/i) })]));
   });
   it('rejects an unsafe persisted openingAction before any write', async () => {
     (agent.getAuthorizedSkill as jest.Mock).mockResolvedValue({

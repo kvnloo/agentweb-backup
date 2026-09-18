@@ -8727,13 +8727,18 @@ export const agentModeController = {
           const authorizedSkill = skill as NonNullable<typeof skill>;
           const applied = await agentModeService.applyOpeningAction(authorizedSkill, user.userId, session.sessionId);
           prefetchMessages = applied.messages as typeof prefetchMessages;
-          for (const msg of prefetchMessages) {
-            await chatbotDb.addMessageToSession(session.sessionId, msg as any);
-          }
+          await chatbotDb.addMessagesToSession(session.sessionId, prefetchMessages as any);
         } catch (prefetchError) {
+          // ENG-1107 CodeRabbit: the session already exists and must still be
+          // returned — a failed prefetch-message persist must not become a 500
+          // (which would orphan this session on idempotent retry).
           console.error('AgentMode: opening-action prefetch failed loudly:', prefetchError);
           prefetchMessages = [{ role: 'assistant', content: 'I could not fetch the opening material. Tell me what to work on and we will start from there.', metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }];
-          await chatbotDb.addMessageToSession(session.sessionId, prefetchMessages[0] as any);
+          try {
+            await chatbotDb.addMessageToSession(session.sessionId, prefetchMessages[0] as any);
+          } catch (fallbackPersistError) {
+            console.error('AgentMode: failed to persist opening-action prefetch fallback message:', fallbackPersistError);
+          }
         }
       }
 

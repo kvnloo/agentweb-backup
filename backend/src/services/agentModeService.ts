@@ -6535,9 +6535,10 @@ export class AgentModeService {
       const reason = failures.length ? ` (${failures.join('; ')})` : '';
       return { messages: [{ role: 'assistant', content: `I could not fetch the opening material${reason}. Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
     }
-    const body = rendered.join('\n\n').slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
-    const tail = failures.length ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).` : '';
-    return { messages: [{ role: 'assistant', content: `${body}${tail}`, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
+    // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
+    // just the body — a long failure tail could otherwise exceed the bound.
+    const content = `${body}${tail}`.slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
+    return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
   }
 
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
