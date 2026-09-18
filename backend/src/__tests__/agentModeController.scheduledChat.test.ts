@@ -81,6 +81,7 @@ jest.mock('../services/db', () => ({
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
     appendDeliveryLogEntry: jest.fn().mockResolvedValue(undefined),
+    getRunResults: jest.fn(),
   },
   userDb: {
     getUserById: jest.fn(),
@@ -4937,5 +4938,70 @@ describe('scheduled-chat activation gates (ENG-1552)', () => {
       expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith('sched-gate', expect.objectContaining({ status: 'active' }));
       expect((mockUserDb as any).getUserByEmail).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── ENG-1552: delivery read-back + human receipt confirmation ─────────────────
+describe('scheduled-report delivery read-back (ENG-1552)', () => {
+  const ownerId = 'owner-rb';
+  const res = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+  const log = [
+    { runId: 'run-a', state: 'generated', at: '1' },
+    { runId: 'run-a', state: 'delivery_attempted', authorizedRecipients: ['a@x.example', 'b@x.example'], at: '2' },
+    { runId: 'run-a', state: 'delivered', authorizedRecipients: ['a@x.example', 'b@x.example'], at: '3' },
+    { runId: 'run-b', state: 'withheld', reason: 'no_authorized_recipients', at: '4' },
+  ];
+  const schedule = { scheduleId: 'sched-rb', userId: ownerId, deliveryLog: log };
+  const req = (runId: string, body: any = {}) => ({
+    user: { userId: ownerId, email: 'owner@x.example' },
+    params: { scheduleId: 'sched-rb', runId },
+    body,
+  } as unknown as Request);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+  });
+
+  it('test-history carries each run\'s latest delivery state without changing the array shape', async () => {
+    (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([{ runId: 'run-a' }, { runId: 'run-b' }, { runId: 'run-c' }]);
+    const r = res();
+    await agentModeController.getScheduledChatTestHistory({ user: { userId: ownerId }, params: { scheduleId: 'sched-rb' } } as unknown as Request, r);
+    const body = (r.json as jest.Mock).mock.calls[0][0];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body[0].delivery).toEqual(expect.objectContaining({ state: 'delivered' }));
+    expect(body[1].delivery).toEqual(expect.objectContaining({ state: 'withheld', reason: 'no_authorized_recipients' }));
+    expect(body[2]).not.toHaveProperty('delivery');
+  });
+
+  it('confirms a delivered run for the recipients it actually reached', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-a', { recipients: ['A@x.example', 'stranger@y.example'] }), r);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).toHaveBeenCalledWith('sched-rb', expect.objectContaining({
+      runId: 'run-a', state: 'recipient_confirmed', authorizedRecipients: ['a@x.example'], confirmedBy: 'owner@x.example',
+    }));
+  });
+
+  it('refuses to confirm a run that was withheld — nothing was delivered to confirm', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-b'), r);
+    expect(r.status).toHaveBeenCalledWith(409);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+
+  it('refuses a confirmation naming only addresses the report never went to', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-a', { recipients: ['stranger@y.example'] }), r);
+    expect(r.status).toHaveBeenCalledWith(400);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+
+  it('404s for another user\'s schedule and for a run with no delivery record', async () => {
+    const other = res();
+    await agentModeController.confirmScheduledReportReceipt({ ...req('run-a'), user: { userId: 'intruder' } } as unknown as Request, other);
+    expect(other.status).toHaveBeenCalledWith(404);
+    const missing = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-zzz'), missing);
+    expect(missing.status).toHaveBeenCalledWith(404);
   });
 });
