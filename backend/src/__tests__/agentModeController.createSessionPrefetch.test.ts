@@ -107,4 +107,14 @@ describe('createSessionFromSkill opening-action prefetch (ENG-1107)', () => {
     expect(agent.applyOpeningAction).not.toHaveBeenCalled();
     expect(agent.executeTool).not.toHaveBeenCalled();
   });
+  it('preserves welcomeMessage on the persistence fallback when prefetch throws', async () => {
+    (agent.getAuthorizedSkill as jest.Mock).mockResolvedValue({ ...PREFETCH_SKILL, welcomeMessage: 'Welcome aboard.' });
+    (agent.applyOpeningAction as jest.Mock).mockRejectedValue(new Error('boom'));
+    const res = response();
+    await agentModeController.createSession(request('skill-prefetch'), res);
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      content: expect.stringMatching(/Welcome aboard\.[\s\S]*could not fetch/i),
+    }));
+  });
 });

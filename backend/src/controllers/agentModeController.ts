@@ -8742,7 +8742,13 @@ export const agentModeController = {
           // returned — a failed prefetch-message persist must not become a 500
           // (which would orphan this session on idempotent retry).
           console.error('AgentMode: opening-action prefetch failed loudly:', prefetchError);
-          prefetchMessages = [{ role: 'assistant', content: 'I could not fetch the opening material. Tell me what to work on and we will start from there.', metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }];
+          // ENG-1107 CodeRabbit: preserve the welcome on the persistence
+          // fallback path too — the initial state carries no messages, so a
+          // bare fallback would lose the configured welcome text.
+          const fallbackContent = welcomeMessage
+            ? `${welcomeMessage}\n\nI could not fetch the opening material. Tell me what to work on and we will start from there.`
+            : 'I could not fetch the opening material. Tell me what to work on and we will start from there.';
+          prefetchMessages = [{ role: 'assistant', content: fallbackContent, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }];
           try {
             await chatbotDb.addMessageToSession(session.sessionId, prefetchMessages[0] as any);
           } catch (fallbackPersistError) {

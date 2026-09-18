@@ -6521,6 +6521,11 @@ export class AgentModeService {
     const rendered: string[] = [];
     const failures: string[] = [];
     const llmModel = await this.getDefaultModel();
+    // ENG-1107 CodeRabbit: scope gateway failure accounting to this opening
+    // run (per-session run id + session budget scope) so a repeatedly failing
+    // read tool trips the repeated-failure breaker instead of re-executing
+    // for every entry in action.calls.
+    const openingRunId = `opening-action:${sessionId}`;
     for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
       // ENG-1107 Greptile P1: membership in the skill tool set does not prove
       // read-only — a skill may carry mutating tools (calendar create/update,
@@ -6537,13 +6542,23 @@ export class AgentModeService {
       try {
         // ENG-1107 Greptile P1: race each call against the remaining deadline
         // so a stalled tool cannot hold session creation open past the bound.
-        const result = await Promise.race([
-          this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+        // Routed through the canonical gateway (budget/breaker accounting
+        // scoped to this opening run) rather than raw executeTool.
+        const outcome = await Promise.race([
+          executeAgentToolThroughGateway({
+            toolName: call.tool,
+            args: call.args ?? {},
+            runId: openingRunId,
+            budgetScopeId: sessionId,
+            execute: () => this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+          }),
           new Promise<never>((_, reject) => setTimeout(
             () => reject(new Error(`opening-action deadline exceeded after ${Math.min(timeoutMs, 30_000)}ms`)),
             remainingMs,
           )),
         ]);
+        if (outcome.status === 'error') throw outcome.error;
+        const result = outcome.result;
         const text = typeof result === 'string' ? result : JSON.stringify(result);
         rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
       } catch (err) {
@@ -6556,7 +6571,14 @@ export class AgentModeService {
     }
     // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
     // just the body — a long failure tail could otherwise exceed the bound.
-    const content = `${rendered.join('\n\n').slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS))}${failures.length ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).` : ''}`.slice(0, Math.min(maxChars, OPENING_ACTION_MAX_CHARS));
+    // Reserve space for the failure note first so a large successful result
+    // cannot truncate the loud-failure signal away.
+    const contentLimit = Math.min(maxChars, OPENING_ACTION_MAX_CHARS);
+    const failureNote = failures.length
+      ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).`
+      : '';
+    const content = `${rendered.join('\n\n').slice(0, Math.max(0, contentLimit - failureNote.length))}${failureNote}`
+      .slice(0, contentLimit);
     return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
   }
 
