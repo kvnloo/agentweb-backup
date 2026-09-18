@@ -126,10 +126,17 @@ async function fillAllRequiredFields(
       // Return complete selectors from discovery so the caller never has to guess
       // whether a reference is an id or a name: a name-only control such as
       // <input name="email"> must become [name="email"], not #email.
+      // Escape interpolated values: React-style ids (":r0:") and names with
+      // quotes/backslashes break Playwright's selector parser, throwing and
+      // leaving required controls empty (false negative). Fallbacks are static
+      // and already valid.
+      const esc = (s: string): string => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const escId = (id: string): string =>
+        `#${id.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`)}`;
       const selFor = (el: Element, fallback: string): string => {
         const input = el as HTMLInputElement;
-        if (input.id) return `#${input.id}`;
-        if (input.name) return `[name="${input.name}"]`;
+        if (input.id) return escId(input.id);
+        if (input.name) return `[name="${esc(input.name)}"]`;
         return fallback;
       };
       const textInputs = [...form.querySelectorAll('input[type="email"]')].map(
@@ -145,9 +152,9 @@ async function fillAllRequiredFields(
         const sel = el as HTMLSelectElement;
         return {
           selector: sel.id
-            ? `#${sel.id}`
+            ? escId(sel.id)
             : sel.name
-              ? `[name="${sel.name}"]`
+              ? `[name="${esc(sel.name)}"]`
               : `select >> nth=${i}`,
           options: [...sel.options].filter((o) => o.value).map((o) => o.value),
         };
@@ -357,7 +364,7 @@ async function runGenerationSmokeTestNow(
     // selects with valid defaults, POSTs /api/capture). Both submit fine with realistic
     // data; the old fill-email-only path failed on both while the forms worked for
     // real visitors.
-    const testPhone = `555${String(Date.now()).slice(-7)}`; // unique 10-digit, 555 = fictional range
+    const testPhone = `41555501${String(Date.now()).slice(-2)}`; // NANPA fictional block 555-0100–0199 with a real area code
     const email = buildSmokeTestEmail();
     const { lastTextSelector } = await fillAllRequiredFields(
       browserPage,
@@ -375,7 +382,24 @@ async function runGenerationSmokeTestNow(
       // can land on a checkbox/radio/hidden/select where Enter never submits).
       // Playwright's click() auto-waits for the button to become actionable, which covers
       // client-side validation that enables submit only after all fields pass.
-      await browserPage.click('button[type="submit"], input[type="submit"]');
+      // Scope the explicit submit click to the discovered first form: a page-wide
+      // click can hit another form's submit control, succeeding while the filled
+      // form stays unsubmitted. The 'form ...' prefix still finds a submit button
+      // when the first form exists; otherwise the bare selector preserves the
+      // no-form fallback below.
+      let submitted = false;
+      for (const scope of ['form >> nth=0 >> ', ""]) {
+        try {
+          await browserPage.click(
+            `${scope}button[type="submit"], ${scope}input[type="submit"]`
+          );
+          submitted = true;
+          break;
+        } catch {
+          // try the next scope
+        }
+      }
+      if (!submitted) throw new Error("no submit control");
     } catch {
       // No submit button found by that selector — submit the form directly.
       try {

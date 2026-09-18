@@ -217,9 +217,32 @@ describe("runGenerationSmokeTest", () => {
     expect(result.error).toMatch(/No Chrome executable found/);
   });
 
-  it("SUCCESS: form has no submit button → submits the form directly", async () => {
+  it("SUCCESS: form has no submit button in first form → falls back in order", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
+    // First-form-scoped click misses; the unscoped fallback click hits.
+    mockPage.click
+      .mockRejectedValueOnce(new Error("no button in first form"))
+      .mockResolvedValueOnce(undefined);
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.click).toHaveBeenCalledWith(
+      'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
+    );
+    expect(mockPage.click).toHaveBeenCalledWith(
+      'button[type="submit"], input[type="submit"]'
+    );
+    // Discovery evaluate always runs during field-fill; the requestSubmit
+    // fallback must NOT run since the unscoped click succeeded (only 1 call).
+    expect(mockPage.evaluate).toHaveBeenCalledTimes(1);
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+  });
+
+  it("SUCCESS: form has no submit button at all → submits the form directly", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    // click default resolves; force both scoped + unscoped attempts to miss.
+    mockPage.click.mockRejectedValue(new Error("no button found"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
@@ -229,9 +252,25 @@ describe("runGenerationSmokeTest", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("SUCCESS: submit click scoped to first form (second form's button ignored)", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    // The first click attempt targets the discovered first form, never a
+    // page-wide selector that could hit another form's submit control.
+    expect(mockPage.click).toHaveBeenNthCalledWith(
+      1,
+      'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
+    );
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+  });
+
   it("SUCCESS: form has no form element either → Enter in last filled text field", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
+    // click default resolves; force both scoped + unscoped attempts to miss.
+    mockPage.click.mockRejectedValue(new Error("no button found"));
     // Discovery resolves (records the email selector); only the form-submit
     // evaluate rejects (no <form> for requestSubmit), so the fallback presses
     // Enter in the last filled text field.
@@ -273,7 +312,7 @@ describe("runGenerationSmokeTest", () => {
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockPage.fill).toHaveBeenCalledWith("#phone", expect.stringMatching(/^555\d{7}$/));
+    expect(mockPage.fill).toHaveBeenCalledWith("#phone", expect.stringMatching(/^41555501\d{2}$/));
     expect(mockPage.fill).toHaveBeenCalledWith("#full_name", "Smoke");
     expect(mockPage.fill).toHaveBeenCalledWith("#zip", "94025");
     expect(mockPage.selectOption).toHaveBeenCalledWith("#urgency", "emergency");
