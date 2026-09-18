@@ -396,10 +396,17 @@ export function discoverSmokeFields(): SmokeFields {
   // Collapsed ARIA disclosures (a "What's happening?" popover holding a checkbox group).
   // Reported rather than clicked here: opening one needs a trusted event, which only
   // Playwright's own click produces — an in-page el.click() leaves React's state untouched.
+  // Selectors must stay stable across the open/close round-trip: after the open click the
+  // trigger's aria-expanded flips to "true", so an id-less `[aria-expanded="false"] >>
+  // nth=i` selector no longer matches the same element on close (it can match a different
+  // collapsed trigger or fail outright). Stamp a marker attribute at discovery time and
+  // select on that instead.
+  const DISCLOSURE_MARK = "data-agentweb-smoke-disclosure";
   const disclosureTriggers: string[] = [];
   if (form) {
     const triggers = all(form, '[aria-expanded="false"]');
-    triggers.forEach((t, index) => {
+    let marked = 0;
+    triggers.forEach((t) => {
       if (!hasBox(t)) return;
       // Only open a disclosure that actually holds a checkbox/radio group. aria-expanded
       // ALSO marks Radix Select triggers ("Select your issue"), and opening one of those
@@ -409,9 +416,13 @@ export function discoverSmokeFields(): SmokeFields {
       const controlsId = t.getAttribute("aria-controls");
       const panel = controlsId ? document.getElementById(controlsId) : null;
       if (!panel || !panel.querySelector('input[type="checkbox"], input[type="radio"]')) return;
-      disclosureTriggers.push(
-        t.id ? `${scope}[id="${esc(t.id)}"]` : `${scope}[aria-expanded="false"] >> nth=${index}`
-      );
+      if (t.id) {
+        disclosureTriggers.push(`${scope}[id="${esc(t.id)}"]`);
+      } else {
+        const mark = String(marked++);
+        t.setAttribute(DISCLOSURE_MARK, mark);
+        disclosureTriggers.push(`${scope}[${DISCLOSURE_MARK}="${mark}"]`);
+      }
     });
   }
 

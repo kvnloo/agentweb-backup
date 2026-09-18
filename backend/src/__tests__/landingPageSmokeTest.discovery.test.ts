@@ -115,6 +115,14 @@ const CASES: Record<string, string> = {
       <button type="button" id="symptoms-trigger" aria-expanded="false" aria-controls="symptoms-panel">What's happening?</button>
       <div id="symptoms-panel"><input type="checkbox" id="s1" name="symptoms"></div>
     </form>`,
+  disclosureWithoutId: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" aria-expanded="false" aria-controls="anon-panel">Details</button>
+      <div id="anon-panel"><input type="checkbox" id="a1" name="flags"></div>
+      <button type="button" aria-expanded="false" aria-controls="other-panel">Other</button>
+      <div id="other-panel"><input type="checkbox" id="a2" name="flags"></div>
+    </form>`,
   radixSelectTrigger: `
     <form>
       <input type="email" name="email" required>
@@ -341,6 +349,20 @@ describe("discoverSmokeFields", () => {
     expect(got("disclosureWithCheckboxes").disclosureTriggers).toEqual([
       `${SCOPE}[id="symptoms-trigger"]`,
     ]);
+  });
+
+  it("marks id-less disclosure triggers with a stable marker, not a stateful nth selector", () => {
+    // After the open click the trigger's aria-expanded flips to "true", so an
+    // `[aria-expanded="false"] >> nth=i` selector no longer addresses the same
+    // element on close. Marker selectors survive the round-trip.
+    const triggers = got("disclosureWithoutId").disclosureTriggers;
+    expect(triggers).toEqual([
+      `${SCOPE}[data-agentweb-smoke-disclosure="0"]`,
+      `${SCOPE}[data-agentweb-smoke-disclosure="1"]`,
+    ]);
+    for (const sel of triggers) expect(sel).not.toContain("nth=");
+    // The second discovery pass (after opening) must still find the same marker.
+    expect(got("disclosureWithoutId").disclosureTriggers).toEqual(triggers);
   });
 
   it("never opens a Radix select trigger, which also carries aria-expanded", () => {
