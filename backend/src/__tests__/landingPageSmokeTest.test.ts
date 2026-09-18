@@ -57,6 +57,7 @@ const SINGLE_EMAIL_FIELD = {
   skippedRequired: 0,
   noFormOnPage: false,
   authFormOnly: false,
+  iframeCount: 0,
 };
 
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
@@ -99,10 +100,12 @@ jest.mock("../utils/browserUtils", () => ({
 
 const mockGetLeadByEmail = jest.fn();
 const mockDeleteLead = jest.fn();
+const mockGetLeadsByListId = jest.fn();
 jest.mock("../services/db", () => ({
   crmDb: {
     getLeadByEmail: (...args: any[]) => mockGetLeadByEmail(...args),
     deleteLead: (...args: any[]) => mockDeleteLead(...args),
+    getLeadsByListId: (...args: any[]) => mockGetLeadsByListId(...args),
   },
 }));
 
@@ -141,6 +144,8 @@ describe("runGenerationSmokeTest", () => {
     jest.clearAllMocks();
     mockGetLeadByEmail.mockReset();
     mockGetLeadByEmail.mockResolvedValue(null);
+    mockGetLeadsByListId.mockReset();
+    mockGetLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     (mockPage.evaluate as jest.Mock).mockResolvedValue(SINGLE_EMAIL_FIELD);
     (mockPage.url as jest.Mock).mockReturnValue("https://test-page.vercel.app");
     (mockPage.waitForURL as jest.Mock).mockRejectedValue(new Error("no navigation"));
@@ -366,6 +371,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -397,15 +403,13 @@ describe("runGenerationSmokeTest", () => {
     );
     expect(checked).not.toContain("#plan-plus");
     expect(checked).not.toContain("#opt-news");
-    // The poll runs even though this form has no email-keyed field: it is the cleanup path,
-    // and a lander that received "Smoke Test" in an untyped contact field still creates a
-    // real row that isSmokeTestEmail() would never match. Here the row exists, so it is
-    // found and deleted rather than left behind forever.
-    expect(mockGetLeadByEmail).toHaveBeenCalled();
-    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
+    // No email field on this form, so cleanup goes through the phone path instead of the
+    // email poll. The list is empty here, so there is nothing to delete.
+    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
+    expect(mockGetLeadsByListId).toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
-    expect(result.ok).toBe(true);
-    expect(result.leadCaptured).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.leadCaptured).toBe(false);
   });
 
   it("VALUES: a name-based selector no longer drags every field into the person-name branch", () => {
@@ -446,6 +450,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
@@ -458,8 +463,8 @@ describe("runGenerationSmokeTest", () => {
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
-    // Polled anyway — a handoff form that ALSO writes a row must still get it cleaned up.
-    expect(mockGetLeadByEmail).toHaveBeenCalled();
+    // Cleanup still runs on the handoff path — by phone here, since the form has no email.
+    expect(mockGetLeadsByListId).toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
@@ -481,6 +486,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
@@ -509,6 +515,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
@@ -534,6 +541,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -559,6 +567,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -584,6 +593,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -596,6 +606,75 @@ describe("runGenerationSmokeTest", () => {
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
+  });
+
+  it("CLEANUP: a lander with no email field still gets its synthetic lead deleted, by phone", async () => {
+    // The lander invents its own placeholder address (observed live:
+    // noemail+<ts>@waterheater.app), so isSmokeTestEmail never matches and pollForLead
+    // misses it. Before the fill fixes on this branch such pages failed validation and
+    // created nothing; now they submit, so every deploy would strand a row in the
+    // customer's CRM.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    const phoneOf = () =>
+      ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1];
+    // Built at call time: the synthetic number is derived from the clock, and the CRM
+    // stores it formatted, so the match has to normalise.
+    mockGetLeadsByListId.mockImplementation(async () => {
+      const digits = String(phoneOf() || "").replace(/\D/g, "");
+      const formatted = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+      return {
+        items: [
+          { leadId: "other-real-lead", phone: "4155551234", createdAt: "2030-01-01T00:00:00.000Z" },
+          { leadId: "ours", phone: formatted, createdAt: "2030-01-01T00:00:00.000Z" },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      };
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(String(phoneOf())).toMatch(/^41555501\d{2}$/);
+    expect(mockGetLeadByEmail).not.toHaveBeenCalled();
+    expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "ours");
+  });
+
+  it("CLEANUP: a pre-existing lead with the same phone but an older timestamp is never deleted", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadsByListId.mockImplementation(async () => {
+      const digits = String(
+        ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
+      ).replace(/\D/g, "");
+      return {
+        items: [{ leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      };
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockDeleteLead).not.toHaveBeenCalled();
+  });
+
+  it("DIAGNOSIS: an iframe-embedded form is not reported as 'no lead form'", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "", fields: [], selects: [], checkables: [], submitSelector: null,
+      disclosureTriggers: [], skippedRequired: 0, noFormOnPage: true,
+      authFormOnly: false, iframeCount: 2,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("2 iframe(s)");
+    expect(reason).toContain("may be embedded");
   });
 
   it("CLEANUP: a handoff form that ALSO writes a CRM row still gets its synthetic lead deleted", async () => {
@@ -633,6 +712,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => emit());
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
@@ -759,6 +839,7 @@ describe("runGenerationSmokeTest", () => {
         skippedRequired: 0,
         noFormOnPage: false,
         authFormOnly: false,
+        iframeCount: 0,
         checkables: [
           { selector: '[data-agentweb-smoke-click="0"]', type: "checkbox", name: "symptoms",
             required: true, viaLabel: true, checked: false },
@@ -844,6 +925,7 @@ describe("runGenerationSmokeTest", () => {
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });

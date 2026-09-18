@@ -68,6 +68,47 @@ function releaseSmokeTestSlot(): void {
   if (next) next();
 }
 
+/**
+ * Cleanup path for a lander that has NO email field.
+ *
+ * Such a page cannot carry our synthetic address, so the lander invents a placeholder —
+ * `noemail+<timestamp>@<its own domain>` was observed live on campaign.waterheater.app —
+ * and posts that. isSmokeTestEmail() never matches it, so pollForLead misses it and the
+ * synthetic row stays in the customer's CRM permanently. This matters MORE after the fill
+ * fixes in this branch, not less: those pages used to fail validation and never submit at
+ * all, so they created nothing. Now they submit, so every deploy would leave a row behind.
+ *
+ * Matched on the synthetic phone AND a createdAt at or after our own submit, so a real
+ * lead can never be selected: the number is in the NANP's reserved fictional range, and the
+ * time window is this one run.
+ */
+async function pollForLeadByPhone(
+  listId: string,
+  phone: string,
+  submittedAtIso: string
+): Promise<{ leadId: string } | null> {
+  const digits = (value: unknown) => String(value ?? "").replace(/\D/g, "");
+  const wanted = digits(phone);
+  if (!wanted) return null;
+  for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
+    try {
+      // ScanIndexForward:false — newest first, so our row is at the top of page one.
+      const page = await crmDb.getLeadsByListId(listId, 25);
+      const hit = (page?.items || []).find(
+        (lead: any) =>
+          digits(lead?.phone) === wanted && String(lead?.createdAt || "") >= submittedAtIso
+      );
+      if (hit?.leadId) return { leadId: hit.leadId as string };
+    } catch {
+      // list unreadable — nothing to clean up
+    }
+    if (attempt < pollMaxAttempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+  return null;
+}
+
 async function pollForLead(listId: string, email: string): Promise<{ leadId: string } | null> {
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     const lead = await crmDb.getLeadByEmail(listId, email);
@@ -127,6 +168,8 @@ export type SmokeFields = {
   noFormOnPage: boolean;
   /** Every form on the page was an authentication form; there is no lead form to drive. */
   authFormOnly: boolean;
+  /** iframes in the main document — a form may be embedded in one, invisible to page.evaluate. */
+  iframeCount: number;
 };
 
 type SmokeTestPage = {
@@ -444,10 +487,14 @@ export function discoverSmokeFields(): SmokeFields {
   // nth=i` selector no longer matches the same element on close (it can match a different
   // collapsed trigger or fail outright). Stamp a marker attribute at discovery time and
   // select on that instead.
+  // Each trigger costs up to FIELD_TIMEOUT_MS to open and the same to close, and the whole
+  // run holds the single smoke-test slot. A quiz/accordion lander should not stall a queue.
+  const MAX_DISCLOSURES = 5;
   const disclosureTriggers: string[] = [];
   if (form) {
     const triggers = all(form, '[aria-expanded="false"]');
     triggers.forEach((t) => {
+      if (disclosureTriggers.length >= MAX_DISCLOSURES) return;
       if (!hasBox(t)) return;
       // A <button> with no type inside a form defaults to type="submit". Clicking one here
       // would submit the form before a single field has been filled, and before the response
@@ -469,6 +516,10 @@ export function discoverSmokeFields(): SmokeFields {
       const controlsId = t.getAttribute("aria-controls");
       const panel = controlsId ? document.getElementById(controlsId) : null;
       if (!panel || !panel.querySelector('input[type="checkbox"], input[type="radio"]')) return;
+      // A Radix Popover/Dialog renders its panel in a portal at document.body, outside the
+      // form. Controls harvested from form.elements can never reach those, so opening it
+      // buys nothing and leaves an overlay sitting over the rest of the form.
+      if (!form.contains(panel)) return;
       if (t.id) {
         disclosureTriggers.push(`${scope}[id="${esc(t.id)}"]`);
       } else {
@@ -492,7 +543,12 @@ export function discoverSmokeFields(): SmokeFields {
     );
     if (submitControl) {
       if (submitControl.id) {
-        submitSelector = `[id="${esc(submitControl.id)}"]`;
+        // Scope it when it lives inside the form: responsive landers ship the same form
+        // (and the same ids) two or three times, page.click is non-strict, and the
+        // collapsed duplicate comes first in DOM order.
+        submitSelector = form.contains(submitControl)
+          ? `${scope}[id="${esc(submitControl.id)}"]`
+          : `[id="${esc(submitControl.id)}"]`;
       } else if (submitControl.name) {
         submitSelector = form.contains(submitControl)
           ? `${scope}[name="${esc(submitControl.name)}"]`
@@ -518,6 +574,9 @@ export function discoverSmokeFields(): SmokeFields {
   }).length;
   const noFormOnPage =
     (forms.length === 0 || authFormOnly) && fields.length === 0 && checkables.length === 0;
+  // A HubSpot/Typeform/Calendly embed is a normal lead-capture lander, and page.evaluate
+  // only ever sees the main frame — so "no lead form" would be confidently wrong.
+  const iframeCount = all(document, "iframe").length;
 
   return {
     scope,
@@ -529,6 +588,7 @@ export function discoverSmokeFields(): SmokeFields {
     skippedRequired,
     noFormOnPage,
     authFormOnly,
+    iframeCount,
   };
 }
 /**
@@ -605,6 +665,8 @@ export type FillOutcome = {
   noFormOnPage: boolean;
   /** Every form on the page was an authentication form; there is no lead form to drive. */
   authFormOnly: boolean;
+  /** iframes in the main document, for an honest "no lead form" message. */
+  iframeCount: number;
 };
 
 /**
@@ -681,6 +743,7 @@ async function fillAllRequiredFields(
       skippedRequired: 0,
       noFormOnPage: false,
       authFormOnly: false,
+      iframeCount: 0,
     };
   }
 
@@ -785,6 +848,7 @@ async function fillAllRequiredFields(
     skippedRequired: discovered.skippedRequired ?? 0,
     noFormOnPage: !!discovered.noFormOnPage,
     authFormOnly: !!discovered.authFormOnly,
+    iframeCount: discovered.iframeCount ?? 0,
   };
 }
 
@@ -824,6 +888,7 @@ async function runGenerationSmokeTestNow(
   let handoffId: string | null = null;
   let noFormOnPage = false;
   let authFormOnly = false;
+  let iframeCount = 0;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
   try {
@@ -917,6 +982,7 @@ async function runGenerationSmokeTestNow(
     // Capture the pre-submit URL BEFORE the submission action: if click/Enter
     // completes a same-instant handoff redirect, reading it after would already
     // see the handoff URL and waitForURL would time out on a success.
+    const submittedAtIso = new Date().toISOString();
     const urlBeforeSubmit = browserPage.url();
     let pageOrigin = "";
     try {
@@ -1073,7 +1139,11 @@ async function runGenerationSmokeTestNow(
     // webhooks.ts validates presence but not format, so a real lead row is created that
     // isSmokeTestEmail() will never match and no suppression will ever cover.
     // Only the PASS CONDITION branches on the redirect.
-    const lead = await pollForLead(leadListId, email);
+    // When no email field existed, fall back to the phone so the row we just created is
+    // still found and deleted rather than stranded in the customer's CRM.
+    const lead = emailFilled
+      ? await pollForLead(leadListId, email)
+      : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso);
     if (lead) {
       leadCaptured = true;
       await crmDb.deleteLead(leadListId, lead.leadId);
@@ -1089,6 +1159,7 @@ async function runGenerationSmokeTestNow(
     // it cannot distinguish "never submitted" from "submitted and the lead was lost".
     noFormOnPage = fillOutcome.noFormOnPage;
     authFormOnly = fillOutcome.authFormOnly;
+    iframeCount = fillOutcome.iframeCount;
     diagnostics = [
       `filled ${fillOutcome.filled}/${fillOutcome.attempted} field(s)`,
       ...(fillOutcome.alreadySatisfied > 0
@@ -1139,7 +1210,9 @@ async function runGenerationSmokeTestNow(
           : noFormOnPage
           ? // Blaming the CRM for a page that has no form at all sends whoever reads the
             // alert looking for a capture bug that cannot exist. Say what is actually true.
-            "page has no lead form — nothing to submit, so no lead can ever be captured"
+            iframeCount > 0
+            ? `no lead form in the main document (${iframeCount} iframe(s) present — the form may be embedded, which this test cannot reach)`
+            : "page has no lead form — nothing to submit, so no lead can ever be captured"
           : `lead did not land in the CRM within the timeout (${diagnostics})`
         : // Detection is the fbq() JS call, not a network sniff — see the pixel block above.
           "Meta pixel Lead event did not fire (fbq('track','Lead') was never called)");

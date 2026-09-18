@@ -186,6 +186,26 @@ const CASES: Record<string, string> = {
       <a href="#" role="button" aria-expanded="false" aria-controls="ap">More</a>
       <div id="ap"><input type="checkbox" name="opt"></div>
     </form>`,
+  portalledPanel: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" aria-expanded="false" aria-controls="portal">Options</button>
+    </form>
+    <div id="portal"><input type="checkbox" name="opt"></div>`,
+  manyDisclosures: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" aria-expanded="false" aria-controls="p1">1</button><div id="p1"><input type="checkbox" name="a"></div>
+      <button type="button" aria-expanded="false" aria-controls="p2">2</button><div id="p2"><input type="checkbox" name="b"></div>
+      <button type="button" aria-expanded="false" aria-controls="p3">3</button><div id="p3"><input type="checkbox" name="c"></div>
+      <button type="button" aria-expanded="false" aria-controls="p4">4</button><div id="p4"><input type="checkbox" name="d"></div>
+      <button type="button" aria-expanded="false" aria-controls="p5">5</button><div id="p5"><input type="checkbox" name="e"></div>
+      <button type="button" aria-expanded="false" aria-controls="p6">6</button><div id="p6"><input type="checkbox" name="f"></div>
+      <button type="button" aria-expanded="false" aria-controls="p7">7</button><div id="p7"><input type="checkbox" name="g"></div>
+    </form>`,
+  duplicateSubmitIds: `
+    <form id="mobile"><input type="email" name="email" required data-rect="0,0,0,0"><button type="submit" id="go" data-rect="0,0,0,0">Go</button></form>
+    <form id="desktop"><input type="email" name="email" required><button type="submit" id="go">Go</button></form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -524,6 +544,26 @@ describe("discoverSmokeFields", () => {
 
   it("an anchor disclosure with no real href is still opened", () => {
     expect(got("anchorTrigger").disclosureTriggers).toHaveLength(1);
+  });
+
+  it("never opens a disclosure whose panel is portalled outside the form", () => {
+    // Radix Popover/Dialog renders into document.body. Controls harvested from form.elements
+    // cannot reach those, so opening it buys nothing and leaves an overlay over the form.
+    expect(got("portalledPanel").disclosureTriggers).toEqual([]);
+  });
+
+  it("caps how many disclosures one run will open", () => {
+    // Each costs up to two 3s interactions and the run holds the single smoke-test slot.
+    expect(got("manyDisclosures").disclosureTriggers).toHaveLength(5);
+  });
+
+  it("scopes an id-based submit selector when the control is inside the form", () => {
+    // Responsive landers ship the same form and the same ids two or three times, and
+    // page.click is non-strict — the collapsed duplicate comes first in DOM order.
+    const r = got("duplicateSubmitIds");
+    expect(out.duplicateSubmitIds.markedFormIds).toEqual(["desktop"]);
+    expect(r.submitSelector).toBe(`${SCOPE}[id="go"]`);
+    expect(out.duplicateSubmitIds.selectorMatches![r.submitSelector!]).toBe(1);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

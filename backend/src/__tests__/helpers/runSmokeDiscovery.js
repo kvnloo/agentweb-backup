@@ -67,6 +67,11 @@ function runCase(fnJs, html, fnName, twoPass) {
   // Resolve every selector discovery emitted against the real DOM. Asserting the selector
   // STRING is what let a `label:has([id=x])` — which matches nothing on shadcn's sibling
   // `<label for=x>` markup — pass as correct through three rounds of testing.
+  // NOTE: this supports only the shapes discovery emits — `<css>` and `<css> >> nth=k`.
+  // It re-queries from `document` for each css part, so it is NOT Playwright-equivalent for
+  // a `cssA >> cssB` chain, and it splits on ">>" without respecting quoting. A green
+  // assertion here means "this selector matches exactly one element in this fixture", not
+  // "Playwright would resolve this identically".
   const resolveCount = (selector) => {
     try {
       let nodes = null;
