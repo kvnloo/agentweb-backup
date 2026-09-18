@@ -1039,6 +1039,81 @@ function isPublishGateWithheldSession(session: ChatSession): boolean {
 }
 
 /**
+ * ENG-1165 — a session blocked by something outside the agent's control must
+ * not be scored as an agent failure. The general satisfaction judge charges
+ * the block to goalCompletion while the specialist judges correctly score the
+ * agent's HANDLING as excellent, so the headline metric reports platform gaps
+ * as agent failures (2-point judge spreads on identical behavior).
+ *
+ * Deterministic transcript classifier, same exclusion treatment as a no-task
+ * session (ENG-168) or a publish-gate-withheld run (ENG-995): the assistant's
+ * LAST substantive turn must affirmatively state an external block AND show
+ * correct handling (refuse/stop/pivot + explain + give the fix or file the
+ * issue). Qualifying blocks: user not signed in, required integration
+ * disconnected/token revoked, upstream provider outage, user never replied to
+ * a legitimate clarifying question, publish deliberately withheld under an
+ * account-level approval setting.
+ *
+ * Conservative by design: detection is POSITIVE (the last assistant turn must
+ * name the block), not the absence of a failure signal — an ordinary task
+ * failure that merely lacks criticism keywords stays scorable. A session whose
+ * last assistant turn criticizes nothing but also names no external block is
+ * scored normally. Gated on hasAssistantTurn by the callers' existing order:
+ * this check sits after the crash/in-flight guards, so a crashed session can
+ * never be misclassified as merely blocked.
+ */
+const BLOCKED_EXTERNAL_PATTERNS: RegExp[] = [
+  // Not signed in / not authenticated.
+  /not signed in|not authenticated|please sign in|sign in (first|to continue|required)/i,
+  // Integration disconnected, token revoked/expired/invalidated.
+  /token (was |has been )?(revoked|expired|invalidated)|access token.{0,40}(revoked|expired|invalid)|reconnect (in|your)|integration.{0,40}(disconnected|revoked|expired)/i,
+  // Upstream provider outage / unavailable. Block signal only — remediation
+  // phrases ("pivoted to", "filed as a product issue") live exclusively in
+  // the HANDLING patterns below, so a turn that pivots without naming an
+  // explicit outage stays scorable (CodeRabbit local review).
+  /(currently down|outage|unavailable right now|service (is |was )?down|provider (outage|error))/i,
+  // Asked a legitimate clarifying question, user never replied. Narrow: the
+  // assistant must ALSO show it declined to guess or take an irreversible
+  // action on the fragment (the ENG-1296 correct-handling shape). A bare
+  // "could you clarify" after an ordinary partial answer is not enough — that
+  // over-matches incomplete work that must stay scorable.
+  /could you clarify.{0,120}(declin|avoid.{0,10}guess|without guess|no action|instead of guessing)|declin.{0,40}guess.{0,120}could you clarify/i,
+];
+
+const BLOCKED_EXTERNAL_HANDLING_PATTERNS: RegExp[] = [
+  // Stopped before acting without authority + explained.
+  /stopped before|will not (proceed|post|make)|saved the draft|draft saved/i,
+  // Gave the fix / next step.
+  /reconnect|takes ~?60 seconds|once (signed in|reconnected)|say retry|settings → integrations|next steps/i,
+  // Asked a focused question instead of guessing.
+  /could you clarify|which (one|option)|let me know/i,
+  // Filed the platform issue.
+  /filed .* (product issue|as a product issue)|reported via the appropriate tool/i,
+  // Asked to sign in.
+  /please sign in|sign in (first|so I can)/i,
+];
+
+function lastAssistantText(messages: ChatMessage[] = []): string {
+  // The FINAL non-system turn must be the assistant's block report. Filtering
+  // to assistant turns first would misclassify a session where the assistant
+  // reported the block and the transcript then continued (user retry, tool
+  // result, mid-loop state) — those are handled by the in-flight/mid-loop
+  // guards elsewhere, not by this exclusion (CodeRabbit local review).
+  const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
+  const last: any = nonSystem[nonSystem.length - 1];
+  if (!last || last.role !== "assistant" || isRunFailurePlaceholder(last)) return "";
+  return typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+}
+
+export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean {
+  const text = lastAssistantText(messages);
+  if (!text) return false;
+  const namesBlock = BLOCKED_EXTERNAL_PATTERNS.some((re) => re.test(text));
+  if (!namesBlock) return false;
+  return BLOCKED_EXTERNAL_HANDLING_PATTERNS.some((re) => re.test(text));
+}
+
+/**
  * Returns true when the transcript ends in a state an agent tool loop cannot
  * terminate on — the run is still mid-flight even though hasAssistantTurn()
  * would return true (a partial tool-call step was persisted).
@@ -1651,6 +1726,17 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // ENG-1165: blocked by something outside the agent's control (unsigned-in
+  // gate, revoked integration, upstream outage, unanswered legitimate
+  // question, approval-held publish) with correct handling — a neutral
+  // EXCLUDED state, not an agent failure. Same skip-and-retract treatment as
+  // the publish-gate hold above, so all judges agree and the platform gap
+  // stays countable via the skip reason instead of hiding in goalCompletion.
+  if (isBlockedExternalSession(session.messages) && hasAssistantTurn(session.messages)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
   // Skip if already scored by this judge, up-to-date, and has dimensional scores.
   // ENG-1296: this guard means a rubric/prompt fix NEVER self-heals a session
   // already scored under the old rules — evaluatedMessageIndex never regresses,
@@ -1750,7 +1836,8 @@ export type ScoringSkipReason =
   | "already-scored"
   | "test-run"
   | "in-flight"
-  | "publish-gate-withheld";
+  | "publish-gate-withheld"
+  | "blocked-external";
 
 export interface SessionScoringAttempt {
   /** The newly-written score, or null when the session was skipped. */
@@ -1811,6 +1898,14 @@ export async function attemptSessionScore(
   if (isPublishGateWithheldSession(session)) {
     await retractSatisfactionScore(session);
     return skip("publish-gate-withheld");
+  }
+
+  // ENG-1165: same neutral EXCLUDED state for the general satisfaction score.
+  // The skip reason keeps the platform-gap cohort countable in reporting
+  // without charging it to the agent's headline metric.
+  if (isBlockedExternalSession(session.messages) && hasAssistantTurn(session.messages)) {
+    await retractSatisfactionScore(session);
+    return skip("blocked-external");
   }
 
   // Skip if already scored, up-to-date, and has dimensional scores.
