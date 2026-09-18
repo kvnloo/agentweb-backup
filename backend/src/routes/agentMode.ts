@@ -6,6 +6,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
 import { MAX_FILE_SIZE } from '../config';
+import { getOwnedRunStatus } from '../services/agentMode/runStore';
 
 const router = express.Router();
 const upload = multer({ 
@@ -139,6 +140,20 @@ router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.em
 // All other routes require authentication
 router.use(authenticateToken);
 
+// Read-only polling: authentication above, strict ownership in the store (no admin bypass).
+// Never generate work or charge quota just to inspect a durable run.
+router.get('/runs/:runId', asyncHandlerAuth(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const run = await getOwnedRunStatus(req.params.runId, req.user.userId);
+    if (!run) return res.status(404).json({ error: 'Run not found', completion_confirmed: false });
+    return res.json(run);
+  } catch (error) {
+    console.error('AgentMode: Get run status failed:', error);
+    return res.status(503).json({ error: 'Failed to get run status', completion_confirmed: false });
+  }
+}));
+
 // Create an authorized Skill-backed session with its existing static welcome brief.
 router.post('/skill/:skillId/session', asyncHandler(agentModeController.createSession));
 
@@ -250,6 +265,10 @@ router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAut
 // POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
 // Owner-only: instantiate a previously-recommended predefined work plan (ENG-1472)
 router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/accept', asyncHandlerAuth(agentModeController.acceptWorkPlanRecommendation));
+
+// POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/decline
+// Owner-only: record that the user declined a recommendation via "Keep chatting" (ENG-1974)
+router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/decline', asyncHandlerAuth(agentModeController.declineWorkPlanRecommendation));
 
 // POST /api/agent-mode/share
 // Create shareable link for conversation

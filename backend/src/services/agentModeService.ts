@@ -71,7 +71,7 @@ import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -1521,60 +1521,181 @@ export class AgentModeService {
   // model — describe_image is a vision utility Emma calls when she needs to "see" an image.
   private visionModelSettingName = 'agent_mode_vision_model';
 
-  // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the [ENG-1852-DIAG] log below.
-  // Same pid, same-second flip-flops between 0 and 264 tools have been observed with
-  // no known code path that mutates the registry in between (see the brain node).
-  // The one remaining live hypothesis is that more than one AgentModeService instance
-  // is answering requests inside the same forked worker process (e.g. the per-message
-  // throwaway instance chatbotService.ts:4983 constructs, if it's reachable from the
-  // worker after all). Stamping each instance at construction settles it directly: if
-  // an allToolsCount:0 read ever carries a DIFFERENT instanceId than the allToolsCount:264
-  // reads on the same pid, that's a second instance, proven, not inferred.
-  private readonly instanceId = Math.random().toString(36).slice(2, 10);
-
   constructor() {
     this.toolRegistry = new ToolRegistry();
     this.mcpClientService = new McpClientService();
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove alongside the instanceId field above.
-    // instanceId alone proved a second, empty-registry instance answers requests
-    // inside the same worker process, but every known construction site (module
-    // singleton, the worker's own instance, chatbotService.ts's per-message
-    // throwaway) traces to a call graph that shouldn't reach the worker a second
-    // time. Capturing the actual construction stack settles which site it really
-    // is instead of continuing to reason about it from the outside.
-    // Stack goes inside the same JSON blob (not a second console.log argument) so a
-    // log shipper that splits on newline can't separate it from its pid/instanceId —
-    // a raw multi-line stack string passed alongside would risk exactly that.
-    console.log('[ENG-1852-CTOR]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      stack: new Error('construction site').stack,
-    }));
   }
 
-  public async initialize() {
+  // ENG-1852 follow-up: the EXPENSIVE half of initialize() runs once per
+  // instance; the cheap half still runs on every call.
+  //
+  // Why a guard at all: server.ts kicks boot init off deliberately NON-blocking
+  // ("Initialize Agent Mode tools in background - don't block server startup ...
+  // prevents health check timeouts during deployment"), so a request can land
+  // mid-init. chatbotService's widget path then calls initialize() again per
+  // message on the same shared module singleton. Unguarded, that re-runs a full
+  // registerTools()/initializeMcp()/ensureBuiltInSkills() pass over shared state
+  // on every message, or races boot init and reads a half-populated registry —
+  // the same empty-registry symptom ENG-1852 turned out to be.
+  //
+  // Why loadFoundationTools() stays OUTSIDE the latch: it writes the
+  // process-global static AgentModeService.FOUNDATION_TOOLS, which the admin
+  // route `PUT /foundation-tools` (routes/agentMode.ts) mutates only in the
+  // process that served the request. Before this change, every gate-open widget
+  // message re-read the `foundation_tools` row and refreshed that static. Latching
+  // it would mean an added foundation tool never reaches a process until restart,
+  // surfacing as "tool not available" — the ENG-280/ENG-404 class this very
+  // function's own comment warns about. It is one settings read that swallows its
+  // own errors and always leaves the set populated, so per-call is cheap and safe;
+  // the registration pass is what actually cost anything.
+  //
+  // Why the latch is NOT just "didn't throw": every step of runInitialize()
+  // swallows its own errors (loadFoundationTools, both halves of registerTools,
+  // initializeMcp, ensureBuiltInSkills all catch-and-log; downstream singletons
+  // are void-ed), so runInitialize() is effectively incapable of rejecting.
+  // Latching on mere completion would make a silently-degraded init — e.g. a
+  // transient throw inside registerTools leaving an empty registry — PERMANENT
+  // for the process lifetime, with no reset. That is strictly worse than the bug
+  // this branch fixes: before it, the per-message fresh instance re-ran
+  // registration and self-healed on the next message. So we latch only on signals
+  // that can observably be false, and leave `initialized` false otherwise so the
+  // next caller retries.
+  //
+  // The flag is per-INSTANCE, not module-level, so tests that construct their own
+  // AgentModeService in beforeEach still initialize normally.
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+  // Set true only when registerTools()'s emmaToolRegistry copy actually completes.
+  //
+  // A registry-size check alone is NOT a success signal, and an earlier version of this
+  // latch that used one was a tautology. registerTools() registers four built-ins
+  // (search_tool_response, read_tool_response, notify_session, wait_seconds)
+  // UNCONDITIONALLY, after both of its try/catch blocks, and ToolRegistry.register is a
+  // Map.set that cannot throw — so getAllTools().length > 0 is always true no matter how
+  // badly registration went. initializeMcp() then adds more afterwards. Confirmed twice:
+  // by fault injection on test-env-1 (the size check latched a fully degraded init, with
+  // "Error registering tools to instance" logged one line earlier) and by an independent
+  // review that ran registerTools() with an empty emmaToolRegistry and observed
+  // initialized=true with a 4-tool registry.
+  //
+  // Both halves of registerTools() have to be checked, because they fail independently:
+  // step 1 (sixteen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
+  // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
+  // without error — so the flag below alone would latch a degraded init too.
+  private emmaToolsRegistered = false;
+  // Not a latch signal — only prevents the retry path from re-scanning every skill and
+  // re-updating each built-in on every failed attempt.
+  private builtInSkillsSeeded = false;
+  // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
+  // that could never report failure:
+  //
+  //   initializeMcp() — McpClientService.initialize() cannot reject in practice. Its two
+  //   statements before the try (startSessionCleanup, a setInterval+unref; and
+  //   sweepStalePlaywrightConfigs, which has its own outer try/catch) cannot throw, the
+  //   rest of the body is inside try/catch, per-server failures are swallowed deeper
+  //   still in safeConnectToServer, and the config read has its own catch. A flag
+  //   set on its success path is therefore constant true. A tool-count check would be
+  //   wrong too: this deployment's only non-internal MCP server carries secret
+  //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
+  //   There is no signal here to gate on, and shipping one that always reads true is
+  //   worse than none — it reads as coverage.
+  //
+  //   CAVEAT, because this is an operational fact rather than a code invariant: that
+  //   zero-tools property holds for mcp_config.ts AND for the current `mcp_servers`
+  //   settings row, which mcpClientService also reads at every boot. If an operator adds
+  //   a placeholder-free server there, a healthy boot registers a non-zero count and a
+  //   transient outage registers zero — and with no MCP signal in the latch, that outage
+  //   latches for the process lifetime rather than retrying on the next message. If that
+  //   day comes, the fix is a real signal (e.g. a getFailedServers() next to
+  //   serversWithSecretPlaceholders: "every server we actually attempted connected"),
+  //   NOT a tool count.
+  //
+  //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
+  //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
+  //   row failing welcome-message validation) silently reverted this whole optimization
+  //   to per-message registration PLUS a full skills-table scan per chat message,
+  //   surfaced only by one console.error per message.
+  //
+  // The latch gates on what ENG-1852 was actually about: whether this instance's tool
+  // registry is usable.
+  // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
+  // its five inits replace live singletons unconditionally. The latch's retry path
+  // would otherwise swap them under in-flight tool calls on every failed attempt.
+  private downstreamSingletonsStarted = false;
+
+  /**
+   * Whether the last initialize() completed with every step reporting success. False
+   * means a degraded init that the next caller will retry — see initialize().
+   */
+  public get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  public async initialize(): Promise<void> {
+    // Deliberately before and outside the latch — see the note above.
     await this.loadFoundationTools();
+
+    if (this.initialized) return;
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = this.runInitialize();
+    try {
+      await this.initializationPromise;
+      // Two conjuncts, both of which can observably be false. A third,
+      // `this.toolRegistry.getAllTools().length > 0`, was here and is deliberately gone:
+      // registerTools() registers four built-ins unconditionally after both of its
+      // try/catch blocks and ToolRegistry.register is a Map.set that cannot throw, so it
+      // could never report failure. That is the same defect this file deleted mcpStepOk
+      // for, and an inert conjunct in an && chain is worse than no conjunct — it reads as
+      // coverage. It also carried a FALSE coverage claim: mutating it to `true` fails no
+      // test, because no test can distinguish it.
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered;
+      if (!this.initialized) {
+        console.error(
+          'AgentMode: initialize() completed but tool registration did not succeed ' +
+          `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
+          `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
+          'treating init as failed so the next caller retries.',
+        );
+      }
+    } finally {
+      this.initializationPromise = null;
+    }
+  }
+
+  private async runInitialize(): Promise<void> {
     await this.registerTools();
+
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
-    // Ensure built-in skills exist in the database
-    await this.ensureBuiltInSkills();
+    // Skipped once it has succeeded: it re-scans every skill and issues an update per
+    // built-in, which the retry path would otherwise repeat on every failed attempt.
+    // Its outcome does NOT gate the latch — see the note on the fields above.
+    if (!this.builtInSkillsSeeded) {
+      await this.ensureBuiltInSkills();
+    }
 
     // Bootstrap downstream service singletons. Server boot also calls these
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
     // (generateMarketingResponseWorker) doesn't run that path — so any tool
     // that resolves a singleton via getEnrichSoService / getUnipile*Service
-    // would throw "service not initialized" inside the worker. Each init is
-    // idempotent and wrapped in try/catch so a single failure (e.g. missing
-    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // would throw "service not initialized" inside the worker. Each is wrapped in
+    // try/catch so a single failure (e.g. a missing enrich.so secret in dev) doesn't
+    // block the rest — but they are NOT all idempotent: initEnrichSoService,
+    // initApolloService and initUnipileSearchParamService each replace their singleton
+    // unconditionally, which is why the guard below runs this once. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
-    void this.initializeDownstreamSingletons();
+    if (!this.downstreamSingletonsStarted) {
+      this.downstreamSingletonsStarted = true;
+      void this.initializeDownstreamSingletons();
+    }
 
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
@@ -1654,6 +1775,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
+    this.builtInSkillsSeeded = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1686,6 +1808,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
+      this.builtInSkillsSeeded = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1726,6 +1849,13 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
+    // Idempotent. On origin/main a fresh instance per widget message meant each call
+    // started an interval on an object that then leaked — the bug this branch fixes. On
+    // the shared singleton a repeat call is no longer hypothetical: the latch's retry
+    // path runs the whole initialization body again whenever init was degraded, and
+    // unguarded each pass would assign a new interval and orphan the previous one, every
+    // orphan retaining this instance through its closure.
+    if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
     }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
@@ -1855,6 +1985,7 @@ export class AgentModeService {
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
+    this.emmaToolsRegistered = false;
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
@@ -1882,6 +2013,24 @@ export class AgentModeService {
             requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
+      }
+      // "Didn't throw" is not success. Every statement in this try is non-throwing
+      // (Array.from, Map.get, Map.set), so an empty or unresolvable emmaToolRegistry
+      // copies ZERO tools and completes cleanly — which an earlier version of this
+      // latch accepted, leaving an instance live with only the four built-ins
+      // registered below. That is the ENG-1852 symptom exactly. Require the copy to
+      // be complete and non-empty.
+      // `copied === toolNames.length` was here and is deliberately gone: against the real
+      // McpToolRegistry (a synchronous Map — getToolNames() is Array.from(keys),
+      // getTool() is Map.get) it can never be false, and a condition that cannot fail is
+      // the exact thing three prior rounds shipped by accident. `toolNames.length > 0` is
+      // the term that does real work: it catches an emmaToolRegistry that was never
+      // populated, which is the ENG-1852 state.
+      this.emmaToolsRegistered = toolNames.length > 0;
+      if (!this.emmaToolsRegistered) {
+        console.error(
+          'AgentMode: emmaToolRegistry was empty — no Emma tools copied into this instance.',
+        );
       }
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
@@ -3301,7 +3450,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -4438,6 +4587,33 @@ export class AgentModeService {
                 `unavailable-capability notice so the answer cannot read as that tool's output`
               );
               content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          /*
+           * ENG-1899: same shape as the unavailable-capability notice directly above — UNCONDITIONAL
+           * on `coding_agent`'s own deterministic acceptance-check result, not on detecting a false
+           * claim in the prose, and PREPENDED so the true state is seen before the model's own
+           * possibly-false claim rather than after it. Own kill switch per this block's convention:
+           * a false positive here prepends a scary banner to an otherwise-correct answer, so standing
+           * it down must be a config change, not a revert-and-redeploy.
+           *
+           * `content` is passed through as `currentContent` so a turn that echoes an EARLIER turn's
+           * already-decorated response from conversation history (live env1 finding: two consecutive
+           * failed coding_agent calls in one session — the original incident's own shape — can produce
+           * exactly this) does not get a second, duplicated banner prepended on top.
+           */
+          const codingAgentAcceptanceNoticeEnabled =
+            process.env.AGENT_CODING_AGENT_ACCEPTANCE_NOTICE !== 'false';
+          if (codingAgentAcceptanceNoticeEnabled && content) {
+            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls, content);
+            if (acceptanceNotice) {
+              console.warn(
+                `AgentMode: coding_agent's acceptance check failed in session ${sessionId} — ` +
+                `prepending a verification notice so the answer cannot read as a passed check`
+              );
+              content = `${acceptanceNotice}\n\n${content}`;
               if (responseMessage) responseMessage.content = content;
             }
           }
@@ -5599,6 +5775,40 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1974. "Keep chatting" on a workplan recommendation card leaves no
+   * trace anywhere in the conversation — the recommendation's tool-call
+   * result just sits in session.messages as permanent context, so Emma has
+   * no signal the user declined, and any vaguely on-topic next message could
+   * get her to self-launch it via launch_predefined_work_plan (live-confirmed
+   * on env1, twice: neither an accept click nor a suggested reply, just an
+   * ordinary continuation). This states the real fact — a declined
+   * recommendation exists — directly in context, before Emma's own read of
+   * the conversation forms, same discipline as the ENG-1899 acceptance
+   * notice: a ledger fact stated unconditionally beats hoping the model
+   * infers it from an absence of signal.
+   *
+   * Returns [] when nothing has been declined this session, so a session
+   * that never hit this path carries zero extra tokens.
+   */
+  public static buildDeclinedWorkPlanRecommendationContextMessages(
+    declined?: Record<string, { planId: string; planTitle: string; declinedAt: string }>,
+  ): any[] {
+    const entries = declined ? Object.values(declined) : [];
+    if (entries.length === 0) return [];
+
+    const titles = entries.map((e) => `"${e.planTitle}"`).join(', ');
+    const plural = entries.length > 1;
+    const content =
+      `[SYSTEM] The user already declined the following recommended work plan${plural ? 's' : ''} by clicking ` +
+      `"Keep chatting" on ${plural ? 'their' : 'its'} recommendation card: ${titles}. Do not call ` +
+      `launch_predefined_work_plan for ${plural ? 'any of these plans' : 'this plan'} on the strength of an ` +
+      `ordinary, ambiguous, or on-topic message — treat the next message as a genuinely new request. Only launch ` +
+      `${plural ? 'one of them' : 'it'} if the user explicitly says they want to start ${plural ? 'that plan' : 'it'} now.`;
+
+    return [{ role: 'user', content }];
+  }
+
+  /**
    * Extract the filenames of images already generated in this session by scanning
    * the "Image generated: <filename>" system messages that generateImage persists
    * (see generateImage -> addMessageToSession). De-duplicated, order-preserving.
@@ -5661,7 +5871,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5833,6 +6043,12 @@ export class AgentModeService {
         messages.push({ role: 'assistant', content: assetAwarenessText });
       }
     }
+
+    // ENG-1974: declined-recommendation notice is independent of whether an
+    // active work plan exists — a session can have declined one plan and
+    // still be mid-way through an unrelated one, or have declined a plan and
+    // have nothing active at all.
+    messages.push(...AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(declinedWorkPlanRecommendations));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
@@ -6140,32 +6356,6 @@ export class AgentModeService {
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
-
-    // ENG-1852 TEMPORARY DIAGNOSTIC — remove after one observed production hit.
-    // First observation (2026-09-11): allToolsCount flip-flopped between 0 and 264
-    // across 5 calls within a single 6-second window of ONE user turn, all bearing
-    // the same "[Worker]" log prefix. That prefix is added ONLY by the parent
-    // process when piping a forked child's stdout (generateMarketingResponseWorkerService.ts),
-    // so all 5 genuinely originated inside a worker process — but pid/uptime were not
-    // captured, leaving two live hypotheses indistinguishable: (a) a single worker's
-    // this.toolRegistry is somehow being read as empty intermittently (no code path
-    // found that would explain this — ToolRegistry has no .clear(), getAllTools() is
-    // pure/synchronous, and registerTools() is called exactly once in this file), or
-    // (b) two DIFFERENT worker processes are alive concurrently (an old one mid-
-    // restart/still draining, a new one still initializing) and both happen to log
-    // through the same generic "[Worker]" prefix. pid + uptime settles it: same pid
-    // across all lines confirms (a); differing pids confirms (b).
-    console.log('[ENG-1852-DIAG]', JSON.stringify({
-      pid: process.pid,
-      instanceId: this.instanceId,
-      uptimeSec: Math.round(process.uptime()),
-      allToolsCount: allTools.length,
-      hasPublish: allTools.some(t => t.name === 'publish_landing_page_changes'),
-      hasPreview: allTools.some(t => t.name === 'get_landing_page_preview_url'),
-      associatedToolNamesCount: associatedToolNames.size,
-      excludedToolsCount: excludedTools.size,
-      publishedSkillsCount: publishedSkills.length,
-    }));
 
     return allTools
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
@@ -6838,7 +7028,11 @@ export class AgentModeService {
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
-      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+      // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
+      // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
+      // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
+      // make the single most important signal in the 2-week analysis the one nobody can act on.
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -8560,11 +8754,21 @@ export class AgentModeService {
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
+    agentRuntimeRunId?: string;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
+    // within — never something the model supplies or can even see elsewhere, unlike the
+    // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
+    // already-completed run — e.g. a reviewer analysing another session, ENG-939). Threading
+    // the real value through as ground truth lets a tool verify a same-turn claim against
+    // the run it is ACTUALLY in, instead of requiring the model to correctly type back an
+    // opaque id it was never given — which live testing showed it cannot do (it guessed the
+    // literal string "current-run").
+    if (input.agentRuntimeRunId) toolOptions.currentRunId = input.agentRuntimeRunId;
     // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
     // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
     // ENG-123). Scoping it here keeps every other tool's context unchanged.
@@ -9248,6 +9452,8 @@ export class AgentModeService {
       end_time?: string;
       /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
       userId?: string;
+      /** Chat session the analysis belongs to, so the ledger row is traceable (ENG-1961). */
+      sessionId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -9460,8 +9666,17 @@ export class AgentModeService {
 
       // Charge (record + deduct when a userId is present; absorb under "system"
       // otherwise). The client above is un-metered, so this is the single meter.
+      // ENG-1961: named `describe_video` rather than the catch-all `agent_task`,
+      // and carrying the session, so this spend is attributable the same way
+      // describeImage's is. The user was already correct (ENG-200).
       meterUsageFromResponse(
-        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        {
+          userId: options?.userId,
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          model: modelName,
+          provider: 'gemini',
+          feature: 'describe_video',
+        },
         response
       );
 
@@ -10810,12 +11025,18 @@ export class AgentModeService {
       }
 
       // Prepare market strategy data - merge with existing if available
+      const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
-        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: existingMarketStrategy?.createdAt || updateTimestamp,
+        updatedAt: updateTimestamp,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): Emma is
+        // explicitly told to send only the fields that changed, so a
+        // competitors-only tool call must not look like an ICP correction to
+        // routes/crm.ts's staleness check.
+        icpUpdatedAt: icp !== undefined ? updateTimestamp : existingMarketStrategy?.icpUpdatedAt,
       };
 
       // Update org-level or personal market strategy
@@ -16785,8 +17006,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * error) — the guard then delivers the message unchanged and records a loud
    * claim_check_error (see core/finalizeGuard.ts).
    *
-   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
-   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (a cheap/fast classification
+   * model) instead of the run's own llmModel: this is a bounded
    * classification task, not conversational generation, and every flagged
    * reply pays for this call, so keeping it cheap directly reduces the
    * guard's latency/cost footprint at scale (PR #2005 left this as a
@@ -16865,37 +17086,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       throw new Error('finalize-guard correction returned no content');
     }
     return text.trim();
-  }
-
-  /**
-   * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
-   * Returns true if the message needs to be handled, false otherwise.
-   */
-  public async triageSlackMessage(message: string): Promise<boolean> {
-    try {
-      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
-
-Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
-Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
-
-      const response = await this.callLLM(DIAGNOSIS_MODEL, [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message },
-      ], {
-        max_completion_tokens: 10,
-        temperature: 0,
-        taskClass: 'mcp_api',
-      });
-
-      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
-      const needsHandling = content.startsWith('yes');
-      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
-      return needsHandling;
-    } catch (error) {
-      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
-      return true; // default to handling on error to avoid missing client questions
-    }
   }
 
   public async listMetaAdsCampaigns(userId: string): Promise<any> {
@@ -31631,7 +31821,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       // Upload to S3 with the same path as the original file
       const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+      // ENG-1997 — this is the shared upload sink for BOTH updateHtmlFile's
+      // part/full replacements and updateHtmlFileCss's selector-based edits.
+      // The latter's `setAttribute` operation lets the model set an arbitrary
+      // attribute name/value pair directly (e.g. onerror/onclick), and its
+      // replace/append/etc. actions splice raw HTML with no escaping — same
+      // "LLM-authored HTML reaches a public S3 file unsanitized" trust gap
+      // createHtmlFile had, one step more direct since there's no need to even
+      // reproduce untrusted quoted text, the tool call arguments ARE the payload.
+      const sanitizedContent = sanitizeGeneratedHtml(content);
+      const uploadResult = await uploadFileToS3WithPath(sanitizedContent, filename, 'text/html', path);
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload updated file');
@@ -32169,8 +32369,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
         const filename = buildHtmlArtifactFilename(title);
-        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        // ENG-1997 — the passthrough uploads the model's own draft verbatim with no
+        // render step in between, so if it faithfully reproduced markup from
+        // untrusted quoted content (a CRM note, a client quote), nothing else in
+        // this path would ever catch it. Sanitize before it ever reaches S3.
+        const sanitizedContent = sanitizeGeneratedHtml(contentDraft);
+        const uploadableHtml = await this.inlinePrivateS3Images(sanitizedContent, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
           const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -32405,8 +32611,15 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const filename = buildHtmlArtifactFilename(title);
-      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      // ENG-1997 — the render step has no {{variable}} boundary to escape values
+      // into (unlike createHtmlFromTemplate/ENG-1877): it's told to copy names,
+      // quotes, and numbers from the draft verbatim, so any markup embedded in
+      // untrusted quoted content can survive the render unchanged. Sanitize the
+      // finished document before it reaches S3.
+      const sanitizedHtmlContent = sanitizeGeneratedHtml(htmlContent);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedHtmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
@@ -32576,8 +32789,13 @@ Return the HTML body fragment for this section only.`;
     try {
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
-      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
+      // ENG-1997 — renderMarkdownReportDocumentAsync already escapes text nodes,
+      // but sanitize defensively here too so this path never silently becomes the
+      // odd one out if that changes.
+      const sanitizedFallbackHtml = sanitizeGeneratedHtml(fallbackHtml);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedFallbackHtml, documentType, userId);
       const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
@@ -33136,7 +33354,7 @@ ${strippedHtml}`;
    *
    * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
    */
-  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean }): Promise<any> {
     try {
       const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
@@ -33209,6 +33427,31 @@ ${strippedHtml}`;
           return {
             success: false,
             message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
+      }
+
+      // ENG-1974: the user already declined this exact plan via "Keep chatting"
+      // on its recommendation card. recommendationId is a deterministic hash
+      // of (sessionId, planId) — recompute it here for the RESOLVED planId
+      // (not the raw planTitleOrId argument) so this correlates exactly
+      // whether launch_predefined_work_plan was called with a title or an id;
+      // no fuzzy title matching needed. `accept` always passes
+      // skipDeclineGate — the user's own explicit accept click must never be
+      // blocked by an earlier decline of any recommendation. Same risk tier
+      // as the force:true retry above (reversible, conversational), not the
+      // harder human-attributed tier checkQuestionGate exists for.
+      if (!options?.skipDeclineGate && !options?.confirmedDeclinedPlan) {
+        const declinedRecommendationId = createHash('sha256')
+          .update(`${sessionId}:${predefinedPlan.planId}`)
+          .digest('hex')
+          .slice(0, 32);
+        const declined = session.declinedWorkPlanRecommendations?.[declinedRecommendationId];
+        if (declined) {
+          return {
+            success: false,
+            message: `The user already declined "${declined.planTitle}" (clicked "Keep chatting" on its recommendation). Ask the user to confirm they want to start it now, then call launch_predefined_work_plan again with confirmedDeclinedPlan=true to proceed.`,
             requiresConfirmation: true,
           };
         }
@@ -33495,6 +33738,96 @@ ${strippedHtml}`;
     }
   }
 
+  // ENG-1875: LLM-judge check for whether the user's most recent REAL message
+  // explicitly authorized removing the scope named in `candidates`, so a
+  // `modify_work_plan removeStepCounts` call that would otherwise create new
+  // ENG-1811 debt doesn't ledger it when the user genuinely asked for the cut.
+  // Sibling to ENG-1819's userExplicitlyRequestedStop (agentModeController.ts)
+  // -- same model/timeout/parse shape, reusing that ticket's live-tested
+  // finding that gemini-3.1-flash-lite needs headroom for an internal
+  // reasoning trace before it emits "yes"/"no". Deliberately a separate
+  // function rather than a shared refactor: the two fail in different
+  // directions on purpose (see below), and this codebase already accepts
+  // duplicating debt-check logic outright (workPlanCompletedWithoutDebt's own
+  // comment, ~line 3735 in agentModeController.ts) rather than risk a shared
+  // path used by ~150 mocking test files.
+  //
+  // Fails SAFE toward "not authorized": any error/timeout/no-message returns
+  // `false`, so the debt is ledgered exactly as before this fix existed. This
+  // is the opposite bias from ENG-1819 (which fails toward NOT suppressing a
+  // continuation) because the risk here is asymmetric the other way -- a
+  // false "yes" would silently reopen the exact ENG-1811 gaming hole this
+  // ledger exists to close, while a false "no" only costs one harmless extra
+  // attempt at already-removed scope.
+  //
+  // Known, accepted limitation (fresh-eyes review, PR #2959): the judge only
+  // sees the user's raw message text, not the assistant's preceding turn. A
+  // common real flow -- assistant proposes "I'll skip step 2 since X, sound
+  // good?" and the user replies with a bare "yes"/"go ahead" -- won't mention
+  // the scope by name and will likely be judged "no", ledgering debt even
+  // though the removal was genuinely authorized. This under-covers the fix's
+  // own motivating scenario, but fails in the SAFE direction (extra debt, not
+  // a reopened gaming hole) -- not fixed here because doing so needs the
+  // assistant's own preceding message as judge context too, a real scope
+  // increase for a Low-priority, narrowly-scoped ticket, not a copy of an
+  // existing pattern the way the rest of this fix is.
+  private readonly STEP_REMOVAL_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+  private readonly STEP_REMOVAL_JUDGE_TIMEOUT_MS = 8000;
+
+  private async wasStepRemovalUserAuthorized(
+    sessionId: string,
+    candidates: Array<{ fn: string; stepTitle: string }>,
+  ): Promise<boolean> {
+    try {
+      const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+      if (!recent?.content) return false;
+      const scopeList = candidates
+        .map((c) => `- step "${c.stepTitle}" (still needs to call: ${c.fn})`)
+        .join('\n');
+      const system = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+The assistant is about to remove one or more steps from the plan before completing required actions those steps call for. Decide whether the user's message EXPLICITLY instructs removing, skipping, or dropping this specific scope -- as opposed to a general instruction, unrelated request, or the assistant's own unprompted decision.
+
+The steps being removed:
+${scopeList}
+
+Answer "yes" only if the user's message clearly and explicitly authorizes skipping this scope (even if phrased casually -- "skip step 2", "don't bother with the export", "we don't need that anymore").
+
+Answer "no" for everything else, including messages that don't mention this scope at all, or only vaguely relate to it.
+
+Reply with ONLY one word: yes or no.`;
+      const llmPromise = this.callLLM(
+        this.STEP_REMOVAL_JUDGE_MODEL,
+        [
+          { role: 'system', content: system },
+          { role: 'user', content: recent.content.slice(0, 2500) },
+        ],
+        {
+          temperature: 0,
+          max_completion_tokens: 500,
+          taskClass: 'scheduled_background',
+          usageContext: { feature: 'step_removal_authorization_judge' },
+        },
+      );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('step-removal judge timed out')), this.STEP_REMOVAL_JUDGE_TIMEOUT_MS)
+      );
+      const res: any = await Promise.race([llmPromise, timeoutPromise]);
+      if (res?.choices?.[0]?.finish_reason === 'length') {
+        console.warn(
+          `AgentMode: work-plan step-removal authorization judge for session ${sessionId} was ` +
+          `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+          `this may be silently missing a real authorization.`
+        );
+      }
+      const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+      return raw.startsWith('yes');
+    } catch (err) {
+      console.error(`AgentMode: work-plan step-removal authorization judge failed for session ${sessionId}:`, err);
+      return false; // fail-safe: never skip debt on judge failure
+    }
+  }
+
   public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
     try {
       // ENG-1793: consistentRead=true so this read of session.workPlan /
@@ -33552,15 +33885,54 @@ ${strippedHtml}`;
       const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
       if (removeStepCounts && removeStepCounts.length > 0) {
         const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const priorSet = new Set(priorPendingRequiredFunctionCalls);
         const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        // ENG-1875: only functions NEWLY going into debt by this call are
+        // candidates for the authorization judge below -- debt already
+        // standing from an earlier, unauthorized removal is never re-judged
+        // or revoked here, only ever added to.
+        //
+        // Judged PER REMOVED STEP, not once for the whole call: a single
+        // removeStepCounts batch can mix a step the user genuinely authorized
+        // with one the model is removing for its own unrelated reason (or to
+        // dodge a required call). A single call-wide yes/no would let one
+        // authorized step's "yes" spare an unrelated, unauthorized step in
+        // the same batch -- reopening ENG-1811's gaming hole through a
+        // batching side door (found by fresh-eyes review of the original
+        // single-verdict version). Each step's own requiredFunctionCalls are
+        // still judged together as one unit -- they're removed as one
+        // decision, not gameable by splitting further.
+        const candidateNewDebtByStep = new Map<number, { stepTitle: string; fns: string[] }>();
         for (const step of workPlan.steps) {
           if (!removeStepCounts.includes(step.stepCount)) continue;
           for (const fn of step.requiredFunctionCalls || []) {
             if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
-              newlyUnresolved.add(fn);
+              if (!priorSet.has(fn)) {
+                if (!candidateNewDebtByStep.has(step.stepCount)) {
+                  candidateNewDebtByStep.set(step.stepCount, { stepTitle: step.title, fns: [] });
+                }
+                candidateNewDebtByStep.get(step.stepCount)!.fns.push(fn);
+              } else {
+                newlyUnresolved.add(fn);
+              }
             }
           }
         }
+        await Promise.all(
+          Array.from(candidateNewDebtByStep.values()).map(async ({ stepTitle, fns }) => {
+            const authorized = await this.wasStepRemovalUserAuthorized(
+              sessionId,
+              fns.map((fn) => ({ fn, stepTitle })),
+            );
+            for (const fn of fns) {
+              if (authorized) {
+                console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }),
+        );
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
@@ -40057,7 +40429,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsReportingApi(userId: string, args: {
     customer_id: string;
-    mode: 'raw' | 'dashboard';
+    mode: 'raw' | 'dashboard' | 'serving_chain';
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
@@ -40072,6 +40444,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         );
         userId = scope.effectiveUserId;
       }
+      if (args.mode === 'serving_chain') {
+        const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
+        const success = report.state === 'READY' || report.state === 'DELIVERING';
+        return { success, report, ...(success ? {} : { error: JSON.stringify(report) }) };
+      }
+
       if (args.mode === 'dashboard') {
         const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
           campaignIds: args.campaign_ids,
@@ -40091,7 +40469,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: true, results, totalRows: results.length };
       }
 
-      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+      return { success: false, error: 'mode must be "raw", "dashboard", or "serving_chain"' };
     } catch (error: any) {
       // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
       // error.response.status specifically, never a Google Ads business code.

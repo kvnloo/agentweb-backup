@@ -175,8 +175,32 @@ export function createRecommendation(input: CreateRecommendationInput): Recommen
   // an Invalid Date, and every comparison against one (`x < invalidDate`) evaluates to `false` —
   // so a garbage evaluationDate would silently fall THROUGH the settling-window guard instead of
   // being blocked by it, defeating the one guarantee that guard exists to provide.
-  if (Number.isNaN(new Date(input.evaluationDate).getTime())) {
+  const evaluationTime = new Date(input.evaluationDate).getTime();
+  if (Number.isNaN(evaluationTime)) {
     throw new Error(`outcomeLedger: evaluationDate must be a valid ISO date (got ${String(input.evaluationDate)})`);
+  }
+  // `createdAt` is validated for the same reason the line above validates evaluationDate, and it is
+  // now load-bearing rather than decorative: every comparison against an Invalid Date is `false`, so
+  // an unparseable createdAt would silently disable the bound below instead of tripping it.
+  const createdTime = new Date(input.createdAt).getTime();
+  if (Number.isNaN(createdTime)) {
+    throw new Error(`outcomeLedger: createdAt must be a valid ISO date (got ${String(input.createdAt)})`);
+  }
+  // A prediction may not be dated into the past. `scoreRecommendation` treats a row as settled once
+  // `now >= evaluationDate + windowDays`, so a backdated evaluationDate produces a row that is born
+  // already past its settling window and can be scored immediately — yielding a real correct/wrong
+  // verdict about a period that ended before the prediction was made. This store exists to be a
+  // FALSIFIABLE track record, and retroactive prediction (recording a "prediction" whose outcome is
+  // already known, then scoring it correct) does not just add one bad row: it makes the aggregate
+  // record untrustworthy, which is the one property the ledger exists to provide.
+  // Equality is allowed: predicting about this instant is not a claim about the past, and the
+  // settling window still prevents it being scored for another windowDays.
+  if (evaluationTime < createdTime) {
+    throw new Error(
+      `outcomeLedger: evaluationDate must not precede createdAt — a recommendation cannot be ` +
+      `evaluated against a period that ended before it was made ` +
+      `(evaluationDate ${String(input.evaluationDate)} < createdAt ${String(input.createdAt)})`
+    );
   }
 
   return {

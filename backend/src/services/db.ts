@@ -70,6 +70,44 @@ const handleDynamoDbError = (error: any, operation: string) => {
 };
 
 /**
+ * A plain UpdateItem on a user/org row can lose a race against a
+ * TransactWriteItems call touching the SAME item — e.g. onboarding's
+ * marketStrategy mirror (updateUser) landing at the exact moment the LLM
+ * usage-credit ledger (transactWrite) meters the ICP generation call that
+ * just completed on that same user row. DynamoDB throws
+ * TransactionConflictException in that case; AWS documents this as an
+ * expected, transient condition to retry, not a permanent failure. Without
+ * this, a caller like mirrorIcpsToMarketStrategy — which treats the write
+ * as best-effort and only logs on failure — silently loses the write
+ * outright (observed live: a fresh onboarding's marketStrategy.icp ended up
+ * empty because of exactly this race) (ENG-1955 follow-up).
+ *
+ * Bounded retries with a short backoff: these conflicts clear in
+ * milliseconds once the competing transaction commits, so there's no
+ * reason to wait long — and no reason to retry anything else, since every
+ * other error here is either permanent or the caller's own guard
+ * (e.g. ConditionalCheckFailedException) firing correctly.
+ */
+const withTransactionConflictRetry = async <T>(
+  fn: () => Promise<T>,
+  maxAttempts = 4,
+): Promise<T> => {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      if (error?.code !== "TransactionConflictException" || attempt === maxAttempts) {
+        throw error;
+      }
+      const delayMs = 50 * Math.pow(2, attempt - 1); // 50ms, 100ms, 200ms
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  // Unreachable — the loop above always returns or throws.
+  throw new Error("withTransactionConflictRetry: exhausted attempts without a result");
+};
+
+/**
  * De-duplicate LinkedIn message events.
  *
  * When a user sends a LinkedIn message from the CRM, the send endpoint writes a
@@ -444,9 +482,25 @@ export interface User {
       description: string;
       valueProposition: string;
       buyerPersonas: string[];
+      // Per-persona LLM-extracted lead-search filter cache (ENG-1955
+      // follow-up) — see routes/crm.ts's GET /icp/filters.
+      extractedFilters?: {
+        cacheKey: string;
+        cacheVersion: number;
+        variants: unknown[];
+        generatedAt: string;
+      };
     }>;
     createdAt: string;
     updatedAt: string;
+    // Bumped only by a write that actually changes `icp` (ENG-1955 follow-up)
+    // — kept distinct from `updatedAt`, which every marketStrategy write
+    // bumps regardless of which field changed. routes/crm.ts's staleness
+    // check relies on this to avoid treating an unrelated competitors/
+    // businessOverview edit (or a system copy/mirror of icpResult) as a
+    // genuine ICP correction. Optional because records written before this
+    // field existed won't have it — callers must fall back to `updatedAt`.
+    icpUpdatedAt?: string;
   };
   startupProfiles?: Array<{
     id: string;
@@ -1668,7 +1722,9 @@ export class UserDB {
     }
 
     try {
-      const result = await this.docClient.update(params).promise();
+      const result = await withTransactionConflictRetry(() =>
+        this.docClient.update(params).promise()
+      );
       return result.Attributes as User;
     } catch (error: any) {
       // An unmet condition is the caller's own guard firing, not a fault —
@@ -10789,11 +10845,26 @@ export const orgDb = {
     return org;
   },
 
-  async getOrgById(orgId: string): Promise<Organization | null> {
-    const params = {
+  // `fields` trims the read to just the listed top-level attributes (via
+  // ProjectionExpression) for call sites that only need a few fields off an
+  // otherwise large org record (brandGuidelines, competitors, etc). Omit it
+  // to fetch the full item as before — every existing caller is unaffected.
+  async getOrgById(orgId: string, fields?: string[]): Promise<Organization | null> {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
     };
+    if (fields && fields.length > 0) {
+      const names: Record<string, string> = {};
+      params.ProjectionExpression = fields
+        .map((f, i) => {
+          const alias = `#p${i}`;
+          names[alias] = f;
+          return alias;
+        })
+        .join(', ');
+      params.ExpressionAttributeNames = names;
+    }
     const result = await dynamodb.get(params).promise();
     return (result.Item as Organization) || null;
   },
@@ -10910,7 +10981,9 @@ export const orgDb = {
       Object.assign(expressionAttributeValues, options.condition.values || {});
     }
 
-    const result = await dynamodb.update(params).promise();
+    const result = await withTransactionConflictRetry(() =>
+      dynamodb.update(params).promise()
+    );
     return result.Attributes as Organization;
   },
 

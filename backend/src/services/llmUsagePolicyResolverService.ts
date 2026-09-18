@@ -7,6 +7,7 @@ import {
 } from "./llmUsagePolicyService";
 import { userDb } from './db';
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 
 export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   billingUserId: string;
@@ -55,7 +56,15 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
   ]);
   const config = await getSubscriptionTypeConfig(subscriptionType);
   const basePolicy = config?.llmUsagePolicy || null;
-  const rawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  const legacyRawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
+  // onto the vendor-inclusive spend ledger and leave the rest of this pipeline —
+  // credit application, threshold, predicate — untouched. See spendEnforcementBasis.ts.
+  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+    billingUserId,
+    billingMonth: usage.month,
+    legacyRawCostUsedMicroUsd,
+  });
   const adjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
   const adjusted = basePolicy
     ? applyLlmUsageCredits({

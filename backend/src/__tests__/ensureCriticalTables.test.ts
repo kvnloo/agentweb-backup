@@ -87,9 +87,10 @@ describe('ensureCriticalTables', () => {
     });
 
     it('only reconciles tables whose spec requests protection', async () => {
-      // AW-SpendEvents is the only critical spec with DeletionProtectionEnabled.
+      // The two money tables carry DeletionProtectionEnabled: the event ledger
+      // and the §3b projection. Both are authoritative and hard to rebuild.
       const guarded = CRITICAL_TABLE_SPECS.filter((s) => (s as any).DeletionProtectionEnabled);
-      expect(guarded.map((s) => s.TableName)).toEqual(['AW-SpendEvents']);
+      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-SpendEvents', 'AW-SpendProjection']);
     });
   });
 
@@ -152,6 +153,19 @@ describe('ensureCriticalTables', () => {
     expect(Object.keys(se!)).not.toContain('TimeToLiveSpecification');
     // The money ledger must be delete-protected (spec, and enabled live).
     expect((se as any).DeletionProtectionEnabled).toBe(true);
+  });
+
+  it('provisions AW-SpendProjection keyed billingUserId+billingMonth, delete-protected, no TTL', () => {
+    const sp = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-SpendProjection'));
+    expect(sp).toBeDefined();
+    expect(sp!.KeySchema).toEqual([
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'billingMonth', KeyType: 'RANGE' },
+    ]);
+    expect((sp as any).DeletionProtectionEnabled).toBe(true);
+    expect(Object.keys(sp!)).not.toContain('TimeToLiveSpecification');
+    // Admission reads by exact key — no GSI needed, and none should creep in.
+    expect(sp!.GlobalSecondaryIndexes).toBeUndefined();
   });
 
   it('onboarding metrics spec carries the StepStartedAtIndex GSI', () => {

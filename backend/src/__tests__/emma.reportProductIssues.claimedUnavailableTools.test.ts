@@ -172,19 +172,130 @@ describe('report_product_issues — claimed_unavailable_tools deterministic gate
     expect(result.results[0]).toMatchObject({ success: true });
   });
 
-  it('requires run_id whenever claimed_unavailable_tools is set — rejects without ever hitting telemetry', async () => {
+  it('requires a resolvable run whenever claimed_unavailable_tools is set and neither run_id nor context.currentRunId is available — rejects without ever hitting telemetry', async () => {
     const result = await tool().execute({
       issues: [{
         title: 'Tool unavailable, no run_id',
         description: 'Claiming unavailability with no evidence trail.',
         claimed_unavailable_tools: ['playwright_browser_navigate'],
       }],
-    }, { userId: CALLER.userId });
+    }, { userId: CALLER.userId }); // no currentRunId in context either — e.g. an external MCP call
 
     expect(fetchAgentRunSummaries).not.toHaveBeenCalled();
     expect(fileUserIssue).not.toHaveBeenCalled();
     expect(result.results[0]).toMatchObject({ success: false });
-    expect(result.results[0].error).toContain('requires run_id');
+    expect(result.results[0].error).toContain('requires a resolvable run');
+  });
+
+  it('falls back to context.currentRunId (the server-supplied current run) when the model omits run_id — the honest same-turn case', async () => {
+    // This reproduces the live-prod finding: the model has no way to learn its own
+    // agentRuntimeRunId and cannot supply it as run_id, so an HONEST claim about the
+    // CURRENT run must still verify via the server-threaded context field, not fail
+    // just because the model didn't (couldn't) type the id back.
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-ctx-1',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'failed',
+        toolCalls: 1,
+        failedToolCalls: 1,
+        outcomes: [
+          outcome('agent_tool_invoked', 'playwright_browser_navigate'),
+          outcome('agent_tool_failed', 'playwright_browser_navigate'),
+        ],
+      }],
+      scannedEvents: 2,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Navigate genuinely fails, no run_id supplied',
+        description: 'Called it, it errored.',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+        // Deliberately no run_id — the model never has one to give.
+      }],
+    }, { userId: CALLER.userId, currentRunId: 'run-ctx-1' });
+
+    expect(fetchAgentRunSummaries).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-ctx-1' }));
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(result.results[0]).toMatchObject({ success: true });
+  });
+
+  it('rejects a false claim verified via context.currentRunId, same as the explicit-run_id path', async () => {
+    (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+      runs: [{
+        runId: 'run-ctx-2',
+        sessionId: 'sess-1',
+        userId: CALLER.userId,
+        verdict: 'degraded',
+        toolCalls: 1,
+        failedToolCalls: 0,
+        outcomes: [outcome('agent_tool_invoked', 'playwright_browser_handle_dialog')],
+      }],
+      scannedEvents: 1,
+      truncated: false,
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'False claim via context.currentRunId',
+        description: 'Claims navigate is broken.',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId, currentRunId: 'run-ctx-2' });
+
+    expect(fileUserIssue).not.toHaveBeenCalled();
+    expect(result.results[0]).toMatchObject({ success: false });
+    expect(result.results[0].error).toContain('playwright_browser_navigate');
+    expect(result.results[0].error).toMatch(/never actually called/);
+  });
+
+  it('an explicit run_id argument still takes priority over context.currentRunId (ENG-939 cross-run citing case)', async () => {
+    // A reviewer analysing a DIFFERENT, already-completed run must be able to cite it
+    // explicitly, even while chatting inside their OWN current (unrelated) run.
+    (fetchAgentRunSummaries as jest.Mock).mockImplementation(({ runId }: { runId: string }) => {
+      if (runId === 'run-other-explicit') {
+        return Promise.resolve({
+          runs: [{
+            runId: 'run-other-explicit',
+            sessionId: 'sess-other',
+            userId: CALLER.userId,
+            verdict: 'failed',
+            toolCalls: 1,
+            failedToolCalls: 1,
+            outcomes: [
+              outcome('agent_tool_invoked', 'playwright_browser_navigate'),
+              outcome('agent_tool_failed', 'playwright_browser_navigate'),
+            ],
+          }],
+          scannedEvents: 2,
+          truncated: false,
+        });
+      }
+      // The reviewer's OWN current run never touched navigate — proves the explicit
+      // id, not the context fallback, is what actually got queried/verified against.
+      return Promise.resolve({
+        runs: [{ runId: 'run-my-current', sessionId: 'sess-mine', userId: CALLER.userId, verdict: 'ok', toolCalls: 0, failedToolCalls: 0, outcomes: [] }],
+        scannedEvents: 0,
+        truncated: false,
+      });
+    });
+
+    const result = await tool().execute({
+      issues: [{
+        title: 'Citing a different run explicitly',
+        description: 'Reviewer citing another session.',
+        run_id: 'run-other-explicit',
+        claimed_unavailable_tools: ['playwright_browser_navigate'],
+      }],
+    }, { userId: CALLER.userId, currentRunId: 'run-my-current' });
+
+    expect(fetchAgentRunSummaries).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-other-explicit' }));
+    expect(fetchAgentRunSummaries).not.toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-my-current' }));
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(result.results[0]).toMatchObject({ success: true });
   });
 
   it('rejects when run_id does not resolve to a known run — an unverifiable claim must not silently file', async () => {
@@ -313,19 +424,51 @@ describe('report_product_issues — claimed_unavailable_tools deterministic gate
       expect(result.results[0].error).toMatch(/never actually called/);
     });
 
-    it('requires run_id when the wording alone implies a claim, same as the explicit field', async () => {
+    it('requires a resolvable run when the wording alone implies a claim and no current run context exists either, same as the explicit field', async () => {
       const result = await tool().execute({
         issues: [{
           title: 'playwright_browser_navigate is unavailable',
           description: 'It is broken and cannot be used.',
-          // No run_id, no claimed_unavailable_tools — wording alone triggers the requirement.
+          // No run_id, no claimed_unavailable_tools, no context.currentRunId — wording
+          // alone triggers the requirement (e.g. an external MCP call with no live run).
         }],
       }, { userId: CALLER.userId });
 
       expect(fetchAgentRunSummaries).not.toHaveBeenCalled();
       expect(fileUserIssue).not.toHaveBeenCalled();
       expect(result.results[0]).toMatchObject({ success: false });
-      expect(result.results[0].error).toContain('requires run_id');
+      expect(result.results[0].error).toContain('requires a resolvable run');
+    });
+
+    it('a prose-implied claim also falls back to context.currentRunId when run_id is omitted', async () => {
+      (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
+        runs: [{
+          runId: 'run-ctx-prose',
+          sessionId: 'sess-1',
+          userId: CALLER.userId,
+          verdict: 'degraded',
+          toolCalls: 1,
+          failedToolCalls: 1,
+          outcomes: [
+            outcome('agent_tool_invoked', 'playwright_browser_handle_dialog'),
+            outcome('agent_tool_failed', 'playwright_browser_handle_dialog'),
+          ],
+        }],
+        scannedEvents: 2,
+        truncated: false,
+      });
+
+      const result = await tool().execute({
+        issues: [{
+          title: 'Browser skill installs but navigation tools remain unavailable',
+          description: 'playwright_browser_navigate did not appear as callable after install.',
+        }],
+      }, { userId: CALLER.userId, currentRunId: 'run-ctx-prose' });
+
+      expect(fetchAgentRunSummaries).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-ctx-prose' }));
+      expect(fileUserIssue).not.toHaveBeenCalled();
+      expect(result.results[0]).toMatchObject({ success: false });
+      expect(result.results[0].error).toContain('playwright_browser_navigate');
     });
 
     it('allows the prose claim through when the named tool genuinely was invoked this run', async () => {

@@ -7,7 +7,7 @@
  * "already applied".
  */
 
-import { buildExecutedActionsFallback, buildExecutedActionsFooter } from '../../services/agentMode/core/synthesisResidue';
+import { buildExecutedActionsFallback, buildExecutedActionsFooter, buildAcceptanceFailureNotice } from '../../services/agentMode/core/synthesisResidue';
 
 describe('buildExecutedActionsFallback — outcome bucketing (ENG-1054)', () => {
   it('reports succeeded and failed calls separately', () => {
@@ -161,5 +161,242 @@ describe('recap states its counting basis (ENG-1054)', () => {
   it('says the same in the full fallback', () => {
     const text = buildExecutedActionsFallback([{ name: 'add_leads_to_list', result: {} }]);
     expect(text).toContain('Counts are tool calls, not the number of records created or changed');
+  });
+});
+
+/**
+ * ENG-1899: coding_agent's own deterministic acceptance checks can fail while the model's free-text
+ * report claims success — a live incident where "visual verification passed with screenshot" was
+ * reported while a `selector_exists` check had failed and the described button copy matched neither
+ * the brief nor the deployed page. `acceptanceStatus`/`acceptance` are real fields already on the
+ * ledger entry; this states them as fact, unconditionally, ahead of the model's own claim.
+ */
+describe('buildAcceptanceFailureNotice (ENG-1899)', () => {
+  it('states the real failed check when acceptanceStatus is failed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          message: 'Visual verification passed with screenshot — CTA buttons are now visible.',
+          acceptanceStatus: 'failed',
+          acceptance: {
+            status: 'failed',
+            summary: '1 of 2 checks failed',
+            checks: [
+              { label: 'CTA text present', status: 'passed', message: 'found' },
+              { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+            ],
+          },
+        },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('VERIFICATION FAILED');
+    expect(notice).toContain('form selector');
+    expect(notice).toContain("selector 'form' not found");
+    // The passed check must not be reported as a failure alongside the real one.
+    expect(notice).not.toContain('CTA text present: found');
+  });
+
+  it('fires for a blocked acceptance status too, not only failed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          acceptanceStatus: 'blocked',
+          acceptance: { status: 'blocked', summary: 'blocked', checks: [
+            { label: 'deploy check', status: 'blocked', message: 'preview deploy did not complete' },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('preview deploy did not complete');
+  });
+
+  it('returns null when the acceptance check genuinely passed — redundant-when-honest stays quiet', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: true,
+          message: 'Fixed the CTA button styling.',
+          acceptanceStatus: 'passed',
+          acceptance: { status: 'passed', summary: 'all checks passed', checks: [
+            { label: 'CTA text present', status: 'passed', message: 'found' },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null when no acceptance checks were configured (not_run)', () => {
+    const notice = buildAcceptanceFailureNotice([
+      { name: 'coding_agent', result: { success: true, message: 'done', acceptanceStatus: 'not_run' } },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null when the turn has no coding_agent call at all', () => {
+    const notice = buildAcceptanceFailureNotice([
+      { name: 'generate_image', result: { url: 'https://example.com/a.png' } },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('returns null for an empty ledger', () => {
+    expect(buildAcceptanceFailureNotice([])).toBeNull();
+  });
+
+  it('covers multiple failed coding_agent calls in the same turn without dropping either', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'attempt 1 check', status: 'failed', message: 'still transparent' },
+        ] } },
+      },
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'attempt 2 check', status: 'failed', message: "form selector not found" },
+        ] } },
+      },
+    ]);
+
+    expect(notice).toContain('attempt 1 check');
+    expect(notice).toContain('attempt 2 check');
+  });
+
+  // Live env1 finding: two consecutive failing coding_agent calls in the SAME chat
+  // session (the original incident's own shape) can have the model echo its own
+  // prior, already-decorated turn from conversation history — this function still
+  // ran exactly once per HTTP request (confirmed via container logs), the model
+  // supplied the duplicate. Passing the in-progress `content` lets the caller skip
+  // prepending a second copy when one is already present, regardless of who echoed it.
+  it('does not duplicate the notice when content already carries one', () => {
+    const toolCalls = [
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+        ] } },
+      },
+    ];
+    const firstNotice = buildAcceptanceFailureNotice(toolCalls);
+    expect(firstNotice).not.toBeNull();
+
+    const contentAlreadyDecorated = `${firstNotice}\n\nSome earlier turn's echoed text.`;
+    const secondNotice = buildAcceptanceFailureNotice(toolCalls, contentAlreadyDecorated);
+    expect(secondNotice).toBeNull();
+  });
+
+  // Independent-review finding: a retry within the SAME turn that later PASSED must
+  // supersede an earlier failed attempt's report — acceptance.checks re-verifies the
+  // full set fresh each call, so the later 'passed' is the complete current truth.
+  it('does not surface a superseded failure once a later retry in the same turn passed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: {
+          success: false,
+          message: 'Attempt 1: applied the fix.',
+          acceptanceStatus: 'failed',
+          acceptance: { status: 'failed', summary: '1 of 1 checks failed', checks: [
+            { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+          ] },
+        },
+      },
+      {
+        name: 'coding_agent',
+        result: {
+          success: true,
+          message: 'Attempt 2 (retry): fixed the form, all checks now pass.',
+          acceptanceStatus: 'passed',
+          acceptance: { status: 'passed', summary: 'all checks passed', checks: [
+            { label: 'form selector', status: 'passed', message: "selector 'form' found" },
+          ] },
+        },
+      },
+    ]);
+
+    expect(notice).toBeNull();
+  });
+
+  it('still reports an earlier failure when no later call in the turn passed', () => {
+    const notice = buildAcceptanceFailureNotice([
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+          { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+        ] } },
+      },
+      {
+        name: 'coding_agent',
+        result: { success: false, acceptanceStatus: 'blocked', acceptance: { status: 'blocked', summary: 's', checks: [
+          { label: 'deploy check', status: 'blocked', message: 'preview deploy did not complete' },
+        ] } },
+      },
+    ]);
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('form selector');
+    expect(notice).toContain('deploy check');
+  });
+
+  // Independent-review finding: an earlier revision suppressed on any occurrence of the
+  // bare marker PHRASE anywhere in currentContent — which also fires when the model's
+  // prose merely recaps an OLDER, different failure, silently swallowing a genuinely new,
+  // currently-real failure this same turn. That's the expensive direction to be wrong (a
+  // live problem going unreported), not the cheap one.
+  it('does NOT suppress a new, different failure just because the marker phrase appears elsewhere in content', () => {
+    const contentRecappingAnOlderFailure =
+      "Last time you saw: ⚠️ VERIFICATION FAILED — coding_agent's own acceptance check " +
+      'did not pass. Since then I made more changes.';
+
+    const notice = buildAcceptanceFailureNotice(
+      [
+        {
+          name: 'coding_agent',
+          result: {
+            success: false,
+            acceptanceStatus: 'failed',
+            acceptance: { status: 'failed', summary: 's', checks: [
+              { label: 'a brand new distinct check', status: 'failed', message: 'still broken, different reason' },
+            ] },
+          },
+        },
+      ],
+      contentRecappingAnOlderFailure,
+    );
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('a brand new distinct check');
+    expect(notice).toContain('still broken, different reason');
+  });
+
+  it('still fires normally when currentContent has no prior notice', () => {
+    const notice = buildAcceptanceFailureNotice(
+      [
+        {
+          name: 'coding_agent',
+          result: { success: false, acceptanceStatus: 'failed', acceptance: { status: 'failed', summary: 's', checks: [
+            { label: 'form selector', status: 'failed', message: "selector 'form' not found" },
+          ] } },
+        },
+      ],
+      'Fixed the CTA button styling.',
+    );
+
+    expect(notice).not.toBeNull();
+    expect(notice).toContain('VERIFICATION FAILED');
   });
 });

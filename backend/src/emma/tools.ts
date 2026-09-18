@@ -16,7 +16,7 @@ import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
-import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   buildPendingUserQuestion,
@@ -75,16 +75,40 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     const sessionId = context?.sessionId;
 
-    const candidate = await humanEvalService.createCandidate({
-      reviewType: args.review_type as HumanEvalReviewType,
-      outputSummary: args.output_summary,
-      artifactUrl: args.artifact_url,
-      chatUrl: args.chat_url,
-      originalRequest: args.original_request,
-      agentRunId: args.agent_run_id,
-      userId,
-      sessionId,
-    });
+    // ENG-1854: this manual path bypasses enqueueAutoHumanEval entirely (it calls
+    // createCandidate directly), so it never went through that function's own dedup — an
+    // auto-trigger could already have posted this exact artifact (e.g. right after
+    // generate_image completes) before Emma also decides to send it herself. Claim the
+    // artifact URL first so whichever path gets here first wins, not both.
+    let claimedArtifact = false;
+    if (args.artifact_url) {
+      if (!(await claimArtifactForHumanEval(args.artifact_url))) {
+        return {
+          success: true,
+          message: 'This output was already sent for human eval (likely automatically, right after it was generated) — not sending a duplicate.',
+        };
+      }
+      claimedArtifact = true;
+    }
+
+    let candidate;
+    try {
+      candidate = await humanEvalService.createCandidate({
+        reviewType: args.review_type as HumanEvalReviewType,
+        outputSummary: args.output_summary,
+        artifactUrl: args.artifact_url,
+        chatUrl: args.chat_url,
+        originalRequest: args.original_request,
+        agentRunId: args.agent_run_id,
+        userId,
+        sessionId,
+      });
+    } catch (err) {
+      // Release the claim on failure — otherwise a transient createCandidate error
+      // permanently blackholes this artifact from ever being sent for review again.
+      if (claimedArtifact) await releaseArtifactClaim(args.artifact_url);
+      throw err;
+    }
 
     return {
       success: true,
@@ -268,7 +292,15 @@ function enqueueLeadEnrichmentEval(input: {
   toolName: 'enrich_leads_execute' | 'enrich_lead_custom';
 }): void {
   const processedCount = Number(input.summary?.processedCount ?? 0);
-  if (!input.userId || processedCount <= 0) return;
+  const failedCount = Number(input.summary?.failedCount ?? 0);
+  // ENG-1854: a routine, zero-failure enrichment run was never a real candidate for human
+  // review — it's a completion log entry, not a judgment call. This was the dominant source
+  // of #eval-queue noise (confirmed via a real Slack dump: near-identical "processed N,
+  // failed 0" posts, minutes apart, differing only by list). Only enqueue when something's
+  // actually anomalous. Does not apply to rerunLeadEnrichment (humanEvalActionService.ts) —
+  // that path fires because a human explicitly asked for and is waiting on this specific
+  // re-run, so it should always report back regardless of outcome.
+  if (!input.userId || processedCount <= 0 || failedCount <= 0) return;
 
   const fields = outputFieldNames(input.outputFields);
   const runId = typeof input.summary?.runId === 'string' && input.summary.runId
@@ -4943,7 +4975,8 @@ emmaToolRegistry.register({
       return_scenes: args.return_scenes,
       start_time: args.start_time,
       end_time: args.end_time,
-      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
+      userId: context?.userId, // charge this describe_video spend to the caller (ENG-200)
+      sessionId: context?.sessionId, // ENG-1961: trace the row back to the chat
     });
   }
 });
@@ -6363,7 +6396,7 @@ emmaToolRegistry.register({
   name: 'launch_predefined_work_plan',
   definition: {
     name: 'launch_predefined_work_plan',
-    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Two distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously.',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Three distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously; (3) the user already declined this exact plan by clicking "Keep chatting" on its recommendation card — confirm the user actually wants to start it now, then call again with confirmedDeclinedPlan=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6374,13 +6407,20 @@ emmaToolRegistry.register({
         force: {
           type: 'boolean',
           description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        },
+        confirmedDeclinedPlan: {
+          type: 'boolean',
+          description: 'Set to true to launch a plan the user previously declined via "Keep chatting". Only do this after the user explicitly confirms they want to start it now.'
         }
       },
       required: ['planTitle']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+      force: args.force === true,
+      confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
+    });
   }
 });
 
@@ -8093,14 +8133,26 @@ emmaToolRegistry.register({
         // The combined set this issue is asserting is broken/unavailable, whether stated
         // explicitly via the field or implied by its own wording — both verified identically.
         const effectiveUnavailableTools = Array.from(new Set([...claimedUnavailableTools, ...impliedUnavailableTools]));
-        if (effectiveUnavailableTools.length > 0 && !(typeof issue.run_id === 'string' && issue.run_id.trim())) {
+        // ENG-1945 follow-up (live-prod finding): the model has no legitimate way to learn
+        // its own agentRuntimeRunId — it is never surfaced in any tool result or prompt text
+        // — so requiring it to TYPE that id back (as the original version of this gate did)
+        // made even an honest same-turn claim unverifiable; live testing confirmed the model
+        // simply invents a plausible-looking placeholder ("current-run") instead. Default to
+        // `context.currentRunId` — the server's OWN id for the run this call is executing
+        // within, threaded in by toolDispatch.ts, not something the model can fake or
+        // mistype — whenever the model doesn't supply an explicit `run_id`. An EXPLICIT
+        // `run_id` argument still takes priority when given, preserving ENG-939's citing-a-
+        // DIFFERENT-run case (a reviewer analysing another session) exactly as before.
+        const explicitRunId = typeof issue.run_id === 'string' && issue.run_id.trim() ? issue.run_id.trim() : undefined;
+        const effectiveRunId = explicitRunId ?? (typeof context?.currentRunId === 'string' ? context.currentRunId : undefined);
+        if (effectiveUnavailableTools.length > 0 && !effectiveRunId) {
           const viaWording = impliedUnavailableTools.length > 0 && claimedUnavailableTools.length === 0;
           throw new Error(
             `Cannot file "${issue.title}": ${viaWording
               ? `this report's own wording names ${impliedUnavailableTools.join(', ')} alongside unavailability language`
               : `claimed_unavailable_tools (${claimedUnavailableTools.join(', ')})`
-            } — that requires run_id so the claim can be checked against that run's actual tool-call telemetry. Include ` +
-            `the run_id from THIS session, or reword the report so it does not assert a specific tool is broken/unavailable.`
+            } — that requires a resolvable run to check the claim against, and none is available (no run_id given and no ` +
+            `current run context). Only call report_product_issues about a tool being broken from within an active agent run.`
           );
         }
         // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
@@ -8112,15 +8164,18 @@ emmaToolRegistry.register({
         let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
         let affectedSessionId: string | undefined;
         let affectedUserUnresolved = false;
-        if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
+        // Uses `effectiveRunId` (explicit run_id, else the server-supplied current run) so
+        // an in-progress agent run gets its dossier auto-attached even when the model never
+        // passed run_id explicitly — not just when claimed_unavailable_tools forces the issue.
+        if (effectiveRunId) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
-            const { runs } = await fetchAgentRunSummaries({ runId: issue.run_id.trim(), limit: 1 });
+            const { runs } = await fetchAgentRunSummaries({ runId: effectiveRunId, limit: 1 });
             const run = runs[0];
             if (!run) {
               if (effectiveUnavailableTools.length > 0) {
                 throw new Error(
-                  `Cannot file "${issue.title}": run_id "${issue.run_id.trim()}" does not resolve to a known run, so ` +
+                  `Cannot file "${issue.title}": run_id "${effectiveRunId}" does not resolve to a known run, so ` +
                   `the claim that ${effectiveUnavailableTools.join(', ')} ${effectiveUnavailableTools.length === 1 ? 'is' : 'are'} ` +
                   `broken/unavailable cannot be verified. Use the exact run_id from THIS session's runtime telemetry.`
                 );
@@ -8265,6 +8320,10 @@ emmaToolRegistry.register({
               ? user.email
               : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
             sessionId: affectedSessionId ?? context?.sessionId,
+            // ENG-1961: who PAYS for the dedup judge is the caller running this
+            // tool, never `userEmail` — under ENG-939 that is the affected user
+            // of a cross-user review, who did not ask for the analysis.
+            actingUserId: userId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
@@ -9345,12 +9404,18 @@ emmaToolRegistry.register({
     name: 'call_google_ads_reporting_api',
     description: `Fetch Google Ads performance data.
 
-TWO MODES:
+THREE MODES:
+- mode="serving_chain": Verify Search serving-chain readiness and today's delivery evidence; optional campaign_ids.
 - mode="dashboard": Pre-formatted markdown table (spend, impressions, clicks, CTR, conversions, avg CPC). Use for "how are my campaigns doing?" questions.
 - mode="raw": Custom GAQL query, returns structured results. Use for keyword-level data, custom breakdowns, or specific fields.
 
 COST: cost_micros from API ÷ 1,000,000 = spend in account currency. Check the currency field in response.
 NEVER fabricate metrics — only report what tools return.
+Before any customer-facing Search launch/status assertion, call call_google_ads_reporting_api mode="serving_chain".
+Never claim ads are live, serving, or spending from campaign or keyword status alone. READY is not evidence of delivery.
+Only DELIVERING supports observed delivery in the returned window; spending additionally requires costMicros > 0 on that eligible path.
+Cite campaign, budget, ad-group, ad creative, keyword eligibility, telemetry, account timezone, window, and checkedAt timestamp. Include every blocked sibling path.
+UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry can lag and does not prove ads are serving at this instant. Performance Max and Display are unsupported by this verifier.
 
 GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
@@ -9359,10 +9424,10 @@ GAQL EXAMPLES:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field (NOT the "id" field).' },
-        mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
+        mode: { type: 'string', enum: ['raw', 'dashboard', 'serving_chain'], description: '"serving_chain" required for Search launch/status assertions. "dashboard" for formatted summary. "raw" for custom GAQL.' },
         query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
-        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
-        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard or serving_chain mode). Omit for all.' },
+        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Dashboard only; defaults to LAST_30_DAYS. serving_chain always uses TODAY in the account timezone.' },
         client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: ['customer_id', 'mode'],

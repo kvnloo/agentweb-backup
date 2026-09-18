@@ -1194,7 +1194,7 @@ export function attachInProcessCompletion(
   genPromise: Promise<any>,
   pageId: string,
   userId: string,
-  sessionId: string
+  sessionId: string,
 ): void {
   genPromise
     .then(async (resolved: any) => {
@@ -1217,9 +1217,20 @@ export function attachInProcessCompletion(
         },
       });
     })
-    .catch((err: any) =>
-      console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err)
-    );
+    .catch((err: any) => {
+      console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err);
+    });
+}
+
+/** Track only the underlying detached generation for the request's durable run.
+ * Delivery/claim failures must not rewrite a successfully completed generation as failed.
+ */
+export function attachDetachedRunTerminalStatus(genPromise: Promise<any>, runId?: string): void {
+  if (!runId) return;
+  genPromise.then(
+    () => markRunTerminal(runId, 'completed', { finishReason: 'detached_completed' }).catch(() => {}),
+    () => markRunTerminal(runId, 'failed', { finishReason: 'detached_failed' }).catch(() => {}),
+  );
 }
 
 // ENG-1239: cap on consecutive automatic continuations for one deferred media batch, so a
@@ -9281,6 +9292,10 @@ export const agentModeController = {
                 await markAwaitingReconnect(inFlight.id);
                 attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
               }
+              // Every request returns its own run ID, including later requests that find
+              // awaitingReconnect already set. Track that request's generation without
+              // competing for shared page delivery.
+              attachDetachedRunTerminalStatus(genPromise, runSurvivalRunId);
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
@@ -9288,13 +9303,9 @@ export const agentModeController = {
                 timestamp: new Date().toISOString(),
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
-              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
-              // Same as the pre-generation reconnect above: the request ended
-              // by detaching — mark the run record terminal or it stays
-              // 'running' for 30d. Best-effort by design.
-              if (runSurvivalRunId) {
-                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
-              }
+              res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true, ...(runSurvivalRunId ? { runId: runSurvivalRunId } : {}) });
+              // Keep the originating request run non-terminal until the detached
+              // completion hook records the actual success or failure.
               return;
             }
           } catch (durErr) {
@@ -11155,7 +11166,10 @@ export const agentModeController = {
         });
       }
 
-      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      // ENG-1974: this endpoint IS the user's explicit accept — it must never
+      // be blocked by an earlier decline of any recommendation (this one or
+      // another), so it always bypasses applyPredefinedWorkPlan's decline gate.
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { skipDeclineGate: true });
       if (!result.success) {
         // Defensive backstop for a race between our pre-check above and this
         // call (e.g. a concurrent accept/launch landed in between) — never a
@@ -11171,6 +11185,76 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Accept work plan recommendation error:', error);
       res.status(500).json({ error: 'Failed to accept work plan recommendation' });
+    }
+  },
+
+  /**
+   * ENG-1974: "Keep chatting" on a workplan recommendation card was, by
+   * ENG-1472's original design, a pure client-side no-op — it never told the
+   * backend or Emma the recommendation was declined, so the recommendation's
+   * tool-call result stayed live in Emma's context forever and any vaguely
+   * on-topic next message could get her to self-launch it via
+   * launch_predefined_work_plan (live-confirmed on env1, twice). This is the
+   * server-side half of the fix: a discrete out-of-band state mutation with
+   * no chat-turn semantics, same shape as acceptWorkPlanRecommendation right
+   * above (which also doesn't go through /generate) — NOT the
+   * questionAnswer/workPlanInputAnswer generate-body-field pattern, because
+   * declining isn't an answer that continues the conversation.
+   *
+   * Deliberately NEVER calls applyPredefinedWorkPlan — declining must only
+   * ever record the decline, never mutate session.workPlan.
+   */
+  async declineWorkPlanRecommendation(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId, recommendationId } = req.params;
+      const user = req.user as User;
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Owner-only — no admin bypass, same reasoning as accept above.
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can decline a work plan recommendation.' });
+      }
+
+      const { findWorkPlanRecommendationToolResult } = await import('../services/predefinedWorkPlanResolver');
+
+      const recommendation = findWorkPlanRecommendationToolResult(
+        session.messages,
+        (r) => r.recommendationId === recommendationId,
+      );
+      if (!recommendation || !recommendation.plan?.id) {
+        return res.status(404).json({
+          error: 'RECOMMENDATION_NOT_FOUND',
+          code: 'RECOMMENDATION_NOT_FOUND',
+          message: 'This work plan recommendation is no longer available.',
+        });
+      }
+
+      // Independent review finding: this return value was previously discarded, so the
+      // endpoint always answered 200 even when the write never actually happened (e.g. the
+      // session was deleted/purged in the window between the getChatSession check above and
+      // this write — the only path that returns false). A silently-unrecorded decline is
+      // exactly the "the model has no idea this was declined" defect this whole PR exists to
+      // close, so a failed write must surface as a real error, not a false-positive success.
+      const recorded = await chatbotDb.recordDeclinedWorkPlanRecommendation(sessionId, recommendationId, {
+        planId: recommendation.plan.id,
+        planTitle: recommendation.plan.title,
+        declinedAt: new Date().toISOString(),
+      });
+      if (!recorded) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      return res.status(200).json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Decline work plan recommendation error:', error);
+      res.status(500).json({ error: 'Failed to decline work plan recommendation' });
     }
   },
 

@@ -1,4 +1,5 @@
 import { AgentModeService } from '../services/agentModeService';
+import { sanitizeGeneratedHtml } from '../utils/htmlSanitizer';
 
 // Mirror the mock set used by the other AgentModeService loop tests so the
 // module graph loads cleanly (do NOT mock axios/aws-sdk — that breaks the
@@ -72,9 +73,27 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
     expect(res.s3_url).toContain('https://');
     // The render LLM must NOT be invoked for already-complete HTML.
     expect(mockGenerateHTML).not.toHaveBeenCalled();
-    // The user's exact HTML must be uploaded verbatim (not re-generated / altered).
+    // ENG-1997: the passthrough is no longer byte-identical — it's sanitized
+    // first (the model's own draft can faithfully reproduce markup from
+    // untrusted quoted content with nothing else to catch it). For content with
+    // nothing dangerous in it, sanitization is a no-op on meaning; assert
+    // against the real sanitizer's output rather than the raw draft.
     expect(mockUpload).toHaveBeenCalledTimes(1);
-    expect(mockUpload.mock.calls[0][0]).toBe(COMPLETE_HTML);
+    expect(mockUpload.mock.calls[0][0]).toBe(sanitizeGeneratedHtml(COMPLETE_HTML));
+  });
+
+  it('neutralizes a script tag and an event-handler payload in an already-complete HTML draft (ENG-1997)', async () => {
+    const evil = COMPLETE_HTML.replace(
+      '<p>Real content here.</p>',
+      '<p>Feedback: <script>alert(1)</script> and <img src=x onerror=alert(1)></p>',
+    );
+    const res = await service.createHtmlFile('Acme Insight', evil, '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(true);
+    const [uploaded] = mockUpload.mock.calls[0];
+    expect(uploaded).not.toContain('<script');
+    expect(uploaded).not.toMatch(/onerror/i);
+    expect(uploaded).toContain('Feedback:');
   });
 
   it('passthrough works for arbitrarily LARGE complete HTML (the timeout case) without rendering', async () => {
@@ -83,7 +102,7 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
 
     expect(res.success).toBe(true);
     expect(mockGenerateHTML).not.toHaveBeenCalled();
-    expect(mockUpload.mock.calls[0][0]).toBe(big);
+    expect(mockUpload.mock.calls[0][0]).toBe(sanitizeGeneratedHtml(big));
   });
 
   it('inlines private images before uploading a complete HTML document', async () => {
@@ -98,7 +117,8 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
     expect(res.success).toBe(true);
     expect(require('../utils/inlineS3Images').createDefaultS3ImageFetcher)
       .toHaveBeenCalledWith('user-1');
-    expect(mockInlineImages).toHaveBeenCalledWith(COMPLETE_HTML, expect.any(Function));
+    // ENG-1997: sanitization now runs before image inlining.
+    expect(mockInlineImages).toHaveBeenCalledWith(sanitizeGeneratedHtml(COMPLETE_HTML), expect.any(Function));
     expect(mockUpload).toHaveBeenCalledWith(inlined, expect.any(String), 'user-1', 'text/html');
   });
 
@@ -135,8 +155,10 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
     const res = await service.createHtmlFile('Summary', 'Render this draft.', '', 'user-1', 'sess-1', 'document');
 
     expect(res.success).toBe(true);
+    // ENG-1997: sanitization runs on the LLM's rendered output before inlining.
+    // This benign fragment has nothing to strip, so it's unchanged either way.
     expect(mockInlineImages).toHaveBeenCalledWith(
-      '<html><body>RENDERED BY LLM</body></html>',
+      sanitizeGeneratedHtml('<html><body>RENDERED BY LLM</body></html>'),
       expect.any(Function),
     );
     expect(mockUpload.mock.calls[0][0]).toContain('RENDERED WITH DATA URI');
