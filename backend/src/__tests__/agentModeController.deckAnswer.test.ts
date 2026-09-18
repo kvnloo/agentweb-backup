@@ -241,6 +241,45 @@ describe('generateResponse — approval-deck answer channel (ENG-1635/1644)', ()
     expect(workerArgs.messageContent).toContain('id-AS_1');
   });
 
+  it('ENG-1635/1644 (found live 2026-09-18): a partially_applied/unapplied outcome includes an explicit instruction not to silently retry an identical failed write', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingDeck()) as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue({
+      outcome: 'submitted',
+      run: { runId: 'run-1' },
+      summary: {
+        status: 'unapplied',
+        items: [
+          { stepId: 'write-1', status: 'failed', error: 'Your ad set budget must be more than ₹94.91 or your ads may not deliver. (Meta code 100, subcode 1885272)' },
+          { stepId: 'write-2', status: 'failed', error: 'Your ad set budget must be more than ₹94.91 or your ads may not deliver. (Meta code 100, subcode 1885272)' },
+        ],
+      },
+      answeredDeck: {
+        ...pendingDeck(),
+        status: 'answered',
+        answers: [
+          { itemId: 'write-1', verdict: 'approve', answeredBy: 'user', at: '2026-09-15T00:00:02.000Z' },
+          { itemId: 'write-2', verdict: 'approve', answeredBy: 'user', at: '2026-09-15T00:00:02.000Z' },
+        ],
+      },
+    });
+
+    const res = makeRes();
+    const answers = [
+      { itemId: 'write-1', verdict: 'approve' },
+      { itemId: 'write-2', verdict: 'approve' },
+    ];
+    await agentModeController.generateResponse(
+      makeReq({ userId: ownerId }, { deckId: 'deck-1', answers }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const workerArgs = (mockWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+    expect(workerArgs.messageContent).toContain('unapplied');
+    expect(workerArgs.messageContent).toContain('budget must be more than ₹94.91');
+    expect(workerArgs.messageContent).toContain('Do NOT silently re-propose an identical write that already failed.');
+  });
+
   it('ENG-1635/1644 round 6: the persisted/displayed user message is the clean label, byte-for-byte — no outcome JSON leaked onto it', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingDeck()) as any);
     (mockAgentModeService as any).submitApprovalDeckAnswers.mockResolvedValue({

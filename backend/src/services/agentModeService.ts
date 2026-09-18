@@ -21841,7 +21841,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         verify: async (executeResult): Promise<WorkflowStepVerification> => {
           const result = executeResult.dispatchResult as MetaApiResult | undefined;
           if (!result || result.success !== true) {
-            return { verified: false, error: result?.error || result?.message || 'Meta write failed' };
+            // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
+            // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
+            // underlying write method built one; `error` is the raw SDK message (e.g. just
+            // "Invalid parameter") and was being checked FIRST, so the `||` chain always
+            // short-circuited on it and silently discarded the enriched text before it ever
+            // reached the deck outcome summary / answerAck. Found live: a repeatedly-failing
+            // ad-set create (real cause: account currency's minimum budget) got silently
+            // re-proposed identically 3 times with no explanation ever surfaced, because
+            // Emma never actually received anything more specific than "Invalid parameter."
+            return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
           }
           // Reuses whatever read-back mismatch detection the underlying write
           // method already performs (Phase 1's existing resolver — today,

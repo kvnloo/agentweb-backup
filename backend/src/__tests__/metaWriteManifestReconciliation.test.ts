@@ -182,6 +182,29 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     expect(verified.map((i) => i.appliedObjectId).sort()).toEqual(['id-AS_94041', 'id-AS_94536'].sort());
   });
 
+  it('ENG-1635/1644 (found live 2026-09-18): the enriched, actionable message wins over the raw SDK error when they differ', async () => {
+    // Mirrors a real write method's catch block (agentModeService.ts's createMetaAdsAdSet
+    // etc.): `error` is the raw top-level SDK message, `message` is enrichMetaError's
+    // human-readable, actionable text. Found live: verify() checked `error` FIRST, so the
+    // `||` chain always short-circuited on the raw string and silently discarded the
+    // enriched one — a repeatedly-failing write ("Budget Is Too Low") got silently
+    // re-proposed identically 3 times because Emma only ever saw "Invalid parameter."
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({
+      success: false,
+      error: 'Invalid parameter',
+      message: 'Your ad set budget must be more than ₹94.91 or your ads may not deliver. (Meta code 100, subcode 1885272)',
+    });
+
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
+
+    expect(result.outcome).toBe('submitted');
+    if (result.outcome !== 'submitted') throw new Error('unreachable');
+    const failed = result.summary!.items.filter((i) => i.status === 'failed');
+    expect(failed.length).toBeGreaterThan(0);
+    expect(failed[0].error).toContain('budget must be more than ₹94.91');
+    expect(failed[0].error).not.toBe('Invalid parameter');
+  });
+
   it('all writes failing reconciles to unapplied, not partially_applied', async () => {
     jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: false, error: 'Invalid parameter' });
 

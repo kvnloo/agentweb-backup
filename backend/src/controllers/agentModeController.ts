@@ -9236,13 +9236,26 @@ export const agentModeController = {
             return { itemId: item.itemId, question: item.question, selected: pickedOption?.label ?? ans.verdict };
           })
           .filter((s): s is { itemId: string; question: string; selected: string } => s !== null);
+        const deckOutcomeStatus = isWriteDeck ? (result.summary?.status ?? 'nothing_approved') : 'answered';
+        // Found live: a write that failed Meta-side validation (e.g. a budget under the
+        // account's real minimum) got silently re-proposed identically 3 times in a row —
+        // the per-item `error` was present in this same JSON the whole time, but nothing
+        // told Emma what to DO with a failure, so she just retried instead of explaining it
+        // to the user or adjusting the params herself. A bare JSON dump relies entirely on
+        // the model inferring the right response; make it explicit instead.
+        const failureInstruction = (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
+          ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
+            'actual failure to the user in plain language, and adjust the params yourself if the error ' +
+            'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
+            'the same write again. Do NOT silently re-propose an identical write that already failed.'
+          : '';
         const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
-          status: isWriteDeck ? (result.summary?.status ?? 'nothing_approved') : 'answered',
+          status: deckOutcomeStatus,
           ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
           ...(selections.length > 0 ? { selections } : {}),
           ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
           ...(commented.length > 0 ? { commented } : {}),
-        })}]`;
+        })}]${failureInstruction}`;
         answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
       }
 
