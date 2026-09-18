@@ -4934,6 +4934,20 @@ describe('scheduled-chat activation gates (ENG-1552)', () => {
       expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toBeUndefined();
     });
 
+    it.each([
+      ['a bare string', 'analyst@customer.example'],
+      ['a JSON-array string', ['["analyst@customer.example"]']],
+    ])('a no-op save on an older row whose recipients are stored as %s is not treated as a change', async (_l, stored) => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, lastKnownSensitive: true, emailNotifications: stored,
+      } as any);
+      const r = res();
+      // The portal echoes the stored value straight back.
+      await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed', emailNotifications: stored }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+    });
+
     it('a rename leaves the sensitivity flag alone', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, lastKnownSensitive: true } as any);
       await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed' }), res());
