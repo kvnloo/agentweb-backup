@@ -123,48 +123,62 @@ async function fillAllRequiredFields(
   const fieldKinds = await browserPage
     .evaluate(() => {
       const form = document.querySelector("form") ?? document;
+      // Return complete selectors from discovery so the caller never has to guess
+      // whether a reference is an id or a name: a name-only control such as
+      // <input name="email"> must become [name="email"], not #email.
+      const selFor = (el: Element, fallback: string): string => {
+        const input = el as HTMLInputElement;
+        if (input.id) return `#${input.id}`;
+        if (input.name) return `[name="${input.name}"]`;
+        return fallback;
+      };
       const textInputs = [...form.querySelectorAll('input[type="email"]')].map(
-        (el) => (el as HTMLInputElement).id || (el as HTMLInputElement).name || 'input[type="email"]'
+        (el) => selFor(el, 'input[type="email"]')
       );
       const telInputs = [...form.querySelectorAll('input[type="tel"]')].map(
-        (el) => (el as HTMLInputElement).id || (el as HTMLInputElement).name || 'input[type="tel"]'
+        (el) => selFor(el, 'input[type="tel"]')
       );
       const otherTexts = [
         ...form.querySelectorAll('input[type="text"], input:not([type])'),
-      ].map(
-        (el) => (el as HTMLInputElement).id || (el as HTMLInputElement).name || 'input[type="text"]'
-      );
-      const selects = [...form.querySelectorAll("select")].map((el, i) => ({
-        selector:
-          (el as HTMLSelectElement).id ||
-          (el as HTMLSelectElement).name ||
-          `select >> nth=${i}`,
-        options: [...(el as HTMLSelectElement).options]
-          .filter((o) => o.value)
-          .map((o) => o.value),
-      }));
-      const checkables = [...form.querySelectorAll('input[type="checkbox"], input[type="radio"]')].map(
-        (el) => (el as HTMLInputElement).id || (el as HTMLInputElement).name || 'input[type="checkbox"]'
-      );
+      ].map((el) => selFor(el, 'input[type="text"]'));
+      const selects = [...form.querySelectorAll("select")].map((el, i) => {
+        const sel = el as HTMLSelectElement;
+        return {
+          selector: sel.id
+            ? `#${sel.id}`
+            : sel.name
+              ? `[name="${sel.name}"]`
+              : `select >> nth=${i}`,
+          options: [...sel.options].filter((o) => o.value).map((o) => o.value),
+        };
+      });
+      const checkables = [
+        ...form.querySelectorAll('input[type="checkbox"], input[type="radio"]'),
+      ].map((el) => {
+        const input = el as HTMLInputElement;
+        return {
+          selector: selFor(el, 'input[type="checkbox"]'),
+          type: input.type,
+          name: input.name || null,
+          required: input.required,
+        };
+      });
       return { textInputs, telInputs, otherTexts, selects, checkables };
     })
     .catch(() => null);
-  if (!fieldKinds) return;
+  if (!fieldKinds) return { lastTextSelector: null as string | null };
 
   const toSelector = (ref: string): string => {
-    if (ref.startsWith("input") || ref.startsWith("select")) return ref;
-    // CSS.escape is a browser global, not available in Node — fall back to a
-    // simple escape for the ids this helper encounters (alphanumeric/_/-).
-    const esc =
-      typeof CSS !== "undefined" && typeof CSS.escape === "function"
-        ? CSS.escape(ref)
-        : ref.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
-    return `#${esc}`;
+    // Discovery already returns complete selectors (#id, [name="..."], or a
+    // positional fallback); pass them through untouched.
+    return ref;
   };
 
+  let lastTextSelector: string | null = null;
   for (const ref of fieldKinds.textInputs) {
     try {
       await browserPage.fill(toSelector(ref), email);
+      if (!lastTextSelector) lastTextSelector = toSelector(ref);
     } catch {
       // best-effort per field
     }
@@ -172,6 +186,7 @@ async function fillAllRequiredFields(
   for (const ref of fieldKinds.telInputs) {
     try {
       await browserPage.fill(toSelector(ref), testPhone);
+      if (!lastTextSelector) lastTextSelector = toSelector(ref);
     } catch {
       // best-effort per field
     }
@@ -184,9 +199,15 @@ async function fillAllRequiredFields(
         ? "Smoke"
         : lower.includes("zip") || lower.includes("postal")
           ? "94025"
-          : "Smoke Test";
+          : lower.includes("url") ||
+              lower.includes("website") ||
+              lower.includes("site") ||
+              lower.includes("link")
+            ? "https://example.com"
+            : "Smoke Test";
     try {
       await browserPage.fill(toSelector(ref), value);
+      lastTextSelector = toSelector(ref);
     } catch {
       // best-effort per field
     }
@@ -199,13 +220,37 @@ async function fillAllRequiredFields(
       // hidden/custom selects (e.g. Radix comboboxes with valid defaults) — leave alone
     }
   }
-  if (fieldKinds.checkables.length > 0) {
+  // Check EVERY required checkbox and one radio per required group. The old path
+  // checked only the first control, so a form with multiple required checkboxes
+  // (or an optional control first) stayed validation-blocked and never submitted.
+  const requiredBoxes = fieldKinds.checkables.filter(
+    (c) => c.type === "checkbox" && c.required
+  );
+  const requiredRadios = fieldKinds.checkables.filter(
+    (c) => c.type === "radio" && c.required
+  );
+  const radiosByGroup = new Map<string, { selector: string }>();
+  for (const r of requiredRadios) {
+    const key = r.name ?? r.selector;
+    if (!radiosByGroup.has(key)) radiosByGroup.set(key, r);
+  }
+  const toCheck = requiredBoxes.length > 0 || radiosByGroup.size > 0
+    ? [...requiredBoxes, ...radiosByGroup.values()]
+    : fieldKinds.checkables.length > 0
+      ? [
+          typeof fieldKinds.checkables[0] === "string"
+            ? { selector: fieldKinds.checkables[0] as string }
+            : fieldKinds.checkables[0],
+        ] // no required info (e.g. older mock shape) — best-effort fallback
+      : [];
+  for (const c of toCheck) {
     try {
-      await browserPage.check(toSelector(fieldKinds.checkables[0]));
+      await browserPage.check(toSelector(c.selector));
     } catch {
       // custom checkbox widgets without a checkable input — leave alone
     }
   }
+  return { lastTextSelector };
 }
 
 /**
@@ -313,16 +358,34 @@ async function runGenerationSmokeTestNow(
     // real visitors.
     const testPhone = `555${String(Date.now()).slice(-7)}`; // unique 10-digit, 555 = fictional range
     const email = buildSmokeTestEmail();
-    await fillAllRequiredFields(browserPage, email, testPhone);
+    const { lastTextSelector } = await fillAllRequiredFields(
+      browserPage,
+      email,
+      testPhone
+    );
 
+    // Capture the pre-submit URL BEFORE the submission action: if click/Enter
+    // completes a same-instant handoff redirect, reading it after would already
+    // see the handoff URL and waitForURL would time out on a success.
+    const urlBeforeSubmit = browserPage.url();
     try {
-      // Prefer an explicit submit button; fall back to Enter in the last-filled field.
+      // Prefer an explicit submit button; fall back to requestSubmit() on the
+      // first form (pressing Enter on a broad 'input, select, textarea' selector
+      // can land on a checkbox/radio/hidden/select where Enter never submits).
       // Playwright's click() auto-waits for the button to become actionable, which covers
       // client-side validation that enables submit only after all fields pass.
       await browserPage.click('button[type="submit"], input[type="submit"]');
     } catch {
-      // No submit button found by that selector — fall back to submitting via Enter.
-      await browserPage.press('input, select, textarea', "Enter");
+      // No submit button found by that selector — submit the form directly.
+      try {
+        await browserPage.evaluate(() => {
+          document.querySelector("form")?.requestSubmit();
+        });
+      } catch {
+        // No form element (or requestSubmit unsupported) — Enter in the last
+        // filled text field as a final fallback.
+        await browserPage.press(lastTextSelector ?? 'input[type="text"]', "Enter");
+      }
     }
 
     // A React/chat-handoff form may legitimately redirect on success (e.g. to
@@ -331,7 +394,6 @@ async function runGenerationSmokeTestNow(
     // (or the appearance of a handoff_id in the URL) right after submit is positive
     // evidence the pipeline accepted the lead; treat it as captured. Only when the page
     // stays put (no navigation) do we poll the CRM by email.
-    const urlBeforeSubmit = browserPage.url();
     let navigatedAway = false;
     try {
       await browserPage.waitForURL(

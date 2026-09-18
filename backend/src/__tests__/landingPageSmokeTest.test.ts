@@ -217,29 +217,57 @@ describe("runGenerationSmokeTest", () => {
     expect(result.error).toMatch(/No Chrome executable found/);
   });
 
-  it("SUCCESS: form has no submit button → falls back to pressing Enter", async () => {
+  it("SUCCESS: form has no submit button → submits the form directly", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
     mockPage.click.mockRejectedValueOnce(new Error("no button found"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
-    expect(mockPage.press).toHaveBeenCalledWith("input, select, textarea", "Enter");
+    expect(mockPage.evaluate).toHaveBeenCalled();
+    expect(mockPage.press).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
   });
 
-  it("SUCCESS: React multi-field form (name/phone/zip + selects + checkbox) → fills all fields, lead lands → ok:true", async () => {
+  it("SUCCESS: form has no form element either → Enter in last filled text field", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    mockPage.click.mockRejectedValueOnce(new Error("no button found"));
+    // Discovery resolves (records the email selector); only the form-submit
+    // evaluate rejects (no <form> for requestSubmit), so the fallback presses
+    // Enter in the last filled text field.
+    (mockPage.evaluate as jest.Mock)
+      .mockResolvedValueOnce({
+        textInputs: ['input[type="email"]'],
+        telInputs: [],
+        otherTexts: [],
+        selects: [],
+        checkables: [],
+      })
+      .mockRejectedValueOnce(new Error("no form"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.press).toHaveBeenCalledWith('input[type="email"]', "Enter");
+  });
+
+  it("SUCCESS: React multi-field form (name/phone/zip + selects + checkboxes) → fills all fields, lead lands → ok:true", async () => {
     // Mirrors campaign.waterheater.app root 2026-09-18: the old fill-email-only path
     // left client-side validation failing so submit never fired (false-negative FAIL).
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
       textInputs: [],
-      telInputs: ["phone"],
-      otherTexts: ["full_name", "zip"],
+      telInputs: ["#phone"],
+      otherTexts: ['#full_name', '#zip'],
       selects: [
-        { selector: "urgency", options: ["emergency", "tomorrow"] },
-        { selector: "heater_type", options: ["gas", "electric"] },
+        { selector: "#urgency", options: ["emergency", "tomorrow"] },
+        { selector: "#heater_type", options: ["gas", "electric"] },
       ],
-      checkables: ["symptom-no_hot_water"],
+      checkables: [
+        { selector: "#symptom-no_hot_water", type: "checkbox", name: "symptom", required: true },
+        { selector: "#symptom-leak", type: "checkbox", name: "symptom", required: true },
+        { selector: "#plan-basic", type: "radio", name: "plan", required: true },
+        { selector: "#plan-plus", type: "radio", name: "plan", required: true },
+        { selector: "#opt-news", type: "checkbox", name: "news", required: false },
+      ],
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -250,12 +278,50 @@ describe("runGenerationSmokeTest", () => {
     expect(mockPage.fill).toHaveBeenCalledWith("#zip", "94025");
     expect(mockPage.selectOption).toHaveBeenCalledWith("#urgency", "emergency");
     expect(mockPage.selectOption).toHaveBeenCalledWith("#heater_type", "gas");
+    // Every required checkbox + one radio per required group; optional untouched.
     expect(mockPage.check).toHaveBeenCalledWith("#symptom-no_hot_water");
+    expect(mockPage.check).toHaveBeenCalledWith("#symptom-leak");
+    expect(mockPage.check).toHaveBeenCalledWith("#plan-basic");
+    expect(mockPage.check).not.toHaveBeenCalledWith("#plan-plus");
+    expect(mockPage.check).not.toHaveBeenCalledWith("#opt-news");
     expect(mockDeleteLead).toHaveBeenCalledWith("list-1", "lead-abc");
     expect(mockSendLandingPageSmokeTestAlert).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
+  });
+
+  it("SUCCESS: URL/website text field gets a URL-shaped value", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      textInputs: [],
+      telInputs: [],
+      otherTexts: ['#company_website'],
+      selects: [],
+      checkables: [],
+    });
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.fill).toHaveBeenCalledWith("#company_website", "https://example.com");
+  });
+
+  it("SUCCESS: name-only control uses a [name=...] selector, not #name", async () => {
+    // A checkbox-only mock shape (plain strings, no required info) still works
+    // via the best-effort fallback.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      textInputs: [],
+      telInputs: [],
+      otherTexts: ['[name="company"]'],
+      selects: [],
+      checkables: ["#legacy-box"],
+    });
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockPage.fill).toHaveBeenCalledWith('[name="company"]', "Smoke");
+    expect(mockPage.check).toHaveBeenCalledWith("#legacy-box");
   });
 
   it("SUCCESS: chat-handoff form redirects with handoff_id instead of a CRM row → ok:true without polling", async () => {
