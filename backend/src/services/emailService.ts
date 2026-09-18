@@ -1680,14 +1680,18 @@ Schedule ID: ${scheduleId}
       runId?: string;
     },
     scheduleId: string,
-    summary?: string
+    summary?: string,
+    // ENG-1552: false for a manual resend to an address the owner typed — that is not
+    // the scheduled delivery, so it must not overwrite the run's recorded state.
+    options?: { recordDelivery?: boolean }
   ) {
+    const deliveryScheduleId = options?.recordDelivery === false ? undefined : scheduleId;
     // ENG-1552 (the xCures / ENG-1504 class): a run can finish with a real session and
     // no output at all. Sending that is an empty report that reads as delivered, so
     // withhold it and record why — before a share link is minted or anything is composed.
-    if (!(result.actualResponse || '').trim()) {
+    if (!String(result.actualResponse ?? '').trim()) {
       if (deliveryEnforcementEnabled()) {
-        await this.withholdEmptyScheduledReport(toEmails, result, scheduleId);
+        await this.withholdEmptyScheduledReport(toEmails, result, deliveryScheduleId);
         return;
       }
       // Shadow mode: send exactly as before; the send is still recorded below.
@@ -1916,7 +1920,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // (a status message ONLY — never the report data) so the report is not
         // lost without a signal and the owner can add an authorized recipient.
         console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
-        await recordReportDeliveryState(scheduleId, {
+        await recordReportDeliveryState(deliveryScheduleId, {
           runId: runKey,
           state: 'withheld',
           reason: 'no_authorized_recipients',
@@ -1935,7 +1939,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         });
       } else {
         // Send ONE email to all authorized recipients
-        await this.deliverScheduledReport(scheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
+        await this.deliverScheduledReport(deliveryScheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
       }
 
@@ -2027,7 +2031,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
    * a non-prod suppression is `delivery_attempted` with the reason.
    */
   async deliverScheduledReport(
-    scheduleId: string,
+    scheduleId: string | undefined,
     runId: string,
     recipients: string[],
     withheld: string[],
@@ -2059,7 +2063,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   async withholdEmptyScheduledReport(
     toEmails: string | string[],
     result: { sessionId: string; runId?: string },
-    scheduleId: string,
+    scheduleId: string | undefined,
   ): Promise<void> {
     const emailList = (Array.isArray(toEmails) ? toEmails : [toEmails]).filter(Boolean);
     console.error(`Scheduled report for schedule ${scheduleId} (session ${result.sessionId || 'none'}) has no content; NOT sent to ${emailList.length} recipient(s).`);
@@ -2294,8 +2298,11 @@ Sent via AgentWeb: ${customerFrontendUrl}
     scheduleName: string,
     todaysResults: any[],
     scheduleId: string,
-    customDate?: Date
+    customDate?: Date,
+    // ENG-1552: false for a manual resend — see sendScheduledChatResultEmail.
+    options?: { recordDelivery?: boolean }
   ) {
+    const deliveryScheduleId = options?.recordDelivery === false ? undefined : scheduleId;
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
@@ -2336,7 +2343,7 @@ Sent via AgentWeb: ${customerFrontendUrl}
       const guard = enforced ? classified : { ...classified, authorized: emailList, withheld: [] as string[] };
       if (guard.authorized.length === 0) {
         console.error(`Daily digest for schedule ${scheduleId} had no authorized recipients after the guard; digest NOT delivered.`);
-        await recordReportDeliveryState(scheduleId, {
+        await recordReportDeliveryState(deliveryScheduleId, {
           runId: digestRunKey,
           state: 'withheld',
           reason: 'no_authorized_recipients',
@@ -2561,7 +2568,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
       // Send ONE email to all authorized recipients
       await this.deliverScheduledReport(
-        scheduleId,
+        deliveryScheduleId,
         digestRunKey,
         guard.authorized,
         guard.withheld,

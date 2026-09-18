@@ -12328,15 +12328,26 @@ export const agentModeController = {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
+      // Tool names are case-sensitive everywhere else; addresses are not.
+      const sameSet = (a: unknown, b: unknown, normalize: (x: string) => string): boolean => {
+        const toSet = (v: unknown) => new Set((Array.isArray(v) ? v : []).map((x) => normalize(String(x).trim())));
+        const left = toSet(a);
+        const right = toSet(b);
+        return left.size === right.size && [...left].every((x) => right.has(x));
+      };
+      const toolsChanged = requiredFunctionCalls !== undefined
+        && !sameSet(requiredFunctionCalls, existingSchedule.requiredFunctionCalls, (x) => x);
+      const recipientsChanged = emailNotifications !== undefined
+        && !sameSet(effectiveEmailNotifications, existingSchedule.emailNotifications, (x) => x.toLowerCase());
+
       // ENG-1552: an edit to who receives an active schedule's report, or to the
       // tools it must call, can leave a cross-account report with nobody allowed
       // to read it. Checked only when the edit touches either — an unrelated edit
       // (a rename) to an already-misconfigured schedule is not refused; the run-time
       // preflight still holds that schedule's generation.
-      if (
-        existingSchedule.status === 'active' &&
-        (emailNotifications !== undefined || requiredFunctionCalls !== undefined)
-      ) {
+      // Compared as sets, not "was the field sent": the portal submits the whole form,
+      // so every save carries both lists even when only the name changed.
+      if (existingSchedule.status === 'active' && (recipientsChanged || toolsChanged)) {
         const updateRemediation = await checkScheduleActivationRecipients({
           scheduleId,
           recipients: effectiveEmailNotifications,
@@ -12344,7 +12355,7 @@ export const agentModeController = {
           schedule: {
             // A changed tool list re-decides sensitivity from scratch; the
             // breadcrumb describes the previous tools.
-            lastKnownSensitive: requiredFunctionCalls !== undefined ? undefined : (existingSchedule as any).lastKnownSensitive,
+            lastKnownSensitive: toolsChanged ? undefined : (existingSchedule as any).lastKnownSensitive,
             requiredFunctionCalls: updates.requiredFunctionCalls,
           },
         });
@@ -12491,7 +12502,7 @@ export const agentModeController = {
         // cross-account tools" could never get the schedule running again.
         [
           ...(llmModel === '' ? ['llmModel'] : []),
-          ...((requiredFunctionCalls !== undefined || effectiveStartingMessage !== previousStartingMessage)
+          ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
             && (existingSchedule as any).lastKnownSensitive !== undefined
             ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
             : []),
@@ -13355,7 +13366,8 @@ export const agentModeController = {
             schedule.scheduleName,
             sameDayResults,
             schedule.scheduleId,
-            selectedResultDate
+            selectedResultDate,
+            { recordDelivery: false }
           );
 
           const dateStr = selectedResultDate.toLocaleDateString('en-US', {
@@ -13391,7 +13403,6 @@ export const agentModeController = {
         functionCallMisses: record.functionCallMisses || [],
         executionTime: record.executionTime || 0,
         sessionId: record.sessionId,
-        runId: record.runId,
         attempt: record.attempt || 1,
         createdAt: record.createdAt || new Date().toISOString(),
       };
@@ -13403,7 +13414,8 @@ export const agentModeController = {
         schedule.scheduleName,
         resultForEmail,
         schedule.scheduleId,
-        runSummary
+        runSummary,
+        { recordDelivery: false }
       );
 
       res.json({ success: true });
@@ -15269,6 +15281,22 @@ export const agentModeController = {
         // stamp it; this path and the ENG-1723 auto-create were the two that did not.
         variableValuesUpdatedAt: now.toISOString(),
       };
+
+      // ENG-1552: a template-created schedule is live the moment it exists, like
+      // createScheduledChat's — same authorized-recipient gate, same shadow mode.
+      const templateRemediation = await checkScheduleActivationRecipients({
+        scheduleId,
+        recipients: scheduledChat.emailNotifications,
+        ownerEmail: user.email,
+        schedule: scheduledChat,
+      });
+      if (templateRemediation) {
+        if (!deliveryEnforcementEnabled()) {
+          logShadowDecision('rejected schedule create from template', { scheduleId, owner: user.email, code: templateRemediation.code });
+        } else {
+          return res.status(400).json({ error: templateRemediation.safeAction, remediation: templateRemediation });
+        }
+      }
 
       await scheduleDb.createSchedule(scheduledChat);
 
