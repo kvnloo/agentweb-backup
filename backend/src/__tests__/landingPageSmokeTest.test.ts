@@ -54,6 +54,8 @@ const SINGLE_EMAIL_FIELD = {
   checkables: [],
   submitSelector: null,
   disclosureTriggers: [],
+  skippedRequired: 0,
+  noFormOnPage: false,
 };
 
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
@@ -360,6 +362,8 @@ describe("runGenerationSmokeTest", () => {
       ],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -437,6 +441,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
@@ -469,6 +475,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
@@ -494,6 +502,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
@@ -516,6 +526,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -538,6 +550,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -560,6 +574,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -606,6 +622,8 @@ describe("runGenerationSmokeTest", () => {
       checkables: [],
       submitSelector: null,
       disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
     });
     mockPage.click.mockImplementationOnce(async () => emit());
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
@@ -729,6 +747,8 @@ describe("runGenerationSmokeTest", () => {
       .mockResolvedValueOnce({
         ...SINGLE_EMAIL_FIELD,
         disclosureTriggers: [],
+        skippedRequired: 0,
+        noFormOnPage: false,
         checkables: [
           { selector: 'label:has([id="s1"])', type: "checkbox", name: "symptoms", required: true, viaLabel: true },
         ],
@@ -756,6 +776,69 @@ describe("runGenerationSmokeTest", () => {
 
     // No second discovery pass, and the run still reaches a verdict.
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
+  });
+
+  it("HANDOFF: a slow chat app that never fires `load` is still a capture", async () => {
+    // waitForURL resolves on the load event. Requiring it as well as the cross-origin check
+    // made a genuine handoff to a slow third-party chat app look like no navigation at all —
+    // the cross-origin comparison already proves the page moved.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "",
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+      selects: [],
+      checkables: [],
+      submitSelector: null,
+      disclosureTriggers: [],
+      skippedRequired: 0,
+      noFormOnPage: false,
+    });
+    mockPage.click.mockImplementationOnce(async () => {
+      emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
+    });
+    (mockPage.waitForURL as jest.Mock).mockRejectedValueOnce(new Error("Timeout 8000ms"));
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(true);
+    expect(result.handoffId).toBe("abc123");
+  });
+
+  it("DIAGNOSIS: a page with no form is not reported as a CRM failure", async () => {
+    // Blaming the CRM for a page that has no capture mechanism at all sends whoever reads
+    // the alert hunting a bug that cannot exist. 10 of 42 live landers are in this state.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "", fields: [], selects: [], checkables: [],
+      submitSelector: null, disclosureTriggers: [], skippedRequired: 0, noFormOnPage: true,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("no lead form");
+    expect(reason).not.toContain("CRM within the timeout");
+  });
+
+  it("DIAGNOSIS: unreachable required controls are named, since they are why submit blocks", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD, disclosureTriggers: [], skippedRequired: 3, noFormOnPage: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockSendLandingPageSmokeTestAlert.mock.calls[0][2]).toContain("3 required control(s) unreachable");
+  });
+
+  it("VALUES: synthetic values respect the field's own min/max/maxlength", () => {
+    const v = (f: any) => syntheticValueFor(f, "smoke@x.test", "4155550100");
+    // an unclamped "5" fails min=1000 and blocks submit — the false negative we are removing
+    expect(v({ selector: "#b", hint: "budget", kind: "number", min: "1000" })).toBe("1000");
+    expect(v({ selector: "#q", hint: "quantity", kind: "number", max: "3" })).toBe("3");
+    expect(v({ selector: "#d", hint: "preferred date", kind: "date", max: "2026-12-31" })).toBe("2026-12-31");
+    expect(v({ selector: "#n", hint: "full name", kind: "text", maxLength: 5 })).toBe("Smoke");
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {

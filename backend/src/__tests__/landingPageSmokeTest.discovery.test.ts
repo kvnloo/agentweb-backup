@@ -22,6 +22,8 @@ type Discovered = {
   checkables: { selector: string; type: string; name: string | null; required: boolean; viaLabel: boolean }[];
   submitSelector: string | null;
   disclosureTriggers: string[];
+  skippedRequired: number;
+  noFormOnPage: boolean;
 };
 
 /** Cases default to discoverSmokeFields; `fn` selects another exported page-side function. */
@@ -118,6 +120,18 @@ const CASES: Record<string, string> = {
       <input type="email" name="email" required>
       <button type="button" id="issueType" aria-expanded="false" aria-controls="radix-listbox">Select your issue</button>
       <div id="radix-listbox" role="listbox"><div role="option">No hot water</div></div>
+    </form>`,
+  opacityControls: `
+    <form>
+      <input type="email" name="email" required>
+      <input type="text" name="fading_required" required style="opacity:0">
+      <input type="text" name="fading_optional" style="opacity:0">
+    </form>`,
+  constraints: `
+    <form>
+      <input type="number" name="budget" min="1000" required>
+      <input type="date" name="slot" max="2026-12-31" required>
+      <input type="text" name="code" maxlength="4" required>
     </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
@@ -333,6 +347,21 @@ describe("discoverSmokeFields", () => {
     // Opening one puts a listbox overlay over the page that swallows every later click,
     // including the submit — observed turning a working lander into a total failure.
     expect(got("radixSelectTrigger").disclosureTriggers).toEqual([]);
+  });
+
+  it("waits on a required control that is mid-fade, but still skips an optional invisible one", () => {
+    // Playwright's own visibility test ignores opacity and auto-waits; this sampled once,
+    // right after networkidle, so a required control mid-animation was dropped outright.
+    const names = selectorsOf(got("opacityControls"));
+    expect(names).toContain(`${SCOPE}[name="fading_required"]`);
+    expect(names).not.toContain(`${SCOPE}[name="fading_optional"]`);
+  });
+
+  it("carries each field's own constraints out of the page", () => {
+    const byName = Object.fromEntries(got("constraints").fields.map((f: any) => [f.hint.split(" ")[0], f]));
+    expect(byName.budget.min).toBe("1000");
+    expect(byName.slot.max).toBe("2026-12-31");
+    expect(byName.code.maxLength).toBe(4);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

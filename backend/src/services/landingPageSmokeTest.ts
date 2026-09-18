@@ -92,6 +92,10 @@ export type SmokeField = {
   hint: string;
   /** input type, or "textarea". */
   kind: string;
+  /** The field's own constraints, so a synthetic value cannot violate them. */
+  min?: string | null;
+  max?: string | null;
+  maxLength?: number | null;
 };
 
 export type SmokeFields = {
@@ -115,6 +119,10 @@ export type SmokeFields = {
   submitSelector: string | null;
   /** Collapsed ARIA disclosures inside the form, to be opened before a second discovery pass. */
   disclosureTriggers: string[];
+  /** Required controls the page has but we could not reach — the usual reason a submit is blocked. */
+  skippedRequired: number;
+  /** True when the page has no <form> and no fillable control at all. */
+  noFormOnPage: boolean;
 };
 
 type SmokeTestPage = {
@@ -243,7 +251,11 @@ export function discoverSmokeFields(): SmokeFields {
     if (allowLabelProxy && clickableLabel(el)) return true;
     const style = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
     if (style) {
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      // Playwright's own visibility test ignores opacity, and this samples once, right after
+      // networkidle — so a required control mid-fade-in was being dropped rather than waited
+      // for. opacity:0 on an OPTIONAL control is still treated as a hidden trap.
+      if (style.opacity === "0" && !(el as HTMLInputElement).required) return false;
     }
     return hasBox(el);
   };
@@ -322,10 +334,15 @@ export function discoverSmokeFields(): SmokeFields {
     const selector = selFor(el);
     if (!selector) continue;
     const isTextarea = el.tagName.toUpperCase() === "TEXTAREA";
+    const input = el as HTMLInputElement;
+    const maxLengthAttr = el.getAttribute("maxlength");
     fields.push({
       selector,
       hint: hintFor(el),
-      kind: isTextarea ? "textarea" : (el as HTMLInputElement).type || "text",
+      kind: isTextarea ? "textarea" : input.type || "text",
+      min: el.getAttribute("min"),
+      max: el.getAttribute("max"),
+      maxLength: maxLengthAttr ? Number(maxLengthAttr) : null,
     });
   }
 
@@ -415,7 +432,27 @@ export function discoverSmokeFields(): SmokeFields {
     }
   }
 
-  return { scope, fields, selects, checkables, submitSelector, disclosureTriggers };
+  // Required controls that exist but were filtered out (invisible, off-canvas, custom
+  // widget with no reachable input or label). These are the usual reason a lander's own
+  // validation blocks submit, and saying so beats reporting "no lead in the CRM".
+  const skippedRequired = controls.filter((el) => {
+    const input = el as HTMLInputElement;
+    if (!input.required) return false;
+    const checkable = matches(el, 'input[type="checkbox"], input[type="radio"]');
+    return !usable(el, checkable);
+  }).length;
+  const noFormOnPage = forms.length === 0 && fields.length === 0 && checkables.length === 0;
+
+  return {
+    scope,
+    fields,
+    selects,
+    checkables,
+    submitSelector,
+    disclosureTriggers,
+    skippedRequired,
+    noFormOnPage,
+  };
 }
 /**
  * Chooses a format-valid synthetic value for one discovered field.
@@ -430,6 +467,31 @@ export function discoverSmokeFields(): SmokeFields {
  * Exported for unit tests.
  */
 export function syntheticValueFor(field: SmokeField, email: string, phone: string): string {
+  const value = chooseSyntheticValue(field, email, phone);
+  // Respect the field's own constraints: a value that violates min/max/maxlength fails the
+  // lander's validation and blocks submit, which is the false negative this path exists to
+  // remove. Length is trimmed last so a clamped number is never re-truncated.
+  if (field.kind === "number") {
+    const numeric = Number(value);
+    const min = field.min != null && field.min !== "" ? Number(field.min) : null;
+    const max = field.max != null && field.max !== "" ? Number(field.max) : null;
+    let clamped = Number.isFinite(numeric) ? numeric : 1;
+    if (min !== null && Number.isFinite(min) && clamped < min) clamped = min;
+    if (max !== null && Number.isFinite(max) && clamped > max) clamped = max;
+    return String(clamped);
+  }
+  if (field.kind === "date") {
+    if (field.max && value > field.max) return field.max;
+    if (field.min && value < field.min) return field.min;
+    return value;
+  }
+  if (field.maxLength && field.maxLength > 0 && value.length > field.maxLength) {
+    return value.slice(0, field.maxLength);
+  }
+  return value;
+}
+
+function chooseSyntheticValue(field: SmokeField, email: string, phone: string): string {
   const hint = field.hint || "";
   if (field.kind === "email" || /e-?mail/.test(hint)) return email;
   if (field.kind === "tel" || /phone|\btel\b|mobile|cell/.test(hint)) return phone;
@@ -454,6 +516,10 @@ export type FillOutcome = {
   scope: string;
   /** Submit control resolved page-side, or null when discovery could not find one. */
   submitSelector: string | null;
+  /** Required controls the page has but we could not reach. */
+  skippedRequired: number;
+  /** The page has no form and nothing fillable — there is no capture path to test. */
+  noFormOnPage: boolean;
 };
 
 /**
@@ -526,6 +592,8 @@ async function fillAllRequiredFields(
       attempted: 0,
       scope: "",
       submitSelector: null,
+      skippedRequired: 0,
+      noFormOnPage: false,
     };
   }
 
@@ -611,6 +679,8 @@ async function fillAllRequiredFields(
     attempted,
     scope: discovered.scope || "",
     submitSelector: discovered.submitSelector ?? null,
+    skippedRequired: discovered.skippedRequired ?? 0,
+    noFormOnPage: !!discovered.noFormOnPage,
   };
 }
 
@@ -648,6 +718,7 @@ async function runGenerationSmokeTestNow(
   let error: string | undefined;
   let diagnostics = "no submission attempted";
   let handoffId: string | null = null;
+  let noFormOnPage = false;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
   try {
@@ -882,7 +953,11 @@ async function runGenerationSmokeTestNow(
     } catch {
       // Unparseable URL — not a verifiable handoff; fall through to the CRM poll.
     }
-    const redirectedToHandoff = navigatedAway && handoffEvidence !== null && submitAccepted;
+    // No `navigatedAway` conjunct: handoffEvidence already requires the post-submit URL to
+    // be a DIFFERENT origin than the pre-submit one, which is proof of navigation on its
+    // own. waitForURL resolves on the `load` event, so a slow third-party chat app made a
+    // genuine handoff look like no navigation at all.
+    const redirectedToHandoff = handoffEvidence !== null && submitAccepted;
     if (redirectedToHandoff) handoffId = handoffEvidence;
 
     // Always poll — on the handoff path too, and even when no email-keyed field was found.
@@ -907,8 +982,12 @@ async function runGenerationSmokeTestNow(
     // Every non-error failure used to report the same "lead did not land in the CRM"
     // string, which is what made the 2026-09-18 false-negatives so hard to diagnose:
     // it cannot distinguish "never submitted" from "submitted and the lead was lost".
+    noFormOnPage = fillOutcome.noFormOnPage;
     diagnostics = [
       `filled ${fillOutcome.filled}/${fillOutcome.attempted} field(s)`,
+      ...(fillOutcome.skippedRequired > 0
+        ? [`${fillOutcome.skippedRequired} required control(s) unreachable`]
+        : []),
       `submit=${submitPath}`,
       emailFilled ? "email field filled" : "no email field to poll by",
       navigatedAway ? `navigated to ${truncateForAlert(urlAfterSubmit)}` : "no navigation",
@@ -946,7 +1025,11 @@ async function runGenerationSmokeTestNow(
     const reason =
       error ||
       (!leadCaptured
-        ? `lead did not land in the CRM within the timeout (${diagnostics})`
+        ? noFormOnPage
+          ? // Blaming the CRM for a page that has no form at all sends whoever reads the
+            // alert looking for a capture bug that cannot exist. Say what is actually true.
+            "page has no lead form — nothing to submit, so no lead can ever be captured"
+          : `lead did not land in the CRM within the timeout (${diagnostics})`
         : // Detection is the fbq() JS call, not a network sniff — see the pixel block above.
           "Meta pixel Lead event did not fire (fbq('track','Lead') was never called)");
     await sendLandingPageSmokeTestAlert(page.id, deployedUrl, reason);
