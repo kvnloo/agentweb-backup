@@ -95,6 +95,7 @@ import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
+import { validateOpeningAction } from '../utils/openingActionValidation';
 import { validateNewChatHeroGreeting } from '../utils/newChatHeroGreeting';
 import { normalizeEmailList } from '../utils/validation';
 import {
@@ -8624,6 +8625,8 @@ export const agentModeController = {
         }
         const validationError = validateWelcomeMessage(skill.welcomeMessage);
         if (validationError) return res.status(400).json({ error: validationError });
+        const openingActionError = validateOpeningAction((skill as any).openingAction, skill.toolNames || []);
+        if (openingActionError) return res.status(400).json({ error: openingActionError });
       }
       const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
@@ -8682,9 +8685,15 @@ export const agentModeController = {
         if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
       }
       const welcomeMessage = skill?.welcomeMessage?.trim();
+      // ENG-1107 Greptile P1: when a skill carries an openingAction, the
+      // prefetch result must be the first assistant turn (contract clause 2).
+      // Seeding the welcome here would put it ahead of the prefetch, so skip
+      // the seed in that case — the welcome text is folded into the prefetch
+      // first turn below instead of being lost.
+      const hasOpeningAction = Boolean(skillId && skill && (skill as any)?.openingAction);
       const initialSkillState = skillId ? {
         llmModel: modelToUse, associatedSkills: [skillId],
-        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+        messages: (welcomeMessage && !hasOpeningAction) ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
       } : undefined;
       const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
@@ -8715,9 +8724,51 @@ export const agentModeController = {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
       }
 
+      // ENG-1107: run the authorized skill's bounded prefetch AFTER the session
+      // exists (auth already completed above), then append the rendered first
+      // turn. A skill without an openingAction costs nothing — no dispatch.
+      let prefetchMessages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] = [];
+      if (skillId && skill && (skill as any)?.openingAction) {
+        try {
+          const authorizedSkill = skill as NonNullable<typeof skill>;
+          const applied = await agentModeService.applyOpeningAction(authorizedSkill, user.userId, session.sessionId);
+          prefetchMessages = applied.messages as typeof prefetchMessages;
+          if (welcomeMessage && prefetchMessages.length > 0) {
+            // ENG-1107 Greptile P1: cap the combined first turn — a long
+            // welcome prepended after applyOpeningAction's own cap could
+            // otherwise exceed maxChars / the global output bound.
+            const combinedLimit = Math.min(
+              ((skill as any)?.openingAction?.maxChars as number | undefined) ?? 4000,
+              8000,
+            );
+            const combined = `${welcomeMessage}\n\n${prefetchMessages[0].content}`.slice(0, combinedLimit);
+            prefetchMessages = [{ ...prefetchMessages[0], content: combined }, ...prefetchMessages.slice(1)];
+          }
+          await chatbotDb.addMessagesToSession(session.sessionId, prefetchMessages as any);
+        } catch (prefetchError) {
+          // ENG-1107 CodeRabbit: the session already exists and must still be
+          // returned — a failed prefetch-message persist must not become a 500
+          // (which would orphan this session on idempotent retry).
+          console.error('AgentMode: opening-action prefetch failed loudly:', prefetchError);
+          // ENG-1107 CodeRabbit: preserve the welcome on the persistence
+          // fallback path too — the initial state carries no messages, so a
+          // bare fallback would lose the configured welcome text.
+          const fallbackContent = welcomeMessage
+            ? `${welcomeMessage}\n\nI could not fetch the opening material. Tell me what to work on and we will start from there.`
+            : 'I could not fetch the opening material. Tell me what to work on and we will start from there.';
+          prefetchMessages = [{ role: 'assistant', content: fallbackContent, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }];
+          try {
+            await chatbotDb.addMessageToSession(session.sessionId, prefetchMessages[0] as any);
+          } catch (fallbackPersistError) {
+            console.error('AgentMode: failed to persist opening-action prefetch fallback message:', fallbackPersistError);
+          }
+        }
+      }
+
       res.status(201).json(skillId ? {
         ...sessionWithModel,
         redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+        ...(prefetchMessages.length > 0 ? { openingAssistantMessage: prefetchMessages[0].content } : {}),
       } : {
         ...sessionWithModel,
         ...(initialModelPolicy ? {
