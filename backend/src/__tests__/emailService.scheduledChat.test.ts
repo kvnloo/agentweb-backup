@@ -657,9 +657,9 @@ describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)'
   );
 
   it.each([
-    ['sent', [['delivery_attempted', undefined], ['delivered', undefined]]],
-    ['suppressed', [['delivery_attempted', undefined], ['delivery_attempted', 'suppressed_nonprod']]],
-    ['failed', [['delivery_attempted', undefined], ['delivery_attempted', 'provider_error']]],
+    ['sent', [['delivered', undefined]]],
+    ['suppressed', [['delivery_attempted', 'suppressed_nonprod']]],
+    ['failed', [['delivery_attempted', 'provider_error']]],
   ])('a %s send records exactly the delivery states it earned', async (outcome, expected) => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
     (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
@@ -702,7 +702,7 @@ describe('ENG-1552 shadow mode — empty report is sent exactly as before (enfor
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy.mock.calls[0][0]).toEqual(['a@example.com']);
     const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => c[1].state);
-    expect(states).toEqual(['delivery_attempted', 'delivered']);
+    expect(states).toEqual(['delivered']);
   });
 });
 

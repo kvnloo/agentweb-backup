@@ -85,8 +85,8 @@ describe('scheduleDb.appendDeliveryLogEntry', () => {
     expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
   });
 
-  it('trims the oldest entries past 100, bound to the length it measured', async () => {
-    const log = Array.from({ length: 102 }, (_, i) => ({ ...entry, runId: `r${i}` }));
+  it('trims the oldest entries past 30, bound to the length it measured', async () => {
+    const log = Array.from({ length: 32 }, (_, i) => ({ ...entry, runId: `r${i}` }));
     mockDocumentClientMethods.update
       .mockReturnValueOnce(resolved({ Attributes: { deliveryLog: log } }))
       .mockReturnValueOnce(resolved({}));
@@ -96,11 +96,11 @@ describe('scheduleDb.appendDeliveryLogEntry', () => {
     const trim = mockDocumentClientMethods.update.mock.calls[1][0];
     expect(trim.UpdateExpression).toBe('REMOVE #deliveryLog[0], #deliveryLog[1]');
     expect(trim.ConditionExpression).toBe('size(#deliveryLog) = :measured');
-    expect(trim.ExpressionAttributeValues[':measured']).toBe(102);
+    expect(trim.ExpressionAttributeValues[':measured']).toBe(32);
   });
 
   it('a raced trim is swallowed — the append already landed', async () => {
-    const log = Array.from({ length: 101 }, (_, i) => ({ ...entry, runId: `r${i}` }));
+    const log = Array.from({ length: 31 }, (_, i) => ({ ...entry, runId: `r${i}` }));
     mockDocumentClientMethods.update
       .mockReturnValueOnce(resolved({ Attributes: { deliveryLog: log } }))
       .mockReturnValueOnce(rejected(conditionalFailure()));

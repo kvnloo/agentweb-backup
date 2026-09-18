@@ -4907,6 +4907,24 @@ describe('scheduled-chat activation gates (ENG-1552)', () => {
       expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
     });
 
+    it('an edit to the tools or prompt clears a stale sensitivity flag, so the schedule can recover', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, status: 'paused', requiredFunctionCalls: [], lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+      } as any);
+      await agentModeController.updateScheduledChat(updateReq({ requiredFunctionCalls: [] }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
+
+      (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+      await agentModeController.updateScheduledChat(updateReq({ startingMessage: 'A different prompt' }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
+    });
+
+    it('a rename leaves the sensitivity flag alone', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, lastKnownSensitive: true } as any);
+      await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed' }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toBeUndefined();
+    });
+
     it('does not gate a paused schedule — toggling it back on is where the check runs', async () => {
       mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, status: 'paused' } as any);
       const r = res();
@@ -5097,6 +5115,34 @@ describe('ENG-1552 shadow mode (enforcement flag unset)', () => {
     expect(result.remediation).toBeUndefined();
     expect(mockEmailService.notifyScheduledReportWithheld).not.toHaveBeenCalled();
     expect(shadowLogged('skipped generation')).toBe(true);
+  });
+
+  it('the schedule list (also Emma\'s list_scheduled_chats) never carries the internal delivery fields', async () => {
+    (mockScheduleDb.getSchedulesByUserId as jest.Mock).mockResolvedValue([
+      { ...sensitive, type: 'scheduled_chat', lastKnownSensitiveAt: '2026-09-18T00:00:00.000Z', runResults: [] },
+    ]);
+    const r = res();
+    await agentModeController.getScheduledChats({ user: { userId: ownerId } } as unknown as Request, r);
+    const [row] = (r.json as jest.Mock).mock.calls[0][0];
+    expect(row.scheduleId).toBe('sched-shadow');
+    expect(row).not.toHaveProperty('deliveryLog');
+    expect(row).not.toHaveProperty('lastKnownSensitive');
+    expect(row).not.toHaveProperty('lastKnownSensitiveAt');
+    expect(row).not.toHaveProperty('runResults');
+  });
+
+  it('a test-email resend is recorded against its run, not the session', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...sensitive, frequency: 'weekly' } as any);
+    (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([
+      { runId: 'run-7', sessionId: 'sess-7', passed: true, actualResponse: 'Report', createdAt: new Date().toISOString() },
+    ]);
+    const r = res();
+    await agentModeController.sendScheduledChatTestEmail({
+      user: { userId: ownerId }, params: { scheduleId: 'sched-shadow', runId: 'run-7' }, body: { toEmail: 'me@customer.example' },
+    } as unknown as Request, r);
+    expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
+      ['me@customer.example'], expect.any(String), expect.objectContaining({ runId: 'run-7', sessionId: 'sess-7' }), 'sched-shadow', undefined,
+    );
   });
 
   it('test-history carries no delivery field, and the confirm endpoint does not exist', async () => {

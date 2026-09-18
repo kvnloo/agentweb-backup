@@ -288,7 +288,7 @@ describe('Daily Digest Email Service', () => {
       (emailService.sendEmail as jest.Mock).mockResolvedValue('failed');
       await emailService.sendDailyDigestEmail(['a@example.com'], 'Hourly', [run('session-1')], 'schedule-1');
       const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => [c[1].state, c[1].reason]);
-      expect(states).toEqual([['delivery_attempted', undefined], ['delivery_attempted', 'provider_error']]);
+      expect(states).toEqual([['delivery_attempted', 'provider_error']]);
     });
   });
 
@@ -297,6 +297,17 @@ describe('Daily Digest Email Service', () => {
       delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT;
       (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue('http://localhost:5174/ishare/x');
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-2', userId: 'owner-id', calledFunctions: { list_all_clients: 1 } });
+    });
+
+    it('leaves an empty run\'s preview blank, exactly as before — the placeholder is enforcement-only', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-1', userId: 'owner-id', calledFunctions: {} });
+      await emailService.sendDailyDigestEmail(['a@example.com'], 'Hourly', [{
+        passed: true, actualResponse: '', keywordMatches: [], keywordMisses: [], functionCallMatches: [],
+        functionCallMisses: [], executionTime: 1000, sessionId: 'session-1', attempt: 1, createdAt: '2024-01-15T10:00:00Z',
+      }], 'schedule-1');
+      const [, , text, html] = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      expect(html).not.toContain('no report content');
+      expect(text).not.toContain('no report content');
     });
 
     it('sends a sensitive digest to every configured recipient with no withheld notice', async () => {
