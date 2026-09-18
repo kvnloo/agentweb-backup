@@ -6493,6 +6493,95 @@ export class AgentModeService {
     return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
   }
 
+  /**
+   * ENG-1107: run a skill's bounded `openingAction.prefetch` after canonical
+   * authenticated authorization, using the canonical tool gateway
+   * (`executeTool` — never raw dispatch). Read tools only: every call must
+   * name a tool in the skill's own `toolNames`, and validation rejects
+   * anything persisted outside that set before execution. Bounded call count,
+   * deadline, and rendered output; any failure degrades LOUDLY — a plain
+   * failure statement, never a silent blank, never fabricated material.
+   * No LLM narration: results are rendered deterministically.
+   */
+  public async applyOpeningAction(
+    skill: Skill,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ messages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] }> {
+    const action = skill.openingAction;
+    if (!action) return { messages: [] };
+    const { validateOpeningAction, OPENING_ACTION_MAX_CHARS } = await import('../utils/openingActionValidation');
+    const invalid = validateOpeningAction(action, skill.toolNames || []);
+    if (invalid) {
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material (${invalid}). Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    const timeoutMs = action.timeoutMs ?? 15000;
+    const maxChars = action.maxChars ?? 4000;
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    const rendered: string[] = [];
+    const failures: string[] = [];
+    const llmModel = await this.getDefaultModel();
+    // ENG-1107 CodeRabbit: scope gateway failure accounting to this opening
+    // run (per-session run id + session budget scope) so a repeatedly failing
+    // read tool trips the repeated-failure breaker instead of re-executing
+    // for every entry in action.calls.
+    const openingRunId = `opening-action:${sessionId}`;
+    for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
+      // ENG-1107 Greptile P1: membership in the skill tool set does not prove
+      // read-only — a skill may carry mutating tools (calendar create/update,
+      // etc.). Prefetch auto-executes on session open with no user instruction,
+      // so only gateway-classified `read` tools may run here; anything else
+      // degrades loudly instead of executing.
+      const policy = evaluateAgentToolPolicy({ toolName: call.tool, args: call.args ?? {} });
+      if (!policy.allowed || policy.effect !== 'read') {
+        failures.push(`${call.tool}: not a read tool (effect=${policy.effect}) — skipped`);
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) { failures.push('deadline exceeded'); break; }
+      try {
+        // ENG-1107 Greptile P1: race each call against the remaining deadline
+        // so a stalled tool cannot hold session creation open past the bound.
+        // Routed through the canonical gateway (budget/breaker accounting
+        // scoped to this opening run) rather than raw executeTool.
+        const outcome = await Promise.race([
+          executeAgentToolThroughGateway({
+            toolName: call.tool,
+            args: call.args ?? {},
+            runId: openingRunId,
+            budgetScopeId: sessionId,
+            execute: () => this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+          }),
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error(`opening-action deadline exceeded after ${Math.min(timeoutMs, 30_000)}ms`)),
+            remainingMs,
+          )),
+        ]);
+        if (outcome.status === 'error') throw outcome.error;
+        const result = outcome.result;
+        const text = typeof result === 'string' ? result : JSON.stringify(result);
+        rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
+      } catch (err) {
+        failures.push(`${call.tool}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (rendered.length === 0) {
+      const reason = failures.length ? ` (${failures.join('; ')})` : '';
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material${reason}. Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
+    // just the body — a long failure tail could otherwise exceed the bound.
+    // Reserve space for the failure note first so a large successful result
+    // cannot truncate the loud-failure signal away.
+    const contentLimit = Math.min(maxChars, OPENING_ACTION_MAX_CHARS);
+    const failureNote = failures.length
+      ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).`
+      : '';
+    const content = `${rendered.join('\n\n').slice(0, Math.max(0, contentLimit - failureNote.length))}${failureNote}`
+      .slice(0, contentLimit);
+    return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
+  }
+
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
