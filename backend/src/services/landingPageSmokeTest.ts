@@ -119,7 +119,7 @@ async function fillAllRequiredFields(
   browserPage: SmokeTestPage,
   email: string,
   testPhone: string
-): Promise<void> {
+): Promise<{ lastTextSelector: string | null }> {
   const fieldKinds = await browserPage
     .evaluate(() => {
       const form = document.querySelector("form") ?? document;
