@@ -65,7 +65,7 @@ function brand(opts: { websites?: Array<{ website: string; domain: string; topLe
         .map((node) => ({ node })),
     },
     cardTransactions: {
-      edges: opts.txns ?? [txn('card_revenue_amount', 4_250_000), txn('card_revenue_yoy_growth', 1.32)],
+      edges: opts.txns ?? [txn('card_revenue_amount', 4_250_000), txn('card_revenue_yoy_growth', 0.32)],
     },
   };
 }
@@ -113,7 +113,7 @@ describe('EnigmaService.lookupBrandCardRevenue', () => {
       fromCache: false,
       cardRevenue12m: {
         amountUsd: 4_250_000,
-        yoyGrowth: 1.32,
+        yoyGrowth: 0.32,
         periodStartDate: '2025-06-01',
         periodEndDate: '2026-05-31',
       },
@@ -177,6 +177,7 @@ describe('EnigmaService.lookupBrandCardRevenue', () => {
   it.each([
     ['social profile', 'https://www.facebook.com/popupbagels'],
     ['site-builder subdomain', 'popupbagels.myshopify.com'],
+    ['AgentWeb form host', 'https://everyio.agentwebforms.com/contact'],
     ['personal email domain', 'gmail.com'],
     ['unparseable input', 'not a domain'],
     ['empty input', ''],
@@ -189,6 +190,23 @@ describe('EnigmaService.lookupBrandCardRevenue', () => {
     expect(result.status).toBe('skipped');
     expect(search).not.toHaveBeenCalled();
     expect(store.puts).toHaveLength(0);
+  });
+
+  // Shapes from live responses (ENG-1933): YoY is a signed change, and a brand can
+  // carry extra YoY rows attributed to individual payment platforms.
+  it('keeps a falling YoY, ignores platform-attributed YoY rows, and drops impossible values', async () => {
+    const lookup = async (txns: any[]) =>
+      (await service(jest.fn().mockResolvedValue([brand({ txns })])).svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }))
+        .cardRevenue12m?.yoyGrowth;
+    const amount = txn('card_revenue_amount', 401_164);
+
+    expect(await lookup([amount, txn('card_revenue_yoy_growth', -0.6069)])).toBe(-0.6069);
+    expect(await lookup([
+      amount,
+      txn('card_revenue_yoy_growth', 0.2392, { platformBrandId: 'platform-a' }),
+      txn('card_revenue_yoy_growth', 0.0739),
+    ])).toBe(0.0739);
+    expect(await lookup([amount, txn('card_revenue_yoy_growth', -1.5)])).toBeNull();
   });
 
   it('serves a repeat lookup from cache, and forceRefresh bypasses and overwrites it', async () => {

@@ -58,7 +58,7 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
     matchedWebsite?: string,    // Enigma-side registrable domain that confirmed the match
     cardRevenue12m: null | {
       amountUsd: number,        // period TOTAL (not monthly average — that was legacy v1)
-      yoyGrowth: number | null, // ratio, 1.32 = +32%
+      yoyGrowth: number | null, // signed change: 0.32 = +32%, -0.61 = -61% (NOT a ratio; see below)
       periodStartDate: "YYYY-MM-DD",
       periodEndDate: "YYYY-MM-DD"
     }
@@ -98,7 +98,9 @@ Variables sent:
 - `limit` belongs **only** in `SearchInput.conditions`. Sub-connections use `first:`.
 - `search` returns `[SearchUnion]` (`LegalEntity | Brand | OperatingLocation`); we read only `... on Brand`.
 - `websites.edges[].node` is a `Website` with `website`, `domain` and `topLevelDomain`. Match confirmation uses `domain + "." + topLevelDomain`.
-- `cardTransactions.edges[].node`: `quantityType`, `period`, `projectedQuantity` (Float, **may be null** below Enigma's compliance threshold), `periodStartDate`, `periodEndDate`, `platformBrandId`. A non-null `platformBrandId` means one platform's slice, not the brand total; we ignore those rows.
+- `cardTransactions.edges[].node`: `quantityType`, `period`, `projectedQuantity` (Float, **may be null** below Enigma's compliance threshold), `periodStartDate`, `periodEndDate`, `platformBrandId`. A non-null `platformBrandId` means one platform's slice, not the brand total; we ignore those rows. **They are still billed** (ENG-1933: Blueland returned 1 amount + 3 YoY rows, 2 of them platform-attributed, 44 credits).
+- `card_revenue_yoy_growth`: Enigma's reference docs describe it as *"the ratio of the brand's current period's revenue to the period one year prior's revenue"*, but live responses return a **signed change**: Kurtz Fargo `-0.6069`, Blueland `0.0739` (ENG-1933, 2026-09-18). A ratio can't be negative, so we treat it as a change. Values below `-1` are discarded.
+- A website-only search returned `search: []` for brands that the same search **with the company name** found (kurtzfargo.com, blueland.com; ENG-1933). Pass the name whenever the lead has one.
 - `rank: 0` meaning "latest period" is taken from Enigma's own examples; it isn't documented as a field.
 
 Errors: `401/403` → `EnigmaAuthError`, `402` → `EnigmaCreditsExhaustedError`, `429` → `EnigmaRateLimitedError(retryAfterSec)`, other non-2xx → `EnigmaApiError`, HTTP 200 with `errors[]` → `EnigmaApiError`.
@@ -114,6 +116,8 @@ None yet. No Emma tool calls Enigma. When one is added it must say "card revenue
 | Failure | Symptom | Guard/test | What not to do |
 | --- | --- | --- | --- |
 | Social or site-builder URL as input | Enigma matches the platform company (e.g. a facebook.com URL → Meta) | `skips social profile / site-builder subdomain` | Don't pass LinkedIn/Facebook/myshopify hosts |
+| AgentWeb form host stored as company website | Wasted lookup on `*.agentwebforms.com` (5 of 5 Every day-zero leads, ENG-1933) | `skips AgentWeb form host` | Don't look up our own hosts |
+| YoY read as a ratio | A falling brand's YoY dropped; UI shows +7% as −93% | `keeps a falling YoY, ignores platform-attributed YoY rows` | Don't subtract 1 or drop negatives |
 | TLD mismatch (`acme.io` vs `acme.com`) | Wrong brand's revenue attached | `treats a brand on a different TLD as not found` | Don't compare on name alone |
 | Malformed HTTP 200 (no `data.search` array) | Schema drift cached as a 30-day not_found | Factory throws `EnigmaApiError`; `treats a malformed HTTP 200 … as a failure` | Don't default a missing `search` to `[]` |
 | Invalid period dates (`2026-02-30`, `2026-99-99`) | Plausible but wrong as-of date stored | Exact `YYYY-MM-DD` + calendar round-trip, else no value | Don't prefix-match or truncate dates |
@@ -138,7 +142,8 @@ None yet. No Emma tool calls Enigma. When one is added it must say "card revenue
 
 ## Open Gaps
 
-- **No live call has been made.** The query shape comes from Enigma's published schema and examples (checked 2026-09-14), not a real response. Verify with the key (ENG-1931) before any caller ships: the `rank: 0` filter, how `platformBrandId` is populated, whether `id` bills.
+- **Live spike done (ENG-1933, 2026-09-18, 35 calls, 664 credits).** The query works. Still open: platform-attributed rows are billed (up to 3 extra × 10 credits per brand); a query-side filter for `platformBrandId` null is being verified before we rely on it. Whether `id` bills is unconfirmed: no credit balance was readable before or after the run, so the 664 comes from our own fill count.
+- Location leads get the brand (chain) total, e.g. one Salt & Straw shop → the chain's $91.6M.
 - Rate-card values are **placeholder list prices** pending Harsha's allocation confirmation.
 - Licence scope for customer display and cross-tenant reuse is unknown (ENG-1930).
 - Industry gating (skip low card-adoption NAICS) is not implemented.
