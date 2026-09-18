@@ -974,6 +974,108 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
+//
+// `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
+// the campaign itself. Read-only by construction: list + inspect + enrollment
+// counts only. Create/activate/pause live in the sibling ENG-442 work
+// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
+// never be added here.
+
+mcpToolRegistry.register({
+  name: 'list_crm_sequences',
+  definition: {
+    name: 'list_crm_sequences',
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+
+Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
+
+An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summary line. That is a valid answer meaning "no campaigns exist", not an error — report it as such instead of retrying or guessing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['draft', 'active', 'paused', 'archived'],
+          description: 'Only return sequences in this status. Omit to return all of them.',
+        },
+        sequence_id: {
+          type: 'string',
+          description: 'Inspect one sequence: returns its summary plus enrollment counts. Omit to list all.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const { summarizeSequence } = await import('../../services/crmSequenceRead');
+    try {
+      // Inspect-one path: summary + enrollment counts. The routes 403 when the
+      // sequence belongs to another user, so cross-account reads fail closed
+      // at the API boundary, not in this tool.
+      if (typeof args?.sequence_id === 'string' && args.sequence_id.trim()) {
+        const sequenceId = args.sequence_id.trim();
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+        });
+        const sequence = data?.sequence;
+        if (!sequence) return jsonResult({ error: `Sequence not found: ${sequenceId}` });
+        let enrollment_count: unknown = undefined;
+        let enrollment_error: string | undefined = undefined;
+        try {
+          const enrollments = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}/enrollments`,
+            context: ctx(context),
+          });
+          enrollment_count = enrollments?.stats ?? enrollments?.enrollments?.length ?? undefined;
+        } catch (err: any) {
+          // Surface enrollment-endpoint failures explicitly instead of
+          // silently dropping the count (CodeRabbit, PR #2974): the
+          // inspect-one contract promises an enrollment count, and a 401/403,
+          // timeout, or 5xx here must not read as "zero enrollments".
+          enrollment_count = undefined;
+          enrollment_error = err?.message || String(err);
+        }
+        return jsonResult({
+          ...summarizeSequence(sequence),
+          enrollment_count,
+          ...(enrollment_error ? { enrollment_error } : {}),
+        });
+      }
+
+      const data = await mcpFetch({
+        method: 'GET',
+        path: '/api/crm/sequences',
+        context: ctx(context),
+      });
+
+      const all = Array.isArray(data?.sequences) ? data.sequences : [];
+      const filtered =
+        typeof args?.status === 'string' ? all.filter((s: any) => s?.status === args.status) : all;
+      const sequences = filtered.map(summarizeSequence);
+      const activeCount = sequences.filter((s: any) => s.is_sending).length;
+
+      return jsonResult({
+        total: sequences.length,
+        active_count: activeCount,
+        sequences,
+        summary:
+          sequences.length === 0
+            ? typeof args?.status === 'string'
+              ? `No CRM drip sequences match status "${args.status}".`
+              : 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
+      });
+    } catch (err: any) {
+      return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
+});
+
 mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
