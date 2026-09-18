@@ -85,9 +85,6 @@ async function pollForLead(listId: string, email: string): Promise<{ leadId: str
  * form above the lead form can't have its fields filled by one query and its
  * submit button clicked by another.
  */
-const SMOKE_FORM_ATTR = "data-agentweb-smoke-form";
-const SMOKE_FORM_SCOPE = `form[${SMOKE_FORM_ATTR}="1"]`;
-
 export type SmokeField = {
   /** Playwright selector, already scoped to the chosen form. */
   selector: string;
@@ -103,6 +100,8 @@ export type SmokeFields = {
   fields: SmokeField[];
   selects: { selector: string; options: string[] }[];
   checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+  /** Submit control resolved page-side (handles a `form=`-associated button); null when none. */
+  submitSelector: string | null;
 };
 
 type SmokeTestPage = {
@@ -132,16 +131,29 @@ const SUBMIT_TIMEOUT_MS = 10_000;
  * no closure over module scope, only DOM globals. Exported so it can be unit-tested
  * against a real DOM instead of only through a mock that never executes it.
  *
- * Picks the most lead-like form, stamps it with SMOKE_FORM_ATTR, and returns fully-formed,
+ * Picks the most lead-like form, stamps it with the marker attribute, and returns fully-formed,
  * form-scoped selectors plus the hint text the caller needs to choose a value per field.
  */
 export function discoverSmokeFields(): SmokeFields {
   const MARK = "data-agentweb-smoke-form";
   const SCOPE_PREFIX = `form[${MARK}="1"] `;
-  // Common honeypot field names (Netlify bot-field, Formspree _gotcha, Mailchimp b_*, and
-  // the generic ones). Filling one makes the lander's own spam filter drop the lead, which
-  // would read here as "the form is broken".
-  const HONEYPOT_NAME = /^(?:_?honey|hp$|hp[_-]|_gotcha|bot-?field|b_\d|url_check|confirm[_-]?email|leave[_-]?blank)/i;
+  // Honeypot names, anchored and exact. An earlier prefix-match version of this swallowed
+  // `confirm_email`, `honeymoon_destination` and `hp_model` — all legitimate required
+  // fields, whose removal left client-side validation blocking submit, i.e. the false
+  // "lead did not land in the CRM" this code exists to prevent. Netlify uses bot-field,
+  // Formspree _gotcha, Mailchimp b_<hex>_<hex>.
+  const HONEYPOT_NAME =
+    /^(?:honeypot|honey_?pot|honey|hp|_gotcha|bot-?field|url_?check|leave_?blank|b_[0-9a-f]{8,}_[0-9a-f]{4,})$/i;
+  // Distinct kinds of lead information. Breadth of coverage is what separates a real lead
+  // form from a one-field newsletter subscribe, so this is the dominant term in the score.
+  const LEAD_HINTS = [
+    /e-?mail/,
+    /phone|\btel\b|mobile|cell/,
+    /name/,
+    /zip|postal|postcode/,
+    /address|street|city|state/,
+    /company|business|organi[sz]ation/,
+  ];
 
   const all = (root: ParentNode, sel: string): Element[] => Array.prototype.slice.call(root.querySelectorAll(sel));
   const esc = (v: string): string => String(v).replace(/(["\\])/g, "\\$1");
@@ -163,6 +175,12 @@ export function discoverSmokeFields(): SmokeFields {
       .toLowerCase();
   };
 
+  // form.elements, not querySelectorAll: a control associated by the `form="id"` attribute
+  // lives outside the form's subtree but still submits with it, and a required one of those
+  // left unfilled blocks submit exactly like any other.
+  const controlsOf = (f: HTMLFormElement): HTMLInputElement[] =>
+    Array.prototype.slice.call(f.elements) as HTMLInputElement[];
+
   // Skip anything a real visitor could not fill. Playwright counts an element as visible
   // when it merely has a non-empty bounding box, so an off-canvas honeypot
   // (position:absolute;left:-9999px) WOULD be filled, and a display:none control instead
@@ -172,8 +190,12 @@ export function discoverSmokeFields(): SmokeFields {
     if (input.disabled || input.readOnly) return false;
     if (input.type === "hidden") return false;
     if (el.getAttribute("aria-hidden") === "true") return false;
-    if (input.name && HONEYPOT_NAME.test(input.name)) return false;
-    if (input.id && HONEYPOT_NAME.test(input.id)) return false;
+    // `required` overrides every name-based guess: a functional honeypot is never marked
+    // required, because that would block real visitors from submitting.
+    if (!input.required) {
+      if (input.name && HONEYPOT_NAME.test(input.name)) return false;
+      if (input.id && HONEYPOT_NAME.test(input.id)) return false;
+    }
     const style = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
     if (style) {
       if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
@@ -191,13 +213,35 @@ export function discoverSmokeFields(): SmokeFields {
   };
 
   const forms = all(document, "form") as HTMLFormElement[];
+  // Clear any stale marker first: two marked forms would make every scoped selector resolve
+  // into whichever comes first, which is not necessarily the one scored below.
+  for (const candidate of forms) candidate.removeAttribute(MARK);
+
+  // Scoring. The count of REQUIRED controls and the breadth of distinct lead hints decide
+  // it; the presence of a type=email/tel input is only a tiebreaker. Weighting that
+  // presence heavily is what made a one-field footer newsletter (type=email, required)
+  // outrank a real lead form whose phone/zip/name controls are all type=text — which is
+  // the shape of the landers this whole path was written for.
+  const scoreOf = (candidate: HTMLFormElement): number => {
+    const controls = controlsOf(candidate).filter(
+      (c) => !/^(?:submit|button|reset|image|hidden)$/i.test(c.type || "")
+    );
+    // A password field means authentication, never lead capture.
+    if (candidate.querySelector('input[type="password"]')) return -1000;
+    const hints = controls.map(hintFor).join(" ");
+    const distinctKinds = LEAD_HINTS.filter((re) => re.test(hints)).length;
+    let score = controls.filter((c) => c.required).length * 3;
+    score += distinctKinds * 4;
+    // A lone email input is a subscribe box, not a lead form.
+    if (controls.length === 1 && /e-?mail/.test(hints)) score -= 6;
+    if (candidate.querySelector('input[type="email"], input[type="tel"]')) score += 1;
+    return score;
+  };
+
   let form: HTMLFormElement | null = null;
-  let bestScore = -1;
+  let bestScore = -Infinity;
   for (const candidate of forms) {
-    const controls = all(candidate, "input, select, textarea") as HTMLInputElement[];
-    let score = controls.filter((c) => c.required).length;
-    if (candidate.querySelector('input[type="email"], input[type="tel"]')) score += 10;
-    if (/e-?mail|phone|tel|zip|postal|name/.test(controls.map(hintFor).join(" "))) score += 5;
+    const score = scoreOf(candidate);
     if (score > bestScore) {
       bestScore = score;
       form = candidate;
@@ -209,35 +253,44 @@ export function discoverSmokeFields(): SmokeFields {
     form.setAttribute(MARK, "1");
     scope = SCOPE_PREFIX;
   }
-  const root: ParentNode = form || document;
-
-  // Index over the form's inputs/textareas so a control with neither id nor name still gets
-  // a selector that resolves back to THAT control (`>> nth=` is resolved against the scoped
-  // set, so the index and the selector agree).
-  const addressable = all(root, "input, textarea");
-  const selFor = (el: Element): string => {
-    const input = el as HTMLInputElement;
-    if (input.id) return `${scope}[id="${esc(input.id)}"]`;
-    if (input.name) return `${scope}[name="${esc(input.name)}"]`;
-    return `${scope}:is(input, textarea) >> nth=${addressable.indexOf(el)}`;
-  };
 
   const FILLABLE =
     'input[type="email"], input[type="tel"], input[type="text"], input[type="url"], ' +
     'input[type="number"], input[type="search"], input[type="date"], input:not([type]), textarea';
+  const matches = (el: Element, sel: string): boolean => !!el.matches && el.matches(sel);
+
+  const controls: Element[] = form
+    ? (controlsOf(form) as Element[])
+    : all(document, "input, select, textarea");
+  // Index space for controls with neither id nor name. `>> nth=` resolves against the
+  // scoped set, so the index must be taken over that same set and in the same order.
+  const addressableScoped = form ? all(form, "input, textarea") : all(document, "input, textarea");
+  const selFor = (el: Element): string => {
+    const input = el as HTMLInputElement;
+    if (input.id) return `${scope}[id="${esc(input.id)}"]`;
+    if (input.name) return `${scope}[name="${esc(input.name)}"]`;
+    // A form=-associated control living outside the form cannot be reached by a
+    // form-scoped selector, and without an id or name there is nothing else to key on.
+    const index = addressableScoped.indexOf(el);
+    if (index < 0) return "";
+    return `${scope}:is(input, textarea) >> nth=${index}`;
+  };
+
   const fields: SmokeField[] = [];
-  for (const el of all(root, FILLABLE)) {
-    if (!usable(el)) continue;
+  for (const el of controls) {
+    if (!matches(el, FILLABLE) || !usable(el)) continue;
+    const selector = selFor(el);
+    if (!selector) continue;
     const isTextarea = el.tagName.toUpperCase() === "TEXTAREA";
     fields.push({
-      selector: selFor(el),
+      selector,
       hint: hintFor(el),
       kind: isTextarea ? "textarea" : (el as HTMLInputElement).type || "text",
     });
   }
 
   const selects: { selector: string; options: string[] }[] = [];
-  const allSelects = all(root, "select") as HTMLSelectElement[];
+  const allSelects = (form ? all(form, "select") : all(document, "select")) as HTMLSelectElement[];
   allSelects.forEach((sel, index) => {
     if (!usable(sel)) return;
     selects.push({
@@ -253,18 +306,39 @@ export function discoverSmokeFields(): SmokeFields {
     });
   });
 
-  const checkables = (all(root, 'input[type="checkbox"], input[type="radio"]') as HTMLInputElement[])
-    .filter(usable)
-    .map((input) => ({
-      selector: selFor(input),
+  const checkables: SmokeFields["checkables"] = [];
+  for (const el of controls) {
+    if (!matches(el, 'input[type="checkbox"], input[type="radio"]') || !usable(el)) continue;
+    const selector = selFor(el);
+    if (!selector) continue;
+    const input = el as HTMLInputElement;
+    checkables.push({
+      selector,
       type: input.type,
       name: input.name || null,
       required: input.required,
-    }));
+    });
+  }
 
-  return { scope, fields, selects, checkables };
+  // Resolve the submit control here rather than guessing a selector Node-side: a sticky
+  // footer `<button type="submit" form="lead">` submits this form while living outside its
+  // subtree, so a form-scoped CSS selector would miss it and burn the click timeout.
+  let submitSelector: string | null = null;
+  if (form) {
+    const submitControl = controlsOf(form).find(
+      (c) => /^(?:submit|image)$/i.test(c.type || "") && !c.disabled
+    );
+    if (submitControl) {
+      submitSelector = submitControl.id
+        ? `[id="${esc(submitControl.id)}"]`
+        : submitControl.name
+          ? `${scope}[name="${esc(submitControl.name)}"]`
+          : `${scope}button[type="submit"], ${scope}input[type="submit"]`;
+    }
+  }
+
+  return { scope, fields, selects, checkables, submitSelector };
 }
-
 /**
  * Chooses a format-valid synthetic value for one discovered field.
  *
@@ -300,6 +374,8 @@ export type FillOutcome = {
   attempted: number;
   /** Selector prefix for the form that was driven ("" when the page has no form). */
   scope: string;
+  /** Submit control resolved page-side, or null when discovery could not find one. */
+  submitSelector: string | null;
 };
 
 /**
@@ -317,6 +393,24 @@ export type FillOutcome = {
  * field (a missing or unfillable control is skipped, never thrown) — a form with NO fillable
  * fields still proceeds to submit, preserving the old behavior for minimal landers.
  */
+/**
+ * Runs INSIDE the page (passed to page.evaluate) — must stay self-contained, like
+ * discoverSmokeFields. Submits ONLY the form discovery marked, and reports whether it did.
+ *
+ * Reporting matters: `document.querySelector("form")?.requestSubmit()` RESOLVES on a page
+ * with no form (optional chaining returns undefined rather than throwing), so a catch-based
+ * chain never reaches the Enter fallback. Falling back to the first form on the page is
+ * equally wrong — that is the newsletter/search form the scoping exists to avoid, and it
+ * would be chosen exactly when the marker went missing, i.e. when we least understand the
+ * page. Exported so it can be unit-tested against a real DOM.
+ */
+export function submitMarkedForm(): boolean {
+  const form = document.querySelector('form[data-agentweb-smoke-form="1"]');
+  if (!form) return false;
+  (form as HTMLFormElement).requestSubmit();
+  return true;
+}
+
 async function fillAllRequiredFields(
   browserPage: SmokeTestPage,
   email: string,
@@ -324,7 +418,14 @@ async function fillAllRequiredFields(
 ): Promise<FillOutcome> {
   const discovered = await browserPage.evaluate(discoverSmokeFields).catch(() => null);
   if (!discovered) {
-    return { lastTextSelector: null, emailFilled: false, filled: 0, attempted: 0, scope: "" };
+    return {
+      lastTextSelector: null,
+      emailFilled: false,
+      filled: 0,
+      attempted: 0,
+      scope: "",
+      submitSelector: null,
+    };
   }
 
   const fields = discovered.fields || [];
@@ -382,8 +483,18 @@ async function fillAllRequiredFields(
     }
   }
 
-  const attempted = fields.length + selects.length + toCheck.length;
-  return { lastTextSelector, emailFilled, filled, attempted, scope: discovered.scope || "" };
+  // Count only what was actually attempted: a select with no selectable options is skipped
+  // above, so including it would make "filled 4/5" indistinguishable from a real failure.
+  const attempted =
+    fields.length + selects.filter((s) => s.options && s.options.length > 0).length + toCheck.length;
+  return {
+    lastTextSelector,
+    emailFilled,
+    filled,
+    attempted,
+    scope: discovered.scope || "",
+    submitSelector: discovered.submitSelector ?? null,
+  };
 }
 
 
@@ -503,7 +614,12 @@ async function runGenerationSmokeTestNow(
     const testPhone = `41555501${String(Date.now()).slice(-2)}`;
     const email = buildSmokeTestEmail();
     const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
-    const { lastTextSelector, emailFilled, scope } = fillOutcome;
+    const {
+      lastTextSelector,
+      emailFilled,
+      scope,
+      submitSelector: discoveredSubmitSelector,
+    } = fillOutcome;
 
     // Capture the pre-submit URL BEFORE the submission action: if click/Enter
     // completes a same-instant handoff redirect, reading it after would already
@@ -519,22 +635,42 @@ async function runGenerationSmokeTestNow(
     // Record the form's OWN submission responses. A handoff lander's success path is a
     // redirect rather than a CRM row, and a redirect on its own is written by the page's
     // JS — it proves nothing about whether the capture endpoint accepted anything. A
-    // same-origin non-GET response is the positive evidence that distinguishes "the
-    // pipeline worked" from "the client redirected anyway after its fetch() threw".
-    const submitResponseStatuses: number[] = [];
+    // same-origin non-GET response that carries OUR synthetic data is the positive evidence
+    // that distinguishes "the pipeline worked" from "the client redirected anyway after its
+    // fetch() threw".
+    //
+    // Two things this deliberately does NOT count:
+    //   - a redirect hop. Playwright raises a response event per hop, and for a 307/308 the
+    //     method is still POST, so `POST /api/capture` -> 308 -> 500 would otherwise look
+    //     accepted. Only a final 2xx counts.
+    //   - a request that merely happened nearby. Vercel Speed Insights POSTs to
+    //     /_vercel/speed-insights/vitals on pagehide — i.e. exactly at the handoff redirect.
+    //     The body must contain the synthetic email or phone for the response to count.
+    const submitEvidence: { status: number; carriedOurData: boolean }[] = [];
+    const carriesOurData = (body: string | null): boolean =>
+      !!body && (body.includes(email) || body.includes(testPhone));
     browserPage.on("response", (response) => {
       try {
-        if (response.request().method() === "GET") return;
+        const request = response.request();
+        if (request.method() === "GET") return;
         if (pageOrigin && new URL(response.url()).origin !== pageOrigin) return;
-        submitResponseStatuses.push(response.status());
+        submitEvidence.push({
+          status: response.status(),
+          carriedOurData: carriesOurData(request.postData()),
+        });
       } catch {
-        // malformed response URL — ignore
+        // malformed response URL or unreadable body — ignore
       }
     });
 
-    const submitSelector = scope
-      ? `${scope}button[type="submit"], ${scope}input[type="submit"]`
-      : 'button[type="submit"], input[type="submit"]';
+    // Discovery resolves the submit control page-side where it can, because a sticky-footer
+    // `<button type="submit" form="lead">` submits the form from outside its subtree and a
+    // form-scoped CSS selector would miss it entirely.
+    const submitSelector =
+      discoveredSubmitSelector ||
+      (scope
+        ? `${scope}button[type="submit"], ${scope}input[type="submit"]`
+        : 'button[type="submit"], input[type="submit"]');
     let submitPath: "click" | "requestSubmit" | "enter" | "none" = "none";
     try {
       // Prefer an explicit submit button, scoped to the form we actually filled.
@@ -548,16 +684,7 @@ async function runGenerationSmokeTestNow(
       // resolves successfully on a page with no <form> at all (optional chaining returns
       // undefined, it does not throw), so the old catch-based chain never reached the Enter
       // fallback for the div-based React forms it was written for.
-      const submitted = await browserPage
-        .evaluate(() => {
-          const form =
-            document.querySelector('form[data-agentweb-smoke-form="1"]') ||
-            document.querySelector("form");
-          if (!form) return false;
-          (form as HTMLFormElement).requestSubmit();
-          return true;
-        })
-        .catch(() => false);
+      const submitted = await browserPage.evaluate(submitMarkedForm).catch(() => false);
       if (submitted) {
         submitPath = "requestSubmit";
       } else if (lastTextSelector) {
@@ -573,9 +700,21 @@ async function runGenerationSmokeTestNow(
     // A React/chat-handoff form may legitimately redirect on success (e.g. to
     // chat.waterheater.app/text?handoff_id=...) INSTEAD of creating a CRM lead row —
     // pollForLead would then always miss.
+    // Compare like with like: waitForURL hands the predicate a URL object, whose toString()
+    // is WHATWG-normalized ("https://x.test" -> "https://x.test/"), while page.url() need
+    // not be. Comparing the raw snapshot against the normalized value reports a navigation
+    // that never happened, and a deployed URL lacking its trailing slash is the common case.
+    const normalizeUrl = (value: string): string => {
+      try {
+        return new URL(value).toString();
+      } catch {
+        return value;
+      }
+    };
+    const urlBeforeSubmitNormalized = normalizeUrl(urlBeforeSubmit);
     let navigatedAway = false;
     try {
-      await browserPage.waitForURL((url) => url.toString() !== urlBeforeSubmit, {
+      await browserPage.waitForURL((url) => url.toString() !== urlBeforeSubmitNormalized, {
         timeout: 8_000,
       });
       navigatedAway = true;
@@ -583,7 +722,10 @@ async function runGenerationSmokeTestNow(
       // No navigation — form likely posts to a capture API and shows inline success.
     }
     const urlAfterSubmit = browserPage.url();
-    const submitAccepted = submitResponseStatuses.some((status) => status >= 200 && status < 400);
+    // Final 2xx only, and it must have carried our synthetic data.
+    const submitAccepted = submitEvidence.some(
+      (evidence) => evidence.status >= 200 && evidence.status < 300 && evidence.carriedOurData
+    );
     // A chat-handoff form's success path is a redirect carrying a handoff id rather than a
     // CRM lead row, so pollForLead would always miss it. Accepting that as a capture needs
     // ALL of:
@@ -591,7 +733,7 @@ async function runGenerationSmokeTestNow(
     //   - handoff_id as an exact query parameter, read via searchParams rather than matched
     //     as raw text (a regex also matches handoff_id nested inside another param's value),
     //   - that the id was not already in the deployed URL before we submitted, and
-    //   - a successful same-origin non-GET response from the submit itself.
+    //   - a 2xx same-origin non-GET response whose body carried our synthetic data.
     // The last one is the load-bearing condition: the redirect is written by the page's own
     // JS, so on its own it proves nothing. A lander whose `fetch(...).catch(() => {})`
     // swallows a 500 still redirects, and URL evidence alone would mark a silently-broken
@@ -611,10 +753,15 @@ async function runGenerationSmokeTestNow(
     const redirectedToHandoff = navigatedAway && handoffEvidence !== null && submitAccepted;
     if (redirectedToHandoff) handoffId = handoffEvidence;
 
-    // Always poll when an email actually went into the form, even on the handoff path:
-    // a form that BOTH writes a CRM row and redirects would otherwise leave the synthetic
-    // lead behind on every single deploy. Only the PASS CONDITION branches on the redirect.
-    const lead = emailFilled ? await pollForLead(leadListId, email) : null;
+    // Always poll — on the handoff path too, and even when no email-keyed field was found.
+    // This is the CLEANUP path as much as the verification path: skipping it leaves the
+    // synthetic lead in the customer's list forever. That matters most in exactly the case
+    // that tempts you to skip it, because a lander whose only contact field is an untyped
+    // `name="contact"` receives "Smoke Test" rather than the smoke-test address —
+    // webhooks.ts validates presence but not format, so a real lead row is created that
+    // isSmokeTestEmail() will never match and no suppression will ever cover.
+    // Only the PASS CONDITION branches on the redirect.
+    const lead = await pollForLead(leadListId, email);
     if (lead) {
       leadCaptured = true;
       await crmDb.deleteLead(leadListId, lead.leadId);
