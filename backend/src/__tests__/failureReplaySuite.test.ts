@@ -75,6 +75,24 @@ describe('failure replay suite', () => {
     expect(result).toMatchObject({ checked: 1, failed: 0, filed: 0, deduped: 0 });
   });
 
+  it('does not count suppressed intake responses as filed', async () => {
+    const fileIssue = jest.fn().mockResolvedValue({
+      pageId: '',
+      deduped: true,
+      tracker: 'Linear',
+      suppressed: true,
+    });
+
+    const result = await runFailureReplaySuite({
+      cases: [eng286Case],
+      contract: preFixContract,
+      fileIssue,
+    });
+
+    expect(fileIssue).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ checked: 1, failed: 1, filed: 0, deduped: 0 });
+  });
+
   it('continues the sweep and reports counts when an intake filing rejects', async () => {
     const secondCase: FailureReplayCase<{ ceiling?: number }, { targetSpend: { cpcBidCeilingMicros?: string }; updateMask: string[] }> = {
       ...eng286Case,

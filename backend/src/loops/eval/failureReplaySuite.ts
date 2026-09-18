@@ -119,6 +119,7 @@ export async function runFailureReplaySuite<TInput, TOutput>({
       }
       continue;
     }
+    if (filed.suppressed) continue;
     if (filed.deduped) deduped += 1;
     filedCount += 1;
   }
