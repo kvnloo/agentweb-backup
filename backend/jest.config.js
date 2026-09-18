@@ -1,4 +1,8 @@
 module.exports = {
+  // ENG-731 AC3: abort LOUD when backend/node_modules is missing/dangling so
+  // jest never silently resolves modules out of a sibling worktree. Pure fs
+  // check — safe to run before any dependency loads.
+  globalSetup: '<rootDir>/jest.worktree-guard.js',
   preset: 'ts-jest',
   testEnvironment: 'node',
   roots: ['<rootDir>/src'],
