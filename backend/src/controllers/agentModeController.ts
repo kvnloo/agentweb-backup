@@ -11,6 +11,18 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
+import {
+  buildRecipientRemediation,
+  checkScheduleActivationRecipients,
+  deliveryEnforcementEnabled,
+  latestDeliveryByRun,
+  logShadowDecision,
+  recordReportDeliveryState,
+  reportContainsCrossAccountData,
+  resolveAuthorizedReportRecipients,
+  scheduleLikelySensitive,
+  type RecipientRemediation,
+} from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -5467,6 +5479,8 @@ export async function runScheduledChat(
   // `failure`, like the publish markers and unlike readOnlyRequirementWaived —
   // the contact never went out.
   sendPressExhausted?: boolean;
+  // ENG-1552: present only when the recipient preflight skipped generation.
+  remediation?: RecipientRemediation;
 }> {
   if (isEvaluationUser(userId) || isEvaluationUser(schedule?.userId)) {
     await (await import('../services/evaluationStore')).evaluationStore.discardJob(isEvaluationUser(schedule?.userId) ? schedule.userId : userId, schedule?.scheduleId);
@@ -5599,6 +5613,80 @@ export async function runScheduledChat(
       await scheduleDb.addRunResult(schedule.scheduleId, entitlementResult)
         .catch((error) => console.error('Error saving scheduled-chat entitlement result:', error));
       return entitlementResult;
+    }
+
+    // ENG-1552: recipient preflight. A schedule whose report carries cross-account
+    // data can only be delivered to admins; if none of its recipients (nor the owner)
+    // currently qualifies, the send-time guard would withhold the whole report — so
+    // don't pay for generating it. Silent schedules (no recipients) are unaffected:
+    // they deliver nothing by design, and the run is still visible in-app.
+    const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter(Boolean)
+      : [];
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule)) {
+      const authz = await resolveAuthorizedReportRecipients({
+        recipients: preflightRecipients,
+        ownerEmail: (scheduleOwner as any)?.email,
+        isSensitive: true,
+      });
+      if (authz.authorized.length === 0 && !deliveryEnforcementEnabled()) {
+        logShadowDecision('skipped generation', {
+          scheduleId: schedule.scheduleId,
+          owner: (scheduleOwner as any)?.email,
+          withheldRecipients: authz.withheld,
+        });
+      } else if (authz.authorized.length === 0) {
+        const withheldRunId: string = leaseRunId;
+        const remediation = buildRecipientRemediation({
+          code: 'no_authorized_recipients',
+          scheduleId: schedule.scheduleId,
+          runId: withheldRunId,
+          owner: (scheduleOwner as any)?.email,
+          eligibleRecipients: authz.authorized,
+        });
+        const withheldResult = {
+          scheduleId: schedule.scheduleId,
+          runId: withheldRunId,
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled report not generated: ${remediation.safeAction}`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: schedule.keywords || [],
+          functionCallMatches: [],
+          functionCallMisses: schedule.requiredFunctionCalls || [],
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString(),
+          remediation,
+        };
+        console.warn(
+          `Scheduled chat "${schedule.scheduleName}" (${schedule.scheduleId}) skipped before generation: sensitive report with no authorized recipient among ${preflightRecipients.length} configured.`
+        );
+        await scheduleDb.addRunResult(schedule.scheduleId, withheldResult)
+          .catch((error) => console.error('Error saving recipient-preflight withheld result:', error));
+        await recordReportDeliveryState(schedule.scheduleId, {
+          runId: withheldRunId,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: authz.withheld,
+          missingPermission: remediation.missingPermission,
+        });
+        // A manual test surfaces the remediation in its own response; only an
+        // unattended run needs someone told.
+        if (!isTest) {
+          await emailService.notifyScheduledReportWithheld({
+            scheduleId: schedule.scheduleId,
+            scheduleName: schedule.scheduleName,
+            ownerEmail: (scheduleOwner as any)?.email,
+            ownerUserId: userId,
+            stage: 'before_generation',
+          });
+        }
+        return withheldResult;
+      }
     }
 
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -6884,6 +6972,15 @@ export async function runScheduledChat(
     } catch (error) {
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
+    }
+    // ENG-1552: record that a report exists, and whether it drew on cross-account
+    // data — the next run's recipient preflight reads that breadcrumb.
+    if (sessionId && (finalResult.actualResponse || '').trim()) {
+      await recordReportDeliveryState(
+        schedule.scheduleId,
+        { runId: finalResult.runId, state: 'generated' },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls) },
+      );
     }
 
     // Self-improve: when enabled, run a reflection turn in the same session that may
@@ -11981,6 +12078,22 @@ export const agentModeController = {
         scheduledChat.variableValuesUpdatedAt = now.toISOString();
       }
 
+      // ENG-1552: a new schedule is live the moment it is created, so the
+      // authorized-recipient gate applies here, before the row exists.
+      const createRemediation = await checkScheduleActivationRecipients({
+        scheduleId,
+        recipients: scheduledChat.emailNotifications,
+        ownerEmail: user.email,
+        schedule: scheduledChat,
+      });
+      if (createRemediation) {
+        if (!deliveryEnforcementEnabled()) {
+          logShadowDecision('rejected schedule create', { scheduleId, owner: user.email, code: createRemediation.code });
+        } else {
+          return res.status(400).json({ error: createRemediation.safeAction, remediation: createRemediation });
+        }
+      }
+
       await scheduleDb.createSchedule(scheduledChat);
 
       res.status(201).json({
@@ -12021,7 +12134,9 @@ export const agentModeController = {
       // available via the dedicated GET /scheduled-chats/:id/test-history endpoint),
       // but first derive a compact runHealth summary (ENG-826 #4) so the list can
       // flag consecutive failures on the card without fetching full history.
-      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
+      // ENG-1552: deliveryLog and the sensitivity breadcrumb are internal bookkeeping —
+      // never part of what a customer (or Emma, via list_scheduled_chats) is shown.
+      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, deliveryLog, lastKnownSensitive, lastKnownSensitiveAt, ...rest }: any) => ({
         ...rest,
         // Whether an EXPLICIT grant exists — not whether this schedule will publish.
         // The two differ, and conflating them is the trap here: a legacy schedule
@@ -12264,6 +12379,48 @@ export const agentModeController = {
         return res.status(400).json({ error: 'At least one email notification is required for scheduled chats' });
       }
 
+      // Tool names are case-sensitive everywhere else; addresses are not.
+      const sameSet = (a: unknown, b: unknown, normalize: (x: string) => string): boolean => {
+        const toSet = (v: unknown) => new Set((Array.isArray(v) ? v : []).map((x) => normalize(String(x).trim())));
+        const left = toSet(a);
+        const right = toSet(b);
+        return left.size === right.size && [...left].every((x) => right.has(x));
+      };
+      const toolsChanged = requiredFunctionCalls !== undefined
+        && !sameSet(requiredFunctionCalls, existingSchedule.requiredFunctionCalls, (x) => x);
+      const recipientsChanged = emailNotifications !== undefined
+        // Both sides normalized: older rows store a bare string or a JSON-array string,
+        // which the portal echoes back unchanged.
+        && !sameSet(effectiveEmailNotifications, normalizeEmailList(existingSchedule.emailNotifications || []), (x) => x.toLowerCase());
+
+      // ENG-1552: an edit to who receives an active schedule's report, or to the
+      // tools it must call, can leave a cross-account report with nobody allowed
+      // to read it. Checked only when the edit touches either — an unrelated edit
+      // (a rename) to an already-misconfigured schedule is not refused; the run-time
+      // preflight still holds that schedule's generation.
+      // Compared as sets, not "was the field sent": the portal submits the whole form,
+      // so every save carries both lists even when only the name changed.
+      if (existingSchedule.status === 'active' && (recipientsChanged || toolsChanged)) {
+        const updateRemediation = await checkScheduleActivationRecipients({
+          scheduleId,
+          recipients: effectiveEmailNotifications,
+          ownerEmail: user.email,
+          schedule: {
+            // A changed tool list re-decides sensitivity from scratch; the
+            // breadcrumb describes the previous tools.
+            lastKnownSensitive: toolsChanged ? undefined : (existingSchedule as any).lastKnownSensitive,
+            requiredFunctionCalls: updates.requiredFunctionCalls,
+          },
+        });
+        if (updateRemediation) {
+          if (!deliveryEnforcementEnabled()) {
+            logShadowDecision('rejected schedule update', { scheduleId, owner: user.email, code: updateRemediation.code });
+          } else {
+            return res.status(400).json({ error: updateRemediation.safeAction, remediation: updateRemediation });
+          }
+        }
+      }
+
       const allUpdateVariablesPrefilled = normalizedVariables.length > 0
         && getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length === 0;
 
@@ -12392,7 +12549,17 @@ export const agentModeController = {
           : undefined,
         // ENG-1365: only when the request EXPLICITLY clears the model. A silent
         // request removes nothing, because it was never asked to.
-        llmModel === '' ? ['llmModel'] : undefined
+        // ENG-1552: a changed tool list or prompt makes the previous run's sensitivity
+        // breadcrumb stale — and since a flagged schedule's runs are held before they
+        // can re-derive it, only an edit can reset it. Otherwise "remove the
+        // cross-account tools" could never get the schedule running again.
+        [
+          ...(llmModel === '' ? ['llmModel'] : []),
+          ...((toolsChanged || effectiveStartingMessage !== previousStartingMessage)
+            && (existingSchedule as any).lastKnownSensitive !== undefined
+            ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
+            : []),
+        ]
       );
 
       res.json({
@@ -13018,6 +13185,23 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
+      // ENG-1552: re-enabling is an activation like any other.
+      if (status === 'active') {
+        const toggleRemediation = await checkScheduleActivationRecipients({
+          scheduleId,
+          recipients: normalizeEmailList(schedule.emailNotifications || []),
+          ownerEmail: user.email,
+          schedule: schedule as any,
+        });
+        if (toggleRemediation) {
+          if (!deliveryEnforcementEnabled()) {
+            logShadowDecision('rejected schedule toggle', { scheduleId, owner: user.email, code: toggleRemediation.code });
+          } else {
+            return res.status(400).json({ error: toggleRemediation.safeAction, remediation: toggleRemediation });
+          }
+        }
+      }
+
       // Update the schedule status
       await scheduleDb.updateSchedule(scheduleId, {
         status,
@@ -13073,11 +13257,20 @@ export const agentModeController = {
       // Arrays are excluded deliberately: spreading one into an object literal
       // would silently turn it into {0: …, 1: …}. A malformed entry passes
       // through untouched rather than being corrupted into a wrong answer.
-      const historyWithActions = (testHistory || []).map((run: any) =>
-        run !== null && typeof run === 'object' && !Array.isArray(run)
-          ? normalizeMarketingActions(run)
-          : run
-      );
+      // ENG-1552 read-back: each run carries its latest delivery state (generated →
+      // withheld / delivery_attempted → delivered → recipient_confirmed). Added as a
+      // field on the run so the array shape every consumer reads is unchanged.
+      // Shadow mode: the field is internal until enforcement is on — Emma reads this
+      // endpoint through the MCP tool and could otherwise surface it to a customer.
+      const deliveryByRun = deliveryEnforcementEnabled()
+        ? latestDeliveryByRun((schedule as any).deliveryLog)
+        : {};
+      const historyWithActions = (testHistory || []).map((run: any) => {
+        if (run === null || typeof run !== 'object' || Array.isArray(run)) return run;
+        const normalized = normalizeMarketingActions(run);
+        const delivery = typeof run.runId === 'string' ? deliveryByRun[run.runId] : undefined;
+        return delivery ? { ...normalized, delivery } : normalized;
+      });
 
       res.json(historyWithActions);
     } catch (error) {
@@ -13110,6 +13303,65 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get scheduled chat storage diagnostics error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chat storage diagnostics' });
+    }
+  },
+
+  // ENG-1552 / ENG-1821 step 5: "ask the recipient to confirm receipt, record the
+  // response". There is no read-receipt infrastructure for scheduled reports, so this
+  // is a person saying so: it promotes a run the system recorded as `delivered` to
+  // `recipient_confirmed`. Only a delivered run can be confirmed — confirming a
+  // withheld or unsent report would record something that did not happen.
+  async confirmScheduledReportReceipt(req: Request, res: Response) {
+    try {
+      if (!deliveryEnforcementEnabled()) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      const user = req.user as User;
+      const { scheduleId, runId } = req.params;
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const current = latestDeliveryByRun((schedule as any).deliveryLog)[runId];
+      if (!current) {
+        return res.status(404).json({ error: 'No delivery recorded for this run' });
+      }
+      if (current.state === 'recipient_confirmed') {
+        return res.json({ delivery: current });
+      }
+      if (current.state !== 'delivered') {
+        return res.status(409).json({
+          error: `Only a delivered report can be confirmed; this run is "${current.state}"${current.reason ? ` (${current.reason})` : ''}.`,
+          delivery: current,
+        });
+      }
+
+      const configured: string[] = current.authorizedRecipients || [];
+      const requested = req.body?.recipients;
+      // Confirmation is per recipient the report actually went to — never an
+      // address it was not sent to.
+      const confirmedRecipients = Array.isArray(requested)
+        ? configured.filter((r) => requested.some((q: unknown) => typeof q === 'string' && q.toLowerCase() === r.toLowerCase()))
+        : configured;
+      if (confirmedRecipients.length === 0) {
+        return res.status(400).json({ error: 'None of the given recipients received this report.', delivery: current });
+      }
+
+      const authReq = req as AuthenticatedRequest;
+      const entry = {
+        runId,
+        state: 'recipient_confirmed' as const,
+        authorizedRecipients: confirmedRecipients,
+        confirmedBy: authReq.delegateInfo?.isDelegated ? authReq.delegateInfo.adminEmail : user.email,
+        at: new Date().toISOString(),
+      };
+      await scheduleDb.appendDeliveryLogEntry(scheduleId, entry);
+      res.json({ delivery: entry });
+    } catch (error) {
+      console.error('AgentMode: Confirm scheduled report receipt error:', error);
+      res.status(500).json({ error: 'Failed to record receipt confirmation' });
     }
   },
 
@@ -13167,7 +13419,8 @@ export const agentModeController = {
             schedule.scheduleName,
             sameDayResults,
             schedule.scheduleId,
-            selectedResultDate
+            selectedResultDate,
+            { recordDelivery: false }
           );
 
           const dateStr = selectedResultDate.toLocaleDateString('en-US', {
@@ -13214,7 +13467,8 @@ export const agentModeController = {
         schedule.scheduleName,
         resultForEmail,
         schedule.scheduleId,
-        runSummary
+        runSummary,
+        { recordDelivery: false }
       );
 
       res.json({ success: true });
@@ -15080,6 +15334,22 @@ export const agentModeController = {
         // stamp it; this path and the ENG-1723 auto-create were the two that did not.
         variableValuesUpdatedAt: now.toISOString(),
       };
+
+      // ENG-1552: a template-created schedule is live the moment it exists, like
+      // createScheduledChat's — same authorized-recipient gate, same shadow mode.
+      const templateRemediation = await checkScheduleActivationRecipients({
+        scheduleId,
+        recipients: scheduledChat.emailNotifications,
+        ownerEmail: user.email,
+        schedule: scheduledChat,
+      });
+      if (templateRemediation) {
+        if (!deliveryEnforcementEnabled()) {
+          logShadowDecision('rejected schedule create from template', { scheduleId, owner: user.email, code: templateRemediation.code });
+        } else {
+          return res.status(400).json({ error: templateRemediation.safeAction, remediation: templateRemediation });
+        }
+      }
 
       await scheduleDb.createSchedule(scheduledChat);
 
