@@ -191,6 +191,7 @@ export type ReportDeliveryReason =
   | 'no_authorized_recipients'
   | 'empty_content'
   | 'provider_error'
+  | 'suppressed_nonprod'
   | 'test_timed_out';
 
 export interface ReportDeliveryLogEntry {

@@ -59,6 +59,10 @@ const SUPPORT_REPLY_TO = 'support@agentweb.pro';
  */
 export const WITHHELD_REPORT_ALERT_CLASS = 'scheduled-report-withheld-no-recipients';
 
+export type EmailSendOutcome = 'sent' | 'suppressed' | 'failed';
+
+const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
+
 // Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
 async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
   if (settingKey === 'oncall_emails' && process.env.ONCALL_EMAIL_LIST) {
@@ -80,7 +84,12 @@ export const emailService = {
       .replace(/'/g, '&#39;');
   },
 
-  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]) {
+  /**
+   * Best-effort send — never throws. Resolves to what actually happened so a caller
+   * that records delivery (ENG-1552) can tell a real send from a swallowed failure or
+   * a non-prod suppression. `void` only ever comes from a test stub; treat it as unknown.
+   */
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]): Promise<EmailSendOutcome | void> {
     try {
       const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
@@ -97,13 +106,15 @@ export const emailService = {
       // the only record this best-effort path leaves behind.
       if (isSuppressedSendResult(result)) {
         console.log('Email suppressed by the non-prod guard, not sent to:', toList, cc ? `CC: ${ccList}` : '');
-        return;
+        return 'suppressed';
       }
       console.log('Email sent successfully to:', toList, cc ? `CC: ${ccList}` : '');
+      return 'sent';
     } catch (error) {
       console.error('Error sending email:', error);
       // Don't throw - best-effort by design. Callers that need delivery
       // guarantees use sendEmailStrict.
+      return 'failed';
     }
   },
 
@@ -1887,70 +1898,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // user data via an admin-only tool, the report can contain other accounts'
       // identities/records — so restrict distribution to authorized (admin)
       // recipients + the owner, rather than auto-sending to every configured
-      // address. No-op for ordinary reports. Fail-closed: if we cannot classify
-      // the run (session lookup error), treat it as sensitive.
-      let recipients = emailList;
-      let finalHtml = html;
-      let finalText = text;
-      let guardOwnerEmail: string | undefined;
-      let guardOwnerUserId: string | undefined;
-      try {
-        let guardSession: any;
-        // FAIL-CLOSED DEFAULT: treat the report as sensitive UNLESS we can
-        // positively verify it is ordinary. Verification requires a present
-        // session AND a clean strongly-consistent tool-call record. A missing
-        // session, an unreadable/stale record, or any error therefore restricts
-        // distribution rather than broadcasting — closing the whole class of
-        // "couldn't classify → sent to everyone" fail-opens.
-        let isSensitive = true;
-        try {
-          guardSession = await chatbotDb.getChatSession(result.sessionId);
-          if (guardSession) {
-            if (reportContainsCrossAccountData(guardSession.calledFunctions)) {
-              isSensitive = true;
-            } else {
-              // calledFunctions is a best-effort counter (its write errors are
-              // swallowed at the call site), so a successful cross-account tool
-              // call can be missing from it. Confirm against the authoritative
-              // tool-call message records. Use a STRONGLY CONSISTENT read: this
-              // send fires immediately after the run wrote these messages, so an
-              // eventually-consistent read could miss a just-written call.
-              const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId, true);
-              isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
-            }
-          }
-          // guardSession falsy → cannot verify → isSensitive stays true (closed).
-        } catch (classifyError) {
-          console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
-          isSensitive = true;
-        }
-        // Resolve the owner email up front — used both to authorize the owner and
-        // to notify them if delivery ends up blocked.
-        guardOwnerUserId = guardSession?.userId;
-        try {
-          const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
-          guardOwnerEmail = (owner as any)?.email;
-        } catch { /* owner unknown → resolver still restricts to verified admins */ }
-        if (isSensitive) {
-          const authz = await resolveAuthorizedReportRecipients({ recipients: emailList, ownerEmail: guardOwnerEmail, isSensitive: true });
-          recipients = authz.authorized;
-          if (authz.withheld.length > 0) {
-            const noticeText = `⚠️ ${authz.withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${authz.withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
-            // Escape the notice before HTML interpolation: withheld addresses are
-            // attacker-influenceable (a configured recipient can contain HTML
-            // metacharacters), so raw insertion would inject markup into the notice.
-            finalHtml = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${this.escapeHtml(noticeText)}</div>${html}`;
-            finalText = `${noticeText}\n\n${text}`;
-            console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session ${result.sessionId}: ${authz.withheld.join(', ')}`);
-          }
-        }
-      } catch (guardError) {
-        // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
-        // than risk distributing possibly-sensitive data to unverified addresses.
-        // The empty-recipients branch below notifies the owner so it is not silent.
-        console.error(`Scheduled report guard errored for session ${result.sessionId}; failing closed:`, guardError);
-        recipients = [];
-      }
+      // address. No-op for ordinary reports. Fail-closed throughout; see
+      // classifyAndResolveScheduledReportRecipients.
+      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList);
+      const recipients = guard.authorized;
+      const notice = this.withheldRecipientsNotice(guard.withheld);
+      const finalHtml = notice ? `${notice.html}${html}` : html;
+      const finalText = notice ? `${notice.text}\n\n${text}` : text;
+      const runKey = result.runId || result.sessionId;
 
       if (recipients.length === 0) {
         // Fail-closed left no authorized recipient. Do NOT silently drop the
@@ -1959,7 +1914,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // lost without a signal and the owner can add an authorized recipient.
         console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
         await recordReportDeliveryState(scheduleId, {
-          runId: result.runId || result.sessionId,
+          runId: runKey,
           state: 'withheld',
           reason: 'no_authorized_recipients',
           authorizedRecipients: [],
@@ -1970,13 +1925,13 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           scheduleId,
           scheduleName,
           sessionId: result.sessionId,
-          ownerEmail: guardOwnerEmail,
-          ownerUserId: guardOwnerUserId,
+          ownerEmail: guard.ownerEmail,
+          ownerUserId: guard.ownerUserId,
           stage: 'after_generation',
         });
       } else {
         // Send ONE email to all authorized recipients
-        await this.sendEmail(recipients, subject, finalText, finalHtml);
+        await this.deliverScheduledReport(scheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
       }
 
@@ -2003,6 +1958,112 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
    * would mint a no-login share link to a report withheld because it holds
    * cross-account data.
    */
+  /**
+   * The ENG-500 recipient guard for one report or a batch of runs (a daily digest).
+   *
+   * FAIL-CLOSED DEFAULT: each session is treated as sensitive UNLESS it can be
+   * positively verified ordinary — a present session AND a clean strongly-consistent
+   * tool-call record. A missing session, an unreadable record, or any error restricts
+   * distribution rather than broadcasting. A batch is sensitive if ANY of its runs is:
+   * a combined digest cannot redact one run's content, so it takes the safer policy.
+   * Callers pass only the sessions whose content is actually in the email. Never
+   * throws: if the guard itself fails, nobody is authorized.
+   */
+  async classifyAndResolveScheduledReportRecipients(
+    sessionIds: string[],
+    recipients: string[],
+  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string }> {
+    let ownerEmail: string | undefined;
+    let ownerUserId: string | undefined;
+    try {
+      let isSensitive = false;
+      for (const sessionId of sessionIds) {
+        let sessionSensitive = true;
+        try {
+          const session: any = await chatbotDb.getChatSession(sessionId);
+          if (session) {
+            ownerUserId = ownerUserId || session.userId;
+            if (!reportContainsCrossAccountData(session.calledFunctions)) {
+              // calledFunctions is a best-effort counter (its write errors are
+              // swallowed at the call site), so a successful cross-account tool
+              // call can be missing from it. Confirm against the authoritative
+              // tool-call message records. Use a STRONGLY CONSISTENT read: this
+              // send fires immediately after the run wrote these messages, so an
+              // eventually-consistent read could miss a just-written call.
+              const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
+              sessionSensitive = messagesReferenceCrossAccountTool(messages as any);
+            }
+          }
+          // session falsy → cannot verify → sessionSensitive stays true (closed).
+        } catch (classifyError) {
+          console.error(`Scheduled report guard: could not classify session ${sessionId}; failing closed (treating as sensitive):`, classifyError);
+          sessionSensitive = true;
+        }
+        isSensitive = isSensitive || sessionSensitive;
+      }
+      // Resolve the owner up front — used both to authorize the owner and to
+      // notify them if delivery ends up blocked.
+      try {
+        const owner = ownerUserId ? await userDb.getUserById(ownerUserId) : undefined;
+        ownerEmail = (owner as any)?.email;
+      } catch { /* owner unknown → resolver still restricts to verified admins */ }
+      const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail, isSensitive });
+      if (authz.withheld.length > 0) {
+        console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
+      }
+      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId };
+    } catch (guardError) {
+      // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
+      // than risk distributing possibly-sensitive data to unverified addresses.
+      // The caller's empty-recipients branch notifies the owner so it is not silent.
+      console.error(`Scheduled report guard errored for session(s) ${sessionIds.join(', ')}; failing closed:`, guardError);
+      return { authorized: [], withheld: [...recipients], ownerEmail, ownerUserId };
+    }
+  },
+
+  /** The banner prepended to a report some configured recipients were withheld from. */
+  withheldRecipientsNotice(withheld: string[]): { html: string; text: string } | null {
+    if (withheld.length === 0) return null;
+    const text = `⚠️ ${withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
+    // Escape the notice before HTML interpolation: withheld addresses are
+    // attacker-influenceable (a configured recipient can contain HTML
+    // metacharacters), so raw insertion would inject markup into the notice.
+    const html = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${this.escapeHtml(text)}</div>`;
+    return { html, text };
+  },
+
+  /**
+   * ENG-1552: send a scheduled report and record what actually happened.
+   * `delivered` is written only for a send the provider accepted; a swallowed
+   * failure or a non-prod suppression stays at `delivery_attempted` with the reason.
+   */
+  async deliverScheduledReport(
+    scheduleId: string,
+    runId: string,
+    recipients: string[],
+    withheld: string[],
+    subject: string,
+    text: string,
+    html: string,
+  ): Promise<void> {
+    const base = {
+      runId,
+      authorizedRecipients: recipients,
+      ...(withheld.length > 0 ? { withheldRecipients: withheld } : {}),
+    };
+    await recordReportDeliveryState(scheduleId, { ...base, state: 'delivery_attempted' });
+    const outcome = await this.sendEmail(recipients, subject, text, html);
+    if (outcome === 'sent') {
+      await recordReportDeliveryState(scheduleId, { ...base, state: 'delivered' });
+    } else if (outcome === 'failed' || outcome === 'suppressed') {
+      await recordReportDeliveryState(scheduleId, {
+        ...base,
+        state: 'delivery_attempted',
+        reason: outcome === 'failed' ? 'provider_error' : 'suppressed_nonprod',
+      });
+    }
+  },
+
   /** ENG-1552: the empty-content half of sendScheduledChatResultEmail. Never throws. */
   async withholdEmptyScheduledReport(
     toEmails: string | string[],
@@ -2257,8 +2318,44 @@ Sent via AgentWeb: ${customerFrontendUrl}
             : r
         )
       );
+      // ENG-1552: a run with no content is shown as such, not as a blank preview
+      // (a missing actualResponse also used to throw on `.length` below).
+      todaysResults = todaysResults.map((r) =>
+        r && !(typeof r.actualResponse === 'string' && r.actualResponse.trim())
+          ? { ...r, actualResponse: EMPTY_RUN_DIGEST_PLACEHOLDER }
+          : r
+      );
 
       const displayDate = customDate || new Date();
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      const digestRunKey = `digest-${displayDate.toISOString().slice(0, 10)}`;
+
+      // ENG-1552: the same ENG-500 recipient guard as a single report. This path
+      // used to send every run's content to every configured address unchecked.
+      // Runs without a session carry only system text, so only sessions count.
+      const digestSessionIds = [...new Set(todaysResults.map((r) => r?.sessionId).filter(Boolean))] as string[];
+      const guard = await this.classifyAndResolveScheduledReportRecipients(digestSessionIds, emailList);
+      if (guard.authorized.length === 0) {
+        console.error(`Daily digest for schedule ${scheduleId} had no authorized recipients after the guard; digest NOT delivered.`);
+        await recordReportDeliveryState(scheduleId, {
+          runId: digestRunKey,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: emailList,
+          missingPermission: 'isAdmin',
+        });
+        await this.notifyScheduledReportWithheld({
+          scheduleId,
+          scheduleName,
+          sessionId: digestSessionIds[0],
+          ownerEmail: guard.ownerEmail,
+          ownerUserId: guard.ownerUserId,
+          stage: 'after_generation',
+        });
+        return;
+      }
+      const digestNotice = this.withheldRecipientsNotice(guard.withheld);
       const currentDate = displayDate.toLocaleDateString('en-US', {
         year: 'numeric',
         month: 'long',
@@ -2463,13 +2560,18 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
       const subject = `📊 Daily Digest: ${scheduleName} - ${currentDate} - ${totalRuns} runs (${Math.round((successfulRuns / totalRuns) * 100)}% success)`;
 
-      // Normalize to array for consistent handling
-      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      // Send ONE email to all authorized recipients
+      await this.deliverScheduledReport(
+        scheduleId,
+        digestRunKey,
+        guard.authorized,
+        guard.withheld,
+        subject,
+        digestNotice ? `${digestNotice.text}\n\n${text}` : text,
+        digestNotice ? html.replace(/<body([^>]*)>/i, (m) => `${m}${digestNotice.html}`) : html,
+      );
 
-      // Send ONE email to all recipients
-      await this.sendEmail(emailList, subject, text, html);
-
-      console.log(`Daily digest email sent to recipients: ${emailList.join(', ')}`);
+      console.log(`Daily digest email sent to recipients: ${guard.authorized.join(', ')}`);
 
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
