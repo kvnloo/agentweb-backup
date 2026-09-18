@@ -42,7 +42,11 @@ export type EnigmaLookupStatus = 'found' | 'not_found' | 'skipped';
 export interface EnigmaCardRevenue {
   /** card_revenue_amount, period 12m, latest period. USD. */
   amountUsd: number;
-  /** card_revenue_yoy_growth for the same period — a ratio (1.1 = +10%). */
+  /**
+   * card_revenue_yoy_growth for the same period, as a signed change: 0.1 = +10%,
+   * -0.6 = -60%. Enigma's reference docs call it a ratio, but live responses
+   * return negative values (ENG-1933), which a ratio can't be.
+   */
   yoyGrowth: number | null;
   /** YYYY-MM-DD */
   periodStartDate: string;
@@ -188,6 +192,9 @@ const PROFILE_PLATFORM_HOSTS = [
   'youtube.com', 'youtu.be', 'tiktok.com', 'linktr.ee', 'pinterest.com', 'yelp.com',
   'crunchbase.com', 'wellfound.com', 'angel.co',
 ];
+// AgentWeb's own hosts. CRM rows captured by our forms can carry the form's
+// host (e.g. everyio.agentwebforms.com) as the company website (ENG-1933).
+const AGENTWEB_OWN_HOSTS = ['agentwebforms.com'];
 // Here only a SUBDOMAIN is someone else's site; the apex is the platform company.
 const SITE_BUILDER_HOSTS = [
   'myshopify.com', 'wixsite.com', 'squarespace.com', 'webflow.io', 'github.io',
@@ -216,7 +223,7 @@ function isOnHost(host: string, base: string): boolean {
 }
 
 function isBlockedHost(host: string): boolean {
-  if (PROFILE_PLATFORM_HOSTS.some((base) => isOnHost(host, base))) return true;
+  if ([...PROFILE_PLATFORM_HOSTS, ...AGENTWEB_OWN_HOSTS].some((base) => isOnHost(host, base))) return true;
   return SITE_BUILDER_HOSTS.some((base) => host.endsWith(`.${base}`));
 }
 
@@ -265,7 +272,8 @@ function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
 
   return {
     amountUsd: value,
-    yoyGrowth: typeof yoy === 'number' && Number.isFinite(yoy) && yoy >= 0 ? yoy : null,
+    // Revenue can't fall by more than 100%.
+    yoyGrowth: typeof yoy === 'number' && Number.isFinite(yoy) && yoy >= -1 ? yoy : null,
     periodStartDate: amount.periodStartDate,
     periodEndDate: amount.periodEndDate,
   };
