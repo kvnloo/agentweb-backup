@@ -43,6 +43,7 @@ jest.mock('../services/chatbotService', () => {
       claimMetaWriteManifestDigest: jest.fn(),
       updateSessionApprovalDeck: jest.fn(),
       updateSessionWorkflowRun: jest.fn(),
+      updateSessionLastFailedMetaWrite: jest.fn(),
     },
   };
 });
@@ -143,6 +144,11 @@ beforeEach(() => {
     sessionState.workflowRun = run;
     return { ...sessionState };
   });
+
+  (chatbotDb.updateSessionLastFailedMetaWrite as jest.Mock).mockImplementation(async (_sid: string, value: any) => {
+    sessionState.lastFailedMetaWrite = value;
+    return { ...sessionState };
+  });
 });
 
 function approveAll() {
@@ -228,6 +234,75 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     if (result.outcome !== 'submitted') throw new Error('unreachable');
     expect(result.summary?.status).toBe('fully_applied');
     expect(result.summary!.items.every((i) => i.status === 'verified')).toBe(true);
+  });
+
+  describe('ENG-1635/1644 follow-up: lastFailedMetaWrite retry-backstop counter (found live 2026-09-18)', () => {
+    // A fresh single-item deck against the SAME target each time, as if the model
+    // re-proposed the write across separate turns — mirrors the real repro (3
+    // consecutive AD_SET CREATE attempts, same campaign, same ad-set name). Each
+    // attempt gets a SLIGHTLY different budget so its digest genuinely differs
+    // (matching what was actually observed live — 3 different digests, same
+    // target) — reusing byte-identical params would hit the at-most-once digest
+    // claim guard on the second attempt instead of a fresh Meta-side failure,
+    // which is a different thing than what this backstop is about.
+    function singleItemDeck(deckId: string, dailyBudget: number) {
+      const dispatch = { ...writeDispatchFor('94043'), params: { name: 'AS_94043', optimization_goal: 'OFFSITE_CONVERSIONS', daily_budget: dailyBudget } };
+      const at = new Date().toISOString();
+      return {
+        deckId,
+        status: 'awaiting' as const,
+        createdAt: at,
+        finalizedAt: at,
+        items: [{
+          itemId: 'write-1',
+          kind: 'meta_write',
+          question: 'Create ad set AS_94043?',
+          allowFreeText: true,
+          metaWriteManifestDigest: computeMetaWriteManifestDigest(getJwtSecret(), dispatch),
+          metaWriteDispatch: dispatch,
+        }],
+      };
+    }
+    function approveOne() {
+      return [{ itemId: 'write-1', verdict: 'approve' }];
+    }
+
+    it('a failed write records count:1 against its target signature', async () => {
+      jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: false, error: 'Invalid parameter', message: 'Budget too low.' });
+      sessionState.pendingApprovalDeck = singleItemDeck('deck-retry-1', 100);
+
+      await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-retry-1', approveOne(), 'user');
+
+      expect(sessionState.lastFailedMetaWrite).toEqual(
+        expect.objectContaining({ signature: 'AD_SET:CREATE:2041725529929988:120249715770410073::', error: 'Budget too low.', count: 1 }),
+      );
+    });
+
+    it('a second consecutive failure against the SAME target increments to count:2', async () => {
+      jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: false, error: 'Invalid parameter', message: 'Budget too low.' });
+      sessionState.pendingApprovalDeck = singleItemDeck('deck-retry-1', 100);
+      await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-retry-1', approveOne(), 'user');
+
+      sessionState.pendingApprovalDeck = singleItemDeck('deck-retry-2', 150);
+      await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-retry-2', approveOne(), 'user');
+
+      expect(sessionState.lastFailedMetaWrite).toEqual(expect.objectContaining({ count: 2 }));
+    });
+
+    it('a success against the same target clears the counter — recovery resets the streak', async () => {
+      jest.spyOn(service as any, 'manageMetaAdsAdSets')
+        .mockResolvedValueOnce({ success: false, error: 'Invalid parameter', message: 'Budget too low.' })
+        .mockResolvedValueOnce({ success: true, message: 'created', adSet: { id: 'id-AS_94043' } });
+
+      sessionState.pendingApprovalDeck = singleItemDeck('deck-retry-1', 100);
+      await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-retry-1', approveOne(), 'user');
+      expect(sessionState.lastFailedMetaWrite?.count).toBe(1);
+
+      sessionState.pendingApprovalDeck = singleItemDeck('deck-retry-2', 300);
+      await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-retry-2', approveOne(), 'user');
+
+      expect(sessionState.lastFailedMetaWrite).toBeNull();
+    });
   });
 
   it('a fully-processed deck refuses a second submission attempt outright (the awaiting-deck guard, NOT the crash-resume path below — see that test for the actual resume guarantee)', async () => {

@@ -26,7 +26,7 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
-import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -3907,6 +3907,15 @@ export class AgentModeService {
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
+      // Meta write that keeps failing the same way — see the annotation logic
+      // below (and applyMetaWriteRetryBackstop's own header) for why this
+      // never blocks a real attempt, only guarantees the approval card itself
+      // carries the failure history once a target has failed this many times
+      // in a row. 2 = one automatic retry is trusted with no extra noise on the
+      // card (a real chance to self-correct); the card for a 3rd consecutive
+      // attempt at the same target gets the warning annotation.
+      const META_WRITE_RETRY_BACKSTOP_THRESHOLD = 2;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -4932,6 +4941,50 @@ export class AgentModeService {
         //      note).
         //   3. else questionDeckHalts present -> build the QUESTION deck.
         const { writeHalts, questionDeckHalts, otherHalts } = this.partitionApprovalHalts(iterationResults);
+
+        // ENG-1635/1644 follow-up: retry-backstop TRANSPARENCY, checked before
+        // building a fresh deck for a write. Found live: a write that fails
+        // Meta-side validation got silently re-proposed identically, turn after
+        // turn, with zero explanation — the model's own in-turn anti-loop
+        // detector (below, in this same function) never caught it because each
+        // retry is only ONE iteration per turn (one halt, one break) — there's
+        // never two identical signatures WITHIN one turn to trip that detector.
+        //
+        // Deliberately NOT a hard block. An earlier version of this fix
+        // intercepted and replaced the turn with a stop message once a target
+        // had failed twice — but that blocks dispatch based on TARGET identity
+        // alone (entity+action+campaign/ad-set), not on whether anything
+        // actually changed. A genuinely corrected 3rd attempt (a real, different,
+        // would-succeed budget) would have been silently blocked too, never even
+        // shown to the user — trading one failure mode (silent identical retry)
+        // for another (silently refusing a good attempt). Caught live re-verifying
+        // this exact fix (Manan: "make sure being overly cautious... does not
+        // impact quality or behavior negatively anywhere").
+        //
+        // Instead: annotate the approval card itself with the failure history —
+        // this is a CODE-level guarantee the user sees the context (never
+        // dependent on Emma choosing to mention it in her own prose), while
+        // NEVER preventing a real attempt from being shown and approved. If the
+        // user approves again knowing this history, that's an informed choice,
+        // not a silent loop — and if it fails again, the next card carries the
+        // same warning, so nothing is ever hidden.
+        if (writeHalts.length > 0 && sessionId) {
+          const sessionForBackstop = await chatbotDb.getChatSession(sessionId);
+          const priorFailure = sessionForBackstop?.lastFailedMetaWrite;
+          if (priorFailure && priorFailure.count >= META_WRITE_RETRY_BACKSTOP_THRESHOLD) {
+            for (const h of writeHalts as any[]) {
+              const dispatch = h?.metaWriteDispatch;
+              if (!dispatch || this.computeMetaWriteTargetSignature(dispatch) !== priorFailure.signature) continue;
+              const warning =
+                `⚠️ This exact target has already failed ${priorFailure.count} time(s) in a row with: ` +
+                `"${priorFailure.error}" — review before approving again.\n\n`;
+              if (typeof h.confirmationDetail === 'string') h.confirmationDetail = warning + h.confirmationDetail;
+              if (typeof h.confirmationPrompt === 'string') h.confirmationPrompt = warning + h.confirmationPrompt;
+              if (typeof h.summary === 'string') h.summary = warning + h.summary;
+            }
+          }
+        }
+
         const approvalDeck: PendingApprovalDeck | null =
           sessionId && otherHalts.length === 0
             ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
@@ -21945,6 +21998,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
     const definition = { workflowId: `approval-deck-${deck.deckId}`, steps };
+    // ENG-1635/1644 follow-up: the retry-backstop needs each step's real target
+    // identity after the run completes, keyed the same way checkpoints are
+    // (stepId === item.itemId — see buildMetaWriteWorkflowSteps).
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
 
     const started = await startWorkflow(sessionId, definition, undefined).catch(() => null);
     if (!started) return { outcome: 'conflict' };
@@ -21959,7 +22016,93 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run') {
       return { outcome: 'conflict' };
     }
-    return { outcome: 'submitted', run: outcome.run, summary: this.summarizeApprovalDeckRun(outcome.run), answeredDeck: answered };
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session!, summary, stepIdToDispatch);
+    }
+    return { outcome: 'submitted', run: outcome.run, summary, answeredDeck: answered };
+  }
+
+  /**
+   * ENG-1635/1644 follow-up: records a per-target consecutive-failure streak so
+   * the loop-seam annotation logic (agentModeService's main iteration loop, see
+   * its own comment right before this field is read) can guarantee the failure
+   * history is visible on the next approval card for the same target — found
+   * live, a write that failed 3x in a row got silently re-proposed identically
+   * each time, with zero explanation, because nothing surfaced the failure
+   * independent of whether the model chose to mention it in prose (the enriched
+   * error reaching Emma via answerAck, fixed separately, was necessary but not
+   * sufficient — she still didn't reliably act on it every time).
+   *
+   * Deliberately does NOT block or gate dispatch itself — see the annotation
+   * logic's own comment for why an earlier hard-block version of this was
+   * reverted (it could silently refuse a genuinely corrected, would-succeed
+   * attempt, trading one failure mode for a worse one). This is purely
+   * bookkeeping: a success against the streak's target clears it, a failure
+   * increments it, and code elsewhere reads it to decide whether to add a
+   * warning to the next card — never whether to allow the attempt at all.
+   *
+   * Tracks ONE target's streak at a time (the most recently failed one in this
+   * batch) — decks are small in practice and the reproduced bug was always a
+   * single-item repeated retry; a full per-signature map would be real
+   * over-engineering for a batch shape that's never actually occurred.
+   */
+  private async applyMetaWriteRetryBackstop(
+    sessionId: string,
+    session: ChatSession,
+    summary: ApprovalDeckExecutionSummary,
+    stepIdToDispatch: Map<string, NonNullable<ApprovalDeckItem['metaWriteDispatch']>>,
+  ): Promise<void> {
+    const current = session.lastFailedMetaWrite ?? null;
+    let next = current;
+    for (const item of summary.items) {
+      const dispatch = stepIdToDispatch.get(item.stepId);
+      if (!dispatch) continue;
+      const signature = this.computeMetaWriteTargetSignature(dispatch);
+      if (item.status === 'verified') {
+        // A success against the same target the streak was tracking means
+        // whatever was wrong got fixed — the backstop's job here is done.
+        if (current?.signature === signature) next = null;
+        continue;
+      }
+      if (item.status === 'failed') {
+        const sameTargetAsBefore = current?.signature === signature;
+        next = {
+          signature,
+          error: item.error || 'Meta write failed',
+          count: sameTargetAsBefore ? current!.count + 1 : 1,
+          at: new Date().toISOString(),
+        };
+      }
+    }
+    if (next === current) return;
+    try {
+      await chatbotDb.updateSessionLastFailedMetaWrite(sessionId, next);
+    } catch (err) {
+      console.error('AgentMode: failed to update lastFailedMetaWrite retry-backstop counter:', err);
+    }
+  }
+
+  private computeMetaWriteTargetSignature(dispatch: {
+    entity_type: string;
+    action: string;
+    account_id: string;
+    campaign_id?: string;
+    ad_set_id?: string;
+    ad_id?: string;
+  }): string {
+    // Target identity only — deliberately NOT the params/digest. A genuinely
+    // corrected retry (different budget, same ad set) still targets the same
+    // entity, and should still count toward the same streak; the backstop is
+    // about a TARGET repeatedly failing, not about byte-identical arguments.
+    return [
+      dispatch.entity_type,
+      dispatch.action,
+      dispatch.account_id,
+      dispatch.campaign_id ?? '',
+      dispatch.ad_set_id ?? '',
+      dispatch.ad_id ?? '',
+    ].join(':');
   }
 
   /**

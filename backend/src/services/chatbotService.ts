@@ -274,6 +274,20 @@ export interface ChatSession {
   // again without a fresh confirmation. Map value is the consumption
   // timestamp (kept, not just a boolean, purely for audit/debugging).
   consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-1635/1644 follow-up: tracks a per-target consecutive-failure streak for
+  // a Meta write, purely so the failure history can be surfaced on the NEXT
+  // approval card for the same target — found live, a write that failed 3x in
+  // a row got silently re-proposed identically each time with zero explanation,
+  // because nothing surfaced the failure independent of the model's own prose.
+  // Deliberately NOT used to block or gate dispatch (an earlier version did —
+  // reverted live, since blocking by target identity alone can silently refuse
+  // a genuinely corrected, would-succeed attempt too, which is worse than the
+  // bug it was fixing). `signature` identifies the TARGET (entity_type+action+
+  // account/campaign/ad_set/ad id), not exact params, so a genuinely corrected
+  // retry (different params, same target) still counts toward the same streak
+  // for warning purposes — never for permission. Cleared to null the moment a
+  // write against the same signature succeeds.
+  lastFailedMetaWrite?: { signature: string; error: string; count: number; at: string } | null;
   // ENG-397: the structured, typed workflow run in flight for this session
   // (if any). Each mutating step's checkpoint (entity IDs + verified
   // end-state) is persisted here so a killed-and-restarted session resumes
@@ -3504,6 +3518,40 @@ export class ChatbotDB {
         return null;
       }
       console.error('Error updating session approval deck:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 follow-up: persist (or clear) the retry-backstop counter for a
+   * repeatedly-failing Meta write. Unconditional (no guard/condition) — this is
+   * advisory bookkeeping for a UX backstop, not a security invariant, so a lost
+   * race under last-write-wins is an acceptable tradeoff against the complexity
+   * a real lock would add here.
+   */
+  async updateSessionLastFailedMetaWrite(
+    sessionId: string,
+    value: { signature: string; error: string; count: number; at: string } | null,
+  ): Promise<ChatSession | null> {
+    const params: any = value
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET lastFailedMetaWrite = :lastFailedMetaWrite',
+          ExpressionAttributeValues: { ':lastFailedMetaWrite': value },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE lastFailedMetaWrite',
+          ReturnValues: 'ALL_NEW',
+        };
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error('Error updating session lastFailedMetaWrite:', error);
       throw error;
     }
   }
