@@ -284,6 +284,7 @@ async function runGenerationSmokeTestNow(
   let leadCaptured = false;
   let pixelFired = false;
   let error: string | undefined;
+  let handoffId: string | null = null;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
   try {
@@ -394,25 +395,34 @@ async function runGenerationSmokeTestNow(
     // (or the appearance of a handoff_id in the URL) right after submit is positive
     // evidence the pipeline accepted the lead; treat it as captured. Only when the page
     // stays put (no navigation) do we poll the CRM by email.
-    let navigatedAway = false;
+    // A React/chat-handoff form may legitimately redirect on success (e.g. to
+    // chat.waterheater.app/text?handoff_id=...) INSTEAD of creating a CRM lead row —
+    // pollForLead would then always miss. Restrict the exception to a CROSS-ORIGIN
+    // navigation carrying a verifiable handoff_id: the redirect left the deployed
+    // origin entirely (an unrelated redirect or broken same-origin hop cannot fake
+    // this), and the handoff id itself is persisted on the result so a human can
+    // verify it against the handoff/chat backend. A same-origin handoff_id URL, or
+    // a cross-origin navigation without one, still falls through to the CRM poll.
     try {
       await browserPage.waitForURL(
         (url) => url.toString() !== urlBeforeSubmit,
         { timeout: 8_000 }
       );
-      navigatedAway = true;
     } catch {
       // No navigation — form likely posts to a capture API and shows inline success.
     }
     const urlAfterSubmit = browserPage.url();
-    // A same-test navigation right after submit is positive evidence the form's own
-    // JS accepted the submission (client-side validation passed and the success path
-    // ran). For chat-handoff forms the success path is a redirect carrying a handoff
-    // id rather than a CRM lead row — pollForLead would always miss those, so treat
-    // a redirect-with-handoff-id as captured. Any OTHER navigation (anchor scroll,
-    // same-URL rerender) still falls through to the CRM poll below.
-    const redirectedToHandoff =
-      navigatedAway && /handoff_id=/.test(urlAfterSubmit);
+    try {
+      const before = new URL(urlBeforeSubmit);
+      const after = new URL(urlAfterSubmit);
+      const match = /[?&]handoff_id=([^&]+)/.exec(urlAfterSubmit);
+      if (after.origin !== before.origin && match?.[1]) {
+        handoffId = decodeURIComponent(match[1]);
+      }
+    } catch {
+      // Unparseable URL — not a verifiable handoff; fall through to the CRM poll.
+    }
+    const redirectedToHandoff = handoffId !== null;
 
     const lead = redirectedToHandoff ? null : await pollForLead(leadListId, email);
     if (lead) {
@@ -445,6 +455,10 @@ async function runGenerationSmokeTestNow(
     ...(pixelExpected ? { pixelFired } : {}),
     checkedAt,
     ...(error ? { error } : {}),
+    // Persisted handoff evidence: the id extracted from the cross-origin redirect
+    // URL, so the handoff can be verified against the chat/handoff backend. Absent
+    // unless the redirect-with-handoff-id path fired.
+    ...(handoffId ? { handoffId } : {}),
   };
 
   await updateLandingPageSmokeTestResult(page.id, result);

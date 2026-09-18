@@ -348,6 +348,38 @@ describe("runGenerationSmokeTest", () => {
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
+    // Handoff evidence is persisted so it can be verified against the chat backend.
+    expect(result.handoffId).toBe("abc123");
+  });
+
+  it("FAIL: same-origin handoff_id URL still polls the CRM (no optimistic read of our own hop)", async () => {
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      .mockReturnValueOnce("https://campaign.waterheater.app/text?handoff_id=abc123");
+    mockGetLeadByEmail.mockResolvedValue(null); // never found
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(false);
+    expect(result.handoffId).toBeUndefined();
+  });
+
+  it("FAIL: cross-origin navigation without handoff_id still polls the CRM", async () => {
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://test-page.vercel.app")
+      .mockReturnValueOnce("https://other.example.com/thanks");
+    mockGetLeadByEmail.mockResolvedValue(null); // never found
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(false);
+    expect(result.handoffId).toBeUndefined();
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {

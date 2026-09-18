@@ -587,6 +587,10 @@ export interface GeneratedLandingPage {
     pixelFired?: boolean;
     checkedAt: string;
     error?: string;
+    /** ENG-449: handoff id extracted from a cross-origin chat-handoff redirect
+     * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
+     * Persisted so the handoff can be verified against the chat/handoff backend. */
+    handoffId?: string;
   };
   /**
    * ENG-1238: externally-deployed/imported page marker. Records registered via
