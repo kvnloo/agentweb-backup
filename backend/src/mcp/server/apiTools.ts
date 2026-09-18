@@ -1024,6 +1024,7 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
         const sequence = data?.sequence;
         if (!sequence) return jsonResult({ error: `Sequence not found: ${sequenceId}` });
         let enrollment_count: unknown = undefined;
+        let enrollment_error: string | undefined = undefined;
         try {
           const enrollments = await mcpFetch({
             method: 'GET',
@@ -1031,10 +1032,19 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
             context: ctx(context),
           });
           enrollment_count = enrollments?.stats ?? enrollments?.enrollments?.length ?? undefined;
-        } catch {
+        } catch (err: any) {
+          // Surface enrollment-endpoint failures explicitly instead of
+          // silently dropping the count (CodeRabbit, PR #2974): the
+          // inspect-one contract promises an enrollment count, and a 401/403,
+          // timeout, or 5xx here must not read as "zero enrollments".
           enrollment_count = undefined;
+          enrollment_error = err?.message || String(err);
         }
-        return jsonResult({ ...summarizeSequence(sequence), enrollment_count });
+        return jsonResult({
+          ...summarizeSequence(sequence),
+          enrollment_count,
+          ...(enrollment_error ? { enrollment_error } : {}),
+        });
       }
 
       const data = await mcpFetch({
@@ -1055,7 +1065,9 @@ An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summ
         sequences,
         summary:
           sequences.length === 0
-            ? 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            ? typeof args?.status === 'string'
+              ? `No CRM drip sequences match status "${args.status}".`
+              : 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
             : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
       });
     } catch (err: any) {
