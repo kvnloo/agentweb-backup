@@ -657,6 +657,22 @@ describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)'
     }
   );
 
+  it.each([
+    ['sent', [['delivery_attempted', undefined], ['delivered', undefined]]],
+    ['suppressed', [['delivery_attempted', undefined], ['delivery_attempted', 'suppressed_nonprod']]],
+    ['failed', [['delivery_attempted', undefined], ['delivery_attempted', 'provider_error']]],
+  ])('a %s send records exactly the delivery states it earned', async (outcome, expected) => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue(outcome as any);
+
+    await emailService.sendScheduledChatResultEmail(['a@example.com'], 'Weekly', { ...GUARD_BASE_RESULT, runId: 'run-5' }, 'schedule-123');
+
+    const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => [c[1].state, c[1].reason]);
+    expect(states).toEqual(expected);
+    expect((scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.every((c) => c[1].runId === 'run-5')).toBe(true);
+  });
+
   it('records withheld/no_authorized_recipients when the send-time guard leaves nobody', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: { list_all_clients: 1 } });
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });

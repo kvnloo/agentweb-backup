@@ -1,13 +1,22 @@
 import { emailService } from '../services/emailService';
 import { chatbotDb } from '../services/chatbotService';
+import { scheduleDb, userDb } from '../services/db';
 
 // Mock the chatbot service
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createOrReuseInteractiveShare: jest.fn(),
     getChatSession: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn()
   }
+}));
+
+// ENG-1552: the digest now runs the ENG-500 recipient guard, which reads the owner
+// and each recipient's admin status, and records delivery state on the schedule.
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn(), getUserByEmail: jest.fn() },
+  scheduleDb: { appendDeliveryLogEntry: jest.fn().mockResolvedValue(undefined), getScheduleById: jest.fn() },
 }));
 
 // Mock the email sending function
@@ -25,6 +34,13 @@ jest.mock('../services/emailService', () => {
 describe('Daily Digest Email Service', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Ordinary runs: the guard can positively verify each session made no
+    // cross-account tool call, so the digest goes to every configured address.
+    (chatbotDb.getChatSession as jest.Mock).mockImplementation(async (sessionId: string) =>
+      ({ sessionId, userId: 'owner-id', calledFunctions: {} }));
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
   });
 
   describe('sendDailyDigestEmail', () => {
@@ -207,6 +223,68 @@ describe('Daily Digest Email Service', () => {
       
       // Check that HTML is escaped
       expect(html).toContain('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;Test response');
+    });
+  });
+
+  // ── ENG-1552: the digest runs the same recipient guard as a single report ──
+  describe('recipient guard parity (ENG-1552)', () => {
+    const run = (sessionId: string, actualResponse = 'Client roster summary') => ({
+      passed: true, actualResponse, keywordMatches: [], keywordMisses: [], functionCallMatches: [],
+      functionCallMisses: [], executionTime: 1000, sessionId, attempt: 1, createdAt: '2024-01-15T10:00:00Z',
+    });
+
+    beforeEach(() => {
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue('http://localhost:5174/ishare/x');
+      // session-2 used a cross-account tool; session-1 is ordinary.
+      (chatbotDb.getChatSession as jest.Mock).mockImplementation(async (sessionId: string) => ({
+        sessionId, userId: 'owner-id', calledFunctions: sessionId === 'session-2' ? { list_all_clients: 1 } : {},
+      }));
+      (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) => ({ email, isAdmin: email === 'admin@example.com' }));
+    });
+
+    it('restricts the whole digest when ANY run in it is sensitive, with the withheld notice', async () => {
+      (emailService.sendEmail as jest.Mock).mockResolvedValue('sent');
+      await emailService.sendDailyDigestEmail(['admin@example.com', 'analyst@example.com'], 'Hourly', [run('session-1'), run('session-2')], 'schedule-1');
+
+      expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+      const [recipients, , text, html] = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      expect(recipients).toEqual(['admin@example.com']);
+      expect(text).toContain('withheld');
+      expect(html).toContain('analyst@example.com');
+      expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+        'schedule-1',
+        expect.objectContaining({ state: 'delivered', authorizedRecipients: ['admin@example.com'], withheldRecipients: ['analyst@example.com'] }),
+        undefined,
+      );
+    });
+
+    it('sends nothing to recipients when nobody is authorized, records withheld, and notifies the owner', async () => {
+      const notify = jest.spyOn(emailService, 'notifyScheduledReportWithheld').mockResolvedValue(undefined);
+      await emailService.sendDailyDigestEmail(['analyst@example.com'], 'Hourly', [run('session-2')], 'schedule-1');
+
+      expect(emailService.sendEmail).not.toHaveBeenCalled();
+      expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+      expect(notify).toHaveBeenCalledWith(expect.objectContaining({ scheduleId: 'schedule-1', stage: 'after_generation' }));
+      expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+        'schedule-1',
+        expect.objectContaining({ state: 'withheld', reason: 'no_authorized_recipients' }),
+        undefined,
+      );
+      notify.mockRestore();
+    });
+
+    it('shows an empty run as "no report content" instead of a blank preview', async () => {
+      await emailService.sendDailyDigestEmail(['a@example.com'], 'Hourly', [run('session-1', '   ')], 'schedule-1');
+      const [, , text, html] = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      expect(html).toContain('This run produced no report content.');
+      expect(text).toContain('This run produced no report content.');
+    });
+
+    it('records delivery_attempted/provider_error — never delivered — when the provider send fails', async () => {
+      (emailService.sendEmail as jest.Mock).mockResolvedValue('failed');
+      await emailService.sendDailyDigestEmail(['a@example.com'], 'Hourly', [run('session-1')], 'schedule-1');
+      const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => [c[1].state, c[1].reason]);
+      expect(states).toEqual([['delivery_attempted', undefined], ['delivery_attempted', 'provider_error']]);
     });
   });
 });
