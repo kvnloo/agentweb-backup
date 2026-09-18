@@ -1925,3 +1925,65 @@ describe('apiTools', () => {
   });
 
 });
+
+describe('ENG-1015 durable session polling', () => {
+  const context = { userId: 'user-123', agentUserId: 'user-123' };
+  const session = { sessionId: 's1', messages: [], hasActiveProgress: false };
+  async function poll(runId?: string) {
+    const result = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: runId }, context);
+    return JSON.parse(result.content[0].text);
+  }
+  beforeEach(() => mockMcpFetch.mockReset());
+  it('does not infer completion from an idle session without a run ID', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session);
+    expect((await poll()).completion_confirmed).toBe(false);
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+  it.each(['completed', 'failed', 'interrupted'])('confirms durable terminal status %s for the requested session and run', async status => {
+    const run = { runId: 'r1', sessionId: 's1', status, finishReason: 'stop' };
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    const body = await poll('r1');
+    expect(body.completion_confirmed).toBe(true);
+    expect(body.run).toEqual(run);
+    expect(mockMcpFetch).toHaveBeenLastCalledWith({ method: 'GET', path: '/api/agent-mode/runs/r1', context });
+  });
+  it.each([
+    null, [], 'completed', {},
+    { runId: 'r1', sessionId: 's1', status: 'running' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: 'detached_still_building' },
+    { runId: 'r1', sessionId: 'other', status: 'completed' },
+    { runId: 'other', sessionId: 's1', status: 'completed' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: {} },
+  ])('withholds confirmation for absent, malformed, unrelated or detached evidence: %j', async run => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingUserQuestion: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits work-plan input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingWorkPlanInput: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it.each(['timeout_partial_media', 'timeout_partial_work'])(
+    'does not confirm partial timeout finish reason %s',
+    async finishReason => {
+      mockMcpFetch.mockResolvedValueOnce(session)
+        .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed', finishReason });
+      expect((await poll('r1')).completion_confirmed).toBe(false);
+    }
+  );
+  it('withholds confirmation if the run endpoint fails', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockRejectedValueOnce(new Error('404'));
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('preserves session refusal and does not attempt the run read', async () => {
+    mockMcpFetch.mockRejectedValueOnce(new Error('Forbidden'));
+    await expect(mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: 'r1' }, context))
+      .rejects.toThrow('Forbidden');
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+});

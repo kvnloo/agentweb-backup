@@ -36,3 +36,42 @@ export async function captureVoiceEditOnPublish(params: {
 export function voiceCardPromptSuffix(profile: SessionVoiceProfile | undefined): string {
   return formatVoiceCardPromptBlock(profile?.voiceCard);
 }
+
+
+const PUBLISH_DRAFT_TOOLS = new Set(['post_on_connected_account', 'post_thread']);
+
+export function augmentPublishToolDefinitions(
+  tools: any[] | undefined,
+  profile: SessionVoiceProfile | undefined,
+): any[] {
+  if (!tools?.length) return tools ?? [];
+  const voiceBlock = formatVoiceCardPromptBlock(profile?.voiceCard);
+  if (!voiceBlock.trim()) return tools;
+
+  return tools.map((tool) => {
+    const name = tool?.function?.name;
+    if (!name || !PUBLISH_DRAFT_TOOLS.has(name)) return tool;
+    const fn = tool.function ?? {};
+    const params = fn.parameters ?? {};
+    const props = { ...(params.properties ?? {}) };
+    if (props.content) {
+      props.content = {
+        ...props.content,
+        description: `${props.content.description ?? 'Post content.'}
+
+${voiceBlock.trim()}`,
+      };
+    }
+    return {
+      ...tool,
+      function: {
+        ...fn,
+        description: `${fn.description ?? name}
+
+When drafting social content, mirror the Author Voice Card below.
+${voiceBlock.trim()}`,
+        parameters: { ...params, properties: props },
+      },
+    };
+  });
+}

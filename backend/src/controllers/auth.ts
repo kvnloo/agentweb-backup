@@ -668,6 +668,9 @@ export const googleCallback = async (
       email: user.email,
       roles: userRoles,
       isAdmin: user.isAdmin || false,
+      // ENG-470: propagated to googleAuthFinalHandler so the portal fires
+      // CompleteRegistration exactly once for genuine new OAuth signups.
+      isNewUser,
     };
     done(null, resultUserObject);
   } catch (error: any) {
