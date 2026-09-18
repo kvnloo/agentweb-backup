@@ -1097,6 +1097,15 @@ const FOCUSED_QUESTION_PATTERN: RegExp =
 const AMBIGUOUS_FRAGMENT_PATTERNS: RegExp[] = [
   /^(post|send|share|publish|do|run|start|go|do it|post it|send it|share it|run it)\s*[.!?]?\s*$/i,
   /^(it|that|this|those|them)\s+[a-z']{0,20}$/i,
+  // Standalone pronoun ("it", "that") — the other half of the pronoun-only
+  // fragment shape (CodeRabbit PR review on #2983).
+  /^(it|that|this|those|them)\s*[.!?]?\s*$/i,
+  // Bare noun ("LinkedIn") — a single capitalized token with no verb and no
+  // sentence structure (CodeRabbit PR review on #2983). Kept narrow: a
+  // multi-word or lowercase-leading fragment only qualifies via the shapes
+  // above, so complete requests like "Write a haiku about winter" stay
+  // scorable.
+  /^[A-Z][a-zA-Z']*$/,
   /^(you (choose|decide|pick)|whatever( works| you (want|think))?|your call)\s*[.!?]?\s*$/i,
 ];
 // Account-level publish-authorization hold for a NON-scheduled (interactive)
@@ -1134,7 +1143,7 @@ const INTERACTIVE_PUBLISH_HANDLING_PATTERNS: RegExp[] = [
 // that mentions "provider error" mid-body and "next steps" at the end stays
 // scorable: neither the opening nor the closing is the block report.
 const BLOCK_REPORT_OPEN_PATTERN: RegExp =
-  /^(sorry|i (can't|cannot|won't|am unable)|unable to|stopped|holding|saved the draft|draft saved|please sign in|sign in|once signed in|your .* was revoked|reconnect|linked(in)? search is (currently down|down)|service is (currently down|down)|.*\boutage, so i stopped\b|.*could you clarify|.*could you let me know|.*publish.*(approval|authorization|withheld))/i;
+  /^(i (can't|cannot|won't|am unable)|unable to|sorry,? i (can't|cannot|won't|am unable)|stopped|holding|saved the draft|draft saved|please sign in|sign in|once signed in|your .* was revoked|reconnect|linked(in)? search is (currently down|down)|service is (currently down|down)|.*\boutage, so i stopped\b|.*could you clarify|.*could you let me know|.*publish.*(approval|authorization|withheld))/i;
 const BLOCK_REPORT_CLOSE_PATTERN: RegExp =
   /(say retry|once (signed in|reconnected)|takes ~?60 seconds|settings → integrations|filed .* (as )?a product issue|reported via the appropriate tool|which [a-z']+\?|what [a-z']+.*\?|whether .*\.?\s*$|please sign in|will not (publish|post|proceed|make)|stopped (before|that path)|saved the draft|draft saved)\s*(<[^>]+>\s*)*$/i;
 

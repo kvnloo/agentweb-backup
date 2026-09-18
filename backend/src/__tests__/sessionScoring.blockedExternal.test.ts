@@ -191,6 +191,53 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(mockCallLLM).not.toHaveBeenCalled();
   });
 
+  it('a bare-noun fragment ("LinkedIn") with a decline-to-guess and focused question is excluded', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'LinkedIn' },
+      { role: 'assistant', content: 'I decline to guess what you want with this instead of guessing. Could you clarify what should I do with it?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a standalone-pronoun fragment ("that") with a decline-to-guess and focused question is excluded', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'that' },
+      { role: 'assistant', content: 'I decline to guess what you mean instead of guessing. Could you clarify which item you mean?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a completed short incident update opening with generic "sorry" stays scorable (not a terminal block report)', async () => {
+    const update = 'Sorry, here is the incident update. The outage affected logins briefly and service is now restored. Next steps: monitor the dashboard.';
+    expect(update.length).toBeLessThan(300);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post the incident update' },
+      { role: 'assistant', content: update },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a genuine "sorry, I can\'t" terminal block report is still excluded (inability-bound sorry)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: 'Sorry, I can\'t reach LinkedIn search right now — the service is down. I stopped that path; say retry once it is back.' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
   it('a complete request ("Write a haiku about winter") with a decline-to-guess stays scorable (positive fragment allowlist)', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', content: 'Write a haiku about winter' },
