@@ -344,6 +344,10 @@ router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeCo
 // schedule is under storage pressure. Never returns field content, never writes.
 router.get('/scheduled-chats/:scheduleId/storage-diagnostics', asyncHandler(agentModeController.getScheduledChatStorageDiagnostics));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/delivery-log/:runId/confirm
+// ENG-1552: record that a recipient confirmed receiving a delivered report.
+router.post('/scheduled-chats/:scheduleId/delivery-log/:runId/confirm', asyncHandler(agentModeController.confirmScheduledReportReceipt));
+
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
 // Send test notification email for a specific test history record
 router.post('/scheduled-chats/:scheduleId/test-history/:runId/send-email', asyncHandler(agentModeController.sendScheduledChatTestEmail));
