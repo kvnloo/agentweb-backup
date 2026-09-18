@@ -423,6 +423,8 @@ export function getRetryAfterMs(error: unknown): number | undefined {
   return undefined;
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
+import { getCustomerUtmDefault, getLanderUtmOverride } from './landerUtmStore';
+import { resolveLanderParams } from '../utils/landerUtm';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
@@ -19298,11 +19300,33 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return params;
   }
 
-  public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
+  public async createMetaAdsAdCreative(
+    userId: string,
+    params: MetaAdsAdCreativeParams & { account_id?: string; lander_id?: string },
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
+      const [customerDefault, landerOverride] = await Promise.all([
+        getCustomerUtmDefault(userId),
+        params.lander_id ? getLanderUtmOverride(params.lander_id, userId) : Promise.resolve(null),
+      ]);
+      const visitor = params.url_tags
+        ? Object.fromEntries(new URLSearchParams(params.url_tags.replace(/^[?&]/, '')).entries())
+        : undefined;
+      const resolvedUrlTags = customerDefault || landerOverride
+        ? Object.entries(
+            resolveLanderParams({ visitor, override: landerOverride ?? undefined, customerDefault: customerDefault ?? undefined }).params,
+          )
+            .map(([key, value]) => `${key}=${/^\{\{[^{}]+\}\}$/.test(value) ? value : encodeURIComponent(value)}`)
+            .join('&')
+        : params.url_tags;
+      const { lander_id: _landerId, ...creativeParams } = params;
+      let resolvedParams: MetaAdsAdCreativeParams = {
+        ...creativeParams,
+        ...(resolvedUrlTags ? { url_tags: resolvedUrlTags } : {}),
+      };
       // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs to hashes first.
-      let resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
