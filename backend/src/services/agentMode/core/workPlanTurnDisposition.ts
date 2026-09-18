@@ -2,7 +2,10 @@ export type WorkPlanTurnSnapshot = {
   hasWorkPlan: boolean;
   pendingStepCount?: number;
   awaitingAction?: {
-    kind: 'input' | 'question';
+    // 'deck' (ENG-1635/1644, ask_user_question retirement): a single-item,
+    // non-write pendingApprovalDeck — the deck-of-one ask_user_question and
+    // the Meta objective gate now build instead of pendingUserQuestion.
+    kind: 'input' | 'question' | 'deck';
     id: string;
   };
 };
@@ -34,6 +37,26 @@ function awaitingId(value: unknown, idKey: string): string | undefined {
 }
 
 /**
+ * ENG-1635/1644 (ask_user_question retirement): the deck sibling of
+ * `awaitingId` above, for `pendingApprovalDeck`. Deliberately narrower than a
+ * generic status+id check — only a single-item, non-write deck counts (the
+ * exact shape ask_user_question/resolveCampaignObjectiveGate now build); a
+ * genuine multi-item present_question_deck or a Meta-write deck was never a
+ * work-plan `awaitingAction` before this migration either and stays out of
+ * scope here.
+ */
+function awaitingDeckOfOneId(value: unknown): string | undefined {
+  const record = asRecord(value);
+  if (!record || record.status !== 'awaiting') return undefined;
+  const items = record.items;
+  if (!Array.isArray(items) || items.length !== 1) return undefined;
+  const item = asRecord(items[0]);
+  if (!item || typeof item.metaWriteManifestDigest === 'string') return undefined;
+  const id = typeof record.deckId === 'string' ? record.deckId.trim() : '';
+  return id || undefined;
+}
+
+/**
  * Capture only persisted workplan state. Model prose is deliberately excluded:
  * a sentence that looks like a question is not a durable turn outcome.
  */
@@ -54,11 +77,20 @@ export function snapshotWorkPlanTurn(session: unknown): WorkPlanTurnSnapshot {
   }
 
   const pendingQuestionId = awaitingId(sessionRecord?.pendingUserQuestion, 'questionId');
+  if (pendingQuestionId) {
+    return {
+      hasWorkPlan: true,
+      pendingStepCount: findPendingStepCount(workPlan.steps),
+      awaitingAction: { kind: 'question' as const, id: pendingQuestionId },
+    };
+  }
+
+  const pendingDeckId = awaitingDeckOfOneId(sessionRecord?.pendingApprovalDeck);
   return {
     hasWorkPlan: true,
     pendingStepCount: findPendingStepCount(workPlan.steps),
-    ...(pendingQuestionId
-      ? { awaitingAction: { kind: 'question' as const, id: pendingQuestionId } }
+    ...(pendingDeckId
+      ? { awaitingAction: { kind: 'deck' as const, id: pendingDeckId } }
       : {}),
   };
 }

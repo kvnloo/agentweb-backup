@@ -184,7 +184,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking AskUserQuestion card), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question.',
+    description: 'Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking legacy AskUserQuestion card) or an awaiting pendingApprovalDeck (a blocking question/approval deck), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question for pendingUserQuestion, or emma_answer_question_deck for pendingApprovalDeck.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -271,11 +271,66 @@ mcpToolRegistry.register({
   },
 });
 
+// ENG-1635/1644 (ask_user_question retirement): the deck-of-one MCP transport,
+// sibling to emma_answer_question above. ask_user_question and the Meta
+// objective-confirmation gate no longer populate pendingUserQuestion at all —
+// they build a single-item pendingApprovalDeck instead, through the SAME
+// present_question_deck deck mechanism, for UI consistency with the rest of
+// the approval deck (ENG-1635/1644). Without this tool, an MCP client would
+// see pendingApprovalDeck on emma_get_session but have no structured way to
+// resolve it — the exact dead-end emma_answer_question was built to prevent
+// for the old primitive. Posts through the same `deckAnswer` channel the
+// chat card uses (POST /api/agent-mode/generate body.deckAnswer); prose is
+// never accepted as an answer here either.
+mcpToolRegistry.register({
+  name: 'emma_answer_question_deck',
+  definition: {
+    name: 'emma_answer_question_deck',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the deck-of-one equivalent of emma_answer_question, used by ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The chat session ID with the awaiting deck.' },
+        deck_id: { type: 'string', description: 'The pendingApprovalDeck.deckId from emma_get_session — must match the currently awaiting deck.' },
+        item_id: { type: 'string', description: 'The pendingApprovalDeck.items[0].itemId from emma_get_session — the single item being answered.' },
+        option_id: { type: 'string', description: 'The chosen option id. Required unless delegate is true.' },
+        delegate: { type: 'boolean', description: 'Set true for "Let Emma decide" — proceeds with the recommended option, logged as a delegation. option_id is ignored when true.' },
+        label: { type: 'string', description: 'Optional human-readable text to show as the chat message for this selection (e.g. the option label). Defaults to option_id, or "Let Emma decide" when delegating.' },
+      },
+      required: ['session_id', 'deck_id', 'item_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const delegate = args.delegate === true;
+    if (!delegate && (typeof args.option_id !== 'string' || args.option_id.trim() === '')) {
+      return jsonResult({ success: false, message: 'option_id is required unless delegate is true.' });
+    }
+    const label = typeof args.label === 'string' && args.label.trim() !== ''
+      ? args.label
+      : delegate ? 'Let Emma decide' : args.option_id;
+
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      context: ctx(context),
+      body: {
+        sessionId: args.session_id,
+        userMessage: label,
+        deckAnswer: {
+          deckId: args.deck_id,
+          answers: [{ itemId: args.item_id, verdict: delegate ? '' : args.option_id, delegated: delegate }],
+        },
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
 mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking legacy AskUserQuestion is awaiting or was recently answered, and pendingApprovalDeck when a blocking question/approval deck is (a single-item deck is the deck-of-one that ask_user_question and the Meta objective confirmation now use) — check status before assuming a run has completed; resolve an "awaiting" pendingUserQuestion with emma_answer_question, or an "awaiting" pendingApprovalDeck with emma_answer_question_deck. Never with a plain emma_send_message reply.',
     inputSchema: {
       type: 'object',
       properties: { session_id: { type: 'string', description: 'The session ID' } },

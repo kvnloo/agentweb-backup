@@ -18,7 +18,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
-import type { PendingApprovalDeck } from '../services/agentMode/core/approvalDeck';
+import { applyDeckAnswers, type PendingApprovalDeck, type InboundDeckAnswer } from '../services/agentMode/core/approvalDeck';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
 import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
@@ -3691,6 +3691,12 @@ type RunVerifiedChatResult = {
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
   parked?: boolean;
   pendingUserQuestion?: PendingUserQuestion;
+  // ENG-1635/1644 (ask_user_question retirement): a headless/scheduled turn can
+  // now also park on a deck-of-one (ask_user_question/the objective gate no
+  // longer write pendingUserQuestion at all) — same park guarantee, different
+  // slot. Set only alongside a deck-of-one park, never alongside
+  // pendingUserQuestion in the same result.
+  pendingApprovalDeck?: PendingApprovalDeck;
   // ENG-636: set when a run had to stop on a blocking question but the caller has
   // NO channel to reach a human (headless, fire-and-forget). The run failed
   // explicitly instead of parking into a void; there is no pendingUserQuestion to
@@ -4106,50 +4112,9 @@ async function runVerifiedChatInner(
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
     const postTurnSession = await chatbotDb.getChatSession(sessionId);
-    if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
-    const pending = postTurnSession.pendingUserQuestion;
 
-    // Reversible questions auto-proceed in any headless run; immutable ones only
-    // when the schedule explicitly waived the human protection (full autonomy).
-    const canAutoTake = fullAutonomy || pending.immutable !== true;
-    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
-      autoTakesUsed++;
-      const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
-      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
-        requireStillAwaiting: pending.questionId,
-      });
-      const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
-      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
-      console.log(
-        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
-      );
-      // Breadcrumb in history so Emma sees the decision and resumes without
-      // re-asking (best-effort; the persisted answer is the source of truth).
-      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
-      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
-      // revisionService, humanEvalActionService, imageReports), so hardcoding
-      // '[Scheduled run]' would write a false label into those sessions' history.
-      const breadcrumbPrefix =
-        fullAutonomy && pending.immutable === true
-          ? '[Full autonomy]'
-          : postTurnSession.sessionType === 'scheduled'
-            ? '[Scheduled run]'
-            : '[Auto-proceed]';
-      try {
-        await chatbotDb.addMessageToSession(sessionId, {
-          role: 'user',
-          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
-          timestamp: new Date().toISOString(),
-          metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
-        });
-      } catch (breadcrumbError) {
-        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
-      }
-      return { action: 'autoTake' };
-    }
-
-    // Shared failure body for both park variants below.
-    const stopResultBase = {
+    // Shared failure body for both park variants below, either slot.
+    const buildStopResultBase = () => ({
       success: false as const,
       content: allContent,
       toolCalls: allToolCalls,
@@ -4165,39 +4130,163 @@ async function runVerifiedChatInner(
       })),
       attempts: attempt,
       workPlanCompleted: false,
-    };
+    });
 
-    // ENG-636: a PARK only makes sense when a human will actually see and answer
-    // the question. Callers with a notification/answer channel (scheduled →
-    // owner email; interactive verifiedGenerate → live session card) set
-    // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
-    // is a dead end: no one is told, no one can answer, and the run silently
-    // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
-    // of returning a pendingUserQuestion nobody will ever action. This is the
-    // correct terminal behavior for an IMMUTABLE question too: we must never
-    // auto-decide an irreversible choice, and the write gate still blocks the
-    // action — so an honest, monitorable failure is the safe outcome.
-    if (!parkNotifiable) {
-      console.error(
-        `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+    // Legacy slot first — any session that entered its awaiting state before
+    // the ask_user_question-retirement migration deployed still resolves here,
+    // untouched. New halts never populate this slot anymore (ask_user_question
+    // and resolveCampaignObjectiveGate both now build a deck-of-one instead —
+    // see the 'New slot' branch below).
+    if (postTurnSession?.pendingUserQuestion?.status === 'awaiting') {
+      const pending = postTurnSession.pendingUserQuestion;
+
+      // Reversible questions auto-proceed in any headless run; immutable ones only
+      // when the schedule explicitly waived the human protection (full autonomy).
+      const canAutoTake = fullAutonomy || pending.immutable !== true;
+      if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
+        autoTakesUsed++;
+        const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
+        await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+          requireStillAwaiting: pending.questionId,
+        });
+        const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+        const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
+        console.log(
+          `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+        );
+        // Breadcrumb in history so Emma sees the decision and resumes without
+        // re-asking (best-effort; the persisted answer is the source of truth).
+        // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
+        // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
+        // revisionService, humanEvalActionService, imageReports), so hardcoding
+        // '[Scheduled run]' would write a false label into those sessions' history.
+        const breadcrumbPrefix =
+          fullAutonomy && pending.immutable === true
+            ? '[Full autonomy]'
+            : postTurnSession.sessionType === 'scheduled'
+              ? '[Scheduled run]'
+              : '[Auto-proceed]';
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'user',
+            content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+            timestamp: new Date().toISOString(),
+            metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
+          });
+        } catch (breadcrumbError) {
+          console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
+        }
+        return { action: 'autoTake' };
+      }
+
+      const stopResultBase = buildStopResultBase();
+
+      // ENG-636: a PARK only makes sense when a human will actually see and answer
+      // the question. Callers with a notification/answer channel (scheduled →
+      // owner email; interactive verifiedGenerate → live session card) set
+      // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
+      // is a dead end: no one is told, no one can answer, and the run silently
+      // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
+      // of returning a pendingUserQuestion nobody will ever action. This is the
+      // correct terminal behavior for an IMMUTABLE question too: we must never
+      // auto-decide an irreversible choice, and the write gate still blocks the
+      // action — so an honest, monitorable failure is the safe outcome.
+      if (!parkNotifiable) {
+        console.error(
+          `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+        );
+        return {
+          action: 'park',
+          result: { ...stopResultBase, parkedUnnotifiable: true },
+        };
+      }
+
+      console.warn(
+        `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
       );
       return {
         action: 'park',
-        result: { ...stopResultBase, parkedUnnotifiable: true },
+        result: {
+          ...stopResultBase,
+          parked: true,
+          pendingUserQuestion: postTurnSession.pendingUserQuestion,
+        },
       };
     }
 
-    console.warn(
-      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
-    );
-    return {
-      action: 'park',
-      result: {
-        ...stopResultBase,
-        parked: true,
-        pendingUserQuestion: postTurnSession.pendingUserQuestion,
-      },
-    };
+    // New slot: a deck-of-one from the migrated ask_user_question/objective-gate
+    // producers (ENG-1635/1644 retirement). Narrowly scoped — exactly what
+    // those two producers build (a single, non-write item) — a genuine
+    // multi-item present_question_deck or a Meta-write deck was never covered
+    // by headless auto-take/park before this migration either, and stays out
+    // of scope here: those always require a live, interactive human.
+    const deck = postTurnSession?.pendingApprovalDeck;
+    if (deck?.status === 'awaiting' && deck.items.length === 1 && !deck.items[0].metaWriteManifestDigest) {
+      const item = deck.items[0];
+
+      const canAutoTake = fullAutonomy || item.immutable !== true;
+      if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
+        autoTakesUsed++;
+        // A synthesized delegated:true answer resolves deterministically to
+        // item.recommended via applyDeckAnswers (verified directly against
+        // approvalDeck.ts) — the deck-of-one equivalent of
+        // resolveInboundAnswer's delegated branch above.
+        const inbound: InboundDeckAnswer[] = [{ itemId: item.itemId, verdict: '', delegated: true }];
+        const answeredDeck = applyDeckAnswers(deck, inbound, 'delegation', new Date().toISOString());
+        await chatbotDb.updateSessionApprovalDeck(sessionId, answeredDeck, {
+          requireStillAwaiting: deck.deckId,
+        });
+        const deckAnswer = answeredDeck.answers?.find(a => a.itemId === item.itemId);
+        const chosenOption = item.options?.find(o => o.id === deckAnswer?.verdict);
+        const takeKind = fullAutonomy && item.immutable === true ? 'full-autonomy' : 'reversible-default';
+        console.log(
+          `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — deck ${deck.deckId} item ${item.itemId} → "${chosenOption?.label}" (delegation); continuing`
+        );
+        const breadcrumbPrefix =
+          fullAutonomy && item.immutable === true
+            ? '[Full autonomy]'
+            : postTurnSession?.sessionType === 'scheduled'
+              ? '[Scheduled run]'
+              : '[Auto-proceed]';
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'user',
+            content: `${breadcrumbPrefix} Proceed with "${chosenOption?.label}".`,
+            timestamp: new Date().toISOString(),
+            metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, pendingApprovalDeckId: deck.deckId } as any,
+          });
+        } catch (breadcrumbError) {
+          console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
+        }
+        return { action: 'autoTake' };
+      }
+
+      const stopResultBase = buildStopResultBase();
+
+      if (!parkNotifiable) {
+        console.error(
+          `AgentMode runVerifiedChat: session ${sessionId} hit a blocking deck-of-one question (${deck.deckId}, immutable=${item.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+        );
+        return {
+          action: 'park',
+          result: { ...stopResultBase, parkedUnnotifiable: true },
+        };
+      }
+
+      console.warn(
+        `AgentMode runVerifiedChat: parking session ${sessionId} — blocking deck-of-one question (${deck.deckId}, immutable=${item.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
+      );
+      return {
+        action: 'park',
+        result: {
+          ...stopResultBase,
+          parked: true,
+          pendingApprovalDeck: deck,
+        },
+      };
+    }
+
+    return null;
   };
 
   while (attempt < maxAttempts) {
@@ -5442,6 +5531,11 @@ export async function runScheduledChat(
   summary?: string;
   // Present only on a parked run — links the pending question for the UI.
   pendingQuestionId?: string;
+  // ENG-1635/1644 (ask_user_question retirement): the deck-of-one equivalent
+  // of pendingQuestionId above — present only when the run parked on a
+  // migrated single-question halt (ask_user_question/the objective gate no
+  // longer populate pendingQuestionId at all). Never present alongside it.
+  pendingApprovalDeckId?: string;
   // ENG-947: present only when the run stopped early on the publish-press budget
   // with the publish tool still uncalled (content drafted and held, not published).
   publishHeldForApproval?: boolean;
@@ -6493,24 +6587,31 @@ export async function runScheduledChat(
     // early-return BEFORE the oncall/auto-issue path. `sessionId: ''` reuses the
     // established convention (see error/token paths) so the orchestrator/callers
     // skip their normal result email — the paused email below carries the link.
-    if (result.parked && result.pendingUserQuestion) {
+    // ENG-1635/1644 (ask_user_question retirement): a parked run now carries
+    // EITHER pendingUserQuestion (legacy, still-live sessions) OR
+    // pendingApprovalDeck (new — ask_user_question/the objective gate no
+    // longer populate pendingUserQuestion at all) — never both, per
+    // resolveAwaitingUserQuestion. Same notify-and-record behavior either way.
+    if (result.parked && (result.pendingUserQuestion || result.pendingApprovalDeck)) {
+      const questionText = result.pendingUserQuestion?.question ?? result.pendingApprovalDeck?.items?.[0]?.question;
+      const questionLogId = result.pendingUserQuestion?.questionId ?? result.pendingApprovalDeck?.deckId;
       const scheduleUser = await userDb.getUserById(userId);
       const notifyEmails = (schedule.emailNotifications && schedule.emailNotifications.length > 0)
         ? schedule.emailNotifications
         : (scheduleUser?.email ? [scheduleUser.email] : []);
-      if (notifyEmails.length > 0) {
+      if (notifyEmails.length > 0 && questionText) {
         await emailService.sendScheduledChatPausedForInputEmail(
           notifyEmails,
           schedule.scheduleName,
           schedule.scheduleId,
-          result.pendingUserQuestion.question,
+          questionText,
           sessionId
         );
       } else {
         // Parked but no recipient (no emailNotifications and no account email) — the
         // owner won't be notified. Surface it loudly rather than parking silently.
         console.warn(
-          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${result.pendingUserQuestion.questionId}`
+          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${questionLogId}`
         );
       }
 
@@ -6530,9 +6631,10 @@ export async function runScheduledChat(
         functionCallDetails: {},
         executionTime: Date.now() - now.getTime(),
         // Empty on purpose — suppresses the callers' result email (the paused
-        // email already notified). The pending question id links back for the UI.
+        // email already notified). The pending question/deck id links back for the UI.
         sessionId: '',
-        pendingQuestionId: result.pendingUserQuestion.questionId,
+        ...(result.pendingUserQuestion ? { pendingQuestionId: result.pendingUserQuestion.questionId } : {}),
+        ...(result.pendingApprovalDeck ? { pendingApprovalDeckId: result.pendingApprovalDeck.deckId } : {}),
         attempt: result.attempts,
         createdAt: new Date().toISOString(),
       };
@@ -10427,7 +10529,17 @@ export const agentModeController = {
           // "View only". Everything here is already visible in the transcript's card, so
           // it leaks nothing new; the share stays read-only via the card's readOnly path.
           pendingUserQuestion: session.pendingUserQuestion,
-          pendingWorkPlanInput: session.pendingWorkPlanInput
+          pendingWorkPlanInput: session.pendingWorkPlanInput,
+          // ENG-1635/1644 (ask_user_question retirement): the deck sibling of
+          // pendingUserQuestion above — was missing here entirely (found live, driving
+          // a real deck-of-one through an interactive share link). Every message that
+          // carries approvalDeckItems/pendingApprovalDeckId metadata is already
+          // self-contained enough to render a card without this field (per
+          // ChatMessageItem's hasApprovalDeckCard), but the LIVE session slot itself
+          // (used to distinguish "still the current awaiting deck" vs "superseded", and
+          // to reflect answers still in progress) was entirely absent from this
+          // response — same leak-nothing-new rationale as pendingUserQuestion above.
+          pendingApprovalDeck: session.pendingApprovalDeck
         }
       });
 

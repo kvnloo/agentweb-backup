@@ -82,6 +82,13 @@ export interface ApprovalDeckItem {
    *  option. Same non-model-attributed `answeredBy: 'delegation'` invariant
    *  as AskUserQuestion's own delegation — never a model self-answer. */
   allowEmmaDecide?: boolean;
+  /** Mirrors PendingUserQuestion.immutable exactly (ask_user_question/
+   *  objective-gate migration). When true, headless auto-take must never
+   *  resolve this item on its own regardless of autonomy level other than
+   *  `fullAutonomy` — the objective-reconfirmation gate always sets this.
+   *  Absent/false means auto-take may delegate to the recommended option
+   *  under the existing `fullAutonomy || !immutable` rule. */
+  immutable?: boolean;
 }
 
 export interface ApprovalDeckAnswer {
@@ -109,6 +116,14 @@ export interface QuestionDeckQuestionInput {
   question: string;
   options: AskUserQuestionOption[];
   allowEmmaDecide?: boolean;
+  /** Correlator preserved through a dropped/re-asked round-trip (mirrors
+   *  ApprovalDeckItem.kind) — e.g. 'meta_objective' for the objective gate's
+   *  deck-of-one item, so a re-ask after drop/cancel can still be identified. */
+  kind?: string;
+  /** Mirrors ApprovalDeckItem.immutable — preserved through the same
+   *  dropped/re-asked round-trip so a re-asked immutable item is rebuilt as
+   *  immutable, not silently downgraded to auto-takeable. */
+  immutable?: boolean;
 }
 
 export interface PendingApprovalDeck {
@@ -409,6 +424,59 @@ export function findApprovalDeckAnswerForDigest(
     return { granted: false, reason: 'The approval was not attributable to a human selection.' };
   }
   return { granted: true, item, answer };
+}
+
+/** The shape of a persisted chat message this module cares about — deliberately
+ *  minimal so this stays a pure function of already-fetched data (the file
+ *  header's "no I/O" rule); the caller (e.g. resolveCampaignObjectiveGate)
+ *  owns fetching the real message list via chatbotDb. */
+export interface ApprovalDeckHistoryMessage {
+  metadata?: {
+    pendingApprovalDeckId?: string;
+    approvalDeckItems?: ApprovalDeckItem[];
+    approvalDeckAnswer?: { deckId: string; answers: ApprovalDeckAnswer[] };
+  } | null;
+}
+
+export type ApprovalDeckHistoryOutcome =
+  | { found: true; item: ApprovalDeckItem; answer: ApprovalDeckAnswer }
+  | { found: false };
+
+/**
+ * ENG-1635/1644 (ask_user_question retirement) — the deck primitive's sibling
+ * to askUserQuestion.ts's `findQuestionByKind`, for a producer (e.g. the Meta
+ * objective gate) that needs to find an already-answered item by its `kind`
+ * correlator across THIS session's history. Decks have no archive
+ * table/field (file header) — history only exists as message-metadata pairs
+ * (the halt message carries `approvalDeckItems` + `pendingApprovalDeckId`,
+ * the reply message carries `approvalDeckAnswer`), the exact same
+ * self-contained pairing the frontend already reconstructs historical cards
+ * from. Pure: the caller fetches `messages` and passes them in. Returns the
+ * FIRST match scanning oldest-to-newest — callers are expected to pass a
+ * `kind` specific enough (e.g. a composite `meta_objective:<correlator>`,
+ * mirroring findQuestionByKind's own exact-match contract) that only one
+ * real match should ever exist.
+ */
+export function findAnsweredDeckItemByKind(
+  messages: ApprovalDeckHistoryMessage[],
+  kind: string,
+): ApprovalDeckHistoryOutcome {
+  for (const message of messages) {
+    const items = message.metadata?.approvalDeckItems;
+    const deckId = message.metadata?.pendingApprovalDeckId;
+    if (!Array.isArray(items) || !deckId) continue;
+    const item = items.find((candidate) => candidate.kind === kind);
+    if (!item) continue;
+    const reply = messages.find((candidate) => candidate.metadata?.approvalDeckAnswer?.deckId === deckId);
+    const answer = reply?.metadata?.approvalDeckAnswer?.answers.find((candidate) => candidate.itemId === item.itemId);
+    // Same defensive human-attribution re-check checkQuestionGate/
+    // findApprovalDeckAnswerForDigest already do — the type forbids 'model'
+    // already, this just never trusts a malformed/legacy record blindly.
+    if (answer && (answer.answeredBy === 'user' || answer.answeredBy === 'delegation')) {
+      return { found: true, item, answer };
+    }
+  }
+  return { found: false };
 }
 
 /**

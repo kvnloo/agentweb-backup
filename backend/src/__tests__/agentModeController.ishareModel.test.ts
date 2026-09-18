@@ -234,6 +234,67 @@ describe('AgentModeController - ishare Model Selection', () => {
       );
     });
 
+    // ENG-1635/1644 (ask_user_question retirement): found live, driving a real
+    // deck-of-one through an interactive share link on env1 — this field was
+    // missing entirely (pendingUserQuestion/pendingWorkPlanInput above were both
+    // already exposed; pendingApprovalDeck, their sibling, was not). Without it,
+    // a migrated ask_user_question/objective-gate halt (which no longer
+    // populates pendingUserQuestion at all) rendered as the plain-text fallback
+    // in ishare instead of a real card — the exact regression this migration's
+    // own ishare-parity fix (useAgentModeSessions.ts) was supposed to prevent,
+    // just one layer further back (the backend never sent the field the
+    // frontend fix was reading).
+    it('should expose pendingApprovalDeck so a shared card can render a deck-of-one halt (ENG-1635/1644)', async () => {
+      const awaitingDeck = {
+        deckId: 'deck-objective-1',
+        status: 'awaiting',
+        items: [
+          {
+            itemId: 'item-1',
+            kind: 'meta_objective',
+            question: 'Which Meta campaign objective should this campaign use?',
+            options: [
+              { id: 'leads', label: 'Leads', consequence: 'Optimizes for leads', recommended: true, why: 'pixel fires LEAD events' },
+              { id: 'traffic', label: 'Traffic', consequence: 'Optimizes for clicks' },
+            ],
+            allowEmmaDecide: true,
+            immutable: true,
+          },
+        ],
+        createdAt: new Date().toISOString(),
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSessionWithModel,
+        pendingApprovalDeck: awaitingDeck as any,
+      });
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        on: jest.fn(),
+      } as unknown as Request;
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.getSharedConversation(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          session: expect.objectContaining({
+            pendingApprovalDeck: expect.objectContaining({
+              deckId: 'deck-objective-1',
+              status: 'awaiting',
+              items: expect.arrayContaining([
+                expect.objectContaining({ itemId: 'item-1', kind: 'meta_objective', immutable: true }),
+              ]),
+            }),
+          }),
+        }),
+      );
+    });
+
     it('should expose a pending work-plan input request to interactive plan clients', async () => {
       const pendingWorkPlanInput: WorkPlanInputRequest = {
         requestId: 'request-1',

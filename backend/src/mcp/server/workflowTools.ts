@@ -75,7 +75,8 @@ mcpToolRegistry.register({
       'Starts a new task unless you pass task_id to continue an existing one. ' +
       'Usually returns the finished result directly (status "complete"). If status is "running" or "unconfirmed", ' +
       'call emma_get_session with session_id set to the returned task_id — "unconfirmed" means the result is real but we could not verify ' +
-      'Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
+      'Emma is not waiting on you. When status is "awaiting_input", answer with emma_answer_question (awaiting_question set) or ' +
+      'emma_answer_question_deck (awaiting_question_deck set).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -132,7 +133,17 @@ mcpToolRegistry.register({
     // The session GET does expose it (the handler spreads `...session`), so
     // confirm against the session before claiming a terminal result. One extra
     // read, only on the path where we would otherwise assert completion.
+    //
+    // ENG-1635/1644 (ask_user_question retirement): pendingUserQuestion is
+    // legacy-only now — ask_user_question and the Meta objective gate build a
+    // single-item pendingApprovalDeck instead. Check both; scoped narrowly to
+    // a deck-of-one (single item, not a Meta write) — the same scope
+    // resolveAwaitingUserQuestion uses server-side — a genuine multi-item
+    // present_question_deck or a write-deck always needs a live interactive
+    // human and isn't something this synchronous status check resolves either
+    // way.
     let pending: any = null;
+    let pendingDeck: any = null;
     let confirmationFailed = false;
     if (!stillBuilding) {
       try {
@@ -142,6 +153,10 @@ mcpToolRegistry.register({
           context: ctx(context),
         });
         pending = session?.pendingUserQuestion ?? null;
+        const deck = session?.pendingApprovalDeck;
+        if (!pending && deck?.status === 'awaiting' && Array.isArray(deck.items) && deck.items.length === 1 && !deck.items[0]?.metaWriteManifestDigest) {
+          pendingDeck = deck;
+        }
       } catch {
         // The turn succeeded, so the result is real and worth returning — but a
         // failed check is NOT a negative result. Swallowing it to `pending =
@@ -158,7 +173,7 @@ mcpToolRegistry.register({
     // still be blocked on their answer — the exact failure this confirmation
     // step exists to prevent. An unconfirmed turn gets its own non-terminal
     // status so the contract and the flag cannot disagree.
-    const status = pending
+    const status = pending || pendingDeck
       ? 'awaiting_input'
       : stillBuilding
         ? 'running'
@@ -175,8 +190,11 @@ mcpToolRegistry.register({
       completion_confirmed: !stillBuilding && !confirmationFailed,
       result: data?.content ?? data?.message ?? null,
       awaiting_question: pending ?? null,
+      awaiting_question_deck: pendingDeck ?? null,
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
+        : pendingDeck
+          ? 'Emma is waiting on an answer. Use emma_answer_question_deck — a plain message abandons the question.'
         : stillBuilding
           ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
           : confirmationFailed

@@ -124,6 +124,7 @@ import {
   appendApprovalDeckItem,
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
+  findAnsweredDeckItemByKind,
   applyDeckAnswers,
   approvedWriteItems,
   renderApprovalDeckPrompt,
@@ -7191,9 +7192,33 @@ export class AgentModeService {
         ...(result.metaWriteDispatch
           ? { metaWriteDispatch: result.metaWriteDispatch } : {}),
       };
-      // ENG-396: also preserve the structured AskUserQuestion payload so the chat
-      // card can render its options and the frontend can post back a structured
-      // selection. Without this the per-tool minimizers drop these unknown fields.
+      // ENG-1635/1644 Phase 2g (extended in the ask_user_question-retirement
+      // migration): same class of bug as metaWriteManifestDigest/
+      // metaWriteDispatch above — this minimizer discards anything it doesn't
+      // name, and the iteration-end seam's partitionApprovalHalts reads
+      // questionDeckPayload off the SAME halted result to classify this as a
+      // question-deck halt at all. Checked by SHAPE (Array.isArray), not by
+      // `result.type` string — partitionApprovalHalts itself classifies this
+      // way (agentModeService.ts's partitionApprovalHalts), and ask_user_question's
+      // migrated execute() + resolveCampaignObjectiveGate's Path 3 BOTH still set
+      // `type: 'ask_user_question'` (unchanged calling-convention tag) while ALSO
+      // carrying questionDeckPayload — checking type first here silently stripped
+      // questionDeckPayload for both of them and fell back to the old plain-text
+      // prompt every time, found live on env1 driving the real objective gate
+      // (not by any handler-level test — same discovery gap the comments above
+      // describe: those tests call the dispatcher directly and never reach this
+      // function). Must be checked BEFORE the true-legacy-shape branch below.
+      if (Array.isArray(result.questionDeckPayload)) {
+        return {
+          ...base,
+          type: result.type,
+          questionDeckPayload: result.questionDeckPayload,
+        };
+      }
+      // ENG-396: true legacy shape (no questionDeckPayload — real options/
+      // questionId directly on the result). No current producer emits this
+      // anymore (both ask_user_question and the objective gate migrated to
+      // questionDeckPayload above); kept only as a defensive fallback.
       if (result.type === 'ask_user_question') {
         return {
           ...base,
@@ -7204,21 +7229,6 @@ export class AgentModeService {
           options: result.options,
           recommendedOptionId: result.recommendedOptionId,
           allowEmmaDecide: result.allowEmmaDecide,
-        };
-      }
-      // ENG-1635/1644 Phase 2g: same class of bug as metaWriteManifestDigest/
-      // metaWriteDispatch above — this minimizer discards anything it doesn't
-      // name, and the iteration-end seam's partitionApprovalHalts reads
-      // questionDeckPayload off the SAME halted result to classify this as a
-      // question-deck halt at all. Without this, present_question_deck would
-      // work in every unit test (which calls the dispatcher directly) and
-      // silently produce zero question-decks in real sessions — named
-      // explicitly here rather than discovered live, this time.
-      if (result.type === 'present_question_deck') {
-        return {
-          ...base,
-          type: 'present_question_deck',
-          questionDeckPayload: result.questionDeckPayload,
         };
       }
       return base;
@@ -20677,10 +20687,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       questions.forEach((q, i) => {
         deck = appendApprovalDeckItem(deck, {
           itemId: `question-${i + 1}`,
-          kind: 'plan_choice',
+          // ask_user_question's migrated payload carries its own kind/immutable
+          // (e.g. 'meta_objective', immutable:true for the objective gate) —
+          // present_question_deck's questions never set either, so this falls
+          // back to the pre-existing 'plan_choice'/not-immutable default.
+          kind: typeof q.kind === 'string' && q.kind.trim() !== '' ? q.kind : 'plan_choice',
           question: q.question,
           options: q.options,
           allowEmmaDecide: q.allowEmmaDecide === true,
+          ...(q.immutable === true ? { immutable: true } : {}),
         });
       });
       return finalizeApprovalDeck(deck, new Date().toISOString());
@@ -21185,8 +21200,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // the claim; fall through to the deterministic ask gate below.
     }
 
-    // Path 2: already settled via a prior ask_user_question in this session,
-    // scoped to THIS campaign (see objectiveKind above).
+    // Path 2: already settled — via a prior deck-of-one item (the current
+    // mechanism, post ask_user_question-retirement) or a prior
+    // ask_user_question (legacy — kept as a fallback for any record settled
+    // before that migration), scoped to THIS campaign (see objectiveKind
+    // above). Deck-history has no archive field (approvalDeck.ts file
+    // header) — findAnsweredDeckItemByKind scans message-metadata pairs, the
+    // same self-contained pairing the frontend already reconstructs
+    // historical cards from.
+    const deckHistoryMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    const deckOutcome = findAnsweredDeckItemByKind(deckHistoryMessages as any, objectiveKind);
+    if (deckOutcome.found) {
+      const pickedOption = deckOutcome.item.options?.find((o) => o.id === deckOutcome.answer.verdict);
+      const objective = (pickedOption?.payload as any)?.objective;
+      if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
+        return { allowed: true, objective };
+      }
+    }
     const session = await chatbotDb.getChatSession(sessionId);
     const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
     const outcome = checkQuestionGate(candidate);
@@ -21260,47 +21290,56 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       },
     ];
 
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
-      intro: hasAnsweredObjectiveCard
-        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
-        : undefined,
+    // ENG-1635/1644 (ask_user_question retirement): no more buildPendingUserQuestion
+    // + synchronous updateSessionAskUserQuestion write. Return the same bare
+    // halt-marker shape ask_user_question's own execute() now returns (a
+    // 1-entry questionDeckPayload) — gate.response is returned directly as
+    // callMetaMarketingApi's own result (verified: emma/tools.ts's
+    // call_meta_marketing_api execute() returns it unwrapped), so this flows
+    // through the exact same iteration-end seam
+    // (partitionApprovalHalts/buildApprovalDeckForIteration) that already
+    // persists and renders any other halt as a real deck-of-one card — no
+    // gate-specific persistence code needed here anymore. If another
+    // halt/deck is already awaiting in this session, that shared seam's own
+    // failIfAwaitingExists guard falls through to the old plain-text prompt,
+    // the same fallback every other halt type already gets on a lost race,
+    // not a special case for this gate anymore.
+    const questionText = 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.';
+    // The old card's separate `intro` sentence has no equivalent field on the
+    // deck primitive (ApprovalDeckItem/QuestionDeckQuestionInput carry only
+    // `question`) — folded into the question text itself rather than adding a
+    // schema field for a narrow, purely informational retry hint.
+    // hasAnsweredObjectiveCard itself still only scans the LEGACY
+    // pendingUserQuestion/answeredQuestions history
+    // (summarizeAnsweredObjectiveQuestions, above) — a deck-answered near-miss
+    // from a different campaign won't trigger this hint post-migration;
+    // accepted as a low-stakes UX-only gap, not a correctness one.
+    const question = hasAnsweredObjectiveCard
+      ? `You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.\n\n${questionText}`
+      : questionText;
+
+    const questionDeckPayload: QuestionDeckQuestionInput[] = [{
+      question,
       options,
-      immutable: true,
       allowEmmaDecide: true,
       kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-
-    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, { failIfAwaitingExists: true });
-    if (!posted) {
-      return {
-        allowed: false,
-        response: {
-          success: false,
-          error: 'ASK_USER_QUESTION_ALREADY_PENDING',
-          message:
-            'A question is already waiting for the user to answer. Wait until it is answered before creating this campaign.',
-        } as any,
-      };
-    }
-
-    const prompt = renderQuestionPrompt(question);
+      immutable: true,
+    }];
     return {
       allowed: false,
       response: {
         success: true,
         awaitingUserConfirmation: true,
         type: 'ask_user_question',
+        // sessionId is echoed back because this method can auto-provision one
+        // internally when the caller passed none (see the anomaly branch
+        // above) — without it on the response, a caller that started with no
+        // session has no way to learn which session the halt (and the deck
+        // built from it) actually landed on.
         sessionId,
-        questionId: question.questionId,
-        question: question.question,
-        options: question.options,
-        recommendedOptionId: question.recommendedOptionId,
-        allowEmmaDecide: question.allowEmmaDecide,
-        confirmationPrompt: prompt,
-        summary: prompt,
+        questionDeckPayload,
+        confirmationPrompt: questionText,
+        summary: questionText,
         message:
           'The campaign objective is immutable and has not been confirmed by the user yet. Do NOT retry the create yourself — the run halts here until they pick an option or delegate.',
       } as any,

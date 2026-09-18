@@ -321,8 +321,11 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, validParams(), 'session-1');
 
       expect(result.awaitingUserConfirmation).toBe(true);
-      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.intro).toMatch(/answered an objective question earlier/i);
+      // ENG-1635/1644: Path 3 no longer persists a PendingUserQuestion with a
+      // separate `intro` field itself — it returns a bare halt marker, and the
+      // deck primitive has no intro field, so the carry-over context is folded
+      // directly into the question text instead (see resolveCampaignObjectiveGate).
+      expect(result.questionDeckPayload[0].question).toMatch(/answered an objective question earlier/i);
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
@@ -441,23 +444,28 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
   });
 
   describe('Path 3 — auto-emitted blocking ask (nothing settled)', () => {
-    it('emits a card with OUTCOME_LEADS recommended by default (static per the 80/20 design)', async () => {
+    it('emits a deck-of-one halt with OUTCOME_LEADS recommended by default (static per the 80/20 design)', async () => {
       const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
 
       expect(result.success).toBe(true);
       expect(result.awaitingUserConfirmation).toBe(true);
       expect(result.type).toBe('ask_user_question');
-      expect(result.recommendedOptionId).toBe('leads');
-      const leadsOption = result.options.find((o: any) => o.id === 'leads');
+      // ENG-1635/1644: no synchronous persist and no top-level options/
+      // recommendedOptionId anymore — a bare halt marker instead, mirroring
+      // present_question_deck's own execute(). The iteration-end seam builds
+      // and persists the real deck (covered by
+      // agentModeService.questionApprovalDeck.test.ts).
+      expect(chatbotDb.updateSessionAskUserQuestion).not.toHaveBeenCalled();
+      expect(result.questionDeckPayload).toHaveLength(1);
+      const q = result.questionDeckPayload[0];
+      expect(q.kind).toBe('meta_objective:123456789|test|||NONE');
+      expect(q.immutable).toBe(true);
+      const leadsOption = q.options.find((o: any) => o.id === 'leads');
       expect(leadsOption.recommended).toBe(true);
       expect(leadsOption.payload).toEqual({ objective: 'OUTCOME_LEADS' });
       // Sales stays present and selectable but non-default.
-      const salesOption = result.options.find((o: any) => o.id === 'sales');
+      const salesOption = q.options.find((o: any) => o.id === 'sales');
       expect(salesOption.recommended).toBeFalsy();
-      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
-      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
-      expect(persisted.immutable).toBe(true);
     });
 
     // Live-test finding (2026-07-30): the card's "Traffic / Awareness" option
@@ -472,26 +480,28 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
     // own distinct, correctly-payloaded option so this scenario can't recur.
     it('offers Awareness as its own distinct option, separate from Traffic', async () => {
       const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
+      const options = result.questionDeckPayload[0].options;
 
-      const awarenessOption = result.options.find((o: any) => o.id === 'awareness');
+      const awarenessOption = options.find((o: any) => o.id === 'awareness');
       expect(awarenessOption).toBeDefined();
       expect(awarenessOption.payload).toEqual({ objective: 'OUTCOME_AWARENESS' });
       expect(awarenessOption.label.toLowerCase()).toContain('awareness');
 
-      const trafficOption = result.options.find((o: any) => o.id === 'traffic');
+      const trafficOption = options.find((o: any) => o.id === 'traffic');
       expect(trafficOption).toBeDefined();
       expect(trafficOption.payload).toEqual({ objective: 'OUTCOME_TRAFFIC' });
       expect(trafficOption.label.toLowerCase()).not.toContain('awareness');
     });
 
-    it('does NOT create the campaign when a question is already awaiting (one-live-question guard)', async () => {
-      (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue(null); // refused: already awaiting
-      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
-
-      expect(result.success).toBe(false);
-      expect(result.error).toBe('ASK_USER_QUESTION_ALREADY_PENDING');
-      expect(metaService.createCampaign).not.toHaveBeenCalled();
-    });
+    // ENG-1635/1644: the "already awaiting" refusal is no longer Path-3's own
+    // job — Path 3 always returns a halt marker unconditionally now; the
+    // one-live-slot guard moved to the shared iteration-end seam that
+    // actually persists the deck (chatbotDb.updateSessionApprovalDeck's own
+    // failIfAwaitingExists guard, covered by
+    // chatbotService.approvalDeckCrossSlotGuard.test.ts), the same seam every
+    // other halt type (Meta writes, present_question_deck) already shares.
+    // Nothing left to assert at this layer beyond "Path 3 never touches
+    // chatbotDb.updateSessionAskUserQuestion at all" (covered above).
 
     // Regression (found live, 2026-07-24): a model that correctly OMITS an
     // objective it doesn't know — the safest thing it can do — must still get

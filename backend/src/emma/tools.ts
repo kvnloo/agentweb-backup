@@ -17,13 +17,8 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
-import { v4 as uuidv4 } from 'uuid';
-import {
-  buildPendingUserQuestion,
-  renderQuestionPrompt,
-  AskUserQuestionError,
-  type AskUserQuestionOption,
-} from '../services/agentMode/core/askUserQuestion';
+import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
+import type { QuestionDeckQuestionInput } from '../services/agentMode/core/approvalDeck';
 import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 
 // Register browser cookie persistence tools
@@ -124,30 +119,31 @@ emmaToolRegistry.register({
 // ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
 // emits it to force a human choice on an immutable/irreversible parameter
 // before building. It returns awaitingUserConfirmation:true so the agent loop
-// HALTS (see collectConfirmationPrompt); the answer is persisted structurally
-// on the session and only an inbound USER selection resolves it — the model
-// cannot self-answer.
+// HALTS (see collectConfirmationPrompt); only an inbound USER selection
+// resolves it — the model cannot self-answer.
+//
+// ENG-1635/1644 (retirement of this tool's OWN UI/persistence, not the tool
+// itself): execute() no longer builds a PendingUserQuestion or writes
+// session.pendingUserQuestion directly. It returns the same bare halt marker
+// present_question_deck's execute() does (a 1-entry questionDeckPayload) and
+// renders through the SAME deck-of-one seam — AskUserQuestionCard's own UI is
+// retired in favor of the deck's chrome (Cancel, Chat-about-this, confirm
+// slide, Prev/Next). The calling convention (tool name, when Emma should
+// reach for it vs present_question_deck) is unchanged — see the description
+// below. `resolveCampaignObjectiveGate` (agentModeService.ts) is migrated the
+// same way, onto the same deck-of-one halt shape — no longer a separate
+// pendingUserQuestion producer.
 //
 // META-SCOPED, NOT OBJECTIVE-SCOPED (2026-07-25): originally restricted to
 // "Meta campaign objective only." That was narrower than intended — the
 // restriction is meant to bound the DOMAIN (Meta Ads), not the specific field
 // within it. Widened to any high-stakes/irreversible Meta Ads decision (e.g.
 // objective, special ad category), still explicitly NOT general-purpose across
-// other domains/platforms. Every part of the underlying mechanism (persistence,
-// the real UI card, the answer channel, headless park, full-autonomy
-// auto-take, delegation, archive, MCP wiring) is fully generic with zero
-// Meta-specific logic and was proven working end-to-end live before this was
-// widened — only the description below is what keeps this Meta-bounded, and
-// that's a prompt-level restriction, not code-enforced.
-//
-// The Meta objective write gate (agentModeService.ts,
-// resolveCampaignObjectiveGate) is UNCHANGED and independent of this — it
-// still enforces the objective deterministically at CAMPAIGN CREATE
-// regardless of whether Emma calls this tool voluntarily for anything else
-// within Meta. This only widens Emma's OWN judgment-based use of the card
-// within Meta; it does not add a new hard-enforced gate for other Meta
-// entities — that requires its own dedicated gate, built the same way
-// ENG-400 was, per irreversible action.
+// other domains/platforms. Only the description below is what keeps this
+// Meta-bounded, and that's a prompt-level restriction, not code-enforced. This
+// only widens Emma's OWN judgment-based use of the card within Meta; it does
+// not add a new hard-enforced gate for other Meta entities — that requires its
+// own dedicated gate, built the same way ENG-400 was, per irreversible action.
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
@@ -191,12 +187,24 @@ If the user replies with a TYPED message instead of clicking an option, that ope
       required: ['question', 'options'],
     },
   },
+  // ENG-1635/1644 (ask_user_question retirement): execute() no longer does a
+  // synchronous DB write or builds its own PendingUserQuestion/card. It
+  // mirrors present_question_deck's execute() exactly — a bare halt marker
+  // (questionDeckPayload, one entry), no persistence here — so this question
+  // renders through the SAME deck-of-one seam a real present_question_deck
+  // call already uses (buildQuestionApprovalDeckFromHalts at iteration end),
+  // getting the deck's full chrome (Prev/Next disabled at 1 item, Cancel,
+  // Chat-about-this, confirm slide) for free instead of AskUserQuestionCard's
+  // now-retired bespoke UI. `kind`/`immutable` are carried on the payload so
+  // the deck item preserves the same write-gate correlation and no-auto-take
+  // guarantee the old PendingUserQuestion.immutable had.
   execute: async (args: any, context: any) => {
     const sessionId = context?.sessionId;
     if (!sessionId) {
       return { success: false, message: 'ask_user_question requires an active session.' };
     }
-    // Normalize incoming options: assign a stable id when the model omitted one.
+    // Normalize incoming options: assign a stable id when the model omitted one —
+    // same normalization present_question_deck's execute() applies.
     const options: AskUserQuestionOption[] = Array.isArray(args.options)
       ? args.options.map((o: any, i: number) => ({
           id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
@@ -208,57 +216,27 @@ If the user replies with a TYPED message instead of clicking an option, that ope
         }))
       : [];
 
-    let question;
-    try {
-      question = buildPendingUserQuestion({
-        questionId: uuidv4(),
-        question: args.question,
-        intro: typeof args.intro === 'string' ? args.intro : undefined,
-        options,
-        immutable: args.immutable === true,
-        allowEmmaDecide: args.allow_emma_decide === true,
-        kind: typeof args.kind === 'string' ? args.kind : undefined,
-        createdAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      if (err instanceof AskUserQuestionError) {
-        // Surface the validation problem so the model can fix and re-emit.
-        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
-      }
-      throw err;
-    }
+    const questionDeckPayload: QuestionDeckQuestionInput[] = [{
+      question: args.question,
+      options,
+      allowEmmaDecide: args.allow_emma_decide === true,
+      kind: typeof args.kind === 'string' ? args.kind : undefined,
+      immutable: args.immutable === true,
+    }];
 
-    // Persist as the single active question. The guard enforces one live question
-    // at a time: if a question is already awaiting, the write is refused (null) and
-    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
-    // never batched, so a second call can't overwrite the pending one's slot.
-    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
-      failIfAwaitingExists: true,
-    });
-    if (!posted) {
-      return {
-        success: false,
-        message:
-          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
-      };
-    }
-
-    const prompt = renderQuestionPrompt(question);
-    // awaitingUserConfirmation halts the loop; type + options let the chat card
-    // render and the frontend post back a structured selection. No field tells
-    // the model how to answer — only a user selection can resolve it.
+    const summary = typeof args.question === 'string' && args.question.trim() !== ''
+      ? args.question
+      : 'Please answer the following question.';
+    // awaitingUserConfirmation halts the loop, exactly like present_question_deck's
+    // halt — no DB write, no deck built here; the iteration-end seam builds and
+    // persists the real deck-of-one.
     return {
       success: true,
       awaitingUserConfirmation: true,
       type: 'ask_user_question',
-      questionId: question.questionId,
-      question: question.question,
-      ...(question.intro ? { intro: question.intro } : {}),
-      options: question.options,
-      recommendedOptionId: question.recommendedOptionId,
-      allowEmmaDecide: question.allowEmmaDecide,
-      confirmationPrompt: prompt,
-      summary: prompt,
+      questionDeckPayload,
+      confirmationPrompt: summary,
+      summary,
     };
   },
 });
