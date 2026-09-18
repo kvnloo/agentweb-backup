@@ -1101,11 +1101,13 @@ const AMBIGUOUS_FRAGMENT_PATTERNS: RegExp[] = [
   // fragment shape (CodeRabbit PR review on #2983).
   /^(it|that|this|those|them)\s*[.!?]?\s*$/i,
   // Bare noun ("LinkedIn") — a single capitalized token with no verb and no
-  // sentence structure (CodeRabbit PR review on #2983). Kept narrow: a
+  // sentence structure (CodeRabbit PR review on #2983). Kept narrow: common
+  // single-word imperative commands ("Cancel", "Stop", ...) are complete
+  // requests, not ambiguous fragments, so they are denied via lookahead; a
   // multi-word or lowercase-leading fragment only qualifies via the shapes
   // above, so complete requests like "Write a haiku about winter" stay
   // scorable.
-  /^[A-Z][a-zA-Z']*$/,
+  /^(?!(?:Cancel|Stop|Delete|Remove|Pause|Resume|Retry|Refresh|Save|Submit|Confirm|Continue|Quit|Exit|Help|Approve|Reject|Archive|Undo|Unsubscribe|Subscribe)(?:[.!?]\s*)?$)[A-Z][a-zA-Z']*$/,
   /^(you (choose|decide|pick)|whatever( works| you (want|think))?|your call)\s*[.!?]?\s*$/i,
 ];
 // Account-level publish-authorization hold for a NON-scheduled (interactive)

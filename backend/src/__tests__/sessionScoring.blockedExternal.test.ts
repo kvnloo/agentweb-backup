@@ -202,6 +202,18 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(mockCallLLM).not.toHaveBeenCalled();
   });
 
+  it('a single-word imperative command ("Cancel") with a decline-to-guess and focused question stays scorable (not an ambiguous fragment)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Cancel' },
+      { role: 'assistant', content: 'I decline to guess what you want to cancel instead of guessing. Could you clarify which subscription should I cancel?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
   it('a standalone-pronoun fragment ("that") with a decline-to-guess and focused question is excluded', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', content: 'that' },
