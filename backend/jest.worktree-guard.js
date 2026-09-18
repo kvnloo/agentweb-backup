@@ -21,8 +21,12 @@ module.exports = async () => {
   let stat = null;
   try {
     stat = fs.lstatSync(nmPath);
-  } catch {
-    stat = null;
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      stat = null;
+    } else {
+      throw error;
+    }
   }
   const worktreeName = path.basename(path.dirname(rootDir));
   if (!stat) {
@@ -35,12 +39,36 @@ module.exports = async () => {
         `this red — check the environment first.`,
     );
   }
-  if (stat.isSymbolicLink() && !fs.existsSync(nmPath)) {
+  let resolved = null;
+  let resolvedOk = false;
+  try {
+    resolved = fs.statSync(nmPath);
+    resolvedOk = true;
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      resolved = null;
+      resolvedOk = false;
+    } else {
+      throw error;
+    }
+  }
+  if (stat.isSymbolicLink() && !resolvedOk) {
     throw new Error(
       `[ENG-731] backend/node_modules in worktree '${worktreeName}' is a ` +
         `DANGLING symlink (-> ${fs.readlinkSync(nmPath)}). Its donor worktree ` +
         `was likely pruned after merge. Fix: rm the link (never rm -rf, which ` +
         `follows the symlink) and \`npm ci\` in ${rootDir}, then re-run.`,
     );
+  }
+  if (!stat.isSymbolicLink() || resolvedOk) {
+    if (!resolved || !resolved.isDirectory()) {
+      throw new Error(
+        `[ENG-731] backend/node_modules in worktree '${worktreeName}' is ` +
+          `not a directory (${rootDir}). Node would resolve required ` +
+          `modules from an ancestor worktree, defeating isolation. ` +
+          `Fix: remove it (never rm -rf a symlink) and \`npm ci\` in ` +
+          `${rootDir}, then re-run.`,
+      );
+    }
   }
 };
