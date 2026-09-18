@@ -201,6 +201,8 @@ export interface ReportDeliveryLogEntry {
   authorizedRecipients?: string[];
   withheldRecipients?: string[];
   missingPermission?: string;
+  /** recipient_confirmed only: who recorded the confirmation. */
+  confirmedBy?: string;
   at: string;
 }
 
@@ -319,4 +321,18 @@ export async function checkScheduleActivationRecipients(params: {
     owner: params.ownerEmail,
     eligibleRecipients: authz.authorized,
   });
+}
+
+/**
+ * ENG-1552 read-back: the most recent delivery-state entry for each run, keyed by
+ * runId. The log is append-only and ordered, so the last entry for a run wins.
+ */
+export function latestDeliveryByRun(
+  log: ReportDeliveryLogEntry[] | null | undefined,
+): Record<string, ReportDeliveryLogEntry> {
+  const latest: Record<string, ReportDeliveryLogEntry> = {};
+  for (const entry of Array.isArray(log) ? log : []) {
+    if (entry && typeof entry.runId === 'string') latest[entry.runId] = entry;
+  }
+  return latest;
 }

@@ -14,6 +14,7 @@ import { emailService } from '../services/emailService';
 import {
   buildRecipientRemediation,
   checkScheduleActivationRecipients,
+  latestDeliveryByRun,
   recordReportDeliveryState,
   reportContainsCrossAccountData,
   resolveAuthorizedReportRecipients,
@@ -13160,11 +13161,16 @@ export const agentModeController = {
       // Arrays are excluded deliberately: spreading one into an object literal
       // would silently turn it into {0: …, 1: …}. A malformed entry passes
       // through untouched rather than being corrupted into a wrong answer.
-      const historyWithActions = (testHistory || []).map((run: any) =>
-        run !== null && typeof run === 'object' && !Array.isArray(run)
-          ? normalizeMarketingActions(run)
-          : run
-      );
+      // ENG-1552 read-back: each run carries its latest delivery state (generated →
+      // withheld / delivery_attempted → delivered → recipient_confirmed). Added as a
+      // field on the run so the array shape every consumer reads is unchanged.
+      const deliveryByRun = latestDeliveryByRun((schedule as any).deliveryLog);
+      const historyWithActions = (testHistory || []).map((run: any) => {
+        if (run === null || typeof run !== 'object' || Array.isArray(run)) return run;
+        const normalized = normalizeMarketingActions(run);
+        const delivery = typeof run.runId === 'string' ? deliveryByRun[run.runId] : undefined;
+        return delivery ? { ...normalized, delivery } : normalized;
+      });
 
       res.json(historyWithActions);
     } catch (error) {
@@ -13197,6 +13203,62 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get scheduled chat storage diagnostics error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chat storage diagnostics' });
+    }
+  },
+
+  // ENG-1552 / ENG-1821 step 5: "ask the recipient to confirm receipt, record the
+  // response". There is no read-receipt infrastructure for scheduled reports, so this
+  // is a person saying so: it promotes a run the system recorded as `delivered` to
+  // `recipient_confirmed`. Only a delivered run can be confirmed — confirming a
+  // withheld or unsent report would record something that did not happen.
+  async confirmScheduledReportReceipt(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId, runId } = req.params;
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const current = latestDeliveryByRun((schedule as any).deliveryLog)[runId];
+      if (!current) {
+        return res.status(404).json({ error: 'No delivery recorded for this run' });
+      }
+      if (current.state === 'recipient_confirmed') {
+        return res.json({ delivery: current });
+      }
+      if (current.state !== 'delivered') {
+        return res.status(409).json({
+          error: `Only a delivered report can be confirmed; this run is "${current.state}"${current.reason ? ` (${current.reason})` : ''}.`,
+          delivery: current,
+        });
+      }
+
+      const configured: string[] = current.authorizedRecipients || [];
+      const requested = req.body?.recipients;
+      // Confirmation is per recipient the report actually went to — never an
+      // address it was not sent to.
+      const confirmedRecipients = Array.isArray(requested)
+        ? configured.filter((r) => requested.some((q: unknown) => typeof q === 'string' && q.toLowerCase() === r.toLowerCase()))
+        : configured;
+      if (confirmedRecipients.length === 0) {
+        return res.status(400).json({ error: 'None of the given recipients received this report.', delivery: current });
+      }
+
+      const authReq = req as AuthenticatedRequest;
+      const entry = {
+        runId,
+        state: 'recipient_confirmed' as const,
+        authorizedRecipients: confirmedRecipients,
+        confirmedBy: authReq.delegateInfo?.isDelegated ? authReq.delegateInfo.adminEmail : user.email,
+        at: new Date().toISOString(),
+      };
+      await scheduleDb.appendDeliveryLogEntry(scheduleId, entry);
+      res.json({ delivery: entry });
+    } catch (error) {
+      console.error('AgentMode: Confirm scheduled report receipt error:', error);
+      res.status(500).json({ error: 'Failed to record receipt confirmation' });
     }
   },
 
