@@ -376,39 +376,40 @@ async function runGenerationSmokeTestNow(
     // completes a same-instant handoff redirect, reading it after would already
     // see the handoff URL and waitForURL would time out on a success.
     const urlBeforeSubmit = browserPage.url();
-    try {
-      // Prefer an explicit submit button; fall back to requestSubmit() on the
-      // first form (pressing Enter on a broad 'input, select, textarea' selector
-      // can land on a checkbox/radio/hidden/select where Enter never submits).
-      // Playwright's click() auto-waits for the button to become actionable, which covers
-      // client-side validation that enables submit only after all fields pass.
-      // Scope the explicit submit click to the discovered first form: a page-wide
-      // click can hit another form's submit control, succeeding while the filled
-      // form stays unsubmitted. The 'form ...' prefix still finds a submit button
-      // when the first form exists; otherwise the bare selector preserves the
-      // no-form fallback below.
-      let submitted = false;
-      for (const scope of ['form >> nth=0 >> ', ""]) {
+    // Scope the explicit submit click to the discovered first form: a page-wide
+    // click can hit another form's submit control, succeeding while the filled
+    // form stays unsubmitted. When a <form> exists, use only its submit control
+    // plus requestSubmit() — never a page-wide retry. The bare selector runs
+    // only when no <form> exists at all (button outside any form).
+    // Playwright's click() auto-waits for the button to become actionable, which
+    // covers client-side validation that enables submit only after all fields pass.
+    // Prefer an explicit submit button; fall back to requestSubmit() on the
+    // first form (pressing Enter on a broad 'input, select, textarea' selector
+    // can land on a checkbox/radio/hidden/select where Enter never submits).
+    if (
+      await browserPage.evaluate(() => document.querySelector("form") !== null)
+    ) {
+      try {
+        await browserPage.click(
+          'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
+        );
+      } catch {
+        // No actionable submit control on the first form — submit it directly.
         try {
-          await browserPage.click(
-            `${scope}button[type="submit"], ${scope}input[type="submit"]`
-          );
-          submitted = true;
-          break;
+          await browserPage.evaluate(() => {
+            document.querySelector("form")?.requestSubmit();
+          });
         } catch {
-          // try the next scope
+          // requestSubmit threw (unsupported) — Enter in the last
+          // filled text field as a final fallback.
+          await browserPage.press(lastTextSelector ?? 'input[type="text"]', "Enter");
         }
       }
-      if (!submitted) throw new Error("no submit control");
-    } catch {
-      // No submit button found by that selector — submit the form directly.
+    } else {
       try {
-        await browserPage.evaluate(() => {
-          document.querySelector("form")?.requestSubmit();
-        });
+        await browserPage.click('button[type="submit"], input[type="submit"]');
       } catch {
-        // No form element (or requestSubmit unsupported) — Enter in the last
-        // filled text field as a final fallback.
+        // No form element — Enter in the last filled text field as final fallback.
         await browserPage.press(lastTextSelector ?? 'input[type="text"]', "Enter");
       }
     }
@@ -439,9 +440,11 @@ async function runGenerationSmokeTestNow(
     try {
       const before = new URL(urlBeforeSubmit);
       const after = new URL(urlAfterSubmit);
-      const match = /[?&]handoff_id=([^&]+)/.exec(urlAfterSubmit);
-      if (after.origin !== before.origin && match?.[1]) {
-        handoffId = decodeURIComponent(match[1]);
+      // searchParams.get matches the parameter exactly — a regex on the raw URL
+      // can match handoff_id-looking text nested inside another param's value.
+      const id = after.searchParams.get("handoff_id")?.trim();
+      if (after.origin !== before.origin && id) {
+        handoffId = id;
       }
     } catch {
       // Unparseable URL — not a verifiable handoff; fall through to the CRM poll.

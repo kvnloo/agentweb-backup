@@ -217,31 +217,32 @@ describe("runGenerationSmokeTest", () => {
     expect(result.error).toMatch(/No Chrome executable found/);
   });
 
-  it("SUCCESS: form has no submit button in first form → falls back in order", async () => {
+  it("SUCCESS: form has no submit button in first form → requestSubmit on the first form (never a page-wide retry)", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // First-form-scoped click misses; the unscoped fallback click hits.
-    mockPage.click
-      .mockRejectedValueOnce(new Error("no button in first form"))
-      .mockResolvedValueOnce(undefined);
+    // Scoped click misses (no actionable submit control on the first form);
+    // a <form> exists, so the code submits it directly — the unscoped
+    // page-wide click must NOT run (it could hit another form's button).
+    mockPage.click.mockRejectedValueOnce(new Error("no button in first form"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockPage.click).toHaveBeenCalledWith(
       'form >> nth=0 >> button[type="submit"], form >> nth=0 >> input[type="submit"]'
     );
-    expect(mockPage.click).toHaveBeenCalledWith(
-      'button[type="submit"], input[type="submit"]'
-    );
-    // Discovery evaluate always runs during field-fill; the requestSubmit
-    // fallback must NOT run since the unscoped click succeeded (only 1 call).
-    expect(mockPage.evaluate).toHaveBeenCalledTimes(1);
+    expect(mockPage.click).toHaveBeenCalledTimes(1);
+    // Discovery evaluate ran during field-fill; one more evaluate checks for a
+    // <form> (exists → requestSubmit), then requestSubmit runs it directly.
+    expect(mockPage.evaluate).toHaveBeenCalledTimes(3);
+    expect(mockPage.press).not.toHaveBeenCalled();
     const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(result.ok).toBe(true);
   });
 
   it("SUCCESS: form has no submit button at all → submits the form directly", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // click default resolves; force both scoped + unscoped attempts to miss.
+    // Force the scoped click to miss. The shared default evaluate mock resolves
+    // the discovery object (truthy), so the <form>-exists branch runs
+    // requestSubmit directly and the Enter fallback never fires.
     mockPage.click.mockRejectedValue(new Error("no button found"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
@@ -267,13 +268,11 @@ describe("runGenerationSmokeTest", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("SUCCESS: form has no form element either → Enter in last filled text field", async () => {
+  it("SUCCESS: no form element either → bare click miss falls back to Enter in last filled text field", async () => {
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
-    // click default resolves; force both scoped + unscoped attempts to miss.
-    mockPage.click.mockRejectedValue(new Error("no button found"));
-    // Discovery resolves (records the email selector); only the form-submit
-    // evaluate rejects (no <form> for requestSubmit), so the fallback presses
-    // Enter in the last filled text field.
+    // Discovery resolves (records the email selector); the form-presence
+    // evaluate returns false (no <form>), so the else branch's bare click also
+    // misses and the fallback presses Enter in the last filled text field.
     (mockPage.evaluate as jest.Mock)
       .mockResolvedValueOnce({
         textInputs: ['input[type="email"]'],
@@ -282,7 +281,10 @@ describe("runGenerationSmokeTest", () => {
         selects: [],
         checkables: [],
       })
-      .mockRejectedValueOnce(new Error("no form"));
+      .mockResolvedValueOnce(false);
+    mockPage.click
+      .mockRejectedValueOnce(new Error("no scoped button"))
+      .mockRejectedValueOnce(new Error("no bare button"));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
@@ -395,7 +397,26 @@ describe("runGenerationSmokeTest", () => {
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
     (mockPage.url as jest.Mock)
       .mockReturnValueOnce("https://campaign.waterheater.app/")
+      // Same origin with a REAL handoff_id param — still polls, because only a
+      // cross-origin hop proves the pipeline left the deployed origin.
       .mockReturnValueOnce("https://campaign.waterheater.app/text?handoff_id=abc123");
+    mockGetLeadByEmail.mockResolvedValue(null); // never found
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadByEmail).toHaveBeenCalled(); // not treated as a handoff
+    const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(result.ok).toBe(false);
+    expect(result.handoffId).toBeUndefined();
+  });
+
+  it("FAIL: handoff-looking text nested inside another param's value still polls the CRM (no regex false pass)", async () => {
+    (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+    (mockPage.url as jest.Mock)
+      .mockReturnValueOnce("https://campaign.waterheater.app/")
+      // Cross-origin, but handoff_id appears only inside next's encoded value —
+      // searchParams.get("handoff_id") is null, so this must poll the CRM.
+      .mockReturnValueOnce("https://chat.waterheater.app/text?next=%2Ftext%3Fhandoff_id%3Dabc123");
     mockGetLeadByEmail.mockResolvedValue(null); // never found
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
