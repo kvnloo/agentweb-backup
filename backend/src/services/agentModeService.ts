@@ -19308,7 +19308,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const [customerDefault, landerOverride] = await Promise.all([
         getCustomerUtmDefault(userId),
-        params.lander_id ? getLanderUtmOverride(params.lander_id) : Promise.resolve(null),
+        params.lander_id ? getLanderUtmOverride(params.lander_id, userId) : Promise.resolve(null),
       ]);
       const visitor = params.url_tags
         ? Object.fromEntries(new URLSearchParams(params.url_tags.replace(/^[?&]/, '')).entries())
