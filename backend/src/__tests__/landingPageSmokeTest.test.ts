@@ -53,6 +53,7 @@ const SINGLE_EMAIL_FIELD = {
   selects: [],
   checkables: [],
   submitSelector: null,
+  disclosureTriggers: [],
 };
 
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
@@ -358,6 +359,7 @@ describe("runGenerationSmokeTest", () => {
         { selector: "#opt-news", type: "checkbox", name: "news", required: false },
       ],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -434,6 +436,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
@@ -465,6 +468,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
@@ -489,6 +493,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
@@ -510,6 +515,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -531,6 +537,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -552,6 +559,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -597,6 +605,7 @@ describe("runGenerationSmokeTest", () => {
       selects: [],
       checkables: [],
       submitSelector: null,
+      disclosureTriggers: [],
     });
     mockPage.click.mockImplementationOnce(async () => emit());
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
@@ -708,6 +717,45 @@ describe("runGenerationSmokeTest", () => {
     expect(reason).not.toContain("\n");
     expect(reason).toContain("...");
     expect(reason.length).toBeLessThan(longUrl.length);
+  });
+
+  it("DISCLOSURE: opens a collapsed checkbox group, re-discovers, then closes it before submit", async () => {
+    // The root waterheater lander: a required symptom group behind a "What's happening?"
+    // popover. Until it is open the group is unreachable, the lander's own JS blocks submit,
+    // and HTML5 checkValidity() still reports true — a working page reported as a failure.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock)
+      .mockResolvedValueOnce({ ...SINGLE_EMAIL_FIELD, disclosureTriggers: ["#symptoms-trigger"] })
+      .mockResolvedValueOnce({
+        ...SINGLE_EMAIL_FIELD,
+        disclosureTriggers: [],
+        checkables: [
+          { selector: 'label:has([id="s1"])', type: "checkbox", name: "symptoms", required: true, viaLabel: true },
+        ],
+      });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const clicks = (mockPage.click as jest.Mock).mock.calls.map((c) => c[0]);
+    // opened, then closed again so the popover cannot overlay the submit button
+    expect(clicks.filter((c) => c === "#symptoms-trigger").length).toBe(2);
+    // a label target is CLICKED, never check()ed — check() asserts the target is a checkbox
+    expect(clicks).toContain('label:has([id="s1"])');
+    expect(mockPage.check).not.toHaveBeenCalledWith('label:has([id="s1"])', expect.anything());
+  });
+
+  it("DISCLOSURE: a trigger that will not open is not retried and does not block the run", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      disclosureTriggers: ["#stuck"],
+    });
+    mockPage.click.mockRejectedValueOnce(new Error("not clickable"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    // No second discovery pass, and the run still reaches a verdict.
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {

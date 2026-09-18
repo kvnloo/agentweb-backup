@@ -19,8 +19,9 @@ type Discovered = {
   scope: string;
   fields: { selector: string; hint: string; kind: string }[];
   selects: { selector: string; options: string[] }[];
-  checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+  checkables: { selector: string; type: string; name: string | null; required: boolean; viaLabel: boolean }[];
   submitSelector: string | null;
+  disclosureTriggers: string[];
 };
 
 /** Cases default to discoverSmokeFields; `fn` selects another exported page-side function. */
@@ -99,6 +100,24 @@ const CASES: Record<string, string> = {
       <input type="text" name="firstName" required>
       <input type="email" name="email" required>
       <input type="tel" name="phone" required>
+    </form>`,
+  labelProxyCheckbox: `
+    <form>
+      <input type="email" name="email" required>
+      <label data-rect="0,0,266,42">Water leaking<input type="checkbox" id="sym-leak" name="symptoms" data-rect="0,0,0,0"></label>
+      <label data-rect="0,0,266,42">No hot water<input type="checkbox" id="sym-cold" name="symptoms" data-rect="0,0,0,0"></label>
+    </form>`,
+  disclosureWithCheckboxes: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" id="symptoms-trigger" aria-expanded="false" aria-controls="symptoms-panel">What's happening?</button>
+      <div id="symptoms-panel"><input type="checkbox" id="s1" name="symptoms"></div>
+    </form>`,
+  radixSelectTrigger: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" id="issueType" aria-expanded="false" aria-controls="radix-listbox">Select your issue</button>
+      <div id="radix-listbox" role="listbox"><div role="option">No hot water</div></div>
     </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
@@ -230,10 +249,10 @@ describe("discoverSmokeFields", () => {
 
   it("reports checkbox/radio requiredness so every required box gets checked", () => {
     expect(got("checkables").checkables).toEqual([
-      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true },
-      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false },
-      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true },
-      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true },
+      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true, viaLabel: false },
+      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false, viaLabel: false },
+      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true, viaLabel: false },
+      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true, viaLabel: false },
     ]);
   });
 
@@ -293,6 +312,27 @@ describe("discoverSmokeFields", () => {
     // filled and the page failed its own smoke test.
     expect(out.collapsedDuplicateForm.markedFormIds).toEqual(["desktop-variant"]);
     expect(selectorsOf(got("collapsedDuplicateForm")).length).toBe(3);
+  });
+
+  it("reaches a visually-hidden checkbox through its label", () => {
+    // Observed live: the shadcn/Radix pattern renders a 0x0 input whose label is the only
+    // clickable surface. Judging the input by its own box skipped a control a visitor can
+    // plainly use, so a required symptom group stayed unselected and submit stayed blocked.
+    const boxes = got("labelProxyCheckbox").checkables;
+    expect(boxes.map((c) => c.viaLabel)).toEqual([true, true]);
+    expect(boxes[0].selector).toBe(`${SCOPE}label:has([id="sym-leak"])`);
+  });
+
+  it("opens a disclosure that holds a checkbox group", () => {
+    expect(got("disclosureWithCheckboxes").disclosureTriggers).toEqual([
+      `${SCOPE}[id="symptoms-trigger"]`,
+    ]);
+  });
+
+  it("never opens a Radix select trigger, which also carries aria-expanded", () => {
+    // Opening one puts a listbox overlay over the page that swallows every later click,
+    // including the submit — observed turning a working lander into a total failure.
+    expect(got("radixSelectTrigger").disclosureTriggers).toEqual([]);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

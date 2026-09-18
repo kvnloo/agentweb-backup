@@ -99,9 +99,22 @@ export type SmokeFields = {
   scope: string;
   fields: SmokeField[];
   selects: { selector: string; options: string[] }[];
-  checkables: { selector: string; type: string; name: string | null; required: boolean }[];
+  checkables: {
+    selector: string;
+    type: string;
+    name: string | null;
+    required: boolean;
+    /**
+     * True when `selector` targets the control's LABEL rather than the input itself. The
+     * shadcn/Radix pattern renders a visually-hidden input with a visible label as its only
+     * clickable surface, so the input is permanently 0x0 and check() can never reach it.
+     */
+    viaLabel: boolean;
+  }[];
   /** Submit control resolved page-side (handles a `form=`-associated button); null when none. */
   submitSelector: string | null;
+  /** Collapsed ARIA disclosures inside the form, to be opened before a second discovery pass. */
+  disclosureTriggers: string[];
 };
 
 type SmokeTestPage = {
@@ -181,11 +194,39 @@ export function discoverSmokeFields(): SmokeFields {
   const controlsOf = (f: HTMLFormElement): HTMLInputElement[] =>
     Array.prototype.slice.call(f.elements) as HTMLInputElement[];
 
+  const hasBox = (el: Element): boolean => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const absLeft = rect.left + (window.scrollX || 0);
+    const absTop = rect.top + (window.scrollY || 0);
+    if (absLeft + rect.width <= 0 || absTop + rect.height <= 0) return false;
+    const docWidth = document.documentElement.scrollWidth;
+    if (docWidth > 0 && absLeft >= docWidth) return false;
+    return true;
+  };
+
+  /**
+   * A visually-hidden control is still reachable when its label carries the box — that is
+   * how shadcn/Radix checkboxes are built, and clicking the label toggles the input. Returns
+   * the label only when the label itself is actually visible.
+   */
+  const clickableLabel = (el: Element): HTMLElement | null => {
+    const labels = (el as any).labels as NodeListOf<HTMLElement> | undefined;
+    if (!labels || !labels.length) return null;
+    const label = labels[0];
+    const style = typeof getComputedStyle === "function" ? getComputedStyle(label) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden")) return null;
+    return hasBox(label) ? label : null;
+  };
+
   // Skip anything a real visitor could not fill. Playwright counts an element as visible
   // when it merely has a non-empty bounding box, so an off-canvas honeypot
   // (position:absolute;left:-9999px) WOULD be filled, and a display:none control instead
   // eats the full action timeout. Both are handled here, before we ever build a selector.
-  const usable = (el: Element): boolean => {
+  // allowLabelProxy: only a checkbox/radio can be operated through its label. A text input
+  // cannot be filled by clicking one, so letting an invisible one through there would just
+  // spend a fill timeout per field.
+  const usable = (el: Element, allowLabelProxy?: boolean): boolean => {
     const input = el as HTMLInputElement;
     if (input.disabled || input.readOnly) return false;
     if (input.type === "hidden") return false;
@@ -196,20 +237,15 @@ export function discoverSmokeFields(): SmokeFields {
       if (input.name && HONEYPOT_NAME.test(input.name)) return false;
       if (input.id && HONEYPOT_NAME.test(input.id)) return false;
     }
+    // Checked BEFORE the control's own style and geometry: a shadcn/Radix checkbox is
+    // deliberately invisible (display:none or sr-only) and its label is the only clickable
+    // surface, so judging the input by its own box rejects a control a visitor can plainly use.
+    if (allowLabelProxy && clickableLabel(el)) return true;
     const style = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
     if (style) {
       if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
     }
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    // Absolute (document-space) position, so a legitimately below-the-fold field isn't
-    // mistaken for an off-canvas one.
-    const absLeft = rect.left + (window.scrollX || 0);
-    const absTop = rect.top + (window.scrollY || 0);
-    if (absLeft + rect.width <= 0 || absTop + rect.height <= 0) return false;
-    const docWidth = document.documentElement.scrollWidth;
-    if (docWidth > 0 && absLeft >= docWidth) return false;
-    return true;
+    return hasBox(el);
   };
 
   const forms = all(document, "form") as HTMLFormElement[];
@@ -311,16 +347,54 @@ export function discoverSmokeFields(): SmokeFields {
   });
 
   const checkables: SmokeFields["checkables"] = [];
-  for (const el of controls) {
-    if (!matches(el, 'input[type="checkbox"], input[type="radio"]') || !usable(el)) continue;
-    const selector = selFor(el);
-    if (!selector) continue;
+  const checkableEls = controls.filter((el) =>
+    matches(el, 'input[type="checkbox"], input[type="radio"]')
+  );
+  checkableEls.forEach((el) => {
+    if (!usable(el, true)) return;
     const input = el as HTMLInputElement;
+    const viaLabel = !hasBox(el) && clickableLabel(el) !== null;
+    let selector: string;
+    if (!viaLabel) {
+      selector = selFor(el);
+    } else if (input.id) {
+      selector = `${scope}label:has([id="${esc(input.id)}"])`;
+    } else if (input.name) {
+      // Index within this name's group, so the label selector resolves to THIS control.
+      const sameName = checkableEls.filter((c) => (c as HTMLInputElement).name === input.name);
+      selector = `${scope}label:has([name="${esc(input.name)}"]) >> nth=${sameName.indexOf(el)}`;
+    } else {
+      return; // nothing stable to key the label off
+    }
+    if (!selector) return;
     checkables.push({
       selector,
       type: input.type,
       name: input.name || null,
       required: input.required,
+      viaLabel,
+    });
+  });
+
+  // Collapsed ARIA disclosures (a "What's happening?" popover holding a checkbox group).
+  // Reported rather than clicked here: opening one needs a trusted event, which only
+  // Playwright's own click produces — an in-page el.click() leaves React's state untouched.
+  const disclosureTriggers: string[] = [];
+  if (form) {
+    const triggers = all(form, '[aria-expanded="false"]');
+    triggers.forEach((t, index) => {
+      if (!hasBox(t)) return;
+      // Only open a disclosure that actually holds a checkbox/radio group. aria-expanded
+      // ALSO marks Radix Select triggers ("Select your issue"), and opening one of those
+      // puts a listbox overlay over the page that swallows every later click, including the
+      // submit — observed turning a working lander into a total failure. The panel named by
+      // aria-controls has to contain checkables for the click to be worth the risk.
+      const controlsId = t.getAttribute("aria-controls");
+      const panel = controlsId ? document.getElementById(controlsId) : null;
+      if (!panel || !panel.querySelector('input[type="checkbox"], input[type="radio"]')) return;
+      disclosureTriggers.push(
+        t.id ? `${scope}[id="${esc(t.id)}"]` : `${scope}[aria-expanded="false"] >> nth=${index}`
+      );
     });
   }
 
@@ -341,7 +415,7 @@ export function discoverSmokeFields(): SmokeFields {
     }
   }
 
-  return { scope, fields, selects, checkables, submitSelector };
+  return { scope, fields, selects, checkables, submitSelector, disclosureTriggers };
 }
 /**
  * Chooses a format-valid synthetic value for one discovered field.
@@ -420,7 +494,30 @@ async function fillAllRequiredFields(
   email: string,
   testPhone: string
 ): Promise<FillOutcome> {
-  const discovered = await browserPage.evaluate(discoverSmokeFields).catch(() => null);
+  let discovered = await browserPage.evaluate(discoverSmokeFields).catch(() => null);
+
+  // Open any collapsed disclosure inside the form before deciding what is fillable. A
+  // required checkbox group can live behind a "What's happening?" popover, and until it is
+  // open the group is unreachable — the lander's own JS then blocks submit while HTML5
+  // checkValidity() still reports true, which reads here as a working page that "did not
+  // land a lead". The click has to come from Playwright: an in-page el.click() flips no
+  // React state. Re-discover afterwards so the newly revealed controls are picked up.
+  const openedTriggers: string[] = [];
+  if (discovered && discovered.disclosureTriggers && discovered.disclosureTriggers.length > 0) {
+    for (const trigger of discovered.disclosureTriggers) {
+      try {
+        await browserPage.click(trigger, { timeout: FIELD_TIMEOUT_MS });
+        openedTriggers.push(trigger);
+      } catch {
+        // not actually openable — leave it
+      }
+    }
+    if (openedTriggers.length > 0) {
+      const reDiscovered = await browserPage.evaluate(discoverSmokeFields).catch(() => null);
+      if (reDiscovered) discovered = reDiscovered;
+    }
+  }
+
   if (!discovered) {
     return {
       lastTextSelector: null,
@@ -472,7 +569,7 @@ async function fillAllRequiredFields(
     const key = radio.name ?? radio.selector;
     if (!radiosByGroup.has(key)) radiosByGroup.set(key, radio);
   }
-  const toCheck: { selector: string }[] =
+  const toCheck: { selector: string; viaLabel?: boolean }[] =
     requiredBoxes.length > 0 || radiosByGroup.size > 0
       ? [...requiredBoxes, ...radiosByGroup.values()]
       : checkables.length > 0
@@ -480,15 +577,31 @@ async function fillAllRequiredFields(
         : [];
   for (const control of toCheck) {
     try {
-      await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
+      if ((control as { viaLabel?: boolean }).viaLabel) {
+        // check() asserts the target IS a checkbox/radio; a label is neither. Clicking the
+        // label is what a visitor does, and it toggles the control it wraps.
+        await browserPage.click(control.selector, { timeout: FIELD_TIMEOUT_MS });
+      } else {
+        await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
+      }
       filled++;
     } catch {
-      // custom checkbox widgets without a checkable input — leave alone
+      // custom checkbox widgets without a reachable input or label — leave alone
     }
   }
 
   // Count only what was actually attempted: a select with no selectable options is skipped
   // above, so including it would make "filled 4/5" indistinguishable from a real failure.
+  // Collapse anything we opened: a popover left open can overlay the submit button and
+  // swallow the click that follows.
+  for (const trigger of openedTriggers) {
+    try {
+      await browserPage.click(trigger, { timeout: FIELD_TIMEOUT_MS });
+    } catch {
+      // already closed, or the trigger moved — the submit click auto-waits for actionability
+    }
+  }
+
   const attempted =
     fields.length + selects.filter((s) => s.options && s.options.length > 0).length + toCheck.length;
   return {
