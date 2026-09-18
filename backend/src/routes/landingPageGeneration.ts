@@ -1045,6 +1045,11 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
 
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    // ENG-1238: external imports have no build behind them — duplicating would
+    // re-run a full v0 generation from the imported stub prompt.
+    if (isExternalLandingPageRecord(auth.page)) {
+      return res.status(409).json({ error: "Externally-imported pages cannot be duplicated" });
+    }
     const original = auth.page;
 
     const { name } = req.body;
