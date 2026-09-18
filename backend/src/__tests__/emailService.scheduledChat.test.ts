@@ -1,6 +1,6 @@
 import { emailService } from '../services/emailService';
 import { chatbotDb } from '../services/chatbotService';
-import { userDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
 import { __resetAgentModeAlertDedupeForTests } from '../utils/agentModeAlerts';
 
 // Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects.
@@ -22,6 +22,7 @@ jest.mock('../services/chatbotService', () => ({
 // The guard resolves per-recipient admin status + the owner via userDb.
 jest.mock('../services/db', () => ({
   userDb: { getUserByEmail: jest.fn(), getUserById: jest.fn() },
+  scheduleDb: { getScheduleById: jest.fn(), appendDeliveryLogEntry: jest.fn().mockResolvedValue(undefined) },
 }));
 
 // The withheld-report oncall alert is deduped per schedule for 24h (ENG-1552), and
@@ -618,5 +619,57 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
     await expect(
       emailService.sendScheduledRunFailedEmail(['x@example.com'], 'S', 'sched-5', opts),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ── ENG-1552: zero-content runs (the xCures / ENG-1504 class) ────────────────
+describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: 'schedule-123', userId: 'owner-id' });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com' });
+  });
+
+  it.each([['empty', ''], ['whitespace-only', '  \n\t ']])(
+    'never sends a %s report to recipients; records withheld/empty_content and notifies only the owner',
+    async (_label, body) => {
+      const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+      await emailService.sendScheduledChatResultEmail(
+        ['a@example.com', 'b@example.com'],
+        'xCures monthly',
+        { ...GUARD_BASE_RESULT, passed: false, actualResponse: body, runId: 'run-9' },
+        'schedule-123'
+      );
+
+      const recipientSends = spy.mock.calls.filter(c => c[0].includes('a@example.com') || c[0].includes('b@example.com'));
+      expect(recipientSends).toHaveLength(0);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0]).toEqual(['owner@example.com']);
+      expect(spy.mock.calls[0][1]).toContain('not delivered');
+      expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+        'schedule-123',
+        expect.objectContaining({ runId: 'run-9', state: 'withheld', reason: 'empty_content', withheldRecipients: ['a@example.com', 'b@example.com'] }),
+        undefined,
+      );
+      // No share link is minted for a report that does not exist.
+      expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    }
+  );
+
+  it('records withheld/no_authorized_recipients when the send-time guard leaves nobody', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: { list_all_clients: 1 } });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
+
+    await emailService.sendScheduledChatResultEmail(['nonadmin@example.com'], 'Report', { ...GUARD_BASE_RESULT, runId: 'run-7' }, 'schedule-123');
+
+    expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+      'schedule-123',
+      expect.objectContaining({ runId: 'run-7', state: 'withheld', reason: 'no_authorized_recipients', missingPermission: 'isAdmin' }),
+      undefined,
+    );
   });
 });
