@@ -14,7 +14,9 @@ import { emailService } from '../services/emailService';
 import {
   buildRecipientRemediation,
   checkScheduleActivationRecipients,
+  deliveryEnforcementEnabled,
   latestDeliveryByRun,
+  logShadowDecision,
   recordReportDeliveryState,
   reportContainsCrossAccountData,
   resolveAuthorizedReportRecipients,
@@ -5626,7 +5628,13 @@ export async function runScheduledChat(
         ownerEmail: (scheduleOwner as any)?.email,
         isSensitive: true,
       });
-      if (authz.authorized.length === 0) {
+      if (authz.authorized.length === 0 && !deliveryEnforcementEnabled()) {
+        logShadowDecision('skipped generation', {
+          scheduleId: schedule.scheduleId,
+          owner: (scheduleOwner as any)?.email,
+          withheldRecipients: authz.withheld,
+        });
+      } else if (authz.authorized.length === 0) {
         const withheldRunId: string = preGeneratedRunId || require('uuid').v4();
         const remediation = buildRecipientRemediation({
           code: 'no_authorized_recipients',
@@ -12028,7 +12036,11 @@ export const agentModeController = {
         schedule: scheduledChat,
       });
       if (createRemediation) {
-        return res.status(400).json({ error: createRemediation.safeAction, remediation: createRemediation });
+        if (!deliveryEnforcementEnabled()) {
+          logShadowDecision('rejected schedule create', { scheduleId, owner: user.email, code: createRemediation.code });
+        } else {
+          return res.status(400).json({ error: createRemediation.safeAction, remediation: createRemediation });
+        }
       }
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -12335,7 +12347,11 @@ export const agentModeController = {
           },
         });
         if (updateRemediation) {
-          return res.status(400).json({ error: updateRemediation.safeAction, remediation: updateRemediation });
+          if (!deliveryEnforcementEnabled()) {
+            logShadowDecision('rejected schedule update', { scheduleId, owner: user.email, code: updateRemediation.code });
+          } else {
+            return res.status(400).json({ error: updateRemediation.safeAction, remediation: updateRemediation });
+          }
         }
       }
 
@@ -13102,7 +13118,11 @@ export const agentModeController = {
           schedule: schedule as any,
         });
         if (toggleRemediation) {
-          return res.status(400).json({ error: toggleRemediation.safeAction, remediation: toggleRemediation });
+          if (!deliveryEnforcementEnabled()) {
+            logShadowDecision('rejected schedule toggle', { scheduleId, owner: user.email, code: toggleRemediation.code });
+          } else {
+            return res.status(400).json({ error: toggleRemediation.safeAction, remediation: toggleRemediation });
+          }
         }
       }
 
@@ -13164,7 +13184,11 @@ export const agentModeController = {
       // ENG-1552 read-back: each run carries its latest delivery state (generated →
       // withheld / delivery_attempted → delivered → recipient_confirmed). Added as a
       // field on the run so the array shape every consumer reads is unchanged.
-      const deliveryByRun = latestDeliveryByRun((schedule as any).deliveryLog);
+      // Shadow mode: the field is internal until enforcement is on — Emma reads this
+      // endpoint through the MCP tool and could otherwise surface it to a customer.
+      const deliveryByRun = deliveryEnforcementEnabled()
+        ? latestDeliveryByRun((schedule as any).deliveryLog)
+        : {};
       const historyWithActions = (testHistory || []).map((run: any) => {
         if (run === null || typeof run !== 'object' || Array.isArray(run)) return run;
         const normalized = normalizeMarketingActions(run);
@@ -13213,6 +13237,9 @@ export const agentModeController = {
   // withheld or unsent report would record something that did not happen.
   async confirmScheduledReportReceipt(req: Request, res: Response) {
     try {
+      if (!deliveryEnforcementEnabled()) {
+        return res.status(404).json({ error: 'Not found' });
+      }
       const user = req.user as User;
       const { scheduleId, runId } = req.params;
 

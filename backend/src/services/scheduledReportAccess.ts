@@ -174,6 +174,23 @@ export async function resolveAuthorizedReportRecipients(params: {
 
 // ── Delivery state + remediation (ENG-1552) ─────────────────────────────────
 //
+// SHADOW MODE BY DEFAULT. Everything customer-visible that ENG-1552 adds — the
+// activation 400s, skipping generation, withholding empty reports, restricting
+// digests, the read-back field — only takes effect when
+// SCHEDULED_REPORT_DELIVERY_ENFORCEMENT=true. Until then each check still runs and
+// what it WOULD have done is logged (`[ENG-1552 shadow]`) and recorded internally,
+// so it can be watched and tuned before any customer sees it (user decision,
+// 2026-09-18). Customer behavior with the flag unset is unchanged from before.
+
+export function deliveryEnforcementEnabled(): boolean {
+  return process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT === 'true';
+}
+
+/** One grep-able line per decision shadow mode did not act on. */
+export function logShadowDecision(wouldHave: string, detail: Record<string, unknown>): void {
+  console.warn(`[ENG-1552 shadow] would have ${wouldHave}: ${JSON.stringify(detail)}`);
+}
+//
 // The guard above decides WHO may receive a sensitive report, but only at send
 // time and without leaving a trace. What follows is the state around it: each
 // run's delivery outcome is persisted on the schedule as a `deliveryLog`, and a

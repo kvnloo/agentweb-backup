@@ -6,7 +6,7 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
@@ -1686,8 +1686,12 @@ Schedule ID: ${scheduleId}
     // no output at all. Sending that is an empty report that reads as delivered, so
     // withhold it and record why — before a share link is minted or anything is composed.
     if (!(result.actualResponse || '').trim()) {
-      await this.withholdEmptyScheduledReport(toEmails, result, scheduleId);
-      return;
+      if (deliveryEnforcementEnabled()) {
+        await this.withholdEmptyScheduledReport(toEmails, result, scheduleId);
+        return;
+      }
+      // Shadow mode: send exactly as before; the send is still recorded below.
+      logShadowDecision('withheld an empty report', { scheduleId, runId: result.runId || result.sessionId });
     }
     try {
       const { marked } = await import('marked');
@@ -2321,7 +2325,13 @@ Sent via AgentWeb: ${customerFrontendUrl}
       // used to send every run's content to every configured address unchecked.
       // Runs without a session carry only system text, so only sessions count.
       const digestSessionIds = [...new Set(todaysResults.map((r) => r?.sessionId).filter(Boolean))] as string[];
-      const guard = await this.classifyAndResolveScheduledReportRecipients(digestSessionIds, emailList);
+      const enforced = deliveryEnforcementEnabled();
+      const classified = await this.classifyAndResolveScheduledReportRecipients(digestSessionIds, emailList);
+      if (!enforced && classified.withheld.length > 0) {
+        logShadowDecision('restricted a digest', { scheduleId, withheldRecipients: classified.withheld });
+      }
+      // Shadow mode: every configured recipient gets the digest, exactly as before.
+      const guard = enforced ? classified : { ...classified, authorized: emailList, withheld: [] as string[] };
       if (guard.authorized.length === 0) {
         console.error(`Daily digest for schedule ${scheduleId} had no authorized recipients after the guard; digest NOT delivered.`);
         await recordReportDeliveryState(scheduleId, {
