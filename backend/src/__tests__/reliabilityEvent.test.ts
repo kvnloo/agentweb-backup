@@ -19,6 +19,8 @@ describe('reliabilityEvent schema', () => {
     expect(classifyToolResultOutcome({ success: true })).toBe('success');
     expect(classifyToolResultOutcome({ success: false, message: 'Tool blocked by policy' })).toBe('blocked');
     expect(classifyToolResultOutcome({ skipped: true })).toBe('skipped');
+    expect(classifyToolResultOutcome({ awaitingUserConfirmation: true })).toBe('pending_confirmation');
+    expect(classifyToolResultOutcome({ requiresConfirmation: true })).toBe('pending_confirmation');
   });
 });
 

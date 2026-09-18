@@ -8,6 +8,7 @@ export type ReliabilityOutcome =
   | 'blocked'
   | 'skipped'
   | 'timeout'
+  | 'pending_confirmation'
   | 'user_refused';
 
 export interface ReliabilityEvent {
@@ -63,7 +64,9 @@ export function classifyToolResultOutcome(result: unknown, thrownError?: unknown
   if (thrownError) return 'error';
   if (!result || typeof result !== 'object') return 'success';
   const r = result as Record<string, unknown>;
-  if (r.awaitingUserConfirmation === true || r.requiresConfirmation === true) return 'user_refused';
+  if (r.awaitingUserConfirmation === true || r.requiresConfirmation === true) {
+    return 'pending_confirmation';
+  }
   if (r.skipped === true) return 'skipped';
   if (r.success === false) {
     const msg = typeof r.message === 'string' ? r.message : typeof r.error === 'string' ? r.error : '';

@@ -126,6 +126,50 @@ describe('runJevDecide fail-open paths', () => {
     expect(result.reason).toBe('http_error');
     expect(result.message).toMatch(/503/);
   });
+  it('fail-opens on malformed provider answers (invalid choice label)', async () => {
+    const request = loadFixture<JevDecideRequest>('route-choice-request.json');
+    const badResponse = {
+      model: 'jev-latest',
+      answers: {
+        queue: {
+          type: 'choice',
+          choice: 'unknown_queue',
+          probabilities: { account_access: 0.9, billing: 0.1 },
+          confidence: 0.8,
+        },
+      },
+    };
+    const fetchImpl = mockFetch(badResponse);
+
+    const result = await runJevDecide(request, {
+      config: typesafeConfig(),
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('invalid_response');
+    expect(result.answers).toEqual({});
+  });
+
+  it('fail-opens on malformed noul range', async () => {
+    const request = loadFixture<JevDecideRequest>('gate-noul-request.json');
+    const badResponse = {
+      model: 'jev-latest',
+      answers: { needs_ticket: { type: 'noul', noul: 5 } },
+    };
+    const fetchImpl = mockFetch(badResponse);
+
+    const result = await runJevDecide(request, {
+      config: typesafeConfig(),
+      fetchImpl,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('invalid_response');
+  });
+
 });
 
 describe('runJevDecide fixture-backed success paths', () => {

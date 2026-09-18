@@ -3721,6 +3721,11 @@ export class ChatbotDB {
     await dynamodb.update(params).promise();
   }
 
+  /**
+   * H-VOICE: persist session-scoped Voice Card metadata on AW-ChatSessions.
+   * Schema extension per RFC H-VOICE (Harsha P0 epic #4) — requires Harsha sign-off
+   * before upstream merge per CLAUDE.md persistent-data policy.
+   */
   async updateSessionVoiceProfile(
     sessionId: string,
     profile: import('./voiceProfileService').SessionVoiceProfile,

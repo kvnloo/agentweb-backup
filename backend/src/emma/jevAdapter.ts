@@ -162,6 +162,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isUnitInterval(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0 && value <= 1;
+}
+
+function isProbabilityMap(value: unknown): value is Record<string, number> {
+  if (!isRecord(value)) return false;
+  return Object.values(value).every((entry) => isUnitInterval(entry));
+}
+
+/** Validate provider answer shape against the originating question (fail closed on mismatch). */
+export function validateParsedAnswer(answer: unknown, question: JevQuestion): answer is JevAnswer {
+  if (!isRecord(answer) || answer.type !== question.type) return false;
+
+  if (question.type === 'choice') {
+    const choice = answer.choice;
+    if (typeof choice !== 'string' || !(choice in question.criteria)) return false;
+    if (!isProbabilityMap(answer.probabilities)) return false;
+    if (!isUnitInterval(answer.confidence)) return false;
+    return true;
+  }
+
+  if (question.type === 'noul') {
+    return isUnitInterval(answer.noul);
+  }
+
+  const maxScore = question.criteria.length - 1;
+  if (!isFiniteNumber(answer.score) || !Number.isInteger(answer.score)) return false;
+  if (answer.score < 0 || answer.score > maxScore) return false;
+  if (!isProbabilityMap(answer.probabilities)) return false;
+  if (!isUnitInterval(answer.confidence)) return false;
+  return true;
+}
+
+class JevInvalidResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JevInvalidResponseError';
+  }
+}
+
 function parseAnswers(raw: unknown, questions: JevQuestions): Record<string, JevAnswer> | null {
   if (!isRecord(raw)) return null;
   const answersRaw = raw.answers;
@@ -170,8 +214,8 @@ function parseAnswers(raw: unknown, questions: JevQuestions): Record<string, Jev
   const parsed: Record<string, JevAnswer> = {};
   for (const [id, question] of Object.entries(questions)) {
     const answer = answersRaw[id];
-    if (!isRecord(answer) || answer.type !== question.type) return null;
-    parsed[id] = answer as JevAnswer;
+    if (!validateParsedAnswer(answer, question)) return null;
+    parsed[id] = answer;
   }
   return parsed;
 }
@@ -220,7 +264,9 @@ export async function postSystemOne(params: {
 
     const answers = parseAnswers(body, params.questions);
     if (!answers) {
-      throw new Error('response missing typed answers for every question');
+      throw new JevInvalidResponseError(
+        'response missing or malformed typed answers for every question',
+      );
     }
 
     const usageRaw = body.usage;
@@ -306,6 +352,9 @@ export async function runJevDecide(
         'timeout',
         `JEV request timed out after ${config.timeoutMs}ms (fail-open).`,
       );
+    }
+    if (error instanceof JevInvalidResponseError) {
+      return skipped(config.backend, 'invalid_response', `${error.message} (fail-open).`);
     }
     const message = error instanceof Error ? error.message : String(error);
     return skipped(config.backend, 'http_error', message);
