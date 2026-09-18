@@ -228,6 +228,9 @@ describe('Daily Digest Email Service', () => {
 
   // ── ENG-1552: the digest runs the same recipient guard as a single report ──
   describe('recipient guard parity (ENG-1552)', () => {
+    // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+    beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+    afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
     const run = (sessionId: string, actualResponse = 'Client roster summary') => ({
       passed: true, actualResponse, keywordMatches: [], keywordMisses: [], functionCallMatches: [],
       functionCallMisses: [], executionTime: 1000, sessionId, attempt: 1, createdAt: '2024-01-15T10:00:00Z',
@@ -288,4 +291,24 @@ describe('Daily Digest Email Service', () => {
       expect(states).toEqual([['delivery_attempted', undefined], ['delivery_attempted', 'provider_error']]);
     });
   });
+
+  describe('ENG-1552 shadow mode — digest goes to everyone, as before (enforcement unset)', () => {
+    beforeEach(() => {
+      delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT;
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue('http://localhost:5174/ishare/x');
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-2', userId: 'owner-id', calledFunctions: { list_all_clients: 1 } });
+    });
+
+    it('sends a sensitive digest to every configured recipient with no withheld notice', async () => {
+      await emailService.sendDailyDigestEmail(['admin@example.com', 'analyst@example.com'], 'Hourly', [{
+        passed: true, actualResponse: 'Client roster', keywordMatches: [], keywordMisses: [], functionCallMatches: [],
+        functionCallMisses: [], executionTime: 1000, sessionId: 'session-2', attempt: 1, createdAt: '2024-01-15T10:00:00Z',
+      }], 'schedule-1');
+      expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+      const [recipients, , text] = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      expect(recipients).toEqual(['admin@example.com', 'analyst@example.com']);
+      expect(text).not.toContain('withheld');
+    });
+  });
 });
+

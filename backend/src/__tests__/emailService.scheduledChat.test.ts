@@ -624,6 +624,9 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
 
 // ── ENG-1552: zero-content runs (the xCures / ENG-1504 class) ────────────────
 describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)', () => {
+  // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+  beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
   beforeEach(() => {
     jest.clearAllMocks();
   });
@@ -685,3 +688,21 @@ describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)'
     );
   });
 });
+
+describe('ENG-1552 shadow mode — empty report is sent exactly as before (enforcement unset)', () => {
+  beforeEach(() => { jest.clearAllMocks(); delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+  it('still emails the recipients, and records the send internally', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue('sent' as any);
+
+    await emailService.sendScheduledChatResultEmail(['a@example.com'], 'xCures monthly', { ...GUARD_BASE_RESULT, actualResponse: '', runId: 'run-e' }, 'schedule-123');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toEqual(['a@example.com']);
+    const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => c[1].state);
+    expect(states).toEqual(['delivery_attempted', 'delivered']);
+  });
+});
+
