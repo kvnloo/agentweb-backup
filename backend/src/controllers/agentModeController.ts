@@ -11,6 +11,14 @@ import multer from 'multer';
 import crypto from 'crypto';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
+import {
+  buildRecipientRemediation,
+  recordReportDeliveryState,
+  reportContainsCrossAccountData,
+  resolveAuthorizedReportRecipients,
+  scheduleLikelySensitive,
+  type RecipientRemediation,
+} from '../services/scheduledReportAccess';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
@@ -5466,6 +5474,8 @@ export async function runScheduledChat(
   // `failure`, like the publish markers and unlike readOnlyRequirementWaived —
   // the contact never went out.
   sendPressExhausted?: boolean;
+  // ENG-1552: present only when the recipient preflight skipped generation.
+  remediation?: RecipientRemediation;
 }> {
   if (isEvaluationUser(userId) || isEvaluationUser(schedule?.userId)) {
     await (await import('../services/evaluationStore')).evaluationStore.discardJob(isEvaluationUser(schedule?.userId) ? schedule.userId : userId, schedule?.scheduleId);
@@ -5598,6 +5608,74 @@ export async function runScheduledChat(
       await scheduleDb.addRunResult(schedule.scheduleId, entitlementResult)
         .catch((error) => console.error('Error saving scheduled-chat entitlement result:', error));
       return entitlementResult;
+    }
+
+    // ENG-1552: recipient preflight. A schedule whose report carries cross-account
+    // data can only be delivered to admins; if none of its recipients (nor the owner)
+    // currently qualifies, the send-time guard would withhold the whole report — so
+    // don't pay for generating it. Silent schedules (no recipients) are unaffected:
+    // they deliver nothing by design, and the run is still visible in-app.
+    const preflightRecipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter(Boolean)
+      : [];
+    if (preflightRecipients.length > 0 && scheduleLikelySensitive(schedule)) {
+      const authz = await resolveAuthorizedReportRecipients({
+        recipients: preflightRecipients,
+        ownerEmail: (scheduleOwner as any)?.email,
+        isSensitive: true,
+      });
+      if (authz.authorized.length === 0) {
+        const withheldRunId: string = preGeneratedRunId || require('uuid').v4();
+        const remediation = buildRecipientRemediation({
+          code: 'no_authorized_recipients',
+          scheduleId: schedule.scheduleId,
+          runId: withheldRunId,
+          owner: (scheduleOwner as any)?.email,
+          eligibleRecipients: authz.authorized,
+        });
+        const withheldResult = {
+          scheduleId: schedule.scheduleId,
+          runId: withheldRunId,
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled report not generated: ${remediation.safeAction}`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: schedule.keywords || [],
+          functionCallMatches: [],
+          functionCallMisses: schedule.requiredFunctionCalls || [],
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString(),
+          remediation,
+        };
+        console.warn(
+          `Scheduled chat "${schedule.scheduleName}" (${schedule.scheduleId}) skipped before generation: sensitive report with no authorized recipient among ${preflightRecipients.length} configured.`
+        );
+        await scheduleDb.addRunResult(schedule.scheduleId, withheldResult)
+          .catch((error) => console.error('Error saving recipient-preflight withheld result:', error));
+        await recordReportDeliveryState(schedule.scheduleId, {
+          runId: withheldRunId,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: authz.withheld,
+          missingPermission: remediation.missingPermission,
+        });
+        // A manual test surfaces the remediation in its own response; only an
+        // unattended run needs someone told.
+        if (!isTest) {
+          await emailService.notifyScheduledReportWithheld({
+            scheduleId: schedule.scheduleId,
+            scheduleName: schedule.scheduleName,
+            ownerEmail: (scheduleOwner as any)?.email,
+            ownerUserId: userId,
+            stage: 'before_generation',
+          });
+        }
+        return withheldResult;
+      }
     }
 
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -6883,6 +6961,15 @@ export async function runScheduledChat(
     } catch (error) {
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
+    }
+    // ENG-1552: record that a report exists, and whether it drew on cross-account
+    // data — the next run's recipient preflight reads that breadcrumb.
+    if (sessionId && (finalResult.actualResponse || '').trim()) {
+      await recordReportDeliveryState(
+        schedule.scheduleId,
+        { runId: finalResult.runId, state: 'generated' },
+        { lastKnownSensitive: reportContainsCrossAccountData(actualFunctionCalls) },
+      );
     }
 
     // Self-improve: when enabled, run a reflection turn in the same session that may

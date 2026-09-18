@@ -5,8 +5,8 @@ import { resendService } from './resendService';
 import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
-import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
+import { scheduleDb, userDb } from './db';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
@@ -1664,10 +1664,21 @@ Schedule ID: ${scheduleId}
       // separate from `passed` on purpose (see agentModeController.ts), so this
       // email must read it explicitly instead of trusting `passed` alone.
       blockedBy?: string;
+      // ENG-1552: the run this email reports on, so its delivery state is recorded
+      // against the right run. Callers that only have a session fall back to it.
+      runId?: string;
     },
     scheduleId: string,
     summary?: string
   ) {
+    // ENG-1552 (the xCures / ENG-1504 class): a run can finish with a real session and
+    // no output at all. Sending that is an empty report that reads as delivered, so
+    // withhold it, record why, and tell only the owner — before a share link is minted
+    // or anything is composed.
+    if (!(result.actualResponse || '').trim()) {
+      await this.withholdEmptyScheduledReport(toEmails, scheduleName, result, scheduleId);
+      return;
+    }
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -1947,46 +1958,22 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // (a status message ONLY — never the report data) so the report is not
         // lost without a signal and the owner can add an authorized recipient.
         console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
-        // Durable escalation so a fully-withheld report is never lost silently —
-        // this fires regardless of whether the owner email is known or its notice
-        // succeeds (owner-notice failure would otherwise be swallowed by sendEmail).
-        //
-        // ENG-1552 / ENG-1825: this used to pass no context, so intake could only
-        // fuzzy-match on the title and re-filed a fresh Linear issue per schedule per
-        // day. The Alert Class folds every occurrence, across all schedules, onto one
-        // canonical defect (each occurrence comment still names its Schedule ID); the
-        // dedupeKey keeps a daily schedule from re-emailing oncall inside 24h.
-        // `sessionId` is deliberately passed only as context, not as the helper's
-        // sessionId param: that would mint a no-login interactive-share link to a
-        // report withheld precisely because it holds cross-account data.
-        try {
-          const { sendAgentModeOncallAlert } = await import('../utils/agentModeAlerts');
-          await sendAgentModeOncallAlert({
-            subject: `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
-            message: `Session ${result.sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered. Owner: ${guardOwnerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`,
-            userId: guardOwnerUserId,
-            context: {
-              'Session ID': result.sessionId,
-              'Schedule ID': scheduleId,
-              'Alert Class': WITHHELD_REPORT_ALERT_CLASS,
-            },
-            dedupeKey: `withheld-recipients:${scheduleId}`,
-            dedupeWindowMs: 24 * 60 * 60 * 1000,
-          });
-        } catch (alertError) {
-          console.error(`Failed to send oncall alert for withheld report ${result.sessionId}:`, alertError);
-        }
-        if (guardOwnerEmail) {
-          try {
-            const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
-            const blockedText = `Your scheduled report "${scheduleName}" was not delivered because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and re-run.`;
-            const blockedHtml = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(blockedText)}</div>`;
-            await this.sendEmail([guardOwnerEmail], blockedSubject, blockedText, blockedHtml);
-            console.log(`Scheduled report delivery-blocked notice sent to owner ${guardOwnerEmail} for session ${result.sessionId}`);
-          } catch (notifyError) {
-            console.error(`Failed to send delivery-blocked notice for session ${result.sessionId}:`, notifyError);
-          }
-        }
+        await recordReportDeliveryState(scheduleId, {
+          runId: result.runId || result.sessionId,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: emailList,
+          missingPermission: 'isAdmin',
+        });
+        await this.notifyScheduledReportWithheld({
+          scheduleId,
+          scheduleName,
+          sessionId: result.sessionId,
+          ownerEmail: guardOwnerEmail,
+          ownerUserId: guardOwnerUserId,
+          stage: 'after_generation',
+        });
       } else {
         // Send ONE email to all authorized recipients
         await this.sendEmail(recipients, subject, finalText, finalHtml);
@@ -1997,6 +1984,99 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat result emails to ${emailList.join(', ')}:`, error);
       // Don't throw error - email failure shouldn't break the scheduled chat execution
+    }
+  },
+
+  /**
+   * A sensitive scheduled report has no authorized recipient, so nothing was
+   * delivered. Tell the two parties who can act: oncall (durably, deduped onto one
+   * canonical defect) and the schedule owner (a status message only, never report
+   * data). Used both after generation (the send-time guard withheld everything) and
+   * before it (the ENG-1552 preflight skipped the run). Never throws.
+   *
+   * ENG-1552 / ENG-1825: the oncall alert used to carry no context, so intake could
+   * only fuzzy-match on a per-schedule title and re-filed a fresh Linear issue per
+   * schedule per day. The Alert Class folds every occurrence, across all schedules,
+   * onto one canonical defect (each occurrence comment still names its Schedule ID);
+   * the dedupeKey keeps a daily schedule from re-emailing oncall inside 24h.
+   * `sessionId` goes only into context, never the helper's own sessionId param: that
+   * would mint a no-login share link to a report withheld because it holds
+   * cross-account data.
+   */
+  /** ENG-1552: the empty-content half of sendScheduledChatResultEmail. Never throws. */
+  async withholdEmptyScheduledReport(
+    toEmails: string | string[],
+    scheduleName: string,
+    result: { sessionId: string; runId?: string },
+    scheduleId: string,
+  ): Promise<void> {
+    const emailList = (Array.isArray(toEmails) ? toEmails : [toEmails]).filter(Boolean);
+    console.error(`Scheduled report for schedule ${scheduleId} (session ${result.sessionId || 'none'}) has no content; NOT sent to ${emailList.length} recipient(s).`);
+    await recordReportDeliveryState(scheduleId, {
+      runId: result.runId || result.sessionId,
+      state: 'withheld',
+      reason: 'empty_content',
+      withheldRecipients: emailList,
+    });
+    let ownerEmail: string | undefined;
+    try {
+      const schedule: any = await scheduleDb.getScheduleById(scheduleId);
+      const owner: any = schedule?.userId ? await userDb.getUserById(schedule.userId) : undefined;
+      ownerEmail = owner?.email;
+    } catch (lookupError) {
+      console.error(`Could not resolve owner of schedule ${scheduleId} for the empty-report notice:`, lookupError);
+    }
+    if (!ownerEmail) return;
+    try {
+      const subject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
+      const text = `Your scheduled report "${scheduleName}" was not sent because the run produced no report content. Open the run to see why, then run the schedule again.`;
+      const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(text)}</div>`;
+      await this.sendEmail([ownerEmail], subject, text, html);
+    } catch (notifyError) {
+      console.error(`Failed to send empty-report notice for schedule ${scheduleId}:`, notifyError);
+    }
+  },
+
+  async notifyScheduledReportWithheld(params: {
+    scheduleId: string;
+    scheduleName: string;
+    sessionId?: string;
+    ownerEmail?: string;
+    ownerUserId?: string;
+    stage: 'before_generation' | 'after_generation';
+  }): Promise<void> {
+    const { scheduleId, scheduleName, sessionId, ownerEmail, ownerUserId, stage } = params;
+    const what = stage === 'before_generation'
+      ? `Schedule ${scheduleId} was not run: it produces a report containing cross-account account data, and none of its configured recipients (or the schedule owner) are currently authorized (admin) to receive it, so generation was skipped.`
+      : `Session ${sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered.`;
+    try {
+      const { sendAgentModeOncallAlert } = await import('../utils/agentModeAlerts');
+      await sendAgentModeOncallAlert({
+        subject: `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
+        message: `${what} Owner: ${ownerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`,
+        userId: ownerUserId,
+        context: {
+          'Session ID': sessionId || 'N/A',
+          'Schedule ID': scheduleId,
+          'Alert Class': WITHHELD_REPORT_ALERT_CLASS,
+        },
+        dedupeKey: `withheld-recipients:${scheduleId}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+      });
+    } catch (alertError) {
+      console.error(`Failed to send oncall alert for withheld report on schedule ${scheduleId}:`, alertError);
+    }
+    if (!ownerEmail) return;
+    try {
+      const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
+      const blockedText = stage === 'before_generation'
+        ? `Your scheduled report "${scheduleName}" was not run because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and it will run again on its next scheduled time.`
+        : `Your scheduled report "${scheduleName}" was not delivered because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and re-run.`;
+      const blockedHtml = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(blockedText)}</div>`;
+      await this.sendEmail([ownerEmail], blockedSubject, blockedText, blockedHtml);
+      console.log(`Scheduled report delivery-blocked notice sent to owner ${ownerEmail} for schedule ${scheduleId}`);
+    } catch (notifyError) {
+      console.error(`Failed to send delivery-blocked notice for schedule ${scheduleId}:`, notifyError);
     }
   },
 
