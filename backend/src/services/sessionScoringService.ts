@@ -1076,9 +1076,22 @@ const BLOCKED_EXTERNAL_PATTERNS: RegExp[] = [
   // assistant must ALSO show it declined to guess or take an irreversible
   // action on the fragment (the ENG-1296 correct-handling shape). A bare
   // "could you clarify" after an ordinary partial answer is not enough — that
-  // over-matches incomplete work that must stay scorable.
+  // over-matches incomplete work that must stay scorable. Kept separate from
+  // the patterns above: clarification blocks additionally require validating
+  // the PRECEDING user request (CodeRabbit PR review on #2983) — an
+  // unnecessary "I decline to guess; could you clarify?" punt after a
+  // fully-specified request is an agent failure, not an external block.
+  // See CLARIFICATION_BLOCK_PATTERNS + matchesClarificationBlock below.
+];
+const CLARIFICATION_BLOCK_PATTERNS: RegExp[] = [
   /could you clarify.{0,120}(declin|avoid.{0,10}guess|without guess|no action|instead of guessing)|declin.{0,40}guess.{0,120}could you clarify/i,
 ];
+// A focused, applicable question — not just a bare "could you clarify?".
+const FOCUSED_QUESTION_PATTERN: RegExp =
+  /which [a-z']+|what [a-z']+( [a-z']+)?|whether/i;
+// The user must actually have left something ambiguous: a short fragment
+// rather than a fully-specified request the assistant punted on.
+const MAX_FRAGMENT_USER_CHARS = 160;
 
 const BLOCKED_EXTERNAL_HANDLING_PATTERNS: RegExp[] = [
   // Stopped before acting without authority + explained.
@@ -1110,9 +1123,43 @@ function lastAssistantText(messages: ChatMessage[] = []): string {
 export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean {
   const text = lastAssistantText(messages);
   if (!text) return false;
-  const namesBlock = BLOCKED_EXTERNAL_PATTERNS.some((re) => re.test(text));
-  if (!namesBlock) return false;
+  // Clarification blocks bind the handling to the SPECIFIC unresolved block
+  // (CodeRabbit PR review on #2983): the decline-to-guess must pair with a
+  // focused question, and the PRECEDING user request must be an ambiguous
+  // fragment rather than a fully-specified request the assistant punted on.
+  const clarificationHandled = matchesClarificationBlock(messages ?? [], text);
+  const nonClarificationBlock = BLOCKED_EXTERNAL_PATTERNS.some((re) => re.test(text));
+  if (!nonClarificationBlock && !clarificationHandled) return false;
+  // Non-clarification blocks require the stop/explain/fix/file handling
+  // evidence from the original patterns. Clarification blocks carry their own
+  // handling evidence (decline + focused question), so the generic patterns
+  // must not independently re-qualify a completed fallback that merely ends
+  // in "let me know".
+  if (clarificationHandled) return true;
   return BLOCKED_EXTERNAL_HANDLING_PATTERNS.some((re) => re.test(text));
+}
+
+/**
+ * True when the final assistant turn declines to guess AND asks a focused,
+ * applicable question, AND the preceding user request is an ambiguous
+ * fragment (short, no concrete noun: no quoted text, no URL, no named entity
+ * the assistant could have acted on). An unnecessary
+ * "I decline to guess; could you clarify?" after a fully-specified request
+ * ("Review my LinkedIn profile: <url>") scores normally — that punt is an
+ * agent failure, not an external block.
+ */
+function matchesClarificationBlock(messages: ChatMessage[], text: string): boolean {
+  if (!CLARIFICATION_BLOCK_PATTERNS.some((re) => re.test(text))) return false;
+  if (!FOCUSED_QUESTION_PATTERN.test(text)) return false;
+  const nonSystem = (messages || []).filter((m: any) => m.role !== 'system');
+  const prev: any = nonSystem.length >= 2 ? nonSystem[nonSystem.length - 2] : null;
+  const prevText =
+    prev && prev.role === 'user' && typeof prev.content === 'string' ? prev.content : '';
+  if (!prevText || prevText.length > MAX_FRAGMENT_USER_CHARS) return false;
+  // A fully-specified request carries something actionable — quoted content,
+  // a link, or a named entity the assistant could have used.
+  if (/["“'«]|https?:\/\/|www\.|\S+@\S+|[A-Z][a-z]+ [A-Z][a-z]+/.test(prevText)) return false;
+  return true;
 }
 
 /**

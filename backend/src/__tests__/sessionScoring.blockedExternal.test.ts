@@ -167,4 +167,27 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(attempt.score).not.toBeNull();
     expect(attempt.skipReason).toBeUndefined();
   });
+
+  it('a punt after a fully-specified request stays scorable (decline-to-guess without an ambiguous fragment is an agent failure)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Review my LinkedIn profile: https://linkedin.com/in/janedoe — give me the full breakdown.' },
+      { role: 'assistant', content: 'I decline to guess at which sections you want. Could you clarify which parts of your profile you want reviewed?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a genuine ambiguous fragment with a decline-to-guess and focused question is excluded (ENG-1296 shape)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'post it' },
+      { role: 'assistant', content: 'I decline to guess which channel you mean instead of guessing. Could you clarify which account should I post to?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
 });
