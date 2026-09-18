@@ -3398,9 +3398,10 @@ const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 // against different history would clobber whatever landed in between.
 const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
 
-// ENG-1552: delivery-state entries are small (~200 bytes), so 100 is ~20KB of the
-// row's 400KB budget — enough history to read back weeks of a daily schedule.
-const MAX_DELIVERY_LOG_ENTRIES = 100;
+// ENG-1552: an entry is ~200 bytes plus its recipient lists. 30 keeps the log to a few
+// KB of the row's 400KB budget (the ENG-1048 shed logic counts it but never trims it)
+// while still covering two weeks of a daily schedule at two entries per run.
+const MAX_DELIVERY_LOG_ENTRIES = 30;
 
 /**
  * ENG-1048: the run history this row can hold WITH one more result on the end, and

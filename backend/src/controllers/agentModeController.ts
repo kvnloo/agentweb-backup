@@ -5635,7 +5635,7 @@ export async function runScheduledChat(
           withheldRecipients: authz.withheld,
         });
       } else if (authz.authorized.length === 0) {
-        const withheldRunId: string = preGeneratedRunId || require('uuid').v4();
+        const withheldRunId: string = leaseRunId;
         const remediation = buildRecipientRemediation({
           code: 'no_authorized_recipients',
           scheduleId: schedule.scheduleId,
@@ -12083,7 +12083,9 @@ export const agentModeController = {
       // available via the dedicated GET /scheduled-chats/:id/test-history endpoint),
       // but first derive a compact runHealth summary (ENG-826 #4) so the list can
       // flag consecutive failures on the card without fetching full history.
-      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
+      // ENG-1552: deliveryLog and the sensitivity breadcrumb are internal bookkeeping —
+      // never part of what a customer (or Emma, via list_scheduled_chats) is shown.
+      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, deliveryLog, lastKnownSensitive, lastKnownSensitiveAt, ...rest }: any) => ({
         ...rest,
         // Whether an EXPLICIT grant exists — not whether this schedule will publish.
         // The two differ, and conflating them is the trap here: a legacy schedule
@@ -12483,7 +12485,17 @@ export const agentModeController = {
           : undefined,
         // ENG-1365: only when the request EXPLICITLY clears the model. A silent
         // request removes nothing, because it was never asked to.
-        llmModel === '' ? ['llmModel'] : undefined
+        // ENG-1552: a changed tool list or prompt makes the previous run's sensitivity
+        // breadcrumb stale — and since a flagged schedule's runs are held before they
+        // can re-derive it, only an edit can reset it. Otherwise "remove the
+        // cross-account tools" could never get the schedule running again.
+        [
+          ...(llmModel === '' ? ['llmModel'] : []),
+          ...((requiredFunctionCalls !== undefined || effectiveStartingMessage !== previousStartingMessage)
+            && (existingSchedule as any).lastKnownSensitive !== undefined
+            ? ['lastKnownSensitive', 'lastKnownSensitiveAt']
+            : []),
+        ]
       );
 
       res.json({
@@ -13379,6 +13391,7 @@ export const agentModeController = {
         functionCallMisses: record.functionCallMisses || [],
         executionTime: record.executionTime || 0,
         sessionId: record.sessionId,
+        runId: record.runId,
         attempt: record.attempt || 1,
         createdAt: record.createdAt || new Date().toISOString(),
       };

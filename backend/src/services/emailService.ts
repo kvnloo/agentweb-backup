@@ -2021,9 +2021,10 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   },
 
   /**
-   * ENG-1552: send a scheduled report and record what actually happened.
-   * `delivered` is written only for a send the provider accepted; a swallowed
-   * failure or a non-prod suppression stays at `delivery_attempted` with the reason.
+   * ENG-1552: send a scheduled report and record what actually happened — ONE write,
+   * after the send (each append rewrites the whole schedule row, so it is kept to the
+   * minimum). `delivered` only for a send the provider accepted; a swallowed failure or
+   * a non-prod suppression is `delivery_attempted` with the reason.
    */
   async deliverScheduledReport(
     scheduleId: string,
@@ -2039,17 +2040,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       authorizedRecipients: recipients,
       ...(withheld.length > 0 ? { withheldRecipients: withheld } : {}),
     };
-    await recordReportDeliveryState(scheduleId, { ...base, state: 'delivery_attempted' });
     const outcome = await this.sendEmail(recipients, subject, text, html);
-    if (outcome === 'sent') {
-      await recordReportDeliveryState(scheduleId, { ...base, state: 'delivered' });
-    } else if (outcome === 'failed' || outcome === 'suppressed') {
-      await recordReportDeliveryState(scheduleId, {
-        ...base,
-        state: 'delivery_attempted',
-        reason: outcome === 'failed' ? 'provider_error' : 'suppressed_nonprod',
-      });
-    }
+    await recordReportDeliveryState(scheduleId, outcome === 'sent'
+      ? { ...base, state: 'delivered' }
+      : {
+          ...base,
+          state: 'delivery_attempted',
+          ...(outcome === 'failed' ? { reason: 'provider_error' as const } : {}),
+          ...(outcome === 'suppressed' ? { reason: 'suppressed_nonprod' as const } : {}),
+        });
   },
 
   /**
@@ -2310,12 +2309,15 @@ Sent via AgentWeb: ${customerFrontendUrl}
         )
       );
       // ENG-1552: a run with no content is shown as such, not as a blank preview
-      // (a missing actualResponse also used to throw on `.length` below).
-      todaysResults = todaysResults.map((r) =>
-        r && !(typeof r.actualResponse === 'string' && r.actualResponse.trim())
-          ? { ...r, actualResponse: EMPTY_RUN_DIGEST_PLACEHOLDER }
-          : r
-      );
+      // (a missing actualResponse also used to throw on `.length` below). Customer-
+      // visible, so enforcement-only like everything else ENG-1552 changes.
+      if (deliveryEnforcementEnabled()) {
+        todaysResults = todaysResults.map((r) =>
+          r && !(typeof r.actualResponse === 'string' && r.actualResponse.trim())
+            ? { ...r, actualResponse: EMPTY_RUN_DIGEST_PLACEHOLDER }
+            : r
+        );
+      }
 
       const displayDate = customDate || new Date();
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
