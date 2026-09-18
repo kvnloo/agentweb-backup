@@ -15,15 +15,25 @@ import path from "path";
 const HELPER = path.join(__dirname, "helpers", "runSmokeDiscovery.js");
 const SCOPE = 'form[data-agentweb-smoke-form="1"] ';
 
+// Mirrors SmokeFields. Kept in sync by the typecheck in this file's own CI note: the build
+// config excludes __tests__, so nothing else catches drift here.
 type Discovered = {
   scope: string;
   fields: { selector: string; hint: string; kind: string }[];
   selects: { selector: string; options: string[] }[];
-  checkables: { selector: string; type: string; name: string | null; required: boolean; viaLabel: boolean }[];
+  checkables: {
+    selector: string;
+    type: string;
+    name: string | null;
+    required: boolean;
+    viaLabel: boolean;
+    checked: boolean;
+  }[];
   submitSelector: string | null;
   disclosureTriggers: string[];
   skippedRequired: number;
   noFormOnPage: boolean;
+  authFormOnly: boolean;
 };
 
 /** Cases default to discoverSmokeFields; `fn` selects another exported page-side function. */
@@ -170,6 +180,12 @@ const CASES: Record<string, string> = {
       <button type="button" aria-expanded="false" aria-controls="pb">B</button>
       <div id="pb"><input type="checkbox" name="b"></div>
     </form>`,
+  anchorTrigger: `
+    <form>
+      <input type="email" name="email" required>
+      <a href="#" role="button" aria-expanded="false" aria-controls="ap">More</a>
+      <div id="ap"><input type="checkbox" name="opt"></div>
+    </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -216,13 +232,18 @@ let out: Record<
     markedFormIds?: string[];
     submitted?: string[];
     selectorMatches?: Record<string, number | string>;
+    secondPass?: {
+      triggers: string[];
+      pass1StillResolves: { selector: string; matches: number; sameElement: boolean }[];
+    };
     error?: string;
   }
 > = {};
 
 beforeAll(() => {
-  const cases = [
+  const cases: any[] = [
     ...Object.entries(CASES).map(([name, html]) => ({ name, html })),
+    { name: "twoIdlessTriggersRoundTrip", html: CASES.twoIdlessTriggers, twoPass: true },
     ...Object.entries(SUBMIT_CASES).map(([name, html]) => ({ name, html, fn: "submitMarkedForm" })),
   ];
   const child = spawnSync(process.execPath, [HELPER], {
@@ -473,6 +494,36 @@ describe("discoverSmokeFields", () => {
       expect(out.twoIdlessTriggers.selectorMatches![t]).toBe(1);
     }
     expect(new Set(triggers).size).toBe(2);
+  });
+
+  it("a disclosure selector still addresses the SAME element after re-discovery", () => {
+    // The caller opens a trigger with a pass-1 selector and closes it with that same selector
+    // after re-discovery. If the marker is swept, the close click either hits nothing (the
+    // panel stays open over the submit button) or the mark is reissued to a different
+    // collapsed trigger, which the close pass then OPENS immediately before submit.
+    const sp = out.twoIdlessTriggersRoundTrip.secondPass!;
+    expect(sp).toBeDefined();
+    for (const r of sp.pass1StillResolves) {
+      expect({ selector: r.selector, matches: r.matches, sameElement: r.sameElement }).toEqual({
+        selector: r.selector,
+        matches: 1,
+        sameElement: true,
+      });
+    }
+  });
+
+  it("an authentication-only page yields nothing fillable, rather than driving the login box", () => {
+    // Skipping the form but then falling through to whole-document discovery picked the
+    // login input straight back up — unscoped, so the blast radius grew.
+    const r = got("onlyLoginForm");
+    expect(r.fields).toEqual([]);
+    expect(r.checkables).toEqual([]);
+    expect(r.authFormOnly).toBe(true);
+    expect(r.noFormOnPage).toBe(true);
+  });
+
+  it("an anchor disclosure with no real href is still opened", () => {
+    expect(got("anchorTrigger").disclosureTriggers).toHaveLength(1);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

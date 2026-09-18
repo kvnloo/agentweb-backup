@@ -125,6 +125,8 @@ export type SmokeFields = {
   skippedRequired: number;
   /** True when the page has no <form> and no fillable control at all. */
   noFormOnPage: boolean;
+  /** Every form on the page was an authentication form; there is no lead form to drive. */
+  authFormOnly: boolean;
 };
 
 type SmokeTestPage = {
@@ -160,6 +162,7 @@ const SUBMIT_TIMEOUT_MS = 10_000;
 export function discoverSmokeFields(): SmokeFields {
   const MARK = "data-agentweb-smoke-form";
   const CLICK_MARK = "data-agentweb-smoke-click";
+  const DISCLOSURE_MARK = "data-agentweb-smoke-disclosure";
   const SCOPE_PREFIX = `form[${MARK}="1"] `;
   // Honeypot names, anchored and exact. An earlier prefix-match version of this swallowed
   // `confirm_email`, `honeymoon_destination` and `hp_model` — all legitimate required
@@ -265,9 +268,18 @@ export function discoverSmokeFields(): SmokeFields {
 
   // Clear every marker this function stamps, so a second discovery pass cannot inherit
   // stale targets from the first.
-  for (const stale of all(document, `[${CLICK_MARK}], [data-agentweb-smoke-disclosure]`)) {
-    stale.removeAttribute(CLICK_MARK);
-    stale.removeAttribute("data-agentweb-smoke-disclosure");
+  // Sweep CLICK_MARK only. Its values restart at 0 each pass and page.click is non-strict,
+  // so a surviving pass-1 mark would alias onto the wrong element.
+  for (const stale of all(document, `[${CLICK_MARK}]`)) stale.removeAttribute(CLICK_MARK);
+  // DISCLOSURE_MARK must SURVIVE across passes: the caller opens a trigger using the pass-1
+  // selector and closes it with that same selector after re-discovery. Clearing it stranded
+  // the close click — the trigger is no longer in `[aria-expanded="false"]` once opened, so
+  // pass 2 could not re-stamp it, and the mark could be reissued to a different collapsed
+  // trigger, which the close pass would then OPEN right before submit.
+  let nextDisclosureMark = 0;
+  for (const marked of all(document, `[${DISCLOSURE_MARK}]`)) {
+    const n = Number(marked.getAttribute(DISCLOSURE_MARK));
+    if (Number.isFinite(n) && n >= nextDisclosureMark) nextDisclosureMark = n + 1;
   }
 
   const forms = all(document, "form") as HTMLFormElement[];
@@ -302,12 +314,16 @@ export function discoverSmokeFields(): SmokeFields {
 
   let form: HTMLFormElement | null = null;
   let bestScore = -Infinity;
+  let rejectedAuthForm = false;
   for (const candidate of forms) {
     // A password field means authentication, never lead capture. This has to skip the
     // candidate outright — scoring it -1000 still won when it was the only form on the page,
     // and the smoke test then typed a synthetic address into a login box and clicked submit
     // against a real auth endpoint on every deploy.
-    if (candidate.querySelector('input[type="password"]')) continue;
+    if (candidate.querySelector('input[type="password"]')) {
+      rejectedAuthForm = true;
+      continue;
+    }
     const score = scoreOf(candidate);
     if (score > bestScore) {
       bestScore = score;
@@ -326,9 +342,15 @@ export function discoverSmokeFields(): SmokeFields {
     'input[type="number"], input[type="search"], input[type="date"], input:not([type]), textarea';
   const matches = (el: Element, sel: string): boolean => !!el.matches && el.matches(sel);
 
+  // Every form on the page was rejected as an authentication form. Falling through to
+  // document-wide discovery would type a synthetic address into the login box and click its
+  // submit against a real auth endpoint — the exact behaviour the rejection exists to stop.
+  const authFormOnly = form === null && rejectedAuthForm;
   const controls: Element[] = form
     ? (controlsOf(form) as Element[])
-    : all(document, "input, select, textarea");
+    : authFormOnly
+      ? []
+      : all(document, "input, select, textarea");
   // Index space for controls with neither id nor name. `>> nth=` resolves against the
   // scoped set, so the index must be taken over that same set and in the same order.
   const addressableScoped = form ? all(form, "input, textarea") : all(document, "input, textarea");
@@ -422,11 +444,9 @@ export function discoverSmokeFields(): SmokeFields {
   // nth=i` selector no longer matches the same element on close (it can match a different
   // collapsed trigger or fail outright). Stamp a marker attribute at discovery time and
   // select on that instead.
-  const DISCLOSURE_MARK = "data-agentweb-smoke-disclosure";
   const disclosureTriggers: string[] = [];
   if (form) {
     const triggers = all(form, '[aria-expanded="false"]');
-    let marked = 0;
     triggers.forEach((t) => {
       if (!hasBox(t)) return;
       // A <button> with no type inside a form defaults to type="submit". Clicking one here
@@ -434,7 +454,13 @@ export function discoverSmokeFields(): SmokeFields {
       // listener even exists.
       const tag = t.tagName.toUpperCase();
       if (tag === "BUTTON" && ((t as HTMLButtonElement).type || "submit") !== "button") return;
-      if (tag === "INPUT" || tag === "A") return;
+      // An <input> is never a disclosure, and an <a href> click navigates away and destroys
+      // the page. An anchor with no real href is a common hand-written disclosure — keep it.
+      if (tag === "INPUT") return;
+      if (tag === "A") {
+        const href = t.getAttribute("href");
+        if (href && href !== "#") return;
+      }
       // Only open a disclosure that actually holds a checkbox/radio group. aria-expanded
       // ALSO marks Radix Select triggers ("Select your issue"), and opening one of those
       // puts a listbox overlay over the page that swallows every later click, including the
@@ -446,7 +472,10 @@ export function discoverSmokeFields(): SmokeFields {
       if (t.id) {
         disclosureTriggers.push(`${scope}[id="${esc(t.id)}"]`);
       } else {
-        const mark = String(marked++);
+        // Reuse an existing mark so a selector handed out on a previous pass keeps pointing
+        // at this same element.
+        const existing = t.getAttribute(DISCLOSURE_MARK);
+        const mark = existing !== null ? existing : String(nextDisclosureMark++);
         t.setAttribute(DISCLOSURE_MARK, mark);
         disclosureTriggers.push(`${scope}[${DISCLOSURE_MARK}="${mark}"]`);
       }
@@ -487,7 +516,8 @@ export function discoverSmokeFields(): SmokeFields {
     const checkable = matches(el, 'input[type="checkbox"], input[type="radio"]');
     return !usable(el, checkable);
   }).length;
-  const noFormOnPage = forms.length === 0 && fields.length === 0 && checkables.length === 0;
+  const noFormOnPage =
+    (forms.length === 0 || authFormOnly) && fields.length === 0 && checkables.length === 0;
 
   return {
     scope,
@@ -498,6 +528,7 @@ export function discoverSmokeFields(): SmokeFields {
     disclosureTriggers,
     skippedRequired,
     noFormOnPage,
+    authFormOnly,
   };
 }
 /**
@@ -562,6 +593,8 @@ export type FillOutcome = {
   emailFilled: boolean;
   filled: number;
   attempted: number;
+  /** Controls that were already checked and deliberately left alone. */
+  alreadySatisfied: number;
   /** Selector prefix for the form that was driven ("" when the page has no form). */
   scope: string;
   /** Submit control resolved page-side, or null when discovery could not find one. */
@@ -570,6 +603,8 @@ export type FillOutcome = {
   skippedRequired: number;
   /** The page has no form and nothing fillable — there is no capture path to test. */
   noFormOnPage: boolean;
+  /** Every form on the page was an authentication form; there is no lead form to drive. */
+  authFormOnly: boolean;
 };
 
 /**
@@ -640,10 +675,12 @@ async function fillAllRequiredFields(
       emailFilled: false,
       filled: 0,
       attempted: 0,
+      alreadySatisfied: 0,
       scope: "",
       submitSelector: null,
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     };
   }
 
@@ -651,6 +688,7 @@ async function fillAllRequiredFields(
   const selects = discovered.selects || [];
   const checkables = discovered.checkables || [];
 
+  let alreadySatisfied = 0;
   let lastTextSelector: string | null = null;
   let emailFilled = false;
   let filled = 0;
@@ -697,7 +735,7 @@ async function fillAllRequiredFields(
     // Already satisfied — leave it alone. A pre-checked required consent box is common, and
     // toggling it off is a false FAIL manufactured out of a working page.
     if (control.checked) {
-      filled++;
+      alreadySatisfied++;
       continue;
     }
     try {
@@ -707,7 +745,12 @@ async function fillAllRequiredFields(
       // stays only as a fallback for widgets check() cannot resolve.
       await browserPage.check(control.selector, { timeout: FIELD_TIMEOUT_MS });
       filled++;
-    } catch {
+    } catch (err: any) {
+      // check() CLICKS and then re-reads; "did not change its state" means the click landed
+      // but the control is controlled/deferred. Clicking again would toggle it back off.
+      // Only retry when check() could not treat the target as a checkable at all.
+      const message = String(err?.message || "");
+      if (!/Not a checkbox or radio button|Element is not an <input>/i.test(message)) continue;
       try {
         await browserPage.click(control.selector, { timeout: FIELD_TIMEOUT_MS });
         filled++;
@@ -736,10 +779,12 @@ async function fillAllRequiredFields(
     emailFilled,
     filled,
     attempted,
+    alreadySatisfied,
     scope: discovered.scope || "",
     submitSelector: discovered.submitSelector ?? null,
     skippedRequired: discovered.skippedRequired ?? 0,
     noFormOnPage: !!discovered.noFormOnPage,
+    authFormOnly: !!discovered.authFormOnly,
   };
 }
 
@@ -778,6 +823,7 @@ async function runGenerationSmokeTestNow(
   let diagnostics = "no submission attempted";
   let handoffId: string | null = null;
   let noFormOnPage = false;
+  let authFormOnly = false;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
   try {
@@ -1042,8 +1088,12 @@ async function runGenerationSmokeTestNow(
     // string, which is what made the 2026-09-18 false-negatives so hard to diagnose:
     // it cannot distinguish "never submitted" from "submitted and the lead was lost".
     noFormOnPage = fillOutcome.noFormOnPage;
+    authFormOnly = fillOutcome.authFormOnly;
     diagnostics = [
       `filled ${fillOutcome.filled}/${fillOutcome.attempted} field(s)`,
+      ...(fillOutcome.alreadySatisfied > 0
+        ? [`${fillOutcome.alreadySatisfied} already satisfied`]
+        : []),
       ...(fillOutcome.skippedRequired > 0
         ? [`${fillOutcome.skippedRequired} required control(s) unreachable`]
         : []),
@@ -1084,7 +1134,9 @@ async function runGenerationSmokeTestNow(
     const reason =
       error ||
       (!leadCaptured
-        ? noFormOnPage
+        ? authFormOnly
+          ? "page's only form is an authentication form (has a password field) — there is no lead form to submit"
+          : noFormOnPage
           ? // Blaming the CRM for a page that has no form at all sends whoever reads the
             // alert looking for a capture bug that cannot exist. Say what is actually true.
             "page has no lead form — nothing to submit, so no lead can ever be captured"

@@ -40,7 +40,7 @@ function extractFunctionJs(fnName) {
   }).outputText;
 }
 
-function runCase(fnJs, html, fnName) {
+function runCase(fnJs, html, fnName, twoPass) {
   const dom = new JSDOM(`<!doctype html><html><body>${html}</body></html>`, {
     runScripts: "outside-only",
   });
@@ -93,10 +93,38 @@ function runCase(fnJs, html, fnName) {
     if (result.submitSelector) selectorMatches[result.submitSelector] = resolveCount(result.submitSelector);
   }
 
+  // Two-pass round trip. The caller opens a disclosure with a pass-1 selector and closes it
+  // with that SAME selector after re-discovery, so a marker that does not survive the second
+  // pass strands the close click — or worse, gets reissued to a different collapsed trigger
+  // that the close pass then opens. Simulate the open (flip aria-expanded) and re-run.
+  let secondPass = null;
+  if (twoPass && result && Array.isArray(result.disclosureTriggers)) {
+    const before = result.disclosureTriggers.map((sel) => {
+      let nodes = [];
+      try { nodes = Array.prototype.slice.call(win.document.querySelectorAll(sel)); } catch {}
+      return { selector: sel, el: nodes[0] || null };
+    });
+    // "open" the first trigger exactly as a real click would
+    if (before[0] && before[0].el) before[0].el.setAttribute("aria-expanded", "true");
+    const again = win.eval(`${fnName}()`);
+    secondPass = {
+      triggers: JSON.parse(JSON.stringify(again.disclosureTriggers || [])),
+      pass1StillResolves: before.map((b) => {
+        let nodes = [];
+        try { nodes = Array.prototype.slice.call(win.document.querySelectorAll(b.selector)); } catch {}
+        return {
+          selector: b.selector,
+          matches: nodes.length,
+          sameElement: nodes.length === 1 && nodes[0] === b.el,
+        };
+      }),
+    };
+  }
+
   const markedFormIds = Array.prototype.slice
     .call(win.document.querySelectorAll("form[data-agentweb-smoke-form]"))
     .map((form) => form.id || "(unnamed)");
-  return { result: JSON.parse(JSON.stringify(result)), markedFormIds, submitted, selectorMatches };
+  return { result: JSON.parse(JSON.stringify(result)), markedFormIds, submitted, selectorMatches, secondPass };
 }
 
 function main() {
@@ -107,7 +135,7 @@ function main() {
     const fnName = testCase.fn || DEFAULT_FN;
     try {
       if (!cache[fnName]) cache[fnName] = extractFunctionJs(fnName);
-      results[testCase.name] = runCase(cache[fnName], testCase.html, fnName);
+      results[testCase.name] = runCase(cache[fnName], testCase.html, fnName, testCase.twoPass);
     } catch (err) {
       results[testCase.name] = { error: err && err.message ? err.message : String(err) };
     }

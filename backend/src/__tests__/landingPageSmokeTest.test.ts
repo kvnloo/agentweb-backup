@@ -56,6 +56,7 @@ const SINGLE_EMAIL_FIELD = {
   disclosureTriggers: [],
   skippedRequired: 0,
   noFormOnPage: false,
+  authFormOnly: false,
 };
 
 const mockCdpSession = { send: jest.fn().mockResolvedValue(undefined) };
@@ -364,6 +365,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
 
@@ -443,6 +445,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
@@ -477,6 +480,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 500 });
@@ -504,6 +508,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://api.segment.io/v1/track", status: 200 });
@@ -528,6 +533,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -552,6 +558,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -576,6 +583,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -624,6 +632,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => emit());
     (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
@@ -749,6 +758,7 @@ describe("runGenerationSmokeTest", () => {
         disclosureTriggers: [],
         skippedRequired: 0,
         noFormOnPage: false,
+        authFormOnly: false,
         checkables: [
           { selector: '[data-agentweb-smoke-click="0"]', type: "checkbox", name: "symptoms",
             required: true, viaLabel: true, checked: false },
@@ -796,7 +806,10 @@ describe("runGenerationSmokeTest", () => {
         { selector: "#odd", type: "checkbox", name: "x", required: true, viaLabel: true, checked: false },
       ],
     });
-    (mockPage.check as jest.Mock).mockRejectedValueOnce(new Error("not a checkbox"));
+    // Playwright's own wording when the target cannot be treated as a checkable at all.
+    (mockPage.check as jest.Mock).mockRejectedValueOnce(
+      new Error("Not a checkbox or radio button")
+    );
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
@@ -830,6 +843,7 @@ describe("runGenerationSmokeTest", () => {
       disclosureTriggers: [],
       skippedRequired: 0,
       noFormOnPage: false,
+      authFormOnly: false,
     });
     mockPage.click.mockImplementationOnce(async () => {
       emitResponse({ url: "https://campaign.waterheater.app/api/x", status: 200 });
@@ -859,6 +873,38 @@ describe("runGenerationSmokeTest", () => {
     const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
     expect(reason).toContain("no lead form");
     expect(reason).not.toContain("CRM within the timeout");
+  });
+
+  it("DIAGNOSIS: an auth-only page says so, instead of blaming the CRM", async () => {
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      scope: "", fields: [], selects: [], checkables: [], submitSelector: null,
+      disclosureTriggers: [], skippedRequired: 0, noFormOnPage: true, authFormOnly: true,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
+    expect(reason).toContain("authentication form");
+    expect(reason).not.toContain("CRM within the timeout");
+  });
+
+  it("CHECKABLES: a deferred-state control is not clicked again after check() already toggled it", async () => {
+    // check() clicks and re-reads; "did not change its state" means the click LANDED but the
+    // control is controlled/deferred. Retrying with click() would toggle it back off.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      checkables: [
+        { selector: "#deferred", type: "checkbox", name: "c", required: true, viaLabel: false, checked: false },
+      ],
+    });
+    (mockPage.check as jest.Mock).mockRejectedValueOnce(
+      new Error("Clicking the checkbox did not change its state")
+    );
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect((mockPage.click as jest.Mock).mock.calls.map((c) => c[0])).not.toContain("#deferred");
   });
 
   it("DIAGNOSIS: unreachable required controls are named, since they are why submit blocks", async () => {
