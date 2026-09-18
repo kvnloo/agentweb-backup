@@ -148,7 +148,9 @@ emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
     name: 'ask_user_question',
-    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. the immutable campaign objective, a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+
+NEVER ask about the Meta campaign objective here (or via present_question_deck) — call_meta_marketing_api's own CAMPAIGN CREATE call already has a hardened, automatic confirmation gate for it (see that tool's description). Asking about it yourself first only produces a second, uncorrelated question the user answers twice — attempt the CREATE call directly instead and let its own gate ask if it's genuinely unsettled.
 
 Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
 
@@ -160,7 +162,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
     inputSchema: {
       type: 'object',
       properties: {
-        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        question: { type: 'string', description: 'The question to ask, e.g. "Which special ad category applies to this campaign?" Never a Meta campaign objective question — see this tool\'s own description.' },
         intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
         options: {
           type: 'array',
@@ -180,7 +182,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
             required: ['label', 'consequence'],
           },
         },
-        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. a Special Ad Category selection). Immutable questions never auto-resolve in headless runs. Not for Meta objective — that has its own dedicated gate, never asked via this tool.' },
         allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
         kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
       },
@@ -258,7 +260,9 @@ emmaToolRegistry.register({
   name: 'present_question_deck',
   definition: {
     name: 'present_question_deck',
-    description: `Ask the user 1-6 structured, blocking multiple-choice questions AT ONCE, front-loaded into a single swipeable deck the user fills and submits together — instead of one ask_user_question call per question (which is one-per-turn by design and forces N serial round-trips). Use this whenever you have MORE THAN ONE predictable planning question determinable right now (e.g. objective + budget + audience) — front-load everything you can into ONE call rather than spacing them across turns. A single genuine question is also valid (a "deck of one") when that's all you have right now.
+    description: `Ask the user 1-6 structured, blocking multiple-choice questions AT ONCE, front-loaded into a single swipeable deck the user fills and submits together — instead of one ask_user_question call per question (which is one-per-turn by design and forces N serial round-trips). Use this whenever you have MORE THAN ONE predictable planning question determinable right now (e.g. budget + audience + creative direction) — front-load everything you can into ONE call rather than spacing them across turns. A single genuine question is also valid (a "deck of one") when that's all you have right now.
+
+NEVER include a Meta campaign objective question here (or via ask_user_question) — call_meta_marketing_api's own CAMPAIGN CREATE call already has a hardened, automatic confirmation gate for it, uncorrelated with anything asked here. Asking about it yourself first only produces a second question the user answers twice; leave it out of this deck and attempt the CREATE call directly once everything else is settled.
 
 Each question needs 2-4 options, each with a one-line consequence. EXACTLY ONE option per question must be marked recommended:true with a one-line why grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d"). Optionally set allow_emma_decide:true on a question to offer a "Let Emma decide" delegation button for THAT question specifically (takes its recommended option).
 
@@ -1080,12 +1084,16 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
   by guessing an objective or retrying.
 
   If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
-  build anything: you have NO way to render an interactive card yourself — do not fabricate one out of HTML,
-  markdown tables, or styled text in your reply; a hand-written "card" you write is not real and answering
-  it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/targeting
-  params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't settled, the
-  call itself returns the real blocking question, which the platform renders as an actual clickable card.
-  Do not stall in prose waiting to "ask first"; attempting the call is how the real card appears.
+  build anything: do NOT use ask_user_question or present_question_deck to ask about the objective
+  yourself — both tools explicitly exclude it for this exact reason, and doing so anyway produces a
+  SECOND, uncorrelated question on top of this gate's own, meaning the user answers the same question
+  twice. You also have no way to render an interactive card any other way — do not fabricate one out of
+  HTML, markdown tables, or styled text in your reply; a hand-written "card" you write is not real and
+  answering it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/
+  targeting params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't
+  settled, the call itself returns the real blocking question, which the platform renders as an actual
+  clickable card. Do not stall in prose waiting to "ask first"; attempting the call is how the real card
+  appears.
 
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE

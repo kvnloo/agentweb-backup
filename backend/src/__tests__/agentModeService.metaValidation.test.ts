@@ -319,10 +319,17 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
       expect(result.success).toBe(true); // halting-card responses use success:true (see ask_user_question tool)
       expect(result.awaitingUserConfirmation).toBe(true);
-      expect(result.type).toBe('ask_user_question');
-      expect(result.recommendedOptionId).toBe('leads'); // OUTCOME_LEADS default, no account preference set
+      expect(result.type).toBe('ask_user_question'); // legacy tag kept for calling-convention continuity (ENG-1635/1644)
+      // ENG-1635/1644: the gate no longer writes pendingUserQuestion synchronously or
+      // returns a top-level recommendedOptionId — it returns a bare halt marker
+      // (questionDeckPayload) built through the same deck-of-one mechanism
+      // present_question_deck uses; see agentModeService.metaObjectiveGate.test.ts's
+      // dedicated coverage of this shape for the full picture.
+      expect(result.questionDeckPayload).toHaveLength(1);
+      const leadsOption = result.questionDeckPayload[0].options.find((o: any) => o.id === 'leads');
+      expect(leadsOption?.recommended).toBe(true); // OUTCOME_LEADS default, no account preference set
       expect(metaService.createCampaign).not.toHaveBeenCalled();
-      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
+      expect(chatbotDb.updateSessionAskUserQuestion).not.toHaveBeenCalled(); // no synchronous DB write inside the gate anymore
     });
 
     it('ALLOWS a CAMPAIGN CREATE whose objective was already answered via ask_user_question (kind meta_objective)', async () => {
@@ -729,7 +736,11 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(typeof result.confirmationPrompt).toBe('string');
       expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
       expect(result.confirmationPrompt).toContain('Maintenance Campaign');
-      expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
+      // ENG-1635/1644 gap 5: must ask for approval through a review card, never invite a
+      // typed "confirm"/"yes" reply — that flag is fully inert now (see the sibling
+      // `message` field's own "Do NOT re-call... with params.confirm=true" instruction).
+      expect(result.confirmationPrompt.toLowerCase()).toContain('approval');
+      expect(result.confirmationPrompt.toLowerCase()).not.toContain('reply "yes"');
     });
 
     it('does NOT set awaitingUserConfirmation on a GRANTED write (gap 5: confirm=true itself grants nothing — the top-level beforeEach stub does)', async () => {
@@ -839,7 +850,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).toContain('AD: pause Prospecting Ad');
       expect(out).toContain('AD_SET: pause Prospecting Ad Set');
       expect(out).toContain('CAMPAIGN: pause Prospecting Campaign');
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
@@ -861,7 +872,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).not.toContain('FULL PROMPT 1');
       expect(out).not.toContain('FULL PROMPT 2');
       // Footer appears exactly once.
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {

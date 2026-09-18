@@ -20767,10 +20767,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (items.length === 1) return items[0].prompt;
     // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
     // each target listed once, one footer — instead of repeating the full wrapper N times.
+    // ENG-1635/1644 gap 5: same fix as the single-item confirmationPrompt above — never
+    // invite a typed "yes"/"confirm" reply, that flag is fully inert now. This whole
+    // function is a fallback-only path (see its own doc comment / the caller's
+    // fall-through contract); the normal path deck-routes every write instead.
     return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
       `please review each target before I proceed:\n\n` +
       items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
-      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
+      `\n\nThis needs your explicit approval through a review card, not a typed reply — ` +
+      `if no card appears here, refresh the page or ask again and I'll represent it as one.`;
   }
 
   /**
@@ -21558,11 +21563,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         requiresConfirmation: true,
         awaitingUserConfirmation: true,
         summary,
+        // ENG-1635/1644 gap 5: never invite a typed "yes"/"confirm" reply — that flag is
+        // fully inert now (see the `message` field below and callMetaMarketingApi's gate).
+        // This exact field is only ever surfaced to the user when deck-routing itself
+        // failed (a malformed deck, or a lost one-live-slot race — see
+        // buildApprovalDeckForIteration's fallback contract) — the normal path never
+        // reaches it, this write instead becomes a real approval-deck card.
         confirmationPrompt:
           `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
           `please check it's the right target before I proceed:\n\n${summary}\n\n` +
-          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
-          `(for example, a different campaign, ad set, or asset).`,
+          `This needs your explicit approval through a review card, not a typed reply — ` +
+          `if no card appears here, refresh the page or ask again and I'll represent it as one.`,
         // Per-item body (no intro/footer) used when several writes are batched in one turn.
         confirmationDetail: summary,
         message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
