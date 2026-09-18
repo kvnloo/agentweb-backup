@@ -44,3 +44,30 @@ describe('voiceProfileHooks', () => {
       .toMatch(/Author Voice Card/);
   });
 });
+
+describe('augmentPublishToolDefinitions', () => {
+  it('injects voice card into post tool schema', async () => {
+    const { augmentPublishToolDefinitions } = await import('../services/voiceProfileHooks');
+    const tools = [{
+      type: 'function',
+      function: {
+        name: 'post_on_connected_account',
+        description: 'Post content',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: 'Body text' },
+          },
+        },
+      },
+    }];
+    const profile = {
+      observations: [],
+      voiceCard: 'Direct tone. Short hooks.',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const augmented = augmentPublishToolDefinitions(tools, profile);
+    expect(augmented[0].function.description).toMatch(/Voice Card/);
+    expect(augmented[0].function.parameters.properties.content.description).toMatch(/Direct tone/);
+  });
+});

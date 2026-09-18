@@ -1463,6 +1463,34 @@ export function areNearDuplicateWorkPlanTitles(a: unknown, b: unknown): boolean 
   return diffCount === 1;
 }
 
+
+async function recordToolReliabilityEvent(params: {
+  toolName: string;
+  result: unknown;
+  startedAt: number;
+  sessionId: string;
+  userId: string;
+  preparedArgs: any;
+  extraContext?: Record<string, any>;
+}): Promise<void> {
+  try {
+    const { recordReliabilityEventSafe } = await import('./reliabilityEventSink');
+    const { classifyToolResultOutcome, summarizeToolError } = await import('./reliabilityEvent');
+    recordReliabilityEventSafe({
+      tool: params.toolName,
+      outcome: classifyToolResultOutcome(params.result),
+      latencyMs: Date.now() - params.startedAt,
+      sessionId: params.sessionId,
+      userId: params.userId,
+      errorSummary: summarizeToolError(params.result),
+      platform: typeof params.preparedArgs?.platform === 'string' ? params.preparedArgs.platform : undefined,
+      userEdit: params.extraContext?.voiceCapture?.draft ? true : undefined,
+    });
+  } catch (reliabilityErr) {
+    console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
+  }
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
@@ -4112,6 +4140,15 @@ export class AgentModeService {
 
           const skillFilter = isLegacySession ? undefined : allowedToolNames;
           filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+          if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+            try {
+              const { augmentPublishToolDefinitions } = await import('./voiceProfileHooks');
+              filteredToolsCache = augmentPublishToolDefinitions(filteredToolsCache, currentSession.sessionVoiceProfile);
+            } catch (voiceToolErr) {
+              console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
+            }
+          }
 
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
           if (excludeTools?.length && filteredToolsCache) {
@@ -8929,6 +8966,8 @@ export class AgentModeService {
     }
   }
 
+
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     await enforceEvaluationTool(userId, toolName, extraContext);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
@@ -8987,6 +9026,7 @@ export class AgentModeService {
       return this.getMockToolResult(toolName, preparedArgs);
     }
 
+    const reliabilityStartedAt = Date.now();
     try {
       // ENG-475: bracket browser-automation tools with deterministic cookie
       // persistence. runTool drives the existing save/load_browser_cookies tools;
@@ -9005,16 +9045,35 @@ export class AgentModeService {
         if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
+        await recordToolReliabilityEvent({
+          toolName,
+          result,
+          startedAt: reliabilityStartedAt,
+          sessionId,
+          userId,
+          preparedArgs,
+          extraContext,
+        });
         return result;
       }
 
-      return await this.toolRegistry.execute(toolName, preparedArgs, {
+      const toolResult = await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
         service: this,
         ...extraContext,
       });
+      await recordToolReliabilityEvent({
+        toolName,
+        result: toolResult,
+        startedAt: reliabilityStartedAt,
+        sessionId,
+        userId,
+        preparedArgs,
+        extraContext,
+      });
+      return toolResult;
 
       // // If result is already MCP-wrapped (from external MCP tools via mcpClientService),
       // // pass it through unchanged. External tools return { content: string, raw: { content: [...] } }
@@ -9032,6 +9091,22 @@ export class AgentModeService {
       //   }
       // };
     } catch (error) {
+      try {
+        const { recordReliabilityEventSafe } = await import('./reliabilityEventSink');
+        const { classifyToolResultOutcome, summarizeToolError } = await import('./reliabilityEvent');
+        recordReliabilityEventSafe({
+          tool: toolName,
+          outcome: classifyToolResultOutcome(undefined, error),
+          latencyMs: Date.now() - reliabilityStartedAt,
+          sessionId,
+          userId,
+          errorSummary: summarizeToolError(undefined, error),
+          platform: typeof (preparedArgs as any)?.platform === 'string' ? (preparedArgs as any).platform : undefined,
+          userEdit: extraContext?.voiceCapture?.draft ? true : undefined,
+        });
+      } catch (reliabilityErr) {
+        console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
+      }
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
     }
