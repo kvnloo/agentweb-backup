@@ -171,3 +171,122 @@ export async function resolveAuthorizedReportRecipients(params: {
 
   return { authorized, withheld, restricted: true };
 }
+
+// ── Delivery state + remediation (ENG-1552) ─────────────────────────────────
+//
+// The guard above decides WHO may receive a sensitive report, but only at send
+// time and without leaving a trace. What follows is the state around it: each
+// run's delivery outcome is persisted on the schedule as a `deliveryLog`, and a
+// schedule that cannot deliver gets one remediation object naming the fix.
+
+export type ReportDeliveryState =
+  | 'generated'
+  | 'withheld'
+  | 'delivery_attempted'
+  | 'delivered'
+  | 'recipient_confirmed';
+
+export type ReportDeliveryReason =
+  | 'no_recipients_configured'
+  | 'no_authorized_recipients'
+  | 'empty_content'
+  | 'provider_error'
+  | 'test_timed_out';
+
+export interface ReportDeliveryLogEntry {
+  runId: string;
+  state: ReportDeliveryState;
+  reason?: ReportDeliveryReason;
+  authorizedRecipients?: string[];
+  withheldRecipients?: string[];
+  missingPermission?: string;
+  at: string;
+}
+
+export type RecipientRemediationCode =
+  | 'no_authorized_recipients'
+  | 'no_recipients_configured'
+  | 'empty_report_content';
+
+export interface RecipientRemediation {
+  code: RecipientRemediationCode;
+  scheduleId: string;
+  runId?: string;
+  owner: string;
+  /**
+   * ONLY the subset of the schedule's OWN configured recipients that qualify —
+   * never the platform admin roster. Listing that to a customer would itself be
+   * the cross-account leak this guard exists to prevent.
+   */
+  eligibleRecipients: string[];
+  missingPermission: string;
+  /** One of a fixed set of sentences — never interpolated upstream error text. */
+  safeAction: string;
+}
+
+const REMEDIATION_SAFE_ACTION: Record<RecipientRemediationCode, string> = {
+  no_authorized_recipients:
+    'This report uses cross-account data, so it can only be sent to admin users. Add an admin recipient, or remove the cross-account tools from the schedule, then run it again.',
+  no_recipients_configured:
+    'Add at least one email recipient before activating this schedule.',
+  empty_report_content:
+    'The run produced no report content, so nothing was sent. Open the run to see why, then run the schedule again.',
+};
+
+const REMEDIATION_MISSING_PERMISSION: Record<RecipientRemediationCode, string> = {
+  no_authorized_recipients: 'isAdmin',
+  no_recipients_configured: 'recipient',
+  empty_report_content: 'none',
+};
+
+export function buildRecipientRemediation(params: {
+  code: RecipientRemediationCode;
+  scheduleId: string;
+  owner?: string | null;
+  runId?: string;
+  eligibleRecipients?: string[];
+}): RecipientRemediation {
+  return {
+    code: params.code,
+    scheduleId: params.scheduleId,
+    ...(params.runId ? { runId: params.runId } : {}),
+    owner: params.owner || 'unknown',
+    eligibleRecipients: [...(params.eligibleRecipients || [])],
+    missingPermission: REMEDIATION_MISSING_PERMISSION[params.code],
+    safeAction: REMEDIATION_SAFE_ACTION[params.code],
+  };
+}
+
+/**
+ * Whether a schedule should be treated as producing a sensitive report BEFORE it
+ * runs. Two cheap signals: the previous run actually used a cross-account tool
+ * (`lastKnownSensitive`), or the schedule requires one. The second matters
+ * because the first only exists after a run has already paid for generation.
+ * This only decides whether to check recipients early; the send-time guard
+ * still re-classifies every run on its own.
+ */
+export function scheduleLikelySensitive(schedule: {
+  lastKnownSensitive?: boolean;
+  requiredFunctionCalls?: string[] | null;
+} | null | undefined): boolean {
+  if (!schedule) return false;
+  return schedule.lastKnownSensitive === true || reportContainsCrossAccountData(schedule.requiredFunctionCalls || null);
+}
+
+/**
+ * Persist one delivery-state transition. Best-effort by design: losing a log
+ * entry must never fail a run or an email, so this never throws.
+ */
+export async function recordReportDeliveryState(
+  scheduleId: string | undefined | null,
+  entry: Omit<ReportDeliveryLogEntry, 'at'> & { at?: string },
+  extra?: { lastKnownSensitive?: boolean },
+): Promise<void> {
+  if (!scheduleId) return;
+  try {
+    const { scheduleDb } = await import('./db');
+    await scheduleDb.appendDeliveryLogEntry(scheduleId, { ...entry, at: entry.at || new Date().toISOString() }, extra);
+  } catch (error) {
+    console.error(`Failed to record delivery state "${entry.state}" for schedule ${scheduleId}:`, error);
+  }
+}
