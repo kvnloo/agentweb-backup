@@ -1,6 +1,7 @@
 import { emailService } from '../services/emailService';
 import { chatbotDb } from '../services/chatbotService';
 import { userDb } from '../services/db';
+import { __resetAgentModeAlertDedupeForTests } from '../utils/agentModeAlerts';
 
 // Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects.
 // getChatSession is read by the recipient-authorization guard (ENG-500); default it
@@ -22,6 +23,10 @@ jest.mock('../services/chatbotService', () => ({
 jest.mock('../services/db', () => ({
   userDb: { getUserByEmail: jest.fn(), getUserById: jest.fn() },
 }));
+
+// The withheld-report oncall alert is deduped per schedule for 24h (ENG-1552), and
+// several tests below reuse 'schedule-123' — start every test with a clean window.
+beforeEach(() => __resetAgentModeAlertDedupeForTests());
 
 // Shared result fixture for the guard tests (module scope so it is visible
 // regardless of which describe block the guard tests live in).
