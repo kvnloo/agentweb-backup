@@ -303,6 +303,8 @@ export interface ChatSession {
     tools: string[];
     recordedAt: string;
   };
+  /** H-VOICE: session-scoped Voice Card from draft → approved edit observations. */
+  sessionVoiceProfile?: import('./voiceProfileService').SessionVoiceProfile;
   emailMetadata?: {
     senderEmail?: string;
     lastInboundEmailId?: string;
@@ -3713,6 +3715,28 @@ export class ChatbotDB {
           recordedAt: new Date().toISOString(),
         },
         ":adminListPartition": "all",
+      },
+    };
+
+    await dynamodb.update(params).promise();
+  }
+
+  /**
+   * H-VOICE: persist session-scoped Voice Card metadata on AW-ChatSessions.
+   * Schema extension per RFC H-VOICE (Harsha P0 epic #4) — requires Harsha sign-off
+   * before upstream merge per CLAUDE.md persistent-data policy.
+   */
+  async updateSessionVoiceProfile(
+    sessionId: string,
+    profile: import('./voiceProfileService').SessionVoiceProfile,
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET sessionVoiceProfile = :sessionVoiceProfile, adminListPartition = :adminListPartition',
+      ExpressionAttributeValues: {
+        ':sessionVoiceProfile': profile,
+        ':adminListPartition': 'all',
       },
     };
 

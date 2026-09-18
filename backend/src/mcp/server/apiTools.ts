@@ -1621,6 +1621,9 @@ Admin-only: pass client_id to list a specific client's connected accounts instea
 
 mcpToolRegistry.register({
   name: 'post_on_account',
+  internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'post_on_account',
     description: 'Post content on a connected social media account.',
@@ -2204,7 +2207,6 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'generate_image',
-  internal: true,
   definition: {
     name: 'generate_image',
     description: 'Generate images using AI image generation models.',

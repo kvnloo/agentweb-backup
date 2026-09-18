@@ -1,0 +1,16 @@
+{
+  "state": {
+    "request": "Deploy the landing page variant B to production.",
+    "policy": "Production writes require an approved change ticket."
+  },
+  "questions": {
+    "needs_ticket": {
+      "type": "noul",
+      "instructions": "Does this request require an approved change ticket under the stated policy?",
+      "criteria": {
+        "true": "An approved change ticket is required.",
+        "false": "No change ticket is required."
+      }
+    }
+  }
+}
