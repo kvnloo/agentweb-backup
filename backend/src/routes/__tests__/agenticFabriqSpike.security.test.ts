@@ -93,10 +93,15 @@ describe('hostile Fabriq OAuth routes', () => {
     const res = await invoke('/callback', { ...issued, connection_id: issued.connectionId, tool: 'gmail', status: 'success' });
     expect(res.send).not.toHaveBeenCalledWith(expect.stringContaining('Gmail connected'));
   });
-  it('consumes error callbacks once without a vendor request', async () => {
+  it.each([
+    ['oauth_failed', 'reported the connect attempt failed'],
+    ['state_expired', 'connect link has expired'],
+  ])('handles %s error callbacks once without a vendor request', async (reason, expectedMessage) => {
     const issued = await create('route-user', 'mailbox', 'gmail');
-    const query = { ...issued, connection_id: issued.connectionId, tool: 'gmail', status: 'error' };
-    expect((await invoke('/callback', query)).statusCode).toBe(200);
+    const query = { ...issued, connection_id: issued.connectionId, tool: 'gmail', status: 'error', reason };
+    const first = await invoke('/callback', query);
+    expect(first.statusCode).toBe(200);
+    expect(first.send).toHaveBeenCalledWith(expect.stringContaining(expectedMessage));
     expect((await invoke('/callback', query)).statusCode).toBe(400);
     expect(mockList).not.toHaveBeenCalled();
   });

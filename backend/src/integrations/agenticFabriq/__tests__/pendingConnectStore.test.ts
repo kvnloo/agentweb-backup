@@ -112,11 +112,18 @@ describe('bounded single-use OAuth state', () => {
     expect(await consume(a.connectionId, a.state, 1001)).not.toBeNull();
     expect(await consume(b.connectionId, b.state, 1001)).not.toBeNull();
   });
-  it('expires at the exact TTL boundary and rejects future creation timestamps', async () => {
-    const a = await create('user-a', 'mailbox-a', 'gmail', 1000);
-    expect(await consume(a.connectionId, a.state, 601000)).toBeNull();
-    const b = await create('user-a', 'mailbox-a', 'gmail', 1000);
-    expect(await consume(b.connectionId, b.state, 999)).toBeNull();
+  it.each([
+    ['10 minutes', 10 * 60 * 1000],
+    ['29 minutes', 29 * 60 * 1000],
+  ])('keeps a pending connect valid after %s', async (_label, elapsedMs) => {
+    const issued = await create('user-a', 'mailbox-a', 'gmail', 1000);
+    expect(await consume(issued.connectionId, issued.state, 1000 + elapsedMs)).not.toBeNull();
+  });
+  it('expires a pending connect after 31 minutes and rejects future creation timestamps', async () => {
+    const expired = await create('user-a', 'mailbox-a', 'gmail', 1000);
+    expect(await consume(expired.connectionId, expired.state, 1000 + 31 * 60 * 1000)).toBeNull();
+    const future = await create('user-a', 'mailbox-a', 'gmail', 1000);
+    expect(await consume(future.connectionId, future.state, 999)).toBeNull();
   });
   it.each(['outlook', '', undefined])('rejects unsupported provider %s', async provider => {
     await expect(create('user-a', 'mailbox-a', provider, 1000)).rejects.toThrow();
@@ -152,7 +159,7 @@ describe('bounded single-use OAuth state', () => {
     expect(await finishPendingConnectVerification(a.connectionId, v!.verificationId, 'connected')).toBe(false);
     const b = await create('u', 'b', 'gmail', 1000);
     const w = await beginPendingConnectVerification(b.connectionId, 1001);
-    jest.spyOn(Date, 'now').mockReturnValue(601000);
+    jest.spyOn(Date, 'now').mockReturnValue(1000 + 31 * 60 * 1000);
     expect(await finishPendingConnectVerification(b.connectionId, w!.verificationId, 'connected')).toBe(false);
     expect(verifiedConnectionIdForAccount('b', 'u')).toBeUndefined();
   });

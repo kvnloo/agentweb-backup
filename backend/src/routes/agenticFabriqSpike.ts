@@ -125,6 +125,11 @@ const callbackHandler: express.RequestHandler = async (req, res) => {
 
   if (status === 'error') {
     await finish('terminal');
+    const reason = req.query.reason;
+    if (reason === 'state_expired') {
+      console.warn('[ENG-1685 spike] provider callback reported expired state');
+      return res.status(200).send('This connect link has expired. Start a new connect.');
+    }
     console.warn('[ENG-1685 spike] provider callback reported failure');
     return res.status(200).send('Agentic Fabriq reported the connect attempt failed. You can retry the connect.');
   }

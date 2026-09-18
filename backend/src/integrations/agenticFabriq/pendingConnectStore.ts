@@ -5,7 +5,7 @@
  */
 import crypto from 'crypto';
 
-const PENDING_TTL_MS = 10 * 60 * 1000;
+const PENDING_TTL_MS = 30 * 60 * 1000;
 const MAX_PENDING_CONNECTS = 1_000;
 
 interface PendingConnectRecord {
