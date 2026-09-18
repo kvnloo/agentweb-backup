@@ -53,6 +53,12 @@ dotenv.config();
 const SYSTEM_FROM = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
 const SUPPORT_REPLY_TO = 'support@agentweb.pro';
 
+/**
+ * ENG-1552: one Alert Class for every "scheduled report withheld" occurrence, so intake
+ * clusters them onto a single canonical Linear defect instead of one issue per schedule/day.
+ */
+export const WITHHELD_REPORT_ALERT_CLASS = 'scheduled-report-withheld-no-recipients';
+
 // Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
 async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
   if (settingKey === 'oncall_emails' && process.env.ONCALL_EMAIL_LIST) {
@@ -1876,6 +1882,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       let finalHtml = html;
       let finalText = text;
       let guardOwnerEmail: string | undefined;
+      let guardOwnerUserId: string | undefined;
       try {
         let guardSession: any;
         // FAIL-CLOSED DEFAULT: treat the report as sensitive UNLESS we can
@@ -1908,6 +1915,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         }
         // Resolve the owner email up front — used both to authorize the owner and
         // to notify them if delivery ends up blocked.
+        guardOwnerUserId = guardSession?.userId;
         try {
           const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
           guardOwnerEmail = (owner as any)?.email;
@@ -1942,11 +1950,29 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // Durable escalation so a fully-withheld report is never lost silently —
         // this fires regardless of whether the owner email is known or its notice
         // succeeds (owner-notice failure would otherwise be swallowed by sendEmail).
+        //
+        // ENG-1552 / ENG-1825: this used to pass no context, so intake could only
+        // fuzzy-match on the title and re-filed a fresh Linear issue per schedule per
+        // day. The Alert Class folds every occurrence, across all schedules, onto one
+        // canonical defect (each occurrence comment still names its Schedule ID); the
+        // dedupeKey keeps a daily schedule from re-emailing oncall inside 24h.
+        // `sessionId` is deliberately passed only as context, not as the helper's
+        // sessionId param: that would mint a no-login interactive-share link to a
+        // report withheld precisely because it holds cross-account data.
         try {
-          await this.sendOncallAlert(
-            `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
-            `Session ${result.sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered. Owner: ${guardOwnerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`
-          );
+          const { sendAgentModeOncallAlert } = await import('../utils/agentModeAlerts');
+          await sendAgentModeOncallAlert({
+            subject: `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
+            message: `Session ${result.sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered. Owner: ${guardOwnerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`,
+            userId: guardOwnerUserId,
+            context: {
+              'Session ID': result.sessionId,
+              'Schedule ID': scheduleId,
+              'Alert Class': WITHHELD_REPORT_ALERT_CLASS,
+            },
+            dedupeKey: `withheld-recipients:${scheduleId}`,
+            dedupeWindowMs: 24 * 60 * 60 * 1000,
+          });
         } catch (alertError) {
           console.error(`Failed to send oncall alert for withheld report ${result.sessionId}:`, alertError);
         }
