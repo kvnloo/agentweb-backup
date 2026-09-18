@@ -268,6 +268,29 @@ describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () =
     expect(attempt.skipReason).toBeUndefined();
   });
 
+  it('an over-600-character terminal-shaped report stays scorable (length guard)', async () => {
+    // A report-shaped final turn that opens on the block and closes on the
+    // handling, but exceeds the documented 600-char cap — a long deliverable
+    // that merely mentions the block stays scorable (CodeRabbit PR #2983).
+    const longReport = "Sorry, I can't reach LinkedIn search right now — the service is currently down. " +
+      'The outage affected logins briefly and our status page reflects the incident in detail. ' +
+      'We stopped that path and filed the platform issue for your review and approval today. ' +
+      'Our team will post hourly updates until service is restored across the entire region. ' +
+      'In the meantime please review this extended status summary and confirm the next steps. ' +
+      'Note that additional background context follows for the record and for downstream review today. ' +
+      'We stopped that path and saved the draft for review; say retry once it is back.';
+    expect(longReport.length).toBeGreaterThan(600);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: longReport },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
   it('an interactive approval-held publish with saved draft is excluded (account-level hold, non-scheduled)', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', content: 'Post this to LinkedIn now' },

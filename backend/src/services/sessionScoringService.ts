@@ -1187,6 +1187,11 @@ export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean 
   // (or the handling) and close on the handling. A draft/explainer that
   // merely mentions an outage mid-body stays scorable even when short.
   const trimmed = text.trim();
+  // Length guard (CodeRabbit PR review on #2983): the documented <= 600-char
+  // cap applies to the non-clarification terminal-report path — a long
+  // deliverable that merely mentions the block stays scorable. Placed after
+  // the clarification branch so valid clarification handling is unchanged.
+  if (trimmed.length > 600) return false;
   const opensOnBlock = BLOCK_REPORT_OPEN_PATTERN.test(trimmed);
   const closesOnHandling = BLOCK_REPORT_CLOSE_PATTERN.test(trimmed);
   // Either edge must carry the report shape: a turn that neither opens on
