@@ -12389,7 +12389,9 @@ export const agentModeController = {
       const toolsChanged = requiredFunctionCalls !== undefined
         && !sameSet(requiredFunctionCalls, existingSchedule.requiredFunctionCalls, (x) => x);
       const recipientsChanged = emailNotifications !== undefined
-        && !sameSet(effectiveEmailNotifications, existingSchedule.emailNotifications, (x) => x.toLowerCase());
+        // Both sides normalized: older rows store a bare string or a JSON-array string,
+        // which the portal echoes back unchanged.
+        && !sameSet(effectiveEmailNotifications, normalizeEmailList(existingSchedule.emailNotifications || []), (x) => x.toLowerCase());
 
       // ENG-1552: an edit to who receives an active schedule's report, or to the
       // tools it must call, can leave a cross-account report with nobody allowed
