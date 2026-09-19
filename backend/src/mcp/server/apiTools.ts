@@ -272,11 +272,83 @@ mcpToolRegistry.register({
   },
 });
 
+// ENG-2057: expose the customer work-plan lifecycle as discrete outcomes so
+// connector discovery can rank launch and structured answering independently.
+// Keep both lifecycle tools public: external agents need the launch and unblock pair.
+mcpToolRegistry.register({
+  name: 'emma_launch_work_plan',
+  requiresUserAccount: true,
+  definition: {
+    name: 'emma_launch_work_plan',
+    description: 'Launch an accessible predefined work plan in an existing Emma session. Find a plan with list_predefined_work_plans first, then poll progress with emma_get_session. Refuses to replace a different active work plan.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        plan_id: { type: 'string', description: 'The predefined plan ID. Alias: work_plan_id.' },
+        work_plan_id: { type: 'string', description: 'Alias for plan_id.' },
+      },
+      required: ['session_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const planId = args.plan_id ?? args.work_plan_id;
+    if (typeof planId !== 'string' || planId.trim() === '') {
+      return jsonResult({ success: false, message: 'plan_id (or work_plan_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}/work-plan`,
+      context: ctx(context),
+      body: { planId },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_answer_work_plan_input',
+  definition: {
+    name: 'emma_answer_work_plan_input',
+    description: 'Answer a pending structured work-plan input request shown by emma_get_session. Values must be keyed by the field IDs in pendingWorkPlanInput. A plain emma_send_message does not submit these structured values.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        request_id: { type: 'string', description: 'The pendingWorkPlanInput.requestId. Alias: work_plan_request_id.' },
+        work_plan_request_id: { type: 'string', description: 'Alias for request_id.' },
+        values: { type: 'object', additionalProperties: true, description: 'Answers keyed by pendingWorkPlanInput field ID.' },
+        label: { type: 'string', description: 'Optional chat-visible summary. Defaults to a neutral submission message.' },
+      },
+      required: ['session_id', 'values'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const requestId = args.request_id ?? args.work_plan_request_id;
+    if (typeof requestId !== 'string' || requestId.trim() === '') {
+      return jsonResult({ success: false, message: 'request_id (or work_plan_request_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      context: ctx(context),
+      body: {
+        sessionId: args.session_id,
+        userMessage: typeof args.label === 'string' && args.label.trim() !== ''
+          ? args.label
+          : 'Submitted requested work plan details.',
+        workPlanInputAnswer: { requestId, values: args.values },
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
 mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID, including the active workPlan summary and pendingWorkPlanInput when structured details are awaiting an answer. Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Check pendingUserQuestion and pendingWorkPlanInput before assuming a run has completed; resolve them with emma_answer_question and emma_answer_work_plan_input respectively, never with a plain emma_send_message reply.',
     inputSchema: {
       type: 'object',
       properties: {
