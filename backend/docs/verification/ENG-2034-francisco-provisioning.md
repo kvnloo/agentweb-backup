@@ -10,7 +10,7 @@ Attempt: 2026-09-18T23:44:13.303Z. Execution actor: Codex; accountable owner: Ha
 
 Read the Ryan setup's `INTERNAL/RELEASE_SHEET.md`, `PRODUCTION_QA.md`, `MASTER_SPEC.md`, `ACCESS_AND_REVOCATION.md`, and this branch's `ENG-2022-2029-investigation.md` before execution.
 
-Requested identity: Francisco Rios, `franciscorios.digital@gmail.com`; active Pro, non-admin customer, standalone, no connectors, 100 generations, 30-day expiry, exact frozen materials and simulation. Frozen `EVALUATION_SEED.json` SHA-256: `0e524608cbc46a27e18025b0bd344a256397830798771ece549a1641e48eadcb` (unchanged). No historical creatives/assets were invented.
+Requested identity: Francisco Rios, `[candidate email redacted; retained in private release sheet]`; active Pro, non-admin customer, standalone, no connectors, 100 generations, 30-day expiry, exact frozen materials and simulation. Frozen `EVALUATION_SEED.json` SHA-256: `0e524608cbc46a27e18025b0bd344a256397830798771ece549a1641e48eadcb` (unchanged). No historical creatives/assets were invented.
 
 ## Live attempt and exact blocker
 
@@ -24,7 +24,7 @@ Used SSM on the production backend to invoke its deployed `EvaluationStore.provi
 
 The rejected application principal is the verified direct administrator `1743956381327`. The local SSM operator is `arn:aws:iam::992382574572:user/harsha-swarm`, already identified by name in the prior investigation. Runtime credential values and runtime principal identifiers are omitted, matching the Ryan evidence convention.
 
-Affected resource/operation: deployed `EvaluationStore.provision` for `franciscorios.digital@gmail.com`; intended persistence is `AW-Users` and `AW-Evaluations` in `us-west-2`. **No AWS authorization denial or denied resource ARN was returned in this attempt.** The earlier `dynamodb:PutItem` denial is historical, not a newly verified result.
+Affected resource/operation: deployed `EvaluationStore.provision` for `[candidate email redacted; retained in private release sheet]`; intended persistence is `AW-Users` and `AW-Evaluations` in `us-west-2`. **No AWS authorization denial or denied resource ARN was returned in this attempt.** The earlier `dynamodb:PutItem` denial is historical, not a newly verified result.
 
 Inspection of the actual deployed implementation explains the rejection: the first legacy-incompatible check requires `brandGuidelines.brandName`; subsequent checks require a pinned dataset. The supported implementation hardcodes subscription tier `Sandbox` and a simulated Meta connector with a sentinel token. Its provision record no longer stores the legacy materials, simulation packet, or `remaining` generation budget. Reset now records `resetting-started` and `reset`, rather than the old `simulation:reset`. Adding missing parameters would create a different account contract and would not satisfy this request. No such substitution, legacy code injection, direct record patch, IAM change, or bypass was attempted.
 
@@ -32,7 +32,7 @@ Inspection of the actual deployed implementation explains the rejection: the fir
 
 | Requirement | Observed result |
 | --- | --- |
-| Requested email/account readback | Email key `franciscorios.digital@gmail.com` absent before and after; no verified user ID |
+| Requested email/account readback | Email key `[candidate email redacted; retained in private release sheet]` absent before and after; no verified user ID |
 | Active Pro, non-admin, standalone login | Not testable: no account or login established |
 | Expiry | Not persisted/verified; 30 days was requested only |
 | Generations | Not persisted/verified; 100 was requested only |

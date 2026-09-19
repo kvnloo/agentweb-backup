@@ -7,7 +7,7 @@ Plan the next 30 days of Meta acquisition for AgentWeb using Emma and the eviden
 ## Access
 
 - Portal: https://app.agentweb.pro
-- Account: franciscorios.digital@gmail.com
+- Account: [candidate email redacted; retained in private release sheet]
 - Workspace: Sandbox · 30d real + 60d synthetic
 - Access ends: October 19, 2026, 19:31 UTC.
 - Use “Forgot password” to set your own password when you receive this packet. No password is included or retained in the packet.

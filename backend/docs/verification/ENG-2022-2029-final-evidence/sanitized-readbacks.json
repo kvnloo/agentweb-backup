@@ -2,7 +2,7 @@
   {
     "provisioned": {
       "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
-      "email": "franciscorios.digital@gmail.com",
+      "email": "[candidate email redacted; retained in private release sheet]",
       "startedAt": "2026-09-19T19:31:02.876Z",
       "expiresAt": "2026-10-19T19:31:02.876Z",
       "dataset": "agentweb-evaluation-90d@1"
@@ -279,7 +279,7 @@
     },
     "evaluation": {
       "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
-      "email": "franciscorios.digital@gmail.com",
+      "email": "[candidate email redacted; retained in private release sheet]",
       "status": "active",
       "expiresAt": 1792438262876,
       "mode": "sandbox",

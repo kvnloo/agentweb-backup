@@ -27,7 +27,7 @@ User requested PR #2963 completed **without merge or email**. Accountable owner:
 
 Current deployed `EvaluationStore.provision` and `reset` used with supported dataset import; no legacy Pro contract or direct record patch. Application runtime authorization used through existing SSM, no IAM expansion. Emma capability verdict: supported lifecycle exists, but provision required an authorized application admin runtime; the connected Emma identity was not sufficient. ENG-2034 retains that access-gap history.
 
-- Email: franciscorios.digital@gmail.com; userId: **eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7**.
+- Email: [candidate email redacted; retained in private release sheet]; userId: **eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7**.
 - Active Sandbox; customer role; non-admin; standalone. Real password login 200 and auth/me 200. Random password generated, used and discarded only in remote process memory. No plaintext password/token retained. Candidate uses Forgot password; no reset email sent in this run. Subsequent checks used an in-memory short-lived application JWT, separate from the actual password-login proof.
 - Provisioned **2026-09-19T19:31:02.876Z**; expires **2026-10-19T19:31:02.876Z** (1792438262876), exactly 30 days.
 - Current supported allowance: **100,000,000 tokens/month**, $500 model-cost accounting allowance, $100 extra-API allowance. Runtime costEnforced=false; actual gate is token usage. No fixed generation counter exists; do not claim 100 guaranteed generations. After the real Emma smoke: 377,328 tokens used; **99,622,672 remaining**; cost $0.094806375; allowed=true. Reset did not refund usage. No tier change or extra top-up needed.
@@ -73,3 +73,5 @@ Repeated paired Okareo guard classification with nine scenarios, including suffi
 At fd2721fe6cd4c7e9765371a255425d529e6c6138 the full typecheck passed in 65s and the exact pre-push selected set completed separately with two workers: **306 suites / 5,717 tests passed**, exit 0 (166.615s). The hook selected eight workers under a 4 GiB cap and was interrupted while swapping; it is not counted as passing. The push used the supported hook-skip switch only after these identical checks completed. Final suffix change is separately covered by the 141 checks above; final build/CI and commit evidence are recorded on the PR and local release sheet.
 
 Portal final review follow-up: dfccda2e4032f83e3b0c661e8575a2db059ffa20 cancels both stale progress and detection results on account switch. RED 1 fail / 15 pass; changed 46 focused tests pass. Final local CodeRabbit: zero findings. Production build, changed-line type/lint and bundle budget pass at that portal head.
+
+Repository copies redact the personal recipient email; the exact verified address and full readbacks remain in the private candidate packet/release sheet. User ID, pin, budget, expiry and audit correlations are preserved. This redaction does not claim erasure from prior commit history.
