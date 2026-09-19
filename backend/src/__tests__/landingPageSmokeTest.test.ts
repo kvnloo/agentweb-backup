@@ -608,6 +608,56 @@ describe("runGenerationSmokeTest", () => {
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(false);
   });
 
+  it("SWEEP: removes synthetic leads a PREVIOUS run stranded, and nothing else", async () => {
+    // The per-run poll only has 8s to find the row it created. When the capture write lands
+    // later the row is never deleted — 45 leads accumulated that way across nine lists in
+    // August, four in a paying customer's CRM. Sweeping at the start of each run makes it
+    // self-correcting.
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [
+        { leadId: "stranded-email", email: "smoke-test+1787265258@agentweb.pro", createdAt: "2026-08-20T00:00:00.000Z" },
+        { leadId: "stranded-phone", email: "noemail+123@lander.test", phone: "(415) 555-0142", createdAt: "2026-08-20T00:00:00.000Z" },
+        { leadId: "REAL-customer-lead", email: "someone@acme.com", phone: "4155551234", createdAt: "2026-08-20T00:00:00.000Z" },
+        { leadId: "real-lead-no-phone", email: "buyer@corp.com", createdAt: "2026-08-20T00:00:00.000Z" },
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const deleted = mockDeleteLead.mock.calls.map((c) => c[1]);
+    expect(deleted).toContain("stranded-email");
+    expect(deleted).toContain("stranded-phone");
+    // a real customer lead must never be touched
+    expect(deleted).not.toContain("REAL-customer-lead");
+    expect(deleted).not.toContain("real-lead-no-phone");
+  });
+
+  it("SWEEP: never deletes a row created during this run", async () => {
+    // beforeIso is the run's own start, so our freshly-created row is out of scope.
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [
+        { leadId: "ours-this-run", email: "smoke-test+9999999999999@agentweb.pro", createdAt: "2099-01-01T00:00:00.000Z" },
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockDeleteLead.mock.calls.map((c) => c[1])).not.toContain("ours-this-run");
+  });
+
+  it("SWEEP: a failing lead list never affects the run's verdict", async () => {
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    mockGetLeadsByListId.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
+  });
+
   it("CLEANUP: a lander with no email field still gets its synthetic lead deleted, by phone", async () => {
     // The lander invents its own placeholder address (observed live:
     // noemail+<ts>@waterheater.app), so isSmokeTestEmail never matches and pollForLead

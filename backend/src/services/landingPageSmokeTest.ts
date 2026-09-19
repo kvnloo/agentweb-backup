@@ -21,7 +21,7 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail } from "../utils/smokeTestLead";
+import { buildSmokeTestEmail, isSmokeTestEmail } from "../utils/smokeTestLead";
 import { crmDb } from "./db";
 import { sendLandingPageSmokeTestAlert } from "./slackService";
 import { updateLandingPageSmokeTestResult, GeneratedLandingPage } from "./v0Service";
@@ -82,6 +82,54 @@ function releaseSmokeTestSlot(): void {
  * lead can never be selected: the number is in the NANP's reserved fictional range, and the
  * time window is this one run.
  */
+// Bounds on the start-of-run sweep: it runs on every deploy, so it must stay cheap.
+const SWEEP_MAX_PAGES = 3;
+const SWEEP_MAX_DELETES = 20;
+/** The reserved fictional range this test fills — 415-555-0100..0199. A real visitor cannot have one. */
+const SYNTHETIC_PHONE_RE = /^41555501\d{2}$/;
+
+/**
+ * Delete synthetic leads that a PREVIOUS run stranded in this list.
+ *
+ * The per-run cleanup only has `pollMaxAttempts × pollIntervalMs` (8s by default) to find
+ * the row it just created. If the capture write lands after that, the run reports FAIL and
+ * the row is never deleted — which is how 45 synthetic leads accumulated across nine lists
+ * between 2026-08-11 and 2026-08-20, four of them in a paying customer's CRM.
+ *
+ * That race matters more now: the fill fixes on this branch turn landers that used to fail
+ * validation (creating nothing) into landers that submit, so more rows flow through an
+ * 8-second window. Sweeping at the START of each run makes the failure self-correcting —
+ * whatever the last deploy stranded, this one removes.
+ *
+ * Only rows provably ours are touched: the smoke-test address, or the reserved fictional
+ * phone. `beforeIso` is this run's start, so the row we are about to create is never in scope.
+ */
+async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promise<number> {
+  let deleted = 0;
+  let lastKey: any = undefined;
+  try {
+    for (let page = 0; page < SWEEP_MAX_PAGES && deleted < SWEEP_MAX_DELETES; page++) {
+      const result = await crmDb.getLeadsByListId(listId, 100, lastKey);
+      for (const lead of (result?.items || []) as any[]) {
+        if (deleted >= SWEEP_MAX_DELETES) break;
+        // Only rows that predate this run — never the one we are about to create.
+        const createdAt = String(lead?.createdAt || "");
+        if (!createdAt || createdAt >= beforeIso) continue;
+        const phone = String(lead?.phone || "").replace(/\D/g, "");
+        if (!isSmokeTestEmail(lead?.email) && !SYNTHETIC_PHONE_RE.test(phone)) continue;
+        if (!lead?.leadId) continue;
+        await crmDb.deleteLead(listId, lead.leadId);
+        deleted++;
+      }
+      lastKey = result?.lastEvaluatedKey;
+      if (!lastKey) break;
+    }
+  } catch {
+    // best-effort housekeeping — never let it affect the run's verdict
+  }
+  return deleted;
+}
+
 async function pollForLeadByPhone(
   listId: string,
   phone: string,
@@ -880,6 +928,8 @@ async function runGenerationSmokeTestNow(
   deployedUrl: string
 ): Promise<void> {
   const checkedAt = new Date().toISOString();
+  // Anything synthetic already in this list predates us, so sweep before creating our row.
+  const sweptStranded = await sweepStrandedSmokeLeads(leadListId, checkedAt);
   const pixelExpected = !!page.metaPixelId;
   let leadCaptured = false;
   let pixelFired = false;
@@ -1165,6 +1215,7 @@ async function runGenerationSmokeTestNow(
       ...(fillOutcome.alreadySatisfied > 0
         ? [`${fillOutcome.alreadySatisfied} already satisfied`]
         : []),
+      ...(sweptStranded > 0 ? [`swept ${sweptStranded} stranded synthetic lead(s)`] : []),
       ...(fillOutcome.skippedRequired > 0
         ? [`${fillOutcome.skippedRequired} required control(s) unreachable`]
         : []),
