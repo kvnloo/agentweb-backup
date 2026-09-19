@@ -148,6 +148,22 @@ jobs:
         working-directory: backend
         run: cp ../test-env/user-data-dev-auto.sh dist/
 
+      # Written INTO dist, immediately before the zip, so the file travels inside the artifact and
+      # describes the code beside it. Anywhere outside dist would be a claim about a build rather
+      # than a property of one. /health then reports the label (see backend/src/utils/buildInfo.ts),
+      # which is what makes "the workflow succeeded" and "this instance is serving that code" two
+      # separately checkable statements.
+      - name: Record the build in dist/build-info.json
+        working-directory: backend
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+        run: |
+          set -euo pipefail
+          printf '{"versionLabel":"%s","commit":"%s","builtAt":"%s"}\n' \
+            "$VERSION_LABEL" "$(git rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > dist/build-info.json
+          cat dist/build-info.json
+
       - name: Package artifact
         working-directory: backend
         env:
