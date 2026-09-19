@@ -18,7 +18,6 @@ describe("RateLimiter eviction under all-blocked flood (ENG-1768)", () => {
       const find = limiter.findEvictionCandidate.bind(limiter);
       const start = Date.now();
       for (let i = 0; i < 50; i++) {
-        // @ts-expect-error accessing private field for test verification
         expect(find(Date.now())).toBeDefined();
       }
       const elapsed = Date.now() - start;
@@ -99,7 +98,6 @@ describe("RateLimiter eviction under all-blocked flood (ENG-1768)", () => {
       const find = limiter.findEvictionCandidate.bind(limiter);
       const start = Date.now();
       for (let i = 0; i < 20; i++) {
-        // @ts-expect-error accessing private field for test verification
         expect(find(Date.now())).toBeDefined();
       }
       // 20 decisions over 5000 fully-blocked entries: O(N^2) shift-drain
