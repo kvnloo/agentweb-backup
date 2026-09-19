@@ -15221,10 +15221,10 @@ export const agentModeController = {
   async updateSessionLlmModel(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
-      const { llmModel } = req.body;
+      const { llmModel } = req.body || {};
       const user = req.user;
 
-      if (!llmModel) {
+      if (typeof llmModel !== 'string' || !llmModel.trim()) {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
@@ -15242,9 +15242,9 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Block non-admins from using opus models
-      if (canonicalModel.includes('opus') && !user.isAdmin) {
-        return res.status(403).json({ error: 'Opus models are not available for your account' });
+      // ENG-2028: honor registry permissions, not a stale model-family deny.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, user.isAdmin === true)) {
+        return res.status(403).json({ error: 'Model is not available for your account' });
       }
 
       // Get the session to verify ownership
@@ -15273,9 +15273,9 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { llmModel } = req.body;
+      const { llmModel } = req.body || {};
 
-      if (!llmModel) {
+      if (typeof llmModel !== 'string' || !llmModel.trim()) {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
@@ -15291,9 +15291,9 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Shared sessions are non-admin; block opus models
-      if (canonicalModel.includes('opus')) {
-        return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
+      // Shared viewers have non-admin registry permissions.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, false)) {
+        return res.status(403).json({ error: 'Model is not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token

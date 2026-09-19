@@ -2309,7 +2309,7 @@ export class AgentModeService {
 
   async getSupportedModels(isAdmin: boolean = false) {
     const models = Object.keys(this.llmModels).filter(
-      m => this.isModelSelectableBy(m, isAdmin),
+      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
     );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
@@ -2354,16 +2354,15 @@ export class AgentModeService {
   }
 
   /**
-   * Would the model picker accept this id for this user? Mirrors the two gates
-   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
-   * supported-model allow-list, then the non-admin Opus restriction. Kept next
-   * to the registry it reads so the two cannot drift.
+   * Registry entitlement for HTTP picker selection and model-mention guidance.
+   * ENG-2028: a name-based Opus deny contradicted ENG-744's explicit public
+   * availability contract. Registry flags are authoritative; Live stays on its
+   * separate voice path and admin/internal restrictions remain enforced.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
   }
 

@@ -1,0 +1,96 @@
+{
+  "draftRetained": true,
+  "url": "http://127.0.0.1:51963/agent-mode/new",
+  "text": "Error\nFailed to update session model\nSANDBOX \u00b7 30D REAL + 60D SYNTHETIC\nShare\nFR\n\nMy detailed first prompt must survive a rejected model switch.\n\n12:42 PM\n\nI couldn't start a new conversation just now (the session request failed). Your message is kept above \u2014 please retry sending it. If it keeps failing, check your connection and try again.\n\n12:42 PM\n3.8 Flash\nSend message\n\nEmma is AI. Outputs (especially images and videos) may need a few tries to look great.\n\nGet Started\n0 of 5 completed",
+  "errors": [],
+  "requests": [
+    {
+      "path": "/api/auth/me",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/llm-models",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/customer-support-default-model",
+      "method": "GET"
+    },
+    {
+      "path": "/api/subscription/usage",
+      "method": "GET"
+    },
+    {
+      "path": "/api/subscription/usage-runway",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/sessions",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/new-chat-hero-greeting",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/model-options",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/sessions",
+      "method": "GET"
+    },
+    {
+      "path": "/api/brand/guidelines",
+      "method": "GET"
+    },
+    {
+      "path": "/api/users/me/onboarding",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/sessions",
+      "method": "GET"
+    },
+    {
+      "path": "/api/chatbot/sessions/emma",
+      "method": "GET"
+    },
+    {
+      "path": "/api/tasks/executions/with-html-reports",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/scheduled-chats",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/llm-models",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/welcome-message",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/conversation-starters",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/public/plans",
+      "method": "GET"
+    },
+    {
+      "path": "/api/agent-mode/sessions",
+      "method": "POST"
+    },
+    {
+      "path": "/api/agent-mode/session/qa-created/llm-model",
+      "method": "PATCH"
+    },
+    {
+      "path": "/api/agent-mode/session/qa-created",
+      "method": "DELETE"
+    }
+  ]
+}

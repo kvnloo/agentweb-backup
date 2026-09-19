@@ -71,8 +71,17 @@ describe('model-mention guards, swept over the real registry', () => {
 it('ENG-2028 offered picker models obey the same permission policy as selection', async () => {
   jest.spyOn(agentModeService, 'getDefaultModel').mockResolvedValue('gemini-3.8-flash');
   for (const admin of [false, true]) {
-    const offered = await agentModeService.getSupportedModels(admin);
+    const offered = (await agentModeService.getSupportedModelsWithMetadata(admin)).map(m => m.id);
     expect(offered.length).toBeGreaterThan(0);
     expect(offered.every(id => agentModeService.isModelSelectableBy(id, admin))).toBe(true);
   }
+});
+
+it('ENG-744/2028 permits public Opus models while preserving actual registry restrictions', () => {
+  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-5', false)).toBe(true);
+  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-8', false)).toBe(true);
+  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-6-v1', false)).toBe(false);
+  expect(agentModeService.isModelSelectableBy('anthropic.claude-opus-4-6-v1', true)).toBe(true);
+  expect(agentModeService.isModelSelectableBy('gemini-3.1-flash-live-preview', true)).toBe(false);
+  expect(agentModeService.isModelSelectableBy('unknown-model', true)).toBe(false);
 });
