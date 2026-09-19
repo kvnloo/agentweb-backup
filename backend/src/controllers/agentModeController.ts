@@ -8136,6 +8136,10 @@ export async function generateSessionResponse(
   if (!session) {
     throw new Error('Session not found');
   }
+  // Some server-side callers (notably Slack) resume a persisted delegated
+  // session without carrying the HTTP request's delegation flag. Preserve the
+  // session's authority when dispatching the turn to the worker.
+  const effectiveIsDelegatedAccess = isDelegatedAccess || session.delegateInfo?.isDelegated === true;
 
   // Check message limit before starting a new turn so in-progress writes (e.g. tool
   // system messages) that pushed the count over the limit don't silently drop the
@@ -8416,7 +8420,7 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
-      isDelegatedAccess,
+      isDelegatedAccess: effectiveIsDelegatedAccess,
       excludeTools,
       screenshotUrl,
       // ENG-473: persist each settled turn as it completes so a hard process kill
