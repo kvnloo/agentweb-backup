@@ -140,6 +140,7 @@ import {
   exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
+import { healthPayload } from "./utils/buildInfo";
 
 const app = express();
 
@@ -547,7 +548,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  res.status(200).json(healthPayload());
 });
 
 // Global error handler — catches unhandled errors from all routes and reports them to Notion
