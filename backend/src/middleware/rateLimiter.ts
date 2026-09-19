@@ -37,6 +37,16 @@ export class RateLimiter {
   // whole array per removal — O(N^2) to drain N heads under flood. The
   // consumed prefix is compacted away once it grows large (amortized O(1)).
   private evictQueueHead = 0;
+  // Block-expiry records (ENG-1768 CodeRabbit follow-up): when check()
+  // rejects a key as blocked, its window-expiry (oldest in-window timestamp
+  // + windowMs) is recorded here. findEvictionCandidate promotes only keys
+  // whose recorded expiry has passed instead of scanning every entry's
+  // timestamps per eviction — a full-map sweep here restored O(n) work per
+  // request under a sustained distinct-key flood at capacity. A watermark
+  // (nextUnblockAt) skips the promotion scan entirely until some recorded
+  // key can actually have expired, so the common case stays O(1).
+  private blockedUntil: Map<string, number> = new Map();
+  private nextUnblockAt = Infinity;
 
   // Removes the current queue head, compacting the consumed prefix when it
   // grows large enough that slicing pays for itself. Callers must also
@@ -69,7 +79,12 @@ export class RateLimiter {
    *   1. The head of the incremental non-blocked queue (a key that was
    *      idle or under-limit when last checked) — O(1) amortized, with a
    *      cheap lazy skip over stale/already-evicted heads.
-   *   2. Only if the queue is exhausted (every tracked key currently
+   *   2. Blocked keys whose recorded window-expiry has passed are promoted
+   *      back into the queue first (no timestamp filtering — expiry was
+   *      recorded when the key was last rejected). Only keys in
+   *      `blockedUntil` are ever examined, and only once the `nextUnblockAt`
+   *      watermark says at least one can have expired.
+   *   3. Only if no unblocked key is known (every tracked key currently
    *      blocked) fall back to the oldest insertion — still bounds memory,
    *      and this case requires >= maxEntries simultaneously-blocked
    *      distinct keys, an extreme flood scenario where evicting one
@@ -79,23 +94,24 @@ export class RateLimiter {
    * queue never goes permanently stale while non-blocked keys exist.
    */
   private findEvictionCandidate(now: number): string | undefined {
-    const windowStart = now - this.windowMs;
-    // First pass: sweep expired keys anywhere in entries back into the
-    // queue. A key dropped from the queue while blocked re-qualifies once
-    // its timestamps age out; without this, the fallback below could evict
-    // a still-blocked key while an untracked idle key sits in entries,
-    // letting the evicted key re-enter with an empty window early.
-    if (this.evictQueueHeads.size < this.entries.size) {
-      for (const [key, entry] of this.entries.entries()) {
-        if (this.evictQueueHeads.has(key)) continue;
-        const activeCount = entry.timestamps.filter(
-          (t) => t > windowStart,
-        ).length;
-        if (activeCount < entry.lastMax) {
+    // Cheap promotion: only recorded-blocked keys can re-qualify, and only
+    // once the watermark says at least one expiry may have passed. No
+    // full-map scan of entries — under a sustained distinct-key flood this
+    // path runs per request at capacity.
+    if (now >= this.nextUnblockAt && this.blockedUntil.size > 0) {
+      let next = Infinity;
+      for (const [key, unblockAt] of this.blockedUntil) {
+        if (now < unblockAt) {
+          if (unblockAt < next) next = unblockAt;
+          continue;
+        }
+        this.blockedUntil.delete(key);
+        if (!this.evictQueueHeads.has(key) && this.entries.has(key)) {
           this.evictQueue.push(key);
           this.evictQueueHeads.add(key);
         }
       }
+      this.nextUnblockAt = next;
     }
     while (this.evictQueueHead < this.evictQueue.length) {
       const key = this.evictQueue[this.evictQueueHead];
@@ -106,14 +122,15 @@ export class RateLimiter {
         this.evictQueueHeads.delete(key);
         continue;
       }
+      const windowStart = now - this.windowMs;
       const activeCount = entry.timestamps.filter((t) => t > windowStart).length;
       if (activeCount === 0 || activeCount < entry.lastMax) {
         return key; // idle or under-limit — safe to evict immediately
       }
-      // Head is currently blocked; drop it from the queue (the sweep above
-      // re-queues it if it ever becomes non-blocked again) and keep
-      // walking — this walk only visits keys once per state change,
-      // never the full timestamp volume per call.
+      // Head is currently blocked; drop it from the queue (promotion above
+      // re-queues it once its recorded expiry passes) and keep walking —
+      // this walk only visits keys once per state change, never the full
+      // timestamp volume per call.
       this.shiftEvictQueue();
       this.evictQueueHeads.delete(key);
     }
@@ -156,6 +173,13 @@ export class RateLimiter {
     if (entry.timestamps.length >= maxPerMinute) {
       const oldestInWindow = entry.timestamps[0];
       const resetInMs = oldestInWindow + this.windowMs - now;
+      // Record when this key's current window expires so eviction can
+      // promote it back as a candidate without scanning all entries'
+      // timestamps on each at-capacity request. Only recorded keys are
+      // ever scanned, gated by the nextUnblockAt watermark.
+      const unblockAt = oldestInWindow + this.windowMs;
+      this.blockedUntil.set(key, unblockAt);
+      if (unblockAt < this.nextUnblockAt) this.nextUnblockAt = unblockAt;
       return {
         allowed: false,
         remaining: 0,
@@ -166,6 +190,9 @@ export class RateLimiter {
     entry.timestamps.push(now);
     // Key just proved itself non-blocked — keep it available as a future
     // eviction candidate so the queue never drains while such keys exist.
+    // Any stale block-expiry record for it is now wrong; drop it so the
+    // promotion pass never re-queues a key that just changed state.
+    this.blockedUntil.delete(key);
     this.trackEvictable(key);
     const remaining = maxPerMinute - entry.timestamps.length;
     const resetInMs = entry.timestamps[0] + this.windowMs - now;
@@ -185,6 +212,7 @@ export class RateLimiter {
       entry.timestamps = entry.timestamps.filter((t) => t > windowStart);
       if (entry.timestamps.length === 0) {
         this.entries.delete(key);
+        this.blockedUntil.delete(key);
       }
     }
   }
@@ -198,6 +226,8 @@ export class RateLimiter {
     this.evictQueue = [];
     this.evictQueueHead = 0;
     this.evictQueueHeads.clear();
+    this.blockedUntil.clear();
+    this.nextUnblockAt = Infinity;
   }
 }
 
