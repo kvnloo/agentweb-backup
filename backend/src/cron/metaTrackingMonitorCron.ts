@@ -20,6 +20,7 @@
 import { userDb } from '../services/db';
 import { monitorUserTracking } from '../services/metaTrackingMonitor';
 import { checkConversionDivergenceForUser } from '../services/metaConversionDivergence';
+import { evaluateAccountHealth, ConnectivityAccountInput } from '../services/accountHealthService';
 
 const TAG = '[metaTrackingMonitorCron]';
 
@@ -83,6 +84,10 @@ export interface TrackingMonitorCronSummary {
   eventMixWatched: number;
   /** Families absent too long to still count as a regression. Logged, never paged. */
   eventMixStale: number;
+  /** Individual account-health checks currently failing across the fleet. */
+  accountHealthFlags: number;
+  /** User IDs with at least one failing account-health check. */
+  accountHealthFlaggedUsers: string[];
   /** Present ONLY on a dry run: every alert the sweep would have sent, in order.
    *  Absent (not empty) on a real run, so the two are never confused. */
   capturedAlerts?: CapturedAlert[];
@@ -142,6 +147,8 @@ export async function runMetaTrackingMonitor(
     eventMixRegressions: 0,
     eventMixWatched: 0,
     eventMixStale: 0,
+    accountHealthFlags: 0,
+    accountHealthFlaggedUsers: [],
   };
 
   // ONE set for the whole sweep. An ad account connected under several user records is one
@@ -229,6 +236,40 @@ export async function runMetaTrackingMonitor(
       summary.eventMixRegressions += result.eventMixRegressions ?? 0;
       summary.eventMixWatched += result.eventMixWatched ?? 0;
       summary.eventMixStale += result.eventMixStale ?? 0;
+
+      const userId = String(user?.userId);
+      const connectedAccounts: ConnectivityAccountInput[] = (user?.connected_accounts ?? []).map(
+        (account: any) => ({
+          platform: account?.platform,
+          config: account?.config
+            ? { token_expires_at: account.config.token_expires_at }
+            : account?.config,
+        }),
+      );
+      const accountHealth = evaluateAccountHealth({
+        userId,
+        pixel: {
+          blackouts: result.blackouts ?? 0,
+          destinationAlerts: result.destinationAlerts ?? 0,
+          destinationOk: result.destinationOk ?? 0,
+        },
+        // Known gap: this cron has neither a platform cap nor window-matched actual spend.
+        // A zero cap explicitly reports "no cap configured" without inventing budget data.
+        budget: { configuredCapCents: 0, actualSpendCents: 0 },
+        connectedAccounts,
+      });
+      if (accountHealth.flagged) {
+        summary.accountHealthFlags += accountHealth.flags.length;
+        summary.accountHealthFlaggedUsers.push(userId);
+        const subject = `[Account Health] ${userId} has ${accountHealth.flags.length} health flag(s)`;
+        const message = accountHealth.flags
+          .map((flag) => `${flag.check}: ${flag.reason ?? 'flagged'}`)
+          .join('\n');
+        const context = { userId, flags: accountHealth.flags };
+        console.warn(`${TAG} ${subject}: ${message.replace(/\n/g, '; ')}`);
+        if (dryRun) capturedAlerts.push({ subject, message, context });
+      }
+
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -341,6 +382,9 @@ export async function runMetaTrackingMonitor(
       : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
+      : '') +
+    (summary.accountHealthFlaggedUsers.length > 0
+      ? `, ${summary.accountHealthFlags} account-health flag(s) for user(s): ${summary.accountHealthFlaggedUsers.join(', ')}`
       : '') +
     `, ${cacheStats.fetches} page fetch(es) (${cacheStats.hits} served from cache)` +
     (dryRun ? `, ${capturedAlerts.length} alert(s) captured and NOT sent` : '') +
