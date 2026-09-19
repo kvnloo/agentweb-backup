@@ -80,9 +80,12 @@ jest.mock('../services/db', () => ({
     claimAndPauseUnresumable: jest.fn().mockResolvedValue('paused'),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
+    appendDeliveryLogEntry: jest.fn().mockResolvedValue(undefined),
+    getRunResults: jest.fn(),
   },
   userDb: {
     getUserById: jest.fn(),
+    getUserByEmail: jest.fn(),
   },
   taskDb: {
     getTaskExecutionById: jest.fn(),
@@ -104,6 +107,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatTokenLimitEmail: jest.fn(),
     sendScheduledRunFailedEmail: jest.fn(),
     sendScheduleSourcingBlockTransitionEmail: jest.fn(),
+    notifyScheduledReportWithheld: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -4654,5 +4658,534 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── ENG-1552: recipient preflight before generation ───────────────────────────
+describe('runScheduledChat recipient preflight (ENG-1552)', () => {
+  // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+  beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+  const ownerId = 'owner-1552';
+  const sensitiveSchedule = {
+    scheduleId: 'sched-1552',
+    scheduleName: 'Haven weekly performance',
+    startingMessage: 'Build the weekly report',
+    keywords: [] as string[],
+    requiredFunctionCalls: [] as string[],
+    userId: ownerId,
+    nextRunTime: new Date().toISOString(),
+    emailNotifications: ['analyst@customer.example'],
+    lastKnownSensitive: true,
+  };
+  const session = { sessionId: 'sess-1552', userId: ownerId, title: 't', messages: [], createdAt: '', updatedAt: '' };
+  const response = {
+    content: 'Weekly report: spend up 12%.',
+    toolCalls: [{ name: 'list_all_clients', arguments: {} }],
+    knowledgeBaseQueries: [],
+    sources: [],
+    responseMessages: [],
+  };
+  const admins = new Set<string>();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    admins.clear();
+    mockedIsSubscriptionFeatureEnabled.mockResolvedValue(true);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockAgentModeService.generateScheduledChatSummary.mockResolvedValue(null);
+    mockChatbotDb.createChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(session as any);
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    (mockScheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.clearRunInFlight as jest.Mock).mockResolvedValue(true);
+    mockScheduleDb.addRunResult.mockResolvedValue(undefined);
+    mockScheduleDb.getScheduleById.mockResolvedValue(sensitiveSchedule as any);
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(response as any);
+    mockUserDb.getUserById.mockResolvedValue({ userId: ownerId, email: 'owner@customer.example', isAdmin: false } as any);
+    (mockUserDb as any).getUserByEmail.mockImplementation(async (email: string) =>
+      ({ email, isAdmin: admins.has(email.toLowerCase()) }));
+  });
+
+  const expectSkippedBeforeGeneration = (result: any) => {
+    // The whole point: the expensive model is never reached, and no session is made.
+    expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(result.status).toBe('failure');
+    expect(result.sessionId).toBe('');
+    expect(result.remediation).toEqual(expect.objectContaining({
+      code: 'no_authorized_recipients',
+      scheduleId: 'sched-1552',
+      missingPermission: 'isAdmin',
+      eligibleRecipients: [],
+    }));
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).toHaveBeenCalledWith(
+      'sched-1552',
+      expect.objectContaining({ state: 'withheld', reason: 'no_authorized_recipients', withheldRecipients: ['analyst@customer.example'] }),
+      undefined,
+    );
+  };
+
+  it('skips generation for a previously-sensitive schedule with no authorized recipient, and tells the owner', async () => {
+    const result = await runScheduledChat(sensitiveSchedule, ownerId, false);
+    expectSkippedBeforeGeneration(result);
+    expect(mockEmailService.notifyScheduledReportWithheld).toHaveBeenCalledWith(
+      expect.objectContaining({ scheduleId: 'sched-1552', stage: 'before_generation', ownerEmail: 'owner@customer.example' })
+    );
+    // Oncall only — the customer is sent nothing new during the review period.
+    expect((mockEmailService.notifyScheduledReportWithheld as jest.Mock).mock.calls[0][0].emailOwner).toBeFalsy();
+  });
+
+  it('skips generation on the FIRST run when the schedule requires a cross-account tool (no breadcrumb yet)', async () => {
+    const firstRun = { ...sensitiveSchedule, lastKnownSensitive: undefined, requiredFunctionCalls: ['list_all_clients'] };
+    const result = await runScheduledChat(firstRun, ownerId, false);
+    expectSkippedBeforeGeneration(result);
+  });
+
+  it('does not treat org-admin membership as authorization — only the global isAdmin flag counts (ENG-500 decision)', async () => {
+    (mockUserDb as any).getUserByEmail.mockImplementation(async (email: string) =>
+      ({ email, isAdmin: false, orgRole: 'admin', organizationId: 'org-haven' }));
+    const result = await runScheduledChat(sensitiveSchedule, ownerId, false);
+    expectSkippedBeforeGeneration(result);
+  });
+
+  it('a manual test run is gated too, but surfaces the remediation instead of emailing anyone', async () => {
+    const result = await runScheduledChat(sensitiveSchedule, ownerId, true, 'test-run-1');
+    expectSkippedBeforeGeneration(result);
+    expect(result.runId).toBe('test-run-1');
+    expect(mockEmailService.notifyScheduledReportWithheld).not.toHaveBeenCalled();
+  });
+
+  it('runs normally with an admin recipient, and records "generated" with the sensitivity breadcrumb', async () => {
+    admins.add('analyst@customer.example');
+    const result = await runScheduledChat(sensitiveSchedule, ownerId, false);
+    expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
+    expect(result.remediation).toBeUndefined();
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).toHaveBeenCalledWith(
+      'sched-1552',
+      expect.objectContaining({ state: 'generated' }),
+      { lastKnownSensitive: true },
+    );
+  });
+
+  it('leaves silent schedules (no recipients) alone — they deliver nothing by design', async () => {
+    const silent = { ...sensitiveSchedule, emailNotifications: [] as string[] };
+    await runScheduledChat(silent, ownerId, false);
+    expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
+    expect((mockUserDb as any).getUserByEmail).not.toHaveBeenCalled();
+  });
+});
+
+// ── ENG-1552: activation gates (create / update / toggle) ─────────────────────
+describe('scheduled-chat activation gates (ENG-1552)', () => {
+  // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+  beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+  const ownerId = 'owner-gate';
+  const ownerEmail = 'owner@customer.example';
+  const admins = new Set<string>();
+  const res = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+  const activeSensitive = {
+    scheduleId: 'sched-gate',
+    scheduleName: 'Cross-account digest',
+    startingMessage: 'Summarize all clients',
+    frequency: 'daily',
+    userId: ownerId,
+    status: 'active',
+    nextRunTime: new Date().toISOString(),
+    requiredFunctionCalls: ['list_all_clients'],
+    emailNotifications: ['admin@agentweb.example'],
+    keywords: [] as string[],
+  };
+  const expectRejected = (r: Response) => {
+    expect(r.status).toHaveBeenCalledWith(400);
+    const body = (r.json as jest.Mock).mock.calls[0][0];
+    expect(body.remediation).toEqual(expect.objectContaining({
+      code: 'no_authorized_recipients',
+      missingPermission: 'isAdmin',
+      eligibleRecipients: [],
+      owner: ownerEmail,
+    }));
+    expect(body.error).toBe(body.remediation.safeAction);
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    admins.clear();
+    admins.add('admin@agentweb.example');
+    mockedIsSubscriptionFeatureEnabled.mockResolvedValue(true);
+    (mockScheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.createSchedule as jest.Mock).mockResolvedValue(undefined);
+    mockScheduleDb.getScheduleById.mockResolvedValue(activeSensitive as any);
+    (mockUserDb as any).getUserByEmail.mockImplementation(async (email: string) =>
+      ({ email, isAdmin: admins.has(email.toLowerCase()) }));
+  });
+
+  const createReq = (body: Record<string, any>) => ({
+    user: { userId: ownerId, email: ownerEmail },
+    body: {
+      scheduleName: 'Cross-account digest',
+      startingMessage: 'Summarize all clients',
+      scheduleFrequency: 'daily',
+      keywords: [],
+      functionCallMinCalls: {},
+      ...body,
+    },
+  } as unknown as Request);
+
+  describe('createScheduledChat', () => {
+    it('rejects a cross-account schedule whose only recipient is not an admin — nothing is written', async () => {
+      const r = res();
+      await agentModeController.createScheduledChat(createReq({ requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['analyst@customer.example'] }), r);
+      expectRejected(r);
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the recipient is only the non-admin requester via the no-email fallback', async () => {
+      const r = res();
+      await agentModeController.createScheduledChat(createReq({ requiredFunctionCalls: ['list_all_clients'] }), r);
+      expectRejected(r);
+    });
+
+    it('creates it when an admin recipient is configured', async () => {
+      const r = res();
+      await agentModeController.createScheduledChat(createReq({ requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['admin@agentweb.example'] }), r);
+      expect(r.status).toHaveBeenCalledWith(201);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('does not gate ordinary (non-cross-account) schedules', async () => {
+      const r = res();
+      await agentModeController.createScheduledChat(createReq({ requiredFunctionCalls: ['get_marketing_tips'], emailNotifications: ['analyst@customer.example'] }), r);
+      expect(r.status).toHaveBeenCalledWith(201);
+    });
+
+    it('exempts the silent run: all variables pre-filled and no recipient', async () => {
+      const r = res();
+      await agentModeController.createScheduledChat(createReq({
+        startingMessage: 'Summarize {{client}}',
+        variables: [{ name: 'client', description: 'Client' }],
+        variableValues: { client: 'Haven' },
+        requiredFunctionCalls: ['list_all_clients'],
+      }), r);
+      expect(r.status).toHaveBeenCalledWith(201);
+      expect((mockScheduleDb.createSchedule as jest.Mock).mock.calls[0][0].emailNotifications).toEqual([]);
+    });
+  });
+
+  describe('updateScheduledChat', () => {
+    const updateReq = (body: Record<string, any>) => ({
+      user: { userId: ownerId, email: ownerEmail },
+      params: { scheduleId: 'sched-gate' },
+      body,
+    } as unknown as Request);
+
+    it('rejects swapping an active cross-account schedule onto a non-admin recipient', async () => {
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({ emailNotifications: ['analyst@customer.example'] }), r);
+      expectRejected(r);
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
+    it('rejects adding a cross-account tool to an active schedule mailed to non-admins', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, requiredFunctionCalls: [], emailNotifications: ['analyst@customer.example'] } as any);
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({ requiredFunctionCalls: ['list_all_clients'] }), r);
+      expectRejected(r);
+    });
+
+    it('does not refuse an unrelated edit (rename) to an already-misconfigured schedule', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, emailNotifications: ['analyst@customer.example'] } as any);
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed' }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+    });
+
+    it('an edit to the tools or prompt clears a stale sensitivity flag, so the schedule can recover', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, status: 'paused', requiredFunctionCalls: ['list_all_clients'], lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+      } as any);
+      await agentModeController.updateScheduledChat(updateReq({ requiredFunctionCalls: [] }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
+
+      (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+      await agentModeController.updateScheduledChat(updateReq({ startingMessage: 'A different prompt' }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toEqual(['lastKnownSensitive', 'lastKnownSensitiveAt']);
+    });
+
+    it('a whole-form portal save that changes nothing is neither gated nor clears the flag', async () => {
+      // The customer portal submits every field on every save — same tools, same
+      // recipients, new name — on an active schedule that is already misconfigured.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+      } as any);
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({
+        scheduleName: 'Renamed', requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['Analyst@Customer.example'],
+      }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toBeUndefined();
+    });
+
+    it.each([
+      ['a bare string', 'analyst@customer.example'],
+      ['a JSON-array string', ['["analyst@customer.example"]']],
+    ])('a no-op save on an older row whose recipients are stored as %s is not treated as a change', async (_l, stored) => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, lastKnownSensitive: true, emailNotifications: stored,
+      } as any);
+      const r = res();
+      // The portal echoes the stored value straight back.
+      await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed', emailNotifications: stored }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+    });
+
+    it('a rename leaves the sensitivity flag alone', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, lastKnownSensitive: true } as any);
+      await agentModeController.updateScheduledChat(updateReq({ scheduleName: 'Renamed' }), res());
+      expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][4]).toBeUndefined();
+    });
+
+    it('does not gate a paused schedule — toggling it back on is where the check runs', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, status: 'paused' } as any);
+      const r = res();
+      await agentModeController.updateScheduledChat(updateReq({ emailNotifications: ['analyst@customer.example'] }), r);
+      expect(r.status).not.toHaveBeenCalledWith(400);
+    });
+  });
+
+  describe('toggleScheduledChatStatus', () => {
+    const toggleReq = (status: string) => ({
+      user: { userId: ownerId, email: ownerEmail },
+      params: { scheduleId: 'sched-gate' },
+      body: { status },
+    } as unknown as Request);
+
+    it('refuses to re-enable a schedule the preflight has marked sensitive when no recipient is authorized', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...activeSensitive, status: 'paused', requiredFunctionCalls: [], lastKnownSensitive: true, emailNotifications: ['analyst@customer.example'],
+      } as any);
+      const r = res();
+      await agentModeController.toggleScheduledChatStatus(toggleReq('active'), r);
+      expectRejected(r);
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
+    it('always allows pausing', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, emailNotifications: ['analyst@customer.example'] } as any);
+      const r = res();
+      await agentModeController.toggleScheduledChatStatus(toggleReq('paused'), r);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith('sched-gate', expect.objectContaining({ status: 'paused' }));
+    });
+
+    it('re-enables a silent schedule (no recipients) without a check (ENG-1723 outreach schedules)', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({ ...activeSensitive, status: 'paused', emailNotifications: [] } as any);
+      const r = res();
+      await agentModeController.toggleScheduledChatStatus(toggleReq('active'), r);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith('sched-gate', expect.objectContaining({ status: 'active' }));
+      expect((mockUserDb as any).getUserByEmail).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ── ENG-1552: delivery read-back + human receipt confirmation ─────────────────
+describe('scheduled-report delivery read-back (ENG-1552)', () => {
+  // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+  beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+  const ownerId = 'owner-rb';
+  const res = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+  const log = [
+    { runId: 'run-a', state: 'generated', at: '1' },
+    { runId: 'run-a', state: 'delivery_attempted', authorizedRecipients: ['a@x.example', 'b@x.example'], at: '2' },
+    { runId: 'run-a', state: 'delivered', authorizedRecipients: ['a@x.example', 'b@x.example'], at: '3' },
+    { runId: 'run-b', state: 'withheld', reason: 'no_authorized_recipients', at: '4' },
+  ];
+  const schedule = { scheduleId: 'sched-rb', userId: ownerId, deliveryLog: log };
+  const req = (runId: string, body: any = {}) => ({
+    user: { userId: ownerId, email: 'owner@x.example' },
+    params: { scheduleId: 'sched-rb', runId },
+    body,
+  } as unknown as Request);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
+  });
+
+  it('test-history carries each run\'s latest delivery state without changing the array shape', async () => {
+    (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([{ runId: 'run-a' }, { runId: 'run-b' }, { runId: 'run-c' }]);
+    const r = res();
+    await agentModeController.getScheduledChatTestHistory({ user: { userId: ownerId }, params: { scheduleId: 'sched-rb' } } as unknown as Request, r);
+    const body = (r.json as jest.Mock).mock.calls[0][0];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body[0].delivery).toEqual(expect.objectContaining({ state: 'delivered' }));
+    expect(body[1].delivery).toEqual(expect.objectContaining({ state: 'withheld', reason: 'no_authorized_recipients' }));
+    expect(body[2]).not.toHaveProperty('delivery');
+  });
+
+  it('confirms a delivered run for the recipients it actually reached', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-a', { recipients: ['A@x.example', 'stranger@y.example'] }), r);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).toHaveBeenCalledWith('sched-rb', expect.objectContaining({
+      runId: 'run-a', state: 'recipient_confirmed', authorizedRecipients: ['a@x.example'], confirmedBy: 'owner@x.example',
+    }));
+  });
+
+  it('refuses to confirm a run that was withheld — nothing was delivered to confirm', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-b'), r);
+    expect(r.status).toHaveBeenCalledWith(409);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+
+  it('refuses a confirmation naming only addresses the report never went to', async () => {
+    const r = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-a', { recipients: ['stranger@y.example'] }), r);
+    expect(r.status).toHaveBeenCalledWith(400);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+
+  it('404s for another user\'s schedule and for a run with no delivery record', async () => {
+    const other = res();
+    await agentModeController.confirmScheduledReportReceipt({ ...req('run-a'), user: { userId: 'intruder' } } as unknown as Request, other);
+    expect(other.status).toHaveBeenCalledWith(404);
+    const missing = res();
+    await agentModeController.confirmScheduledReportReceipt(req('run-zzz'), missing);
+    expect(missing.status).toHaveBeenCalledWith(404);
+  });
+});
+
+// ── ENG-1552 shadow mode: with enforcement OFF (the default) customers see no change ──
+describe('ENG-1552 shadow mode (enforcement flag unset)', () => {
+  const ownerId = 'owner-shadow';
+  const res = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+  const sensitive = {
+    scheduleId: 'sched-shadow', scheduleName: 'Shadow', startingMessage: 'Summarize all clients', frequency: 'daily',
+    userId: ownerId, status: 'paused', nextRunTime: new Date().toISOString(), keywords: [] as string[],
+    requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['analyst@customer.example'], lastKnownSensitive: true,
+    deliveryLog: [{ runId: 'run-a', state: 'delivered', authorizedRecipients: ['analyst@customer.example'], at: '1' }],
+  };
+  let warn: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT;
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockedIsSubscriptionFeatureEnabled.mockResolvedValue(true);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockAgentModeService.generateScheduledChatSummary.mockResolvedValue(null);
+    const session = { sessionId: 'sess-shadow', userId: ownerId, title: 't', messages: [], createdAt: '', updatedAt: '' };
+    mockChatbotDb.createChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(session as any);
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    (mockScheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.createSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.clearRunInFlight as jest.Mock).mockResolvedValue(true);
+    mockScheduleDb.addRunResult.mockResolvedValue(undefined);
+    mockScheduleDb.getScheduleById.mockResolvedValue(sensitive as any);
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+      content: 'Report body', toolCalls: [{ name: 'list_all_clients', arguments: {} }], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    } as any);
+    mockUserDb.getUserById.mockResolvedValue({ userId: ownerId, email: 'owner@customer.example', isAdmin: false } as any);
+    (mockUserDb as any).getUserByEmail.mockResolvedValue({ isAdmin: false });
+  });
+  afterEach(() => warn.mockRestore());
+
+  const shadowLogged = (what: string) =>
+    warn.mock.calls.some((c) => String(c[0]).startsWith(`[ENG-1552 shadow] would have ${what}`));
+
+  it('create/toggle/update go through unchanged, and only log what would have been rejected', async () => {
+    const create = res();
+    await agentModeController.createScheduledChat({
+      user: { userId: ownerId, email: 'owner@customer.example' },
+      body: { scheduleName: 'S', startingMessage: 'x', scheduleFrequency: 'daily', keywords: [], functionCallMinCalls: {},
+        requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['analyst@customer.example'] },
+    } as unknown as Request, create);
+    expect(create.status).toHaveBeenCalledWith(201);
+    expect(shadowLogged('rejected schedule create')).toBe(true);
+
+    const toggle = res();
+    await agentModeController.toggleScheduledChatStatus({
+      user: { userId: ownerId, email: 'owner@customer.example' }, params: { scheduleId: 'sched-shadow' }, body: { status: 'active' },
+    } as unknown as Request, toggle);
+    expect(toggle.status).not.toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith('sched-shadow', expect.objectContaining({ status: 'active' }));
+    expect(shadowLogged('rejected schedule toggle')).toBe(true);
+
+    const update = res();
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...sensitive, status: 'active' } as any);
+    await agentModeController.updateScheduledChat({
+      user: { userId: ownerId, email: 'owner@customer.example' }, params: { scheduleId: 'sched-shadow' },
+      body: { emailNotifications: ['other@customer.example'] },
+    } as unknown as Request, update);
+    expect(update.status).not.toHaveBeenCalledWith(400);
+    expect(shadowLogged('rejected schedule update')).toBe(true);
+  });
+
+  it('the run still generates (no skip), and the would-have-skipped decision is logged', async () => {
+    // Sensitive via the previous run's breadcrumb (this suite's subscription mock
+    // doesn't allow list_all_clients as a REQUIRED call, an unrelated gate).
+    const result = await runScheduledChat({ ...sensitive, requiredFunctionCalls: [] }, ownerId, false);
+    expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
+    expect(result.remediation).toBeUndefined();
+    expect(mockEmailService.notifyScheduledReportWithheld).not.toHaveBeenCalled();
+    expect(shadowLogged('skipped generation')).toBe(true);
+  });
+
+  it('the schedule list (also Emma\'s list_scheduled_chats) never carries the internal delivery fields', async () => {
+    (mockScheduleDb.getSchedulesByUserId as jest.Mock).mockResolvedValue([
+      { ...sensitive, type: 'scheduled_chat', lastKnownSensitiveAt: '2026-09-18T00:00:00.000Z', runResults: [] },
+    ]);
+    const r = res();
+    await agentModeController.getScheduledChats({ user: { userId: ownerId } } as unknown as Request, r);
+    const [row] = (r.json as jest.Mock).mock.calls[0][0];
+    expect(row.scheduleId).toBe('sched-shadow');
+    expect(row).not.toHaveProperty('deliveryLog');
+    expect(row).not.toHaveProperty('lastKnownSensitive');
+    expect(row).not.toHaveProperty('lastKnownSensitiveAt');
+    expect(row).not.toHaveProperty('runResults');
+  });
+
+  it('a test-email resend to a typed address is NOT recorded as the run\'s delivery', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({ ...sensitive, frequency: 'weekly' } as any);
+    (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([
+      { runId: 'run-7', sessionId: 'sess-7', passed: true, actualResponse: 'Report', createdAt: new Date().toISOString() },
+    ]);
+    const r = res();
+    await agentModeController.sendScheduledChatTestEmail({
+      user: { userId: ownerId }, params: { scheduleId: 'sched-shadow', runId: 'run-7' }, body: { toEmail: 'me@customer.example' },
+    } as unknown as Request, r);
+    expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
+      ['me@customer.example'], expect.any(String), expect.objectContaining({ sessionId: 'sess-7' }), 'sched-shadow', undefined,
+      { recordDelivery: false },
+    );
+  });
+
+  it('test-history carries no delivery field, and the confirm endpoint does not exist', async () => {
+    (mockScheduleDb.getRunResults as jest.Mock).mockResolvedValue([{ runId: 'run-a' }]);
+    const history = res();
+    await agentModeController.getScheduledChatTestHistory({ user: { userId: ownerId }, params: { scheduleId: 'sched-shadow' } } as unknown as Request, history);
+    expect((history.json as jest.Mock).mock.calls[0][0][0]).not.toHaveProperty('delivery');
+
+    const confirm = res();
+    await agentModeController.confirmScheduledReportReceipt({
+      user: { userId: ownerId, email: 'owner@customer.example' }, params: { scheduleId: 'sched-shadow', runId: 'run-a' }, body: {},
+    } as unknown as Request, confirm);
+    expect(confirm.status).toHaveBeenCalledWith(404);
+    expect((mockScheduleDb as any).appendDeliveryLogEntry).not.toHaveBeenCalled();
   });
 });

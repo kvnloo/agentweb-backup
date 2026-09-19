@@ -11,6 +11,7 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -271,20 +272,119 @@ mcpToolRegistry.register({
   },
 });
 
+// ENG-2057: expose the customer work-plan lifecycle as discrete outcomes so
+// connector discovery can rank launch and structured answering independently.
+// Keep both lifecycle tools public: external agents need the launch and unblock pair.
+mcpToolRegistry.register({
+  name: 'emma_launch_work_plan',
+  requiresUserAccount: true,
+  definition: {
+    name: 'emma_launch_work_plan',
+    description: 'Launch an accessible predefined work plan in an existing Emma session. Find a plan with list_predefined_work_plans first, then poll progress with emma_get_session. Refuses to replace a different active work plan.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        plan_id: { type: 'string', description: 'The predefined plan ID. Alias: work_plan_id.' },
+        work_plan_id: { type: 'string', description: 'Alias for plan_id.' },
+      },
+      required: ['session_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const planId = args.plan_id ?? args.work_plan_id;
+    if (typeof planId !== 'string' || planId.trim() === '') {
+      return jsonResult({ success: false, message: 'plan_id (or work_plan_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}/work-plan`,
+      context: ctx(context),
+      body: { planId },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_answer_work_plan_input',
+  definition: {
+    name: 'emma_answer_work_plan_input',
+    description: 'Answer a pending structured work-plan input request shown by emma_get_session. Values must be keyed by the field IDs in pendingWorkPlanInput. A plain emma_send_message does not submit these structured values.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        request_id: { type: 'string', description: 'The pendingWorkPlanInput.requestId. Alias: work_plan_request_id.' },
+        work_plan_request_id: { type: 'string', description: 'Alias for request_id.' },
+        values: { type: 'object', additionalProperties: true, description: 'Answers keyed by pendingWorkPlanInput field ID.' },
+        label: { type: 'string', description: 'Optional chat-visible summary. Defaults to a neutral submission message.' },
+      },
+      required: ['session_id', 'values'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const requestId = args.request_id ?? args.work_plan_request_id;
+    if (typeof requestId !== 'string' || requestId.trim() === '') {
+      return jsonResult({ success: false, message: 'request_id (or work_plan_request_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      context: ctx(context),
+      body: {
+        sessionId: args.session_id,
+        userMessage: typeof args.label === 'string' && args.label.trim() !== ''
+          ? args.label
+          : 'Submitted requested work plan details.',
+        workPlanInputAnswer: { requestId, values: args.values },
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
 mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID, including the active workPlan summary and pendingWorkPlanInput when structured details are awaiting an answer. Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Check pendingUserQuestion and pendingWorkPlanInput before assuming a run has completed; resolve them with emma_answer_question and emma_answer_work_plan_input respectively, never with a plain emma_send_message reply.',
     inputSchema: {
       type: 'object',
-      properties: { session_id: { type: 'string', description: 'The session ID' } },
+      properties: {
+        session_id: { type: 'string', description: 'The session ID' },
+        run_id: { type: 'string', description: 'The run_id returned by a detached task (runId from emma_send_message). Pass it to check durable terminal status.' },
+      },
       required: ['session_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${args.session_id}`, context: ctx(context) });
-    return jsonResult(data);
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}`, context: ctx(context) });
+    let run: AgentRunStatus | null = null;
+    if (typeof args.run_id === 'string' && args.run_id) {
+      try {
+        const record: any = await mcpFetch({
+          method: 'GET', path: `/api/agent-mode/runs/${encodeURIComponent(args.run_id)}`, context: ctx(context),
+        });
+        // This is a network boundary: validate identity and every field used as evidence.
+        if (record && record.runId === args.run_id && record.sessionId === args.session_id &&
+            ['running', 'completed', 'failed', 'interrupted'].includes(record.status) &&
+            (record.finishReason == null || typeof record.finishReason === 'string')) {
+          run = { runId: record.runId, sessionId: record.sessionId, status: record.status,
+            finishReason: record.finishReason ?? null };
+        }
+      } catch {
+        // A refusal, missing record or operational failure is never completion evidence.
+      }
+    }
+    return jsonResult({
+      ...data,
+      run,
+      // Terminal means the request ended, not that all detached or continuation work did.
+      completion_confirmed: run !== null && run.status !== 'running' &&
+        !['detached_still_building', 'timeout_partial_media', 'timeout_partial_work'].includes(run.finishReason ?? '') &&
+        data?.pendingUserQuestion?.status !== 'awaiting' && data?.pendingWorkPlanInput?.status !== 'awaiting',
+    });
   }
 });
 
@@ -946,6 +1046,108 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
+//
+// `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
+// the campaign itself. Read-only by construction: list + inspect + enrollment
+// counts only. Create/activate/pause live in the sibling ENG-442 work
+// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
+// never be added here.
+
+mcpToolRegistry.register({
+  name: 'list_crm_sequences',
+  definition: {
+    name: 'list_crm_sequences',
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+
+Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
+
+An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summary line. That is a valid answer meaning "no campaigns exist", not an error — report it as such instead of retrying or guessing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['draft', 'active', 'paused', 'archived'],
+          description: 'Only return sequences in this status. Omit to return all of them.',
+        },
+        sequence_id: {
+          type: 'string',
+          description: 'Inspect one sequence: returns its summary plus enrollment counts. Omit to list all.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const { summarizeSequence } = await import('../../services/crmSequenceRead');
+    try {
+      // Inspect-one path: summary + enrollment counts. The routes 403 when the
+      // sequence belongs to another user, so cross-account reads fail closed
+      // at the API boundary, not in this tool.
+      if (typeof args?.sequence_id === 'string' && args.sequence_id.trim()) {
+        const sequenceId = args.sequence_id.trim();
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+        });
+        const sequence = data?.sequence;
+        if (!sequence) return jsonResult({ error: `Sequence not found: ${sequenceId}` });
+        let enrollment_count: unknown = undefined;
+        let enrollment_error: string | undefined = undefined;
+        try {
+          const enrollments = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}/enrollments`,
+            context: ctx(context),
+          });
+          enrollment_count = enrollments?.stats ?? enrollments?.enrollments?.length ?? undefined;
+        } catch (err: any) {
+          // Surface enrollment-endpoint failures explicitly instead of
+          // silently dropping the count (CodeRabbit, PR #2974): the
+          // inspect-one contract promises an enrollment count, and a 401/403,
+          // timeout, or 5xx here must not read as "zero enrollments".
+          enrollment_count = undefined;
+          enrollment_error = err?.message || String(err);
+        }
+        return jsonResult({
+          ...summarizeSequence(sequence),
+          enrollment_count,
+          ...(enrollment_error ? { enrollment_error } : {}),
+        });
+      }
+
+      const data = await mcpFetch({
+        method: 'GET',
+        path: '/api/crm/sequences',
+        context: ctx(context),
+      });
+
+      const all = Array.isArray(data?.sequences) ? data.sequences : [];
+      const filtered =
+        typeof args?.status === 'string' ? all.filter((s: any) => s?.status === args.status) : all;
+      const sequences = filtered.map(summarizeSequence);
+      const activeCount = sequences.filter((s: any) => s.is_sending).length;
+
+      return jsonResult({
+        total: sequences.length,
+        active_count: activeCount,
+        sequences,
+        summary:
+          sequences.length === 0
+            ? typeof args?.status === 'string'
+              ? `No CRM drip sequences match status "${args.status}".`
+              : 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
+      });
+    } catch (err: any) {
+      return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
+});
+
 mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
@@ -1491,6 +1693,9 @@ Admin-only: pass client_id to list a specific client's connected accounts instea
 
 mcpToolRegistry.register({
   name: 'post_on_account',
+  internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'post_on_account',
     description: 'Post content on a connected social media account.',
@@ -2074,7 +2279,6 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'generate_image',
-  internal: true,
   definition: {
     name: 'generate_image',
     description: 'Generate images using AI image generation models.',

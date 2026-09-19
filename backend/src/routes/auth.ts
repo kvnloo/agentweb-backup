@@ -323,7 +323,10 @@ const googleAuthFinalHandler = (req: Request, res: Response) => {
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
     }
 
-    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}`);
+    // ENG-470: propagate the new-vs-returning signal only when true. Returning
+    // logins get no param, so the portal can never mistake them for signups.
+    const newUserSuffix = userAuthInfo.isNewUser === true ? '&isNewUser=true' : '';
+    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}${newUserSuffix}`);
 };
 
 router.get('/google/callback', 

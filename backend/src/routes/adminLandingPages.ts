@@ -8,6 +8,9 @@
  *   GET  /resolve?url=…            resolve a page (any owner) by URL/domain
  *   POST /:id/org-share            enable owner-org sharing + grant editors
  *   GET  /:id/effective-view?member=…  a member's effective access to a page
+ *   POST /external-import           register an already-deployed canonical URL
+ *                                   as an imported record owned by the caller
+ *                                   (ENG-1238; no generation/clone/deploy)
  *
  * Cross-account mutations are audited via recordAdminAudit (ENG-721 AC4).
  */
@@ -26,8 +29,57 @@ import {
   defaultShareSettings,
 } from "../services/orgShareService";
 import { recordAdminAudit } from "../services/adminAuditLog";
+import {
+  registerExternalLandingPage,
+  ExternalLandingPageValidationError,
+} from "../services/externalLandingPageCatalog";
 
 const router = express.Router();
+
+/**
+ * POST /external-import (ENG-1238)
+ * Body: { name, canonicalUrl, context?, repoRef?, projectRef?, leadListId? }
+ *
+ * Registers an already-deployed canonical URL as an imported Landing Pages
+ * record owned by the calling admin's own userId partition — no generation,
+ * no clone, no deploy, no site/repo mutation. Mounted behind authenticateToken
+ * + isAdmin (see app.ts), so every caller here is a real admin and the row is
+ * always owned by the admin who registered it: no cross-account write, no
+ * impersonation. Audited via recordAdminAudit like the other admin mutations.
+ */
+router.post("/external-import", async (req: Request, res: Response) => {
+  const actor = (req as AuthenticatedRequest).user;
+  if (!actor?.userId) {
+    return res.status(401).json({ message: "Authentication required" });
+  }
+  try {
+    const result = await registerExternalLandingPage({
+      userId: actor.userId,
+      name: typeof req.body?.name === "string" ? req.body.name : "",
+      canonicalUrl: typeof req.body?.canonicalUrl === "string" ? req.body.canonicalUrl : "",
+      context: typeof req.body?.context === "string" ? req.body.context : undefined,
+      repoRef: typeof req.body?.repoRef === "string" ? req.body.repoRef : undefined,
+      projectRef: typeof req.body?.projectRef === "string" ? req.body.projectRef : undefined,
+      leadListId: typeof req.body?.leadListId === "string" ? req.body.leadListId : undefined,
+    });
+    recordAdminAudit({
+      actorUserId: actor.userId,
+      actorEmail: actor.email,
+      action: "landing_page_external_import",
+      pageId: result.page.id,
+      pageOwnerUserId: result.page.userId,
+      canonicalUrl: result.page.canonicalUrl,
+      leadListId: result.page.leadListId ?? null,
+    });
+    return res.status(201).json(result);
+  } catch (error: any) {
+    if (error instanceof ExternalLandingPageValidationError) {
+      return res.status(400).json({ message: error.reason });
+    }
+    console.error("adminLandingPages external-import error:", error?.message ?? error);
+    return res.status(500).json({ message: "Failed to register externally-deployed landing page" });
+  }
+});
 
 interface UserRecordLike {
   userId: string;
