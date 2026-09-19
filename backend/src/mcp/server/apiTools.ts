@@ -274,6 +274,7 @@ mcpToolRegistry.register({
 
 // ENG-2057: expose the customer work-plan lifecycle as discrete outcomes so
 // connector discovery can rank launch and structured answering independently.
+// Keep both lifecycle tools public: external agents need the launch and unblock pair.
 mcpToolRegistry.register({
   name: 'emma_launch_work_plan',
   requiresUserAccount: true,
