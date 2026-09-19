@@ -149,7 +149,8 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
   it('still creates/dedupes the Linear canonical (still files)', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
+    // ENG-1590: reportedByAdmin set => Delegated-Filed is appended alongside the base labels.
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported', 'Delegated-Filed'] }));
     expect(r.canonicalUrl).toBe('lin');
   });
 
