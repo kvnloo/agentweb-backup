@@ -1133,7 +1133,12 @@ describe('Slack Events API', () => {
           if (key === 'slack_admin_channels') return { settingValue: JSON.stringify(['C_ADMIN']) };
           return null;
         });
-        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'delegated-session', userId: 'customer-user', llmModel: 'gpt-4o' });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'delegated-session',
+          userId: 'customer-user',
+          llmModel: 'gpt-4o',
+          delegateInfo: { isDelegated: true, adminUserId: 'admin-user' },
+        });
         userDb.getUserById.mockResolvedValue({ userId: 'customer-user', slackChannel: 'C_CUSTOMER' });
         getSlackUserEmail.mockResolvedValue('admin@agentweb.pro');
         userDb.getUserByEmail.mockResolvedValue({ userId: 'admin-user', slackChannel: 'C_ADMIN' });
