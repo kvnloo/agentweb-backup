@@ -65,6 +65,7 @@ export interface OAuthTokenRecord {
   familyId?: string; // Root tokenHash; legacy refresh tokens without lineage require login.
   familyRevoked?: boolean; // Only authoritative on the root; retained until family expiry.
   revoked: boolean;
+  revokedAtSec?: number; // epoch seconds when this record's refresh was consumed; bounds replay grace.
   createdAt: string;
 }
 
@@ -117,6 +118,11 @@ const SUPPORTED_AUTH_METHODS = ['none', 'client_secret_basic', 'client_secret_po
 const AUTH_CODE_TTL_SEC = 600; // 10 minutes
 const ACCESS_TOKEN_TTL_SEC = 3600; // 1 hour
 const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 3600; // 30 days
+// Duplicate-delivery grace: a consumed refresh token re-presented within this window
+// returns the already-issued successor instead of revoking the family. Covers benign
+// races (multi-process clients, retried requests after a lost response) without weakening
+// theft detection — a genuinely stolen ancestor replayed after the window still revokes.
+const REFRESH_REPLAY_GRACE_SEC = 60;
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
@@ -411,6 +417,30 @@ export class McpOAuthService {
     }
   }
 
+  private async replayGraceSuccessor(record: OAuthTokenRecord, now: number): Promise<TokenPairResponse | null> {
+    // Benign duplicate delivery (multi-process refresh race, retried request after a
+    // lost response): the consumed token re-presented within REFRESH_REPLAY_GRACE_SEC
+    // of its consumption mints a fresh pair in the same family instead of revoking it.
+    // Only hashes are stored, so the already-issued successor's raw tokens are
+    // unrecoverable — a fresh sibling pair keeps the client working without weakening
+    // theft detection. Outside the window, null: the caller revokes (unchanged).
+    if (typeof record.familyId !== 'string' || !record.familyId ||
+        !Number.isFinite(record.revokedAtSec) || now - record.revokedAtSec! > REFRESH_REPLAY_GRACE_SEC) return null;
+    if (!await this.activeFamily(record)) return null;
+    const familyId = record.familyId!;
+    const { record: sibling, response } = this.newTokenPair(record, familyId, record.refreshExpiresAt);
+    try {
+      await dynamodb.put({
+        TableName: this.tokensTable,
+        Item: sibling,
+        ConditionExpression: 'attribute_not_exists(tokenHash)',
+      }).promise();
+    } catch {
+      return null;
+    }
+    return response;
+  }
+
   private async revokeFamily(record: OAuthTokenRecord): Promise<void> {
     if (!record.familyId) return; // Legacy consumed records have no recoverable lineage.
     try {
@@ -448,6 +478,8 @@ export class McpOAuthService {
       try { await requireActiveEvaluation(record.userId); } catch { return null; }
     }
     if (record.revoked) {
+      const graced = await this.replayGraceSuccessor(record, now);
+      if (graced) return graced;
       await this.revokeFamily(record);
       return null;
     }
@@ -464,7 +496,7 @@ export class McpOAuthService {
     if (familyId === record.tokenHash) conditions.push('familyRevoked = :unused');
     const TransactItems: AWS.DynamoDB.DocumentClient.TransactWriteItemList = [
       { Update: { TableName: this.tokensTable, Key: { tokenHash: record.tokenHash },
-        UpdateExpression: 'SET revoked = :used', ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } },
+        UpdateExpression: 'SET revoked = :used, revokedAtSec = :now', ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } },
       { Put: { TableName: this.tokensTable, Item: successor, ConditionExpression: 'attribute_not_exists(tokenHash)' } },
     ];
     if (familyId !== record.tokenHash) {
@@ -484,6 +516,8 @@ export class McpOAuthService {
       // Only authenticated, correctly bound replay revokes. Storage errors must not
       // masquerade as replay or silently revoke an otherwise usable grant.
       if (current?.revoked && current.clientId === clientId && current.refreshTokenHash === refreshTokenHash) {
+        const graced = await this.replayGraceSuccessor(current, now);
+        if (graced) return graced;
         await this.revokeFamily(current);
         return null;
       }
