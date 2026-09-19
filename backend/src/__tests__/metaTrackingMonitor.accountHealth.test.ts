@@ -74,3 +74,41 @@ describe('metaTrackingMonitorCron account-health sweep', () => {
     expect(result.accountHealthFlaggedUsers).toEqual([]);
   });
 });
+
+describe('ad-account scoping (CodeRabbit review)', () => {
+  it('restricts the health signal to the scoped ad account only', async () => {
+    const multiUser = {
+      userId: 'u-health-scope',
+      connected_accounts: [
+        {
+          platform: 'meta',
+          account_id: 'act-scoped',
+          config: { account_type: 'ad_account', token_expires_at: Date.parse('2099-01-01T00:00:00Z') },
+        },
+        {
+          platform: 'meta',
+          account_id: 'act-other',
+          config: { account_type: 'ad_account', token_expires_at: 1 },
+        },
+      ],
+    };
+    getAllUsers.mockResolvedValue([multiUser]);
+    // Destination alerts force the pixel check to flag, so the run records a flag
+    // regardless — the scope assertion below is what distinguishes the signal.
+    monitorUserTracking.mockResolvedValue(monitorSummary({ destinationAlerts: 1, destinationOk: 0 }));
+
+    const result = await runMetaTrackingMonitor({ dryRun: true, adAccountId: 'act-scoped' });
+
+    expect(result.accountHealthFlags).toBeGreaterThan(0);
+    // The scoped account has a valid token, so connectivity must not flag:
+    // every captured account-health alert must come from the pixel check, not connectivity.
+    const healthAlerts = (result.capturedAlerts ?? []).filter((a: any) =>
+      /account health/i.test(a.subject),
+    );
+    expect(healthAlerts.length).toBeGreaterThan(0);
+    for (const alert of healthAlerts) {
+      const checks = (alert.context?.flags ?? []).map((f: any) => f.check);
+      expect(checks).not.toContain('connectivity');
+    }
+  });
+});

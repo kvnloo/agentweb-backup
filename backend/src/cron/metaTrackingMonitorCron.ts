@@ -238,14 +238,21 @@ export async function runMetaTrackingMonitor(
       summary.eventMixStale += result.eventMixStale ?? 0;
 
       const userId = String(user?.userId);
-      const connectedAccounts: ConnectivityAccountInput[] = (user?.connected_accounts ?? []).map(
-        (account: any) => ({
-          platform: account?.platform,
-          config: account?.config
-            ? { token_expires_at: account.config.token_expires_at }
-            : account?.config,
-        }),
-      );
+      // Honor the dry-run ad-account scope: when options.adAccountId restricts the sweep,
+      // the health signal must cover only that account — otherwise a scoped one-account
+      // probe inherits every other account's token state and reads like a fleet finding.
+      const scopedAccounts = Array.isArray(user?.connected_accounts)
+        ? user.connected_accounts.filter(
+            (account: any) =>
+              !options?.adAccountId || String(account?.account_id) === String(options.adAccountId),
+          )
+        : [];
+      const connectedAccounts: ConnectivityAccountInput[] = scopedAccounts.map((account: any) => ({
+        platform: account?.platform,
+        config: account?.config
+          ? { token_expires_at: account.config.token_expires_at }
+          : account?.config,
+      }));
       const accountHealth = evaluateAccountHealth({
         userId,
         pixel: {
