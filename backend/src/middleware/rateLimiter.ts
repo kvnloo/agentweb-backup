@@ -32,6 +32,28 @@ export class RateLimiter {
   // are skipped lazily at eviction time).
   private evictQueue: string[] = [];
   private evictQueueHeads: Set<string> = new Set();
+  // Head offset into evictQueue (ENG-1768 follow-up): heads are removed by
+  // advancing this index instead of Array.shift(), which would reindex the
+  // whole array per removal — O(N^2) to drain N heads under flood. The
+  // consumed prefix is compacted away once it grows large (amortized O(1)).
+  private evictQueueHead = 0;
+
+  // Removes the current queue head, compacting the consumed prefix when it
+  // grows large enough that slicing pays for itself. Callers must also
+  // evictQueueHeads.delete(key) for the removed head.
+  private shiftEvictQueue(): void {
+    this.evictQueueHead++;
+    if (this.evictQueueHead >= this.evictQueue.length) {
+      this.evictQueue = [];
+      this.evictQueueHead = 0;
+    } else if (
+      this.evictQueueHead >= 1024 &&
+      this.evictQueueHead * 2 >= this.evictQueue.length
+    ) {
+      this.evictQueue = this.evictQueue.slice(this.evictQueueHead);
+      this.evictQueueHead = 0;
+    }
+  }
 
   constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000) {
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
@@ -58,12 +80,29 @@ export class RateLimiter {
    */
   private findEvictionCandidate(now: number): string | undefined {
     const windowStart = now - this.windowMs;
-    while (this.evictQueue.length > 0) {
-      const key = this.evictQueue[0];
+    // First pass: sweep expired keys anywhere in entries back into the
+    // queue. A key dropped from the queue while blocked re-qualifies once
+    // its timestamps age out; without this, the fallback below could evict
+    // a still-blocked key while an untracked idle key sits in entries,
+    // letting the evicted key re-enter with an empty window early.
+    if (this.evictQueueHeads.size < this.entries.size) {
+      for (const [key, entry] of this.entries.entries()) {
+        if (this.evictQueueHeads.has(key)) continue;
+        const activeCount = entry.timestamps.filter(
+          (t) => t > windowStart,
+        ).length;
+        if (activeCount < entry.lastMax) {
+          this.evictQueue.push(key);
+          this.evictQueueHeads.add(key);
+        }
+      }
+    }
+    while (this.evictQueueHead < this.evictQueue.length) {
+      const key = this.evictQueue[this.evictQueueHead];
       const entry = this.entries.get(key);
       if (!entry) {
         // Stale head: key already evicted — drop and continue.
-        this.evictQueue.shift();
+        this.shiftEvictQueue();
         this.evictQueueHeads.delete(key);
         continue;
       }
@@ -71,11 +110,11 @@ export class RateLimiter {
       if (activeCount === 0 || activeCount < entry.lastMax) {
         return key; // idle or under-limit — safe to evict immediately
       }
-      // Head is currently blocked; drop it from the queue (it will be
-      // re-queued by check() if it ever becomes non-blocked again) and
-      // keep walking — this walk only visits keys once per state change,
+      // Head is currently blocked; drop it from the queue (the sweep above
+      // re-queues it if it ever becomes non-blocked again) and keep
+      // walking — this walk only visits keys once per state change,
       // never the full timestamp volume per call.
-      this.evictQueue.shift();
+      this.shiftEvictQueue();
       this.evictQueueHeads.delete(key);
     }
     // Every tracked key is currently blocked: fall back to oldest insertion.
@@ -157,6 +196,7 @@ export class RateLimiter {
     }
     this.entries.clear();
     this.evictQueue = [];
+    this.evictQueueHead = 0;
     this.evictQueueHeads.clear();
   }
 }
