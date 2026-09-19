@@ -1,0 +1,57 @@
+{
+  "author_email": "harsha@agentweb.pro",
+  "author_name": "Harsha Vankayalapati",
+  "author_type": "apiKey",
+  "id": "3ad1dc70-480a-498e-8a2a-086134949545",
+  "project_id": "0d5558f2-1829-4990-b4a2-78dd6f9c9798",
+  "mut_id": "fceef839-d367-402c-a3c6-cc2b594cdc00",
+  "scenario_set_id": "d776f09a-7829-4280-af1f-f8614786110a",
+  "filter_group_id": "b1b4b00c-97e2-4975-bbfc-bc36dee3d7c9",
+  "name": "ENG-2029-final-changed-20260919",
+  "tags": [],
+  "type": "MULTI_CLASS_CLASSIFICATION",
+  "start_time": "2026-09-19T20:08:22.075433",
+  "end_time": "2026-09-19T20:08:22.153093",
+  "time_created": "2026-09-19T20:08:22.075998",
+  "test_data_point_count": 9,
+  "model_metrics": {
+    "weighted_average": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "accuracy": 1.0
+    },
+    "scores_by_label": {
+      "needs_correction": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      },
+      "no_correction": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0
+      }
+    }
+  },
+  "error_matrix": [
+    {
+      "needs_correction": [
+        5,
+        0
+      ]
+    },
+    {
+      "no_correction": [
+        0,
+        4
+      ]
+    }
+  ],
+  "status": "FINISHED",
+  "failure_message": null,
+  "progress": 100.0,
+  "app_link": "https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/3ad1dc70-480a-498e-8a2a-086134949545",
+  "simulation_params": {},
+  "driver_id": null
+}

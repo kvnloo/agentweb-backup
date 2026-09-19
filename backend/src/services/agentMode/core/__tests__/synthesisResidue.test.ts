@@ -373,6 +373,19 @@ describe('buildExecutedActionsFooter', () => {
 // content and compares it against the ledger's actual successful asset-producing
 // tool calls.
 describe('detectFalseCompletionClaim', () => {
+  it.each([
+    'All 12 sizes rendered successfully.',
+    'All 12 sizes were rendered successfully for the campaign.',
+    'All 12 sizes have been rendered successfully, and saved.',
+  ])('verifies the production-verb success suffix: %s', content => {
+    expect(detectFalseCompletionClaim(content, [])).toEqual({ claimed: 12, actual: 0 });
+  });
+  it('scans a large read-only analysis without quadratic predicate rescanning', () => {
+    const content = 'All 4 ads generated leads in this reporting window. '.repeat(20_000);
+    const started = performance.now();
+    expect(detectFalseCompletionClaim(content, [])).toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
   it('still verifies a production claim with a success adverb', () => {
     expect(detectFalseCompletionClaim('All 12 sizes were successfully rendered.', [])).toEqual({ claimed: 12, actual: 0 });
   });

@@ -1,0 +1,57 @@
+{
+  "author_email": "harsha@agentweb.pro",
+  "author_name": "Harsha Vankayalapati",
+  "author_type": "apiKey",
+  "id": "5e8d5de1-8f21-46a6-9c11-c1e3adaaafc0",
+  "project_id": "0d5558f2-1829-4990-b4a2-78dd6f9c9798",
+  "mut_id": "9a5ab9ec-92e2-4c50-a7d6-733f101657c7",
+  "scenario_set_id": "d776f09a-7829-4280-af1f-f8614786110a",
+  "filter_group_id": "c28e5b07-02e8-402a-bc62-5af31f6f4271",
+  "name": "ENG-2029-final-baseline-20260919",
+  "tags": [],
+  "type": "MULTI_CLASS_CLASSIFICATION",
+  "start_time": "2026-09-19T20:08:19.211278",
+  "end_time": "2026-09-19T20:08:19.296169",
+  "time_created": "2026-09-19T20:08:19.211873",
+  "test_data_point_count": 9,
+  "model_metrics": {
+    "weighted_average": {
+      "precision": 0.8412698412698413,
+      "recall": 0.7777777777777778,
+      "f1": 0.7592592592592593,
+      "accuracy": 0.7777777777777778
+    },
+    "scores_by_label": {
+      "needs_correction": {
+        "precision": 0.7142857142857143,
+        "recall": 1.0,
+        "f1": 0.8333333333333334
+      },
+      "no_correction": {
+        "precision": 1.0,
+        "recall": 0.5,
+        "f1": 0.6666666666666666
+      }
+    }
+  },
+  "error_matrix": [
+    {
+      "needs_correction": [
+        5,
+        0
+      ]
+    },
+    {
+      "no_correction": [
+        2,
+        2
+      ]
+    }
+  ],
+  "status": "FINISHED",
+  "failure_message": null,
+  "progress": 100.0,
+  "app_link": "https://app.okareo.com/project/0d5558f2-1829-4990-b4a2-78dd6f9c9798/eval/5e8d5de1-8f21-46a6-9c11-c1e3adaaafc0",
+  "simulation_params": {},
+  "driver_id": null
+}
