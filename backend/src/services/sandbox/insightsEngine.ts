@@ -198,6 +198,7 @@ interface Agg {
   bucket: DayRange; // frozen dates
   impressions: number; reach: number; clicks: number; uniqueClicks: number; inlineLinkClicks: number;
   outboundClicks: number; hasOutbound: boolean; spend: number; videoViews: number; hasVideo: boolean;
+  dailyReach: Map<string, Map<string, number>>;
   actions: Map<string, number>; actionValues: Map<string, number>;
 }
 
@@ -505,7 +506,7 @@ export function runInsights(dataset: SandboxDataset, overlay: SandboxOverlay, pa
   const rows = sourceRows(dataset, params.breakdowns)
     .filter((row) => inScope(params.node, row, dataset.account.account_id))
     .filter((row) => filters.entity.every((f) => operatorMatches(entityValue(f.field, row, objects), f.operator, f.value)))
-    .filter((row) => filters.dimension.every((f) => operatorMatches(row.dims[f.field], f.operator, f.value)));
+    ;
   const actionAllowed = (type: string) => filters.actionType.every((f) => operatorMatches(type, f.operator, f.value));
   const ctx: EmitContext = { dataset, objects, level, shift };
   const fields = [...new Set(params.fields)];
@@ -523,10 +524,13 @@ export function runInsights(dataset: SandboxDataset, overlay: SandboxOverlay, pa
         let agg = groups.get(key);
         if (!agg) {
           agg = { entity, dims: Object.fromEntries(params.breakdowns.map((d) => [d, row.dims[d] ?? 'unknown'])), bucket, impressions: 0, reach: 0, clicks: 0, uniqueClicks: 0,
-            inlineLinkClicks: 0, outboundClicks: 0, hasOutbound: false, spend: 0, videoViews: 0, hasVideo: false, actions: new Map(), actionValues: new Map() };
+            inlineLinkClicks: 0, outboundClicks: 0, hasOutbound: false, spend: 0, videoViews: 0, hasVideo: false, dailyReach: new Map(), actions: new Map(), actionValues: new Map() };
           groups.set(key, agg);
         }
-        agg.impressions += row.impressions; agg.reach += row.reach; agg.clicks += row.clicks;
+        agg.impressions += row.impressions; agg.clicks += row.clicks;
+        const days = agg.dailyReach.get(row.ad_id) ?? new Map<string, number>();
+        days.set(row.date, (days.get(row.date) ?? 0) + row.reach);
+        agg.dailyReach.set(row.ad_id, days);
         agg.uniqueClicks += row.unique_clicks ?? row.clicks; agg.inlineLinkClicks += row.inline_link_clicks; agg.spend += row.spend;
         if (row.outbound_clicks !== undefined) { agg.hasOutbound = true; agg.outboundClicks += row.outbound_clicks; }
         if (row.video_views !== undefined) { agg.hasVideo = true; agg.videoViews += row.video_views; }
@@ -534,7 +538,41 @@ export function runInsights(dataset: SandboxDataset, overlay: SandboxOverlay, pa
         for (const action of row.action_values ?? []) if (actionAllowed(action.action_type)) agg.actionValues.set(action.action_type, (agg.actionValues.get(action.action_type) ?? 0) + action.value);
       }
     }
+    // Model unique reach once for the unbroken entity/window. Breakdown
+    // dimensions are disjoint synthetic allocations; rounding independently per
+    // dimension would manufacture people. Apply dimension filters only AFTER this.
+    const unbroken = new Map<string, Agg[]>();
+    for (const agg of groups.values()) {
+      const key = `${agg.bucket.since}|${JSON.stringify(agg.entity)}`;
+      unbroken.set(key, [...(unbroken.get(key) ?? []), agg]);
+    }
+    for (const dimensions of unbroken.values()) {
+      const byAd = new Map<string, Map<string, number>>();
+      const weights = dimensions.map(agg => {
+        let weight = 0;
+        for (const [adId, days] of agg.dailyReach) {
+          const combined = byAd.get(adId) ?? new Map<string, number>();
+          for (const [date, reach] of days) { combined.set(date, (combined.get(date) ?? 0) + reach); weight += reach; }
+          byAd.set(adId, combined);
+        }
+        return weight;
+      });
+      let modeled = 0;
+      for (const days of byAd.values()) {
+        const daily = [...days.values()], largest = Math.max(0, ...daily);
+        modeled += Math.ceil(largest + (daily.reduce((a, b) => a + b, 0) - largest) * 0.35);
+      }
+      modeled = Math.min(modeled, dimensions.reduce((n, a) => n + a.impressions, 0));
+      const totalWeight = weights.reduce((a, b) => a + b, 0);
+      const exact = weights.map(weight => totalWeight ? modeled * weight / totalWeight : 0);
+      dimensions.forEach((agg, i) => { agg.reach = Math.floor(exact[i]); });
+      const remainder = modeled - dimensions.reduce((n, a) => n + a.reach, 0);
+      const order = exact.map((v, i) => ({ i, fraction: v - Math.floor(v) }))
+        .sort((a, b) => b.fraction - a.fraction || a.i - b.i);
+      for (let i = 0; i < remainder; i++) dimensions[order[i].i].reach++;
+    }
     const aggs = [...groups.values()]
+      .filter(agg => filters.dimension.every(f => operatorMatches(agg.dims[f.field], f.operator, f.value)))
       .filter((agg) => agg.impressions > 0 || agg.spend > 0)
       .filter((agg) => filters.metric.every((f) => operatorMatches(metricValue(f.field, agg), f.operator, f.value)))
       .sort((a, b) => a.bucket.since.localeCompare(b.bucket.since)

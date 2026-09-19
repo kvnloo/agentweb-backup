@@ -2309,7 +2309,7 @@ export class AgentModeService {
 
   async getSupportedModels(isAdmin: boolean = false) {
     const models = Object.keys(this.llmModels).filter(
-      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
+      m => this.isModelSelectableBy(m, isAdmin),
     );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one

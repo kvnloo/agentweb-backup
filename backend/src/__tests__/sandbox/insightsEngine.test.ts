@@ -26,11 +26,13 @@ describe('insights engine — sync', () => {
     const row = res.data[0] as any;
     const impressions = fixtureTotal(dataset, 'impressions'), clicks = fixtureTotal(dataset, 'clicks'), spend = fixtureTotal(dataset, 'spend');
     expect(row).toMatchObject({ account_id: FIXTURE_ACCOUNT_ID, account_name: 'AgentWeb Sandbox', date_start: '2026-08-22', date_stop: '2026-09-12',
-      impressions: String(impressions), clicks: String(clicks), spend: cents(spend), inline_link_clicks: String(fixtureTotal(dataset, 'inline_link_clicks')), reach: String(fixtureTotal(dataset, 'reach')) });
+      impressions: String(impressions), clicks: String(clicks), spend: cents(spend), inline_link_clicks: String(fixtureTotal(dataset, 'inline_link_clicks')) });
+    expect(Number(row.reach)).toBeGreaterThan(0);
+    expect(Number(row.reach)).toBeLessThan(fixtureTotal(dataset, 'reach'));
     expect(row.ctr).toBe((clicks / impressions * 100).toFixed(6));
     expect(row.cpc).toBe((spend / 100 / clicks).toFixed(6));
     expect(row.cpm).toBe((spend / 100 / impressions * 1000).toFixed(6));
-    expect(row.frequency).toBe((impressions / fixtureTotal(dataset, 'reach')).toFixed(6));
+    expect(row.frequency).toBe((impressions / Number(row.reach)).toFixed(6));
     const leads = fixtureActionTotal(dataset, 'lead');
     expect(row.actions).toEqual(expect.arrayContaining([
       { action_type: 'lead', value: String(leads) }, { action_type: 'offsite_conversion.fb_pixel_lead', value: String(leads) },
@@ -148,4 +150,25 @@ describe('insights engine — async report flow', () => {
     expect(second.paging.next).toBeUndefined();
     expect([...first.data, ...second.data].map((r: any) => r.ad_id)).toEqual(FIXTURE_IDS.ads);
   });
+});
+
+it('ENG-2025 repeated exposure is deduplicated across days, not summed as new people', () => {
+  const d = buildFixtureDataset();
+  const row = d.insightsDaily[0];
+  d.insightsDaily = Array.from({ length: 14 }, (_, i) => ({ ...row, date: `2026-04-${String(10 + i).padStart(2, '0')}`, impressions: 100, reach: 80 }));
+  const read = (since: string) => runInsights(d, EMPTY_OVERLAY, params({ fields: ['reach', 'frequency', 'impressions'], timeRange: { since, until: '2026-04-23' } }), 0, now).data[0] as any;
+  const seven = read('2026-04-17'), fourteen = read('2026-04-10');
+  expect(Number(fourteen.reach)).toBeGreaterThan(Number(seven.reach));
+  expect(Number(fourteen.reach)).toBeLessThan(1120);
+  expect(Number(fourteen.frequency)).toBeGreaterThan(Number(seven.frequency));
+  expect(Number(fourteen.frequency)).toBeCloseTo(1400 / Number(fourteen.reach), 5);
+});
+
+it('modeled reach reconciles across breakdowns and does not change when a dimension is filtered', () => {
+  const fields = ['impressions', 'reach', 'frequency'];
+  const total = runInsights(dataset, EMPTY_OVERLAY, params({ fields, datePreset: 'maximum' }), shift, now).data[0] as any;
+  const split = runInsights(dataset, EMPTY_OVERLAY, params({ fields, breakdowns: ['age', 'gender'], datePreset: 'maximum' }), shift, now).data as any[];
+  expect(split.reduce((n, r) => n + Number(r.reach), 0)).toBe(Number(total.reach));
+  const female = runInsights(dataset, EMPTY_OVERLAY, params({ fields, breakdowns: ['age', 'gender'], datePreset: 'maximum', filtering: [{ field: 'gender', operator: 'EQUAL', value: 'female' }] }), shift, now).data;
+  expect(female).toEqual(split.filter(r => r.gender === 'female'));
 });

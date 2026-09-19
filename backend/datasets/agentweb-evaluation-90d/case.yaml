@@ -1,0 +1,13 @@
+# ENG-2022: preserve trailing 30d measured metrics; synthesize only the older 60d.
+datasetId: agentweb-evaluation-90d
+version: 1
+caseId: agentweb-evaluation-90d
+name: AgentWeb Sandbox - 30d real + 60d synthetic
+currency: USD
+timezone: America/Los_Angeles
+reviewWindowSeconds: 60
+history: real30-synthetic60
+# Explicit exercise conditions, not inferred historical Meta statuses.
+statuses:
+  CAMPAIGN_01: PAUSED
+  CAMPAIGN_02: PAUSED

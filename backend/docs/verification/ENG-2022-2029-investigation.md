@@ -1,5 +1,7 @@
 # Ryan sandbox investigation — 2026-09-17
 
+> Historical attempt, superseded by [2026-09-19 completion evidence](ENG-2022-2029-final-evidence/README.md). The current supported Sandbox lifecycle is now provisioned; the former legacy-Pro blocker is resolved.
+
 This is a **partial implementation, blocked before deployment**, not evidence that
 all eight reports are fixed. Linear report text was read without modification.
 

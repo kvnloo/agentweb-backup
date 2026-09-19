@@ -67,3 +67,12 @@ describe('model-mention guards, swept over the real registry', () => {
     expect(missed).toEqual([]);
   });
 });
+
+it('ENG-2028 offered picker models obey the same permission policy as selection', async () => {
+  jest.spyOn(agentModeService, 'getDefaultModel').mockResolvedValue('gemini-3.8-flash');
+  for (const admin of [false, true]) {
+    const offered = await agentModeService.getSupportedModels(admin);
+    expect(offered.length).toBeGreaterThan(0);
+    expect(offered.every(id => agentModeService.isModelSelectableBy(id, admin))).toBe(true);
+  }
+});

@@ -1,0 +1,6 @@
+{"input": "All 4 ads were reviewed. They generated 20 leads across 4 reporting windows.", "result": "no_correction"}
+{"input": "All 4 ads have delivered 20 leads.", "result": "no_correction"}
+{"input": "All 4 campaigns show measured spend, reach, and frequency.", "result": "no_correction"}
+{"input": "All 12 sizes were successfully rendered.", "result": "needs_correction"}
+{"input": "I generated all 4 images.", "result": "needs_correction"}
+{"input": "The account has four campaigns.", "result": "no_correction"}

@@ -43,22 +43,28 @@ export function resolveObjects(dataset: SandboxDataset, overlay: SandboxOverlay,
   for (const image of Object.values(overlay.adimages)) images.set(image.hash, image);
   const nowMs = now.getTime();
 
-  const campaignEffectiveStatus = (campaign: SandboxCampaign): string => campaign.status;
+  // Configured statuses track user toggles; delivery restrictions (review,
+  // billing, rejection) are independent and must survive pause/resume cycles.
+  const ownStatus = (object: { status: string; effective_status: string }): string => {
+    if (object.status !== 'ACTIVE') return object.status;
+    return ['ACTIVE', 'PAUSED', 'DELETED', 'ARCHIVED'].includes(object.effective_status)
+      ? 'ACTIVE' : object.effective_status || 'ACTIVE';
+  };
+  const campaignEffectiveStatus = (campaign: SandboxCampaign): string => ownStatus(campaign);
   const adsetEffectiveStatus = (adset: SandboxAdSet): string => {
-    if (adset.status !== 'ACTIVE') return adset.status;
+    const own = ownStatus(adset);
+    if (own !== 'ACTIVE') return own;
     const campaign = campaigns.get(adset.campaign_id);
-    if (campaign && campaign.status === 'PAUSED') return 'CAMPAIGN_PAUSED';
-    if (campaign && campaign.status !== 'ACTIVE') return campaign.status;
-    return 'ACTIVE';
+    const parent = campaign ? campaignEffectiveStatus(campaign) : 'ACTIVE';
+    return parent === 'PAUSED' ? 'CAMPAIGN_PAUSED' : parent;
   };
   const adEffectiveStatus = (ad: SandboxAd): string => {
-    if (ad.status !== 'ACTIVE') return ad.status;
-    const campaign = campaigns.get(ad.campaign_id);
-    if (campaign && campaign.status === 'PAUSED') return 'CAMPAIGN_PAUSED';
-    if (campaign && campaign.status !== 'ACTIVE') return campaign.status;
+    const own = ownStatus(ad);
+    if (own !== 'ACTIVE') return own;
     const adset = adsets.get(ad.adset_id);
-    if (adset && adset.status === 'PAUSED') return 'ADSET_PAUSED';
-    if (adset && adset.status !== 'ACTIVE') return adset.status;
+    const campaign = campaigns.get(ad.campaign_id);
+    const parent = adset ? adsetEffectiveStatus(adset) : campaign ? campaignEffectiveStatus(campaign) : 'ACTIVE';
+    if (parent !== 'ACTIVE') return parent === 'PAUSED' ? 'ADSET_PAUSED' : parent;
     const reviewUntil = overlay.reviewUntil[ad.id];
     if (reviewUntil && new Date(reviewUntil).getTime() > nowMs) return 'PENDING_REVIEW';
     return 'ACTIVE';

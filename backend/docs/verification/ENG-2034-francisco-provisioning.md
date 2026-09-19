@@ -1,5 +1,7 @@
 # ENG-2034 — Francisco provisioning attempt
 
+> Historical attempt, superseded by [2026-09-19 completion evidence](ENG-2022-2029-final-evidence/README.md). The current supported Sandbox lifecycle is now provisioned; the former legacy-Pro blocker is resolved.
+
 **BLOCKED — the deployed supported lifecycle rejects the requested Ryan/ENG-1870 account contract. No Francisco account was created.**
 
 Attempt: 2026-09-18T23:44:13.303Z. Execution actor: Codex; accountable owner: Harsha (ENG-2034 assignee). Branch: `defense/ryan-sandbox-bugs-francisco`; inspected head: `7a58a1a32`.

@@ -5,7 +5,7 @@ import { resolve, sep } from 'path';
 import { parse } from 'csv-parse/sync';
 import { load } from 'js-yaml';
 import { META_OBJ_GOAL_MAP, META_GOAL_BILLING_MAP, META_GOAL_BID_STRATEGY_MAP } from '../../utils/metaConstants';
-import { isDay } from './dateShift';
+import { isDay, addDays } from './dateShift';
 import { validateDataset } from './sandboxDatasetStore';
 import type { SandboxDataset, SandboxInsightsDaily, SandboxBreakdown } from './types';
 
@@ -13,6 +13,8 @@ type Row = Record<string, string>;
 export interface SandboxCase {
   datasetId: string; version: number; caseId: string; name: string;
   currency: string; timezone: string; reviewWindowSeconds?: number;
+  history?: 'real30-synthetic60';
+  statuses?: Record<string, 'ACTIVE' | 'PAUSED'>;
   page?: { name: string; category: string }; pixel?: { name: string };
   landers?: Array<{ url: string }>;
   displayNames?: Record<string, string>;
@@ -21,7 +23,8 @@ export interface SandboxCase {
 const METRICS = ['spend', 'impressions', 'clicks', 'inline_link_clicks', 'reported_leads', 'reported_complete_registrations', 'reported_purchases'] as const;
 type Metric = typeof METRICS[number];
 const fail = (message: string): never => { throw new Error(`Sandbox compiler: ${message}`); };
-export const SANDBOX_PLACEHOLDER_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNoaGj4DwAFhAKAjM1mJgAAAABJRU5ErkJggg==', 'base64');
+export { CREATIVE_UNAVAILABLE_PNG as SANDBOX_PLACEHOLDER_PNG } from './creativeUnavailable';
+import { CREATIVE_UNAVAILABLE_PNG as SANDBOX_PLACEHOLDER_PNG } from './creativeUnavailable';
 const sha = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 
 function safeTree(value: unknown, inUrl: boolean): void {
@@ -69,7 +72,7 @@ export function parseSandboxCase(yaml: string): SandboxCase {
 function checkCase(value: unknown): SandboxCase {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('case.yaml must be a mapping');
   const c = value as SandboxCase;
-  const allowed = ['datasetId', 'version', 'caseId', 'name', 'currency', 'timezone', 'reviewWindowSeconds', 'page', 'pixel', 'landers', 'displayNames', 'targeting'];
+  const allowed = ['datasetId', 'version', 'caseId', 'name', 'currency', 'timezone', 'reviewWindowSeconds', 'page', 'pixel', 'landers', 'displayNames', 'targeting', 'history', 'statuses'];
   if (Object.keys(c).some(k => !allowed.includes(k))) fail('unknown case.yaml field');
   for (const key of ['datasetId', 'caseId', 'name', 'currency', 'timezone'] as const) {
     if (typeof c[key] !== 'string' || !c[key] || c[key].length > 100) fail(`invalid case.${key}`);
@@ -95,6 +98,8 @@ function checkCase(value: unknown): SandboxCase {
       if (t.summary !== undefined) text(t.summary);
     }
   }
+  if (c.history !== undefined && c.history !== 'real30-synthetic60') fail('invalid history');
+  if (c.statuses !== undefined && (!mapping(c.statuses) || Object.entries(c.statuses).some(([key, value]) => !/^(CAMPAIGN|ADSET|AD)_[0-9]{1,4}$/.test(key) || !['ACTIVE', 'PAUSED'].includes(value)))) fail('invalid statuses');
   safeTree(c, false);
   return c;
 }
@@ -157,7 +162,8 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
     }
   }
   const table = (name: string): Row[] => tables.get(name) ?? fail(`manifest missing ${name}`);
-  const daily = table('performance_daily.csv'), period = table('performance_period.csv'), settings = table('settings.csv'), creatives = table('creative_index.csv');
+  let daily = table('performance_daily.csv');
+  const period = table('performance_period.csv'), settings = table('settings.csv'), creatives = table('creative_index.csv');
   if (!daily.length || !period.length) fail('empty performance exports');
   const keys = new Set<string>();
   for (const row of daily) {
@@ -184,6 +190,22 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
   for (const name of ['performance_daily.csv', 'performance_period.csv']) {
     reconcile(name === 'performance_daily.csv' ? daily : period.filter(r => r.level === 'account'), manifest.find(r => r.path === name)!, `manifest ${name}`);
   }
+  // Reconcile the untouched packet FIRST. The evaluation case keeps the last
+  // 30 days verbatim and uses two explicitly synthetic, scaled older cohorts.
+  const sourceUntil = daily.map(r => r.date).sort().slice(-1)[0];
+  if (c.history === 'real30-synthetic60') {
+    const real = daily.filter(r => r.date >= addDays(sourceUntil, -29));
+    const synthetic = [30, 60].flatMap(offset => real.filter(r => number(r.impressions) > 1).map(row => {
+      const copy: Row = { ...row, date: addDays(row.date, -offset), period: 'SYNTHETIC' };
+      const scale = offset === 30 ? 0.65 : 0.45;
+      for (const metric of METRICS) {
+        const value = Math.round(number(row[metric], metric === 'spend') * scale);
+        copy[metric] = metric === 'spend' ? (value / 100).toFixed(2) : String(value);
+      }
+      return copy;
+    }));
+    daily = [...synthetic, ...real];
+  }
   // All identifiers are allocated afresh in a disjoint, visibly synthetic numeric namespace.
   const idMap = new Map<string, string>();
   const id = (key: string) => {
@@ -191,7 +213,7 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
     return idMap.get(key)!;
   };
   const accountId = id(accounts[0]), pageId = id('PAGE'), pixelId = id('PIXEL');
-  const since = daily.map(r => r.date).sort()[0], until = daily.map(r => r.date).sort().slice(-1)[0];
+  const since = c.history ? addDays(sourceUntil, -89) : daily.map(r => r.date).sort()[0], until = daily.map(r => r.date).sort().slice(-1)[0];
   const timestamp = `${since}T00:00:00.000Z`;
   const settingsMap = new Map<string, string>();
   for (const row of settings) {
@@ -203,7 +225,7 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
   if (settingsMap.has(`${accounts[0]}/currency`) && settingsMap.get(`${accounts[0]}/currency`) !== c.currency) fail('case/packet currency mismatch');
   if (settingsMap.has(`${accounts[0]}/timezone_name`) && settingsMap.get(`${accounts[0]}/timezone_name`) !== c.timezone) fail('case/packet timezone mismatch');
   const setting = (entity: string, key: string, fallback: string) => {
-    const value = settingsMap.get(`${entity}/${key}`) ?? fallback;
+    const value = (key === 'status' ? c.statuses?.[entity] : undefined) ?? settingsMap.get(`${entity}/${key}`) ?? fallback;
     if (!/^[A-Z_]+$/.test(value)) fail(`unsafe setting ${key}`);
     return value;
   };
@@ -219,7 +241,7 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
   };
   const dataset: SandboxDataset = {
     meta: { datasetId: c.datasetId, version: c.version, schemaVersion: 1, caseId: c.caseId, frozenWindow: { since, until }, dateShift: 'anchor_until_to_yesterday_utc', createdAt: timestamp,
-      approximations: ['Names, IDs, page, pixel, audience and destination are synthetic; settings are current snapshots, not historical truth.', 'Reach is approximated as 80% of daily impressions; it is not measured unique reach.', 'Pixel event stats mirror reported actions; PageView uses link clicks as a synthetic proxy.', 'All breakdown dimensions use equal deterministic shares with integer remainder allocation; they are not observed performance.', 'Withheld creatives use synthetic placeholders; supplied assets retain packet checksums and are staged separately.'],
+      approximations: [...(c.history ? ['30d real + 60d synthetic'] : []), 'Names, IDs, page, pixel, audience and destination are synthetic; settings are current snapshots, not historical truth. Case status overrides are simulated conditions, not inferred from zero delivery.', 'Reach is modeled from daily impressions with repeat exposure across days; frequency is impressions divided by modeled window reach, not measured unique reach.', 'Pixel event stats mirror reported actions; PageView uses link clicks as a synthetic proxy.', 'All breakdown dimensions use equal deterministic shares with integer remainder allocation; they are not observed performance.', 'Withheld creatives use explicit unavailable-image disclosure cards; supplied assets retain packet checksums and are staged separately.'],
       ...(c.reviewWindowSeconds === undefined ? {} : { reviewWindowSeconds: c.reviewWindowSeconds }) },
     account: { id: `act_${accountId}`, account_id: accountId, name: c.name, currency: c.currency, timezone_name: c.timezone, account_status: 1 },
     pages: [{ id: pageId, name: c.page?.name ?? c.name, category: c.page?.category ?? 'Software', tasks: ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT', 'MANAGE', 'MODERATE'] }],
@@ -252,26 +274,26 @@ export function compileSandboxDataset(packet: string, config: unknown): SandboxD
     }
   }
   for (const row of [...creativeByAd.values()].sort((a, b) => a.ad_id.localeCompare(b.ad_id))) {
-    if (!dataset.campaigns.some(o => o.id === id(row.campaign_id))) dataset.campaigns.push({ id: id(row.campaign_id), account_id: accountId, name: displayName(row.campaign_id), status: 'ACTIVE', effective_status: 'ACTIVE', objective: setting(row.campaign_id, 'objective', 'OUTCOME_LEADS'), ...budgets(row.campaign_id), start_time: timestamp, created_time: timestamp, updated_time: timestamp, special_ad_categories: [] });
+    if (!dataset.campaigns.some(o => o.id === id(row.campaign_id))) dataset.campaigns.push({ id: id(row.campaign_id), account_id: accountId, name: displayName(row.campaign_id), status: setting(row.campaign_id, 'status', 'ACTIVE') as 'ACTIVE' | 'PAUSED' | 'DELETED' | 'ARCHIVED', effective_status: setting(row.campaign_id, 'effective_status', setting(row.campaign_id, 'status', 'ACTIVE')) , objective: setting(row.campaign_id, 'objective', 'OUTCOME_LEADS'), ...budgets(row.campaign_id), start_time: timestamp, created_time: timestamp, updated_time: timestamp, special_ad_categories: [] });
     const existing = dataset.adsets.find(o => o.id === id(row.adset_id));
     if (existing && existing.campaign_id !== id(row.campaign_id)) fail('adset campaign hierarchy conflict');
-    if (!existing) dataset.adsets.push({ id: id(row.adset_id), account_id: accountId, campaign_id: id(row.campaign_id), name: displayName(row.adset_id), status: 'ACTIVE', effective_status: 'ACTIVE', optimization_goal: setting(row.adset_id, 'optimization_goal', 'OFFSITE_CONVERSIONS'), billing_event: setting(row.adset_id, 'billing_event', 'IMPRESSIONS'), bid_strategy: setting(row.adset_id, 'bid_strategy', 'LOWEST_COST_WITHOUT_CAP'), ...budgets(row.adset_id), ...(settingsMap.has(`${row.adset_id}/bid_amount`) ? { bid_amount: number(settingsMap.get(`${row.adset_id}/bid_amount`)!) } : {}), start_time: timestamp, ...(budgets(row.adset_id).lifetime_budget ? { end_time: `${until}T23:59:59.000Z` } : {}), destination_type: 'WEBSITE', promoted_object: { pixel_id: pixelId, custom_event_type: 'LEAD' }, targeting: targeting(row.adset_id) });
+    if (!existing) dataset.adsets.push({ id: id(row.adset_id), account_id: accountId, campaign_id: id(row.campaign_id), name: displayName(row.adset_id), status: setting(row.adset_id, 'status', 'ACTIVE') as 'ACTIVE' | 'PAUSED' | 'DELETED' | 'ARCHIVED', effective_status: setting(row.adset_id, 'effective_status', setting(row.adset_id, 'status', 'ACTIVE')) , optimization_goal: setting(row.adset_id, 'optimization_goal', 'OFFSITE_CONVERSIONS'), billing_event: setting(row.adset_id, 'billing_event', 'IMPRESSIONS'), bid_strategy: setting(row.adset_id, 'bid_strategy', 'LOWEST_COST_WITHOUT_CAP'), ...budgets(row.adset_id), ...(settingsMap.has(`${row.adset_id}/bid_amount`) ? { bid_amount: number(settingsMap.get(`${row.adset_id}/bid_amount`)!) } : {}), start_time: timestamp, ...(budgets(row.adset_id).lifetime_budget ? { end_time: `${until}T23:59:59.000Z` } : {}), destination_type: 'WEBSITE', promoted_object: { pixel_id: pixelId, custom_event_type: 'LEAD' }, targeting: targeting(row.adset_id) });
     const asset = assetByPath.get((JSON.parse(row.asset_paths) as string[])[0]);
     const placeholderSha = sha(SANDBOX_PLACEHOLDER_PNG);
-    const imageAsset = asset ?? { assetKey: `assets/${placeholderSha}.png`, sourcePath: 'generated/placeholder.png', sha256: placeholderSha, bytes: SANDBOX_PLACEHOLDER_PNG.length, width: 1, height: 1 };
+    const imageAsset = asset ?? { assetKey: `assets/${placeholderSha}.png`, sourcePath: 'generated/placeholder.png', sha256: placeholderSha, bytes: SANDBOX_PLACEHOLDER_PNG.length, width: 960, height: 540 };
     if (!dataset.assetsManifest!.some(a => a.assetKey === imageAsset.assetKey)) dataset.assetsManifest!.push(imageAsset);
     const hash = imageAsset.sha256.slice(0, 32);
     const url = `https://assets.example.invalid/${imageAsset.assetKey}`;
     if (!dataset.adcreatives.some(o => o.id === id(row.creative_id))) {
-      dataset.adcreatives.push({ id: id(row.creative_id), account_id: accountId, name: displayName(row.creative_id), status: 'ACTIVE', image_hash: hash, image_url: url, thumbnail_url: url, link_url: dataset.landers[0].url, object_type: 'SHARE', object_story_spec: { page_id: pageId, link_data: { link: dataset.landers[0].url, image_hash: hash } } });
-      if (!asset && !dataset.adimages.some(a => a.hash === hash)) dataset.adimages.push({ hash, url, name: 'Withheld creative placeholder', width: 1, height: 1, status: 'ACTIVE', assetKey: imageAsset.assetKey });
+      dataset.adcreatives.push({ id: id(row.creative_id), account_id: accountId, name: displayName(row.creative_id), status: 'ACTIVE', ...(!asset ? { body: 'Creative unavailable: original withheld; this disclosure card is not the historical ad.' } : {}), image_hash: hash, image_url: url, thumbnail_url: url, link_url: dataset.landers[0].url, object_type: 'SHARE', object_story_spec: { page_id: pageId, link_data: { link: dataset.landers[0].url, image_hash: hash } } });
+      if (!asset && !dataset.adimages.some(a => a.hash === hash)) dataset.adimages.push({ hash, url, name: 'Creative unavailable — original withheld', width: 960, height: 540, status: 'ACTIVE', assetKey: imageAsset.assetKey });
     }
-    dataset.ads.push({ id: id(row.ad_id), account_id: accountId, campaign_id: id(row.campaign_id), adset_id: id(row.adset_id), name: displayName(row.ad_id), status: 'ACTIVE', effective_status: 'ACTIVE', creative: { id: id(row.creative_id) }, created_time: timestamp, updated_time: timestamp });
+    dataset.ads.push({ id: id(row.ad_id), account_id: accountId, campaign_id: id(row.campaign_id), adset_id: id(row.adset_id), name: displayName(row.ad_id), status: setting(row.ad_id, 'status', 'ACTIVE') as 'ACTIVE' | 'PAUSED' | 'DELETED' | 'ARCHIVED', effective_status: setting(row.ad_id, 'effective_status', setting(row.ad_id, 'status', 'ACTIVE')) , creative: { id: id(row.creative_id) }, created_time: timestamp, updated_time: timestamp });
   }
   for (const row of [...daily].sort((a, b) => a.date.localeCompare(b.date) || a.ad_id.localeCompare(b.ad_id))) {
     const mapping = creativeByAd.get(row.ad_id);
     if (!mapping || mapping.campaign_id !== row.campaign_id || mapping.adset_id !== row.adset_id) fail('daily/creative hierarchy mismatch');
-    const insight: SandboxInsightsDaily = { date: row.date, ad_id: id(row.ad_id), adset_id: id(row.adset_id), campaign_id: id(row.campaign_id), impressions: number(row.impressions), reach: Math.ceil(number(row.impressions) * 0.8), clicks: number(row.clicks), inline_link_clicks: number(row.inline_link_clicks), spend: number(row.spend, true), actions: [
+    const insight: SandboxInsightsDaily = { date: row.date, ad_id: id(row.ad_id), adset_id: id(row.adset_id), campaign_id: id(row.campaign_id), impressions: number(row.impressions), reach: Math.ceil(number(row.impressions) * (0.5 + (Number(row.date.slice(-2)) % 10) * 0.03)), clicks: number(row.clicks), inline_link_clicks: number(row.inline_link_clicks), spend: number(row.spend, true), actions: [
       { action_type: 'link_click', value: number(row.inline_link_clicks) }, { action_type: 'landing_page_view', value: number(row.inline_link_clicks) }, { action_type: 'lead', value: number(row.reported_leads) }, { action_type: 'offsite_conversion.fb_pixel_lead', value: number(row.reported_leads) }, { action_type: 'complete_registration', value: number(row.reported_complete_registrations) },
       { action_type: 'offsite_conversion.fb_pixel_complete_registration', value: number(row.reported_complete_registrations) }, { action_type: 'purchase', value: number(row.reported_purchases) },
     ] };

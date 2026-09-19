@@ -114,3 +114,28 @@ test('rejects excessive CSV rows before reconciliation or expansion', () => {
   writeFileSync(join(packet, 'manifest.csv'), 'path,sha256,bytes,data_rows\n' + 'x,a,1,0\n'.repeat(5001));
   expect(() => compileSandboxDataset(packet, config)).toThrow(/row limit/);
 });
+
+test('ENG-2022 preserves real 30d and adds older synthetic delivery without mutating input', () => {
+  fixture();
+  const source = compileSandboxDataset(packet, config);
+  const mixed = compileSandboxDataset(packet, { ...config, history: 'real30-synthetic60' });
+  expect(mixed.insightsDaily.filter(r => r.date >= '2026-03-11')).toEqual(source.insightsDaily);
+  expect(mixed.insightsDaily.some(r => r.date < '2026-03-11' && r.spend > 0)).toBe(true);
+  expect(mixed.meta.frozenWindow).toEqual({ since: '2026-01-10', until: '2026-04-09' });
+  expect(mixed.meta.approximations).toContain('30d real + 60d synthetic');
+});
+
+test('ENG-2026 configured ACTIVE does not erase supplied effective delivery status', () => {
+  fixture(values, { 'settings.csv': 'level,entity_id,setting,value\ncampaign,CAMPAIGN_01,status,ACTIVE\ncampaign,CAMPAIGN_01,effective_status,WITH_ISSUES\nadset,ADSET_01,effective_status,PENDING_REVIEW\nad,AD_01,effective_status,DISAPPROVED\n' });
+  const d = compileSandboxDataset(packet, config);
+  expect(d.campaigns[0]).toMatchObject({ status: 'ACTIVE', effective_status: 'WITH_ISSUES' });
+  expect(d.adsets[0].effective_status).toBe('PENDING_REVIEW');
+  expect(d.ads[0].effective_status).toBe('DISAPPROVED');
+});
+
+test('ENG-2023 missing creative is an explicit unavailable image, never a gray pixel', () => {
+  fixture(); const d = compileSandboxDataset(packet, config);
+  expect(d.adimages[0].width).toBeGreaterThanOrEqual(600);
+  expect(d.adimages[0].height).toBeGreaterThanOrEqual(300);
+  expect(d.adcreatives[0].body).toMatch(/unavailable/i);
+});

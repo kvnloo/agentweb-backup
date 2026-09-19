@@ -1,0 +1,306 @@
+[
+  {
+    "provisioned": {
+      "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
+      "email": "franciscorios.digital@gmail.com",
+      "startedAt": "2026-09-19T19:31:02.876Z",
+      "expiresAt": "2026-10-19T19:31:02.876Z",
+      "dataset": "agentweb-evaluation-90d@1"
+    }
+  },
+  {
+    "identity": {
+      "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
+      "loginStatus": 200,
+      "meStatus": 200,
+      "tier": "Sandbox",
+      "isAdmin": false,
+      "roles": [
+        "customer"
+      ],
+      "standalone": true,
+      "simulatedConnectorOnly": true,
+      "noRealCredentials": true,
+      "label": "Sandbox \u00b7 30d real + 60d synthetic",
+      "expiresAt": 1792438262876
+    },
+    "budget": {
+      "allowed": true,
+      "warning": false,
+      "used": 0,
+      "allowance": 100000000,
+      "bonus": 0,
+      "effectiveAllowance": 100000000,
+      "percentUsed": 0,
+      "month": "2026-09",
+      "costUsed": 0,
+      "costAllowance": 500,
+      "costPercentUsed": 0,
+      "costEnforced": false,
+      "usageMode": "full_choice",
+      "usagePolicyVersion": null,
+      "alertThresholds": {
+        "usagePercent": 90,
+        "onForecastShortfall": true
+      }
+    }
+  },
+  {
+    "ad15": {
+      "width": 960,
+      "height": 540,
+      "sha256": "e927de971cf016b3297d3f32cbbb6cfd57073a5f56aadd63156559b33ca24347",
+      "body": "Creative unavailable: original withheld; this disclosure card is not the historical ad."
+    }
+  },
+  {
+    "denials": [
+      {
+        "path": "/api/oauth/meta/connect",
+        "status": 403
+      },
+      {
+        "path": "/api/stripe/create-checkout-session",
+        "status": 403
+      },
+      {
+        "path": "/api/admin/evaluations",
+        "status": 403
+      },
+      {
+        "path": "/api/agent-mode/session/nonexistent/share",
+        "status": 403
+      },
+      {
+        "tool": "send_email",
+        "denied": true
+      },
+      {
+        "tool": "publish_landing_page",
+        "denied": true
+      },
+      {
+        "tool": "deploy_landing_page",
+        "denied": true
+      },
+      {
+        "tool": "connect_account",
+        "denied": true
+      },
+      {
+        "tool": "call_google_ads_api",
+        "denied": true
+      }
+    ]
+  },
+  {
+    "verifiedWindows": [
+      {
+        "days": 7,
+        "spendCents": 20800,
+        "impressions": 3536,
+        "clicks": 128,
+        "leads": 1
+      },
+      {
+        "days": 14,
+        "spendCents": 52414,
+        "impressions": 7173,
+        "clicks": 262,
+        "leads": 4
+      },
+      {
+        "days": 30,
+        "spendCents": 103024,
+        "impressions": 12992,
+        "clicks": 493,
+        "leads": 20
+      },
+      {
+        "days": 90,
+        "spendCents": 216324,
+        "impressions": 27279,
+        "clicks": 1032,
+        "leads": 42
+      }
+    ]
+  },
+  {
+    "reset": {
+      "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
+      "seedSha256": "1d388a21ee9daddcfa7047866a89dceb6d2512b6c53a1679bb9854cdf97dda4b",
+      "cleanup": {
+        "s3": 1,
+        "AW-ChatMessages": 15,
+        "AW-AccountMemory": 0,
+        "AW-Skills": 0,
+        "AW-Deals": 0,
+        "AW-Settings": 0,
+        "AW-AgentRuns": 0,
+        "AW-ChatSessions": 1,
+        "AW-TaskExecutions": 0,
+        "AW-WorkflowExecutions": 0,
+        "AW-Tasks": 0,
+        "AW-Workflows": 0,
+        "AW-LandingPages": 0,
+        "AW-WorkPlans": 0,
+        "AW-LeadLists": 0,
+        "AW-Characters": 0,
+        "AW-Books": 0
+      }
+    }
+  },
+  {
+    "ownerScansAfterReset": {
+      "AW-AgentApiKeys": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-MCPOAuthTokens": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-MCPOAuthCodes": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-MCPSessions": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-Tasks": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-TaskSchedules": {
+        "count": 0,
+        "pages": 13
+      },
+      "AW-TaskExecutions": {
+        "count": 0,
+        "pages": 49
+      },
+      "AW-ChatSessions": {
+        "count": 0,
+        "pages": 214
+      },
+      "AW-ChatMessages": {
+        "count": 0,
+        "pages": 2137
+      },
+      "AW-Configs": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-AdsMetricsSnapshots": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-AdsThresholds": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-LandingPages": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-ConnectedAccountPosts": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-AssetApprovals": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-Deals": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-Characters": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-Leads": {
+        "count": 0,
+        "pages": 128
+      },
+      "AW-Workflows": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-WorkflowExecutions": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-OAuthSessions": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-AgentRuns": {
+        "absent": true
+      },
+      "AW-WorkPlans": {
+        "count": 0,
+        "pages": 8
+      },
+      "AW-UnipileConnections": {
+        "count": 0,
+        "pages": 24
+      }
+    },
+    "auditActions": {
+      "provision": 1,
+      "meta": 84,
+      "resetting-started": 1,
+      "reset": 1
+    },
+    "allMetaActionsReadOnly": true,
+    "overlayDiffCount": 0,
+    "postResetMeStatus": 200,
+    "finalBudget": {
+      "allowed": true,
+      "warning": false,
+      "used": 377328,
+      "allowance": 100000000,
+      "bonus": 0,
+      "effectiveAllowance": 100000000,
+      "percentUsed": 0,
+      "month": "2026-09",
+      "costUsed": 0.094806375,
+      "costAllowance": 500,
+      "costPercentUsed": 0,
+      "costEnforced": false,
+      "usageMode": "full_choice",
+      "usagePolicyVersion": null,
+      "alertThresholds": {
+        "usagePercent": 90,
+        "onForecastShortfall": true
+      }
+    },
+    "evaluation": {
+      "userId": "eval_00e1b770-feb0-45cc-8c21-ffc9f2d05bc7",
+      "email": "franciscorios.digital@gmail.com",
+      "status": "active",
+      "expiresAt": 1792438262876,
+      "mode": "sandbox",
+      "label": "Sandbox \u00b7 30d real + 60d synthetic",
+      "connectors": {
+        "meta": "simulated"
+      },
+      "deniedToolClasses": [
+        "lifecycle",
+        "connectors",
+        "sends",
+        "social",
+        "publish",
+        "third_party_writes",
+        "browser",
+        "automation"
+      ],
+      "datasetId": "agentweb-evaluation-90d",
+      "datasetVersion": 1,
+      "provisionedBy": "1743956381327",
+      "reviewerUserIds": []
+    }
+  }
+]

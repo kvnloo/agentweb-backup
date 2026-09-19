@@ -172,3 +172,27 @@ describe('pixels, audiences, targeting, account-level insights via the edge', ()
     expect(handleGraphRead(ctx, req(`${act}/adimages`, {}, 'POST'))).toBeNull();
   });
 });
+
+it('ENG-2026 retains effective delivery restrictions while configured status stays ACTIVE', () => {
+  const d = buildFixtureDataset();
+  d.campaigns[0].effective_status = 'WITH_ISSUES';
+  d.adsets[0].effective_status = 'PENDING_BILLING_INFO';
+  d.ads[0].effective_status = 'DISAPPROVED';
+  const c = { ...ctx, dataset: d };
+  for (const [object, status] of [[d.campaigns[0], 'WITH_ISSUES'], [d.adsets[0], 'PENDING_BILLING_INFO'], [d.ads[0], 'DISAPPROVED']] as const) {
+    expect(body(handleGraphRead(c, req(object.id, { fields: 'id,status,effective_status' }))!)).toMatchObject({ status: 'ACTIVE', effective_status: status });
+  }
+});
+
+it('parent delivery restrictions cascade and survive a configured pause/resume', () => {
+  const d = buildFixtureDataset();
+  d.campaigns[0].effective_status = 'WITH_ISSUES';
+  const c = { ...ctx, dataset: d, overlay: structuredClone(EMPTY_OVERLAY) };
+  for (const obj of [d.campaigns[0], d.adsets[0], d.ads[0]]) {
+    expect(body(handleGraphRead(c, req(obj.id, { fields: 'effective_status' }))!).effective_status).toBe('WITH_ISSUES');
+  }
+  c.overlay.campaigns[d.campaigns[0].id] = { ...d.campaigns[0], status: 'PAUSED' };
+  expect(body(handleGraphRead(c, req(d.ads[0].id, { fields: 'effective_status' }))!).effective_status).toBe('CAMPAIGN_PAUSED');
+  c.overlay.campaigns[d.campaigns[0].id].status = 'ACTIVE';
+  expect(body(handleGraphRead(c, req(d.ads[0].id, { fields: 'effective_status' }))!).effective_status).toBe('WITH_ISSUES');
+});

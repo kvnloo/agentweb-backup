@@ -16,18 +16,18 @@ router.use(authenticateToken);
 // Helpers: connected-account fallback
 // ---------------------------------------------------------------------------
 
-const CLEAN_ACCOUNT_ID = (id: string) => (id || '').replace('act_', '');
+const CLEAN_ACCOUNT_ID = (id: unknown) => typeof id === 'string' ? id.replace(/^act_/, '') : '';
 
 function getConnectedMetaAdAccounts(user: any): any[] {
-  return (user.connected_accounts || []).filter((acc: any) =>
-    (acc.platform === 'facebook' || acc.platform === 'meta') &&
+  return (Array.isArray(user.connected_accounts) ? user.connected_accounts : []).filter((acc: any) =>
+    acc && typeof acc === 'object' && !Array.isArray(acc) && (acc.platform === 'facebook' || acc.platform === 'meta') &&
     acc.config?.account_type === 'ad_account' &&
-    acc.config?.access_token
+    typeof acc.config?.access_token === 'string' && acc.config.access_token.length > 0
   );
 }
 
 function userHasMetaAdAccount(user: any): boolean {
-  if (user.adAccount && user.adAccount.trim() !== '') return true;
+  if (typeof user.adAccount === 'string' && user.adAccount.trim() !== '') return true;
   return getConnectedMetaAdAccounts(user).length > 0;
 }
 
@@ -37,7 +37,7 @@ function userHasMetaAdAccount(user: any): boolean {
  * Falls back to the first connected Meta ad account if legacy is not set.
  */
 async function resolveMetaCredentials(user: any): Promise<{ adAccountId: string; accessToken: string }> {
-  if (user.adAccount && user.adAccount.trim() !== '') {
+  if (typeof user.adAccount === 'string' && user.adAccount.trim() !== '') {
     const accessToken = await getMetaAccessToken();
     return { adAccountId: user.adAccount.trim(), accessToken };
   }
@@ -158,7 +158,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching campaigns for timeframe:", timeframe);
     let campaigns;
     try {
-      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`;
+      const campaignsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&access_token=${accessToken}`;
       // Never log the URL itself: it carries `access_token` in the query string.
       console.log("Fetching campaigns for act_%s", adAccountId);
 
@@ -168,7 +168,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${campaignsData.error.message}`);
       }
 
-      campaigns = campaignsData.data || [];
+      campaigns = performanceRows(campaignsData.data);
       if (campaignsData.pagingTruncated === true) truncatedSections.push('Campaigns');
       console.log("Campaigns fetched successfully:", campaigns.length);
     } catch (campaignError: any) {
@@ -180,7 +180,7 @@ router.get("/ad-performance", async (req, res) => {
     console.log("Fetching ad sets for timeframe:", timeframe);
     let adSets;
     try {
-      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,campaign_id,targeting&access_token=${accessToken}`;
+      const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adsets?fields=id,name,status,effective_status,campaign_id,targeting&access_token=${accessToken}`;
       console.log("Fetching ad sets for act_%s", adAccountId);
       
       const adSetsData = await fetchWithRetryAndPaging(adSetsUrl);
@@ -189,7 +189,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${adSetsData.error.message}`);
       }
 
-      adSets = adSetsData.data || [];
+      adSets = performanceRows(adSetsData.data);
       if (adSetsData.pagingTruncated === true) truncatedSections.push('Ad Sets');
       console.log("Ad Sets fetched successfully:", adSets.length);
     } catch (adSetsError: any) {
@@ -207,7 +207,7 @@ router.get("/ad-performance", async (req, res) => {
       // this exact string returned every ad with `creative` entirely absent; the encoded form
       // (`encodeURIComponent('creative{...}')`) returns real thumbnail_url/title/body/image_url.
       const creativeFields = encodeURIComponent('creative{thumbnail_url,title,body,image_url}');
-      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,adset_id,campaign_id,${creativeFields}&access_token=${accessToken}`;
+      const adsUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,status,effective_status,adset_id,campaign_id,${creativeFields}&access_token=${accessToken}`;
       console.log("Fetching ads for act_%s", adAccountId);
       
       const adsData = await fetchWithRetryAndPaging(adsUrl);
@@ -216,7 +216,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${adsData.error.message}`);
       }
 
-      ads = adsData.data || [];
+      ads = performanceRows(adsData.data);
       if (adsData.pagingTruncated === true) truncatedSections.push('Ads');
       console.log("Ads fetched successfully:", ads.length);
     } catch (adsError: any) {
@@ -237,7 +237,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${adInsightsData.error.message}`);
       }
       
-      insights = adInsightsData.data || [];
+      insights = performanceRows(adInsightsData.data, 'ad_id');
       if (adInsightsData.pagingTruncated === true) truncatedSections.push('Ad-level Insights');
       console.log("Ad-level insights fetched successfully:", insights.length);
 
@@ -250,7 +250,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${adSetInsightsData.error.message}`);
       }
       
-      adSetInsights = adSetInsightsData.data || [];
+      adSetInsights = performanceRows(adSetInsightsData.data, 'adset_id');
       if (adSetInsightsData.pagingTruncated === true) truncatedSections.push('Adset-level Insights');
       console.log("Adset-level insights fetched successfully:", adSetInsights.length);
 
@@ -263,7 +263,7 @@ router.get("/ad-performance", async (req, res) => {
         throw new Error(`Graph API Error: ${campaignInsightsData.error.message}`);
       }
       
-      campaignInsights = campaignInsightsData.data || [];
+      campaignInsights = performanceRows(campaignInsightsData.data, 'campaign_id');
       if (campaignInsightsData.pagingTruncated === true) truncatedSections.push('Campaign-level Insights');
       console.log("Campaign-level insights fetched successfully:", campaignInsights.length);
     } catch (insightsError: any) {
@@ -308,6 +308,16 @@ router.get("/ad-performance", async (req, res) => {
   }
 });
 
+// Fail explicitly on malformed upstream rows; silently treating them as no delivery
+// would give a plausible but false account summary. Applies to all six sibling reads.
+function performanceRows(value: unknown, identity = 'id'): Record<string, any>[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some(row => !row || typeof row !== 'object' || Array.isArray(row) || typeof row[identity] !== 'string' || !row[identity])) {
+    throw new Error('Invalid Meta performance response');
+  }
+  return value;
+}
+
 // Helper function to process campaign data from Meta API
 async function processCampaignData(campaigns: any, insights: any, adSets: any): Promise<any[]> {
   const campaignMap = new Map();
@@ -323,7 +333,8 @@ async function processCampaignData(campaigns: any, insights: any, adSets: any): 
     campaignMap.set(campaign.id, {
       id: campaign.id,
       name: campaign.name,
-      status: campaign.status,
+      status: campaign.effective_status || campaign.status,
+      configuredStatus: campaign.status,
       objective: campaign.objective,
       impressions: 0,
       clicks: 0,
@@ -428,7 +439,8 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
     adSetsMap.set(adSet.id, {
       id: adSet.id,
       name: adSet.name,
-      status: adSet.status,
+      status: adSet.effective_status || adSet.status,
+      configuredStatus: adSet.status,
       campaignId: adSet.campaign_id,
       campaignName: campaignMap.get(adSet.campaign_id) || 'Unknown Campaign',
       targeting: adSet.targeting,
@@ -464,7 +476,7 @@ async function processAdSetsData(adSets: any, insights: any, campaigns: any): Pr
       adSet.ctr = parseFloat(insight.ctr) || 0;
       adSet.cpc = parseFloat(insight.cpc) || 0;
       adSet.reach = parseInt(insight.reach) || 0;
-      adSet.frequency = parseFloat(insight.frequency) || 0;
+      adSet.frequency = adSet.reach > 0 ? adSet.impressions / adSet.reach : 0;
       applyLeadMetrics(adSet, insight);
       // Derived
       finalizeLeadCosts(adSet);
@@ -498,7 +510,8 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
     adsMap.set(ad.id, {
       id: ad.id,
       name: ad.name,
-      status: ad.status,
+      status: ad.effective_status || ad.status,
+      configuredStatus: ad.status,
       adSetId: ad.adset_id,
       adSetName: adSetMap.get(ad.adset_id) || 'Unknown Ad Set',
       campaignId: ad.campaign_id,
@@ -532,7 +545,7 @@ async function processAdsData(ads: any, insights: any, adSets: any, campaigns: a
       ad.ctr = parseFloat(insight.ctr) || 0;
       ad.cpc = parseFloat(insight.cpc) || 0;
       ad.reach = parseInt(insight.reach) || 0;
-      ad.frequency = parseFloat(insight.frequency) || 0;
+      ad.frequency = ad.reach > 0 ? ad.impressions / ad.reach : 0;
       applyLeadMetrics(ad, insight);
       finalizeLeadCosts(ad);
     }

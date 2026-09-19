@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+  <rect width="960" height="540" fill="#17202e"/>
+  <rect x="40" y="40" width="880" height="460" rx="20" fill="#243245" stroke="#6d829c"/>
+  <g fill="#f4f7fb" font-family="sans-serif" text-anchor="middle">
+    <text x="480" y="170" font-size="22" letter-spacing="3">SANDBOX DATA CONTEXT</text>
+    <text x="480" y="260" font-size="44" font-weight="bold">Creative unavailable</text>
+    <text x="480" y="325" font-size="24">The original image was withheld from this dataset.</text>
+    <text x="480" y="368" font-size="24">This card is not the ad that earned the reported results.</text>
+  </g>
+</svg>
