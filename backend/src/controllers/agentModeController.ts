@@ -11236,6 +11236,47 @@ export const agentModeController = {
   },
 
   /**
+   * POST /api/agent-mode/session/:sessionId/work-plan
+   * Launch an accessible predefined work plan in an owner-scoped session.
+   */
+  async launchWorkPlan(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const { planId } = req.body ?? {};
+      const user = req.user as User;
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
+      if (typeof planId !== 'string' || planId.trim() === '') {
+        return res.status(400).json({ error: 'planId is required' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can launch a work plan.' });
+      }
+
+      const existing = session.workPlan;
+      const hasActivePlan = !!existing && Array.isArray(existing.steps) && existing.steps.length > 0;
+      if (hasActivePlan && (existing as any).templatePlanId === planId) {
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existing });
+      }
+
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      if (!result.success) {
+        return res.status(result.requiresConfirmation ? 409 : 404).json({
+          error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
+          code: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
+          message: result.message,
+        });
+      }
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+    } catch (error) {
+      console.error('AgentMode: Launch work plan error:', error);
+      return res.status(500).json({ error: 'Failed to launch work plan' });
+    }
+  },
+
+  /**
    * POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
    *
    * ENG-1472: the owner-only accept endpoint for a `recommend_predefined_work_plan`

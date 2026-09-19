@@ -212,3 +212,49 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     expect(mockAgentModeService.applyPredefinedWorkPlan).not.toHaveBeenCalled();
   });
 });
+
+describe('agentModeController.launchWorkPlan', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const launchRequest = (user: AuthenticatedRequest['user'] | undefined, planId = 'plan-onboard') => ({
+    user,
+    params: { sessionId: 'sess-1' },
+    body: { planId },
+  } as unknown as AuthenticatedRequest);
+
+  it('launches by stable plan ID for the session owner', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({}) as any);
+    mockAgentModeService.applyPredefinedWorkPlan.mockResolvedValue({
+      success: true,
+      workPlan: { templatePlanId: 'plan-onboard', title: 'Client Onboarding', steps: [] },
+    });
+    const res = mockResponse();
+
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+
+    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1');
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('refuses to launch in another user\'s session', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({ userId: 'user-2' }) as any);
+    const res = mockResponse();
+
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(mockAgentModeService.applyPredefinedWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it('returns the existing matching template idempotently', async () => {
+    const workPlan = { templatePlanId: 'plan-onboard', title: 'Client Onboarding', steps: [{ stepCount: 1 }] };
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({ workPlan }) as any);
+    const res = mockResponse();
+
+    await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({ success: true, alreadyApplied: true, workPlan });
+    expect(mockAgentModeService.applyPredefinedWorkPlan).not.toHaveBeenCalled();
+  });
+});
