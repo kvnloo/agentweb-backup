@@ -241,3 +241,26 @@ Park for later:
 - Meta Doctor v0: https://github.com/kvnloo/agentweb/issues/32
 - GTM Arena multimodal image-ad matchup: https://github.com/AgentWebPro/gtm-arena/issues/1
 - OpenAvatar Taste Library v0: https://github.com/kvnloo/openavatar/issues/2
+
+
+## Arena repository identity check (2026-09-20)
+
+Current evidence says `AgentWebPro/gtm-arena` is **not a GitHub fork** of a surviving `kvnloo/*arena*` repository:
+
+- GitHub reports `fork: false`, `network_count: 0`.
+- The repository was created 2026-03-11.
+- Visible history begins with Harsha creating a fresh Next.js app, followed by Harsha-authored Arena commits.
+- No currently accessible `kvnloo/*arena*` repository was found by installed-repo or public-repo search.
+- `kvnloo/gtm-test` was checked and is unrelated; it is the private X/voice corpus project.
+
+Therefore treat the older Kevin Arena / FactoryBench / FactoryMarket thesis as a separate conceptual lineage unless an older renamed/deleted repository is recovered later. Do not assume AgentWebPro/gtm-arena is the canonical original.
+
+## OpenAvatar execution slices created
+
+- #2 Taste Library v0: https://github.com/kvnloo/openavatar/issues/2
+- #3 Taste manifest schema: https://github.com/kvnloo/openavatar/issues/3
+- #4 privacy-safe Taste Card: https://github.com/kvnloo/openavatar/issues/4
+- #5 X bookmarks adapter: https://github.com/kvnloo/openavatar/issues/5
+- #6 agent-facing taste context pack: https://github.com/kvnloo/openavatar/issues/6
+- PR #7 portable manifest: https://github.com/kvnloo/openavatar/pull/7
+- PR #8 local CLI (stacked on #7): https://github.com/kvnloo/openavatar/pull/8
