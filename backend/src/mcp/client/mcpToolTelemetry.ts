@@ -91,13 +91,17 @@ export function redactSensitive(input: unknown): string {
     msg = String(input);
   }
 
+  // Authorization: Basic <credential> must redact the whole credential, not
+  // merely the authentication scheme.
+  msg = msg.replace(/\b(Authorization\s*:\s*)Basic\s+[^\s,;}]+/gi, '$1[REDACTED]');
+
   // Bearer <token> (JWTs contain '.', so include it in the token char class).
   msg = msg.replace(/\b(Bearer)\s+[A-Za-z0-9\-._~+/]+=*/gi, '$1 [REDACTED]');
 
   // key=value / key: value for sensitive keys (quoted or bare value).
   msg = msg.replace(
-    /\b(access_token|refresh_token|api[_-]?key|apikey|client_secret|password|passwd|secret|token|authorization)\b(\s*[=:]\s*)("?)([^\s"'&,;}]+)\3/gi,
-    '$1$2[REDACTED]'
+    /(["']?)(access_token|refresh_token|auth[_-]?token|api[_-]?key|apikey|client_secret|password|passwd|secret|token|authorization)\1(\s*[=:]\s*)("?)([^\s"'&,;}]+)\4/gi,
+    '$1$2$1$3[REDACTED]'
   );
 
   // Long opaque blobs not caught above (raw secrets, JWT segments >= 24 chars).
