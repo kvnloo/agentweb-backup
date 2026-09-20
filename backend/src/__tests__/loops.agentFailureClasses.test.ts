@@ -79,6 +79,24 @@ it('uses the latest shipped legacy outcome and ignores unshipped decisions', asy
   expect(await policy([history('tool-failure:mixed:tool'), unshipped, improved]).evaluate(events(), window)).toHaveLength(3);
 });
 
+it('reads history once while enforcing both legacy and class cooldown identities', async () => {
+  const store = getLearningStore('agentModeLearning');
+  const query = jest.spyOn(store, 'queryHistory').mockResolvedValue([history('tool-failure:mixed:tool:config')]);
+  const proposals = await getRuleSet('agentModeFailurePolicy').evaluate(events(), window);
+  expect(query).toHaveBeenCalledTimes(1);
+  expect(proposals.map(p => p.sourceRuleId)).toEqual(['tool-failure:mixed:tool:bug', 'tool-failure:mixed:tool:schema_reject']);
+});
+
+it('redacts secrets and identifiers from representative failure text', async () => {
+  const sensitive = 'Bearer abc.def api_key=sk-secret email=user@example.com account_id=acct_123';
+  const proposals = await policy().evaluate(events().map(e => e.eventType === EVT_TOOL_FAILED
+    ? { ...e, dimensions: { ...e.dimensions, errorMessage: sensitive } } : e), window);
+  const directives = proposals.map(p => (p.payload as { directive: string }).directive).join('\n');
+  expect(directives).not.toContain('abc.def');
+  expect(directives).not.toContain('sk-secret');
+  expect(directives).toContain('[REDACTED]');
+});
+
 it('counts unique tools before and after truncation, excluding whole-run findings', () => {
   const proposals = [{ payload: { occurrences: 3 } }, { payload: { toolName: 'a' } },
     { payload: { toolName: 'a' } }, { payload: { toolName: 'a' } }, { payload: { toolName: 'b' } }];

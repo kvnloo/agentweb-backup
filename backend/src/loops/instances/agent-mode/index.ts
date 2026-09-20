@@ -20,7 +20,6 @@ import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopD
 import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
-import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
@@ -46,7 +45,7 @@ const runner = createInstanceRunner({
     const learning = new DynamoLearningStore(ports.dynamo);
     return {
       sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
-      ruleSet: new CooldownRuleSet(withLegacyToolCooldown(new AgentFailureRuleSet(), learning), learning, AGENT_MODE_LOOP_ID),
+      ruleSet: withLegacyToolCooldown(new AgentFailureRuleSet(), learning),
       tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
       learning,
     };

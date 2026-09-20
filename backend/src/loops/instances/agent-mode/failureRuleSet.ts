@@ -26,6 +26,7 @@ import type {
   TimeWindow,
 } from '../../core/types';
 import { asMutationId } from '../../core/types';
+import { redactSensitive } from '../../../mcp/client/mcpToolTelemetry';
 import { EVT_RUN_VERDICT, EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
 
 export interface AgentFailureProposalPayload {
@@ -103,7 +104,8 @@ function directiveFor(
   minFailureRate: number,
 ): string {
   const pct = `${Math.round((failures / (denom || 1)) * 100)}%`;
-  const sample = sampleMessage ? ` Representative failure: "${sampleMessage.slice(0, 160)}".` : '';
+  const redactedSample = sampleMessage ? redactSensitive(sampleMessage).slice(0, 160) : '';
+  const sample = redactedSample ? ` Representative failure: "${redactedSample}".` : '';
   if (failureType === 'config') {
     // Not a code change. Someone has to reconnect an account, grant a scope, or
     // top up a balance — and they need to know which.
