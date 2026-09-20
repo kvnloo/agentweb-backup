@@ -171,12 +171,14 @@ describe('redactSensitive', () => {
     const basicCredential = String.fromCharCode(100, 88, 78, 108, 99, 106, 112, 119, 89, 88, 78, 122);
     const tokenKey = ['auth', 'Token'].join('');
     const shortToken = ['abc', '123'].join('');
+    const singleQuotedToken = ['single', '-quoted-secret'].join('');
     const out = redactSensitive(
-      `Authorization: ${scheme} ${basicCredential} and ${JSON.stringify({ [tokenKey]: shortToken })}`,
+      `Authorization: ${scheme} ${basicCredential} and ${JSON.stringify({ [tokenKey]: shortToken })} and {'${tokenKey}': '${singleQuotedToken}'}`,
     );
     expect(out).not.toContain(basicCredential);
     expect(out).not.toContain(shortToken);
-    expect((out.match(/\[REDACTED\]/g) || []).length).toBe(2);
+    expect(out).not.toContain(singleQuotedToken);
+    expect((out.match(/\[REDACTED\]/g) || []).length).toBe(3);
   });
 
   it('handles non-string / non-error inputs without throwing', () => {

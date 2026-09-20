@@ -100,7 +100,7 @@ export function redactSensitive(input: unknown): string {
 
   // key=value / key: value for sensitive keys (quoted or bare value).
   msg = msg.replace(
-    /(["']?)(access_token|refresh_token|auth[_-]?token|api[_-]?key|apikey|client_secret|password|passwd|secret|token|authorization)\1(\s*[=:]\s*)("?)([^\s"'&,;}]+)\4/gi,
+    /(["']?)(access_token|refresh_token|auth[_-]?token|api[_-]?key|apikey|client_secret|password|passwd|secret|token|authorization)\1(\s*[=:]\s*)(["']?)([^\s"'&,;}]+)\4/gi,
     '$1$2$1$3[REDACTED]'
   );
 
