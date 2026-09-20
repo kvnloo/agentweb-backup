@@ -234,3 +234,10 @@ Park for later:
   - https://blog.adobe.com/en/publish/2026/03/19/adobe-firefly-expands-video-image-creation-with-new-ai-capabilities-custom-models
 - GTM Engineering:
   - https://knowledge.gtmstrategist.com/p/the-2026-state-of-gtm-engineering
+
+
+## Created first slices (2026-09-20)
+
+- Meta Doctor v0: https://github.com/kvnloo/agentweb/issues/32
+- GTM Arena multimodal image-ad matchup: https://github.com/AgentWebPro/gtm-arena/issues/1
+- OpenAvatar Taste Library v0: https://github.com/kvnloo/openavatar/issues/2
