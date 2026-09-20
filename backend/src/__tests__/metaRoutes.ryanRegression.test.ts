@@ -31,3 +31,9 @@ it.each([0,1,2,3,4,5])('rejects malformed row at sibling external boundary %i in
   replies(rows.map((r, i) => i === index ? [null] as any : r));
   await request(app).get('/api/meta/ad-performance?timeframe=30d').expect(500);
 });
+it.each([0,1,2,3,4,5])('rejects missing data at sibling external boundary %i instead of reporting zero', async index => {
+  for (const [rowIndex, data] of rows.entries()) {
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce(rowIndex === index ? {} : { data });
+  }
+  await request(app).get('/api/meta/ad-performance?timeframe=30d').expect(500);
+});

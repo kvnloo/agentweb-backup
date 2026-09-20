@@ -311,7 +311,9 @@ router.get("/ad-performance", async (req, res) => {
 // Fail explicitly on malformed upstream rows; silently treating them as no delivery
 // would give a plausible but false account summary. Applies to all six sibling reads.
 function performanceRows(value: unknown, identity = 'id'): Record<string, any>[] {
-  if (value === undefined) return [];
+  if (value === undefined) {
+    throw new Error('Invalid Meta performance response');
+  }
   if (!Array.isArray(value) || value.some(row => !row || typeof row !== 'object' || Array.isArray(row) || typeof row[identity] !== 'string' || !row[identity])) {
     throw new Error('Invalid Meta performance response');
   }
