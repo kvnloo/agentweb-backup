@@ -170,7 +170,7 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
     })).size;
     const shown = toolCount(result.proposals);
     const total = toolCount(result.uncappedProposals ?? result.proposals);
-    const failing = (result.proposalsTruncated ?? 0) > 0
+    const failing = shown < total
       ? `Failing tools: showing ${shown} of ${total}`
       : `Failing tools: ${shown}`;
     return `Tool events scanned: ${result.eventsScanned}  |  ${failing}`;

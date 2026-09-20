@@ -86,6 +86,8 @@ it('counts unique tools before and after truncation, excluding whole-run finding
   expect(counts({ proposals, eventsScanned: 50 } as any, 0)).toContain('Failing tools: 2');
   expect(counts({ proposals: proposals.slice(0, 3), uncappedProposals: proposals,
     proposalsTruncated: 2, eventsScanned: 50 } as any, 0)).toContain('showing 1 of 2');
+  expect(counts({ proposals: proposals.slice(0, 2), uncappedProposals: proposals.slice(0, 4),
+    proposalsTruncated: 2, eventsScanned: 50 } as any, 0)).toContain('Failing tools: 1');
 });
 
 it('keeps non-actionable failure classes excluded', async () => {
