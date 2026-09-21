@@ -259,6 +259,47 @@ async function postToGraph(body: Record<string, unknown>): Promise<{ messageId: 
   return { messageId: json?.messages?.[0]?.id ?? null };
 }
 
+// ── Display number ─────────────────────────────────────────────────────────
+
+let displayNumberCache: { phoneNumberId: string; digits: string } | null = null;
+
+/** Test hook: forget the cached display number. */
+export function __resetDisplayPhoneNumberCache(): void {
+  displayNumberCache = null;
+}
+
+/**
+ * The business number people message, as bare digits (no '+') for a wa.me link.
+ *
+ * Asked of Meta rather than configured: credentials carry the phone number ID, which
+ * is not the number, and a hand-copied display number that drifts from the ID would
+ * send customers' verification messages to somebody else's WhatsApp. Cached for the
+ * process lifetime, keyed on the ID so a credential change is picked up.
+ */
+export async function getDisplayPhoneNumber(): Promise<string> {
+  const creds = await getWhatsAppCredentials();
+  if (displayNumberCache?.phoneNumberId === creds.phoneNumberId) return displayNumberCache.digits;
+
+  const response = await fetch(
+    `https://graph.facebook.com/${GRAPH_VERSION}/${creds.phoneNumberId}?fields=display_phone_number`,
+    {
+      headers: { Authorization: `Bearer ${creds.accessToken}` },
+      signal: AbortSignal.timeout(8000),
+    },
+  );
+  if (!response.ok) {
+    // Never interpolate credentials into an error — these get logged and surfaced.
+    throw new WhatsAppError(`Could not read the WhatsApp display number (HTTP ${response.status}).`);
+  }
+  const json: any = await response.json();
+  const digits = String(json?.display_phone_number ?? '').replace(/\D/g, '');
+  if (digits.length < 7) {
+    throw new WhatsAppError('WhatsApp did not return a usable display number for this phone number ID.');
+  }
+  displayNumberCache = { phoneNumberId: creds.phoneNumberId, digits };
+  return digits;
+}
+
 // ── Sending ────────────────────────────────────────────────────────────────
 
 async function assertSendable(destination: string): Promise<string> {
