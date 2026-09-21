@@ -1,6 +1,11 @@
 // Unit tests for deepResearchService
 
-import { DeepResearchService, extractReportText } from '../services/deepResearchService';
+import {
+  DeepResearchService,
+  extractReportText,
+  DEFAULT_POLL_BUDGET_MS,
+  DEFAULT_RETRY_POLL_BUDGET_MS,
+} from '../services/deepResearchService';
 import * as secretsManager from '../utils/secretsManager';
 import { DEEP_RESEARCH_AGENT, DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 
@@ -351,13 +356,19 @@ describe('DeepResearchService', () => {
   });
 
   describe('Polling Configuration', () => {
-    it('should use correct polling parameters', () => {
-      const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
-      const pollIntervalMs = 10000; // 10 seconds
+    // ENG-738: the OLD fixed 20-minute poll budget outlived
+    // agentModeController's GENERATION_TIMEOUT_MS (10 minutes by default) — the
+    // outer wall-clock timeout always killed the whole turn first, so this
+    // service's own graceful-degradation logic never got a chance to run. The
+    // primary attempt plus one depth-degraded retry must together stay safely
+    // under that outer cap, with headroom for API latency and the S3 upload
+    // that follows a successful result.
+    it('keeps the combined primary + retry poll budgets safely under the outer generation timeout', () => {
+      const OUTER_GENERATION_TIMEOUT_MS = 600000; // agentModeController default
+      const HEADROOM_MS = 60000;
 
-      const totalTimeoutMinutes = (maxPollAttempts * pollIntervalMs) / 1000 / 60;
-
-      expect(totalTimeoutMinutes).toBe(20);
+      expect(DEFAULT_POLL_BUDGET_MS + DEFAULT_RETRY_POLL_BUDGET_MS)
+        .toBeLessThanOrEqual(OUTER_GENERATION_TIMEOUT_MS - HEADROOM_MS);
     });
   });
 
@@ -403,6 +414,162 @@ describe('DeepResearchService', () => {
 
       const input = (createMock.mock.calls[0][0] as { input: string }).input;
       expect(input).toContain('inline');
+    });
+  });
+
+  // ENG-738: deep research on a heavy topic repeatedly hit the poll timeout with
+  // no graceful recovery — the model got a bare failure with no partial findings
+  // and no automatic depth-reduced retry. These tests cover the resilience fix.
+  describe('Timeout Resilience (ENG-738)', () => {
+    const mockGoogleGenAI = require('@google/genai').GoogleGenAI;
+    let createMock: jest.Mock;
+    let getMock: jest.Mock;
+
+    beforeEach(() => {
+      mockGetSecret.mockResolvedValue('test-api-key');
+      jest.useFakeTimers();
+      // Small budgets (one poll attempt per pass) so these tests run fast.
+      process.env.DEEP_RESEARCH_POLL_BUDGET_MS = '10000';
+      process.env.DEEP_RESEARCH_RETRY_POLL_BUDGET_MS = '10000';
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+      delete process.env.DEEP_RESEARCH_POLL_BUDGET_MS;
+      delete process.env.DEEP_RESEARCH_RETRY_POLL_BUDGET_MS;
+    });
+
+    function mockInteractions(createSequence: any[], getSequence: any[]): void {
+      createMock = jest.fn();
+      createSequence.forEach((value) => createMock.mockResolvedValueOnce(value));
+      getMock = jest.fn();
+      getSequence.forEach((value) => getMock.mockResolvedValueOnce(value));
+      mockGoogleGenAI.mockImplementation(() => ({
+        interactions: { create: createMock, get: getMock },
+      }));
+    }
+
+    it('degrades depth once and succeeds on retry after the first attempt times out', async () => {
+      const runningInteraction = { id: 'primary-1', status: 'running', steps: [] };
+      const completedInteraction = {
+        id: 'retry-1',
+        status: 'completed',
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: '# Retry report\n\nFinished at reduced depth.' }] }],
+      };
+      mockInteractions([runningInteraction, completedInteraction], [runningInteraction]);
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Apple silicon moat',
+        depth: 'comprehensive',
+      });
+      await jest.advanceTimersByTimeAsync(10000); // primary attempt's single poll wait
+      await jest.advanceTimersByTimeAsync(10000); // retry attempt (no-op if it completes immediately)
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.markdownContent).toContain('Finished at reduced depth');
+      expect(result.degradedFrom).toBe('comprehensive');
+      expect(result.actualDepth).toBe('detailed');
+      expect(createMock).toHaveBeenCalledTimes(2);
+      // Reduced depth ('detailed') routes to the speed agent, not the max agent.
+      expect(createMock.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
+      );
+    });
+
+    it('returns honest partial content when the depth-degraded retry also times out', async () => {
+      const primaryPartial = {
+        id: 'primary-2',
+        status: 'running',
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'Primary partial findings before the cutoff.' }] }],
+      };
+      const retryRunning = { id: 'retry-2', status: 'running', steps: [] };
+      mockInteractions([primaryPartial, retryRunning], [primaryPartial, retryRunning]);
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Semiconductor architecture',
+        depth: 'comprehensive',
+      });
+      await jest.advanceTimersByTimeAsync(10000); // primary poll
+      await jest.advanceTimersByTimeAsync(10000); // retry poll
+      const result = await resultPromise;
+
+      expect(result.success).toBe(false);
+      expect(result.partial).toBe(true);
+      expect(result.partialContent).toContain('Primary partial findings');
+      expect(result.partialDepth).toBe('comprehensive');
+      expect(result.error).toBeTruthy();
+    });
+
+    it('does not attempt a further retry when depth is already overview', async () => {
+      const runningWithPartial = {
+        id: 'primary-3',
+        status: 'running',
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'Overview partial text.' }] }],
+      };
+      mockInteractions([runningWithPartial], [runningWithPartial]);
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Topic X',
+        depth: 'overview',
+      });
+      await jest.advanceTimersByTimeAsync(10000);
+      const result = await resultPromise;
+
+      expect(createMock).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(false);
+      expect(result.partial).toBe(true);
+      expect(result.partialContent).toContain('Overview partial text');
+      expect(result.partialDepth).toBe('overview');
+    });
+
+    it('does not mark the result partial when the timed-out attempt produced no content', async () => {
+      // Honesty guard (mirrors the ENG-510 media-timeout convention): a genuinely
+      // empty timeout must not be dressed up as a partial success.
+      const emptyRunning = { id: 'primary-4', status: 'running', steps: [] };
+      mockInteractions([emptyRunning], [emptyRunning]);
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Topic Y',
+        depth: 'overview',
+      });
+      await jest.advanceTimersByTimeAsync(10000);
+      const result = await resultPromise;
+
+      expect(result.success).toBe(false);
+      expect(result.partial).toBeFalsy();
+      expect(result.partialContent).toBeUndefined();
+      expect(result.error).toBeTruthy();
+    });
+
+    it('honors DEEP_RESEARCH_POLL_BUDGET_MS to bound the primary poll loop', async () => {
+      process.env.DEEP_RESEARCH_POLL_BUDGET_MS = '30000'; // 3 poll attempts
+      process.env.DEEP_RESEARCH_RETRY_POLL_BUDGET_MS = '10000'; // 1 poll attempt
+
+      const primaryRunning = { id: 'primary-5', status: 'running', steps: [] };
+      const retryRunning = { id: 'retry-5', status: 'running', steps: [] };
+      createMock = jest.fn()
+        .mockResolvedValueOnce(primaryRunning)
+        .mockResolvedValueOnce(retryRunning);
+      getMock = jest.fn().mockImplementation((id: string) =>
+        Promise.resolve(id === 'primary-5' ? primaryRunning : retryRunning)
+      );
+      mockGoogleGenAI.mockImplementation(() => ({
+        interactions: { create: createMock, get: getMock },
+      }));
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Topic Z',
+        depth: 'detailed',
+      });
+      await jest.advanceTimersByTimeAsync(10000);
+      await jest.advanceTimersByTimeAsync(10000);
+      await jest.advanceTimersByTimeAsync(10000);
+      await jest.advanceTimersByTimeAsync(10000);
+      await resultPromise;
+
+      // 3 polls for the primary pass (30000 / 10000) + 1 poll for the retry pass.
+      expect(getMock).toHaveBeenCalledTimes(4);
     });
   });
 });

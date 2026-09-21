@@ -199,6 +199,37 @@ describe('AgentModeService - perform_deep_research tool', () => {
           'text/markdown'
         );
       });
+
+      // ENG-738: a successful result that only completed after an internal
+      // depth downgrade must say so — reporting the originally-requested
+      // depth here would silently misrepresent what was actually delivered.
+      it('reports the actual (downgraded) depth honestly when the service succeeded after a retry', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: true,
+          markdownContent: '# Research\n\nContent produced at reduced depth.',
+          title: 'Research',
+          researchSummary: 'Summary',
+          degradedFrom: 'comprehensive',
+          actualDepth: 'detailed',
+        });
+        mockUploadFileToS3.mockResolvedValue({
+          success: true,
+          url: 'https://s3.amazonaws.com/bucket/test.md'
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool(
+          'Test topic',
+          undefined,
+          'professional',
+          'comprehensive'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.data.research_depth).toBe('detailed');
+        expect(result.message).toContain('detailed');
+        expect(result.message).toContain('comprehensive');
+      });
     });
 
     describe('Service Unavailable', () => {
@@ -294,6 +325,118 @@ describe('AgentModeService - perform_deep_research tool', () => {
         expect(result.success).toBe(false);
         expect(result.message).toBe('Deep research failed');
         expect(result.error).toBe('Unknown error');
+      });
+    });
+
+    // ENG-738: a timed-out deep research call that still gathered real partial
+    // findings must save and surface them honestly, instead of a bare failure
+    // that throws the work away — and must tell the model not to blindly
+    // re-issue the same failing call (the service already retried internally).
+    describe('Partial Result Handling (ENG-738)', () => {
+      it('saves partial content to S3 and returns an honest partial result', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: false,
+          error: 'Deep research timed out. Please try again with a more specific topic.',
+          partial: true,
+          partialContent: '# Semiconductor Architecture\n\nPartial findings gathered before the cutoff.',
+          partialDepth: 'comprehensive',
+        });
+        mockUploadFileToS3.mockResolvedValue({
+          success: true,
+          url: 'https://s3.amazonaws.com/bucket/research-partial.md',
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool(
+          'Semiconductor architecture',
+          undefined,
+          'professional',
+          'comprehensive',
+          undefined,
+          'user-123'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.partial).toBe(true);
+        expect(result.data.research_url).toBe('https://s3.amazonaws.com/bucket/research-partial.md');
+        expect(result.data.research_depth).toBe('comprehensive');
+        expect(result.data.topic).toBe('Semiconductor architecture');
+        expect(result.message).toContain('Semiconductor architecture');
+        expect(result.message.toLowerCase()).toContain('partial');
+        // The service already retried internally — the model must not spiral.
+        expect(result.message).toContain('Do NOT call perform_deep_research again');
+        expect(mockUploadFileToS3).toHaveBeenCalledWith(
+          expect.stringContaining('Partial findings gathered before the cutoff'),
+          expect.any(String),
+          'user-123',
+          'text/markdown'
+        );
+      });
+
+      it('notes the automatic depth downgrade honestly when the result carries degradedFrom', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: false,
+          error: 'Deep research timed out.',
+          partial: true,
+          partialContent: '# Partial\n\nSome content.',
+          partialDepth: 'overview',
+          degradedFrom: 'comprehensive',
+        });
+        mockUploadFileToS3.mockResolvedValue({
+          success: true,
+          url: 'https://s3.amazonaws.com/bucket/research-partial.md',
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool(
+          'Topic',
+          undefined,
+          'professional',
+          'comprehensive'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.data.research_depth).toBe('overview');
+        expect(result.message).toContain('comprehensive');
+        expect(result.message).toContain('overview');
+      });
+
+      it('falls back to the plain failure message when S3 upload of partial content fails', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: false,
+          error: 'Deep research timed out.',
+          partial: true,
+          partialContent: '# Partial\n\nSome content.',
+          partialDepth: 'detailed',
+        });
+        mockUploadFileToS3.mockResolvedValue({
+          success: false,
+          error: 'S3 bucket not accessible',
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool('Test topic');
+
+        expect(result.success).toBe(false);
+        expect(result.partial).toBeFalsy();
+        expect(result.message).toBe('Deep research timed out.');
+        expect(result.data).toBeUndefined();
+      });
+
+      it('falls back to the plain failure branch when partial is true but partialContent is empty', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: false,
+          error: 'Deep research timed out.',
+          partial: true,
+          partialContent: '',
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool('Test topic');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Deep research timed out.');
+        expect(mockUploadFileToS3).not.toHaveBeenCalled();
       });
     });
 
