@@ -21,6 +21,7 @@ import {
   EnigmaQuotaExceededError,
   EnigmaRateLimitedError,
   EnigmaService,
+  ENIGMA_MAX_CREDITS_PER_CALL,
   countEnigmaBilledFills,
   initEnigmaService,
   type EnigmaBilledFillKey,
@@ -29,6 +30,7 @@ import {
   type EnigmaQuotaTracker,
 } from './enigmaService';
 import { getEnigmaApiKey } from '../utils/secretsManager';
+import { TABLE_PREFIX } from '../config/constants';
 import { recordVendorUsage } from './usageRecorderService';
 import { getRecordingUnit } from '../utils/vendorRateCard';
 import { buildSearchBrandBody } from './enigmaGraphql';
@@ -125,9 +127,11 @@ function buildCacheStore(): EnigmaCacheStore {
   };
 }
 
-// ─── Per-user daily cap (AW-Configs, same row pattern as Apollo/enrich.so) ────
+// ─── Spend limits (AW-Configs rows, reserved atomically) ─────────────────────
 
-const CONFIGS_TABLE = `${process.env.NODE_ENV === 'production' ? '' : 'Dev-'}AW-Configs`;
+// Same prefix as db.ts, which owns the rest of this feature's persistence (the
+// enrichment cache): quota rows and cache rows must live in the same environment.
+const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
 const ENIGMA_USAGE_CONFIG_ID = 'system:enigmaUsage';
 const ENIGMA_CREDIT_BUDGET_CONFIG_ID = 'system:enigmaCreditBudget';
 // AW-Configs rows are keyed by userId; the credit budget is platform-wide, so
@@ -148,101 +152,145 @@ function monthlyCreditBudgetFromEnv(): number {
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MONTHLY_CREDIT_BUDGET;
 }
 
+const isConditionFailure = (err: any) => err?.code === 'ConditionalCheckFailedException';
+
+/**
+ * Atomic counters on AW-Configs. Both limits reserve capacity with a single
+ * conditional write, so concurrent lookups cannot all pass one stale read:
+ *
+ * - user/day:    ADD callCount 1        IF today's row and callCount < limit
+ * - platform/mo: ADD creditCount reserve IF this month's row and creditCount <= budget - reserve
+ *
+ * A row from an earlier day/month is replaced by a conditional put, so the first
+ * call of a new period starts a fresh counter; losing that race falls back to
+ * one retry of the conditional add. `settle` then trues the credits up to what
+ * Enigma actually billed and releases everything when the call failed.
+ */
 export function buildEnigmaQuotaTracker(
-  dynamodb: Pick<AWS.DynamoDB.DocumentClient, 'get' | 'update' | 'put'>,
+  dynamodb: Pick<AWS.DynamoDB.DocumentClient, 'update' | 'put'>,
   limit: number = dailyLimitFromEnv(),
   now: () => Date = () => new Date(),
   creditBudget: number = monthlyCreditBudgetFromEnv(),
 ): EnigmaQuotaTracker {
-  const key = (userId: string) => ({ userId, configId: ENIGMA_USAGE_CONFIG_ID });
-  const today = () => now().toISOString().slice(0, 10);
+  const userKey = (userId: string) => ({ userId, configId: ENIGMA_USAGE_CONFIG_ID });
   const budgetKey = { userId: PLATFORM_BUDGET_USER_ID, configId: ENIGMA_CREDIT_BUDGET_CONFIG_ID };
-  const thisMonth = () => now().toISOString().slice(0, 7);
+
+  /**
+   * Adds `amount` to `counter` on a row scoped to `period` (`periodField` holds
+   * the day or month), only while the counter is <= `maxBefore`. Returns false
+   * when the limit is spent. A stale or missing row is replaced.
+   */
+  async function reserveOn(
+    key: { userId: string; configId: string },
+    periodField: 'date' | 'month',
+    period: string,
+    counter: 'callCount' | 'creditCount',
+    amount: number,
+    maxBefore: number,
+  ): Promise<boolean> {
+    if (maxBefore < 0) return false;
+    const tryAdd = async (): Promise<boolean> => {
+      try {
+        await dynamodb.update({
+          TableName: CONFIGS_TABLE,
+          Key: key,
+          UpdateExpression: 'ADD #counter :amount',
+          ConditionExpression: '#period = :period AND #counter <= :maxBefore',
+          ExpressionAttributeNames: { '#counter': counter, '#period': periodField },
+          ExpressionAttributeValues: { ':amount': amount, ':period': period, ':maxBefore': maxBefore },
+        }).promise();
+        return true;
+      } catch (err) {
+        if (!isConditionFailure(err)) throw err;
+        return false;
+      }
+    };
+
+    if (await tryAdd()) return true;
+    // Either the limit is spent today/this month, or the row is missing or from
+    // an earlier period. Start a fresh counter if (and only if) it is not today's.
+    try {
+      await dynamodb.put({
+        TableName: CONFIGS_TABLE,
+        Item: { ...key, [periodField]: period, [counter]: amount },
+        ConditionExpression: 'attribute_not_exists(userId) OR #period <> :period',
+        ExpressionAttributeNames: { '#period': periodField },
+        ExpressionAttributeValues: { ':period': period },
+      }).promise();
+      return true;
+    } catch (err) {
+      if (!isConditionFailure(err)) throw err;
+    }
+    // Another writer created this period's row between our two writes: one retry.
+    return tryAdd();
+  }
+
+  /** Best-effort add of a (possibly negative) delta to the period's counter. */
+  async function adjust(
+    key: { userId: string; configId: string },
+    periodField: 'date' | 'month',
+    period: string,
+    counter: 'callCount' | 'creditCount',
+    delta: number,
+  ): Promise<void> {
+    if (delta === 0) return;
+    try {
+      await dynamodb.update({
+        TableName: CONFIGS_TABLE,
+        Key: key,
+        UpdateExpression: 'ADD #counter :delta',
+        // The period may have rolled over while the call was in flight; then the
+        // reservation belonged to a row that no longer counts, so do nothing.
+        ConditionExpression: '#period = :period',
+        ExpressionAttributeNames: { '#counter': counter, '#period': periodField },
+        ExpressionAttributeValues: { ':delta': delta, ':period': period },
+      }).promise();
+    } catch (err) {
+      if (!isConditionFailure(err)) throw err;
+    }
+  }
 
   return {
-    async checkCreditBudget() {
-      if (creditBudget <= 0) return;
-      const r = await dynamodb.get({ TableName: CONFIGS_TABLE, Key: budgetKey }).promise();
-      const spent = r.Item?.month === thisMonth() ? Number(r.Item.creditCount ?? 0) : 0;
-      if (spent >= creditBudget) throw new EnigmaBudgetExhaustedError(creditBudget);
-    },
+    async reserve(userId) {
+      const at = now();
+      const month = at.toISOString().slice(0, 7);
+      const day = at.toISOString().slice(0, 10);
 
-    // Recorded after the call, so the month's last call can overshoot by one
-    // call's credits (<= 52). Budgeting, not a hard spend gate: Enigma's own
-    // 402 remains the final stop.
-    async recordCredits(credits) {
-      if (credits <= 0) return;
-      const month = thisMonth();
-      try {
-        await dynamodb.update({
-          TableName: CONFIGS_TABLE,
-          Key: budgetKey,
-          UpdateExpression: 'ADD creditCount :c',
-          ConditionExpression: '#month = :month',
-          ExpressionAttributeNames: { '#month': 'month' },
-          ExpressionAttributeValues: { ':c': credits, ':month': month },
-        }).promise();
-      } catch (err: any) {
-        if (err.code !== 'ConditionalCheckFailedException') throw err;
+      // Budget first; if the user's own limit then refuses, give the credits back.
+      let credits = 0;
+      if (creditBudget > 0) {
+        credits = Math.min(ENIGMA_MAX_CREDITS_PER_CALL, creditBudget);
+        const ok = await reserveOn(budgetKey, 'month', month, 'creditCount', credits, creditBudget - credits);
+        if (!ok) throw new EnigmaBudgetExhaustedError(creditBudget);
+      }
+
+      if (userId) {
+        let ok = false;
         try {
-          await dynamodb.put({
-            TableName: CONFIGS_TABLE,
-            Item: { ...budgetKey, month, creditCount: credits },
-            ConditionExpression: 'attribute_not_exists(userId) OR #month <> :month',
-            ExpressionAttributeNames: { '#month': 'month' },
-            ExpressionAttributeValues: { ':month': month },
-          }).promise();
-        } catch (putErr: any) {
-          if (putErr.code !== 'ConditionalCheckFailedException') throw putErr;
-          await dynamodb.update({
-            TableName: CONFIGS_TABLE,
-            Key: budgetKey,
-            UpdateExpression: 'ADD creditCount :c',
-            ExpressionAttributeValues: { ':c': credits },
-          }).promise();
+          ok = await reserveOn(userKey(userId), 'date', day, 'callCount', 1, limit - 1);
+        } catch (err) {
+          await adjust(budgetKey, 'month', month, 'creditCount', -credits).catch(() => undefined);
+          throw err;
+        }
+        if (!ok) {
+          await adjust(budgetKey, 'month', month, 'creditCount', -credits).catch(() => undefined);
+          throw new EnigmaQuotaExceededError(limit);
         }
       }
+
+      return { userId, credits, month, day: userId ? day : undefined };
     },
 
-    async checkQuota(userId) {
-      const r = await dynamodb.get({ TableName: CONFIGS_TABLE, Key: key(userId) }).promise();
-      const count = r.Item?.date === today() ? Number(r.Item.callCount ?? 0) : 0;
-      if (count >= limit) throw new EnigmaQuotaExceededError(limit);
-    },
-    // Check-then-record is not atomic: concurrent leads can overshoot by up to
-    // the run's concurrency, the same trade-off apolloService.ts documents.
-    async recordUsage(userId) {
-      const day = today();
-      try {
-        await dynamodb.update({
-          TableName: CONFIGS_TABLE,
-          Key: key(userId),
-          UpdateExpression: 'ADD callCount :one',
-          ConditionExpression: '#date = :today',
-          ExpressionAttributeNames: { '#date': 'date' },
-          ExpressionAttributeValues: { ':one': 1, ':today': day },
-        }).promise();
-      } catch (err: any) {
-        if (err.code !== 'ConditionalCheckFailedException') throw err;
-        // First call of the day (or no row yet): start a fresh counter. If a
-        // concurrent writer already did, fall back to a plain ADD.
-        try {
-          await dynamodb.put({
-            TableName: CONFIGS_TABLE,
-            Item: { ...key(userId), date: day, callCount: 1 },
-            ConditionExpression: 'attribute_not_exists(userId) OR #date <> :today',
-            ExpressionAttributeNames: { '#date': 'date' },
-            ExpressionAttributeValues: { ':today': day },
-          }).promise();
-        } catch (putErr: any) {
-          if (putErr.code !== 'ConditionalCheckFailedException') throw putErr;
-          await dynamodb.update({
-            TableName: CONFIGS_TABLE,
-            Key: key(userId),
-            UpdateExpression: 'ADD callCount :one',
-            ExpressionAttributeValues: { ':one': 1 },
-          }).promise();
-        }
+    async settle(reservation, actualCredits) {
+      if (reservation.credits > 0 && reservation.month) {
+        // Billed less than the worst case: release the difference. (Billed more
+        // than reserved cannot happen: the reservation is the query's ceiling.)
+        const billed = actualCredits === null ? 0 : Math.min(actualCredits, reservation.credits);
+        await adjust(budgetKey, 'month', reservation.month, 'creditCount', billed - reservation.credits);
+      }
+      // A call that failed before billing does not use up the user's daily allowance.
+      if (actualCredits === null && reservation.userId && reservation.day) {
+        await adjust(userKey(reservation.userId), 'date', reservation.day, 'callCount', -1);
       }
     },
   };

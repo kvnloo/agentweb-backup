@@ -38,7 +38,8 @@ import {
   type EnigmaHttpClient,
 } from '../services/enigmaService';
 import { buildEnigmaHttpClient } from '../services/enigmaServiceFactory';
-import { ENIGMA_CREDITS_PER_FILL } from '../services/enigmaService';
+import { ENIGMA_CREDITS_PER_FILL, ENIGMA_MAX_CREDITS_PER_CALL } from '../services/enigmaService';
+import { SEARCH_BRAND_QUERY } from '../services/enigmaGraphql';
 import { getAllocatedRate } from '../utils/vendorRateCard';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -266,6 +267,17 @@ describe('buildEnigmaHttpClient', () => {
 
   // The budget counts credits; the ledger charges dollars. If these drift, one
   // of them is silently wrong (1 credit = $0.01, rate card of 2026-08-10).
+  // The budget reserves this much per call BEFORE the call, so it must be the
+  // query's true worst case. Raising a `first:` in the query has to fail here.
+  it('reserves exactly the query\'s worst-case billing per call', () => {
+    const first = (field: string) => Number(new RegExp(`${field}\\(first: (\\d+)`).exec(SEARCH_BRAND_QUERY)![1]);
+    const worst = first('cardTransactions') * ENIGMA_CREDITS_PER_FILL.card_revenue_12m
+      + first('names') * ENIGMA_CREDITS_PER_FILL.brand_attribute
+      + first('websites') * ENIGMA_CREDITS_PER_FILL.brand_attribute;
+
+    expect(ENIGMA_MAX_CREDITS_PER_CALL).toBe(worst);
+  });
+
   it('keeps the credit table and the rate card in step', () => {
     for (const [key, credits] of Object.entries(ENIGMA_CREDITS_PER_FILL)) {
       expect(credits * 0.01).toBeCloseTo(getAllocatedRate('enigma', key)!, 6);

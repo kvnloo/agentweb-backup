@@ -12,7 +12,7 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 - **Card revenue ≠ revenue.** It comes from a panel of about a third of US consumer and small-business card transactions. Enigma says to exclude low card-adoption industries (B2B software, wholesale, manufacturing) and to treat mixed ones as a floor. Always label it "Card revenue (12 mo), as of `periodEndDate`".
 - **Fail closed.** No brand, a brand whose own websites don't match our domain (TLD included), or a null/negative/undated value all mean *no value*. Nothing is guessed or repaired.
 - **Billing is per value returned**, even when we discard the brand. A search with no brand costs $0. The ledger records exactly that (`recordEnigmaLedger`).
-- **Status (2026-09-15): wired into V3 enrichment, off by default.** Calls happen only when `ENIGMA_ENRICHMENT_ENABLED=true`, the user is on `ENIGMA_ENRICHMENT_USER_ALLOWLIST` (empty = nobody), the run is user-initiated (enrich-v3 route or Emma; never the cron) and the run's config explicitly names a card-revenue field. The portal display is built in customer-portal PR #1169 (labels, compact USD, as-of date, tooltip).
+- **Status (2026-09-15): wired into V3 enrichment, off by default.** Calls happen only when `ENIGMA_ENRICHMENT_ENABLED=true`, the user is on `ENIGMA_ENRICHMENT_USER_ALLOWLIST` (empty = nobody), the run is user-initiated (enrich-v3 route or Emma; never the cron) and the run's config explicitly names a card-revenue field. The portal display (labels, compact USD, as-of date, tooltip) ships in customer-portal PR #1169. Do not enable this flag for real customer accounts until ENG-1930 confirms the licence for customer display.
 - **Licence:** Enigma's public ToS is internal-use-only and non-sublicensable. Do not show Enigma values to customers, or copy them across tenants, until ENG-1930 confirms the terms.
 
 ## What AgentWeb Uses This For
@@ -44,7 +44,7 @@ Primary risk: `Enigma returns CARD revenue for US card-accepting businesses, not
 | Opt-in guards | `enrichmentConfigService.ts` (default `include:false`, alias/smart-dep stripping), `enrichmentConfigDeps.ts` (LLM cheat sheets), `crmEnrichmentServiceV3.ts` (no injected card deps) | No implicit purchase |
 | Exclusions | `enrichmentSiblingConfigFields.ts` (no cross-tenant copy), `enrichmentCacheService.ts` `splitFieldsByGroup` (no V2 web fill), `cron/crmAutoEnrichmentCron.ts` (`isUnenriched` ignores card fields) | |
 | Daily quota | `enigmaService.ts` `EnigmaQuotaTracker`, `enigmaServiceFactory.ts` `buildEnigmaQuotaTracker` | AW-Configs `system:enigmaUsage`, `ENIGMA_DAILY_LIMIT_PER_USER` (default 150) |
-| Monthly credit budget | same tracker: `checkCreditBudget` / `recordCredits` | AW-Configs `system:enigmaCreditBudget` (userId `system`), `ENIGMA_MONTHLY_CREDIT_BUDGET` (default 1,800 of the 2,100 Pro plan; 0 disables). Credits come from `countEnigmaBilledCredits`, the same values the ledger meters |
+| Monthly credit budget | same tracker (`reserve` / `settle`) | AW-Configs `system:enigmaCreditBudget` (userId `system`), `ENIGMA_MONTHLY_CREDIT_BUDGET` (default 1,800 of the 2,100 Pro plan; 0 disables). Reserved atomically before each call (`ENIGMA_MAX_CREDITS_PER_CALL` = 52), then trued up to `countEnigmaBilledCredits`, the same values the ledger meters |
 | Tests | `backend/src/__tests__/enigmaService.test.ts`, `backend/src/__tests__/enigmaCardRevenueEnrichment.test.ts` | Invariants below |
 
 ## Stored Internal Shape
@@ -92,6 +92,7 @@ enrichmentMetadata[field] = {
 ```
 
 **Daily quota row:** AW-Configs `{ userId, configId: "system:enigmaUsage", date: "YYYY-MM-DD", callCount }`.
+**Credit budget row:** AW-Configs `{ userId: "system", configId: "system:enigmaCreditBudget", month: "YYYY-MM", creditCount }` (reserved credits until settled). Table prefix comes from `config/constants.ts` `TABLE_PREFIX`, the same as `db.ts` and the enrichment cache.
 
 ## External Payload Contract
 
@@ -174,7 +175,7 @@ No dedicated tool. Emma reaches Enigma only through `enrich_leads_preview` / `en
 - Rate-card values are **placeholder list prices** pending Harsha's allocation confirmation.
 - Licence scope for customer display and cross-tenant reuse is unknown (ENG-1930).
 - Industry gating uses keyword rules over free-text industry (we have no NAICS); tune with ENG-1933 spike data.
-- **Caps and budget (set from ENG-1933):** 100 lookups/run (`ENIGMA_MAX_CALLS_PER_RUN`), 150 calls/user/day (`ENIGMA_DAILY_LIMIT_PER_USER`), 1,800 credits/month platform-wide (`ENIGMA_MONTHLY_CREDIT_BUDGET`). The spike measured ~19 credits per live call against a 2,100-credit/month plan, so call caps alone can't bound spend; the budget can. The per-run cap counts lookups including cache hits (conservative). The budget is checked before each call and recorded after it, so the month's last call can overshoot by one call's credits (<= 52); Enigma's own 402 stays the final stop.
+- **Caps and budget (set from ENG-1933):** 100 lookups/run (`ENIGMA_MAX_CALLS_PER_RUN`), 150 calls/user/day (`ENIGMA_DAILY_LIMIT_PER_USER`), 1,800 credits/month platform-wide (`ENIGMA_MONTHLY_CREDIT_BUDGET`). The spike measured ~19 credits per live call against a 2,100-credit/month plan, so call caps alone can't bound spend; the budget can. The per-run cap counts lookups including cache hits (conservative). Both limits reserve capacity with one conditional DynamoDB write **before** the call (user/day: `callCount < limit`; platform/month: `creditCount <= budget - 52`), so concurrent lookups cannot all pass one stale read. `settle` then releases the difference once Enigma has billed, and the whole reservation when the call fails. Neither can overshoot; Enigma's own 402 stays the final stop.
 - **Per-call cost ceiling: 52 credits (~$0.52).** `cardTransactions(first: 4)` = 4 x 10, name 2, `websites(first: 5)` = 5 x 2. Typical is ~19; platform-attributed rows we discard are still billed.
 - `enigma_brand_id` is not persisted on leads (design D2 deviation: no consumer needs it; the cache is keyed by host).
 - Portal display ("Card revenue (12 mo)" label, as-of tooltip) is not built; until then the column shows the raw key and value.

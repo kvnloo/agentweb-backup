@@ -123,19 +123,45 @@ export class EnigmaQuotaExceededError extends Error {
 
 // ─── Injected dependencies ───────────────────────────────────────────────────
 
-/** Per-user daily call counter. Only calls that reach Enigma count; cache hits are free. */
+/**
+ * What one billed call may cost, reserved BEFORE the call. Enigma bills per
+ * value returned: `cardTransactions(first: 4)` = 4 x 10, name 2, `websites(first:
+ * 5)` = 5 x 2, so 52 credits at worst (see enigmaGraphql.ts).
+ */
+export const ENIGMA_MAX_CREDITS_PER_CALL = 52;
+
+/** Handle for capacity reserved before a call; pass it back to `settle`. */
+export interface EnigmaQuotaReservation {
+  userId?: string;
+  /** Credits held against the monthly budget (0 when no budget applies). */
+  credits: number;
+  /** Month the credits were reserved in, e.g. "2026-09". */
+  month?: string;
+  /** Day the user call was counted in, e.g. "2026-09-21". */
+  day?: string;
+}
+
+/**
+ * Spend limits, enforced by RESERVING capacity before the billed call rather
+ * than checking and recording around it: concurrent leads (a run fans out)
+ * would otherwise all pass the same read-only check and overshoot. Cache hits
+ * never reserve.
+ */
 export interface EnigmaQuotaTracker {
-  /** Throws EnigmaQuotaExceededError when the user is at the limit. */
-  checkQuota(userId: string): Promise<void>;
-  recordUsage(userId: string): Promise<void>;
   /**
-   * Platform-wide monthly credit ceiling. The lookup caps count CALLS, but
-   * Enigma bills per value returned: ENG-1933 measured ~19 credits per call
-   * (52 worst case) against a 2,100-credit monthly plan, so a call cap alone
-   * cannot bound spend. Throws EnigmaBudgetExhaustedError once it is spent.
+   * Atomically reserves one call against the user's daily limit and up to
+   * ENIGMA_MAX_CREDITS_PER_CALL against the platform's monthly credit budget.
+   * Throws EnigmaBudgetExhaustedError / EnigmaQuotaExceededError, reserving
+   * nothing, when either is spent. ENG-1933 measured ~19 credits per call on a
+   * 2,100-credit monthly plan, so a call cap alone cannot bound spend.
    */
-  checkCreditBudget?(): Promise<void>;
-  recordCredits?(credits: number): Promise<void>;
+  reserve(userId?: string): Promise<EnigmaQuotaReservation>;
+  /**
+   * Reconciles a reservation once the call is over. `actualCredits` is what
+   * Enigma billed; `null` means the call failed before billing, so the whole
+   * reservation (credits and the user's call) is released.
+   */
+  settle(reservation: EnigmaQuotaReservation, actualCredits: number | null): Promise<void>;
 }
 
 export interface EnigmaSearchRequest {
@@ -417,21 +443,20 @@ export class EnigmaService {
     }
 
     const { quota } = this.deps;
-    if (quota?.checkCreditBudget) await quota.checkCreditBudget();
-    if (quota && opts.userId) await quota.checkQuota(opts.userId);
+    const reservation = quota ? await quota.reserve(opts.userId) : undefined;
 
     const name = input.companyName?.trim();
-    const brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
-    if (quota && opts.userId) {
-      await quota.recordUsage(opts.userId).catch((err) =>
-        console.warn(`[enigma] quota record failed: ${(err as Error).message}`));
+    let brands: any[];
+    try {
+      brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
+    } catch (err) {
+      // Nothing was billed for a failed call: give the reservation back.
+      if (quota && reservation) await this.settleQuietly(quota, reservation, null);
+      throw err;
     }
     // Credits come from what Enigma actually returned - the same values the
     // ledger meters - so the budget and the spend ledger cannot drift.
-    if (quota?.recordCredits) {
-      await quota.recordCredits(countEnigmaBilledCredits(brands)).catch((err) =>
-        console.warn(`[enigma] credit record failed: ${(err as Error).message}`));
-    }
+    if (quota && reservation) await this.settleQuietly(quota, reservation, countEnigmaBilledCredits(brands));
     const result = evaluateSearch(brands, host);
 
     await this.writeCache({
@@ -445,6 +470,20 @@ export class EnigmaService {
     }, key, !!opts.forceRefresh);
 
     return { ...result, fromCache: false, checkedAt };
+  }
+
+  private async settleQuietly(
+    quota: EnigmaQuotaTracker,
+    reservation: EnigmaQuotaReservation,
+    actualCredits: number | null,
+  ): Promise<void> {
+    try {
+      await quota.settle(reservation, actualCredits);
+    } catch (err) {
+      // The reservation already counts against the limits, so a failed
+      // reconcile only errs on the safe (over-counted) side.
+      console.warn(`[enigma] quota settle failed: ${(err as Error).message}`);
+    }
   }
 
   // A cache outage degrades to a fresh lookup rather than failing enrichment.

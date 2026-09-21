@@ -26,6 +26,7 @@ import {
   EnigmaCreditsExhaustedError,
   EnigmaBudgetExhaustedError,
   EnigmaQuotaExceededError,
+  EnigmaRateLimitedError,
   EnigmaService,
   type EnigmaBrandLookupResult,
 } from '../services/enigmaService';
@@ -213,9 +214,54 @@ describe('createEnigmaCardRevenueFetcher', () => {
   });
 });
 
-// ─── Service daily quota (AC4) ───────────────────────────────────────────────
+// ─── Spend limits: reserved before the billed call (AC4, ENG-1933) ───────────
 
-describe('EnigmaService daily quota', () => {
+/**
+ * In-memory stand-in for the two DynamoDB calls the tracker makes. Each call is
+ * one synchronous critical section, like DynamoDB's own conditional writes, so
+ * interleaved (concurrent) reservations exercise the real atomicity argument.
+ */
+function fakeConfigsTable(seed: Array<Record<string, any>> = []) {
+  const rows = new Map<string, Record<string, any>>();
+  const id = (k: { userId: string; configId: string }) => `${k.userId}|${k.configId}`;
+  for (const r of seed) rows.set(id(r as any), { ...r });
+  const conditionFailed = () => Object.assign(new Error('conditional check failed'), { code: 'ConditionalCheckFailedException' });
+  const settle = <T>(fn: () => T) => ({ promise: async () => { await Promise.resolve(); return fn(); } });
+
+  // The tracker uses exactly these expressions. The fake evaluates them by text
+  // and rejects any other, so a wrong expression in production cannot pass here.
+  const UPDATE_CONDITIONS = new Set(['#period = :period', '#period = :period AND #counter <= :maxBefore']);
+  const PUT_CONDITION = 'attribute_not_exists(userId) OR #period <> :period';
+
+  const dynamodb: any = {
+    update: (params: any) => settle(() => {
+      if (!UPDATE_CONDITIONS.has(params.ConditionExpression)) throw new Error(`fake: unsupported ConditionExpression "${params.ConditionExpression}"`);
+      if (!/^ADD #counter :(amount|delta)$/.test(params.UpdateExpression)) throw new Error(`fake: unsupported UpdateExpression "${params.UpdateExpression}"`);
+      const row = rows.get(id(params.Key));
+      const v = params.ExpressionAttributeValues;
+      const n = params.ExpressionAttributeNames;
+      const counter = n['#counter'];
+      const periodField = n['#period'];
+      if (!row || row[periodField] !== v[':period']) throw conditionFailed();
+      if (params.ConditionExpression.includes('#counter <= :maxBefore') && !(row[counter] <= v[':maxBefore'])) throw conditionFailed();
+      row[counter] = (row[counter] ?? 0) + (v[':amount'] ?? v[':delta']);
+    }),
+    put: (params: any) => settle(() => {
+      if (params.ConditionExpression !== PUT_CONDITION) throw new Error(`fake: unsupported ConditionExpression "${params.ConditionExpression}"`);
+      const row = rows.get(id(params.Item));
+      const periodField = params.ExpressionAttributeNames['#period'];
+      if (row && row[periodField] === params.ExpressionAttributeValues[':period']) throw conditionFailed();
+      rows.set(id(params.Item), { ...params.Item });
+    }),
+  };
+  return { dynamodb, rows, row: (userId: string, configId: string) => rows.get(`${userId}|${configId}`) };
+}
+
+const AT = () => new Date('2026-09-15T12:00:00Z');
+const USER_ROW = 'system:enigmaUsage';
+const BUDGET_ROW = 'system:enigmaCreditBudget';
+
+describe('EnigmaService spend limits', () => {
   const brand = {
     id: 'b1',
     names: { edges: [{ node: { name: 'Popup Bagels' } }] },
@@ -226,23 +272,30 @@ describe('EnigmaService daily quota', () => {
     const rows = new Map<string, any>();
     return { get: async (id: string, sk: string) => rows.get(`${id}|${sk}`) ?? null, put: async (r: any) => { rows.set(`${r.canonicalId}|${r.fieldGroup}`, r); } };
   };
+  const tracker = () => ({
+    reserve: jest.fn().mockResolvedValue({ userId: 'u1', credits: 52 }),
+    settle: jest.fn().mockResolvedValue(undefined),
+  });
 
-  it('blocks before HTTP when the user is at the limit, and never counts cache hits', async () => {
+  it('reserves before the HTTP call, never for a cache hit, and blocks when a limit is spent', async () => {
     const searchBrand = jest.fn().mockResolvedValue([brand]);
-    const quota = { checkQuota: jest.fn().mockResolvedValue(undefined), recordUsage: jest.fn().mockResolvedValue(undefined) };
+    const quota = tracker();
     const svc = new EnigmaService({ http: { searchBrand }, store: store(), quota });
 
     await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' });
     await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' });   // cache hit
     expect(searchBrand).toHaveBeenCalledTimes(1);
-    expect(quota.recordUsage).toHaveBeenCalledTimes(1);
+    expect(quota.reserve).toHaveBeenCalledTimes(1);
+    expect(quota.reserve.mock.invocationCallOrder[0]).toBeLessThan(searchBrand.mock.invocationCallOrder[0]);
 
-    quota.checkQuota.mockRejectedValueOnce(new EnigmaQuotaExceededError(300));
+    quota.reserve.mockRejectedValueOnce(new EnigmaQuotaExceededError(150));
     await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
-    expect(searchBrand).toHaveBeenCalledTimes(1);
+    quota.reserve.mockRejectedValueOnce(new EnigmaBudgetExhaustedError(1800));
+    await expect(svc.lookupBrandCardRevenue({ website: 'third.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
+    expect(searchBrand).toHaveBeenCalledTimes(1);   // neither refusal reached Enigma
   });
 
-  it('checks the credit budget before HTTP and records what Enigma billed', async () => {
+  it('settles with what Enigma billed, and releases the reservation when the call fails', async () => {
     const billing = {
       id: 'b1',
       names: { edges: [{ node: { name: 'Popup Bagels' } }] },                       // 2 credits
@@ -253,43 +306,102 @@ describe('EnigmaService daily quota', () => {
         { node: { quantityType: 'card_revenue_yoy_growth', period: '12m', projectedQuantity: 0.2392, periodStartDate: '2025-07-01', periodEndDate: '2026-06-30', platformBrandId: 'p1' } },   // 10, billed though discarded
       ] },
     };
-    const searchBrand = jest.fn().mockResolvedValue([billing]);
-    const quota = {
-      checkQuota: jest.fn().mockResolvedValue(undefined),
-      recordUsage: jest.fn().mockResolvedValue(undefined),
-      checkCreditBudget: jest.fn().mockResolvedValue(undefined),
-      recordCredits: jest.fn().mockResolvedValue(undefined),
-    };
+    const searchBrand = jest.fn().mockResolvedValueOnce([billing]).mockRejectedValueOnce(new EnigmaRateLimitedError(2));
+    const quota = tracker();
     const svc = new EnigmaService({ http: { searchBrand }, store: store(), quota });
 
     await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' });
-    expect(quota.recordCredits).toHaveBeenCalledWith(34);
+    expect(quota.settle).toHaveBeenLastCalledWith({ userId: 'u1', credits: 52 }, 34);
 
-    quota.checkCreditBudget.mockRejectedValueOnce(new EnigmaBudgetExhaustedError(1800));
-    await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' }))
-      .rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
-    expect(searchBrand).toHaveBeenCalledTimes(1);
-    expect(quota.checkQuota).toHaveBeenCalledTimes(1);   // budget is checked first
+    await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaRateLimitedError);
+    expect(quota.settle).toHaveBeenLastCalledWith({ userId: 'u1', credits: 52 }, null);
   });
 
-  it('Dynamo tracker: this month at budget throws; last month\'s spend does not', async () => {
-    let item: any = { month: '2026-09', creditCount: 1800 };
-    const dynamodb: any = { get: () => ({ promise: async () => ({ Item: item }) }), update: jest.fn(), put: jest.fn() };
-    const tracker = buildEnigmaQuotaTracker(dynamodb, 150, () => new Date('2026-09-15T12:00:00Z'), 1800);
+  it('a failed settle never fails the lookup', async () => {
+    const quota = tracker();
+    quota.settle.mockRejectedValue(new Error('dynamo down'));
+    const svc = new EnigmaService({ http: { searchBrand: jest.fn().mockResolvedValue([brand]) }, store: store(), quota });
 
-    await expect(tracker.checkCreditBudget!()).rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
-    item = { month: '2026-08', creditCount: 5000 };
-    await expect(tracker.checkCreditBudget!()).resolves.toBeUndefined();
+    await expect(svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' })).resolves.toMatchObject({ status: 'found' });
+  });
+});
+
+describe('buildEnigmaQuotaTracker (atomic reservations)', () => {
+  it('concurrent lookups can never exceed the user\'s daily limit', async () => {
+    const t = fakeConfigsTable();
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 5, AT, 0);
+
+    const results = await Promise.allSettled(Array.from({ length: 20 }, () => tracker.reserve('u1')));
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(5);
+    expect(results.filter((r) => r.status === 'rejected').every((r: any) => r.reason instanceof EnigmaQuotaExceededError)).toBe(true);
+    expect(t.row('u1', USER_ROW)).toMatchObject({ date: '2026-09-15', callCount: 5 });
   });
 
-  it('Dynamo tracker: at the limit today throws; yesterday\'s count does not', async () => {
-    let item: any = { date: '2026-09-15', callCount: 300 };
-    const dynamodb: any = { get: () => ({ promise: async () => ({ Item: item }) }), update: jest.fn(), put: jest.fn() };
-    const tracker = buildEnigmaQuotaTracker(dynamodb, 300, () => new Date('2026-09-15T12:00:00Z'));
+  it('concurrent lookups can never exceed the monthly credit budget, and settling frees the difference', async () => {
+    const t = fakeConfigsTable();
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 1000, AT, 200);
 
-    await expect(tracker.checkQuota('u1')).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
-    item = { date: '2026-09-14', callCount: 300 };
-    await expect(tracker.checkQuota('u1')).resolves.toBeUndefined();
+    const results = await Promise.allSettled(Array.from({ length: 10 }, (_, i) => tracker.reserve(`u${i}`)));
+    const held = results.filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled').map((r) => r.value);
+
+    expect(held).toHaveLength(3);                                        // 3 x 52 = 156; a 4th (208) would pass 200
+    expect(results.filter((r) => r.status === 'rejected').every((r: any) => r.reason instanceof EnigmaBudgetExhaustedError)).toBe(true);
+    expect(t.row('system', BUDGET_ROW)).toMatchObject({ month: '2026-09', creditCount: 156 });
+
+    for (const r of held) await tracker.settle(r, 20);                  // each really billed 20
+    expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(60);
+    await expect(tracker.reserve('u-new')).resolves.toMatchObject({ credits: 52 });
+  });
+
+  it('a failed call releases both the credits and the user\'s call', async () => {
+    const t = fakeConfigsTable();
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 10, AT, 1800);
+
+    const r = await tracker.reserve('u1');
+    expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(52);
+    expect(t.row('u1', USER_ROW)!.callCount).toBe(1);
+
+    await tracker.settle(r, null);
+    expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(0);
+    expect(t.row('u1', USER_ROW)!.callCount).toBe(0);
+  });
+
+  it('refusing on the user\'s limit gives the credits back; a spent budget never touches the user row', async () => {
+    const t = fakeConfigsTable([{ userId: 'u1', configId: USER_ROW, date: '2026-09-15', callCount: 10 }]);
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 10, AT, 1800);
+
+    await expect(tracker.reserve('u1')).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
+    expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(0);            // reserved, then released
+
+    const spent = fakeConfigsTable([{ userId: 'system', configId: BUDGET_ROW, month: '2026-09', creditCount: 1800 }]);
+    await expect(buildEnigmaQuotaTracker(spent.dynamodb, 10, AT, 1800).reserve('u2')).rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
+    expect(spent.row('u2', USER_ROW)).toBeUndefined();
+  });
+
+  it('starts a fresh counter on a new day and month, and ignores a stale reservation on settle', async () => {
+    const t = fakeConfigsTable([
+      { userId: 'u1', configId: USER_ROW, date: '2026-09-14', callCount: 150 },
+      { userId: 'system', configId: BUDGET_ROW, month: '2026-08', creditCount: 1800 },
+    ]);
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 150, AT, 1800);
+
+    const r = await tracker.reserve('u1');
+    expect(t.row('u1', USER_ROW)).toMatchObject({ date: '2026-09-15', callCount: 1 });
+    expect(t.row('system', BUDGET_ROW)).toMatchObject({ month: '2026-09', creditCount: 52 });
+
+    // Settling a reservation made last month must not touch this month's counter.
+    await tracker.settle({ ...r, month: '2026-08' }, 0);
+    expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(52);
+  });
+
+  it('a budget of 0 disables the credit budget but still enforces the user limit', async () => {
+    const t = fakeConfigsTable();
+    const tracker = buildEnigmaQuotaTracker(t.dynamodb, 1, AT, 0);
+
+    await expect(tracker.reserve('u1')).resolves.toMatchObject({ credits: 0 });
+    await expect(tracker.reserve('u1')).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
+    expect(t.row('system', BUDGET_ROW)).toBeUndefined();
   });
 });
 
