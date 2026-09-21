@@ -491,6 +491,15 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     that did not produce what was required. create_image_task_from_prompt
   //     and create_revision are also [DEPRECATED], further lowering their
   //     real-world likelihood.
+  //   - present_question_deck -> ask_user_question (ENG-1635/1644): both build
+  //     a blocking question halt, but for different SITUATIONS, not the same
+  //     requirement — present_question_deck front-loads 1-6 predictable
+  //     planning questions determinable up front, ask_user_question is the
+  //     narrow escape hatch for a genuinely unpredictable question that only
+  //     comes up mid-execution (present_question_deck's own description says
+  //     so explicitly). Calling one is not evidence the other's requirement
+  //     was also satisfied. Not aliased; logged here so it isn't silently
+  //     missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -532,6 +541,7 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'list_knowledge_base_files -> materialize_knowledge_base_asset',
         'list_knowledge_base_files -> read_knowledge_base_files',
         'perform_deep_research -> create_blog_article',
+        'present_question_deck -> ask_user_question',
         'read_file_content -> describe_image',
         'read_file_content -> describe_video',
         'read_knowledge_base_files -> materialize_knowledge_base_asset',
