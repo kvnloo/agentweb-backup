@@ -178,6 +178,101 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(mockSessionId, {});
     });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model omits it — nobody is present to approve interactive steps', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+        // autocomplete intentionally omitted, like the production run that stalled
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model explicitly requests false', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        false
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('leaves autocomplete as requested on a non-scheduled session (zero regression)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'regular',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Client Onboarding',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: false })
+      );
+    });
+
+    it('preserves an explicit autocomplete true on a non-scheduled session (zero regression)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'regular',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Client Onboarding',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        true
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
   });
 
   describe('modifyWorkPlan', () => {
@@ -319,6 +414,33 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('No work plan found');
+    });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model requests false', async () => {
+      const freshWorkPlan = JSON.parse(JSON.stringify({ ...existingWorkPlan, autocomplete: false }));
+
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+        workPlan: freshWorkPlan,
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).modifyWorkPlan(
+        [],
+        [],
+        mockSessionId,
+        false
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
     });
   });
 
@@ -3128,6 +3250,225 @@ describe('AgentModeService - Work Plan', () => {
         );
         expect(secondAttempt.success).toBe(true);
         expect(mockSession.workPlan.pendingRequiredFunctionCalls).toEqual([]);
+      });
+
+      describe('ENG-1875: judge-gated debt for a step removal the user explicitly authorized', () => {
+        function buildMockSession(overrides: any = {}) {
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+            ...overrides,
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+          return mockSession;
+        }
+
+        it('judge says "yes" against a real authorizing message -- debt is NOT ledgered for the removed step', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: "skip step 2, we don't need that email sent",
+          });
+          const callLLMSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls || []).not.toContain('send_report_email');
+          expect(callLLMSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('judge says "no" -- debt is ledgered exactly as before this fix (regression guard)', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'looks good, keep going',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'no' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+        });
+
+        it('judge throws/times out -- fails safe, debt is still ledgered', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 2',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockRejectedValue(new Error('LLM gateway down'));
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+        });
+
+        it('no real user message at all -- fails safe, debt is still ledgered, judge LLM is never called', async () => {
+          buildMockSession();
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue(null);
+          const callLLMSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['send_report_email'])
+          );
+          expect(callLLMSpy).not.toHaveBeenCalled();
+        });
+
+        it('an authorized-judged removal never clears already-standing debt from an EARLIER, unauthorized removal', async () => {
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+              {
+                stepCount: 3,
+                title: 'Publish landing page',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['publish_landing_page'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+
+          // First call: step 2 removed with no authorizing message at all --
+          // its required call goes into debt exactly as before this fix.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue(null);
+          const firstResult = await (agentModeService as any).modifyWorkPlan([], [2], mockSessionId);
+          expect(firstResult.workPlan.pendingRequiredFunctionCalls).toEqual(['send_report_email']);
+
+          // Second, SEPARATE call: step 3 removed WITH an explicit authorizing
+          // message and a "yes" judge -- only step 3's function is spared.
+          // Step 2's already-standing debt must remain untouched.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 3, we already published manually',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+            choices: [{ message: { content: 'yes' }, finish_reason: 'stop' }],
+          });
+          const secondResult = await (agentModeService as any).modifyWorkPlan([], [3], mockSessionId);
+
+          expect(secondResult.workPlan.pendingRequiredFunctionCalls).toEqual(['send_report_email']);
+          expect(secondResult.workPlan.pendingRequiredFunctionCalls).not.toContain('publish_landing_page');
+        });
+
+        it('a single removeStepCounts call mixing an authorized step with an unauthorized step only spares the authorized one', async () => {
+          // Fresh-eyes review of PR #2959 found: an earlier version of this fix
+          // asked the judge ONE yes/no for the whole modifyWorkPlan call, so a
+          // "yes" covering one genuinely-authorized step would silently spare
+          // every OTHER step removed in the same call too -- a batching side
+          // door back into the exact ENG-1811 gaming hole this ledger exists
+          // to close. The judge must be asked per removed step.
+          const workPlan = {
+            title: 'Client Report',
+            steps: [
+              { stepCount: 1, title: 'Load Metrics', status: 'completed' as const, requiredFunctionCalls: [] },
+              {
+                stepCount: 2,
+                title: 'Send report email',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['send_report_email'],
+              },
+              {
+                stepCount: 3,
+                title: 'Publish landing page',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['publish_landing_page'],
+              },
+            ],
+            createdAt: '2026-09-11T08:00:00.000Z',
+            updatedAt: '2026-09-11T08:00:00.000Z',
+          };
+          const mockSession: any = {
+            sessionId: mockSessionId,
+            userId: mockUserId,
+            messages: [],
+            workPlan: JSON.parse(JSON.stringify(workPlan)),
+            calledFunctions: {},
+            failedFunctions: {},
+          };
+          (chatbotDb.getChatSession as jest.Mock).mockImplementation(() => Promise.resolve(mockSession));
+          (chatbotDb.updateSessionWorkPlan as jest.Mock).mockImplementation((_sid: string, updatedPlan: any) => {
+            mockSession.workPlan = updatedPlan;
+            return Promise.resolve(mockSession);
+          });
+
+          // The user only authorized dropping step 2's scope. The judge is
+          // asked once per removed step, so the step-3 call must independently
+          // come back "no" even though the same message authorized step 2.
+          (chatbotDb.getMostRecentRealUserMessage as jest.Mock).mockResolvedValue({
+            content: 'skip step 2, we do not need that email sent -- keep step 3 though',
+          });
+          jest.spyOn(agentModeService as any, 'callLLM').mockImplementation((...args: any[]) => {
+            const messages = args[1];
+            const systemContent = messages?.[0]?.content ?? '';
+            const isStep2Judge = systemContent.includes('Send report email');
+            return Promise.resolve({
+              choices: [{ message: { content: isStep2Judge ? 'yes' : 'no' }, finish_reason: 'stop' }],
+            });
+          });
+
+          const result = await (agentModeService as any).modifyWorkPlan([], [2, 3], mockSessionId);
+
+          expect(result.success).toBe(true);
+          expect(result.workPlan.pendingRequiredFunctionCalls).not.toContain('send_report_email');
+          expect(result.workPlan.pendingRequiredFunctionCalls).toEqual(
+            expect.arrayContaining(['publish_landing_page'])
+          );
+        });
       });
 
       it('ENG-1811: deleting the last pending step(s) WITHOUT re-adding them (never calling set_work_plan_status again) must not report the plan as done while debt is outstanding', async () => {

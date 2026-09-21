@@ -6,6 +6,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
 import { MAX_FILE_SIZE } from '../config';
+import { getOwnedRunStatus } from '../services/agentMode/runStore';
 
 const router = express.Router();
 const upload = multer({ 
@@ -139,6 +140,20 @@ router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.em
 // All other routes require authentication
 router.use(authenticateToken);
 
+// Read-only polling: authentication above, strict ownership in the store (no admin bypass).
+// Never generate work or charge quota just to inspect a durable run.
+router.get('/runs/:runId', asyncHandlerAuth(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const run = await getOwnedRunStatus(req.params.runId, req.user.userId);
+    if (!run) return res.status(404).json({ error: 'Run not found', completion_confirmed: false });
+    return res.json(run);
+  } catch (error) {
+    console.error('AgentMode: Get run status failed:', error);
+    return res.status(503).json({ error: 'Failed to get run status', completion_confirmed: false });
+  }
+}));
+
 // Create an authorized Skill-backed session with its existing static welcome brief.
 router.post('/skill/:skillId/session', asyncHandler(agentModeController.createSession));
 
@@ -247,9 +262,17 @@ router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asy
 // Submit or update message feedback
 router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAuth(agentModeController.submitMessageFeedback));
 
+// POST /api/agent-mode/session/:sessionId/work-plan
+// Owner-only: launch an accessible predefined work plan (ENG-2057)
+router.post('/session/:sessionId/work-plan', asyncHandlerAuth(agentModeController.launchWorkPlan));
+
 // POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/accept
 // Owner-only: instantiate a previously-recommended predefined work plan (ENG-1472)
 router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/accept', asyncHandlerAuth(agentModeController.acceptWorkPlanRecommendation));
+
+// POST /api/agent-mode/session/:sessionId/work-plan-recommendations/:recommendationId/decline
+// Owner-only: record that the user declined a recommendation via "Keep chatting" (ENG-1974)
+router.post('/session/:sessionId/work-plan-recommendations/:recommendationId/decline', asyncHandlerAuth(agentModeController.declineWorkPlanRecommendation));
 
 // POST /api/agent-mode/share
 // Create shareable link for conversation
@@ -324,6 +347,10 @@ router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeCo
 // results) against DynamoDB's per-item limit, plus a corrective action when the
 // schedule is under storage pressure. Never returns field content, never writes.
 router.get('/scheduled-chats/:scheduleId/storage-diagnostics', asyncHandler(agentModeController.getScheduledChatStorageDiagnostics));
+
+// POST /api/agent-mode/scheduled-chats/:scheduleId/delivery-log/:runId/confirm
+// ENG-1552: record that a recipient confirmed receiving a delivered report.
+router.post('/scheduled-chats/:scheduleId/delivery-log/:runId/confirm', asyncHandler(agentModeController.confirmScheduledReportReceipt));
 
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
 // Send test notification email for a specific test history record

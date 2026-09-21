@@ -156,3 +156,38 @@ describe("absent is a legal state (AC 5) and old records still read (AC 6)", () 
     expect(await getLanderUtmOverride("page-1")).toBeNull();
   });
 });
+
+describe("caller-scoped override reads (ENG-725 cross-tenant guard)", () => {
+  it("returns the override to the owning caller without extra user lookups", async () => {
+    mockGet.mockReturnValue(
+      ok({ Item: { id: "page-1", userId: "user-1", utmOverride: { utm_campaign: "launch" } } })
+    );
+    expect(await getLanderUtmOverride("page-1", "user-1")).toEqual({ utm_campaign: "launch" });
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("returns null for a lander owned by another tenant outside the caller org", async () => {
+    mockGet.mockReturnValue(
+      ok({ Item: { id: "page-9", userId: "user-9", utmOverride: { utm_campaign: "theirs" } } })
+    );
+    mockGetUserById.mockImplementation(async (id: string) =>
+      id === "user-1" ? { userId: "user-1", orgId: "org-a" } : { userId: "user-9", orgId: "org-b" }
+    );
+    expect(await getLanderUtmOverride("page-9", "user-1")).toBeNull();
+  });
+
+  it("returns the override to a same-org member, and null when the caller has no org", async () => {
+    mockGet.mockReturnValue(
+      ok({ Item: { id: "page-2", userId: "user-2", utmOverride: { utm_campaign: "shared" } } })
+    );
+    mockGetUserById.mockImplementation(async (id: string) => {
+      if (id === "user-1") return { userId: "user-1", orgId: "org-a" };
+      return { userId: "user-2", orgId: "org-a" };
+    });
+    expect(await getLanderUtmOverride("page-2", "user-1")).toEqual({ utm_campaign: "shared" });
+
+    mockGetUserById.mockReset();
+    mockGetUserById.mockResolvedValue({ userId: "user-1" });
+    expect(await getLanderUtmOverride("page-2", "user-1")).toBeNull();
+  });
+});

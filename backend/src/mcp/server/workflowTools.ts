@@ -183,6 +183,7 @@ mcpToolRegistry.register({
 
     return jsonResult({
       task_id: taskId,
+      ...(typeof data?.runId === 'string' && data.runId ? { run_id: data.runId } : {}),
       status,
       // Confirmed only when we actually verified it: a synchronous return IS
       // the completion signal, but only once the session read has ruled out a
@@ -197,7 +198,7 @@ mcpToolRegistry.register({
       next: pendingDeck
         ? 'Emma is waiting on an answer. Use emma_answer_question_deck — a plain message abandons the question.'
         : stillBuilding
-          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
+          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id and run_id if returned — an idle session or detached_still_building record does not confirm completion.'
           : confirmationFailed
             ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_session with session_id set to this task_id to check.'
             : undefined,
@@ -268,6 +269,10 @@ mcpToolRegistry.register({
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
+      // Not also requiring hasDesignSystem — see ProtectedRoute.tsx's
+      // ENG-328 comment: every account onboarded before that step existed
+      // would otherwise report is_onboarded:false despite being fully
+      // onboarded under the rules that applied when they signed up.
       is_onboarded: me?.hasBrandGuidelines ?? null,
       usage: me?.tokenUsage ?? null,
     });

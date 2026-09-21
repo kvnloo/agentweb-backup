@@ -1378,6 +1378,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             body: { type: "string", description: "Ad body / primary text." },
             title: { type: "string", description: "Ad headline." },
             link_url: { type: "string", description: "Destination URL." },
+            lander_id: { type: "string", description: "Generated landing page ID. When provided, its UTM override is resolved over the customer default for Meta url_tags." },
+            url_tags: { type: "string", description: "Meta creative URL parameters as a query string. Validated as a string at the tool boundary; configured lander UTMs are resolved around it without overwriting gclid/fbclid." },
             call_to_action_type: { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
             creative_id: { type: "string", description: "Creative ID. For AD CREATE: the creative to attach. For AD UPDATE: swap the ad onto this existing creative (nested as { creative: { creative_id } } — a top-level creative_id is silently ignored by Meta)." },
             ad_format: { type: "string", description: "AD/AD_CREATIVE PREVIEW: Meta placement format to render, e.g. DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, or INSTAGRAM_STORY." },
@@ -3875,7 +3877,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4022,7 +4024,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX milliseconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile, enigma), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Enigma card revenue (`card_revenue_12m`, `card_revenue_period_end`, `card_revenue_yoy_growth`; provider "enigma") is card spend on US consumer and small-business cards over the 12 months ending the meta `asOf` date — ALWAYS call it "card revenue" with that date (e.g. "$4.2M card revenue, 12 months to May 2026"), NEVER "revenue" or total revenue; it excludes corporate-card, invoice and cash sales and is a floor for B2B or mixed businesses. `card_revenue_yoy_growth` is a signed change versus the same 12 months a year earlier (0.07 = up 7%, -0.61 = down 61%), not a ratio. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX milliseconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -5077,7 +5079,8 @@ emmaToolRegistry.register({
       return_scenes: args.return_scenes,
       start_time: args.start_time,
       end_time: args.end_time,
-      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
+      userId: context?.userId, // charge this describe_video spend to the caller (ENG-200)
+      sessionId: context?.sessionId, // ENG-1961: trace the row back to the chat
     });
   }
 });
@@ -5838,7 +5841,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills. For an IMAGE or VIDEO file found here that you need to actually USE (e.g. as ad creative), do NOT use read_knowledge_base_files — use materialize_knowledge_base_asset instead.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills. For an IMAGE or VIDEO file found here that you need to actually USE (e.g. as ad creative), do NOT use read_knowledge_base_files — if its identifier starts with "gdrive:", use materialize_knowledge_base_asset instead. For non-Drive identifiers (private, public, clickup:, clickup-folder:, foreplay:), materialize_knowledge_base_asset cannot handle them (Google Drive only) — use read_knowledge_base_files to inspect/describe the file instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -5882,7 +5885,7 @@ emmaToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file. WARNING: for an image or video file this returns raw bytes as a base64 string, capped and silently truncated at 1,000,000 characters — truncated base64 does not decode, so any real image/video will come back corrupted. Never use this tool for image/video files you intend to actually use (e.g. as ad creative) — use materialize_knowledge_base_asset instead, which returns a real hosted URL. Only use this tool for images/video if you genuinely just need to inspect/describe them and corruption from truncation is acceptable.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file. WARNING: for an image or video file this returns raw bytes as a base64 string, capped and silently truncated at 1,000,000 characters — truncated base64 does not decode, so any real image/video will come back corrupted. Never use this tool for image/video files you intend to actually use (e.g. as ad creative) when the kb_identifier starts with "gdrive:" — use materialize_knowledge_base_asset instead, which returns a real hosted URL. materialize_knowledge_base_asset is Google-Drive-only: for non-Drive identifiers (private, public, clickup:, clickup-folder:, foreplay:), do NOT route to it — use this tool to inspect/describe the file instead. Only use this tool for images/video if you genuinely just need to inspect/describe them and corruption from truncation is acceptable.',
     inputSchema: {
       type: "object",
       properties: {
@@ -6497,7 +6500,7 @@ emmaToolRegistry.register({
   name: 'launch_predefined_work_plan',
   definition: {
     name: 'launch_predefined_work_plan',
-    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Two distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously.',
+    description: 'Launch (instantiate) a predefined work plan template into the current chat session. Use this when the user picks a template returned by list_predefined_work_plans. This copies the template\'s steps into the session as a fresh work plan (all pending), installs any skills the plan needs, and applies its settings, so you can then guide the user through the steps. Three distinct cases return requiresConfirmation instead of launching: (1) a work plan is already active in this session — confirm with the user, then call again with force=true to replace it; (2) the resolved title has a similarly-named sibling template that could easily be confused for it — confirm with the user exactly which one they meant, then call again using that plan\'s planId (not its title) to launch it unambiguously; (3) the user already declined this exact plan by clicking "Keep chatting" on its recommendation card — confirm the user actually wants to start it now, then call again with confirmedDeclinedPlan=true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6508,13 +6511,20 @@ emmaToolRegistry.register({
         force: {
           type: 'boolean',
           description: 'Set to true to replace an existing active work plan in this session. Only do this after the user confirms.'
+        },
+        confirmedDeclinedPlan: {
+          type: 'boolean',
+          description: 'Set to true to launch a plan the user previously declined via "Keep chatting". Only do this after the user explicitly confirms they want to start it now.'
         }
       },
       required: ['planTitle']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, { force: args.force === true });
+    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+      force: args.force === true,
+      confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
+    });
   }
 });
 
@@ -7155,7 +7165,7 @@ IMPORTANT — identity resolution failures: If processedCount is 0 and failureBr
 
 "Enrich all lists" workflow: When the user asks to enrich multiple or all lists at once, preview each list first (you may run all previews sequentially without waiting for per-list confirmation). After all previews complete, summarize which lists passed (processedCount > 0) and which are unenrichable (processedCount === 0 with identityResolutionFailed > 0). If the user already confirmed they want all lists enriched, proceed to call enrich_leads_execute for each passing list without asking again per list — only pause if a list has an unexpected issue.
 
-output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
+output_fields guidance: one entry per distinct data point. Each entry has a snake_case "name", an "instruction" (what to find / where it lives), and an optional "overwrite_policy". Numeric values, categorical values, URLs, and prose summaries each get their own field. The engine routes data sources (Apollo, LinkedIn, web search) automatically — you do not specify sources. Card revenue is different: only when the user explicitly asks for card revenue / card sales, request the exact field names "card_revenue_12m" and "card_revenue_period_end", and also "card_revenue_yoy_growth" only when they explicitly ask for card-revenue growth or YoY (the pipeline never adds a card field you did not name; it is paid per company and only enabled for some accounts; if it comes back empty, say card revenue was not available rather than guessing). Never request it for a generic "revenue" ask — use revenue_range for that. If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -8414,6 +8424,10 @@ emmaToolRegistry.register({
               ? user.email
               : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
             sessionId: affectedSessionId ?? context?.sessionId,
+            // ENG-1961: who PAYS for the dedup judge is the caller running this
+            // tool, never `userEmail` — under ENG-939 that is the affected user
+            // of a cross-user review, who did not ask for the analysis.
+            actingUserId: userId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
@@ -9363,6 +9377,7 @@ ACTION MATRIX:
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
+              ENG-1944: enabling the CAMPAIGN does NOT enable its ad groups, keywords, or ads — those default to PAUSED on creation and stay that way unless explicitly updated. A successful RESUME/UPDATE(ENABLED) response may include pausedChildEntitiesWarning naming ad groups/keywords/ads still PAUSED underneath — if present, the campaign will deliver ZERO traffic despite showing ENABLED. Do not report a launch as live until you've enabled those too (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED) and re-checked. Never rely on CAMPAIGN status alone to confirm something is live.
               ADD_PROXIMITY (campaign_resource_name, radius, address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?}; radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
@@ -9474,12 +9489,16 @@ ACTION MATRIX:
         landscape_image_assets: { type: 'array', items: { type: 'string' }, description: 'Landscape image asset resource names for ASSET_GROUP CREATE.' },
         logo_assets: { type: 'array', items: { type: 'string' }, description: 'Logo asset resource names for ASSET_GROUP CREATE.' },
         video_assets: { type: 'array', items: { type: 'string' }, description: 'Video asset resource names for ASSET_GROUP CREATE. Optional.' },
+        client_id: { ...CLIENT_ID_SCHEMA_PROPERTY, description: `${CLIENT_ID_SCHEMA_PROPERTY.description} Read-only here: only honored for action=LIST or action=SEARCH — a client-scoped write is refused, since that would mutate a client's live campaign without their own authorization.` },
       },
       required: ['customer_id', 'entity_type', 'action'],
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, { sessionId: context?.sessionId });
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
+      sessionId: context?.sessionId,
+      ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_api' } } : {}),
+    });
   },
 });
 
@@ -9489,12 +9508,18 @@ emmaToolRegistry.register({
     name: 'call_google_ads_reporting_api',
     description: `Fetch Google Ads performance data.
 
-TWO MODES:
+THREE MODES:
+- mode="serving_chain": Verify Search serving-chain readiness and today's delivery evidence; optional campaign_ids.
 - mode="dashboard": Pre-formatted markdown table (spend, impressions, clicks, CTR, conversions, avg CPC). Use for "how are my campaigns doing?" questions.
 - mode="raw": Custom GAQL query, returns structured results. Use for keyword-level data, custom breakdowns, or specific fields.
 
 COST: cost_micros from API ÷ 1,000,000 = spend in account currency. Check the currency field in response.
 NEVER fabricate metrics — only report what tools return.
+Before any customer-facing Search launch/status assertion, call call_google_ads_reporting_api mode="serving_chain".
+Never claim ads are live, serving, or spending from campaign or keyword status alone. READY is not evidence of delivery.
+Only DELIVERING supports observed delivery in the returned window; spending additionally requires costMicros > 0 on that eligible path.
+Cite campaign, budget, ad-group, ad creative, keyword eligibility, telemetry, account timezone, window, and checkedAt timestamp. Include every blocked sibling path.
+UNVERIFIED or failed reads forbid readiness/delivery claims. Today's telemetry can lag and does not prove ads are serving at this instant. Performance Max and Display are unsupported by this verifier.
 
 GAQL EXAMPLES:
   Campaign: SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS
@@ -9503,16 +9528,19 @@ GAQL EXAMPLES:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field (NOT the "id" field).' },
-        mode: { type: 'string', enum: ['raw', 'dashboard'], description: '"dashboard" for formatted summary. "raw" for custom GAQL.' },
+        mode: { type: 'string', enum: ['raw', 'dashboard', 'serving_chain'], description: '"serving_chain" required for Search launch/status assertions. "dashboard" for formatted summary. "raw" for custom GAQL.' },
         query: { type: 'string', description: 'GAQL query. Required for mode="raw".' },
-        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard mode only). Omit for all.' },
-        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Defaults to LAST_30_DAYS.' },
+        campaign_ids: { type: 'array', items: { type: 'string' }, description: 'Filter to specific campaigns (dashboard or serving_chain mode). Omit for all.' },
+        date_preset: { type: 'string', enum: ['TODAY', 'YESTERDAY', 'LAST_7_DAYS', 'LAST_30_DAYS', 'LAST_90_DAYS', 'THIS_MONTH', 'LAST_MONTH', 'THIS_YEAR'], description: 'Dashboard only; defaults to LAST_30_DAYS. serving_chain always uses TODAY in the account timezone.' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY,
       },
       required: ['customer_id', 'mode'],
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
+    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
+      ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_reporting_api' } } : {}),
+    });
   },
   // ENG-1276 follow-up: only fetches metrics/GAQL results (getQuickMetrics,
   // queryReporting) — no write-capable action in this tool's schema at all,

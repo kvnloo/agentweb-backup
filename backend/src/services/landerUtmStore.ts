@@ -87,16 +87,34 @@ export async function setCustomerUtmDefault(
   return validated;
 }
 
-/** The per-lander override, or `null` when this lander has none. */
-export async function getLanderUtmOverride(pageId: string): Promise<UtmConfig | null> {
+/** The per-lander override, or `null` when this lander has none.
+ *
+ * Caller-scoped: the override is returned only when the lander belongs to
+ * `callerUserId` or to a member of the caller's org. Any other lander —
+ * missing, archived, or owned outside the caller's visibility — reads back as
+ * `null` (fail closed: a foreign id silently contributes no tags rather than
+ * leaking another tenant's configuration into this caller's creatives).
+ */
+export async function getLanderUtmOverride(
+  pageId: string,
+  callerUserId?: string,
+): Promise<UtmConfig | null> {
   const result = await dynamodb
     .get({
       TableName: LANDERS_TABLE,
       Key: { id: pageId },
-      ProjectionExpression: "utmOverride",
+      ProjectionExpression: "utmOverride, userId",
     })
     .promise();
-  return normalizeStored(result.Item?.utmOverride);
+  const item = result.Item as { utmOverride?: unknown; userId?: string } | undefined;
+  if (callerUserId && item && item.userId && item.userId !== callerUserId) {
+    const caller = await userDb.getUserById(callerUserId);
+    const callerOrgId = caller?.orgId;
+    if (!callerOrgId) return null;
+    const owner = await userDb.getUserById(item.userId);
+    if (!owner || owner.orgId !== callerOrgId) return null;
+  }
+  return normalizeStored(item?.utmOverride);
 }
 
 /**

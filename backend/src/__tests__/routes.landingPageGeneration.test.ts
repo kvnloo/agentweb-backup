@@ -1966,6 +1966,24 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 // Rate Limiting
 // =============================================================================
 describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
+  it("FAIL (ENG-1238): an externally-imported record is rejected before any generation", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Imported",
+      status: "deployed",
+      sourceType: "external",
+      canonicalUrl: "https://example.com/page",
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(409);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: re-generates with org-aware brand context passed through", async () => {
     const orgBrand = {
       brandData: { brandName: "OrgBrand" },

@@ -575,8 +575,9 @@ export interface GeneratedLandingPage {
   /**
    * ENG-449 gap #3: result of the automated post-deploy Playwright smoke test
    * (loads the live page, submits the lead form for real, confirms the lead lands in
-   * the CRM and — if a pixel is configured — that a real facebook.com/tr request
-   * fired). Unlike pixelLeadEventVerified/bridgeOutVerified (static code checks at
+   * the CRM and — if a pixel is configured — that the page's JS calls
+   * fbq('track','Lead',...) on submit; the real beacon is blocked, so this is a
+   * JS-call check, not a network sniff). Unlike pixelLeadEventVerified/bridgeOutVerified (static code checks at
    * generation time), this verifies the actually-deployed, actually-live page.
    * Written by runGenerationSmokeTest (landingPageSmokeTest.ts), fire-and-forget
    * after deploy — absent until that first run completes.
@@ -587,7 +588,22 @@ export interface GeneratedLandingPage {
     pixelFired?: boolean;
     checkedAt: string;
     error?: string;
+    /** ENG-449: handoff id extracted from a cross-origin chat-handoff redirect
+     * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
+     * Persisted so the handoff can be verified against the chat/handoff backend. */
+    handoffId?: string;
   };
+  /**
+   * ENG-1238: externally-deployed/imported page marker. Records registered via
+   * the admin external-import route carry sourceType 'external' + canonicalUrl
+   * + repo/project ref + leadListId and are otherwise plain AW-LandingPages rows,
+   * so the owner-scoped list route already surfaces them; build/deploy/poller/
+   * janitor paths never match them (no siteId/v0/vercel fields set).
+   */
+  sourceType?: "external";
+  canonicalUrl?: string;
+  repoRef?: string;
+  projectRef?: string;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge

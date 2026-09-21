@@ -115,6 +115,20 @@ jest.mock("../services/adminAuditLog", () => ({
   recordAdminAudit: (...a: any[]) => mockRecordAdminAudit(...a),
 }));
 
+const mockRegisterExternalLandingPage = jest.fn();
+class MockExternalLandingPageValidationError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(reason);
+    this.name = "ExternalLandingPageValidationError";
+    this.reason = reason;
+  }
+}
+jest.mock("../services/externalLandingPageCatalog", () => ({
+  registerExternalLandingPage: (...a: any[]) => mockRegisterExternalLandingPage(...a),
+  ExternalLandingPageValidationError: MockExternalLandingPageValidationError,
+}));
+
 import adminLandingPagesRoutes from "../routes/adminLandingPages";
 
 // ---------------------------------------------------------------------------
@@ -485,5 +499,70 @@ describe("GET /:id/effective-view", () => {
       "/api/admin/landing-pages/page-1/effective-view?member=ghost@rankai.ai"
     );
     expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ENG-1238 — POST /external-import route contract (admin-owned registration)
+// ---------------------------------------------------------------------------
+describe("POST /external-import (ENG-1238)", () => {
+  const validBody = {
+    name: "AI Readiness Roadmap",
+    canonicalUrl: "https://hireemma.ai/ai-readiness-roadmap",
+    context: "Cold-intent lander",
+    repoRef: "AgentWebPro/agentweb-landing-page",
+    projectRef: "hireemma.ai",
+    leadListId: "list_1786727568488_vchiqixf5",
+  };
+  const registeredPage = {
+    id: "page-ext-1",
+    userId: adminId,
+    name: validBody.name,
+    status: "deployed",
+    sourceType: "external",
+    canonicalUrl: validBody.canonicalUrl,
+    context: validBody.context,
+    repoRef: validBody.repoRef,
+    projectRef: validBody.projectRef,
+    leadListId: validBody.leadListId,
+    deployedUrl: validBody.canonicalUrl,
+  };
+
+  it("registers under the calling admin's own userId partition and audits (201)", async () => {
+    mockRegisterExternalLandingPage.mockResolvedValue({ ok: true, page: registeredPage });
+    const app = makeApp(admin);
+    const res = await request(app).post("/api/admin/landing-pages/external-import").send(validBody);
+    expect(res.status).toBe(201);
+    expect(mockRegisterExternalLandingPage).toHaveBeenCalledWith({ userId: adminId, ...validBody });
+    expect(mockRecordAdminAudit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actorUserId: adminId,
+        action: "landing_page_external_import",
+        pageId: "page-ext-1",
+        pageOwnerUserId: adminId,
+        canonicalUrl: validBody.canonicalUrl,
+        leadListId: validBody.leadListId,
+      })
+    );
+  });
+
+  it("surfaces validation failures as 400 without auditing", async () => {
+    mockRegisterExternalLandingPage.mockRejectedValue(
+      new MockExternalLandingPageValidationError("canonicalUrl must be an https URL")
+    );
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/external-import")
+      .send({ ...validBody, canonicalUrl: "http://hireemma.ai/x" });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/https/);
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
+  it("denies non-admin callers (403)", async () => {
+    const app = makeApp(nonAdmin);
+    const res = await request(app).post("/api/admin/landing-pages/external-import").send(validBody);
+    expect(res.status).toBe(403);
+    expect(mockRegisterExternalLandingPage).not.toHaveBeenCalled();
   });
 });

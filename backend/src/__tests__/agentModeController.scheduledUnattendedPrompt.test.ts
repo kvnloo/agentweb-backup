@@ -155,6 +155,20 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     });
   });
 
+  it('derives delegated access from persisted session metadata when the caller omits it', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...scheduledSession,
+      delegateInfo: { isDelegated: true, adminUserId: 'admin-user' },
+    } as any);
+
+    await generateSessionResponse(SESSION_ID, 'Continue', USER_ID, scheduledSession.llmModel, []);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ isDelegatedAccess: true }),
+      expect.any(Function),
+    );
+  });
+
   it('persists a system message on the first turn of a scheduled session', async () => {
     await agentModeController.generateResponse(makeReq(), makeRes());
     expect(capturedSystemPrompt()).toBeDefined();

@@ -24,10 +24,11 @@ export interface McpToolHandler {
    * When true, the tool is hidden from external MCP clients' `tools/list`.
    *
    * Hiding only — a client that knows the name can still call it. That is
-   * deliberate for the cost-driven tools (image generation, the searches,
-   * `save_file`): ENG-973 meters the `/api/emma/*` routes they self-call, so
-   * naming one buys no free spend. Where the damage would be the *action*
-   * rather than the cost, use `internalOnly` instead.
+   * deliberate for the cost-driven tools (the searches, `save_file`):
+   * ENG-973 meters the `/api/emma/*` routes they self-call, so naming one
+   * buys no free spend. `generate_image` is listed for external MCP
+   * (metered on `/api/emma/generate-image`). Where the damage would be the
+   * *action* rather than the cost, use `internalOnly` instead.
    */
   internal?: boolean;
   /**

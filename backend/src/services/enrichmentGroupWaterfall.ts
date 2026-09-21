@@ -15,7 +15,8 @@
 // Design ref: tasks/crm-enrichment-v3.1-design.md §5.2.
 
 import { isFresh } from './enrichmentTtl';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { CARD_REVENUE_GROUP, FIELD_GROUPS } from './enrichmentGroups';
+import type { CardAdoption, EnigmaCardRevenueOutcome } from './enigmaCardRevenueEnrichment';
 import { apolloEmailStatusToConfidence } from './apolloFieldMapper';
 import { getFieldConfidence } from './fieldConfidenceRegistry';
 import type { LeadRecord } from './crmEnrichmentService';
@@ -119,7 +120,7 @@ export interface FieldFill {
 export interface GroupResult {
   fields: FieldFill[];
   missing: string[];
-  tierFills: { crm: number; apollo: number; enrichSo: number; unipile: number; web: number; missing: number };
+  tierFills: { crm: number; apollo: number; enrichSo: number; unipile: number; web: number; missing: number; enigma?: number };
 }
 
 export interface LLMExtractInput {
@@ -187,6 +188,13 @@ export interface WaterfallDeps {
   /** Tier 3.5b-enrich.so: reverse-lookup by email → person + company fields.
    *  Memoized via EnrichSoFetchContext — called at most once per lead. */
   findEnrichSoPerson?(email: string): Promise<EnrichSoFetchResult | null>;
+  /** ENG-1388: Enigma card revenue for the company_card_revenue group only.
+   *  Absent unless this run may buy Enigma data (flag + allowlist + explicit
+   *  field). Without it the group's fields stay missing — nothing else fills them. */
+  fetchEnigmaCardRevenue?(
+    lead: LeadRecord,
+    opts: { industryLabels: Array<string | undefined>; forceRefresh: boolean },
+  ): Promise<EnigmaCardRevenueOutcome>;
 }
 
 export interface RunWaterfallInput {
@@ -357,6 +365,78 @@ function llmFilledHasValue(entry: LLMFilledValue | undefined): boolean {
   return !!entry && typeof entry.value === 'string' && entry.value.length > 0;
 }
 
+function metaEnigma(field: string, periodEndDate: string, adoption: CardAdoption, fromCache: boolean): EnrichedFieldMeta {
+  const floor = adoption === 'high' ? '' : ' Likely a floor for this industry.';
+  return {
+    source: 'api',
+    provider: 'enigma',
+    confidence: getFieldConfidence('enigma', field),
+    enrichedAt: new Date().toISOString(),
+    fromCache,
+    asOf: periodEndDate,
+    sourceQuote:
+      `Card spend on US consumer and small-business cards over the 12 months ending ${periodEndDate}. ` +
+      `Not total revenue: corporate-card, invoice and cash sales are excluded.${floor}`,
+  };
+}
+
+function stringOrUndefined(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v : undefined;
+}
+
+async function runCardRevenueTier(
+  input: RunWaterfallInput,
+  deps: WaterfallDeps,
+  filled: FieldFill[],
+  crmHitCount: number,
+  remaining: string[],
+  tag: string,
+): Promise<GroupResult> {
+  const { lead, apolloCtx, refreshFields } = input;
+  const result = (fields: FieldFill[], missing: string[], enigma: number): GroupResult => ({
+    fields,
+    missing,
+    tierFills: { crm: crmHitCount, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: missing.length, enigma },
+  });
+
+  if (!deps.fetchEnigmaCardRevenue) {
+    console.log(`${tag} ENIGMA not enabled for this run → missing=[${remaining.join(',')}]`);
+    return result(filled, remaining, 0);
+  }
+
+  // Industry already known for this lead — never an extra Apollo call just for it.
+  const orgRaw = apolloCtx.orgRawJson;
+  const industryLabels = [
+    getLeadFieldValue(lead, 'industry'),
+    stringOrUndefined(orgRaw?.industry),
+    ...(Array.isArray(orgRaw?.industries) ? orgRaw.industries.map(stringOrUndefined) : []),
+  ];
+  const forceRefresh = remaining.some((f) => refreshFields.has(`${lead.leadId}:${f}`));
+  const outcome = await deps.fetchEnigmaCardRevenue(lead, { industryLabels, forceRefresh });
+
+  if (outcome.kind !== 'found') {
+    console.log(`${tag} ENIGMA ${outcome.kind} reason=${outcome.reason} → missing=[${remaining.join(',')}]`);
+    return result(filled, remaining, 0);
+  }
+
+  const { cardRevenue12m, fromCache } = outcome.result;
+  // customFields and Tier 1 freshness only understand strings.
+  const values: Record<string, string | undefined> = {
+    card_revenue_12m: String(cardRevenue12m.amountUsd),
+    card_revenue_period_end: cardRevenue12m.periodEndDate,
+    card_revenue_yoy_growth: cardRevenue12m.yoyGrowth != null ? String(cardRevenue12m.yoyGrowth) : undefined,
+  };
+  const enigmaFills: FieldFill[] = [];
+  for (const field of remaining) {
+    const value = values[field];
+    if (value === undefined) continue;
+    enigmaFills.push({ field, value, meta: metaEnigma(field, cardRevenue12m.periodEndDate, outcome.adoption, fromCache) });
+  }
+  const missing = remaining.filter((f) => !enigmaFills.some((e) => e.field === f));
+  console.log(`${tag} ENIGMA HIT fills=[${enigmaFills.map((f) => f.field).join(',')}] adoption=${outcome.adoption} missing=[${missing.join(',')}]`);
+  return result([...filled, ...enigmaFills], missing, enigmaFills.length);
+}
+
 // ─── Main entry ───────────────────────────────────────────────────────────────
 
 export async function runWaterfall(
@@ -415,6 +495,13 @@ export async function runWaterfall(
       missing: [],
       tierFills: { crm: crmHits.length, apollo: 0, enrichSo: 0, unipile: 0, web: 0, missing: 0 },
     };
+  }
+
+  // ─ Card revenue (ENG-1388): Enigma or nothing ─────────────────────────────
+  // Returns unconditionally so Tiers 2–5 never see these fields: an LLM or web
+  // guess at card revenue would be indistinguishable from measured data.
+  if (groupName === CARD_REVENUE_GROUP) {
+    return runCardRevenueTier(input, deps, filled, crmHits.length, remaining, tag);
   }
 
   // ─ Tier 2: Apollo ──────────────────────────────────────────────────────────

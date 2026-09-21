@@ -119,6 +119,7 @@ import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
+import designSystemBuildRoutes from "./routes/designSystemBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
 import outreachOnboardingRoutes from "./routes/outreachOnboarding";
@@ -140,6 +141,7 @@ import {
   exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
+import { healthPayload } from "./utils/buildInfo";
 
 const app = express();
 
@@ -315,6 +317,7 @@ app.use((req, res, next) => {
 });
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
+app.use("/api/slack/events", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 // Stripe Connect webhook needs its own raw-body handler — also before express.json().
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
@@ -494,6 +497,7 @@ try {
   console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
+app.use("/api/onboarding", designSystemBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);
 app.use("/api/onboarding", outreachOnboardingRoutes);
@@ -546,7 +550,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  res.status(200).json(healthPayload());
 });
 
 // Global error handler — catches unhandled errors from all routes and reports them to Notion

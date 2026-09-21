@@ -32,7 +32,7 @@
  */
 
 import * as crypto from 'crypto';
-import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { isSmokeTestLead } from '../utils/smokeTestLead';
 
 export type LeadStatusType = 'active' | 'won' | 'lost' | 'churned';
 
@@ -544,7 +544,7 @@ export async function relayLeadStatusEvent(
 
     // Never pollute a real ad account with the automated smoke test's synthetic lead —
     // same guard the form-submission path applies (routes/webhooks.ts).
-    if (isSmokeTestEmail(lead.email)) {
+    if (isSmokeTestLead(lead)) {
       return skip('smoke-test lead', true, false, true);
     }
 

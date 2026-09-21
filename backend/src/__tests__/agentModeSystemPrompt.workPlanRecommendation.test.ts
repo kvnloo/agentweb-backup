@@ -43,3 +43,25 @@ describe('AgentMode system prompt - proactive work plan recommendation lookup (E
     );
   });
 });
+
+/**
+ * ENG-1974: "Keep chatting" on a recommendation card leaves no backend/model
+ * signal that the user declined -- the recommendation's tool-call result
+ * just sits in context forever, so an ordinary next message could get the
+ * model to self-launch it via launch_predefined_work_plan (live-confirmed on
+ * env1, twice). The dynamic per-turn note (built by
+ * buildDeclinedWorkPlanRecommendationContextMessages) is the primary
+ * signal; this static sentence is the cross-reference telling the model
+ * that note exists and what to do about it, same convention as the
+ * "automatically provided in your context" line for the active work plan.
+ */
+describe('AgentMode system prompt - declined work plan recommendation cross-reference (ENG-1974)', () => {
+  it('tells the model not to launch a previously-declined plan on an ordinary message, and to wait for explicit confirmation', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'If a recommended plan was previously declined via "Keep chatting", you\'ll see a note above the user\'s message saying so'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'do not call **launch_predefined_work_plan** for it again on the strength of an ordinary on-topic message'
+    );
+  });
+});
