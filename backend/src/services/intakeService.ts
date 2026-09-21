@@ -467,7 +467,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ].join('\n'),
       // Stage labels + no-rot defaults (ENG-187): every customer bug lands in Todo, assigned,
       // with a funnel-derived priority — never unowned in Backlog.
-      labelNames: ['Bug', 'Customer Reported', ...stageTags],
+      // ENG-1590: Delegated-Filed marks issues filed via a delegated admin session; absence is the
+      // queryable self-filed signal (matches the repo's Auto-label convention — no paired default).
+      labelNames: ['Bug', 'Customer Reported', ...(p.reportedByAdmin ? ['Delegated-Filed'] : []), ...stageTags],
       priority,
       stateName: BUG_CANONICAL_STATE,
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,

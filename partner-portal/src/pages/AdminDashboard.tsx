@@ -42,6 +42,7 @@ import {
   Divider,
   Switch,
 } from "@mui/material";
+import { alpha } from "@mui/material/styles";
 import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP, ADMIN_TABS } from "./adminNavigation";
 
 // One-line descriptions shown under the page title (copy from the approved ENG-1707 mock).
@@ -3431,9 +3432,9 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
           maxHeight: { xs: 280, md: "100vh" },
           overflowY: "auto",
           scrollbarWidth: "thin",
-          scrollbarColor: "#e2e8f0 transparent",
+          scrollbarColor: (theme) => `${alpha(theme.palette.text.primary, 0.16)} transparent`,
           "&::-webkit-scrollbar": { width: 6 },
-          "&::-webkit-scrollbar-thumb": { bgcolor: "#e2e8f0", borderRadius: 3 },
+          "&::-webkit-scrollbar-thumb": { bgcolor: (theme) => alpha(theme.palette.text.primary, 0.16), borderRadius: 3 },
         }}
       >
         {ADMIN_NAVIGATION_SECTIONS.map((section, sectionIndex) => (
@@ -3448,7 +3449,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 fontWeight: 700,
                 letterSpacing: "0.07em",
                 textTransform: "uppercase",
-                color: "#94a3b8",
+                color: "text.disabled",
               }}
             >
               {section.label}
@@ -3475,10 +3476,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                     fontSize: "0.8125rem",
                     lineHeight: 1.35,
                     fontWeight: selected ? 700 : 500,
-                    color: selected ? "primary.dark" : "#475569",
-                    bgcolor: selected ? "#eff6ff" : "transparent",
-                    "&:hover": { bgcolor: selected ? "#eff6ff" : "background.default", color: selected ? "primary.dark" : "text.primary" },
-                    "&.Mui-focusVisible": { boxShadow: "0 0 0 2px #bfdbfe" },
+                    color: selected ? "primary.dark" : "text.secondary",
+                    bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "transparent",
+                    "&:hover": { bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "background.default", color: selected ? "primary.dark" : "text.primary" },
+                    "&.Mui-focusVisible": { boxShadow: (theme) => `0 0 0 2px ${alpha(theme.palette.primary.main, 0.35)}` },
                   }}
                 >
                   {adminTab.label}
@@ -4255,7 +4256,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
             const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
-              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderRadius: 2, boxShadow: "none", borderColor: "#fecaca", bgcolor: "#fef2f2" }}>
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderRadius: 2, boxShadow: "none", borderColor: (theme) => alpha(theme.palette.error.main, 0.35), bgcolor: (theme) => alpha(theme.palette.error.main, 0.08) }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
                   Attention needed
                 </Typography>
@@ -4337,7 +4338,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 { label: "Showing", value: sortedUsers.length, sub: undefined },
               ];
             })().map((stat) => (
-              <Paper key={stat.label} variant="outlined" sx={{ px: 1.75, py: 1.5, minWidth: 0, borderRadius: 2, boxShadow: "none", borderColor: stat.warn ? "#fecaca" : "divider", bgcolor: stat.warn ? "#fef2f2" : "background.paper" }}>
+              <Paper key={stat.label} variant="outlined" sx={{ px: 1.75, py: 1.5, minWidth: 0, borderRadius: 2, boxShadow: "none", borderColor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.35) : "divider", bgcolor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.08) : "background.paper" }}>
                 <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontSize: "0.6875rem", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {stat.label}
                 </Typography>

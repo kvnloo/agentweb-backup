@@ -39,6 +39,7 @@ import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/en
 import { getEnrichmentConfig as svcGetEnrichmentConfig } from '../services/enrichmentConfigService';
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { crmDb } from '../services/db';
+import { isCardRevenueField } from '../services/enrichmentGroups';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 const TAG = '[crmAutoEnrichmentCron]';
@@ -94,7 +95,11 @@ function isUnenriched(
   lead: { enrichmentMetadata?: Record<string, unknown> },
   config: EnrichmentConfig,
 ): boolean {
-  const enabledFieldNames = config.fields.filter((f) => f.include).map((f) => f.name);
+  // Card-revenue fields are never filled by the cron (it doesn't use Enigma,
+  // ENG-1388); counting them would reselect the same leads on every tick.
+  const enabledFieldNames = config.fields
+    .filter((f) => f.include && !isCardRevenueField(f.aliasFor ?? f.name))
+    .map((f) => f.name);
   if (enabledFieldNames.length === 0) return false; // nothing configured to enrich
   const meta = lead.enrichmentMetadata;
   return enabledFieldNames.some((name) => !meta || !(name in meta));

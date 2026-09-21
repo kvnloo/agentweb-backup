@@ -8136,6 +8136,10 @@ export async function generateSessionResponse(
   if (!session) {
     throw new Error('Session not found');
   }
+  // Some server-side callers (notably Slack) resume a persisted delegated
+  // session without carrying the HTTP request's delegation flag. Preserve the
+  // session's authority when dispatching the turn to the worker.
+  const effectiveIsDelegatedAccess = isDelegatedAccess || session.delegateInfo?.isDelegated === true;
 
   // Check message limit before starting a new turn so in-progress writes (e.g. tool
   // system messages) that pushed the count over the limit don't silently drop the
@@ -8416,7 +8420,7 @@ export async function generateSessionResponse(
       sessionId,
       mockMode: false,
       isInteractiveShare: isInteractiveShare || false,
-      isDelegatedAccess,
+      isDelegatedAccess: effectiveIsDelegatedAccess,
       excludeTools,
       screenshotUrl,
       // ENG-473: persist each settled turn as it completes so a hard process kill
@@ -11228,6 +11232,47 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Submit message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
+  /**
+   * POST /api/agent-mode/session/:sessionId/work-plan
+   * Launch an accessible predefined work plan in an owner-scoped session.
+   */
+  async launchWorkPlan(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId } = req.params;
+      const { planId } = req.body ?? {};
+      const user = req.user as User;
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
+      if (typeof planId !== 'string' || planId.trim() === '') {
+        return res.status(400).json({ error: 'planId is required' });
+      }
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) return res.status(404).json({ error: 'Session not found' });
+      if (session.userId !== user.userId) {
+        return res.status(403).json({ error: 'Only the session owner can launch a work plan.' });
+      }
+
+      const existing = session.workPlan;
+      const hasActivePlan = !!existing && Array.isArray(existing.steps) && existing.steps.length > 0;
+      if (hasActivePlan && (existing as any).templatePlanId === planId) {
+        return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existing });
+      }
+
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      if (!result.success) {
+        return res.status(result.requiresConfirmation ? 409 : 404).json({
+          error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
+          code: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
+          message: result.message,
+        });
+      }
+      return res.status(200).json({ success: true, alreadyApplied: false, workPlan: result.workPlan });
+    } catch (error) {
+      console.error('AgentMode: Launch work plan error:', error);
+      return res.status(500).json({ error: 'Failed to launch work plan' });
     }
   },
 

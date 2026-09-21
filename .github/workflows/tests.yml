@@ -87,6 +87,9 @@ jobs:
       - name: Production build
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build
+      - name: Agent Mode wiring invariant
+        working-directory: backend
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/loops.agentModeWiring.test.ts
 
   partner-build:
     name: Partner portal build

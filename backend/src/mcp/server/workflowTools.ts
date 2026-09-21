@@ -250,6 +250,10 @@ mcpToolRegistry.register({
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
+      // Not also requiring hasDesignSystem — see ProtectedRoute.tsx's
+      // ENG-328 comment: every account onboarded before that step existed
+      // would otherwise report is_onboarded:false despite being fully
+      // onboarded under the rules that applied when they signed up.
       is_onboarded: me?.hasBrandGuidelines ?? null,
       usage: me?.tokenUsage ?? null,
     });

@@ -431,6 +431,34 @@ export interface User {
    * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
    */
   landingSiteMode?: "unified" | "separate";
+  /**
+   * ENG-328 — mandatory onboarding design-system scrape, async status.
+   * Same idle|running|ready|failed shape as the Onboarding Epic axes above,
+   * but — like brandGuidelines below — resolved org-first via
+   * resolveOrgProfileField, since a design system is an ORG/account-level
+   * artifact (one website per account) and a second org member joining an
+   * already-onboarded account must never re-trigger it (ProtectedRoute
+   * already skips onboarding entirely for any user with orgId set; this axis
+   * follows the same convention rather than introducing a new one).
+   */
+  designSystem?: {
+    status: "idle" | "running" | "ready" | "failed";
+    startedAt?: string;
+    completedAt?: string;
+    durationMs?: number;
+    error?: string;
+    /**
+     * Whether design.md came from a real scrape or the manual-fallback path
+     * (built from brandGuidelines when the scrape genuinely couldn't
+     * succeed — no website, site down, bot-walled). Both terminal states set
+     * status: 'ready', matching how brandGuidelines makes no distinction
+     * between a scraped and a manually-typed brand.
+     */
+    source?: "scrape" | "manual_fallback";
+    /** KB task holding design.md — set on first successful write so re-runs
+     * upsert in place instead of creating a duplicate-named entry. */
+    kbTaskId?: string;
+  };
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -788,6 +816,7 @@ export interface Organization {
   name: string;
   ownerUserId: string;
   brandGuidelines?: User["brandGuidelines"];
+  designSystem?: User["designSystem"];
   marketStrategy?: User["marketStrategy"];
   startupProfiles?: User["startupProfiles"];
   connected_accounts?: User["connected_accounts"];
@@ -9231,6 +9260,7 @@ export const crmDb = {
       webSearch: { live: number; cached: number };
       sibling:   { live: number; cached: number };
       llm:       { live: number; cached: number };
+      enigma?:   { live: number; cached: number };
     };
   }): Promise<void> {
     try {
@@ -9488,7 +9518,7 @@ export const crmDb = {
     // owns this row, so a future caller cannot silently mislabel an enrich.so
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
-    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo' | 'enigma';
     // Marks a cached payload with no usable signal — written with a short
     // negative TTL so it doesn't lock a lead out of re-enrichment. (WS4)
     negative?: boolean;
