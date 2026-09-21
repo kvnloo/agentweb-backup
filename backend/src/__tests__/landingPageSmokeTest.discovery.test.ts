@@ -28,6 +28,7 @@ type Discovered = {
     required: boolean;
     viaLabel: boolean;
     checked: boolean;
+    isAria: boolean;
   }[];
   submitSelector: string | null;
   disclosureTriggers: string[];
