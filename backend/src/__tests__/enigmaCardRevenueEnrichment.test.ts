@@ -22,6 +22,7 @@ import {
   isEnigmaEnrichmentEnabledForUser,
 } from '../services/enigmaCardRevenueEnrichment';
 import {
+  EnigmaApiError,
   EnigmaAuthError,
   EnigmaCreditsExhaustedError,
   EnigmaBudgetExhaustedError,
@@ -30,7 +31,7 @@ import {
   EnigmaService,
   type EnigmaBrandLookupResult,
 } from '../services/enigmaService';
-import { buildEnigmaQuotaTracker } from '../services/enigmaServiceFactory';
+import { buildEnigmaHttpClient, buildEnigmaQuotaTracker } from '../services/enigmaServiceFactory';
 import {
   runWaterfall,
   createApolloFetchContext,
@@ -315,6 +316,25 @@ describe('EnigmaService spend limits', () => {
 
     await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaRateLimitedError);
     expect(quota.settle).toHaveBeenLastCalledWith({ userId: 'u1', credits: 52 }, null);
+  });
+
+  // A response can carry billed values AND a GraphQL `errors` array. The client
+  // ledgers those values, so the budget must count them instead of releasing.
+  it('settles with the billed credits when a failed response still carried billed values', async () => {
+    const http = buildEnigmaHttpClient('test-key');
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({ data: { search: [brand] }, errors: [{ message: 'partial failure' }] }),
+    } as any);
+    const quota = tracker();
+    const svc = new EnigmaService({ http, store: store(), quota });
+
+    await expect(svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaApiError);
+
+    expect(quota.settle).toHaveBeenLastCalledWith({ userId: 'u1', credits: 52 }, 4);   // name 2 + website 2, not null
+    fetchMock.mockRestore();
   });
 
   it('a failed settle never fails the lookup', async () => {

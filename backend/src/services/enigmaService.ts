@@ -75,6 +75,13 @@ export interface EnigmaCallOptions {
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 export class EnigmaApiError extends Error {
+  /**
+   * Credits Enigma billed for values that came back on a response we then
+   * treated as failed (a GraphQL `errors` array alongside data). The quota
+   * settles with this rather than releasing the whole reservation.
+   */
+  billedCredits?: number;
+
   constructor(message: string, readonly status?: number) {
     super(message);
     this.name = 'EnigmaApiError';
@@ -158,7 +165,8 @@ export interface EnigmaQuotaTracker {
   reserve(userId?: string): Promise<EnigmaQuotaReservation>;
   /**
    * Reconciles a reservation once the call is over. `actualCredits` is what
-   * Enigma billed; `null` means the call failed before billing, so the whole
+   * Enigma billed (also for a response that carried values and errors);
+   * `null` means the call failed before anything was billed, so the whole
    * reservation (credits and the user's call) is released.
    */
   settle(reservation: EnigmaQuotaReservation, actualCredits: number | null): Promise<void>;
@@ -450,8 +458,11 @@ export class EnigmaService {
     try {
       brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
     } catch (err) {
-      // Nothing was billed for a failed call: give the reservation back.
-      if (quota && reservation) await this.settleQuietly(quota, reservation, null);
+      // Most failures are unbilled, so the reservation goes back. A response
+      // that carried values AND errors was billed for those values: settle with
+      // that, so the budget never under-counts what the ledger recorded.
+      const billed = err instanceof EnigmaApiError ? err.billedCredits : undefined;
+      if (quota && reservation) await this.settleQuietly(quota, reservation, typeof billed === 'number' ? billed : null);
       throw err;
     }
     // Credits come from what Enigma actually returned - the same values the

@@ -22,6 +22,7 @@ import {
   EnigmaRateLimitedError,
   EnigmaService,
   ENIGMA_MAX_CREDITS_PER_CALL,
+  countEnigmaBilledCredits,
   countEnigmaBilledFills,
   initEnigmaService,
   type EnigmaBilledFillKey,
@@ -102,7 +103,11 @@ export function buildEnigmaHttpClient(apiKey: string): EnigmaHttpClient {
 
       if (Array.isArray(body?.errors) && body.errors.length > 0) {
         const message = body.errors.map((e: any) => e?.message).filter(Boolean).join('; ') || 'unknown GraphQL error';
-        throw new EnigmaApiError(`Enigma GraphQL error: ${message}`, res.status);
+        const err = new EnigmaApiError(`Enigma GraphQL error: ${message}`, res.status);
+        // The values that came back were billed (and ledgered above), so the
+        // monthly budget must count them too.
+        if (Array.isArray(search)) err.billedCredits = countEnigmaBilledCredits(search);
+        throw err;
       }
       // A missing or non-array `search` is schema drift, not "no brand": throw so
       // it is never cached as a 30-day not_found.
