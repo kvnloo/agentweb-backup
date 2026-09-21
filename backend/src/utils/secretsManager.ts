@@ -877,6 +877,22 @@ export async function getEnrichSoApiKey(): Promise<string> {
   return key.trim();
 }
 
+/**
+ * Get the Enigma (company card-revenue data) API key from AWS Secrets Manager.
+ * Stored as a plain string at dev/AgentWeb/Enigma or prod/AgentWeb/Enigma.
+ */
+export async function getEnigmaApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Enigma'
+    : 'dev/AgentWeb/Enigma';
+  const key = await getSecret(secretName);
+  if (!key || key.trim() === '') {
+    throw new Error(`Enigma API key is empty. Store it in Secrets Manager at ${secretName}.`);
+  }
+  return key.trim();
+}
+
 export interface ApolloCredentials {
   apiKey: string;
   webhookSecret?: string;
