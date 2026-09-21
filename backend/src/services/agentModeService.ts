@@ -24975,6 +24975,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
+        // ENG-738: a timeout that still gathered real partial findings (possibly
+        // after an automatic depth-degraded retry inside deepResearchService)
+        // must not be thrown away as a bare failure — save what exists and tell
+        // the model honestly, mirroring how a successful result is surfaced.
+        if (researchResult.partial && researchResult.partialContent) {
+          const { uploadFileToS3 } = await import('../utils/s3Utils');
+          const sanitizedTopic = topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().substring(0, 50);
+          const partialFilename = `research-${sanitizedTopic}-partial-${Date.now()}.md`;
+
+          const partialUpload = await uploadFileToS3(
+            researchResult.partialContent,
+            partialFilename,
+            userId || 'anonymous',
+            'text/markdown'
+          );
+
+          if (partialUpload.success && partialUpload.url) {
+            const partialWordCount = researchResult.partialContent.split(/\s+/).length;
+            const actualDepth = researchResult.partialDepth || depth;
+            const depthNote = researchResult.degradedFrom
+              ? ` (after automatically retrying at a reduced "${actualDepth}" depth once "${researchResult.degradedFrom}" depth timed out)`
+              : '';
+            console.log('AgentMode: Deep research partial content uploaded to S3:', partialUpload.url);
+            return {
+              success: false,
+              partial: true,
+              message: `Deep research on "${topic}" didn't finish before the time budget ran out${depthNote}, but I saved ${partialWordCount} words of partial findings to S3. Do NOT call perform_deep_research again with the same topic and depth — the service already retried automatically. Review the partial findings, ask me to narrow the topic and try again, or ask me to continue this as a scheduled background run.`,
+              error: researchResult.error || 'Deep research timed out',
+              data: {
+                research_url: partialUpload.url,
+                title: researchResult.title || topic,
+                summary: researchResult.researchSummary,
+                word_count: partialWordCount,
+                research_depth: actualDepth,
+                topic: topic,
+                ...(researchResult.degradedFrom ? { degraded_from: researchResult.degradedFrom } : {})
+              }
+            };
+          }
+          // Partial-content upload itself failed — fall through to the plain
+          // failure below rather than claim a saved URL that doesn't exist.
+        }
+
         return {
           success: false,
           message: researchResult.error || 'Deep research failed',
@@ -25007,15 +25050,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       console.log('AgentMode: Deep research uploaded to S3:', uploadResult.url);
 
+      // ENG-738: a success that only landed after an automatic depth downgrade
+      // must report the depth actually delivered, not the one originally
+      // requested — reporting the request depth here would misrepresent the
+      // result (e.g. claiming "comprehensive" when the agent produced "overview").
+      const actualDepth = researchResult.actualDepth || depth;
+      const successDepthNote = researchResult.degradedFrom
+        ? ` at "${actualDepth}" depth (automatically reduced from "${researchResult.degradedFrom}" after the first attempt timed out)`
+        : '';
+
       return {
         success: true,
-        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
+        message: `Deep research completed successfully${successDepthNote}. Generated ${wordCount} words of content and saved to S3.`,
         data: {
           research_url: uploadResult.url,
           title: researchResult.title,
           summary: researchResult.researchSummary,
           word_count: wordCount,
-          research_depth: depth,
+          research_depth: actualDepth,
           topic: topic
         }
       };
