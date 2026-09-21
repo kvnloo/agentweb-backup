@@ -1,9 +1,24 @@
 import { agentModeService } from './agentModeService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 
 const DEEP_RESEARCH_MODEL = 'openrouter/perplexity/sonar-deep-research';
 const DEEP_RESEARCH_FALLBACK_MODEL = 'openrouter/perplexity/sonar-pro-search';
 // Return our stable error contract before the ALB/Nginx 600-second request budget closes.
 const DEEP_RESEARCH_TIMEOUT_MS = 9 * 60 * 1000;
+// ENG-738: a genuine timeout at DEEP_RESEARCH_TIMEOUT_MS used to surface as a bare
+// failure with nothing to show for it. Reserve a slice of that same budget for ONE
+// automatic retry at the next cheaper depth -- 'overview' asks for 800-1200 words
+// instead of comprehensive's 4000+, so it has a real shot at finishing where the
+// original depth didn't.
+const DEGRADE_RETRY_TIMEOUT_MS = 2 * 60 * 1000;
+const MIN_PRIMARY_TIMEOUT_MS = 60 * 1000;
+
+// 'overview' is the floor -- once we're already there, there is nothing cheaper
+// left to fall back to, so it (and an unset depth) has no entry here.
+const DEPTH_DEGRADE: Record<string, string> = {
+  comprehensive: 'detailed',
+  detailed: 'overview',
+};
 
 interface DeepResearchResult {
   success: boolean;
@@ -11,6 +26,11 @@ interface DeepResearchResult {
   title?: string;
   researchSummary?: string;
   error?: string;
+  // Set only when the primary attempt timed out and the automatic retry at a
+  // cheaper depth succeeded -- callers that report `research_depth` back to the
+  // model/user should use `actualDepth`, not the originally requested depth.
+  degradedFrom?: string;
+  actualDepth?: string;
 }
 
 interface DeepResearchParams {
@@ -65,7 +85,10 @@ export class DeepResearchService {
     return `${params.topic}\n\nFormat and Style Instructions:\n${instructions.map((item) => `- ${item}`).join('\n')}`;
   }
 
-  async performDeepResearch(params: DeepResearchParams): Promise<DeepResearchResult> {
+  private async attempt(
+    params: DeepResearchParams,
+    timeoutMs: number,
+  ): Promise<{ result: DeepResearchResult; timedOut: boolean }> {
     try {
       const completion = await agentModeService.callLLM(
         DEEP_RESEARCH_MODEL,
@@ -77,7 +100,7 @@ export class DeepResearchService {
               ? 7_000
               : 5_000,
           temperature: 0.2,
-          timeoutMs: DEEP_RESEARCH_TIMEOUT_MS,
+          timeoutMs,
           usageContext: { userId: params.userId, feature: 'content_gen' },
           taskClass: 'content_generation',
           fallbackModels: [DEEP_RESEARCH_FALLBACK_MODEL],
@@ -87,8 +110,11 @@ export class DeepResearchService {
       const researchText = String(completion?.choices?.[0]?.message?.content || '').trim();
       if (!researchText) {
         return {
-          success: false,
-          error: 'Deep research completed but no report content was returned.',
+          result: {
+            success: false,
+            error: 'Deep research completed but no report content was returned.',
+          },
+          timedOut: false,
         };
       }
 
@@ -102,18 +128,47 @@ export class DeepResearchService {
         : cleanText;
 
       return {
-        success: true,
-        markdownContent: researchText,
-        title,
-        researchSummary,
+        result: {
+          success: true,
+          markdownContent: researchText,
+          title,
+          researchSummary,
+        },
+        timedOut: false,
       };
     } catch (error: any) {
       console.error('Deep research error:', error);
       return {
-        success: false,
-        error: `Deep research failed: ${error?.message || 'Unknown error'}`,
+        result: {
+          success: false,
+          error: `Deep research failed: ${error?.message || 'Unknown error'}`,
+        },
+        timedOut: classifyToolErrorClass(error) === 'timeout',
       };
     }
+  }
+
+  async performDeepResearch(params: DeepResearchParams): Promise<DeepResearchResult> {
+    const degradedDepth = params.depth ? DEPTH_DEGRADE[params.depth] : undefined;
+    const primaryTimeoutMs = degradedDepth
+      ? Math.max(MIN_PRIMARY_TIMEOUT_MS, DEEP_RESEARCH_TIMEOUT_MS - DEGRADE_RETRY_TIMEOUT_MS)
+      : DEEP_RESEARCH_TIMEOUT_MS;
+
+    const primary = await this.attempt(params, primaryTimeoutMs);
+    if (primary.result.success || !degradedDepth || !primary.timedOut) {
+      return primary.result;
+    }
+
+    console.warn(
+      `Deep research: primary attempt at depth "${params.depth}" timed out after ${primaryTimeoutMs}ms, retrying once at "${degradedDepth}"`,
+    );
+    const retry = await this.attempt({ ...params, depth: degradedDepth }, DEGRADE_RETRY_TIMEOUT_MS);
+    if (retry.result.success) {
+      return { ...retry.result, degradedFrom: params.depth, actualDepth: degradedDepth };
+    }
+    // Report the original attempt's failure -- it reflects what the caller
+    // actually asked for; the retry was our own internal fallback.
+    return primary.result;
   }
 
   async isAvailable(): Promise<boolean> {
