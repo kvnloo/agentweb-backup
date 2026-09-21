@@ -9,13 +9,13 @@
  *
  * Output proposal == the "repeated pattern + exact proposed fix" the audit asks
  * for: a `code_change` proposal carrying the failing tool, its failure count /
- * rate, and the dominant error class as the signature. The SpecOutputTool turns
+ * rate, and the cohort's dominant error class as the signature. The SpecOutputTool turns
  * it into a cloud-dev task; the gate routes it for approval; attribution later
  * grades whether the shipped fix actually lifted that tool's success rate. The
  * CooldownRuleSet wrapper stops the loop re-proposing a fix that's still in
  * flight or already failed.
  *
- * One proposal per failing tool, sorted worst-failure-rate first so the cap in
+ * One proposal per actionable failure class per tool, sorted by count so the cap in
  * the orchestrator keeps the highest-signal fixes.
  */
 
@@ -26,6 +26,7 @@ import type {
   TimeWindow,
 } from '../../core/types';
 import { asMutationId } from '../../core/types';
+import { redactSensitive } from '../../../mcp/client/mcpToolTelemetry';
 import { EVT_RUN_VERDICT, EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
 
 export interface AgentFailureProposalPayload {
@@ -40,12 +41,6 @@ export interface AgentFailureProposalPayload {
    * policy, which is why 35% of dispatches were not handler bugs.
    */
   failureType: string;
-  /**
-   * Other actionable classes present on this tool, as "<n> <class>" strings.
-   * The dominant class drives the remedy; naming the rest keeps a minority
-   * cohort visible instead of silently folded into another class's count.
-   */
-  otherActionableClasses?: string;
   directive: string;
 }
 
@@ -63,10 +58,10 @@ export interface AgentClaimMismatchProposalPayload {
 }
 
 export interface AgentFailureRuleSetOptions {
-  /** Minimum absolute failures for a tool before a fix is proposed. Default 3 —
+  /** Minimum failures per class per tool before a fix is proposed. Default 3 —
    * below this it's noise, not a pattern. */
   minFailures?: number;
-  /** Minimum failure rate (failures / invocations) before proposing. Default
+  /** Minimum class failure rate (class failures / tool invocations). Default
    * 0.2 — a tool failing 20%+ of the time is broken enough to act on. */
   minFailureRate?: number;
   /** Minimum agent_run_verdict events carrying 'claim_mismatch' in the window
@@ -79,25 +74,9 @@ export interface AgentFailureRuleSetOptions {
 interface ToolStats {
   toolName: string;
   invocations: number;
-  failures: number;
-  errorClasses: Map<string, number>;
   failureTypes: Map<string, number>;
-  /**
-   * A representative error message PER (failure class, error class) pair — see
-   * msgKey (ENG-820 review): the directive names the dominant error class of
-   * its cohort, so the quoted message must come from that same error class.
-   * Keying by failure class alone still let a `config` directive dominated by
-   * `auth` quote whichever message arrived first, e.g. one from a minority
-   * `scope_missing` failure.
-   */
+  /** Representative message per (failure class, error class) pair. */
   messagesByType: Map<string, string>;
-  /**
-   * Error classes counted PER failure class. `errorClasses` above stays global
-   * for the unclassified fallback, but the directive must cite an error class
-   * from the same cohort it is advising on — otherwise a config-dominant tool
-   * reports the error class of its handful of bug failures, and the operator
-   * is told to reconnect an account on the evidence of a TypeError.
-   */
   errorClassesByType: Map<string, Map<string, number>>;
 }
 
@@ -109,26 +88,6 @@ interface ToolStats {
  * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
  */
 export const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
-
-/**
- * A one-line action for a secondary cohort (ENG-820 review round 7).
- *
- * A tool with 10 config + 8 bug failures gets ONE proposal, because
- * `sourceRuleId` is the cooldown key and splitting it orphans history
- * (see ENG-937). But the minority cohort must still receive an ACTION, not just
- * a mention — otherwise resolving the account closes the dispatch and the 8
- * recurring handler bugs are never worked.
- */
-function secondaryAction(failureType: string, toolName: string, count: number): string {
-  if (failureType === 'config') {
-    return `${count} configuration/credential failure(s) — reconnect or re-authorise the account for "${toolName}", or top up its balance.`;
-  }
-  if (failureType === 'schema_reject') {
-    return `${count} schema rejection(s) — reconcile "${toolName}"'s declared JSON schema with what the handler accepts.`;
-  }
-  const label = failureType || 'unclassified';
-  return `${count} ${label} failure(s) — investigate the "${toolName}" handler and add a regression test.`;
-}
 
 /**
  * Directive per failure class. The whole defect was appending one sentence —
@@ -145,7 +104,8 @@ function directiveFor(
   minFailureRate: number,
 ): string {
   const pct = `${Math.round((failures / (denom || 1)) * 100)}%`;
-  const sample = sampleMessage ? ` Representative failure: "${sampleMessage.slice(0, 160)}".` : '';
+  const redactedSample = sampleMessage ? redactSensitive(sampleMessage).slice(0, 160) : '';
+  const sample = redactedSample ? ` Representative failure: "${redactedSample}".` : '';
   if (failureType === 'config') {
     // Not a code change. Someone has to reconnect an account, grant a scope, or
     // top up a balance — and they need to know which.
@@ -208,8 +168,6 @@ export class AgentFailureRuleSet
       const stats = byTool.get(toolName) ?? {
         toolName,
         invocations: 0,
-        failures: 0,
-        errorClasses: new Map<string, number>(),
         failureTypes: new Map<string, number>(),
         messagesByType: new Map<string, string>(),
         errorClassesByType: new Map<string, Map<string, number>>(),
@@ -217,11 +175,9 @@ export class AgentFailureRuleSet
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
       } else {
-        stats.failures++;
         const ec = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
-        stats.errorClasses.set(ec, (stats.errorClasses.get(ec) ?? 0) + 1);
         const ft = strDim(e.dimensions?.failureType) || '';
-        if (ft) stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
+        stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         const em = strDim(e.dimensions?.errorMessage) || '';
         // Store under this event's OWN (failure class, error class) pair, so
         // the directive can quote a message that actually belongs to both the
@@ -272,97 +228,61 @@ export class AgentFailureRuleSet
         if (NON_DISPATCHABLE_FAILURE_TYPES.has(ft)) excludedNonActionable += n;
         else actionableTypes.set(ft, n);
       }
-      // Failures with no recorded class (pre-backfill) are actionable and form
-      // their own cohort: failing the other way would hide real bugs.
-      const classified = Array.from(stats.failureTypes.values()).reduce((a, b) => a + b, 0);
-      const unclassified = Math.max(0, stats.failures - classified);
-      if (unclassified > 0) actionableTypes.set('', (actionableTypes.get('') ?? 0) + unclassified);
       const actionableFailures = Array.from(actionableTypes.values()).reduce((a, b) => a + b, 0);
 
       if (actionableFailures === 0) continue;
 
-      // ONE proposal per tool, under the tool-level identity.
-      //
-      // A per-class proposal would describe each cohort exactly, and an earlier
-      // revision of this change did that — but `sourceRuleId` is the cooldown
-      // key (CooldownRuleSet matches it exactly against persisted learning
-      // records), so class-qualifying it orphans every historical record and
-      // re-dispatches tools that are deliberately on cooldown. That is a
-      // persistence-semantics change, not a digest change, and it belongs in
-      // its own issue with a migration. Tracked as ENG-937.
-      //
-      // The dominant actionable class drives the remedy, and every OTHER
-      // actionable class is named in the hypothesis so no cohort is silently
-      // dropped — which is the substance of what per-class dispatch would buy.
       const denom = stats.invocations > 0 ? stats.invocations : actionableFailures;
-      const failureRate = denom > 0 ? actionableFailures / denom : 0;
+      for (const [failureType, failures] of actionableTypes) {
+        const failureRate = failures / denom;
+        if (failures < this.minFailures || failureRate < this.minFailureRate) continue;
 
-      if (actionableFailures < this.minFailures) continue;
-      if (failureRate < this.minFailureRate) continue;
+        const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
+        const topErrorClass = dominantKey(stats.errorClassesByType.get(failureType)!);
+        const sourceRuleId = `tool-failure:${stats.toolName}:${failureType || 'unclassified'}`;
 
-      const failureType = dominantKey(actionableTypes);
-      const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
-      // Cite an error class from the SAME cohort as the chosen class. Falls back
-      // to the global aggregate only for unclassified failures, where global IS
-      // the cohort.
-      const cohort = stats.errorClassesByType.get(failureType);
-      const topErrorClass = cohort && cohort.size > 0
-        ? dominantKey(cohort)
-        : dominantKey(stats.errorClasses);
-      const otherEntries = Array.from(actionableTypes.entries())
-        .filter(([ft]) => ft !== failureType)
-        .sort((a, b) => b[1] - a[1]);
-      const otherClasses = otherEntries.map(([ft, n]) => `${n} ${ft || 'unclassified'}`);
-      // Every remaining cohort gets its OWN instruction, so completing the
-      // primary remedy cannot close out work that was never dispatched.
-      const alsoNote = otherEntries.length > 0
-        ? ` This tool ALSO has other failure classes needing separate action: `
-          + otherEntries.map(([ft, n]) => secondaryAction(ft, stats.toolName, n)).join(' ')
-          + ` Do not close this out after the first remedy alone.`
-        : '';
-
-      proposals.push({
-        proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
-        sourceRuleId: `tool-failure:${stats.toolName}`,
-        hypothesis:
-          `Tool \`${stats.toolName}\` failed ${actionableFailures}/${denom} times ` +
-          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
-          `${failureType ? ` [${failureType}]` : ''}` +
-          `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
-          (handlerBug
-            ? `Investigate the handler + propose a robustness fix.`
-            : failureType === 'config'
-              ? `Configuration/credential issue — resolve the account, not the code.`
-              : `Declared schema and handler disagree — fix the contract.`)
-          + alsoNote,
-        kind: 'code_change',
-        payload: {
-          toolName: stats.toolName,
-          failures: actionableFailures,
-          invocations: stats.invocations,
-          failureRate,
-          topErrorClass,
-          failureType,
-          otherActionableClasses: otherClasses.join(', '),
-          directive: directiveFor(
-            failureType,
-            stats.toolName,
+        proposals.push({
+          proposalId: asMutationId(`agent-mode:${sourceRuleId}`),
+          sourceRuleId,
+          hypothesis:
+            `Tool \`${stats.toolName}\` failed ${failures}/${denom} times ` +
+            `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
+            ` [${failureType || 'unclassified'}]` +
+            `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
+            (handlerBug
+              ? `Investigate the handler + propose a robustness fix.`
+              : failureType === 'config'
+                ? `Configuration/credential issue — resolve the account, not the code.`
+                : `Declared schema and handler disagree — fix the contract.`),
+          kind: 'code_change',
+          payload: {
+            toolName: stats.toolName,
+            failures,
+            invocations: stats.invocations,
+            failureRate,
             topErrorClass,
-            actionableTypes.get(failureType) ?? actionableFailures,
-            denom,
-            stats.messagesByType.get(msgKey(failureType, topErrorClass)) ?? '',
-            this.minFailureRate,
-          ) + alsoNote,
-        },
-        triggeringStats: {
-          toolName: stats.toolName,
-          failures: actionableFailures,
-          excludedNonActionable,
-          invocations: stats.invocations,
-          failureRatePct: Math.round(failureRate * 100),
-          topErrorClass,
-        },
-      });
+            failureType,
+            directive: directiveFor(
+              failureType,
+              stats.toolName,
+              topErrorClass,
+              failures,
+              denom,
+              stats.messagesByType.get(msgKey(failureType, topErrorClass)) ?? '',
+              this.minFailureRate,
+            ),
+          },
+          triggeringStats: {
+            toolName: stats.toolName,
+            failures,
+            failureType,
+            excludedNonActionable,
+            invocations: stats.invocations,
+            failureRatePct: Math.round(failureRate * 100),
+            topErrorClass,
+          },
+        });
+      }
     }
 
     // ENG-820: rank by failure COUNT, not rate. Impact is volume x rate, and

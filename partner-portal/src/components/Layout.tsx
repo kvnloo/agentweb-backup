@@ -13,6 +13,8 @@ import {
   Typography
 } from '@mui/material';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
+import { alpha } from '@mui/material/styles';
+import type { Theme } from '@mui/material/styles';
 import { useAuth } from '../contexts/AuthContext';
 import logo from '../assets/logo.svg';
 import ChatSupport from './ChatSupport';
@@ -36,10 +38,10 @@ const NAV_ITEM_SX = {
 } as const;
 
 const NAV_ITEM_ACTIVE_SX = {
-  bgcolor: '#eff6ff',
+  bgcolor: (theme: Theme) => alpha(theme.palette.primary.main, 0.14),
   color: 'primary.dark',
-  '&:hover': { bgcolor: '#eff6ff', color: 'primary.dark' },
-} as const;
+  '&:hover': { bgcolor: (theme: Theme) => alpha(theme.palette.primary.main, 0.14), color: 'primary.dark' },
+};
 
 const MENU_PAPER_SX = {
   mt: 0.5,
@@ -235,7 +237,7 @@ export default function Layout() {
                   onClick={handleMenu}
                   sx={{ ml: 0.5, p: 0.5 }}
                 >
-                  <Avatar sx={{ width: 28, height: 28, bgcolor: '#dbeafe', color: 'primary.dark', fontSize: '0.75rem', fontWeight: 700 }}>
+                  <Avatar sx={{ width: 28, height: 28, bgcolor: (theme) => alpha(theme.palette.primary.main, 0.2), color: 'primary.dark', fontSize: '0.75rem', fontWeight: 700 }}>
                     {avatarInitial}
                   </Avatar>
                 </IconButton>

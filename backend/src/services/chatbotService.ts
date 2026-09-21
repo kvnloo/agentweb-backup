@@ -266,6 +266,18 @@ export interface ChatSession {
   // again without a fresh confirmation. Map value is the consumption
   // timestamp (kept, not just a boolean, purely for audit/debugging).
   consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-1974: workplan recommendations the user explicitly declined via "Keep
+  // chatting" this session, keyed by recommendationId (the deterministic
+  // sha256(sessionId:planId) hash recommendPredefinedWorkPlan already
+  // computes — see agentModeService.ts). A map, not a single slot like
+  // pendingUserQuestion, because a decline isn't blocking the way an
+  // unanswered question is, and a single slot would let declining a SECOND
+  // plan silently erase protection for the first. Consulted by
+  // applyPredefinedWorkPlan's decline gate and by the dynamic work-plan
+  // context builder so Emma sees the real fact before her own read of the
+  // conversation forms, instead of self-launching a plan the user already
+  // passed on.
+  declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>;
   // ENG-397: the structured, typed workflow run in flight for this session
   // (if any). Each mutating step's checkpoint (entity IDs + verified
   // end-state) is persisted here so a killed-and-restarted session resumes
@@ -291,6 +303,8 @@ export interface ChatSession {
     tools: string[];
     recordedAt: string;
   };
+  /** H-VOICE: session-scoped Voice Card from draft → approved edit observations. */
+  sessionVoiceProfile?: import('./voiceProfileService').SessionVoiceProfile;
   emailMetadata?: {
     senderEmail?: string;
     lastInboundEmailId?: string;
@@ -3331,6 +3345,83 @@ export class ChatbotDB {
   }
 
   /**
+   * ENG-1974: record that the user declined a workplan recommendation via
+   * "Keep chatting". Unlike claimMetaWriteManifestDigest, this is an
+   * UNCONDITIONAL overwrite — re-declining the same recommendationId (e.g. a
+   * retried request after a dropped response) is harmless and idempotent,
+   * not an exactly-once claim like a Meta write. Same "SET the map key, and
+   * on ValidationException init the map then retry once" shape as
+   * claimMetaWriteManifestDigest because a fresh session's
+   * declinedWorkPlanRecommendations attribute doesn't exist yet either.
+   */
+  async recordDeclinedWorkPlanRecommendation(
+    sessionId: string,
+    recommendationId: string,
+    entry: { planId: string; planTitle: string; declinedAt: string },
+  ): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET declinedWorkPlanRecommendations.#id = :entry',
+          ConditionExpression: 'attribute_exists(sessionId)',
+          ExpressionAttributeNames: { '#id': recommendationId },
+          ExpressionAttributeValues: { ':entry': entry },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression:
+                'SET declinedWorkPlanRecommendations = if_not_exists(declinedWorkPlanRecommendations, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return false;
+          throw initError;
+        }
+        return this.recordDeclinedWorkPlanRecommendationRetry(sessionId, recommendationId, entry);
+      }
+      console.error('Error recording declined work plan recommendation:', error);
+      throw error;
+    }
+  }
+
+  /** Single retry after map initialization — never recurses further. */
+  private async recordDeclinedWorkPlanRecommendationRetry(
+    sessionId: string,
+    recommendationId: string,
+    entry: { planId: string; planTitle: string; declinedAt: string },
+  ): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET declinedWorkPlanRecommendations.#id = :entry',
+          ConditionExpression: 'attribute_exists(sessionId)',
+          ExpressionAttributeNames: { '#id': recommendationId },
+          ExpressionAttributeValues: { ':entry': entry },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      console.error('Error recording declined work plan recommendation (retry):', error);
+      throw error;
+    }
+  }
+
+  /**
    * Persist the typed information a work-plan step is waiting for. The same
    * request is rendered as a chat card in the portal or as MCP elicitation;
    * persisting the channel-neutral form lets a reconnect resume safely.
@@ -3624,6 +3715,28 @@ export class ChatbotDB {
           recordedAt: new Date().toISOString(),
         },
         ":adminListPartition": "all",
+      },
+    };
+
+    await dynamodb.update(params).promise();
+  }
+
+  /**
+   * H-VOICE: persist session-scoped Voice Card metadata on AW-ChatSessions.
+   * Schema extension per RFC H-VOICE (Harsha P0 epic #4) — requires Harsha sign-off
+   * before upstream merge per CLAUDE.md persistent-data policy.
+   */
+  async updateSessionVoiceProfile(
+    sessionId: string,
+    profile: import('./voiceProfileService').SessionVoiceProfile,
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET sessionVoiceProfile = :sessionVoiceProfile, adminListPartition = :adminListPartition',
+      ExpressionAttributeValues: {
+        ':sessionVoiceProfile': profile,
+        ':adminListPartition': 'all',
       },
     };
 
