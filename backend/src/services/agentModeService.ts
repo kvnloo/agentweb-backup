@@ -33684,6 +33684,9 @@ ${strippedHtml}`;
           ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
+        // ENG-2058: same rationale as createWorkPlan above — a scheduled session has no
+        // user to approve an interactive step, so a template's own autocomplete (or lack
+        // of one) is overridden hands-off whenever this launch lands on a scheduled run.
         autocomplete: session.sessionType === 'scheduled' ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
