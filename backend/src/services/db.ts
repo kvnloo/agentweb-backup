@@ -9517,7 +9517,7 @@ export const crmDb = {
     // owns this row, so a future caller cannot silently mislabel an enrich.so
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
-    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo' | 'enigma';
     // Marks a cached payload with no usable signal — written with a short
     // negative TTL so it doesn't lock a lead out of re-enrichment. (WS4)
     negative?: boolean;
