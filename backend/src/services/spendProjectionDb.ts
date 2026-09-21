@@ -58,7 +58,11 @@ const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
  * ledger (§1), not here — re-persisting the same month simply overwrites with
  * an equal-or-fresher value.
  */
-export async function putProjection(projection: MonthlyProjection, computedAt: string = new Date().toISOString()): Promise<PersistedProjection> {
+/**
+ * Validate and materialise the row to persist. Shared by putProjection and the
+ * conditional putProjectionIfUnchanged so the two can never build it differently.
+ */
+function buildPersistedItem(projection: MonthlyProjection, computedAt: string): PersistedProjection {
   if (projection.billingUserId === "" || !MONTH.test(projection.billingMonth)) {
     throw new Error(
       `refusing to persist a projection with an empty subject or bad month: ` +
@@ -73,20 +77,75 @@ export async function putProjection(projection: MonthlyProjection, computedAt: s
   if (Number.isNaN(parsed)) {
     throw new Error(`computedAt must be an ISO-8601 instant, got ${JSON.stringify(computedAt)}`);
   }
-  const item: PersistedProjection = {
+  return {
     ...projection,
     computedAt: new Date(parsed).toISOString(),
     // Seed the admission balance unfloored, so §4 can condition and decrement it
     // atomically. usable − settled − reserved; negative means already over cap.
     availableMicroUsd: projection.usableAllowanceMicroUsd - projection.settledMicroUsd - projection.reservedMicroUsd,
   };
+}
+
+export async function putProjection(projection: MonthlyProjection, computedAt: string = new Date().toISOString()): Promise<PersistedProjection> {
+  const item = buildPersistedItem(projection, computedAt);
   await db().put({ TableName: SPEND_PROJECTION_TABLE, Item: item }).promise();
   return item;
 }
 
-export async function getProjection(billingUserId: string, billingMonth: string): Promise<PersistedProjection | null> {
+/**
+ * Conditional whole-item put for the backfill's optimistic concurrency (F2).
+ *
+ * `putProjection` overwrites unconditionally, which races the event-driven
+ * writer: if it ADDs settledMicroUsd between the backfill's read and its write,
+ * a plain whole-item put silently reverts that add. This variant writes only if
+ * the row is still what the caller observed — absent, or with the same
+ * settledMicroUsd AND settledEventCount — and returns false (rather than throw)
+ * on a conditional miss so the caller can re-derive from a fresh read and retry.
+ *
+ * `expected` is the row the caller last read (null = observed absent).
+ */
+export async function putProjectionIfUnchanged(
+  projection: MonthlyProjection,
+  expected: { settledMicroUsd: number; settledEventCount: number } | null,
+  computedAt: string = new Date().toISOString(),
+): Promise<{ written: boolean; item: PersistedProjection }> {
+  const item = buildPersistedItem(projection, computedAt);
+  const condition =
+    expected === null
+      ? "attribute_not_exists(billingUserId)"
+      : "settledMicroUsd = :expSettled AND settledEventCount = :expCount";
+  try {
+    await db()
+      .put({
+        TableName: SPEND_PROJECTION_TABLE,
+        Item: item,
+        ConditionExpression: condition,
+        ...(expected === null
+          ? {}
+          : { ExpressionAttributeValues: { ":expSettled": expected.settledMicroUsd, ":expCount": expected.settledEventCount } }),
+      })
+      .promise();
+    return { written: true, item };
+  } catch (error: any) {
+    if (error?.code === "ConditionalCheckFailedException") return { written: false, item };
+    throw error;
+  }
+}
+
+export async function getProjection(
+  billingUserId: string,
+  billingMonth: string,
+  consistentRead = false,
+): Promise<PersistedProjection | null> {
   const result = await db()
-    .get({ TableName: SPEND_PROJECTION_TABLE, Key: { billingUserId, billingMonth } })
+    .get({
+      TableName: SPEND_PROJECTION_TABLE,
+      Key: { billingUserId, billingMonth },
+      // Strongly-consistent reads matter right after a write (the backfill's
+      // observe + verify reads): an eventually-consistent get can return a stale
+      // or missing item and read as false drift.
+      ...(consistentRead ? { ConsistentRead: true } : {}),
+    })
     .promise();
   return (result.Item as PersistedProjection) ?? null;
 }
@@ -141,6 +200,49 @@ export function isProjectionWriterEnabled(): boolean {
  * month so one batch that spans a midnight boundary still lands in the right
  * months.
  */
+/**
+ * One subject+month's settled delta, applied with a monotonic computedAt (F4).
+ *
+ * Concurrent writers each carry their own `now`; out-of-order completion could
+ * SET an older computedAt over a newer one, which would make the staleness guard
+ * misjudge freshness. So the combined SET+ADD is guarded to only move computedAt
+ * FORWARD (`attribute_not_exists(computedAt) OR computedAt <= :now`). If a newer
+ * timestamp is already present the condition fails — and we then retry the SAME
+ * delta as an ADD-only update with no computedAt SET, so the settled spend and
+ * count are NEVER dropped, only the backwards timestamp write is.
+ */
+async function applyGroup(
+  g: { billingUserId: string; billingMonth: string; micro: number; count: number },
+  now: string,
+): Promise<void> {
+  const Key = { billingUserId: g.billingUserId, billingMonth: g.billingMonth };
+  try {
+    await db()
+      .update({
+        TableName: SPEND_PROJECTION_TABLE,
+        Key,
+        // SET stamps freshness (only forward); ADD both creates the row on first
+        // touch and never overwrites reserved/available/allowance siblings.
+        UpdateExpression: "SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c",
+        ConditionExpression: "attribute_not_exists(computedAt) OR computedAt <= :now",
+        ExpressionAttributeValues: { ":now": now, ":m": g.micro, ":c": g.count },
+      })
+      .promise();
+  } catch (error: any) {
+    if (error?.code !== "ConditionalCheckFailedException") throw error;
+    // A newer computedAt already exists: keep it, but the settled spend still
+    // has to land. ADD-only, no computedAt SET.
+    await db()
+      .update({
+        TableName: SPEND_PROJECTION_TABLE,
+        Key,
+        UpdateExpression: "ADD settledMicroUsd :m, settledEventCount :c",
+        ExpressionAttributeValues: { ":m": g.micro, ":c": g.count },
+      })
+      .promise();
+  }
+}
+
 export async function applySettledSpendEvents(
   events: readonly SpendEvent[],
   now: string = new Date().toISOString(),
@@ -160,20 +262,7 @@ export async function applySettledSpendEvents(
     }
     if (groups.size === 0) return;
 
-    await Promise.all(
-      [...groups.values()].map((g) =>
-        db()
-          .update({
-            TableName: SPEND_PROJECTION_TABLE,
-            Key: { billingUserId: g.billingUserId, billingMonth: g.billingMonth },
-            // SET stamps freshness; ADD both creates the row on first touch and
-            // never overwrites reserved/available/allowance siblings.
-            UpdateExpression: "SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c",
-            ExpressionAttributeValues: { ":now": now, ":m": g.micro, ":c": g.count },
-          })
-          .promise(),
-      ),
-    );
+    await Promise.all([...groups.values()].map((g) => applyGroup(g, now)));
   } catch (err) {
     console.error(
       "[spendProjectionWriter] settled-spend projection maintenance failed (observe-only, swallowed):",
