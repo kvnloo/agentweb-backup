@@ -19,6 +19,7 @@
 import {
   sendMessage,
   sendTemplate,
+  toTemplateParam,
   toE164,
   recordInboundMessage,
   isServiceWindowOpen,
@@ -264,6 +265,85 @@ describe('template registry', () => {
       sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['only-one']),
     ).rejects.toBeInstanceOf(WhatsAppError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── Template parameter hygiene ─────────────────────────────────────────────
+
+describe('template parameter hygiene', () => {
+  // Meta rejects an empty body parameter, a newline/tab inside one, and a run of 4+
+  // spaces (132018) — each as a 400 that reads nothing like its cause. Values are
+  // user-authored (public post titles, lead names), so the service enforces this.
+  const bodyTexts = () => {
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    return body.template.components
+      .find((c: any) => c.type === 'body')
+      .parameters.map((p: any) => p.text);
+  };
+
+  it('leaves an ordinary value untouched', () => {
+    expect(toTemplateParam('Dark mode — https://fb/p/dark?x=1&y=2')).toBe(
+      'Dark mode — https://fb/p/dark?x=1&y=2',
+    );
+  });
+
+  it('turns newlines and tabs into a space', () => {
+    expect(toTemplateParam('line one\nline two\r\n\tline three')).toBe('line one line two line three');
+  });
+
+  it('collapses a run of spaces, which Meta rejects at four or more', () => {
+    expect(toTemplateParam('a      b    c')).toBe('a b c');
+  });
+
+  it('replaces an empty or whitespace-only value with a placeholder', () => {
+    expect(toTemplateParam('')).toBe('-');
+    expect(toTemplateParam('   \n\t ')).toBe('-');
+    expect(toTemplateParam(undefined as unknown as string)).toBe('-');
+  });
+
+  it('strips zero-width and bidi-override characters', () => {
+    expect(toTemplateParam('pay​ment‮gnp.exe')).toBe('paymentgnp.exe');
+  });
+
+  it('a value that is only invisible characters becomes the placeholder, not empty', () => {
+    expect(toTemplateParam('​‍﻿')).toBe('-');
+  });
+
+  it('caps at 1024 characters and never splits an emoji', () => {
+    const out = toTemplateParam('😀'.repeat(2000));
+    expect([...out]).toHaveLength(1024);
+    expect(out.endsWith('…')).toBe(true);
+    // A split surrogate pair would leave a lone half that JSON-encodes as garbage.
+    expect(out).toBe(JSON.parse(JSON.stringify(out)));
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
+  it('does not truncate a value at exactly the limit', () => {
+    expect(toTemplateParam('x'.repeat(1024))).toBe('x'.repeat(1024));
+  });
+
+  it('applies to the request actually sent to Meta, for every positional slot', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['Dark\nmode', '']);
+    expect(bodyTexts()).toEqual(['Dark mode', '-']);
+  });
+
+  it('still counts an empty caller value as provided, so the placeholder is not a way around the count check', async () => {
+    await expect(
+      sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['only-one']),
+    ).rejects.toBeInstanceOf(WhatsAppError);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(
+      sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['title', '']),
+    ).resolves.toEqual({ messageId: 'wamid.TEST1' });
+  });
+
+  it('is applied on the window-closed sendMessage path too', async () => {
+    await sendMessage({
+      destination: '+14155550123',
+      text: 'ignored — window closed',
+      template: { name: TEMPLATES.LEAD_ALERT.name, variables: ['Ada\nLovelace', 'replied on  Q3 list'] },
+    });
+    expect(bodyTexts()).toEqual(['Ada Lovelace', 'replied on Q3 list']);
   });
 });
 
