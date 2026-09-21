@@ -33499,7 +33499,12 @@ ${strippedHtml}`;
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
-        autocomplete: autocomplete || false,
+        // ENG-2058: an interactive (autocomplete: false) plan on a scheduled run stalls
+        // forever — the "wait for the user to approve each step" contract has no user
+        // to ask, so the run just burns its completion-gate continuation budget presenting
+        // results and asking for approval, then records a deferredUnresolved failure. Force
+        // hands-off mode on every scheduled session regardless of what the model passed.
+        autocomplete: session.sessionType === 'scheduled' ? true : (autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -33679,7 +33684,10 @@ ${strippedHtml}`;
           ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false,
+        // ENG-2058: same rationale as createWorkPlan above — a scheduled session has no
+        // user to approve an interactive step, so a template's own autocomplete (or lack
+        // of one) is overridden hands-off whenever this launch lands on a scheduled run.
+        autocomplete: session.sessionType === 'scheduled' ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         // ENG-1472: which predefined template this session's plan was launched
@@ -34134,8 +34142,13 @@ Reply with ONLY one word: yes or no.`;
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
-      // Update autocomplete if explicitly provided
-      if (autocomplete !== undefined) {
+      // Update autocomplete if explicitly provided. ENG-2058: a scheduled session
+      // always stays hands-off — there is no user to approve an interactive step —
+      // so this overrides any explicit `false` (or a plan created before this fix)
+      // rather than only applying when the caller passed a value.
+      if (session.sessionType === 'scheduled') {
+        workPlan.autocomplete = true;
+      } else if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;
       }
 
