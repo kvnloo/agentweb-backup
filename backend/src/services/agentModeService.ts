@@ -3276,6 +3276,7 @@ export class AgentModeService {
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const openResearchRequests = currentSession?.openResearchRequests;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
@@ -3293,7 +3294,7 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
+      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, openResearchRequests);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -4251,6 +4252,22 @@ export class AgentModeService {
           }
         }
 
+        // ENG-738: track research/lookup requests that timed out this iteration (and
+        // clear any earlier open entry a now-successful call just resolved) so a later
+        // turn doesn't silently drop — or misremember — a request the user is still owed.
+        {
+          const { additions, resolvedTools } = AgentModeService.detectOpenResearchRequestChanges(
+            toolCalls.slice(toolCallsLengthBeforeIteration)
+          );
+          if (additions.length > 0 || resolvedTools.length > 0) {
+            try {
+              await chatbotDb.recordOpenResearchRequests(sessionId, additions, resolvedTools);
+            } catch (openRequestError) {
+              console.error('AgentMode: Failed to update open research requests:', openRequestError);
+            }
+          }
+        }
+
         // Human-in-the-loop confirmation gate: if a tool in this iteration requested
         // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
         // autonomous loop and hand control back to the user. The model CANNOT self-approve
@@ -4907,6 +4924,108 @@ export class AgentModeService {
     return [{ role: 'assistant', content: workPlanContent.trim() }];
   }
 
+  // ENG-738: how long an open research request keeps being surfaced as a reminder
+  // before it silently ages out. Bounds the nag lifetime without needing a
+  // separate "dismiss" action — the primary incident session's user asked about
+  // the dropped request ~1h45m after the timeout, well inside this window.
+  private static readonly OPEN_RESEARCH_REQUEST_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  /**
+   * From one iteration's tool-call entries, work out which RESEARCH_LOOKUP_TOOLS
+   * calls newly timed out (still owed to the user) and which succeeded (clearing
+   * any earlier open entry for that tool). Pure — no I/O — so this is fully
+   * covered by unit tests instead of only exercised through a live session.
+   *
+   * A call only counts as "resolved" on a genuine success — a soft failure
+   * (e.g. perform_deep_research's `{success:false, partial:true}` after an
+   * internal timeout, ENG-738) must NOT clear the open entry it's reporting.
+   * A non-timeout failure (invalid args, service unavailable, …) is left alone
+   * entirely: it doesn't add a new open entry (retrying won't fix it, so it's
+   * not "still owed" in the same sense) and doesn't resolve an existing one
+   * (the underlying ask still isn't done).
+   */
+  private static detectOpenResearchRequestChanges(
+    toolCallEntries: Array<{ name: string; arguments?: any; error?: string; result?: any }>,
+    nowIso: string = new Date().toISOString(),
+  ): { additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }>; resolvedTools: string[] } {
+    const additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> = [];
+    const resolvedTools: string[] = [];
+
+    for (const entry of toolCallEntries || []) {
+      if (!AgentModeService.RESEARCH_LOOKUP_TOOLS.has(entry.name)) continue;
+
+      const softFailure = Boolean(entry.result) && typeof entry.result === 'object' && entry.result.success === false;
+      const failed = Boolean(entry.error) || softFailure;
+
+      if (!failed) {
+        resolvedTools.push(entry.name);
+        continue;
+      }
+
+      const errorText = entry.error || (softFailure ? String(entry.result?.error || entry.result?.message || '') : '');
+      if (classifyToolErrorClass(errorText) === 'timeout') {
+        additions.push({
+          tool: entry.name,
+          topic: AgentModeService.summarizeResearchTopic(entry.arguments),
+          failedAt: nowIso,
+          errorSummary: errorText.slice(0, 200),
+        });
+      }
+    }
+
+    return { additions, resolvedTools };
+  }
+
+  /** Best-effort short human-readable topic from a research-lookup tool's call args. */
+  private static summarizeResearchTopic(args: any): string {
+    if (!args || typeof args !== 'object') return 'unspecified topic';
+    const candidate = args.topic || args.query || args.profile_url || args.q;
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().slice(0, 150);
+    }
+    try {
+      const serialized = JSON.stringify(args);
+      return serialized && serialized !== '{}' ? serialized.slice(0, 150) : 'unspecified topic';
+    } catch {
+      return 'unspecified topic';
+    }
+  }
+
+  /**
+   * ENG-738: a research/lookup request that timed out and was never retried to
+   * success must not be silently dropped (or misremembered) once the
+   * conversation moves on to something else — this re-injects it as an
+   * authoritative reminder on later turns, the same way buildWorkPlanContextMessages
+   * keeps an active plan visible. Filtered by age so a session that lives for
+   * days doesn't nag about a request from a week ago forever (see
+   * OPEN_RESEARCH_REQUEST_MAX_AGE_MS) — persistence-layer capping (chatbotDb.
+   * recordOpenResearchRequests) additionally bounds the list size.
+   */
+  public static buildOpenResearchRequestReminder(
+    openResearchRequests: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> | undefined,
+    nowMs: number = Date.now(),
+  ): any[] {
+    if (!Array.isArray(openResearchRequests) || openResearchRequests.length === 0) {
+      return [];
+    }
+
+    const recent = openResearchRequests.filter((r) => {
+      const failedAtMs = Date.parse(r.failedAt);
+      return Number.isFinite(failedAtMs) && nowMs - failedAtMs <= AgentModeService.OPEN_RESEARCH_REQUEST_MAX_AGE_MS;
+    });
+    if (recent.length === 0) {
+      return [];
+    }
+
+    let content = '⚠️ UNRESOLVED REQUEST(S) FROM EARLIER IN THIS SESSION:\n';
+    recent.forEach((r) => {
+      content += `- ${r.tool} on "${r.topic}" failed with a timeout at ${r.failedAt} and was never completed.\n`;
+    });
+    content += '\nDo NOT silently leave these dropped, and do NOT claim you never attempted them — the record above is authoritative, not your recollection of the conversation. At a natural point in this response (after handling what the user is asking now), either proactively retry the ones you have enough context to retry, or tell the user plainly that they are still outstanding and ask whether to continue now or later.';
+
+    return [{ role: 'assistant', content }];
+  }
+
   /**
    * Extract the filenames of images already generated in this session by scanning
    * the "Image generated: <filename>" system messages that generateImage persists
@@ -4960,7 +5079,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, openResearchRequests?: any[]): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5132,6 +5251,11 @@ export class AgentModeService {
         messages.push({ role: 'assistant', content: assetAwarenessText });
       }
     }
+
+    // ENG-738: surface any research/lookup request that timed out earlier in this
+    // session and was never retried to success — independent of whether a work
+    // plan exists, since the incident this fixes was a plain conversational ask.
+    messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
