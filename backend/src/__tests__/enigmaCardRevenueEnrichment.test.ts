@@ -232,7 +232,7 @@ function fakeConfigsTable(seed: Array<Record<string, any>> = []) {
   // The tracker uses exactly these expressions. The fake evaluates them by text
   // and rejects any other, so a wrong expression in production cannot pass here.
   const UPDATE_CONDITIONS = new Set(['#period = :period', '#period = :period AND #counter <= :maxBefore']);
-  const PUT_CONDITION = 'attribute_not_exists(userId) OR #period <> :period';
+  const PUT_CONDITION = 'attribute_not_exists(userId) OR #period < :period';
 
   const dynamodb: any = {
     update: (params: any) => settle(() => {
@@ -251,7 +251,8 @@ function fakeConfigsTable(seed: Array<Record<string, any>> = []) {
       if (params.ConditionExpression !== PUT_CONDITION) throw new Error(`fake: unsupported ConditionExpression "${params.ConditionExpression}"`);
       const row = rows.get(id(params.Item));
       const periodField = params.ExpressionAttributeNames['#period'];
-      if (row && row[periodField] === params.ExpressionAttributeValues[':period']) throw conditionFailed();
+      // `<` on ISO strings: only a missing or strictly older period may be replaced.
+      if (row && !(row[periodField] < params.ExpressionAttributeValues[':period'])) throw conditionFailed();
       rows.set(id(params.Item), { ...params.Item });
     }),
   };
@@ -337,6 +338,21 @@ describe('EnigmaService spend limits', () => {
     fetchMock.mockRestore();
   });
 
+  it('releases the whole reservation, including the daily call, when an errors response returned no billed values', async () => {
+    const http = buildEnigmaHttpClient('test-key');
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true, status: 200, headers: new Headers(),
+      json: async () => ({ data: { search: [] }, errors: [{ message: 'upstream failure' }] }),
+    } as any);
+    const quota = tracker();
+    const svc = new EnigmaService({ http, store: store(), quota });
+
+    await expect(svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaApiError);
+
+    expect(quota.settle).toHaveBeenLastCalledWith({ userId: 'u1', credits: 52 }, null);
+    fetchMock.mockRestore();
+  });
+
   it('a failed settle never fails the lookup', async () => {
     const quota = tracker();
     quota.settle.mockRejectedValue(new Error('dynamo down'));
@@ -413,6 +429,24 @@ describe('buildEnigmaQuotaTracker (atomic reservations)', () => {
     // Settling a reservation made last month must not touch this month's counter.
     await tracker.settle({ ...r, month: '2026-08' }, 0);
     expect(t.row('system', BUDGET_ROW)!.creditCount).toBe(52);
+  });
+
+  it('a request that computed an older period can never overwrite a newer counter', async () => {
+    // Row already rolled over to the 16th / October; a straggler still holds the 15th / September.
+    const t = fakeConfigsTable([
+      { userId: 'u1', configId: USER_ROW, date: '2026-09-16', callCount: 3 },
+      { userId: 'system', configId: BUDGET_ROW, month: '2026-10', creditCount: 500 },
+    ]);
+    const straggler = buildEnigmaQuotaTracker(t.dynamodb, 150, () => new Date('2026-09-15T23:59:59Z'), 1800);
+
+    await expect(straggler.reserve('u1')).rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);   // fails closed
+    expect(t.row('u1', USER_ROW)).toMatchObject({ date: '2026-09-16', callCount: 3 });
+    expect(t.row('system', BUDGET_ROW)).toMatchObject({ month: '2026-10', creditCount: 500 });
+
+    // Same for the daily row on its own (budget disabled).
+    const dailyOnly = buildEnigmaQuotaTracker(t.dynamodb, 150, () => new Date('2026-09-15T23:59:59Z'), 0);
+    await expect(dailyOnly.reserve('u1')).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
+    expect(t.row('u1', USER_ROW)).toMatchObject({ date: '2026-09-16', callCount: 3 });
   });
 
   it('a budget of 0 disables the credit budget but still enforces the user limit', async () => {

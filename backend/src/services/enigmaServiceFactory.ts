@@ -104,9 +104,11 @@ export function buildEnigmaHttpClient(apiKey: string): EnigmaHttpClient {
       if (Array.isArray(body?.errors) && body.errors.length > 0) {
         const message = body.errors.map((e: any) => e?.message).filter(Boolean).join('; ') || 'unknown GraphQL error';
         const err = new EnigmaApiError(`Enigma GraphQL error: ${message}`, res.status);
-        // The values that came back were billed (and ledgered above), so the
-        // monthly budget must count them too.
-        if (Array.isArray(search)) err.billedCredits = countEnigmaBilledCredits(search);
+        // Values that came back were billed (and ledgered above), so the monthly
+        // budget must count them too. With none, nothing was billed: leave it
+        // unset so the whole reservation, including the user's daily call, is released.
+        const billedCredits = Array.isArray(search) ? countEnigmaBilledCredits(search) : 0;
+        if (billedCredits > 0) err.billedCredits = billedCredits;
         throw err;
       }
       // A missing or non-array `search` is schema drift, not "no brand": throw so
@@ -212,13 +214,16 @@ export function buildEnigmaQuotaTracker(
     };
 
     if (await tryAdd()) return true;
-    // Either the limit is spent today/this month, or the row is missing or from
-    // an earlier period. Start a fresh counter if (and only if) it is not today's.
+    // Either the limit is spent this period, or the row is missing or from an
+    // earlier period. Start a fresh counter only in that last case.
     try {
       await dynamodb.put({
         TableName: CONFIGS_TABLE,
         Item: { ...key, [periodField]: period, [counter]: amount },
-        ConditionExpression: 'attribute_not_exists(userId) OR #period <> :period',
+        // Replace only a missing or OLDER period (ISO day/month strings sort
+        // lexicographically). A request that computed its period just before a
+        // rollover must not overwrite the newer counter and lose reservations.
+        ConditionExpression: 'attribute_not_exists(userId) OR #period < :period',
         ExpressionAttributeNames: { '#period': periodField },
         ExpressionAttributeValues: { ':period': period },
       }).promise();
