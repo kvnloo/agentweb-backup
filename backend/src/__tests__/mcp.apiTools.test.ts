@@ -68,7 +68,7 @@ describe('apiTools', () => {
     it('should register API-wrapping tools', () => {
       const names = mcpToolRegistry.getToolNames();
       const expectedTools = [
-        'emma_create_session', 'emma_send_message', 'emma_answer_question', 'emma_answer_question_deck', 'emma_get_session', 'emma_list_sessions',
+        'emma_create_session', 'emma_send_message', 'emma_answer_question_deck', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
         'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
@@ -313,81 +313,13 @@ describe('apiTools', () => {
 
   });
 
-  // ─── emma_answer_question (ENG-400: MCP transport for the AskUserQuestion primitive) ───
-
-  describe('emma_answer_question', () => {
-    it('posts a direct pick through the structured questionAnswer channel, using option_id as the default label', async () => {
-      mockMcpFetch.mockResolvedValue({ response: 'OK' });
-
-      await mcpToolRegistry.execute('emma_answer_question', {
-        session_id: 'sess-1',
-        question_id: 'q-1',
-        option_id: 'leads',
-      }, context);
-
-      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
-        method: 'POST',
-        path: '/api/agent-mode/generate',
-        body: {
-          sessionId: 'sess-1',
-          userMessage: 'leads',
-          questionAnswer: { questionId: 'q-1', optionId: 'leads', delegated: false },
-        },
-      }));
-    });
-
-    it('uses a provided label as the human-readable chat message instead of the raw option_id', async () => {
-      mockMcpFetch.mockResolvedValue({ response: 'OK' });
-
-      await mcpToolRegistry.execute('emma_answer_question', {
-        session_id: 'sess-1',
-        question_id: 'q-1',
-        option_id: 'leads',
-        label: 'Leads',
-      }, context);
-
-      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
-      expect(callBody.userMessage).toBe('Leads');
-    });
-
-    it('posts a delegation ("Let Emma decide") with delegated:true and no option_id required', async () => {
-      mockMcpFetch.mockResolvedValue({ response: 'OK' });
-
-      await mcpToolRegistry.execute('emma_answer_question', {
-        session_id: 'sess-1',
-        question_id: 'q-1',
-        delegate: true,
-      }, context);
-
-      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
-        body: {
-          sessionId: 'sess-1',
-          userMessage: 'Let Emma decide',
-          questionAnswer: { questionId: 'q-1', optionId: undefined, delegated: true },
-        },
-      }));
-    });
-
-    it('refuses (without calling the API) a direct pick missing option_id', async () => {
-      const result = await mcpToolRegistry.execute('emma_answer_question', {
-        session_id: 'sess-1',
-        question_id: 'q-1',
-      }, context);
-
-      expect(mockMcpFetch).not.toHaveBeenCalled();
-      expect(JSON.parse(result.content[0].text).success).toBe(false);
-    });
-
-    it('is registered with session_id and question_id required', () => {
-      const defs = mcpToolRegistry.getToolDefinitions();
-      const answerQuestion = defs.find((d: any) => d.name === 'emma_answer_question');
-      expect(answerQuestion).toBeDefined();
-      expect(answerQuestion.inputSchema.required).toEqual(['session_id', 'question_id']);
-    });
-  });
+  // ENG-1635/1644 PR2: the emma_answer_question tool + its whole describe
+  // block are deleted — the tool itself is deleted (nothing populates
+  // session.pendingUserQuestion anymore), emma_answer_question_deck below is
+  // the sole MCP transport for every producer that used to reach it.
 
   // ─── emma_answer_question_deck (ENG-1635/1644: MCP transport for the deck-of-one
-  // ask_user_question/objective-gate now build, sibling of emma_answer_question) ───
+  // ask_user_question/objective-gate build) ───
 
   describe('emma_answer_question_deck', () => {
     it('posts a direct pick through the structured deckAnswer channel, using option_id as the default label', async () => {

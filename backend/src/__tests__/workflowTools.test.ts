@@ -181,27 +181,11 @@ describe('ENG-982: one call completes the job', () => {
     }
   });
 
-  it('emma_run_marketing_task confirms a blocking question against the SESSION, not the generate reply', async () => {
-    // The generate response does not carry pendingUserQuestion — no res.json in
-    // agentModeController includes it. Reading it off the reply was dead code,
-    // so a run blocked on a question reported "complete" and the caller walked
-    // away from work waiting on them.
-    mockMcpFetch
-      .mockResolvedValueOnce({ sessionId: 'task-42' })
-      .mockResolvedValueOnce({ content: 'which audience?' }) // generate: no pending field
-      .mockResolvedValueOnce({ pendingUserQuestion: { question: 'which audience?' } }); // session GET
-
-    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
-    const body = JSON.parse(res.content[0].text);
-
-    expect(paths()).toEqual([
-      '/api/agent-mode/sessions',
-      '/api/agent-mode/generate',
-      '/api/agent-mode/session/task-42',
-    ]);
-    expect(body.status).toBe('awaiting_input');
-    expect(body.next).toMatch(/emma_answer_question/);
-  });
+  // ENG-1635/1644 PR2: the pendingUserQuestion-recognition test that lived
+  // here is deleted — nothing ever populates that field anymore, and the
+  // status-check function no longer reads it at all (only pendingApprovalDeck
+  // below). Confirming "the SESSION, not the generate reply" is what's
+  // checked is now covered by the deck-of-one test right below.
 
   // ENG-1635/1644 (ask_user_question retirement): ask_user_question and the
   // Meta objective gate no longer populate pendingUserQuestion at all — they

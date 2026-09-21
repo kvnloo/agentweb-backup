@@ -35,7 +35,9 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
     getChatSession: jest.fn().mockResolvedValue(null),
-    updateSessionAskUserQuestion: jest.fn().mockResolvedValue({}),
+    // ENG-1635/1644 PR2: persistExplicitObjectiveConfirmation's real sink now
+    // (updateSessionAskUserQuestion, the old sink, is deleted).
+    updateSessionObjectiveConfirmation: jest.fn().mockResolvedValue(undefined),
     createChatSession: jest.fn().mockResolvedValue({ sessionId: 'auto-created-session' }),
   },
 }));
@@ -64,7 +66,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
     (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
-    (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue({});
+    (chatbotDb.updateSessionObjectiveConfirmation as jest.Mock).mockResolvedValue(undefined);
     (chatbotDb.createChatSession as jest.Mock).mockResolvedValue({ sessionId: 'auto-created-session' });
     (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', name: 'Test' });
     // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
@@ -157,16 +159,20 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
         'session-1',
       );
       expect(firstCall.success).toBe(true);
-      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
-      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.status).toBe('answered');
-      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
-      expect(persisted.answer.answeredBy).toBe('user');
+      expect(chatbotDb.updateSessionObjectiveConfirmation).toHaveBeenCalled();
+      const [persistedSessionId, persistedKind, persisted] =
+        (chatbotDb.updateSessionObjectiveConfirmation as jest.Mock).mock.calls[0];
+      expect(persistedSessionId).toBe('session-1');
+      expect(persistedKind).toBe('meta_objective:123456789|test|||NONE');
+      expect(persisted.objective).toBe('OUTCOME_LEADS');
+      expect(persisted.answeredBy).toBe('user');
 
       // Simulate the retry: the session now reflects that persisted record,
       // and the LATEST message is the user's confirmation reply ("yes"), which
       // does NOT contain the original quote.
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: persisted });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        objectiveConfirmations: { [persistedKind]: persisted },
+      });
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
         { role: 'user', content: 'Create a leads campaign for our new offer.' },
         { role: 'assistant', content: 'Confirm this campaign?' },
@@ -198,12 +204,15 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
         validParams({ name: 'Campaign One', objective: 'OUTCOME_LEADS', objective_quote: 'leads campaign' }),
         'session-1',
       );
-      const persistedFirst = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persistedFirst.kind).toBe('meta_objective:123456789|campaign one|||NONE');
+      const [, persistedFirstKind, persistedFirst] =
+        (chatbotDb.updateSessionObjectiveConfirmation as jest.Mock).mock.calls[0];
+      expect(persistedFirstKind).toBe('meta_objective:123456789|campaign one|||NONE');
 
       // A second, unrelated campaign in the SAME session — session now reflects
       // Campaign One's answered objective as the live slot.
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: persistedFirst });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        objectiveConfirmations: { [persistedFirstKind]: persistedFirst },
+      });
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
         { role: 'user', content: 'Now also create a second campaign called Campaign Two, no objective decided yet.' },
       ]);
@@ -272,133 +281,60 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
     });
   });
 
-  describe('Path 2 — prior answered ask_user_question (kind: meta_objective)', () => {
-    function answeredQuestion(objective: string, overrides: any = {}) {
-      return {
-        questionId: 'q-1',
-        question: 'Which objective?',
-        options: [{ id: 'x', label: 'X', consequence: 'x', recommended: true, why: 'y', payload: { objective } }],
-        recommendedOptionId: 'x',
-        immutable: true,
-        allowEmmaDecide: true,
-        kind: 'meta_objective:123456789|test|||NONE',
-        status: 'answered',
-        createdAt: '2026-07-24T00:00:00.000Z',
-        answer: { optionId: 'x', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
-        ...overrides,
-      };
-    }
-
-    it('reuses a human-answered bare-kind objective card and persists its correlator consumption record', async () => {
-      const source = answeredQuestion('OUTCOME_LEADS', {
-        questionId: 'model-card-1',
-        kind: 'meta_objective',
-        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for lead conversions.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
+  describe('Path 2 — objectiveConfirmations (ENG-1635/1644 PR2, the primary sink now)', () => {
+    it('ALLOWS via objectiveConfirmations without touching message history or the legacy fields at all', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: 'session-1',
+        objectiveConfirmations: {
+          'meta_objective:123456789|test|||NONE': {
+            objective: 'OUTCOME_SALES',
+            answeredBy: 'user',
+            at: '2026-09-19T00:00:00.000Z',
+            quote: 'purchases on our checkout page',
+          },
+        },
       });
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
 
-      const result = await callApi(service, validParams(), 'session-1');
+      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' /* ignored — settled value wins */ }), 'session-1');
 
       expect(result.success).toBe(true);
-      expect(metaService.createCampaign).toHaveBeenCalled();
-      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
-      expect(persisted.options[0].payload).toMatchObject({ objective: 'OUTCOME_LEADS', sourceQuestionId: 'model-card-1' });
+      expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_SALES');
+      // Cheapest check first — no message fetch needed when this field settles it.
+      expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
     });
 
-    it.each([
-      ['a label/payload mismatch', answeredQuestion('OUTCOME_TRAFFIC', {
-        kind: 'meta_objective',
-        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_TRAFFIC' } }],
-      })],
-      ['a different-account kind', answeredQuestion('OUTCOME_LEADS', {
-        kind: 'meta_objective:999999999|test|||NONE',
-        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
-      })],
-    ])('re-asks with carry-over context for %s', async (_case, source) => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
+    it('does NOT trust a stored objective outside the known objective values', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: 'session-1',
+        objectiveConfirmations: {
+          'meta_objective:123456789|test|||NONE': {
+            objective: 'NOT_A_REAL_OBJECTIVE',
+            answeredBy: 'user',
+            at: '2026-09-19T00:00:00.000Z',
+          },
+        },
+      });
 
       const result = await callApi(service, validParams(), 'session-1');
 
       expect(result.awaitingUserConfirmation).toBe(true);
-      // ENG-1635/1644: Path 3 no longer persists a PendingUserQuestion with a
-      // separate `intro` field itself — it returns a bare halt marker, and the
-      // deck primitive has no intro field, so the carry-over context is folded
-      // directly into the question text instead (see resolveCampaignObjectiveGate).
-      expect(result.questionDeckPayload[0].question).toMatch(/answered an objective question earlier/i);
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
-    it('does not reuse a loose objective card for a second differently-named campaign', async () => {
-      const source = answeredQuestion('OUTCOME_LEADS', {
-        questionId: 'model-card-1',
-        kind: 'meta_objective',
-        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
-      });
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
-      await callApi(service, validParams({ name: 'Campaign One' }), 'session-1');
-      const consumed = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-
-      jest.clearAllMocks();
-      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        pendingUserQuestion: source,
-        answeredQuestions: { consumed: consumed },
-      });
-      (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue({});
-      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_2' });
-
-      const second = await callApi(service, validParams({ name: 'Campaign Two' }), 'session-1');
-      expect(second.awaitingUserConfirmation).toBe(true);
-      expect(metaService.createCampaign).not.toHaveBeenCalled();
-    });
-
-    it('ALLOWS via the LIVE pendingUserQuestion slot and applies the gate-resolved objective VERBATIM', async () => {
+    it('is scoped to the correlator — a different campaign in the same session does not inherit it', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
-        pendingUserQuestion: answeredQuestion('OUTCOME_SALES'),
+        objectiveConfirmations: {
+          'meta_objective:123456789|campaign one|||NONE': {
+            objective: 'OUTCOME_LEADS',
+            answeredBy: 'user',
+            at: '2026-09-19T00:00:00.000Z',
+          },
+        },
       });
 
-      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' /* model's guess, ignored */ }), 'session-1');
+      const result = await callApi(service, validParams({ name: 'Campaign Two' }), 'session-1');
 
-      expect(result.success).toBe(true);
-      expect(metaService.createCampaign).toHaveBeenCalled();
-      expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_SALES');
-    });
-
-    it('ALLOWS via the ARCHIVE when a LATER question has taken the live slot', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        sessionId: 'session-1',
-        pendingUserQuestion: { ...answeredQuestion('OUTCOME_LEADS'), questionId: 'q-later', kind: 'some_other_kind' },
-        answeredQuestions: { 'q-1': answeredQuestion('OUTCOME_SALES') },
-      });
-
-      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
-
-      expect(result.success).toBe(true);
-      expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_SALES');
-    });
-
-    it('does NOT allow a DELEGATED answer to be treated any differently — still applies verbatim', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        sessionId: 'session-1',
-        pendingUserQuestion: answeredQuestion('OUTCOME_LEADS', {
-          answer: { optionId: 'x', delegated: true, answeredBy: 'delegation', rationale: 'r', at: 't' },
-        }),
-      });
-
-      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
-      expect(result.success).toBe(true);
-      expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_LEADS');
-    });
-
-    it('BLOCKS when the pending question is still AWAITING (same-turn [ask, create] bundle refused)', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        sessionId: 'session-1',
-        pendingUserQuestion: { ...answeredQuestion('OUTCOME_LEADS'), status: 'awaiting', answer: undefined },
-      });
-
-      const result = await callApi(service, validParams({ objective: 'OUTCOME_LEADS' }), 'session-1');
       expect(result.awaitingUserConfirmation).toBe(true);
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
@@ -454,8 +390,9 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       // recommendedOptionId anymore — a bare halt marker instead, mirroring
       // present_question_deck's own execute(). The iteration-end seam builds
       // and persists the real deck (covered by
-      // agentModeService.questionApprovalDeck.test.ts).
-      expect(chatbotDb.updateSessionAskUserQuestion).not.toHaveBeenCalled();
+      // agentModeService.questionApprovalDeck.test.ts). PR2: the old sync-persist
+      // method (updateSessionAskUserQuestion) this once asserted "not called"
+      // against is deleted entirely — the invariant is now structural.
       expect(result.questionDeckPayload).toHaveLength(1);
       const q = result.questionDeckPayload[0];
       expect(q.kind).toBe('meta_objective:123456789|test|||NONE');
@@ -500,8 +437,8 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
     // failIfAwaitingExists guard, covered by
     // chatbotService.approvalDeckCrossSlotGuard.test.ts), the same seam every
     // other halt type (Meta writes, present_question_deck) already shares.
-    // Nothing left to assert at this layer beyond "Path 3 never touches
-    // chatbotDb.updateSessionAskUserQuestion at all" (covered above).
+    // Nothing left to assert at this layer — PR2 deleted
+    // updateSessionAskUserQuestion (the old sync-persist method) entirely.
 
     // Regression (found live, 2026-07-24): a model that correctly OMITS an
     // objective it doesn't know — the safest thing it can do — must still get

@@ -13,18 +13,12 @@
 
 import '../emma/tools'; // side-effect: registers the tool
 import { emmaToolRegistry } from '../emma/registry';
-import { chatbotDb } from '../services/chatbotService';
 
 describe('ask_user_question tool handler', () => {
-  let persistSpy: jest.SpyInstance;
-
-  beforeEach(() => {
-    // No producer writes session.pendingUserQuestion anymore — assert this
-    // stays true rather than merely asserting a positive shape.
-    persistSpy = jest
-      .spyOn(chatbotDb, 'updateSessionAskUserQuestion')
-      .mockResolvedValue({} as any);
-  });
+  // PR2: no producer writes session.pendingUserQuestion anymore — the
+  // method that once persisted it (updateSessionAskUserQuestion) is deleted
+  // entirely, so "nothing persists via the old path" is now a structural
+  // guarantee rather than something to assert via a spy.
 
   afterEach(() => jest.restoreAllMocks());
 
@@ -43,10 +37,8 @@ describe('ask_user_question tool handler', () => {
     expect(emmaToolRegistry.getTool('ask_user_question')).toBeDefined();
   });
 
-  it('SUCCESS: returns a bare halt marker (questionDeckPayload) and does NOT write pendingUserQuestion', async () => {
+  it('SUCCESS: returns a bare halt marker (questionDeckPayload)', async () => {
     const result = await emmaToolRegistry.execute('ask_user_question', validArgs(), { sessionId: 's-1' });
-
-    expect(persistSpy).not.toHaveBeenCalled();
 
     expect(result.success).toBe(true);
     expect(result.awaitingUserConfirmation).toBe(true); // halts the loop
@@ -96,7 +88,6 @@ describe('ask_user_question tool handler', () => {
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/requires an active session/);
     expect(result.awaitingUserConfirmation).toBeUndefined();
-    expect(persistSpy).not.toHaveBeenCalled();
   });
 
   // Structural validation (exactly-one-recommended, 2-4 options, etc.) is no

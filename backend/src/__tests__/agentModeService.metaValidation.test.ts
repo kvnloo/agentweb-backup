@@ -56,7 +56,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
     getChatSession: jest.fn().mockResolvedValue(null),
-    updateSessionAskUserQuestion: jest.fn().mockResolvedValue({}),
+    updateSessionObjectiveConfirmation: jest.fn().mockResolvedValue(undefined),
     createChatSession: jest.fn().mockResolvedValue({ sessionId: 'auto-created-session' }),
   },
 }));
@@ -329,23 +329,19 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       const leadsOption = result.questionDeckPayload[0].options.find((o: any) => o.id === 'leads');
       expect(leadsOption?.recommended).toBe(true); // OUTCOME_LEADS default, no account preference set
       expect(metaService.createCampaign).not.toHaveBeenCalled();
-      expect(chatbotDb.updateSessionAskUserQuestion).not.toHaveBeenCalled(); // no synchronous DB write inside the gate anymore
+      // PR2: updateSessionAskUserQuestion (the old sync-persist method this
+      // once asserted "not called" against) is deleted entirely now.
     });
 
-    it('ALLOWS a CAMPAIGN CREATE whose objective was already answered via ask_user_question (kind meta_objective)', async () => {
+    it('ALLOWS a CAMPAIGN CREATE whose objective was already confirmed this session (ENG-1635/1644 PR2: objectiveConfirmations)', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
-        pendingUserQuestion: {
-          questionId: 'q-1',
-          question: 'Which objective?',
-          options: [{ id: 'sales', label: 'Sales', consequence: 'x', recommended: true, why: 'y', payload: { objective: 'OUTCOME_SALES' } }],
-          recommendedOptionId: 'sales',
-          immutable: true,
-          allowEmmaDecide: true,
-          kind: 'meta_objective:123456789|test|||NONE',
-          status: 'answered',
-          createdAt: '2026-07-24T00:00:00.000Z',
-          answer: { optionId: 'sales', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
+        objectiveConfirmations: {
+          'meta_objective:123456789|test|||NONE': {
+            objective: 'OUTCOME_SALES',
+            answeredBy: 'user',
+            at: '2026-07-24T00:01:00.000Z',
+          },
         },
       });
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_456', name: 'Test' });
