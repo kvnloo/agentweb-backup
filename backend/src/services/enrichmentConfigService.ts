@@ -450,6 +450,30 @@ export async function getEnrichmentConfig(
  * restore + classify smart fields, validate, and stamp audit fields.
  * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
  */
+/**
+ * ENG-1388: Enigma card revenue is bought per value, so it is only ever routed
+ * when the user names the field exactly. Drops any heuristic, LLM or client
+ * alias onto a card field ("Revenue" -> card_revenue_12m) and any smart-field
+ * dependency that would trigger a purchase implicitly.
+ *
+ * Every path that can reach the card-revenue tier must run this, including
+ * preview runs that take an inline config straight from the client.
+ */
+export function stripImplicitCardRevenueRouting<T extends { fields: any[] }>(config: T): T {
+  return {
+    ...config,
+    fields: config.fields.map((f: any) => {
+      const aliasToCard = isCardRevenueField(f.aliasFor) && f.aliasFor !== f.name;
+      const cardDeps = (f.smartDependencies ?? []).filter(isCardRevenueField);
+      if (!aliasToCard && cardDeps.length === 0) return f;
+      const out = { ...f };
+      if (aliasToCard) delete out.aliasFor;
+      if (cardDeps.length > 0) out.smartDependencies = (f.smartDependencies ?? []).filter((d: any) => !isCardRevenueField(d));
+      return out;
+    }),
+  };
+}
+
 export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigProcessingDeps,
@@ -595,22 +619,7 @@ export async function processEnrichmentConfig(
     }
   }
 
-  // ENG-1388: Enigma card revenue is bought per value, so it is only ever
-  // routed when the user names the field exactly. Drop any heuristic, LLM or
-  // client alias onto a card field ("Revenue" → card_revenue_12m) and any
-  // smart-field dependency that would trigger a purchase implicitly.
-  enriched = {
-    ...enriched,
-    fields: enriched.fields.map(f => {
-      const aliasToCard = isCardRevenueField(f.aliasFor) && f.aliasFor !== f.name;
-      const cardDeps = (f.smartDependencies ?? []).filter(isCardRevenueField);
-      if (!aliasToCard && cardDeps.length === 0) return f;
-      const out = { ...f };
-      if (aliasToCard) delete out.aliasFor;
-      if (cardDeps.length > 0) out.smartDependencies = (f.smartDependencies ?? []).filter(d => !isCardRevenueField(d));
-      return out;
-    }),
-  };
+  enriched = stripImplicitCardRevenueRouting(enriched);
 
   const { warnings } = validateConfig(enriched);
 

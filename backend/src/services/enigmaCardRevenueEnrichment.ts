@@ -17,6 +17,8 @@
 import {
   EnigmaAuthError,
   EnigmaCreditsExhaustedError,
+  EnigmaBudgetExhaustedError,
+  isEnigmaBlockedWebsite,
   EnigmaQuotaExceededError,
   EnigmaRateLimitedError,
   type EnigmaBrandLookupResult,
@@ -99,6 +101,7 @@ export type EnigmaSkipReason =
   | 'unusable_domain'
   | 'low_card_adoption'
   | 'cap_reached'
+  | 'budget_reached'
   | 'not_found'
   | 'no_value'
   | 'provider_unavailable';
@@ -116,7 +119,7 @@ export interface EnigmaRunSummary {
   skipped: Partial<Record<EnigmaSkipReason, number>>;
   failed: Partial<Record<EnigmaFailReason, number>>;
   /** Set when a 402/401 stopped every later Enigma call in this run. */
-  haltedBy?: 'credits_exhausted' | 'auth';
+  haltedBy?: 'credits_exhausted' | 'auth' | 'budget_reached';
 }
 
 export interface EnigmaLookupRequest {
@@ -131,7 +134,9 @@ export interface EnigmaCardRevenueFetcher {
   summary(): EnigmaRunSummary;
 }
 
-export const DEFAULT_MAX_ENIGMA_LOOKUPS_PER_RUN = 200;
+// ENG-1933 measured ~19 credits per live call (52 worst case) on a 2,100
+// credit/month plan, so 100 calls is already about a month's allowance.
+export const DEFAULT_MAX_ENIGMA_LOOKUPS_PER_RUN = 100;
 
 export function maxLookupsPerRunFromEnv(env: Record<string, string | undefined> = process.env): number {
   const n = Number(env.ENIGMA_MAX_CALLS_PER_RUN);
@@ -161,8 +166,10 @@ export function createEnigmaCardRevenueFetcher(opts: {
 
   return {
     async fetch(request) {
-      if (summary.haltedBy) return skip('provider_unavailable');
-      if (!request.domain) return skip('unusable_domain');
+      if (summary.haltedBy) return skip(summary.haltedBy === 'budget_reached' ? 'budget_reached' : 'provider_unavailable');
+      // Checked before a per-run slot is taken: a list full of form or profile
+      // hosts must not use up the run's lookups without a single API call.
+      if (!request.domain || isEnigmaBlockedWebsite(request.domain)) return skip('unusable_domain');
 
       const adoption = classifyCardAdoption(request.industryLabels);
       if (adoption === 'low') return skip('low_card_adoption');
@@ -178,6 +185,15 @@ export function createEnigmaCardRevenueFetcher(opts: {
         );
       } catch (err) {
         if (err instanceof EnigmaQuotaExceededError) return skip('cap_reached');
+        // The monthly budget is platform-wide: once spent, every later lead in
+        // this run would hit the same wall, so stop calling.
+        if (err instanceof EnigmaBudgetExhaustedError) {
+          if (!summary.haltedBy) {
+            summary.haltedBy = 'budget_reached';
+            console.error(`[enigma:enrichment] run halted (budget_reached) for user ${opts.userId}: ${err.message}`);
+          }
+          return skip('budget_reached');
+        }
         if (err instanceof EnigmaCreditsExhaustedError || err instanceof EnigmaAuthError) {
           const reason = err instanceof EnigmaCreditsExhaustedError ? 'credits_exhausted' : 'auth';
           if (!summary.haltedBy) {

@@ -17,6 +17,7 @@ import {
   EnigmaApiError,
   EnigmaAuthError,
   EnigmaCreditsExhaustedError,
+  EnigmaBudgetExhaustedError,
   EnigmaQuotaExceededError,
   EnigmaRateLimitedError,
   EnigmaService,
@@ -128,22 +129,81 @@ function buildCacheStore(): EnigmaCacheStore {
 
 const CONFIGS_TABLE = `${process.env.NODE_ENV === 'production' ? '' : 'Dev-'}AW-Configs`;
 const ENIGMA_USAGE_CONFIG_ID = 'system:enigmaUsage';
-const DEFAULT_DAILY_LIMIT_PER_USER = 300;
+const ENIGMA_CREDIT_BUDGET_CONFIG_ID = 'system:enigmaCreditBudget';
+// AW-Configs rows are keyed by userId; the credit budget is platform-wide, so
+// it uses a reserved id no real user can hold.
+const PLATFORM_BUDGET_USER_ID = 'system';
+// ENG-1933: ~19 credits per live call, 52 worst case, against a 2,100/month Pro
+// plan. Default leaves headroom for the manual Console checks.
+const DEFAULT_MONTHLY_CREDIT_BUDGET = 1_800;
+const DEFAULT_DAILY_LIMIT_PER_USER = 150;
 
 function dailyLimitFromEnv(): number {
   const n = Number(process.env.ENIGMA_DAILY_LIMIT_PER_USER);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DAILY_LIMIT_PER_USER;
 }
 
+function monthlyCreditBudgetFromEnv(): number {
+  const n = Number(process.env.ENIGMA_MONTHLY_CREDIT_BUDGET);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MONTHLY_CREDIT_BUDGET;
+}
+
 export function buildEnigmaQuotaTracker(
   dynamodb: Pick<AWS.DynamoDB.DocumentClient, 'get' | 'update' | 'put'>,
   limit: number = dailyLimitFromEnv(),
   now: () => Date = () => new Date(),
+  creditBudget: number = monthlyCreditBudgetFromEnv(),
 ): EnigmaQuotaTracker {
   const key = (userId: string) => ({ userId, configId: ENIGMA_USAGE_CONFIG_ID });
   const today = () => now().toISOString().slice(0, 10);
+  const budgetKey = { userId: PLATFORM_BUDGET_USER_ID, configId: ENIGMA_CREDIT_BUDGET_CONFIG_ID };
+  const thisMonth = () => now().toISOString().slice(0, 7);
 
   return {
+    async checkCreditBudget() {
+      if (creditBudget <= 0) return;
+      const r = await dynamodb.get({ TableName: CONFIGS_TABLE, Key: budgetKey }).promise();
+      const spent = r.Item?.month === thisMonth() ? Number(r.Item.creditCount ?? 0) : 0;
+      if (spent >= creditBudget) throw new EnigmaBudgetExhaustedError(creditBudget);
+    },
+
+    // Recorded after the call, so the month's last call can overshoot by one
+    // call's credits (<= 52). Budgeting, not a hard spend gate: Enigma's own
+    // 402 remains the final stop.
+    async recordCredits(credits) {
+      if (credits <= 0) return;
+      const month = thisMonth();
+      try {
+        await dynamodb.update({
+          TableName: CONFIGS_TABLE,
+          Key: budgetKey,
+          UpdateExpression: 'ADD creditCount :c',
+          ConditionExpression: '#month = :month',
+          ExpressionAttributeNames: { '#month': 'month' },
+          ExpressionAttributeValues: { ':c': credits, ':month': month },
+        }).promise();
+      } catch (err: any) {
+        if (err.code !== 'ConditionalCheckFailedException') throw err;
+        try {
+          await dynamodb.put({
+            TableName: CONFIGS_TABLE,
+            Item: { ...budgetKey, month, creditCount: credits },
+            ConditionExpression: 'attribute_not_exists(userId) OR #month <> :month',
+            ExpressionAttributeNames: { '#month': 'month' },
+            ExpressionAttributeValues: { ':month': month },
+          }).promise();
+        } catch (putErr: any) {
+          if (putErr.code !== 'ConditionalCheckFailedException') throw putErr;
+          await dynamodb.update({
+            TableName: CONFIGS_TABLE,
+            Key: budgetKey,
+            UpdateExpression: 'ADD creditCount :c',
+            ExpressionAttributeValues: { ':c': credits },
+          }).promise();
+        }
+      }
+    },
+
     async checkQuota(userId) {
       const r = await dynamodb.get({ TableName: CONFIGS_TABLE, Key: key(userId) }).promise();
       const count = r.Item?.date === today() ? Number(r.Item.callCount ?? 0) : 0;

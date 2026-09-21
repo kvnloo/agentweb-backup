@@ -24,6 +24,7 @@ import {
 import {
   EnigmaAuthError,
   EnigmaCreditsExhaustedError,
+  EnigmaBudgetExhaustedError,
   EnigmaQuotaExceededError,
   EnigmaService,
   type EnigmaBrandLookupResult,
@@ -35,7 +36,8 @@ import {
   createEnrichSoFetchContext,
   type WaterfallDeps,
 } from '../services/enrichmentGroupWaterfall';
-import { getEnrichmentConfig, processEnrichmentConfig, type ConfigServiceDeps } from '../services/enrichmentConfigService';
+import { llmEligibleFields } from '../services/crmEnrichmentService';
+import { getEnrichmentConfig, processEnrichmentConfig, stripImplicitCardRevenueRouting, type ConfigServiceDeps } from '../services/enrichmentConfigService';
 import { copySiblingConfigFields } from '../services/enrichmentSiblingConfigFields';
 import { splitFieldsByGroup } from '../services/enrichmentCacheService';
 import type { LeadRecord } from '../services/crmEnrichmentService';
@@ -160,6 +162,30 @@ describe('createEnigmaCardRevenueFetcher', () => {
     expect(outcomes.filter((o) => o.kind === 'skipped' && o.reason === 'cap_reached')).toHaveLength(1);
   });
 
+  it('does not spend a run slot on a website that can never be looked up', async () => {
+    const lookup = jest.fn().mockResolvedValue(found(1000));
+    const f = createEnigmaCardRevenueFetcher({ service: fakeService(lookup), userId: 'u1', maxLookupsPerRun: 1 });
+
+    expect(await f.fetch(req({ domain: 'everyio.agentwebforms.com' }))).toEqual({ kind: 'skipped', reason: 'unusable_domain' });
+    expect(await f.fetch(req({ domain: 'linkedin.com' }))).toEqual({ kind: 'skipped', reason: 'unusable_domain' });
+    expect((await f.fetch(req())).kind).toBe('found');     // the one real slot is still free
+    expect(f.summary().lookups).toBe(1);
+  });
+
+  // ENG-1933: credits, not calls, are the real limit (~19 credits per call on a
+  // 2,100/month plan), so a spent budget must stop the run like a 402 does.
+  it('halts the run when the monthly credit budget is spent, as a skip not a failure', async () => {
+    const lookup = jest.fn()
+      .mockRejectedValueOnce(new EnigmaBudgetExhaustedError(1800))
+      .mockResolvedValue(found(1000));
+    const f = createEnigmaCardRevenueFetcher({ service: fakeService(lookup), userId: 'u1', maxLookupsPerRun: 10 });
+
+    expect(await f.fetch(req())).toEqual({ kind: 'skipped', reason: 'budget_reached' });
+    expect(await f.fetch(req())).toEqual({ kind: 'skipped', reason: 'budget_reached' });
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(f.summary()).toMatchObject({ filled: 0, failed: {} });
+  });
+
   it.each([
     ['402 out of credits', new EnigmaCreditsExhaustedError(), 'credits_exhausted'],
     ['401 bad key', new EnigmaAuthError(401), 'auth'],
@@ -214,6 +240,46 @@ describe('EnigmaService daily quota', () => {
     quota.checkQuota.mockRejectedValueOnce(new EnigmaQuotaExceededError(300));
     await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' })).rejects.toBeInstanceOf(EnigmaQuotaExceededError);
     expect(searchBrand).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks the credit budget before HTTP and records what Enigma billed', async () => {
+    const billing = {
+      id: 'b1',
+      names: { edges: [{ node: { name: 'Popup Bagels' } }] },                       // 2 credits
+      websites: { edges: [{ node: { website: 'https://popupbagels.com', domain: 'popupbagels', topLevelDomain: 'com' } }] }, // 2
+      cardTransactions: { edges: [
+        { node: { quantityType: 'card_revenue_amount', period: '12m', projectedQuantity: 401164, periodStartDate: '2025-07-01', periodEndDate: '2026-06-30', platformBrandId: null } },      // 10
+        { node: { quantityType: 'card_revenue_yoy_growth', period: '12m', projectedQuantity: 0.0739, periodStartDate: '2025-07-01', periodEndDate: '2026-06-30', platformBrandId: null } },   // 10
+        { node: { quantityType: 'card_revenue_yoy_growth', period: '12m', projectedQuantity: 0.2392, periodStartDate: '2025-07-01', periodEndDate: '2026-06-30', platformBrandId: 'p1' } },   // 10, billed though discarded
+      ] },
+    };
+    const searchBrand = jest.fn().mockResolvedValue([billing]);
+    const quota = {
+      checkQuota: jest.fn().mockResolvedValue(undefined),
+      recordUsage: jest.fn().mockResolvedValue(undefined),
+      checkCreditBudget: jest.fn().mockResolvedValue(undefined),
+      recordCredits: jest.fn().mockResolvedValue(undefined),
+    };
+    const svc = new EnigmaService({ http: { searchBrand }, store: store(), quota });
+
+    await svc.lookupBrandCardRevenue({ website: 'popupbagels.com' }, { userId: 'u1' });
+    expect(quota.recordCredits).toHaveBeenCalledWith(34);
+
+    quota.checkCreditBudget.mockRejectedValueOnce(new EnigmaBudgetExhaustedError(1800));
+    await expect(svc.lookupBrandCardRevenue({ website: 'other.com' }, { userId: 'u1' }))
+      .rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
+    expect(searchBrand).toHaveBeenCalledTimes(1);
+    expect(quota.checkQuota).toHaveBeenCalledTimes(1);   // budget is checked first
+  });
+
+  it('Dynamo tracker: this month at budget throws; last month\'s spend does not', async () => {
+    let item: any = { month: '2026-09', creditCount: 1800 };
+    const dynamodb: any = { get: () => ({ promise: async () => ({ Item: item }) }), update: jest.fn(), put: jest.fn() };
+    const tracker = buildEnigmaQuotaTracker(dynamodb, 150, () => new Date('2026-09-15T12:00:00Z'), 1800);
+
+    await expect(tracker.checkCreditBudget!()).rejects.toBeInstanceOf(EnigmaBudgetExhaustedError);
+    item = { month: '2026-08', creditCount: 5000 };
+    await expect(tracker.checkCreditBudget!()).resolves.toBeUndefined();
   });
 
   it('Dynamo tracker: at the limit today throws; yesterday\'s count does not', async () => {
@@ -331,6 +397,25 @@ describe('enrichment config — card revenue is never switched on implicitly', (
   });
 });
 
+// ENG-1388 AC2: a preview run buys real values from an inline client config,
+// so it must get the same sanitising a saved config gets.
+describe('stripImplicitCardRevenueRouting (preview path)', () => {
+  it('drops aliases onto card fields and card smart-dependencies, keeping exact names', () => {
+    const out = stripImplicitCardRevenueRouting({
+      fields: [
+        { name: 'Revenue', aliasFor: 'card_revenue_12m', include: true },
+        { name: 'is_big', smartDependencies: ['card_revenue_12m', 'employee_count'], include: true },
+        { name: 'card_revenue_12m', include: true },
+      ],
+    });
+
+    const byName = Object.fromEntries(out.fields.map((f: any) => [f.name, f]));
+    expect(byName.Revenue.aliasFor).toBeUndefined();
+    expect(byName.is_big.smartDependencies).toEqual(['employee_count']);
+    expect(byName.card_revenue_12m).toEqual({ name: 'card_revenue_12m', include: true });
+  });
+});
+
 // ─── No cross-customer copy (AC9) and no legacy web fill (AC7) ───────────────
 
 describe('card revenue outside the V3 Enigma tier', () => {
@@ -352,6 +437,12 @@ describe('card revenue outside the V3 Enigma tier', () => {
     const { fills } = copySiblingConfigFields(lead(), [sibling], configFields, mapping);
 
     expect(fills).toEqual([]);
+  });
+
+  it('no legacy V2 LLM unit can be handed a card field, even when a specialist resolved nothing', () => {
+    expect(llmEligibleFields(['card_revenue_12m', 'card_revenue_yoy_growth', 'industry'], {})).toEqual(['industry']);
+    expect(llmEligibleFields(['card_revenue_12m'], {})).toEqual([]);          // no `no_context` unit is built for it
+    expect(llmEligibleFields(['industry', 'funding_stage'], { industry: 'x' })).toEqual(['funding_stage']);   // existing behaviour kept
   });
 
   it('the legacy V2 web path drops card fields entirely', () => {

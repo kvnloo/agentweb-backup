@@ -145,6 +145,19 @@ export async function runEmmaEnrichment(
     `fields=${effectiveOutputFields.length} failed=${failedCount} durationMs=${result.durationMs}`,
   );
 
+  // ENG-1388 AC5: an Enigma run that stopped for credits, a bad key or the
+  // monthly budget must never reach the user as "no card revenue found".
+  const halt = result.enigma?.haltedBy;
+  if (halt) {
+    const why = halt === 'credits_exhausted' ? 'Enigma credits are exhausted'
+      : halt === 'auth' ? 'the Enigma API key was rejected'
+      : 'the monthly Enigma credit budget is spent';
+    warnings.push(
+      `Card revenue was NOT looked up for every lead in this run because ${why}. ` +
+      'Missing card revenue here means the lookup did not run, not that the company has none.',
+    );
+  }
+
   const summary: EmmaEnrichmentSummary = {
     runId: result.runId,
     mode: params.mode,

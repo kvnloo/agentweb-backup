@@ -25,6 +25,8 @@ import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
+import { isCardRevenueField } from '../services/enrichmentGroups';
+import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -1717,7 +1719,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       if (!req.body?.inlineConfig) {
         return res.status(400).json({ message: 'preview mode requires inlineConfig in request body' });
       }
-      config = req.body.inlineConfig;
+      // A preview run buys real Enigma values, so the client's inline config
+      // gets the same card-revenue sanitising a saved config gets (ENG-1388).
+      config = stripImplicitCardRevenueRouting(req.body.inlineConfig);
     } else {
       const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
       if (stored.isDefault) {
@@ -7617,6 +7621,15 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    // ENG-1388: card revenue comes from Enigma, never from the web/LLM path
+    // this endpoint runs. Refreshing one here would overwrite a measured value
+    // with a guess (and forceOverwrite is on), so refuse it outright.
+    if (isCardRevenueField(validatedField)) {
+      return res.status(400).json({
+        message: 'Card revenue is measured by Enigma and cannot be refreshed here. Re-run enrichment for this list to fetch it again.',
+      });
+    }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
     const service = new CrmEnrichmentService();

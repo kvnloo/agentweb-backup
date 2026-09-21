@@ -15,6 +15,11 @@ export const ENIGMA_MATCH_THRESHOLD = 0.8;
 
 // One brand, its first name, its websites (to confirm the match against our
 // domain) and the latest 12-month card revenue + YoY growth.
+//
+// Cost ceiling per call: Enigma bills every value returned, including rows we
+// discard. cardTransactions(first: 4) = 4 x 10 credits, name 2, websites
+// (first: 5) = 5 x 2, so 52 credits (~$0.52) at worst; ~19 typical (ENG-1933).
+// Raising any `first:` raises that ceiling and the monthly budget maths.
 export const SEARCH_BRAND_QUERY = `
 query SearchBrandCardRevenue($searchInput: SearchInput!, $cardTransactionConditions: ConnectionConditions!) {
   search(searchInput: $searchInput) {

@@ -38,6 +38,7 @@ import {
   type EnigmaHttpClient,
 } from '../services/enigmaService';
 import { buildEnigmaHttpClient } from '../services/enigmaServiceFactory';
+import { ENIGMA_CREDITS_PER_FILL } from '../services/enigmaService';
 import { getAllocatedRate } from '../utils/vendorRateCard';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -262,6 +263,14 @@ describe('buildEnigmaHttpClient', () => {
       json: async () => body,
     }) as any;
   }
+
+  // The budget counts credits; the ledger charges dollars. If these drift, one
+  // of them is silently wrong (1 credit = $0.01, rate card of 2026-08-10).
+  it('keeps the credit table and the rate card in step', () => {
+    for (const [key, credits] of Object.entries(ENIGMA_CREDITS_PER_FILL)) {
+      expect(credits * 0.01).toBeCloseTo(getAllocatedRate('enigma', key)!, 6);
+    }
+  });
 
   it('records each billed value against its rate key and sends the key header', async () => {
     respond(200, { data: { search: [brand()] } });

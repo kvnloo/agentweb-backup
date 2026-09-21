@@ -105,6 +105,14 @@ export class EnigmaRateLimitedError extends EnigmaApiError {
   }
 }
 
+/** Platform-wide monthly Enigma credit budget spent - raised before any HTTP call. */
+export class EnigmaBudgetExhaustedError extends Error {
+  constructor(readonly budgetCredits: number) {
+    super(`Enigma monthly credit budget spent (${budgetCredits} credits)`);
+    this.name = 'EnigmaBudgetExhaustedError';
+  }
+}
+
 /** Per-user daily Enigma lookup cap reached — raised before any HTTP call. */
 export class EnigmaQuotaExceededError extends Error {
   constructor(readonly limit: number) {
@@ -120,6 +128,14 @@ export interface EnigmaQuotaTracker {
   /** Throws EnigmaQuotaExceededError when the user is at the limit. */
   checkQuota(userId: string): Promise<void>;
   recordUsage(userId: string): Promise<void>;
+  /**
+   * Platform-wide monthly credit ceiling. The lookup caps count CALLS, but
+   * Enigma bills per value returned: ENG-1933 measured ~19 credits per call
+   * (52 worst case) against a 2,100-credit monthly plan, so a call cap alone
+   * cannot bound spend. Throws EnigmaBudgetExhaustedError once it is spent.
+   */
+  checkCreditBudget?(): Promise<void>;
+  recordCredits?(credits: number): Promise<void>;
 }
 
 export interface EnigmaSearchRequest {
@@ -227,6 +243,12 @@ function isBlockedHost(host: string): boolean {
   return SITE_BUILDER_HOSTS.some((base) => host.endsWith(`.${base}`));
 }
 
+/** True when a lead's website can never be looked up (profile page, site-builder subdomain, our own host). */
+export function isEnigmaBlockedWebsite(website: string | null | undefined): boolean {
+  const host = normalizeEnigmaHost(website);
+  return !host || isBlockedHost(host);
+}
+
 /** Registrable domains a Brand's websites resolve to (e.g. "acme.com"). */
 function brandWebsiteRoots(brand: any): string[] {
   const roots: string[] = [];
@@ -280,6 +302,25 @@ function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
 }
 
 export type EnigmaBilledFillKey = 'card_revenue_12m' | 'card_revenue_yoy_growth_12m' | 'brand_attribute';
+
+/**
+ * Enigma credits per billed value (rate card effective 2026-08-10; 1 credit =
+ * $0.01), in the units Enigma sells its plan in so the budget can be compared
+ * with the plan directly. `vendorRateCard.ts` holds the dollar prices; a test
+ * pins the two together.
+ */
+export const ENIGMA_CREDITS_PER_FILL: Record<EnigmaBilledFillKey, number> = {
+  card_revenue_12m: 10,
+  card_revenue_yoy_growth_12m: 10,
+  brand_attribute: 2,
+};
+
+/** Credits Enigma billed for one response. */
+export function countEnigmaBilledCredits(brands: any[] | null | undefined): number {
+  const fills = countEnigmaBilledFills(brands);
+  return (Object.keys(fills) as EnigmaBilledFillKey[])
+    .reduce((total, key) => total + fills[key] * ENIGMA_CREDITS_PER_FILL[key], 0);
+}
 
 /**
  * Values Enigma bills for in a search response. Enigma charges per value
@@ -376,6 +417,7 @@ export class EnigmaService {
     }
 
     const { quota } = this.deps;
+    if (quota?.checkCreditBudget) await quota.checkCreditBudget();
     if (quota && opts.userId) await quota.checkQuota(opts.userId);
 
     const name = input.companyName?.trim();
@@ -383,6 +425,12 @@ export class EnigmaService {
     if (quota && opts.userId) {
       await quota.recordUsage(opts.userId).catch((err) =>
         console.warn(`[enigma] quota record failed: ${(err as Error).message}`));
+    }
+    // Credits come from what Enigma actually returned - the same values the
+    // ledger meters - so the budget and the spend ledger cannot drift.
+    if (quota?.recordCredits) {
+      await quota.recordCredits(countEnigmaBilledCredits(brands)).catch((err) =>
+        console.warn(`[enigma] credit record failed: ${(err as Error).message}`));
     }
     const result = evaluateSearch(brands, host);
 
