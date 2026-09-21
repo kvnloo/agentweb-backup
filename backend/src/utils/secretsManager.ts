@@ -1159,15 +1159,47 @@ export interface WhatsAppCredentials {
 }
 
 /**
- * Get WhatsApp Cloud API credentials from AWS Secrets Manager (ENG-273).
+ * Get WhatsApp Cloud API credentials (ENG-273).
  *
- * Secret location: dev/AgentWeb/WhatsApp (or prod/... for production).
+ * Env vars first, matching getGitHubOrgToken and Slack's SLACK_BOT_TOKEN: a test env
+ * can be pointed at Meta's sandbox number by setting five variables, without needing
+ * write access to Secrets Manager for a throwaway value. Otherwise the secret at
+ * dev/AgentWeb/WhatsApp (or prod/... for production).
+ *
+ * The env set is used ONLY when complete. A partial set falls through to Secrets
+ * Manager rather than being merged with it — mixing sources could pair one
+ * environment's access token with another's phoneNumberId and send from the wrong number.
  *
  * Throws rather than returning a partial object: a missing appSecret would silently
  * disable inbound webhook signature verification, and a missing phoneNumberId would
  * send to the wrong number. Both fail closed.
  */
+const WHATSAPP_ENV_VARS = {
+  phoneNumberId: 'WHATSAPP_PHONE_NUMBER_ID',
+  wabaId: 'WHATSAPP_WABA_ID',
+  accessToken: 'WHATSAPP_ACCESS_TOKEN',
+  appSecret: 'WHATSAPP_APP_SECRET',
+  webhookVerifyToken: 'WHATSAPP_WEBHOOK_VERIFY_TOKEN',
+} as const satisfies Record<keyof WhatsAppCredentials, string>;
+
 export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
+  const fromEnv = {} as WhatsAppCredentials;
+  const missingEnv: string[] = [];
+  for (const [field, envName] of Object.entries(WHATSAPP_ENV_VARS)) {
+    const value = process.env[envName]?.trim();
+    if (value) fromEnv[field as keyof WhatsAppCredentials] = value;
+    else missingEnv.push(envName);
+  }
+  if (missingEnv.length === 0) return fromEnv;
+  if (missingEnv.length < Object.keys(WHATSAPP_ENV_VARS).length) {
+    // Some but not all set: almost certainly a forgotten variable, not an intent to
+    // use Secrets Manager. Say so instead of silently ignoring the ones that ARE set.
+    console.warn(
+      `[whatsapp] ignoring partial WHATSAPP_* env config (missing: ${missingEnv.join(', ')}); ` +
+        'falling back to Secrets Manager.',
+    );
+  }
+
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
@@ -1191,6 +1223,8 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
     return credentials;
   } catch (error) {
     console.error('Error fetching WhatsApp credentials from Secrets Manager:', error);
-    throw new Error('Failed to fetch WhatsApp credentials from Secrets Manager');
+    throw new Error(
+      'Failed to fetch WhatsApp credentials. Set all of the WHATSAPP_* env vars or store them in Secrets Manager.',
+    );
   }
 }
