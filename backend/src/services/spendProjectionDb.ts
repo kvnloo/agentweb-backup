@@ -21,6 +21,7 @@
  */
 import AWS from "aws-sdk";
 import { MonthlyProjection } from "./spendProjection";
+import { SpendEvent } from "./spendEventDb";
 
 export const SPEND_PROJECTION_TABLE = `${process.env.NODE_ENV === "development" ? "Dev-" : ""}AW-SpendProjection`;
 
@@ -88,6 +89,97 @@ export async function getProjection(billingUserId: string, billingMonth: string)
     .get({ TableName: SPEND_PROJECTION_TABLE, Key: { billingUserId, billingMonth } })
     .promise();
   return (result.Item as PersistedProjection) ?? null;
+}
+
+// ── Event-driven writer (ENG-1250 §3b, the missing production writer) ─────────
+//
+// §3b shipped this table plus `putProjection`, but nothing called it in
+// production, so `AW-SpendProjection` stayed empty and the §9.6 enforcement
+// switch (`spendEnforcementBasis`) had nothing to read. This is the writer that
+// keeps `settledMicroUsd` current, hooked at the single `usageRecordDb`
+// transaction seam every settled spend event already funnels through.
+//
+// ## Why an atomic ADD, never `putProjection`, on the hot path
+//
+// `putProjection` is an unconditional WHOLE-ITEM put. Calling it per event would
+// overwrite `reservedMicroUsd` / `availableMicroUsd` — the fields §4 admission
+// maintains under its own atomic conditions — and a reservation taken between
+// this read and write would vanish. An `ADD` on `settledMicroUsd` alone touches
+// no sibling attribute, creates the row on first touch, and can never clobber a
+// reservation. It is the same additive, condition-free shape §4's settle uses.
+//
+// ## The deliberate boundary: this path owns ONLY settled spend
+//
+// A row created here by first-touch has no allowance baseline, so this path must
+// NOT decrement `availableMicroUsd` (it would start negative and read as
+// over-cap). Seeding allowance + `availableMicroUsd` belongs to the backfill /
+// materializer (`putProjection`), and reservations belong to §4. For the §9.6
+// flip that is sufficient: `spendEnforcementBasis` reads only `settledMicroUsd`.
+// `computedAt` is restamped so the enforcement staleness guard sees a fresh row.
+
+export const SPEND_PROJECTION_WRITER_ENV = "SPEND_PROJECTION_WRITER";
+
+/**
+ * Kill switch, default ON (like the dual-write shims this rides alongside). Set
+ * SPEND_PROJECTION_WRITER=false to stop maintaining the projection without a
+ * deploy; the table simply stops advancing and enforcement, if flipped, falls
+ * open on staleness.
+ */
+export function isProjectionWriterEnabled(): boolean {
+  return process.env[SPEND_PROJECTION_WRITER_ENV] !== "false";
+}
+
+/**
+ * Fold a batch of just-committed spend events into the persisted projection.
+ *
+ * Never throws: this is observe-only maintenance invoked from the charging
+ * transaction's success path, and a projection write failing must never break
+ * the metering it mirrors (identical stance to `spendLedgerDualWrite`).
+ *
+ * Only `settled` events move `settledMicroUsd`; reserved/voided are ignored here
+ * (reservations are §4's, voided cost nothing). Events are grouped by subject +
+ * month so one batch that spans a midnight boundary still lands in the right
+ * months.
+ */
+export async function applySettledSpendEvents(
+  events: readonly SpendEvent[],
+  now: string = new Date().toISOString(),
+): Promise<void> {
+  try {
+    if (!isProjectionWriterEnabled()) return;
+
+    const groups = new Map<string, { billingUserId: string; billingMonth: string; micro: number; count: number }>();
+    for (const e of events) {
+      if (e.lifecycle !== "settled") continue;
+      if (!e.billingUserId || !MONTH.test(e.billingMonth)) continue;
+      const key = `${e.billingUserId}\u0000${e.billingMonth}`;
+      const g = groups.get(key) ?? { billingUserId: e.billingUserId, billingMonth: e.billingMonth, micro: 0, count: 0 };
+      g.micro += e.costMicroUsd;
+      g.count += 1;
+      groups.set(key, g);
+    }
+    if (groups.size === 0) return;
+
+    await Promise.all(
+      [...groups.values()].map((g) =>
+        db()
+          .update({
+            TableName: SPEND_PROJECTION_TABLE,
+            Key: { billingUserId: g.billingUserId, billingMonth: g.billingMonth },
+            // SET stamps freshness; ADD both creates the row on first touch and
+            // never overwrites reserved/available/allowance siblings.
+            UpdateExpression: "SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c",
+            ExpressionAttributeValues: { ":now": now, ":m": g.micro, ":c": g.count },
+          })
+          .promise(),
+      ),
+    );
+  } catch (err) {
+    console.error(
+      "[spendProjectionWriter] settled-spend projection maintenance failed (observe-only, swallowed):",
+      err,
+    );
+  }
 }
 
 export interface PersistedProjectionReconciliation {

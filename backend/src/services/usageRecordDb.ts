@@ -17,6 +17,7 @@
 import AWS from "aws-sdk";
 import { LLM_CHARGE_EVENTS_TABLE, LlmChargeAuditEvent } from "./llmChargeAuditDb";
 import { SPEND_EVENTS_TABLE, SpendEvent, validateSpendEvent } from "./spendEventDb";
+import { applySettledSpendEvents } from "./spendProjectionDb";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-UsageRecords`;
@@ -395,6 +396,11 @@ export const usageRecordDb = {
       await getDocumentClient()
         .transactWrite({ TransactItems: transactItems })
         .promise();
+      // ENG-1250 §3b: fold the just-committed settled events into the persisted
+      // projection. Fire-and-forget and never-throws — observe-only maintenance
+      // must not fail the charging transaction it rides behind. Only on a
+      // genuinely new write ("applied"); a duplicate replay must not double-add.
+      void applySettledSpendEvents(spendEvents);
       return "applied";
     } catch (error: any) {
       // Same classification as db.ts's applyMonthlyChargeAtomic: a
@@ -467,6 +473,10 @@ export const usageRecordDb = {
       await getDocumentClient()
         .transactWrite({ TransactItems: [ledgerItem, spendItem] })
         .promise();
+      // ENG-1250 §3b: fold this just-committed settled event into the persisted
+      // projection (fire-and-forget, never-throws). "applied" only, so a
+      // deduped replay never double-adds.
+      void applySettledSpendEvents([spendEvent]);
       return "applied";
     } catch (error: any) {
       // Same classification as incrementUsageWithChargeEvent: a transaction
