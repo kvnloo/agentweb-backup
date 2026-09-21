@@ -33684,7 +33684,7 @@ ${strippedHtml}`;
           ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false,
+        autocomplete: session.sessionType === 'scheduled' ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         // ENG-1472: which predefined template this session's plan was launched
