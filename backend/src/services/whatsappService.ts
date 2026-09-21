@@ -30,7 +30,7 @@
  */
 
 import { parsePhoneNumberWithError, isValidPhoneNumber, type CountryCode } from 'libphonenumber-js';
-import { MessagingChannelError } from './messagingChannelService';
+import { MessagingChannelError, formatForChannel } from './messagingChannelService';
 import { settingsService } from './settingsService';
 import { getWhatsAppCredentials } from '../utils/secretsManager';
 
@@ -274,6 +274,39 @@ async function assertSendable(destination: string): Promise<string> {
   return phone;
 }
 
+/** Meta's ceiling for one body parameter. */
+const TEMPLATE_PARAM_MAX = 1024;
+/**
+ * Stand-in for a value that is empty once cleaned. Callers pass '' for an absent
+ * optional value (e.g. no URL) precisely so the positional count stays right — but
+ * Meta rejects an empty body parameter outright.
+ */
+const EMPTY_PARAM_PLACEHOLDER = '-';
+
+/**
+ * Make one value safe to bind into a template body parameter.
+ *
+ * Meta rejects, with a 400 that reads nothing like the cause: an empty parameter, a
+ * newline or tab inside one, and a run of 4+ consecutive spaces (error 132018). The
+ * values come from user-authored text — public post titles, lead names — so this is
+ * enforced here, once, for every caller rather than left to each call site to remember.
+ *
+ * Also strips zero-width and bidi-override characters, which the free-form path
+ * already strips via formatForChannel, so a template body is no easier to spoof.
+ */
+export function toTemplateParam(value: string): string {
+  const cleaned = formatForChannel(value ?? '', 'whatsapp')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+  if (!cleaned) return EMPTY_PARAM_PLACEHOLDER;
+  // Spread by code point so truncation cannot split a surrogate pair (emoji).
+  const points = [...cleaned];
+  return points.length > TEMPLATE_PARAM_MAX
+    ? `${points.slice(0, TEMPLATE_PARAM_MAX - 1).join('')}…`
+    : cleaned;
+}
+
 /** Send a pre-approved template. Legal inside and outside the service window. */
 export async function sendTemplate(
   destination: string,
@@ -299,7 +332,10 @@ export async function sendTemplate(
       name: template.name,
       language: { code: template.language },
       components: [
-        { type: 'body', parameters: variables.map((text) => ({ type: 'text', text })) },
+        {
+          type: 'body',
+          parameters: variables.map((text) => ({ type: 'text', text: toTemplateParam(text) })),
+        },
       ],
     },
   });
