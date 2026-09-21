@@ -7,6 +7,13 @@
  * requires recorded opt-in from that person before the first outbound message. An
  * admin cannot consent on a customer's behalf.
  *
+ * There is no "save this number" endpoint, on purpose. A number the user merely typed
+ * proves nothing: it may be a typo, or a stranger's, and AgentWeb messages from one
+ * shared business number whose quality rating a single unwanted message can damage.
+ * Instead the user starts a verification, messages a one-time code to AgentWeb's
+ * WhatsApp number, and the webhook binds the SENDER's number to them
+ * (whatsappVerificationService). Only that path writes a WhatsApp entry.
+ *
  * Writes go through userDb.updateUser on the additive `messagingChannels` field. The
  * legacy slack* fields are never touched here — they stay authoritative for Slack and
  * are folded in at read time by messagingChannelService.normalizeUserChannels.
@@ -15,25 +22,11 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
-import { normalizeUserChannels } from '../services/messagingChannelService';
-import { toE164, isOptedOut } from '../services/whatsappService';
+import { explicitChannels, normalizeUserChannels } from '../services/messagingChannelService';
+import { getDisplayPhoneNumber, isOptedOut } from '../services/whatsappService';
+import { getVerificationStatus, startVerification } from '../services/whatsappVerificationService';
 
 const router = express.Router();
-
-/**
- * The channels a user has EXPLICITLY configured, with nothing inferred.
- *
- * The read path (GET, and every notification sender) uses normalizeUserChannels,
- * which folds the legacy slackChannel / slackChannels fields in so Slack-only users
- * resolve correctly. The WRITE path must not: persisting a normalized list would copy
- * the user's current Slack destination into an explicit entry, and an explicit entry
- * outranks the legacy field — freezing their Slack routing at whatever it happened to
- * be the day they configured WhatsApp.
- */
-const explicitChannels = (user: any): any[] =>
-  (Array.isArray(user?.messagingChannels) ? user.messagingChannels : []).filter(
-    (c: any) => c && typeof c.channel === 'string' && typeof c.destination === 'string' && c.destination,
-  );
 
 /** GET / — the caller's configured channels, including legacy Slack, normalized. */
 router.get('/', authenticateToken, async (req: any, res: any) => {
@@ -48,7 +41,9 @@ router.get('/', authenticateToken, async (req: any, res: any) => {
     const enriched = await Promise.all(
       channels.map(async (c) => ({
         ...c,
-        ...(c.channel === 'whatsapp' ? { optedOut: await isOptedOut(c.destination) } : {}),
+        ...(c.channel === 'whatsapp'
+          ? { optedOut: await isOptedOut(c.destination), verified: !!c.optIn?.verifiedAt }
+          : {}),
       })),
     );
     res.json({ success: true, channels: enriched });
@@ -59,59 +54,63 @@ router.get('/', authenticateToken, async (req: any, res: any) => {
 });
 
 /**
- * PUT /whatsapp — set (or replace) the caller's WhatsApp destination.
+ * POST /whatsapp/verification — begin connecting a WhatsApp number.
  *
- * Requires an explicit opt-in acknowledgement in the same request. Meta requires
- * recorded consent before the first outbound message, and accepting a phone number
- * without it would create a destination we are not allowed to message.
+ * Requires the explicit opt-in acknowledgement in the same request: Meta requires
+ * recorded consent before the first outbound message, and the portal copy must name
+ * AgentWeb and say what will be sent. The acknowledgement time is kept and becomes the
+ * saved entry's `optIn.at`; the verification message itself is the proof of control.
+ *
+ * Returns the code and a wa.me link that opens WhatsApp with "Verify <CODE>" already
+ * typed. The code is a short-lived credential, so the response must never be cached.
  */
-router.put('/whatsapp', authenticateToken, async (req: any, res: any) => {
+router.post('/whatsapp/verification', authenticateToken, async (req: any, res: any) => {
   try {
-    const { phone, optIn, source } = req.body ?? {};
-
-    if (optIn !== true) {
+    if (req.body?.optIn !== true) {
       return res.status(400).json({
         error:
           'Explicit opt-in is required before WhatsApp messages can be sent to this number.',
       });
     }
 
-    const e164 = typeof phone === 'string' ? toE164(phone) : null;
-    if (!e164) {
-      return res.status(400).json({
-        error:
-          'Enter a valid phone number including its country code (for example +1 415 555 0123).',
-      });
+    // Resolve the business number BEFORE issuing a code, so a failure here does not
+    // leave a live code the user has no way to use.
+    let displayDigits: string;
+    try {
+      displayDigits = await getDisplayPhoneNumber();
+    } catch (error: any) {
+      console.error('[messaging-channels] display number unavailable:', error?.message ?? error);
+      return res.status(503).json({ error: 'WhatsApp is not available right now. Try again shortly.' });
     }
 
-    const user = await userDb.getUserById(req.user.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // Persist only EXPLICITLY-configured channels — deliberately not
-    // normalizeUserChannels(), which materializes the legacy slackChannel /
-    // slackChannels fields into explicit entries. Writing those back would freeze the
-    // user's current Slack destination: an explicit entry outranks the legacy field,
-    // so a later admin re-mapping of their Slack channel would be silently ignored and
-    // notifications would keep going to the old channel. Legacy stays legacy.
-    const others = explicitChannels(user).filter((c) => c.channel !== 'whatsapp');
-    const messagingChannels = [
-      ...others,
-      {
-        channel: 'whatsapp' as const,
-        destination: e164,
-        enabled: true,
-        optIn: {
-          at: new Date().toISOString(),
-          source: typeof source === 'string' && source ? source : 'settings_ui',
-        },
-      },
-    ];
-
-    await userDb.updateUser(req.user.userId, { messagingChannels } as any);
-    res.json({ success: true, channels: messagingChannels });
+    const { code, expiresAt } = await startVerification(req.user.userId, new Date().toISOString());
+    const message = `Verify ${code}`;
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      code,
+      expiresAt,
+      message,
+      displayNumber: `+${displayDigits}`,
+      link: `https://wa.me/${displayDigits}?text=${encodeURIComponent(message)}`,
+    });
   } catch (error: any) {
-    console.error('[messaging-channels] whatsapp save failed:', error);
-    res.status(500).json({ error: 'Failed to save WhatsApp number' });
+    console.error('[messaging-channels] whatsapp verification start failed:', error);
+    res.status(500).json({ error: 'Failed to start WhatsApp verification' });
+  }
+});
+
+/**
+ * GET /whatsapp/verification — where the caller's verification stands. Polled by the
+ * portal while the user is in WhatsApp sending the code.
+ */
+router.get('/whatsapp/verification', authenticateToken, async (req: any, res: any) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, ...(await getVerificationStatus(req.user.userId)) });
+  } catch (error: any) {
+    console.error('[messaging-channels] whatsapp verification status failed:', error);
+    res.status(500).json({ error: 'Failed to load WhatsApp verification status' });
   }
 });
 
@@ -128,7 +127,7 @@ router.delete('/whatsapp', authenticateToken, async (req: any, res: any) => {
     const user = await userDb.getUserById(req.user.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Explicit entries only — see the note in PUT. Removing WhatsApp must not have
+    // Explicit entries only — see explicitChannels. Removing WhatsApp must not have
     // the side effect of pinning the user's Slack destination.
     const messagingChannels = explicitChannels(user).filter((c) => c.channel !== 'whatsapp');
     await userDb.updateUser(req.user.userId, { messagingChannels } as any);

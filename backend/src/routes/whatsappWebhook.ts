@@ -25,6 +25,7 @@ import express from 'express';
 import crypto from 'crypto';
 import { getWhatsAppCredentials } from '../utils/secretsManager';
 import { recordInboundMessage, recordOptOut, recordOptIn } from '../services/whatsappService';
+import { handleVerificationMessage } from '../services/whatsappVerificationService';
 
 const router = express.Router();
 
@@ -148,6 +149,11 @@ async function handleInboundMessage(message: any): Promise<void> {
   } else if (START_KEYWORDS.has(normalized)) {
     await recordOptIn(phone, 'unstop_keyword');
     console.log(`[whatsapp-webhook] opt-in recorded for ${phone}`);
+  } else {
+    // "Verify <CODE>" binds this sender's number to the portal user who holds the code.
+    // A fixed command only — anything that is not exactly that shape is ignored, so this
+    // stays a notification channel and never becomes a conversation.
+    await handleVerificationMessage(text, phone);
   }
 }
 
