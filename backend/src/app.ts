@@ -119,6 +119,7 @@ import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
+import designSystemBuildRoutes from "./routes/designSystemBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
 import outreachOnboardingRoutes from "./routes/outreachOnboarding";
@@ -496,6 +497,7 @@ try {
   console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
+app.use("/api/onboarding", designSystemBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);
 app.use("/api/onboarding", outreachOnboardingRoutes);
