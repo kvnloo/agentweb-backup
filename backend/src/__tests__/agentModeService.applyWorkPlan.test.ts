@@ -111,6 +111,35 @@ describe('AgentModeService - predefined work plan templates', () => {
       );
     });
 
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the template requests false', async () => {
+      const interactiveTemplate = { ...systemTemplate, planId: 'plan-interactive', title: 'Interactive Plan', autocomplete: false };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [interactiveTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, sessionType: 'scheduled', messages: [] });
+
+      await service.applyPredefinedWorkPlan('Interactive Plan', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('leaves autocomplete as the template requests on a non-scheduled session (zero regression)', async () => {
+      const interactiveTemplate = { ...systemTemplate, planId: 'plan-interactive', title: 'Interactive Plan', autocomplete: false };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [interactiveTemplate] : []
+      );
+
+      await service.applyPredefinedWorkPlan('Interactive Plan', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ autocomplete: false })
+      );
+    });
+
     it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [templateWithInputRequest] : []
