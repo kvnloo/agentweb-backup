@@ -25116,6 +25116,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let blogData: { title: string; description: string; content: string; imagePrompt: string };
       let finalContent: string;
       let inlineImagesCount = 0;
+      // ENG-738: true when the article below was built from partial research
+      // (the deep-dive timed out partway through) rather than a completed run.
+      let deepResearchPartial = false;
 
       if (deepResearch) {
         // ========================================
@@ -25135,16 +25138,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           userId
         });
 
-        if (!researchResult.success || !researchResult.markdownContent) {
-          throw new Error(researchResult.error || 'Deep research failed');
+        // ENG-738: a timeout that still gathered real partial findings must not
+        // be thrown away — continue the article from what was actually
+        // gathered (flagged below) instead of failing a request that would
+        // otherwise have gotten nothing at all.
+        let researchContent = researchResult.markdownContent;
+        if (!researchResult.success || !researchContent) {
+          if (researchResult.partial && researchResult.partialContent) {
+            console.warn('AgentMode: Deep research for blog article timed out; continuing with partial content:', researchResult.error);
+            researchContent = researchResult.partialContent;
+            deepResearchPartial = true;
+          } else {
+            throw new Error(researchResult.error || 'Deep research failed');
+          }
         }
 
-        console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
+        console.log('AgentMode: Deep research complete. Length:', researchContent.length);
         console.log('AgentMode: Restyling research content with style:', style);
 
         // Restyle with inline image placeholders
         blogData = await restyleContent(
-          researchResult.markdownContent,
+          researchContent,
           titleDraft,
           'professional',
           style,
@@ -25243,7 +25257,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return {
         success: true,
-        message: this.getBlogSuccessMessage(deepResearch, inlineImagesCount),
+        message: this.getBlogSuccessMessage(deepResearch, inlineImagesCount, deepResearchPartial),
         data: {
           title: blogData.title,
           description: blogData.description,
@@ -25251,6 +25265,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           imageUrl: heroImageUrl,
           htmlUrl: htmlUrl,
           deepResearchUsed: deepResearch,
+          deepResearchPartial: deepResearchPartial,
           inlineImagesCount: inlineImagesCount,
           wordCount: wordCount
         }
@@ -25269,13 +25284,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   /**
    * Get success message based on options used
    */
-  private getBlogSuccessMessage(deepResearch: boolean, inlineCount: number): string {
+  private getBlogSuccessMessage(deepResearch: boolean, inlineCount: number, deepResearchPartial: boolean = false): string {
     const parts = ['Blog article created successfully'];
     if (deepResearch) parts.push('with deep research');
     if (inlineCount > 0) {
       parts.push(`and ${inlineCount} inline images`);
     }
-    return parts.join(' ');
+    let message = parts.join(' ');
+    // ENG-738: the article is real, but say plainly that the underlying
+    // research didn't finish — silently shipping this as equivalent to a
+    // completed deep-dive would misrepresent how thorough it actually is.
+    if (deepResearchPartial) {
+      message += '. Note: the deep research timed out partway through, so this article is based on partial findings — review it for completeness before publishing.';
+    }
+    return message;
   }
 
   /**
