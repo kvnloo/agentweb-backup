@@ -59,6 +59,15 @@ jest.mock("@projectwallace/css-analyzer", () => ({ analyze: jest.fn() }));
 
 import { fetchFreshHtmlFromValidatedUrl } from "../services/cssExtractor";
 
+// This test's fixture server deliberately binds to loopback (127.0.0.1),
+// which the real ssrfGuard rightly blocks in production. Inject a resolver
+// that pins straight to it, same as any other loopback test fixture would —
+// this does not touch or weaken the real guard used by every other caller.
+async function resolvePinnedLoopback(url: string) {
+  const u = new URL(url);
+  return { hostname: u.hostname, address: "127.0.0.1", family: 4 };
+}
+
 function page(version: string, color: string): string {
   return `<!DOCTYPE html>
 <html>
@@ -101,7 +110,7 @@ describe("cssExtractor — fresh changing-fixture scrape (AC#3)", () => {
   it("scrapes the CURRENT content on every call — a changed fixture yields the new version, not a stale copy", async () => {
     // First scrape sees V1.
     currentHtml = page("V1", "#112233");
-    const first = await fetchFreshHtmlFromValidatedUrl(baseUrl);
+    const first = await fetchFreshHtmlFromValidatedUrl(baseUrl, resolvePinnedLoopback);
     expect(first).toContain("marker-V1");
     expect(first).toContain("#112233");
     expect(first).not.toContain("marker-V2");
@@ -110,7 +119,7 @@ describe("cssExtractor — fresh changing-fixture scrape (AC#3)", () => {
     currentHtml = page("V2", "#ff8800");
 
     // Second scrape must reflect V2 — proving no stale-cache reuse.
-    const second = await fetchFreshHtmlFromValidatedUrl(baseUrl);
+    const second = await fetchFreshHtmlFromValidatedUrl(baseUrl, resolvePinnedLoopback);
     expect(second).toContain("marker-V2");
     expect(second).toContain("#ff8800");
     expect(second).not.toContain("marker-V1");
@@ -119,7 +128,7 @@ describe("cssExtractor — fresh changing-fixture scrape (AC#3)", () => {
   it("opts every scrape request out of intermediary caches (no-cache headers on the wire)", async () => {
     requestHeaders.length = 0;
     currentHtml = page("V3", "#00aa55");
-    await fetchFreshHtmlFromValidatedUrl(baseUrl);
+    await fetchFreshHtmlFromValidatedUrl(baseUrl, resolvePinnedLoopback);
 
     const scrapeReq = requestHeaders.find(
       (h) => h["cache-control"] !== undefined

@@ -33,6 +33,7 @@ Every piece of content you create — LinkedIn posts, blog articles, ad copy, em
 
 Before generating any content:
 - Draw on the client's brand voice, ICP, tone of voice, and any knowledge base materials
+- **For visual/design-sensitive work** (images, landing pages, ad creative, newsletters): call **list_knowledge_base_files** to check for a "Website Design System" knowledge base task, then **read_knowledge_base_files** its design.md file — it holds real computed hex colors, fonts, logo/favicon URLs, and layout notes scraped directly from the client's live site during onboarding, more precise than brand guidelines' hand-picked palette. Ground exact colors/fonts in it when present; fall back to brand guidelines if it's missing or the account predates this step.
 - Make it specific to their business — no generic filler, no templated boilerplate
 - Write for their audience, not for the average reader
 
