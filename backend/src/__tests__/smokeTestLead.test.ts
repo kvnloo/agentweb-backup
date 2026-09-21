@@ -34,13 +34,21 @@ describe("smokeTestLead", () => {
     // marker cannot match and every suppression would otherwise fire on a synthetic lead.
     expect(isSmokeTestPhone("4155550142")).toBe(true);
     expect(isSmokeTestPhone("(415) 555-0142")).toBe(true);
-    expect(isSmokeTestPhone("+1 415-555-0100")).toBe(false); // country code is not stripped to our shape
+    // E.164 is what a libphonenumber-style phone component emits, and nothing in the
+    // platform normalises what a lander posts. Rejecting it defeated suppression, the
+    // per-run cleanup AND the stranded-lead sweep at once. Country code 1 IS the NANP, so
+    // 1 + 4155550142 can only be the reserved fictional number.
+    expect(isSmokeTestPhone("+1 415-555-0100")).toBe(true);
+    expect(isSmokeTestPhone("+14155550142")).toBe(true);
+    expect(isSmokeTestPhone("1-415-555-0142")).toBe(true);
     expect(isSmokeTestPhone("4155550199")).toBe(true);
   });
 
   it("FAIL: a real phone number is never recognised, including nearby non-reserved ones", () => {
     expect(isSmokeTestPhone("4155551234")).toBe(false); // same exchange, outside the 01xx block
     expect(isSmokeTestPhone("2025550142")).toBe(false); // reserved block, different area code
+    expect(isSmokeTestPhone("+1 415-555-1234")).toBe(false); // country code stripped, still not reserved
+    expect(isSmokeTestPhone("+44 20 7946 0142")).toBe(false); // non-NANP keeps all its digits
     expect(isSmokeTestPhone("4155550200")).toBe(false); // one past the reserved block
     expect(isSmokeTestPhone(undefined)).toBe(false);
     expect(isSmokeTestPhone(null)).toBe(false);
@@ -64,5 +72,13 @@ describe("smokeTestLead", () => {
     expect(isSmokeTestLead({ email: "buyer@acme.com" })).toBe(false);
     expect(isSmokeTestLead(null)).toBe(false);
     expect(isSmokeTestLead(undefined)).toBe(false);
+  });
+
+  it("never throws on a non-string email or phone from a raw DynamoDB row", () => {
+    // These helpers are called with `any` from DynamoDB items and webhooks' untyped body.
+    // A throw inside the sweep is swallowed, silently abandoning the rest of the page.
+    expect(() => isSmokeTestLead({ email: 12345 as any, phone: 4155550142 as any })).not.toThrow();
+    expect(isSmokeTestLead({ email: 12345 as any, phone: 4155550142 as any })).toBe(true);
+    expect(isSmokeTestLead({ email: 12345 as any })).toBe(false);
   });
 });

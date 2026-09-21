@@ -36,7 +36,26 @@ export function buildSmokeTestEmail(): string {
 
 export function isSmokeTestEmail(email: string | undefined | null): boolean {
   if (!email) return false;
-  return PATTERN.test(email.trim().toLowerCase());
+  // String(): these helpers are called with `any` from raw DynamoDB rows and from
+  // webhooks' untyped body, so a numeric email must not throw — the sweep swallows
+  // errors, and a throw there would silently abandon the rest of the page.
+  return PATTERN.test(String(email).trim().toLowerCase());
+}
+
+/**
+ * Digits of a phone, with a NANP country code removed.
+ *
+ * A lander using a libphonenumber-style phone component emits E.164 (`+14155550142`), and
+ * the platform stores whatever the lander posts — nothing normalises it. Comparing raw
+ * digits therefore failed for exactly those landers, which defeats suppression, the
+ * per-run cleanup AND the stranded-lead sweep at the same time.
+ *
+ * Widening is safe: country code 1 IS the NANP, so `1` + `4155550142` can only be the
+ * reserved fictional number. A non-NANP number keeps all its digits and still cannot match.
+ */
+export function phoneDigits(phone: unknown): string {
+  const digits = String(phone ?? "").replace(/\D/g, "");
+  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
 // 415-555-0100..0199 — the NANP's reserved fictional range inside a real area code. Valid
@@ -55,7 +74,7 @@ export function buildSmokeTestPhone(): string {
 
 export function isSmokeTestPhone(phone: string | undefined | null): boolean {
   if (!phone) return false;
-  return PHONE_PATTERN.test(String(phone).replace(/\D/g, ""));
+  return PHONE_PATTERN.test(phoneDigits(phone));
 }
 
 /**

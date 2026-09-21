@@ -34,6 +34,7 @@ type Discovered = {
   skippedRequired: number;
   noFormOnPage: boolean;
   authFormOnly: boolean;
+  iframeCount: number;
 };
 
 /** Cases default to discoverSmokeFields; `fn` selects another exported page-side function. */
@@ -225,6 +226,31 @@ const CASES: Record<string, string> = {
       <input type="number" name="budget" min="1000" step="500" required>
       <input type="number" name="qty" min="10" max="4" required>
     </form>`,
+  typelessAriaButton: `
+    <form>
+      <input type="email" name="email" required>
+      <button role="checkbox" id="terms" aria-required="true">Accept</button>
+      <button type="submit" id="go">Send</button>
+    </form>`,
+  switchBeforeConsent: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" role="switch" id="sms" aria-checked="false">SMS updates</button>
+      <input type="checkbox" id="consent" name="consent">
+    </form>`,
+  divAriaCheckbox: `
+    <form>
+      <input type="email" name="email" required>
+      <div role="checkbox" id="divbox" aria-required="true" aria-checked="false">Agree</div>
+    </form>`,
+  authOnlyWithSelect: `
+    <form id="login">
+      <input type="email" name="email" required>
+      <input type="password" name="pw" required>
+      <select id="realm"><option value="">-</option><option value="admin">admin</option></select>
+      <button type="submit" id="signin">Sign in</button>
+    </form>`,
+  iframeEmbed: `<div><h1>Get a quote</h1><iframe src="https://forms.example.com/x"></iframe></div>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -366,10 +392,10 @@ describe("discoverSmokeFields", () => {
 
   it("reports checkbox/radio requiredness so every required box gets checked", () => {
     expect(got("checkables").checkables).toEqual([
-      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true, viaLabel: false, checked: false },
-      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false, viaLabel: false, checked: false },
-      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false },
-      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false },
+      { selector: `${SCOPE}[id="terms"]`, type: "checkbox", name: "terms", required: true, viaLabel: false, checked: false, isAria: false },
+      { selector: `${SCOPE}[id="news"]`, type: "checkbox", name: "news", required: false, viaLabel: false, checked: false, isAria: false },
+      { selector: `${SCOPE}[id="plan-a"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false, isAria: false },
+      { selector: `${SCOPE}[id="plan-b"]`, type: "radio", name: "plan", required: true, viaLabel: false, checked: false, isAria: false },
     ]);
   });
 
@@ -609,6 +635,50 @@ describe("discoverSmokeFields", () => {
     );
     expect(byName.budget).toMatchObject({ min: "1000", step: "500" });
     expect(byName.qty).toMatchObject({ min: "10", max: "4" });
+  });
+
+  it("never treats a typeless <button role=checkbox> as a checkable, nor as the submit control", () => {
+    // HTMLButtonElement.type resolves to "submit" when the attribute is absent, so the same
+    // element satisfied both the ARIA-checkable match and the submit-control find. check()
+    // would then click it, submitting the form mid-fill — before the response listener is
+    // attached and before the submit timestamp is taken.
+    const r = got("typelessAriaButton");
+    expect(r.checkables).toEqual([]);
+    expect(r.submitSelector).toBe(`${SCOPE}[id="go"]`);
+    expect(r.skippedRequired).toBe(1);
+  });
+
+  it("the no-required fallback prefers a native checkbox over a role=switch", () => {
+    // Toggling an "SMS updates" switch while leaving the consent box unchecked is a false
+    // FAIL manufactured from a page that previously passed.
+    const boxes = got("switchBeforeConsent").checkables;
+    expect(boxes.map((c: any) => c.selector)).toEqual([
+      `${SCOPE}[id="sms"]`,
+      `${SCOPE}[id="consent"]`,
+    ]);
+    expect(boxes[0].isAria).toBe(true);
+    expect(boxes[1].isAria).toBe(false);
+  });
+
+  it("finds a <div role=checkbox>, which form.elements never lists", () => {
+    // HTMLFormControlsCollection contains only form-associated elements, so keying discovery
+    // on form.elements left a div-based ARIA checkbox invisible everywhere.
+    const boxes = got("divAriaCheckbox").checkables;
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0]).toMatchObject({ isAria: true, required: true, checked: false });
+  });
+
+  it("an auth-only page leaks no selects for the fill step to touch", () => {
+    // Selecting a realm and then clicking the login form's submit posts to a real auth endpoint.
+    const r = got("authOnlyWithSelect");
+    expect(r.authFormOnly).toBe(true);
+    expect(r.selects).toEqual([]);
+    expect(r.fields).toEqual([]);
+  });
+
+  it("counts iframes, so an embedded form is not reported as 'no lead form'", () => {
+    expect(got("iframeEmbed").iframeCount).toBe(1);
+    expect(got("iframeEmbed").noFormOnPage).toBe(true);
   });
 
   it("clears a stale marker so only one form is ever marked", () => {

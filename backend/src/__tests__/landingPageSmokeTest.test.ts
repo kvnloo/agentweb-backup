@@ -634,6 +634,100 @@ describe("runGenerationSmokeTest", () => {
     expect(deleted).not.toContain("real-lead-no-phone");
   });
 
+  it("SWEEP: leaves a RECENT row alone, so a run on another instance is not sabotaged", async () => {
+    // acquireSmokeTestSlot only serialises runs inside one process. Across two backend
+    // instances, this sweep would otherwise delete the other run's freshly created row out
+    // from under its poll — turning a passing page into a false FAIL.
+    const justNow = new Date(Date.now() - 5_000).toISOString();
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [{ leadId: "in-flight-elsewhere", email: "smoke-test+1789767265236@agentweb.pro", createdAt: justNow }],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockDeleteLead.mock.calls.map((c) => c[1])).not.toContain("in-flight-elsewhere");
+  });
+
+  it("SWEEP: a row with no createdAt is never deleted", async () => {
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [{ leadId: "no-timestamp", email: "smoke-test+1789767265236@agentweb.pro" }],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockDeleteLead.mock.calls.map((c) => c[1])).not.toContain("no-timestamp");
+  });
+
+  it("SWEEP: is bounded — never more than 20 deletes or 3 pages in one run", async () => {
+    // Unbounded housekeeping against a customer's CRM is not housekeeping.
+    const old = "2026-08-20T00:00:00.000Z";
+    mockGetLeadsByListId.mockResolvedValue({
+      items: Array.from({ length: 100 }, (_, i) => ({
+        leadId: `stranded-${i}`, email: `smoke-test+17872652${String(i).padStart(2, "0")}@agentweb.pro`, createdAt: old,
+      })),
+      lastEvaluatedKey: { k: 1 },
+      hasMore: true,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockDeleteLead.mock.calls.length).toBeLessThanOrEqual(20);
+    expect(mockGetLeadsByListId.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("SWEEP: stops after 3 pages even when the list keeps paginating", async () => {
+    // The delete cap alone does not bound this: a list whose pages hold few deletable rows
+    // would otherwise be walked indefinitely while holding the single smoke-test slot.
+    const old = "2026-08-20T00:00:00.000Z";
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [{ leadId: "one-per-page", email: "smoke-test+1787265258@agentweb.pro", createdAt: old }],
+      lastEvaluatedKey: { k: 1 },
+      hasMore: true,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadsByListId.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("CHECKABLES: with nothing required, a native checkbox is chosen over a role=switch", async () => {
+    // Toggling an "SMS updates" switch and leaving the consent box unchecked is a false FAIL
+    // manufactured from a page that previously passed.
+    mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      checkables: [
+        { selector: "#sms", type: "checkbox", name: "sms", required: false, viaLabel: false, checked: false, isAria: true },
+        { selector: "#consent", type: "checkbox", name: "consent", required: false, viaLabel: false, checked: false, isAria: false },
+      ],
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const checked = (mockPage.check as jest.Mock).mock.calls.map((c) => c[0]);
+    expect(checked).toContain("#consent");
+    expect(checked).not.toContain("#sms");
+  });
+
+  it("SWEEP: logs every deletion, since it removes rows from a customer's CRM", async () => {
+    const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+    mockGetLeadsByListId.mockResolvedValue({
+      items: [{ leadId: "stranded-audit", email: "smoke-test+1787265258@agentweb.pro", createdAt: "2026-08-20T00:00:00.000Z" }],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join(" | ");
+    logSpy.mockRestore();
+    expect(logged).toContain("stranded-audit");
+  });
+
   it("SWEEP: never deletes a row created during this run", async () => {
     // beforeIso is the run's own start, so our freshly-created row is out of scope.
     mockGetLeadsByListId.mockResolvedValue({

@@ -21,7 +21,7 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead } from "../utils/smokeTestLead";
+import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead, phoneDigits } from "../utils/smokeTestLead";
 import { crmDb } from "./db";
 import { sendLandingPageSmokeTestAlert } from "./slackService";
 import { updateLandingPageSmokeTestResult, GeneratedLandingPage } from "./v0Service";
@@ -68,7 +68,10 @@ function releaseSmokeTestSlot(): void {
   if (next) next();
 }
 
+/* eslint-disable-next-line no-irregular-whitespace */
 /**
+ * (See pollForLeadByPhone below for the per-run cleanup this pairs with.)
+ *
  * Cleanup path for a lander that has NO email field.
  *
  * Such a page cannot carry our synthetic address, so the lander invents a placeholder —
@@ -85,6 +88,12 @@ function releaseSmokeTestSlot(): void {
 // Bounds on the start-of-run sweep: it runs on every deploy, so it must stay cheap.
 const SWEEP_MAX_PAGES = 3;
 const SWEEP_MAX_DELETES = 20;
+// acquireSmokeTestSlot is module-scoped, so it serialises runs within ONE process. Across
+// two backend instances, run B's start-of-run sweep would otherwise see run A's row (it
+// predates B's start and carries the marker) and delete it out from under A's poll —
+// turning a passing page into a false FAIL. Leave anything recent alone; a genuinely
+// stranded row is minutes old by the next deploy, never seconds.
+const SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
 /**
  * Delete synthetic leads that a PREVIOUS run stranded in this list.
  *
@@ -99,7 +108,10 @@ const SWEEP_MAX_DELETES = 20;
  * whatever the last deploy stranded, this one removes.
  *
  * Only rows provably ours are touched — isSmokeTestLead matches the smoke-test address OR
- * the reserved fictional phone. `beforeIso` is this run's start, so the row we are about to
+ * the reserved fictional phone. Note the limit of that second marker: it only reaches the
+ * row if the lander posted its phone field as the top-level `phone` key. A lander using
+ * `phoneNumber`/`tel`/`contact_phone` lands it in customFields, where neither suppression
+ * nor this sweep can see it — a false negative, never a false positive. `beforeIso` is this run's start, so the row we are about to
  * create is never in scope.
  */
 async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promise<number> {
@@ -113,17 +125,27 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
         // Only rows that predate this run — never the one we are about to create.
         const createdAt = String(lead?.createdAt || "");
         if (!createdAt || createdAt >= beforeIso) continue;
+        // Old enough that no in-flight run on another instance can still be polling for it.
+        const createdMs = Date.parse(createdAt);
+        if (!Number.isFinite(createdMs) || Date.now() - createdMs < SWEEP_MIN_AGE_MS) continue;
         if (!isSmokeTestLead(lead)) continue;
         if (!lead?.leadId) continue;
         await crmDb.deleteLead(listId, lead.leadId);
         deleted++;
+        // This deletes rows from a paying customer's CRM. Log every one: if the marker ever
+        // over-matches, an audit trail is the only way anyone finds out.
+        console.log(
+          `[smokeTest] swept stranded synthetic lead ${lead.leadId} from list ${listId} (created ${lead.createdAt})`
+        );
       }
       lastKey = result?.lastEvaluatedKey;
       if (!lastKey) break;
     }
-  } catch {
-    // best-effort housekeeping — never let it affect the run's verdict
+  } catch (err: any) {
+    // Never let housekeeping change the run's verdict — but do not swallow it silently.
+    console.warn(`[smokeTest] stranded-lead sweep failed for list ${listId}: ${err?.message || err}`);
   }
+  if (deleted > 0) console.log(`[smokeTest] swept ${deleted} stranded synthetic lead(s) from list ${listId}`);
   return deleted;
 }
 
@@ -132,8 +154,9 @@ async function pollForLeadByPhone(
   phone: string,
   submittedAtIso: string
 ): Promise<{ leadId: string } | null> {
-  const digits = (value: unknown) => String(value ?? "").replace(/\D/g, "");
-  const wanted = digits(phone);
+  // Shared with the suppression sites so an E.164 phone can never match in one place and
+  // miss in the other.
+  const wanted = phoneDigits(phone);
   if (!wanted) return null;
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     try {
@@ -141,7 +164,8 @@ async function pollForLeadByPhone(
       const page = await crmDb.getLeadsByListId(listId, 25);
       const hit = (page?.items || []).find(
         (lead: any) =>
-          digits(lead?.phone) === wanted && String(lead?.createdAt || "") >= submittedAtIso
+          phoneDigits(lead?.phone) === wanted &&
+          String(lead?.createdAt || "") >= submittedAtIso
       );
       if (hit?.leadId) return { leadId: hit.leadId as string };
     } catch {
@@ -204,6 +228,8 @@ export type SmokeFields = {
     viaLabel: boolean;
     /** Already-checked controls must not be toggled back off. */
     checked: boolean;
+    /** True for a role=checkbox/radio/switch widget rather than a native input. */
+    isAria: boolean;
   }[];
   /** Submit control resolved page-side (handles a `form=`-associated button); null when none. */
   submitSelector: string | null;
@@ -484,7 +510,11 @@ export function discoverSmokeFields(): SmokeFields {
   }
 
   const selects: { selector: string; options: string[] }[] = [];
-  const allSelects = (form ? all(form, "select") : all(document, "select")) as HTMLSelectElement[];
+  // Gated on authFormOnly for the same reason `controls` is: selecting an option in a login
+  // form's realm dropdown and then clicking its submit posts to a real auth endpoint.
+  const allSelects = (
+    authFormOnly ? [] : form ? all(form, "select") : all(document, "select")
+  ) as HTMLSelectElement[];
   allSelects.forEach((sel, index) => {
     if (!usable(sel)) return;
     emitted.add(sel);
@@ -508,9 +538,20 @@ export function discoverSmokeFields(): SmokeFields {
   // aria-hidden — which usable() rejects — so keying only on input[type=checkbox] made the
   // control invisible everywhere: never filled, and never even counted as unreachable.
   const ARIA_CHECKABLE = '[role="checkbox"], [role="radio"], [role="switch"]';
-  const checkableEls = controls.filter((el) =>
-    matches(el, `input[type="checkbox"], input[type="radio"], ${ARIA_CHECKABLE}`)
-  );
+  // form.elements is an HTMLFormControlsCollection — only form-associated elements — so a
+  // <div role="checkbox"> inside the form never appeared there. Union the subtree scan in.
+  const ariaEls = form ? all(form, ARIA_CHECKABLE) : all(document, ARIA_CHECKABLE);
+  const checkableSeen = new Set<Element>();
+  const checkableEls = [...controls, ...ariaEls].filter((el) => {
+    if (checkableSeen.has(el)) return false;
+    if (!matches(el, `input[type="checkbox"], input[type="radio"], ${ARIA_CHECKABLE}`)) return false;
+    // A <button> with no type attribute is a SUBMIT control. Treating one as a checkable
+    // makes check() click it, submitting the form mid-fill — before the response listener
+    // is attached and before the submit timestamp is taken.
+    if (el.tagName.toUpperCase() === "BUTTON" && (el as HTMLButtonElement).type !== "button") return false;
+    checkableSeen.add(el);
+    return true;
+  });
   checkableEls.forEach((el) => {
     if (!usable(el, true)) return;
     const input = el as HTMLInputElement;
@@ -537,15 +578,16 @@ export function discoverSmokeFields(): SmokeFields {
     emitted.add(el);
     checkables.push({
       selector,
-      // An ARIA widget reports its role; check() cannot operate on one, and the caller's
-      // existing click() fallback (gated on Playwright's "Not a checkbox or radio button")
-      // is exactly the right path for it.
+      // An ARIA widget reports its role. Playwright's check() drives these natively —
+      // kAriaCheckedRoles in its injected script covers checkbox/radio/switch and reads
+      // aria-checked — so no special path is needed here.
       type: isAria ? (ariaRole === "radio" ? "radio" : "checkbox") : input.type,
       name: input.name || el.getAttribute("name") || null,
       required: isAria ? el.getAttribute("aria-required") === "true" : input.required,
       viaLabel,
       // Reported so an already-satisfied control is never toggled back off.
       checked: isAria ? el.getAttribute("aria-checked") === "true" : !!input.checked,
+      isAria,
     });
   });
 
@@ -612,7 +654,12 @@ export function discoverSmokeFields(): SmokeFields {
   let submitSelector: string | null = null;
   if (form) {
     const submitControl = controlsOf(form).find(
-      (c) => /^(?:submit|image)$/i.test(c.type || "") && !c.disabled
+      (c) =>
+        /^(?:submit|image)$/i.test(c.type || "") &&
+        !c.disabled &&
+        // An ARIA checkable reports type "submit" when it is a typeless <button>; it is a
+        // checkbox, not the form's submit control.
+        !matches(c, ARIA_CHECKABLE)
     );
     if (submitControl) {
       if (submitControl.id) {
@@ -639,7 +686,10 @@ export function discoverSmokeFields(): SmokeFields {
   // Required controls that exist but were filtered out (invisible, off-canvas, custom
   // widget with no reachable input or label). These are the usual reason a lander's own
   // validation blocks submit, and saying so beats reporting "no lead in the CRM".
-  const skippedRequired = controls.filter((el) => {
+  const requiredCandidates = [...controls, ...ariaEls].filter(
+    (el, i, arr) => arr.indexOf(el) === i
+  );
+  const skippedRequired = requiredCandidates.filter((el) => {
     const input = el as HTMLInputElement;
     const required = input.required || el.getAttribute("aria-required") === "true";
     if (!required) return false;
@@ -874,11 +924,14 @@ async function fillAllRequiredFields(
     const key = radio.name ?? radio.selector;
     if (!radiosByGroup.has(key)) radiosByGroup.set(key, radio);
   }
-  const toCheck: { selector: string; viaLabel?: boolean; checked?: boolean }[] =
+  const toCheck: { selector: string; viaLabel?: boolean; checked?: boolean; isAria?: boolean }[] =
     requiredBoxes.length > 0 || radiosByGroup.size > 0
       ? [...requiredBoxes, ...radiosByGroup.values()]
       : checkables.length > 0
-        ? [checkables[0]]
+        ? // Prefer a native checkbox: a role="switch" ("SMS updates") appearing earlier in
+          // the form would otherwise steal this slot from the consent box the lander's own
+          // validation actually gates submit on.
+          [checkables.find((c) => c.type === "checkbox" && !c.isAria) ?? checkables[0]]
         : [];
   for (const control of toCheck) {
     // Already satisfied — leave it alone. A pre-checked required consent box is common, and
@@ -897,7 +950,10 @@ async function fillAllRequiredFields(
     } catch (err: any) {
       // check() CLICKS and then re-reads; "did not change its state" means the click landed
       // but the control is controlled/deferred. Clicking again would toggle it back off.
-      // Only retry when check() could not treat the target as a checkable at all.
+      // Only retry when check() could not treat the target as a checkable at all — defensive
+      // only: every selector discovery emits (native inputs, the three ARIA roles, and
+      // label targets, which retarget via follow-label) is something check() can drive, so
+      // this branch is not expected to fire in production.
       const message = String(err?.message || "");
       if (!/Not a checkbox or radio button|Element is not an <input>/i.test(message)) continue;
       try {
@@ -1138,7 +1194,12 @@ async function runGenerationSmokeTestNow(
         ? `${scope}button[type="submit"], ${scope}input[type="submit"]`
         : 'button[type="submit"], input[type="submit"]');
     let submitPath: "click" | "requestSubmit" | "enter" | "none" = "none";
+    // Nothing to submit: an auth-only page has no lead form, and a form-less page has no
+    // control worth clicking. Attempting anyway costs SUBMIT_TIMEOUT_MS and — on an
+    // auth-only page — would click the login form's submit via the unscoped fallback.
+    const nothingToSubmit = fillOutcome.authFormOnly || fillOutcome.noFormOnPage;
     try {
+      if (nothingToSubmit) throw new Error("no lead form to submit");
       // Prefer an explicit submit button, scoped to the form we actually filled.
       // Playwright's click() auto-waits for the button to become actionable, which covers
       // client-side validation that enables submit only after all fields pass.
@@ -1150,10 +1211,12 @@ async function runGenerationSmokeTestNow(
       // resolves successfully on a page with no <form> at all (optional chaining returns
       // undefined, it does not throw), so the old catch-based chain never reached the Enter
       // fallback for the div-based React forms it was written for.
-      const submitted = await browserPage.evaluate(submitMarkedForm).catch(() => false);
+      const submitted = nothingToSubmit
+        ? false
+        : await browserPage.evaluate(submitMarkedForm).catch(() => false);
       if (submitted) {
         submitPath = "requestSubmit";
-      } else if (lastTextSelector) {
+      } else if (lastTextSelector && !nothingToSubmit) {
         try {
           await browserPage.press(lastTextSelector, "Enter", { timeout: SUBMIT_TIMEOUT_MS });
           submitPath = "enter";
