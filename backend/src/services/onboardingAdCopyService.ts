@@ -26,6 +26,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
@@ -260,7 +261,8 @@ export async function generateAdCopyForUser(
   personas: ICPPersona[],
   brand: IcpBrandContext,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
-  negativeExamples = ""
+  negativeExamples = "",
+  usageContext?: LLMUsageContext
 ): Promise<AdCopyResult> {
   if (!Array.isArray(images) || images.length === 0) {
     throw new Error("ad copy requires at least one image variant");
@@ -284,9 +286,12 @@ export async function generateAdCopyForUser(
     );
     // generateJsonRobust: retry-once on prose preambles. Per-variant loop
     // means one bad call won't cascade-fail the whole ad-copy step.
+    // ENG-1858: metered to the onboarding user (was feature "unknown" / "system").
     const raw = await llm.generateJsonRobust<PerVariantLlmResponse>(
       AD_COPY_SYSTEM_PROMPT,
       userPrompt,
+      undefined,
+      usageContext ?? { feature: "onboarding_ad_copy" },
     );
     out.push({
       id: image.id,
@@ -379,13 +384,16 @@ export async function triggerAdCopyForUser(
   );
 
   try {
+    // ENG-1858: attribute and charge the copy generation to this user.
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_ad_copy" };
     const result = await generateAdCopyForUser(
       imageVariants,
       creativeDir,
       personas,
       brand,
       deps,
-      negativeExamples
+      negativeExamples,
+      usageContext
     );
     const current = await userDb.getUserById(userId);
     const patch = adCopyReadyPatch((current as any) || {}, result);

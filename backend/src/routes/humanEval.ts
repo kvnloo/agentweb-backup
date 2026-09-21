@@ -7,6 +7,7 @@ import {
   HumanEvalReviewType,
   HumanEvalStatus,
 } from '../services/humanEvalService';
+import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 
 const HUMAN_EVAL_STATUSES: readonly HumanEvalStatus[] = ['pending', 'reviewed'];
 const HUMAN_EVAL_REVIEW_TYPES: readonly HumanEvalReviewType[] = ['creative_image', 'landing_page', 'lead_enrichment'];
@@ -16,6 +17,7 @@ const router = express.Router();
 router.use(authenticateToken);
 
 router.post('/candidates', async (req: Request, res: Response): Promise<void> => {
+  let claimedArtifactUrl: string | null = null;
   try {
     const authReq = req as AuthenticatedRequest;
     const {
@@ -34,6 +36,21 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
+    // ENG-1854: this route calls createCandidate directly, same as the manual Emma tool did —
+    // same cross-path duplicate risk if the given artifactUrl was already auto-posted.
+    if (typeof artifactUrl === 'string' && artifactUrl) {
+      if (!(await claimArtifactForHumanEval(artifactUrl))) {
+        res.json({
+          success: true,
+          message: 'This output was already sent for human eval — not creating a duplicate.',
+        });
+        return;
+      }
+      // Tracked so the catch block below can release it if createCandidate fails — an
+      // unreleased claim on a failed attempt would permanently blackhole this artifact.
+      claimedArtifactUrl = artifactUrl;
+    }
+
     const candidate = await humanEvalService.createCandidate({
       reviewType: reviewType as HumanEvalReviewType,
       outputSummary: String(outputSummary),
@@ -48,6 +65,7 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
 
     res.json({ success: true, candidate });
   } catch (error: any) {
+    if (claimedArtifactUrl) await releaseArtifactClaim(claimedArtifactUrl);
     const message = error?.message || 'Failed to create human eval candidate';
     const status = message.includes('reviewType') || message.includes('required') ? 400 : 500;
     res.status(status).json({ error: message });

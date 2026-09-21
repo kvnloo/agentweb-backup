@@ -1,0 +1,13 @@
+{
+  "model": "jev-latest",
+  "answers": {
+    "needs_ticket": {
+      "type": "noul",
+      "noul": 0.91
+    }
+  },
+  "usage": {
+    "input_tokens": 96,
+    "output_tokens": 4
+  }
+}

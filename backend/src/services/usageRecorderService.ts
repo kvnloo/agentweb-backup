@@ -469,10 +469,33 @@ async function recordVendorUsageIdempotent(ctx: ResolvedVendorUsageContext, now:
   try {
     const built = buildShadowEvent(ctx, now.toISOString());
     if ("skip" in built) {
-      // Unpriced: no spend event may exist for it, so there is nothing to make
-      // the aggregate write idempotent against. Fall back to the plain write
-      // rather than inventing a $0 event the billing boundary forbids.
-      await usageRecordDb.incrementUsage(buildVendorIncrement(ctx, userId, billingUserId, now));
+      // Unpriced: no spend event may exist for it (the billing boundary forbids
+      // a $0 one), so it can't dedupe via the spend-event transaction.
+      const increment = buildVendorIncrement(ctx, userId, billingUserId, now);
+      if (ctx.idempotencyKey) {
+        // ENG-1958: a KEYED unpriced call can still be replayed, and a plain
+        // ADD double-counts the aggregate on retry. Guard it with a conditional
+        // dedupe marker in the same transaction so a replay is a no-op. Conflict
+        // is a write that didn't happen, so retry it as transient (matches the
+        // priced path); "applied" and "duplicate" are both terminal successes.
+        await retryTransientWrite(async () => {
+          const outcome = await usageRecordDb.incrementUsageWithDedupeMarker(
+            increment,
+            billingUserId,
+            ctx.idempotencyKey!,
+          );
+          if (outcome === "conflict") {
+            throw Object.assign(new Error("transaction conflict on unpriced vendor usage"), {
+              code: "TransactionConflictException",
+            });
+          }
+          return outcome;
+        });
+      } else {
+        // Unkeyed: a replay is not detectable anyway, so keep the plain write
+        // rather than pay for a marker that could never match (ENG-1958 AC3).
+        await usageRecordDb.incrementUsage(increment);
+      }
       // Recovery on ANY successful path closes an open window, not just the
       // priced+keyed one (CodeRabbit, PR #2807) — otherwise an account whose
       // vendor traffic is all unpriced never reports its final alert.
@@ -689,11 +712,25 @@ async function recordVendorUsageLegacy(
  * only blocks when ENFORCE_COST_CAP is enabled (observe-only by default).
  */
 export function meterUserUsage(ctx: RecordUsageContext): void {
+  void meterUserUsageAsync(ctx);
+}
+
+/**
+ * `meterUserUsage`, awaitable: resolves once BOTH writes — the usage row and the
+ * cap charge — have settled (ENG-1858). Never rejects; each write keeps its own
+ * fail-open handling. Use it where something must wait for the metering to be
+ * durable, such as registering it with the graceful-shutdown drain; hot paths
+ * keep calling `meterUserUsage` and never wait.
+ */
+export async function meterUserUsageAsync(ctx: RecordUsageContext): Promise<void> {
   // Shadow analytics — records under "system" when userId is absent.
-  void recordUsage(ctx);
+  const recorded = recordUsage(ctx);
 
   // Enforced per-user cap — only when a real user is attributable.
-  if (!ctx.userId) return;
+  if (!ctx.userId) {
+    await recorded;
+    return;
+  }
 
   const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
   const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
@@ -715,11 +752,14 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
           ctx.cacheWriteByTtl
         ) / 1e6;
 
-  if (totalTokens <= 0 && costUsd <= 0) return;
+  if (totalTokens <= 0 && costUsd <= 0) {
+    await recorded;
+    return;
+  }
 
   // Lazy-required (see import-site note) to keep this module's static load graph light.
   const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
-  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
+  const charged = incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
     eventId: ctx.eventId,
     model: ctx.model,
     provider: ctx.provider,
@@ -731,6 +771,7 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
       err instanceof Error ? err.message : err
     )
   );
+  await Promise.all([recorded, charged]);
 }
 
 /** Test hook: reset the error-log throttle. */

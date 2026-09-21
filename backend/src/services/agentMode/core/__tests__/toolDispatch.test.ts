@@ -239,6 +239,93 @@ describe('executePreparedTools', () => {
     });
   });
 
+  /*
+   * ENG-1945 follow-up: install_skills now runs its real, gateway-routed execution
+   * eagerly in Phase 1 (so a sibling call gated by it can unlock in the SAME batch —
+   * see installSkillsSameBatchToolGate.test.ts), instead of only in Phase 2. That
+   * eager call must be the tool's ONLY execution for a given tool_call_id, not an
+   * extra one layered on top of Phase 2 — a second, independent execution through
+   * the REAL gateway double-records failures against the same per-run breaker key,
+   * which halves the model's genuine 2-strike retry budget for install_skills'
+   * FAST_TRIP rejection classes (skill_install_refused/subscription_blocked/
+   * invalid_args) without either the model or a human ever seeing two attempts.
+   */
+  describe('install_skills executes exactly once per call (breaker budget)', () => {
+    const REJECTION = {
+      success: false,
+      message: 'Could not resolve these skill IDs to any known skill: no-such-skill.',
+    };
+
+    const realGatewayPorts = (spy: jest.Mock) =>
+      makePorts({
+        evaluateAgentToolPolicy,
+        validateAndRepairToolArgs,
+        toolResultError: realToolResultError,
+        getToolInputSchema: () => undefined,
+        executeAgentToolThroughGateway: spy,
+        executePreparedAgentTool: async () => REJECTION,
+      });
+
+    it('calls the real gateway exactly once for a single install_skills tool call', async () => {
+      const spy = jest.fn(executeAgentToolThroughGateway);
+      const ports = realGatewayPorts(spy);
+      const input = makeInput(
+        [toolCall('i1', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: 'run-single-exec' },
+      );
+
+      await executePreparedTools(input);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(String(input.toolCallsLedger[0].error)).toContain('no-such-skill');
+    });
+
+    // The regression this pins: with a double execution, ONE rejected call in turn 1
+    // already records 2 failures (fast-trip threshold), so turn 2 — the model's
+    // first genuine retry — is silently short-circuited by the breaker instead of
+    // re-running and reporting the real, bucketed rejection reason. With a single
+    // execution, turn 1 records exactly 1 failure, so turn 2 still runs for real and
+    // only turn 3 (the model's SECOND genuine retry) trips the breaker.
+    it('takes two genuine identical failures across turns to trip the repeated-failure breaker, not one', async () => {
+      const spy = jest.fn(executeAgentToolThroughGateway);
+      const ports = realGatewayPorts(spy);
+      const runId = 'run-breaker-budget';
+
+      const turn2 = makeInput(
+        [toolCall('i2', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      const turn1 = makeInput(
+        [toolCall('i1', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      await executePreparedTools(turn1);
+      await executePreparedTools(turn2);
+
+      // Turn 2 must still be the REAL rejection reason (gateway ran install_skills
+      // again), not a generic repeated-failure stop message — that only happens once
+      // the breaker has actually seen 2 genuine failures.
+      expect(String(turn2.toolCallsLedger[0].error)).toContain('no-such-skill');
+      expect(spy).toHaveBeenCalledTimes(2);
+
+      const turn3 = makeInput(
+        [toolCall('i3', 'install_skills', '{"skillIds":["no-such-skill"]}')],
+        ports,
+        { agentRuntimeRunId: runId },
+      );
+      await executePreparedTools(turn3);
+
+      // Now (2 genuine prior failures) the breaker trips: the gateway is still
+      // invoked (it does the tripped-check internally) but its own `execute()` must
+      // NOT run a 3rd time, and the model sees the repeated-failure stop message.
+      expect(spy).toHaveBeenCalledTimes(3);
+      expect(String(turn3.toolCallsLedger[0].error)).toMatch(/already failed 2 times/i);
+    });
+  });
+
   it('executes a batch and appends tool messages in original order', async () => {
     const ports = makePorts();
     const input = makeInput(

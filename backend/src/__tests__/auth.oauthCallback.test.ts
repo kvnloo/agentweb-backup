@@ -563,5 +563,29 @@ describe('OAuth Callback - Customer Role Addition for Invited Users', () => {
 
       expect(mockEmailService.sendTeamIntroductionEmail).not.toHaveBeenCalled();
     });
+
+    it('ENG-470: new OAuth signup propagates isNewUser=true; returning login propagates false', async () => {
+      // New user: getUserByEmail null -> creation branch -> isNewUser true.
+      // Uses the genius branch (same isNewUser capture) to avoid the customer
+      // role gate, which is orthogonal to the new-vs-returning signal.
+      mockUserDb.getUserByEmail.mockResolvedValue(null as any);
+      mockUserDb.createUser.mockResolvedValue(newUser('user-new-1', 'brandnew@example.com', 'New') as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+
+      const newDone = createMockDone();
+      await googleCallback(createMockRequest('genius') as Request, 'access-token', 'refresh-token', createMockProfile('brandnew@example.com'), newDone);
+      expect(newDone).toHaveBeenCalledWith(null, expect.objectContaining({ isNewUser: true }));
+
+      // Returning user: existing record -> isNewUser false (portal must never fire)
+      jest.clearAllMocks();
+      mockUserDb.getUserByEmail.mockResolvedValue({ userId: 'user-old', email: 'old@example.com', roles: ['customer'], isAdmin: false } as any);
+      mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+      (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+
+      const oldDone = createMockDone();
+      await googleCallback(createMockRequest('customer') as Request, 'access-token', 'refresh-token', createMockProfile('old@example.com'), oldDone);
+      expect(oldDone).toHaveBeenCalledWith(null, expect.objectContaining({ isNewUser: false }));
+    });
   });
 });

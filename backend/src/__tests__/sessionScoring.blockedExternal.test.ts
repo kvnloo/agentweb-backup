@@ -1,0 +1,350 @@
+/**
+ * ENG-1165: blocked-by-external sessions must be excluded
+ * from the satisfaction cohort as a neutral state — like the Slack-suggestion
+ * exception — instead of being scored as agent failures.
+ *
+ * Three deterministic fixtures. Each MUST return score:null with skipReason
+ * "blocked-external" after the fix. They FAIL before it (LLM is called and a
+ * low goalCompletion score is persisted).
+ */
+import {
+  attemptSessionScore,
+  ScoringJudge,
+} from '../services/sessionScoringService';
+import { ChatMessage } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
+import { chatbotDb } from '../services/chatbotService';
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    callLLM: jest.fn(),
+    resolveGenerationModel: (m: string) => ({ model: m, fellBack: false, requestedModel: m }),
+  },
+}));
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    updateSessionSatisfactionScore: jest.fn().mockResolvedValue({}),
+    updateSessionJudgeScore: jest.fn().mockResolvedValue({}),
+  },
+}));
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn().mockResolvedValue(null),
+  },
+}));
+
+const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
+
+function lowScoreResponse() {
+  return {
+    choices: [{ message: { content: JSON.stringify({ score: 3, reason: 'goal not completed', dimensions: { goalCompletion: 3, dataAccuracy: 5, outputQuality: 5 } }) } }],
+  } as any;
+}
+
+function base(overrides: Record<string, any> = {}) {
+  return {
+    sessionId: 'eng-1165-red',
+    userId: 'u1',
+    pageIdentifier: 'portal-chat',
+    sessionType: 'regular',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    ...overrides,
+  } as any;
+}
+
+// 1. Visitor not signed in — assistant correctly refuses + explains.
+const unsignedIn: ChatMessage[] = [
+  { role: 'user', content: 'Review my LinkedIn profile' },
+  { role: 'assistant', content: 'Please sign in first so I can access your profile data. Once signed in I can run the review.' },
+];
+
+// 2. Integration token revoked mid-task — assistant stops + gives reconnect fix.
+const revokedToken: ChatMessage[] = [
+  { role: 'user', content: 'Post this update to Meta Ads' },
+  { role: 'assistant', content: 'Draft saved.', metadata: { toolCalls: [{ name: 'save_draft' }] } } as any,
+  { role: 'assistant', content: 'Your Meta access token was revoked, so I stopped before making changes. Reconnect in Settings → Integrations (takes ~60 seconds), then say retry.' },
+];
+
+// 3. Upstream provider outage — assistant reports + files the product issue.
+const upstreamOutage: ChatMessage[] = [
+  { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+  { role: 'assistant', content: 'Searched existing CRM leads instead.', metadata: { toolCalls: [{ name: 'search_crm_leads' }] } } as any,
+  { role: 'assistant', content: 'LinkedIn search is currently down with an upstream outage, so I stopped that path, pivoted to your CRM leads and filed the outage as a product issue.', metadata: { toolCalls: [{ name: 'report_product_issues' }] } } as any,
+];
+
+const judge: ScoringJudge = {
+  id: 'judge-1', name: 'J', systemPrompt: 'Evaluate.',
+  createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+};
+
+describe('ENG-1165: blocked-by-external sessions are excluded, not scored', () => {
+  beforeEach(() => { jest.clearAllMocks(); mockCallLLM.mockResolvedValue(lowScoreResponse()); });
+
+  it('CONTROL (must pass before AND after): an ordinary task failure is still scored', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Write a haiku about churn' },
+      { role: 'assistant', content: 'Here is your haiku: churn churn churn.' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).not.toBeNull();
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('FAIL-1: unsigned-in session is excluded as blocked-external', async () => {
+    const attempt = await attemptSessionScore(base({ messages: unsignedIn, messageCount: unsignedIn.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('FAIL-2: revoked-token session is excluded as blocked-external', async () => {
+    const attempt = await attemptSessionScore(base({ messages: revokedToken, messageCount: revokedToken.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('FAIL-3: upstream-outage session is excluded as blocked-external', async () => {
+    const attempt = await attemptSessionScore(base({ messages: upstreamOutage, messageCount: upstreamOutage.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('FAIL-4: custom-judge path also excludes blocked-external (judges cannot diverge)', async () => {
+    const { scoreSessionWithJudgeIfNeeded } = await import('../services/sessionScoringService');
+    const result = await scoreSessionWithJudgeIfNeeded(
+      base({ messages: unsignedIn, messageCount: unsignedIn.length, judgeScores: {} }), judge
+    );
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('FAIL-5: a pivot WITHOUT a named outage stays scorable (no silent cohort shrink)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: 'No matches found, so I pivoted to your CRM leads and filed a note as a product issue.' },
+    ];
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ score: 2, reason: 'no results', dimensions: { goalCompletion: 2, dataAccuracy: 4, outputQuality: 3 } }) } }],
+    } as any);
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+  });
+
+  it('FAIL-6: a block report followed by a user retry is NOT excluded (transcript continued)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Review my LinkedIn profile' },
+      { role: 'assistant', content: 'Please sign in first so I can access your profile data.' },
+      { role: 'user', content: 'I signed in, try again' },
+    ];
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ score: 3, reason: 'goal not completed', dimensions: { goalCompletion: 3, dataAccuracy: 5, outputQuality: 5 } }) } }],
+    } as any);
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    // Final turn is the user's retry, not the assistant's block report → the
+    // exclusion does not fire; the session scores normally (proves the
+    // final-turn anchor, not a transcript-wide substring match).
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a completed outage fallback ending in a bare "let me know" stays scorable (generic closing is not handling evidence)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: 'LinkedIn search had an upstream outage. I already pulled an equivalent list another way — here it is. Let me know if you need anything else.' },
+    ];
+    mockCallLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ score: 4, reason: 'done via fallback', dimensions: { goalCompletion: 4, dataAccuracy: 5, outputQuality: 4 } }) } }],
+    } as any);
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a punt after a fully-specified request stays scorable (decline-to-guess without an ambiguous fragment is an agent failure)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Review my LinkedIn profile: https://linkedin.com/in/janedoe — give me the full breakdown.' },
+      { role: 'assistant', content: 'I decline to guess at which sections you want. Could you clarify which parts of your profile you want reviewed?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a genuine ambiguous fragment with a decline-to-guess and focused question is excluded (ENG-1296 shape)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'post it' },
+      { role: 'assistant', content: 'I decline to guess which channel you mean instead of guessing. Could you clarify which account should I post to?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a bare-noun fragment ("LinkedIn") with a decline-to-guess and focused question is excluded', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'LinkedIn' },
+      { role: 'assistant', content: 'I decline to guess what you want with this instead of guessing. Could you clarify what should I do with it?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a single-word imperative command ("Cancel") with a decline-to-guess and focused question stays scorable (not an ambiguous fragment)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Cancel' },
+      { role: 'assistant', content: 'I decline to guess what you want to cancel instead of guessing. Could you clarify which subscription should I cancel?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a standalone-pronoun fragment ("that") with a decline-to-guess and focused question is excluded', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'that' },
+      { role: 'assistant', content: 'I decline to guess what you mean instead of guessing. Could you clarify which item you mean?' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a completed short incident update opening with generic "sorry" stays scorable (not a terminal block report)', async () => {
+    const update = 'Sorry, here is the incident update. The outage affected logins briefly and service is now restored. Next steps: monitor the dashboard.';
+    expect(update.length).toBeLessThan(300);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post the incident update' },
+      { role: 'assistant', content: update },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a genuine "sorry, I can\'t" terminal block report is still excluded (inability-bound sorry)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: 'Sorry, I can\'t reach LinkedIn search right now — the service is down. I stopped that path; say retry once it is back.' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('a complete request ("Write a haiku about winter") with a decline-to-guess stays scorable (positive fragment allowlist)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Write a haiku about winter' },
+      { role: 'assistant', content: 'I decline to guess which tone you want instead of guessing. Could you clarify what tone should I use?' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a long generated incident-notice draft mentioning an outage stays scorable (not a terminal block report)', async () => {
+    const longDraft = 'Here is the customer notice draft you asked for regarding the event. ' +
+      'Service is currently down across the region and our status page reflects the outage. ' +
+      'Details of the incident follow in the next paragraph for your review. ' +
+      'We apologize for the disruption and appreciate your patience. ' +
+      'Next steps: our team will post updates hourly until service is restored. Please review and approve.';
+    expect(longDraft.length).toBeGreaterThan(300);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Draft an incident notice for the outage' },
+      { role: 'assistant', content: longDraft },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('an over-600-character terminal-shaped report stays scorable (length guard)', async () => {
+    // A report-shaped final turn that opens on the block and closes on the
+    // handling, but exceeds the documented 600-char cap — a long deliverable
+    // that merely mentions the block stays scorable (CodeRabbit PR #2983).
+    const longReport = "Sorry, I can't reach LinkedIn search right now — the service is currently down. " +
+      'The outage affected logins briefly and our status page reflects the incident in detail. ' +
+      'We stopped that path and filed the platform issue for your review and approval today. ' +
+      'Our team will post hourly updates until service is restored across the entire region. ' +
+      'In the meantime please review this extended status summary and confirm the next steps. ' +
+      'Note that additional background context follows for the record and for downstream review today. ' +
+      'We stopped that path and saved the draft for review; say retry once it is back.';
+    expect(longReport.length).toBeGreaterThan(600);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Search LinkedIn for CTOs at fintechs' },
+      { role: 'assistant', content: longReport },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('an interactive approval-held publish with saved draft is excluded (account-level hold, non-scheduled)', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post this to LinkedIn now' },
+      { role: 'assistant', content: 'Publishing requires approval before publishing under your account-level setting, so I saved the draft and will not publish until approved.' },
+    ];
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'regular' }));
+    expect(attempt.score).toBeNull();
+    expect(attempt.skipReason).toBe('blocked-external');
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('an over-600-character interactive publish-hold response stays scorable (length guard)', async () => {
+    // Same hold + handling patterns as the short excluded case, but padded
+    // past the documented 600-char cap — a long deliverable that mentions the
+    // approval hold stays scorable (CodeRabbit PR #2983).
+    const longHold = 'Publishing requires approval before publishing under your account-level setting, so I saved the draft and will not publish until approved. ' +
+      'Here is the extended campaign summary for your review with additional background context on the launch plan and audience. ' +
+      'The draft covers messaging pillars, creative variants, budget allocation, and the measurement framework in detail. ' +
+      'Additional context follows for downstream review: timeline, owners, risks, mitigations, and rollout sequencing notes. ' +
+      'Please review this extended status summary and confirm the next steps for approval when ready next week. ' +
+      'Further scheduling details and stakeholder sign-off notes are appended here for completeness today.';
+    expect(longHold.length).toBeGreaterThan(600);
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Post this to LinkedIn now' },
+      { role: 'assistant', content: longHold },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'regular' }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+
+  it('a scheduled run with approval-hold wording but no PUBLISH WITHHELD marker stays in the judged cohort', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Scheduled post' },
+      { role: 'assistant', content: 'Publishing requires approval before publishing, so I saved the draft.' },
+    ];
+    mockCallLLM.mockResolvedValue(lowScoreResponse());
+    const attempt = await attemptSessionScore(base({ messages, messageCount: messages.length, sessionType: 'scheduled' }));
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(attempt.score).not.toBeNull();
+    expect(attempt.skipReason).toBeUndefined();
+  });
+});

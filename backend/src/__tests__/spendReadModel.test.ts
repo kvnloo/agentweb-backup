@@ -8,7 +8,7 @@
  * as spend, and that the pause explanation cannot contradict the decision it
  * explains.
  */
-import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from '../services/spendReadModel';
+import { boundBreakdownRows, buildSpendBreakdown, explainPause, resolveAllowanceInputs } from '../services/spendReadModel';
 import { SpendEvent } from '../services/spendEventDb';
 import { MonthlyProjection } from '../services/spendProjection';
 
@@ -296,5 +296,74 @@ describe('resolveAllowanceInputs', () => {
     await resolveAllowanceInputs('owner-1', '2026-07', deps({ getCreditAdjustment } as any));
 
     expect(getCreditAdjustment).toHaveBeenCalledWith(expect.anything(), '2026-07');
+  });
+});
+
+// ── ENG-1841: bounded detail rows, exact totals ─────────────────────────────
+
+describe('boundBreakdownRows (ENG-1841)', () => {
+  const ev = (i: number, over: Record<string, unknown> = {}) =>
+    ({
+      billingUserId: 'owner-1',
+      eventId: `e${i}`,
+      occurredAt: `2026-09-${String(1 + (i % 28)).padStart(2, '0')}T10:00:${String(i % 60).padStart(2, '0')}.000Z`,
+      billingMonth: '2026-09',
+      actingUserId: `member-${i % 3}`,
+      provider: 'apollo',
+      operation: 'reveal',
+      unit: 'reveal',
+      quantity: 1,
+      costMicroUsd: 1_000 + i,
+      costSource: 'allocated',
+      rateCardVersion: '2026-09-02',
+      lifecycle: 'settled',
+      references: { sessionId: `s${i}` },
+      ...over,
+    }) as any;
+
+  it('leaves a small breakdown untouched, with nothing omitted', () => {
+    const b = buildSpendBreakdown('owner-1', '2026-09', [ev(1), ev(2)]);
+    const bounded = boundBreakdownRows(b, 100);
+
+    expect(bounded.bySession).toEqual(b.bySession);
+    expect(bounded.inFlight).toEqual(b.inFlight);
+    for (const o of Object.values(bounded.omitted)) {
+      expect(o).toEqual({ rows: 0, eventCount: 0, settledMicroUsd: 0, reservedMicroUsd: 0 });
+    }
+  });
+
+  it('cuts only the row lists: totals, daily and the rows it keeps are unchanged', () => {
+    const events = Array.from({ length: 130 }, (_, i) => ev(i));
+    const b = buildSpendBreakdown('owner-1', '2026-09', events);
+    const bounded = boundBreakdownRows(b, 100);
+
+    expect(bounded.settledMicroUsd).toBe(b.settledMicroUsd);
+    expect(bounded.eventCount).toBe(130);
+    expect(bounded.daily).toEqual(b.daily);
+    expect(bounded.bySession).toEqual(b.bySession.slice(0, 100));
+    // The largest rows survive the cut.
+    expect(bounded.bySession[0].settledMicroUsd).toBe(Math.max(...b.bySession.map((r) => r.settledMicroUsd)));
+  });
+
+  it('omitted sums exactly to what was cut, so listed + omitted reproduces every total', () => {
+    const events = Array.from({ length: 130 }, (_, i) => ev(i));
+    const b = buildSpendBreakdown('owner-1', '2026-09', events);
+    const { bySession, omitted } = boundBreakdownRows(b, 100);
+
+    const listed = bySession.reduce((t, r) => t + r.settledMicroUsd, 0);
+    expect(omitted.bySession.rows).toBe(30);
+    expect(omitted.bySession.eventCount).toBe(30);
+    expect(listed + omitted.bySession.settledMicroUsd).toBe(b.settledMicroUsd);
+  });
+
+  it('keeps open reservations newest first and drops the oldest, counting their money', () => {
+    const events = Array.from({ length: 5 }, (_, i) => ev(i, { lifecycle: 'reserved', costMicroUsd: 10 * (i + 1) }));
+    const b = buildSpendBreakdown('owner-1', '2026-09', events);
+    const bounded = boundBreakdownRows(b, 3);
+
+    expect(bounded.inFlight).toEqual(b.inFlight.slice(0, 3));
+    expect(bounded.inFlightMicroUsd).toBe(b.inFlightMicroUsd);
+    expect(bounded.omitted.inFlight.rows).toBe(2);
+    expect(bounded.omitted.inFlight.reservedMicroUsd).toBe(b.inFlight.slice(3).reduce((t, r) => t + r.costMicroUsd, 0));
   });
 });

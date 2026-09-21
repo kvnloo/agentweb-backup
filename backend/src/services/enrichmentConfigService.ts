@@ -194,6 +194,8 @@ export interface ConfigServiceDeps {
    *  (return {} on error) so heuristic results still apply. */
   llmInferAliases(
     input: Array<{ name: string; instruction: string }>,
+    /** ENG-1858: the saving user, so the call is metered to them, not "system". */
+    userId?: string,
   ): Promise<Record<string, string | null>>;
   /** Called once per save to classify fields as smart (computed/derived) or
    *  normal (directly fetchable). For smart fields also extracts canonical
@@ -201,6 +203,8 @@ export interface ConfigServiceDeps {
    *  error) so the rest of the save still proceeds. */
   llmClassifySmartFields(
     input: Array<{ name: string; instruction: string }>,
+    /** ENG-1858: see llmInferAliases. */
+    userId?: string,
   ): Promise<Record<string, SmartFieldClassification>>;
 }
 
@@ -509,6 +513,7 @@ export async function processEnrichmentConfig(
     try {
       const llmAliases = await deps.llmInferAliases(
         llmCandidates.map(f => ({ name: f.name, instruction: f.instruction || '' })),
+        input.userId,
       );
       enriched = {
         ...enriched,
@@ -567,6 +572,7 @@ export async function processEnrichmentConfig(
     try {
       const classifications = await deps.llmClassifySmartFields(
         classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),
+        input.userId,
       );
       enriched = {
         ...enriched,

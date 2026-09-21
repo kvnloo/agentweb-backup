@@ -183,6 +183,10 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
+    // ENG-328 — mandatory design-system scrape. 'ready' covers both a real
+    // scrape and the manual-fallback path (mirrors hasBrandGuidelines making
+    // no distinction between a scraped and a manually-typed brand).
+    response.hasDesignSystem = user.designSystem?.status === 'ready';
 
     // Include org info if user is in an org
     if (org) {
@@ -203,6 +207,13 @@ router.get('/me', authenticateToken, async (req, res) => {
       } catch (e: any) {
         console.error('Error resolving org brand for /me:', e?.message);
         response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      }
+      try {
+        const orgDesignSystem = await resolveOrgProfileField(user, org, 'designSystem');
+        response.hasDesignSystem = orgDesignSystem?.status === 'ready';
+      } catch (e: any) {
+        console.error('Error resolving org design system for /me:', e?.message);
+        response.hasDesignSystem = org.designSystem?.status === 'ready';
       }
       // Merge org-level and user-level Drive folders so legacy user-record folders
       // (added before the org feature) continue to appear in the UI without migration.
@@ -323,7 +334,10 @@ const googleAuthFinalHandler = (req: Request, res: Response) => {
         return res.redirect(`${targetFrontendUrl}/oauth-callback?error=${encodeURIComponent('Authentication token is missing after Google auth. Please try again.')}&code=token_missing`);
     }
 
-    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}`);
+    // ENG-470: propagate the new-vs-returning signal only when true. Returning
+    // logins get no param, so the portal can never mistake them for signups.
+    const newUserSuffix = userAuthInfo.isNewUser === true ? '&isNewUser=true' : '';
+    res.redirect(`${targetFrontendUrl}/oauth-callback?token=${userAuthInfo.token}${newUserSuffix}`);
 };
 
 router.get('/google/callback', 

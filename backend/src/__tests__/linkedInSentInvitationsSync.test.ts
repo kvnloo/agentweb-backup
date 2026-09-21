@@ -91,9 +91,9 @@ describe('syncSentInvitationsForAccount', () => {
       expect(upserted[0].sentAt).toBe(upserted[0].syncedAt);
     });
 
-    it('still prefers Unipile parsed_datetime over the cached value when present', async () => {
+    it('prefers Unipile parsed_datetime over the cached value when it is EARLIER (ENG-1938)', async () => {
       mockGetAllSentInvitationsByAccount.mockResolvedValue([
-        { invitedUserPublicId: 'jane-doe', sentAt: '2020-01-01T00:00:00.000Z' },
+        { invitedUserPublicId: 'jane-doe', sentAt: '2026-09-01T00:00:00.000Z' },
       ]);
       mockListSentInvitations.mockResolvedValue({ items: [invitation('jane-doe')], cursor: undefined });
 
@@ -101,6 +101,21 @@ describe('syncSentInvitationsForAccount', () => {
 
       const [upserted] = mockUpsertSentInvitations.mock.calls[0];
       expect(upserted[0].sentAt).toBe('2026-05-31T14:40:05.959Z');
+    });
+
+    it('keeps the cached value when parsed_datetime is LATER — an earlier estimate is never overwritten (ENG-1938)', async () => {
+      // Pre-ENG-1938 this test asserted the opposite ("prefers parsed_datetime"),
+      // which moved sentAt later whenever any other field forced a rewrite.
+      // Same invitation (matching id): only then may an earlier cached date stand.
+      mockGetAllSentInvitationsByAccount.mockResolvedValue([
+        { invitedUserPublicId: 'jane-doe', invitationId: 'inv-jane-doe', sentAt: '2020-01-01T00:00:00.000Z' },
+      ]);
+      mockListSentInvitations.mockResolvedValue({ items: [invitation('jane-doe')], cursor: undefined });
+
+      await syncSentInvitationsForAccount('acct-1');
+
+      const [upserted] = mockUpsertSentInvitations.mock.calls[0];
+      expect(upserted[0].sentAt).toBe('2020-01-01T00:00:00.000Z');
     });
 
     it('still syncs when the cache preload fails', async () => {

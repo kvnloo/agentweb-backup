@@ -179,6 +179,13 @@ router.post("/", authenticateToken, async (req, res) => {
         icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
         createdAt: (existingMarketStrategyMerged as any).createdAt || now,
         updatedAt: now,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): a
+        // competitors- or businessOverview-only save must not look like an
+        // ICP correction to routes/crm.ts's staleness check, or every org
+        // member editing an unrelated field silently — and permanently —
+        // switches that org off its cached, richer icpResult-derived ICP
+        // filters for no reason.
+        icpUpdatedAt: icp !== undefined ? now : (existingMarketStrategyMerged as any).icpUpdatedAt,
       };
 
       await orgDb.updateOrg(user.orgId, { marketStrategy });
@@ -204,6 +211,9 @@ router.post("/", authenticateToken, async (req, res) => {
       icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
       createdAt: (existingMarketStrategyMerged as any).createdAt || now,
       updatedAt: now,
+      // See the org branch above for why this is tracked separately from
+      // updatedAt (ENG-1955 follow-up).
+      icpUpdatedAt: icp !== undefined ? now : (existingMarketStrategyMerged as any).icpUpdatedAt,
     };
 
     // Update user record with market strategy data

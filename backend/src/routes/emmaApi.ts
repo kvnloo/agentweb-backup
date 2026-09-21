@@ -200,12 +200,21 @@ router.post('/generate-video', async (req: Request, res: Response) => {
 router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time } = req.body;
+    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
     let result;
     if (type === 'video') {
-      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time, userId: userId(req) });
+      // ENG-1961: carry the session too, so analysis run through this API is
+      // traceable to its chat the same way the tool path is (the sibling
+      // /generate-video route already takes session_id).
+      result = await svc.describeVideo(url, prompt, {
+        return_transcript, return_scenes, start_time, end_time,
+        userId: userId(req), sessionId: session_id,
+      });
     } else {
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
+      // ENG-1858: meter to the API caller instead of "system".
+      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, {
+        userId: userId(req), sessionId: session_id, feature: 'describe_image',
+      });
     }
     res.json(result);
   } catch (err: any) {

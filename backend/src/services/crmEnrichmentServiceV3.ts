@@ -1007,7 +1007,8 @@ export async function runEnrichment(
   // fields, canonical match is free). Passed to every processLead call. Skipped
   // entirely when there are no leads — no processLead would consume it.
   const siblingMappingTable: SiblingFieldMappingTable = leads.length > 0
-    ? await buildSiblingFieldMappingTable(workingConfig.fields)
+    // ENG-1858: meter the mapping call to the run's user, not "system".
+    ? await buildSiblingFieldMappingTable(workingConfig.fields, { userId: input.userId, feature: 'crm_enrichment_field_mapping' })
     : { canonical: new Map(), llm: new Map() };
   const configFieldsByName: Record<string, EnrichmentFieldConfig> = {};
   const fieldAliasMap: Record<string, string> = {};
