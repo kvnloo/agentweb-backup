@@ -1448,4 +1448,72 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       });
     });
   });
+
+
+  // ENG-449 gap #3: the post-deploy smoke test submits a REAL lead through a customer's real
+  // form. Deleting the row afterwards does not undo HubSpot/Attio sync, drip enrolment or an
+  // auto-sent email — those fire the instant the lead is created. The guard therefore has to
+  // recognise the lead by EITHER marker at creation time.
+  describe('POST /api/webhooks/forward-lead — synthetic smoke-test lead suppression', () => {
+    const smokeLeadList = {
+      listId: 'list_123',
+      userId: 'user_123',
+      name: 'Test List',
+      publicAccessEnabled: true,
+      autoDraftEnabled: true,
+    };
+
+    beforeEach(() => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(smokeLeadList);
+    });
+
+    it('skips the whole side-effect cascade for a lead recognised by its email', async () => {
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_smoke', listId: 'list_123', email: 'smoke-test+1789767265236@agentweb.pro',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', email: 'smoke-test+1789767265236@agentweb.pro' });
+
+      expect(response.status).toBe(201);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+    });
+
+    it('skips the cascade for a lead recognised by its PHONE, when the address cannot carry the marker', async () => {
+      // A lander with no email field substitutes its own placeholder address (observed live:
+      // noemail+<ts>@waterheater.app). Without the phone marker, a real auto-sent email and a
+      // real CRM sync fire for a lead that never existed.
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_smoke_phone', listId: 'list_123',
+        email: 'noemail+1789767265236@waterheater.app', phone: '(415) 555-0142',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'noemail+1789767265236@waterheater.app',
+          phone: '(415) 555-0142',
+        });
+
+      expect(response.status).toBe(201);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+    });
+
+    it('still runs the cascade for a real lead whose phone merely looks similar', async () => {
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_real', listId: 'list_123', email: 'buyer@acme.com', phone: '4155551234',
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', email: 'buyer@acme.com', phone: '4155551234' });
+
+      await new Promise((r) => setTimeout(r, 200));
+      expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();
+    });
+  });
 });
