@@ -5,28 +5,65 @@ import { meterUserUsage } from './usageRecorderService';
 
 const POLL_INTERVAL_MS = 10000; // 10 seconds between status polls
 
-// ENG-738: agentModeController's GENERATION_TIMEOUT_MS (10 minutes by default)
-// wraps the ENTIRE agent-mode turn in a Promise.race and kills it — including
-// any tool call still in flight — with no way for the killed call to return a
-// result of its own. The prior fixed 20-minute poll budget here was LONGER than
-// that outer cap, so for any research that legitimately ran past ~10 minutes,
-// the outer race always won: the whole turn died with a bare 504 before this
-// service's own graceful-failure branches ever got a chance to run, and the
-// model never saw any tool result to react to. These two budgets are sized so
-// a primary attempt plus one depth-degraded retry together stay safely under
-// that outer cap (see the "Polling Configuration" test), leaving headroom for
-// API latency and the S3 upload that follows a successful result.
-export const DEFAULT_POLL_BUDGET_MS = 4 * 60 * 1000; // 4 minutes
-export const DEFAULT_RETRY_POLL_BUDGET_MS = 3 * 60 * 1000; // 3 minutes
-
-function getPollBudgetMs(): number {
-  const raw = parseInt(process.env.DEEP_RESEARCH_POLL_BUDGET_MS || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_POLL_BUDGET_MS;
+// ENG-738: agentModeController's GENERATION_TIMEOUT_MS wraps the ENTIRE
+// agent-mode turn in a Promise.race and kills it — including any tool call
+// still in flight — with no way for the killed call to return a result of its
+// own. The prior fixed 20-minute poll budget here was LONGER than that outer
+// cap's 10-minute default, so for any research that legitimately ran past
+// ~10 minutes, the outer race always won: the whole turn died with a bare 504
+// before this service's own graceful-failure branches ever got a chance to
+// run, and the model never saw any tool result to react to.
+//
+// These budgets are derived from the SAME env var agentModeController reads
+// (not a hardcoded guess) so they can never silently drift back out of sync
+// with the outer cap if that value is ever reconfigured — a fixed constant
+// here would become unsafe (too long again) the moment someone lowered
+// AGENT_MODE_GENERATION_TIMEOUT_MS without knowing this file depends on it.
+function getGenerationTimeoutMs(): number {
+  const raw = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600000; // matches agentModeController's own default
 }
 
-function getRetryPollBudgetMs(): number {
-  const raw = parseInt(process.env.DEEP_RESEARCH_RETRY_POLL_BUDGET_MS || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RETRY_POLL_BUDGET_MS;
+// Reserved off the top of the outer timeout for: the interactions.create()
+// call, the S3 upload of the final (or partial) content, and — critically —
+// the LLM turn that synthesizes the assistant's reply AFTER the tool result
+// comes back, which still has to complete before the SAME outer deadline.
+export const RESEARCH_TIME_BUFFER_MS = 3 * 60 * 1000;
+// Fixed slice reserved for the one depth-degraded retry pass, whenever the
+// requested depth actually has somewhere cheaper to fall back to.
+export const RETRY_SHARE_MS = 2 * 60 * 1000;
+const MIN_POLL_BUDGET_MS = 60000; // never poll for less than one useful minute
+
+function usableResearchBudgetMs(): number {
+  return Math.max(MIN_POLL_BUDGET_MS, getGenerationTimeoutMs() - RESEARCH_TIME_BUFFER_MS);
+}
+
+/**
+ * Primary-attempt poll budget. When the requested depth CAN'T degrade further
+ * (already 'overview', or no depth given — e.g. the createBlogArticle caller),
+ * no retry will ever follow, so the primary attempt gets the full usable
+ * budget instead of artificially giving up early to reserve time nothing will
+ * use.
+ */
+export function getPollBudgetMs(canDegrade: boolean): number {
+  const override = parseInt(process.env.DEEP_RESEARCH_POLL_BUDGET_MS || '', 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  const usable = usableResearchBudgetMs();
+  return canDegrade ? Math.max(MIN_POLL_BUDGET_MS, usable - RETRY_SHARE_MS) : usable;
+}
+
+export function getRetryPollBudgetMs(): number {
+  const override = parseInt(process.env.DEEP_RESEARCH_RETRY_POLL_BUDGET_MS || '', 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  // Cap at whatever the primary (degradable) attempt's budget actually left
+  // behind — RETRY_SHARE_MS is a ceiling, not a guarantee. Without this cap,
+  // a squeezed outer timeout (AGENT_MODE_GENERATION_TIMEOUT_MS lowered, or
+  // getPollBudgetMs(true) hitting its MIN_POLL_BUDGET_MS floor) could let
+  // primary + retry exceed the usable budget again — the exact class of bug
+  // this file exists to prevent.
+  const usable = usableResearchBudgetMs();
+  const remaining = Math.max(MIN_POLL_BUDGET_MS, usable - getPollBudgetMs(true));
+  return Math.min(RETRY_SHARE_MS, remaining);
 }
 
 // Depth ladder for the automatic degrade-on-timeout retry. 'overview' is the
@@ -42,6 +79,13 @@ interface PollResult {
   interaction: any;
   status: PollStatus;
   error?: string;
+}
+
+interface ResearchAttempt {
+  depth: string | undefined;
+  agent: string;
+  pollResult: PollResult;
+  researchText: string;
 }
 
 /**
@@ -324,13 +368,37 @@ export class DeepResearchService {
     };
   }
 
+  /**
+   * Best-effort cancel of a background interaction we're no longer reading
+   * from (ENG-738). A 'timeout'/'invalid'/'poll_error' interaction was
+   * started with background: true and keeps running — and being billed —
+   * server-side on Gemini's end even after we stop polling it; a 'completed'
+   * or 'failed' interaction is already terminal and has nothing left to
+   * cancel. Fire-and-forget and fully guarded, matching the metering guard in
+   * performDeepResearch: cleanup must never delay or break the research
+   * result itself.
+   */
+  private abandonInteraction(ai: any, pollResult: PollResult): void {
+    const id = pollResult?.interaction?.id;
+    if (!id || pollResult.status === 'completed' || pollResult.status === 'failed') {
+      return;
+    }
+    try {
+      void Promise.resolve(ai.interactions.cancel(id)).catch((error: any) => {
+        console.warn(`Deep research: failed to cancel abandoned interaction ${id}:`, error?.message || error);
+      });
+    } catch (error: any) {
+      console.warn(`Deep research: failed to cancel abandoned interaction ${id}:`, error?.message || error);
+    }
+  }
+
   /** Start one interaction at the given depth and poll it to completion or budget exhaustion. */
   private async runResearchAttempt(
     ai: any,
     params: DeepResearchParams,
     depth: string | undefined,
     budgetMs: number,
-  ): Promise<{ depth: string | undefined; agent: string; pollResult: PollResult; researchText: string }> {
+  ): Promise<ResearchAttempt> {
     const researchInput = this.buildResearchInput(params, depth);
     const agent = this.selectAgent(depth);
     console.log(`Deep Research Prompt: ${researchInput}`);
@@ -367,9 +435,12 @@ export class DeepResearchService {
       const ai = await getGeminiClient({ userId: params.userId, feature: 'content_gen' }, apiKey);
 
       const requestedDepth = params.depth;
-      const primaryAttempt = await this.runResearchAttempt(ai, params, requestedDepth, getPollBudgetMs());
+      const degradedDepth = requestedDepth ? DEPTH_DEGRADE[requestedDepth] : undefined;
+      const canDegrade = Boolean(degradedDepth);
+      const primaryAttempt = await this.runResearchAttempt(ai, params, requestedDepth, getPollBudgetMs(canDegrade));
 
       let finalAttempt = primaryAttempt;
+      let retryAttempt: ResearchAttempt | undefined;
       let degradedFrom: string | undefined;
       let actualDepth: string | undefined;
 
@@ -380,22 +451,29 @@ export class DeepResearchService {
       // degrade-and-retry happens inside this one tool call, so the model never
       // needs to (and is told not to, see performDeepResearchTool) re-issue the
       // identical failing call itself.
-      if (primaryAttempt.pollResult.status === 'timeout') {
-        const degradedDepth = requestedDepth ? DEPTH_DEGRADE[requestedDepth] : undefined;
-        if (degradedDepth) {
-          console.warn(
-            `Deep research at depth "${requestedDepth}" timed out; retrying once at reduced depth "${degradedDepth}".`
-          );
-          const retryAttempt = await this.runResearchAttempt(ai, params, degradedDepth, getRetryPollBudgetMs());
-          if (
-            retryAttempt.pollResult.status === 'completed' ||
-            retryAttempt.researchText.length > primaryAttempt.researchText.length
-          ) {
-            finalAttempt = retryAttempt;
-            degradedFrom = requestedDepth;
-            actualDepth = degradedDepth;
-          }
+      if (primaryAttempt.pollResult.status === 'timeout' && degradedDepth) {
+        console.warn(
+          `Deep research at depth "${requestedDepth}" timed out; retrying once at reduced depth "${degradedDepth}".`
+        );
+        retryAttempt = await this.runResearchAttempt(ai, params, degradedDepth, getRetryPollBudgetMs());
+        if (
+          retryAttempt.pollResult.status === 'completed' ||
+          retryAttempt.researchText.length > primaryAttempt.researchText.length
+        ) {
+          finalAttempt = retryAttempt;
+          degradedFrom = requestedDepth;
+          actualDepth = degradedDepth;
         }
+      }
+
+      // Both the primary and retry interactions run in the background
+      // (background: true) — whichever one we did NOT keep is still running
+      // server-side with nothing left to read it. Free it up rather than pay
+      // for an abandoned run. Best-effort: never lets cleanup delay or break
+      // the actual research result.
+      if (retryAttempt) {
+        const loserAttempt = finalAttempt === retryAttempt ? primaryAttempt : retryAttempt;
+        this.abandonInteraction(ai, loserAttempt.pollResult);
       }
 
       if (finalAttempt.pollResult.status === 'completed' && finalAttempt.researchText) {
@@ -452,9 +530,12 @@ export class DeepResearchService {
         };
       }
 
-      // Not completed — an honest failure. Only claim partial progress when
-      // real, non-empty content was actually gathered (mirrors the ENG-510
-      // "genuinely empty must not be dressed up as a partial success" rule).
+      // Not completed and we're giving up on it — nothing will poll it again.
+      this.abandonInteraction(ai, finalAttempt.pollResult);
+
+      // An honest failure. Only claim partial progress when real, non-empty
+      // content was actually gathered (mirrors the ENG-510 "genuinely empty
+      // must not be dressed up as a partial success" rule).
       const errorMessage = finalAttempt.pollResult.error
         || `Deep research ended with status: ${finalAttempt.pollResult.interaction?.status}. Please try again.`;
 
