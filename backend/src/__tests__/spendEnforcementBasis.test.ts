@@ -17,13 +17,14 @@ import {
   resolveEnforcementCostBasisMicroUsd,
   SPEND_LEDGER_ENFORCEMENT_ENV,
   SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV,
+  SPEND_PROJECTION_MAX_STALENESS_MIN_ENV,
 } from "../services/spendEnforcementBasis";
 
 const ACCT = "bb07579b-2d82-4d45-894f-ec74ec7e78c2";
 const MONTH = "2026-09";
 
 /** A persisted projection whose settled all-vendor total is `settledMicroUsd`. */
-function projection(settledMicroUsd: number): PersistedProjection {
+function projection(settledMicroUsd: number, computedAt = "2026-09-17T00:00:00.000Z"): PersistedProjection {
   return {
     billingUserId: ACCT,
     billingMonth: MONTH,
@@ -42,7 +43,7 @@ function projection(settledMicroUsd: number): PersistedProjection {
     reservedEventCount: 0,
     voidedEventCount: 0,
     excludedEventCount: 0,
-    computedAt: "2026-09-17T00:00:00.000Z",
+    computedAt,
     availableMicroUsd: 0,
   };
 }
@@ -54,6 +55,7 @@ describe("spendEnforcementBasis", () => {
     getProjectionMock.mockReset();
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ENV];
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV];
+    delete process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV];
   });
 
   afterAll(() => {
@@ -99,7 +101,7 @@ describe("spendEnforcementBasis", () => {
         billingMonth: MONTH,
         legacyRawCostUsedMicroUsd: 115_740_000,
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: false });
+      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: false, stale: false });
       expect(getProjectionMock).not.toHaveBeenCalled();
     });
 
@@ -112,7 +114,7 @@ describe("spendEnforcementBasis", () => {
         billingMonth: MONTH,
         legacyRawCostUsedMicroUsd: 115_740_000,
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 218_240_000, basis: "spend_ledger", projectionMissing: false });
+      expect(res).toEqual({ rawCostUsedMicroUsd: 218_240_000, basis: "spend_ledger", projectionMissing: false, stale: false });
       expect(getProjectionMock).toHaveBeenCalledWith(ACCT, MONTH);
     });
 
@@ -124,7 +126,7 @@ describe("spendEnforcementBasis", () => {
         billingMonth: MONTH,
         legacyRawCostUsedMicroUsd: 115_740_000,
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true });
+      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
     });
 
     it("fails OPEN to the legacy figure when the ledger read throws", async () => {
@@ -136,7 +138,7 @@ describe("spendEnforcementBasis", () => {
         billingMonth: MONTH,
         legacyRawCostUsedMicroUsd: 115_740_000,
       });
-      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true });
+      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: true, stale: false });
       errSpy.mockRestore();
     });
 
@@ -179,6 +181,64 @@ describe("spendEnforcementBasis", () => {
         legacyRawCostUsedMicroUsd: 10,
       });
       expect(frac.rawCostUsedMicroUsd).toBe(101);
+    });
+  });
+
+  describe("computedAt staleness guard", () => {
+    it("is disabled by default: an ancient snapshot is still used when no threshold is set", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      getProjectionMock.mockResolvedValue(projection(218_240_000, "2000-01-01T00:00:00.000Z"));
+      const res = await resolveEnforcementCostBasisMicroUsd({
+        billingUserId: ACCT,
+        billingMonth: MONTH,
+        legacyRawCostUsedMicroUsd: 115_740_000,
+      });
+      expect(res.basis).toBe("spend_ledger");
+      expect(res.stale).toBe(false);
+    });
+
+    it("fails OPEN to legacy when the snapshot is older than the threshold", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV] = "60";
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const old = new Date(Date.now() - 120 * 60_000).toISOString(); // 2h old
+      getProjectionMock.mockResolvedValue(projection(218_240_000, old));
+      const res = await resolveEnforcementCostBasisMicroUsd({
+        billingUserId: ACCT,
+        billingMonth: MONTH,
+        legacyRawCostUsedMicroUsd: 115_740_000,
+      });
+      expect(res).toEqual({ rawCostUsedMicroUsd: 115_740_000, basis: "legacy", projectionMissing: false, stale: true });
+      warn.mockRestore();
+    });
+
+    it("uses the ledger basis when the snapshot is within the threshold", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV] = "60";
+      const fresh = new Date(Date.now() - 5 * 60_000).toISOString(); // 5m old
+      getProjectionMock.mockResolvedValue(projection(218_240_000, fresh));
+      const res = await resolveEnforcementCostBasisMicroUsd({
+        billingUserId: ACCT,
+        billingMonth: MONTH,
+        legacyRawCostUsedMicroUsd: 115_740_000,
+      });
+      expect(res.basis).toBe("spend_ledger");
+      expect(res.stale).toBe(false);
+    });
+
+    it("treats a missing/unparseable computedAt as stale when the guard is on", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV] = "60";
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      getProjectionMock.mockResolvedValue(projection(218_240_000, "not-a-date"));
+      const res = await resolveEnforcementCostBasisMicroUsd({
+        billingUserId: ACCT,
+        billingMonth: MONTH,
+        legacyRawCostUsedMicroUsd: 115_740_000,
+      });
+      expect(res.basis).toBe("legacy");
+      expect(res.stale).toBe(true);
+      warn.mockRestore();
     });
   });
 });
