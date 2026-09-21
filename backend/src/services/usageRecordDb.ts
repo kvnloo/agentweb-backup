@@ -400,6 +400,15 @@ export const usageRecordDb = {
       // projection. Fire-and-forget and never-throws — observe-only maintenance
       // must not fail the charging transaction it rides behind. Only on a
       // genuinely new write ("applied"); a duplicate replay must not double-add.
+      //
+      // At-least-once, deliberately (CodeRabbit F5, skipped): this delivery is
+      // best-effort, so a crash between the commit and this call drops the
+      // projection update. That is acceptable while the rail is DARK — the drift
+      // it causes is healed by the periodic reconcile (spendReconciliation) and
+      // the backfill (spendProjectionBackfill), and nothing enforces on the
+      // projection until AW_SPEND_LEDGER_ENFORCEMENT flips. Durable delivery (a
+      // DynamoDB-stream/outbox consumer) is a pre-flip follow-up, not built here;
+      // a stream/outbox would be disproportionate for an observe-only rail.
       void applySettledSpendEvents(spendEvents);
       return "applied";
     } catch (error: any) {
@@ -476,6 +485,11 @@ export const usageRecordDb = {
       // ENG-1250 §3b: fold this just-committed settled event into the persisted
       // projection (fire-and-forget, never-throws). "applied" only, so a
       // deduped replay never double-adds.
+      //
+      // At-least-once, deliberately (CodeRabbit F5, skipped): a crash before this
+      // runs drops the update; the reconcile + backfill heal the drift and
+      // nothing enforces until the flag flips, so a stream/outbox is a pre-flip
+      // follow-up, not warranted for this dark, observe-only rail.
       void applySettledSpendEvents([spendEvent]);
       return "applied";
     } catch (error: any) {
