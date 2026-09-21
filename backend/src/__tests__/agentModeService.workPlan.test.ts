@@ -249,6 +249,30 @@ describe('AgentModeService - Work Plan', () => {
         expect.objectContaining({ autocomplete: false })
       );
     });
+
+    it('preserves an explicit autocomplete true on a non-scheduled session (zero regression)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'regular',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Client Onboarding',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        true
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
   });
 
   describe('modifyWorkPlan', () => {
