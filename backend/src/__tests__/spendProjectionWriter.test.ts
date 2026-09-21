@@ -113,4 +113,37 @@ describe("applySettledSpendEvents", () => {
     await applySettledSpendEvents([], NOW);
     expect(updateMock).not.toHaveBeenCalled();
   });
+
+  it("guards computedAt forward-only: an older now never clobbers a newer stamp, but settled/count still land", async () => {
+    // The guarded SET+ADD fails the computedAt<=:now condition (a newer stamp is
+    // present); the retry must be ADD-only so the settled delta is never dropped.
+    updateMock
+      .mockImplementationOnce(() => ({
+        promise: () => Promise.reject(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" })),
+      }))
+      .mockImplementationOnce(() => ({ promise: () => Promise.resolve({}) }));
+
+    await applySettledSpendEvents([settled({ costMicroUsd: 500 })], "2020-01-01T00:00:00.000Z");
+
+    expect(updateMock).toHaveBeenCalledTimes(2);
+    const guarded = updateMock.mock.calls[0][0];
+    expect(guarded.UpdateExpression).toBe("SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c");
+    expect(guarded.ConditionExpression).toBe("attribute_not_exists(computedAt) OR computedAt <= :now");
+    const addOnly = updateMock.mock.calls[1][0];
+    expect(addOnly.UpdateExpression).toBe("ADD settledMicroUsd :m, settledEventCount :c");
+    expect(addOnly.UpdateExpression).not.toContain("computedAt");
+    expect(addOnly.ConditionExpression).toBeUndefined();
+    expect(addOnly.ExpressionAttributeValues).toEqual({ ":m": 500, ":c": 1 });
+  });
+
+  it("stays never-throws even if the ADD-only fallback also fails", async () => {
+    updateMock
+      .mockImplementationOnce(() => ({
+        promise: () => Promise.reject(Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" })),
+      }))
+      .mockImplementationOnce(() => ({ promise: () => Promise.reject(new Error("dynamo down")) }));
+    const err = jest.spyOn(console, "error").mockImplementation(() => {});
+    await expect(applySettledSpendEvents([settled()], "2020-01-01T00:00:00.000Z")).resolves.toBeUndefined();
+    err.mockRestore();
+  });
 });
