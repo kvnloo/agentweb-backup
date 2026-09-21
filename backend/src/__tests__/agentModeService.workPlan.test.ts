@@ -178,6 +178,77 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(chatbotDb.updateCalledFunctions).toHaveBeenCalledWith(mockSessionId, {});
     });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model omits it — nobody is present to approve interactive steps', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+        // autocomplete intentionally omitted, like the production run that stalled
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model explicitly requests false', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        false
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('leaves autocomplete as requested on a non-scheduled session (zero regression)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'regular',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Client Onboarding',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: false })
+      );
+    });
   });
 
   describe('modifyWorkPlan', () => {
@@ -319,6 +390,33 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('No work plan found');
+    });
+
+    it('ENG-2058: forces autocomplete true on a scheduled session even when the model requests false', async () => {
+      const freshWorkPlan = JSON.parse(JSON.stringify({ ...existingWorkPlan, autocomplete: false }));
+
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+        workPlan: freshWorkPlan,
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).modifyWorkPlan(
+        [],
+        [],
+        mockSessionId,
+        false
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
     });
   });
 
