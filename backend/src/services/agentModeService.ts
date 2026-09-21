@@ -108,13 +108,6 @@ import { RunEmitter } from './agentMode/streamEvents';
 // the outreach-onboarding prospect preview cannot drift apart.
 import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
-  applyAnswer,
-  buildPendingUserQuestion,
-  checkQuestionGate,
-  findAnsweredObjectiveCandidate,
-  summarizeAnsweredObjectiveQuestions,
-  findQuestionByKind,
-  renderQuestionPrompt,
   verifyExplicitStatement,
   type AskUserQuestionOption,
   type PendingUserQuestion,
@@ -21103,10 +21096,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * (verified explicit-statement) success durable for the rest of the session,
    * the same way a card answer is — so a target-confirmation retry (or any
    * later CAMPAIGN CREATE in this session) finds it via Path 2 instead of
-   * re-deriving it against a possibly different later message. Synthesizes a
-   * single-option "question" that's already answered — never shown to the
-   * user (no card was needed; the user already stated it themselves), just a
-   * structural record for the gate to find.
+   * re-deriving it against a possibly different later message.
+   *
+   * ENG-1635/1644 PR2: writes to session.objectiveConfirmations (a plain
+   * advisory map field, see its own doc comment on ChatSession) instead of
+   * the old pendingUserQuestion primitive — this record is never shown to
+   * the user as a card (no card was needed; the user already stated it
+   * themselves), and the deck/message-history mechanism that replaced
+   * pendingUserQuestion for real cards has no equivalent "never rendered"
+   * mode, so reusing it here would risk a synthetic bookkeeping message
+   * actually appearing in the user's chat transcript.
    */
   private async persistExplicitObjectiveConfirmation(
     sessionId: string,
@@ -21115,43 +21114,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     objectiveKind: string,
     sourceQuestionId?: string,
   ): Promise<void> {
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Meta campaign objective (confirmed from the user\'s own explicit statement).',
-      options: [
-        {
-          id: 'confirmed',
-          label: objective,
-          consequence: 'Confirmed by the user\'s own words — not shown as a card.',
-          recommended: true,
-          why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
-        },
-        {
-          // Structural placeholder only — the primitive requires 2–4 options
-          // and exactly one recommended. This one was never actually offered;
-          // it can never be selected since this record is built pre-answered.
-          id: 'not-applicable',
-          label: 'N/A',
-          consequence: 'Not a real choice — this record reflects an explicit user statement, not a live card.',
-          payload: {},
-        },
-      ],
-      immutable: true,
-      allowEmmaDecide: false,
-      kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-    const answered = applyAnswer(question, {
-      optionId: 'confirmed',
-      delegated: false,
+    await chatbotDb.updateSessionObjectiveConfirmation(sessionId, objectiveKind, {
+      objective,
       answeredBy: 'user',
-      rationale: sourceQuestionId
-        ? `Consumed answered objective card ${sourceQuestionId}`
-        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
+      quote: sourceQuestionId ? `Consumed answered objective card ${sourceQuestionId}` : quote,
     });
-    await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
   }
 
   /**
@@ -21165,8 +21133,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    *
    * 1. Explicitly stated by the user THIS turn — verified against the actual
    *    message text (verifyExplicitStatement), never trusted on a model flag.
-   * 2. A prior ask_user_question (kind 'meta_objective') answered by the user
-   *    or delegation — live or archived in this session (checkQuestionGate).
+   * 2. A prior confirmation already settled this session — objectiveConfirmations
+   *    (persistExplicitObjectiveConfirmation), a prior answered deck-of-one item
+   *    (findAnsweredDeckItemByKind), answered by the user or delegation.
    * 3. Neither: this method emits the blocking question itself (grounded,
    *    static per the 80/20 design) and refuses the create.
    */
@@ -21258,14 +21227,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // the claim; fall through to the deterministic ask gate below.
     }
 
-    // Path 2: already settled — via a prior deck-of-one item (the current
-    // mechanism, post ask_user_question-retirement) or a prior
-    // ask_user_question (legacy — kept as a fallback for any record settled
-    // before that migration), scoped to THIS campaign (see objectiveKind
-    // above). Deck-history has no archive field (approvalDeck.ts file
-    // header) — findAnsweredDeckItemByKind scans message-metadata pairs, the
-    // same self-contained pairing the frontend already reconstructs
-    // historical cards from.
+    // Path 2: already settled — cheapest check first (ENG-1635/1644 PR2:
+    // objectiveConfirmations, no message fetch needed — this is now the
+    // primary sink persistExplicitObjectiveConfirmation writes to), then a
+    // prior deck-of-one item (the current mechanism, post
+    // ask_user_question-retirement), then a prior ask_user_question (legacy
+    // — kept as a fallback for any record settled before that migration,
+    // deleted in PR2 Part B once the 40 pre-migration stale records are
+    // drained), scoped to THIS campaign (see objectiveKind above).
+    const session = await chatbotDb.getChatSession(sessionId);
+    const objectiveConfirmation = session?.objectiveConfirmations?.[objectiveKind];
+    if (objectiveConfirmation && AgentModeService.META_OBJECTIVE_VALUES.includes(objectiveConfirmation.objective)) {
+      return { allowed: true, objective: objectiveConfirmation.objective };
+    }
+    // Deck-history has no archive field (approvalDeck.ts file header) —
+    // findAnsweredDeckItemByKind scans message-metadata pairs, the same
+    // self-contained pairing the frontend already reconstructs historical
+    // cards from.
     const deckHistoryMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     const deckOutcome = findAnsweredDeckItemByKind(deckHistoryMessages as any, objectiveKind);
     if (deckOutcome.found) {
@@ -21275,41 +21253,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return { allowed: true, objective };
       }
     }
-    const session = await chatbotDb.getChatSession(sessionId);
-    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
-    const outcome = checkQuestionGate(candidate);
-    if (outcome.allowed) {
-      const objective = (outcome.payload as any)?.objective;
-      if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
-        return { allowed: true, objective };
-      }
-    }
-
-    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
-      session?.pendingUserQuestion,
-      session?.answeredQuestions,
-      AgentModeService.META_OBJECTIVE_VALUES,
-    );
-    const looseCandidate = findAnsweredObjectiveCandidate(
-      session?.pendingUserQuestion,
-      session?.answeredQuestions,
-      {
-        accountId: account_id,
-        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
-        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
-        consumedQuestionIds,
-      },
-    );
-    if (looseCandidate) {
-      await this.persistExplicitObjectiveConfirmation(
-        sessionId,
-        looseCandidate.objective,
-        `answered objective card ${looseCandidate.question.questionId}`,
-        objectiveKind,
-        looseCandidate.question.questionId,
-      );
-      return { allowed: true, objective: looseCandidate.objective };
-    }
+    // ENG-1635/1644 PR2: the legacy findQuestionByKind/checkQuestionGate and
+    // findAnsweredObjectiveCandidate/summarizeAnsweredObjectiveQuestions
+    // fallbacks (scanned session.pendingUserQuestion/answeredQuestions) are
+    // deleted — nothing writes those fields anymore (persistExplicitObjectiveConfirmation
+    // migrated to objectiveConfirmations, checked above), and the pre-migration
+    // stale records those fallbacks existed to serve have been drained (see
+    // the one-off migration that nulled them, PR2 Part E).
 
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
@@ -21367,11 +21317,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // deck primitive (ApprovalDeckItem/QuestionDeckQuestionInput carry only
     // `question`) — folded into the question text itself rather than adding a
     // schema field for a narrow, purely informational retry hint.
-    // hasAnsweredObjectiveCard itself still only scans the LEGACY
-    // pendingUserQuestion/answeredQuestions history
-    // (summarizeAnsweredObjectiveQuestions, above) — a deck-answered near-miss
-    // from a different campaign won't trigger this hint post-migration;
-    // accepted as a low-stakes UX-only gap, not a correctness one.
+    // ENG-1635/1644 PR2: "answered an objective question earlier, just not
+    // for THIS campaign" now derives from objectiveConfirmations (any entry
+    // at all, regardless of key) rather than the deleted legacy scan — same
+    // near-miss UX hint, sourced from the current sink instead of a decaying
+    // legacy one.
+    const hasAnsweredObjectiveCard = Object.keys(session?.objectiveConfirmations ?? {}).length > 0;
     const question = hasAnsweredObjectiveCard
       ? `You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.\n\n${questionText}`
       : questionText;

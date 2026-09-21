@@ -218,75 +218,27 @@ mcpToolRegistry.register({
   }
 });
 
-// ENG-400: MCP transport for the ENG-396 AskUserQuestion primitive. Without
-// this, a blocking objective card fired by Emma over MCP (Claude.ai driving
-// `emma_send_message`) degrades to prose — the client sees `pendingUserQuestion`
-// on emma_get_session but has no way to resolve it STRUCTURALLY, so a plain
-// reply (e.g. "Leads") never reaches the answer channel and the write gate
-// stays blocked forever (the one-live-question guard also prevents Emma from
-// re-asking). This posts through the SAME structured `questionAnswer` channel
-// the chat card uses — the gate's human-attribution guarantee is unchanged,
-// it just has a second front door. Prose is NEVER accepted as an answer here
-// either: a plain emma_send_message reply to an awaiting question still just
-// abandons the card server-side (agentModeController.generateResponse), same
-// as typing past the card in the web UI.
-mcpToolRegistry.register({
-  name: 'emma_answer_question',
-  definition: {
-    name: 'emma_answer_question',
-    description:
-      'Answer a blocking AskUserQuestion card on an Emma session (see pendingUserQuestion on emma_get_session) — the ONLY way to resolve one over MCP. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open question instead, same as typing past the card in the chat UI.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        session_id: { type: 'string', description: 'The chat session ID with the awaiting question.' },
-        question_id: { type: 'string', description: 'The pendingUserQuestion.questionId from emma_get_session — must match the currently awaiting question.' },
-        option_id: { type: 'string', description: 'The chosen option id. Required unless delegate is true.' },
-        delegate: { type: 'boolean', description: 'Set true for "Let Emma decide" — proceeds with the recommended option, logged as a delegation. option_id is ignored when true.' },
-        label: { type: 'string', description: 'Optional human-readable text to show as the chat message for this selection (e.g. the option label). Defaults to option_id, or "Let Emma decide" when delegating.' },
-      },
-      required: ['session_id', 'question_id'],
-    },
-  },
-  execute: async (args: any, context: any) => {
-    const delegate = args.delegate === true;
-    if (!delegate && (typeof args.option_id !== 'string' || args.option_id.trim() === '')) {
-      return jsonResult({ success: false, message: 'option_id is required unless delegate is true.' });
-    }
-    const label = typeof args.label === 'string' && args.label.trim() !== ''
-      ? args.label
-      : delegate ? 'Let Emma decide' : args.option_id;
+// ENG-1635/1644 PR2: the emma_answer_question tool (ENG-400's original MCP
+// transport for the AskUserQuestion primitive) is deleted — it posted a
+// structured `questionAnswer` body that generateResponse no longer handles
+// (nothing ever populates session.pendingUserQuestion for it to resolve
+// against anymore). emma_answer_question_deck below is the sole, sufficient
+// MCP transport for every producer that used to reach this primitive.
 
-    const data = await mcpFetch({
-      method: 'POST',
-      path: '/api/agent-mode/generate',
-      context: ctx(context),
-      body: {
-        sessionId: args.session_id,
-        userMessage: label,
-        questionAnswer: { questionId: args.question_id, optionId: args.option_id, delegated: delegate },
-      },
-    });
-    return jsonResult(data);
-  },
-});
-
-// ENG-1635/1644 (ask_user_question retirement): the deck-of-one MCP transport,
-// sibling to emma_answer_question above. ask_user_question and the Meta
-// objective-confirmation gate no longer populate pendingUserQuestion at all —
-// they build a single-item pendingApprovalDeck instead, through the SAME
-// present_question_deck deck mechanism, for UI consistency with the rest of
-// the approval deck (ENG-1635/1644). Without this tool, an MCP client would
-// see pendingApprovalDeck on emma_get_session but have no structured way to
-// resolve it — the exact dead-end emma_answer_question was built to prevent
-// for the old primitive. Posts through the same `deckAnswer` channel the
-// chat card uses (POST /api/agent-mode/generate body.deckAnswer); prose is
-// never accepted as an answer here either.
+// ENG-1635/1644 (ask_user_question retirement): the deck-of-one MCP transport.
+// ask_user_question and the Meta objective-confirmation gate no longer
+// populate pendingUserQuestion at all — they build a single-item
+// pendingApprovalDeck instead, through the SAME present_question_deck deck
+// mechanism, for UI consistency with the rest of the approval deck. Without
+// this tool, an MCP client would see pendingApprovalDeck on emma_get_session
+// but have no structured way to resolve it. Posts through the same
+// `deckAnswer` channel the chat card uses (POST /api/agent-mode/generate
+// body.deckAnswer); prose is never accepted as an answer here either.
 mcpToolRegistry.register({
   name: 'emma_answer_question_deck',
   definition: {
     name: 'emma_answer_question_deck',
-    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the deck-of-one equivalent of emma_answer_question, used by ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
+    description: 'Answer a blocking single-question deck card on an Emma session (see pendingApprovalDeck on emma_get_session, when it has exactly one item) — the sole MCP transport for ask_user_question and the Meta campaign-objective confirmation. Provide option_id for a direct pick, or delegate:true for "Let Emma decide" (takes the recommended option). A plain emma_send_message reply is NOT an answer — it abandons the open deck instead, same as typing past the card in the chat UI.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -330,7 +282,7 @@ mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking legacy AskUserQuestion is awaiting or was recently answered, and pendingApprovalDeck when a blocking question/approval deck is (a single-item deck is the deck-of-one that ask_user_question and the Meta objective confirmation now use) — check status before assuming a run has completed; resolve an "awaiting" pendingUserQuestion with emma_answer_question, or an "awaiting" pendingApprovalDeck with emma_answer_question_deck. Never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID. Includes pendingApprovalDeck when a blocking question/approval deck is awaiting (a single-item deck is the deck-of-one that ask_user_question and the Meta objective confirmation use) — check status before assuming a run has completed; resolve an "awaiting" pendingApprovalDeck with emma_answer_question_deck, never with a plain emma_send_message reply. pendingUserQuestion may still appear on a session that predates this mechanism, but nothing produces a new one — always resolve via pendingApprovalDeck.',
     inputSchema: {
       type: 'object',
       properties: { session_id: { type: 'string', description: 'The session ID' } },

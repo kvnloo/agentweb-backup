@@ -75,8 +75,7 @@ mcpToolRegistry.register({
       'Starts a new task unless you pass task_id to continue an existing one. ' +
       'Usually returns the finished result directly (status "complete"). If status is "running" or "unconfirmed", ' +
       'call emma_get_session with session_id set to the returned task_id — "unconfirmed" means the result is real but we could not verify ' +
-      'Emma is not waiting on you. When status is "awaiting_input", answer with emma_answer_question (awaiting_question set) or ' +
-      'emma_answer_question_deck (awaiting_question_deck set).',
+      'Emma is not waiting on you. When status is "awaiting_input", answer with emma_answer_question_deck (awaiting_question_deck set).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -142,7 +141,9 @@ mcpToolRegistry.register({
     // present_question_deck or a write-deck always needs a live interactive
     // human and isn't something this synchronous status check resolves either
     // way.
-    let pending: any = null;
+    // PR2: pendingUserQuestion is dead — nothing populates it anymore
+    // (updateSessionAskUserQuestion, its only writer, is deleted), so the
+    // deck-of-one slot below is the only thing this check needs to look at.
     let pendingDeck: any = null;
     let confirmationFailed = false;
     if (!stillBuilding) {
@@ -152,9 +153,8 @@ mcpToolRegistry.register({
           path: `/api/agent-mode/session/${taskId}`,
           context: ctx(context),
         });
-        pending = session?.pendingUserQuestion ?? null;
         const deck = session?.pendingApprovalDeck;
-        if (!pending && deck?.status === 'awaiting' && Array.isArray(deck.items) && deck.items.length === 1 && !deck.items[0]?.metaWriteManifestDigest) {
+        if (deck?.status === 'awaiting' && Array.isArray(deck.items) && deck.items.length === 1 && !deck.items[0]?.metaWriteManifestDigest) {
           pendingDeck = deck;
         }
       } catch {
@@ -173,7 +173,7 @@ mcpToolRegistry.register({
     // still be blocked on their answer — the exact failure this confirmation
     // step exists to prevent. An unconfirmed turn gets its own non-terminal
     // status so the contract and the flag cannot disagree.
-    const status = pending || pendingDeck
+    const status = pendingDeck
       ? 'awaiting_input'
       : stillBuilding
         ? 'running'
@@ -189,12 +189,13 @@ mcpToolRegistry.register({
       // blocking question. A failed check is not a negative result.
       completion_confirmed: !stillBuilding && !confirmationFailed,
       result: data?.content ?? data?.message ?? null,
-      awaiting_question: pending ?? null,
+      // PR2: always null now — kept in the response shape (not removed) so an
+      // existing MCP client's destructuring/type expectations don't break.
+      // Nothing populates session.pendingUserQuestion anymore.
+      awaiting_question: null,
       awaiting_question_deck: pendingDeck ?? null,
-      next: pending
-        ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
-        : pendingDeck
-          ? 'Emma is waiting on an answer. Use emma_answer_question_deck — a plain message abandons the question.'
+      next: pendingDeck
+        ? 'Emma is waiting on an answer. Use emma_answer_question_deck — a plain message abandons the question.'
         : stillBuilding
           ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
           : confirmationFailed
