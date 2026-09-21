@@ -27,7 +27,13 @@ const { sendLeadNotification } = require('../services/slackService');
 const { userDb } = require('../services/db');
 const whatsapp = require('../services/whatsappService');
 
-const WA = { channel: 'whatsapp' as const, destination: '+14155550123', enabled: true };
+// A verified entry: the person proved they control the number by messaging us a code.
+const WA = {
+  channel: 'whatsapp' as const,
+  destination: '+14155550123',
+  enabled: true,
+  optIn: { at: '2026-08-01T00:00:00.000Z', source: 'inbound_verification', verifiedAt: '2026-08-01T00:00:00.000Z' },
+};
 
 const lead = {
   leadId: 'l1',
@@ -105,5 +111,34 @@ describe('WhatsApp lead alerts', () => {
     sendLeadNotification.mockRejectedValue(new Error('channel_not_found'));
     await notify({ userId: 'u1', email: 'u@e.com', slackChannel: 'C1', messagingChannels: [WA] });
     expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('unverified WhatsApp entry', () => {
+  it('is never messaged, even though it is enabled', async () => {
+    // A number someone merely typed in may be a typo or a stranger's; the shared
+    // business number is not used on it until the person has proven control.
+    await notify({
+      userId: 'u1',
+      email: 'u@e.com',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('is not rescued by an opt-in record that lacks verifiedAt', async () => {
+    await notify({
+      userId: 'u1',
+      email: 'u@e.com',
+      messagingChannels: [
+        {
+          channel: 'whatsapp',
+          destination: '+14155550123',
+          enabled: true,
+          optIn: { at: '2026-08-01T00:00:00.000Z', source: 'settings_ui' },
+        },
+      ],
+    });
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
   });
 });

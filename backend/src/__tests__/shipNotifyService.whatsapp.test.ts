@@ -42,7 +42,13 @@ const base = {
   kind: 'feature_request' as const,
 };
 
-const WA = { channel: 'whatsapp' as const, destination: '+14155550123', enabled: true };
+// A verified entry: the person proved they control the number by messaging us a code.
+const WA = {
+  channel: 'whatsapp' as const,
+  destination: '+14155550123',
+  enabled: true,
+  optIn: { at: '2026-08-01T00:00:00.000Z', source: 'inbound_verification', verifiedAt: '2026-08-01T00:00:00.000Z' },
+};
 
 beforeEach(() => {
   jest.resetAllMocks();
@@ -204,5 +210,27 @@ describe('Slack and WhatsApp as peers', () => {
     await notifyReporterShipped(base);
     expect(whatsapp.sendMessage).not.toHaveBeenCalled();
     expect(postSlackMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('unverified WhatsApp entry', () => {
+  it('is never messaged, and does not stop Slack from being notified', async () => {
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C1'],
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+    expect(postSlackMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports no_channel when unverified WhatsApp is the only thing configured', async () => {
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    await expect(notifyReporterShipped(base)).resolves.toBe('no_channel');
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
   });
 });

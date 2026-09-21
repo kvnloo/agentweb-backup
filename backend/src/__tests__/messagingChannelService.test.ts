@@ -28,6 +28,7 @@ import {
   MESSAGING_CHANNELS,
   type IMessagingChannel,
   type MessagingChannel,
+  explicitChannels,
 } from '../services/messagingChannelService';
 
 jest.mock('../services/db', () => ({
@@ -252,6 +253,29 @@ describe('resolveDestination', () => {
     await expect(resolveDestination({ slackChannels: ['C1'] }, 'whatsapp')).resolves.toBeNull();
   });
 
+  it('resolves a WhatsApp entry only once the person has verified the number', async () => {
+    const entry = { channel: 'whatsapp' as const, destination: '+14155550123', enabled: true };
+    const verified = {
+      ...entry,
+      optIn: { at: '2026-08-01T00:00:00.000Z', source: 'inbound_verification', verifiedAt: '2026-08-01T00:00:01.000Z' },
+    };
+    await expect(resolveDestination({ messagingChannels: [entry] }, 'whatsapp')).resolves.toBeNull();
+    await expect(
+      resolveDestination(
+        { messagingChannels: [{ ...entry, optIn: { at: '2026-08-01T00:00:00.000Z', source: 'settings_ui' } }] },
+        'whatsapp',
+      ),
+    ).resolves.toBeNull();
+    await expect(resolveDestination({ messagingChannels: [verified] }, 'whatsapp')).resolves.toBe(
+      '+14155550123',
+    );
+  });
+
+  it('does not demand verification of Slack, which has no such requirement', async () => {
+    const user = { messagingChannels: [{ channel: 'slack' as const, destination: 'C-explicit', enabled: true }] };
+    await expect(resolveDestination(user, 'slack')).resolves.toBe('C-explicit');
+  });
+
   it('skips a disabled channel entry', async () => {
     const user = {
       messagingChannels: [
@@ -281,5 +305,26 @@ describe('MessagingChannelError', () => {
   it('carries the channel that produced it', () => {
     const err = new MessagingChannelError('boom', 'whatsapp');
     expect(err.channel).toBe('whatsapp');
+  });
+});
+
+describe('explicitChannels', () => {
+  it('returns only what is stored, never the legacy Slack fields folded in', () => {
+    const user = {
+      slackChannels: ['C1'],
+      messagingChannels: [{ channel: 'whatsapp' as const, destination: '+14155550123', enabled: true }],
+    };
+    expect(explicitChannels(user)).toEqual(user.messagingChannels);
+    expect(explicitChannels({ slackChannels: ['C1'] })).toEqual([]);
+  });
+
+  it('drops malformed entries and tolerates a missing user or field', () => {
+    expect(explicitChannels(null)).toEqual([]);
+    expect(explicitChannels({})).toEqual([]);
+    expect(
+      explicitChannels({
+        messagingChannels: [null, { channel: 'whatsapp', destination: '' }, { destination: 'x' }] as any,
+      }),
+    ).toEqual([]);
   });
 });
