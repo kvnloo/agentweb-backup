@@ -923,6 +923,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     expect(deps.llmClassifySmartFields).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ name: 'industry' })]),
+      USER_ID, // ENG-1858: the saving user, so the call is metered to them
     );
   });
 
@@ -1354,6 +1355,7 @@ describe('setEnrichmentConfig — smart field classification', () => {
 
     expect(deps.llmClassifySmartFields).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ name: 'industry' })]),
+      USER_ID, // ENG-1858: the saving user, so the call is metered to them
     );
   });
 

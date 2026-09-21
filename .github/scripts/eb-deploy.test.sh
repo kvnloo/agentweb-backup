@@ -35,9 +35,18 @@ install_mock_aws() {
 #   update_results     one "<exit>|<stderr message>" per update-environment call
 #   describe_states    one "<Status>|<Health>|<VersionLabel>" per describe call,
 #                      or "NOTFOUND", or "ERROR|<message>". Last line repeats.
+#   clock              ENG-1522: the virtual clock eb-deploy.sh reads through
+#                      EB_CLOCK_FILE. Advanced by clock_tick on every
+#                      describe-environments call, so one tick == one poll.
+#   clock_tick         seconds added per poll (default 1).
 MOCK_DIR="${EB_MOCK_DIR:?EB_MOCK_DIR must be set}"
 
 operation="${2:-}"
+all_args="$*"
+
+# Preserve the exact AWS operation order so lifecycle-hook tests can prove the
+# hook is installed before update-environment starts terminating old instances.
+printf '%s\n' "$operation" >>"${MOCK_DIR}/operations"
 
 query=''
 while [ "$#" -gt 0 ]; do
@@ -80,6 +89,17 @@ case "$operation" in
 
   describe-environments)
     line=$(next_line "${MOCK_DIR}/describe_states" "${MOCK_DIR}/describe_calls")
+
+    # ENG-1522: one describe-environments call is exactly one poll iteration, so
+    # advancing here makes eb-deploy.sh's clock a function of the scripted event
+    # sequence instead of the runner's wall clock. That is what removes the race:
+    # now_seconds() is now CONSTANT within an iteration, so the two reads that
+    # stamp and then test `ready_since` can no longer straddle a second boundary.
+    if [ -f "${MOCK_DIR}/clock" ]; then
+      tick=1
+      [ -f "${MOCK_DIR}/clock_tick" ] && tick=$(cat "${MOCK_DIR}/clock_tick")
+      printf '%s\n' "$(( $(cat "${MOCK_DIR}/clock") + tick ))" >"${MOCK_DIR}/clock"
+    fi
 
     if [ "$line" = "NOTFOUND" ]; then
       printf 'None\n'
@@ -134,6 +154,15 @@ case "$operation" in
         printf '%s\n' "${first#*|}" >&2
         exit 255
       fi
+      if [ "${first%%|*}" = "SLEEP" ]; then
+        # Simulates a stalled/throttled AWS call so the dry run's own timeout
+        # is exercised rather than assumed. The PID is recorded so a test can
+        # prove the descendant was actually reaped, not just its wrapper.
+        printf '%s\n' "$$" >"${MOCK_DIR}/stall_pid"
+        sleep "${first#*|}"
+        printf 'None\n'
+        exit 0
+      fi
       if [ "$first" = "NONE" ]; then
         printf 'None\n'
         exit 0
@@ -146,6 +175,12 @@ case "$operation" in
     ;;
 
   describe-environment-resources)
+    # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+    # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+    if grep -qF 'AutoScalingGroups' <<<"$query"; then
+      cat "${MOCK_DIR}/asg_name" 2>/dev/null || printf 'awseb-e-test-stack-AWSEBAutoScalingGroup-test\n'
+      exit 0
+    fi
     # Fixture `lb_arns`: tab/newline separated ALB ARNs, NONE, or "ERROR|<msg>".
     if [ -f "${MOCK_DIR}/lb_arns" ]; then
       first=$(head -n 1 "${MOCK_DIR}/lb_arns")
@@ -164,6 +199,18 @@ case "$operation" in
     exit 0
     ;;
 
+  put-lifecycle-hook)
+    code=0
+    [ -f "${MOCK_DIR}/put_lifecycle_hook_exit" ] && code=$(cat "${MOCK_DIR}/put_lifecycle_hook_exit")
+    if [ "$code" != "0" ]; then
+      cat "${MOCK_DIR}/put_lifecycle_hook_error" 2>/dev/null >&2 || \
+        printf 'mock aws: simulated put-lifecycle-hook failure\n' >&2
+      exit "$code"
+    fi
+    printf '%s\n' "$all_args" >"${MOCK_DIR}/put_lifecycle_hook_args"
+    exit 0
+    ;;
+
   describe-target-groups)
     if [ -f "${MOCK_DIR}/tg_arns" ]; then
       first=$(head -n 1 "${MOCK_DIR}/tg_arns")
@@ -174,6 +221,40 @@ case "$operation" in
       cat "${MOCK_DIR}/tg_arns"
     else
       printf 'None\n'
+    fi
+    exit 0
+    ;;
+
+  describe-target-group-attributes)
+    # Fixture `tg_attrs`: current deregistration_delay value, or "ERROR|<msg>".
+    if [ -f "${MOCK_DIR}/tg_attrs_exit" ]; then
+      code=$(cat "${MOCK_DIR}/tg_attrs_exit")
+      printf 'mock aws: simulated describe-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    val='20'
+    [ -f "${MOCK_DIR}/tg_attrs" ] && val=$(cat "${MOCK_DIR}/tg_attrs")
+    printf '%s\n' "$val"
+    exit 0
+    ;;
+
+  modify-target-group-attributes)
+    printf '%s\n' "$all_args" >>"${MOCK_DIR}/modify_tg_calls"
+    if [ -f "${MOCK_DIR}/modify_tg_exit" ]; then
+      code=$(cat "${MOCK_DIR}/modify_tg_exit")
+      printf 'mock aws: simulated modify-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    # Applying the mutation updates what the next describe call reports,
+    # unless the fixture wants to prove a silent-drop scenario (tg_attrs_stuck).
+    if [ ! -f "${MOCK_DIR}/tg_attrs_stuck" ]; then
+      for pair in $all_args; do
+        case "$pair" in
+          Key=deregistration_delay.timeout_seconds,Value=*)
+            printf '%s\n' "${pair#*Value=}" >"${MOCK_DIR}/tg_attrs"
+            ;;
+        esac
+      done
     fi
     exit 0
     ;;
@@ -217,6 +298,7 @@ new_mock_dir() {
   printf '0|\n' >"${dir}/create_result"
   printf '0|\n' >"${dir}/update_results"
   printf 'Ready|Green|old-version\n' >"${dir}/describe_states"
+  printf '0\n' >"${dir}/clock"
   printf '%s' "${dir}"
 }
 
@@ -248,6 +330,7 @@ run_deploy() {
   env \
     PATH="${WORKDIR}/bin:${PATH}" \
     EB_MOCK_DIR="${dir}" \
+    EB_CLOCK_FILE="${dir}/clock" \
     EB_APPLICATION_NAME='test-app' \
     EB_ENVIRONMENT_NAME='test-env' \
     EB_VERSION_LABEL='backend-20260729-pr2216' \
@@ -279,7 +362,14 @@ check() {
     return
   fi
 
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: here-string, not a pipe. Under `set -o pipefail` (line 15),
+  # `grep -q` exiting early on the first match can SIGPIPE the upstream
+  # printf, and pipefail then reports THAT nonzero for the whole pipeline even
+  # though grep genuinely matched — a race that passes locally most of the
+  # time and fails intermittently (this is very likely the root cause of the
+  # local 1-in-5 flake observed on this exact file during ENG-1277). A
+  # here-string has no live producer process for grep to SIGPIPE.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -714,6 +804,557 @@ M=$(new_mock_dir)
 set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878: a Green deploy never invokes the probe' 0 'SUCCESS: environment'
+
+# ---------------------------------------------------------------------------
+# ENG-823 — ensure_deregistration_delay sets DeregistrationDelay directly
+# against the live target group after a verified deploy, since two straight
+# `.ebextensions` fixes both silently failed to apply it.
+# ---------------------------------------------------------------------------
+
+# Not opted in (EB_DEREGISTRATION_DELAY_SECONDS unset): zero extra AWS calls.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-823: opted-out deploy still succeeds' 0 'SUCCESS: environment'
+if grep -qF 'DeregistrationDelay' "${WORKDIR}/out.txt"; then
+  printf '  FAIL ENG-823: opted-out deploy made a DeregistrationDelay call anyway\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: opted-out deploy makes no DeregistrationDelay call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# Opted in, target group currently at the AWS default: applies and verifies.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: opted-in deploy still succeeds' 0 'SUCCESS: environment'
+check 'ENG-823: sets DeregistrationDelay on the live target group' 0 \
+  'Setting DeregistrationDelay on target group def: 20s -> 600s.'
+check 'ENG-823: confirms the value by re-reading it, not by trusting the call' 0 \
+  'Confirmed DeregistrationDelay=600s on target group def.'
+
+# Already at the desired value: no-op, no mutation call.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '600\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: already-correct value is a no-op' 0 \
+  'already 600s on target group def; no change needed.'
+if [ -f "$M/modify_tg_calls" ]; then
+  printf '  FAIL ENG-823: no-op case still called modify-target-group-attributes\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: already-correct value makes no modify call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# The regression this exists to catch: modify-target-group-attributes reports
+# success but the value is silently dropped, exactly like .ebextensions did
+# twice. Must fail the job rather than report a false green.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+: >"$M/tg_attrs_stuck"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a silently-dropped value fails the job, not a false green' 1 \
+  'still reads 20s, not the desired 600s'
+
+# A denied elbv2 call fails loudly rather than reporting the deploy as fully
+# applied when it was not.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+printf '1\n' >"$M/modify_tg_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a denied modify-target-group-attributes call fails the job' 1 \
+  'modify-target-group-attributes failed for'
+
+# ---------------------------------------------------------------------------
+# ENG-878 follow-up — EB_HEALTH_PROBE_DRYRUN exercises the probe on a healthy
+# deploy.
+#
+# The probe only runs when the rollup is still Grey/Red past the settle window,
+# which has not happened since #2264 merged. So the branch the fix exists for,
+# and the four extra IAM actions it needs, have never executed in production —
+# an inert probe and a working one look identical from outside. The dry run
+# makes the probe deliberately reachable on an ordinary Green deploy: it runs
+# the real AWS calls, reports what it saw, and never touches the exit status.
+# ---------------------------------------------------------------------------
+
+# A Green deploy with the dry run on: the probe runs, reports LAGGING-equivalent
+# healthy underlying signals, and the deploy still passes on its own merits.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: a Green deploy still succeeds' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: and reports the probe verdict it would have used' 0 \
+  'probe dry run: verdict=LAGGING'
+check 'ENG-878 dry run: and says the verdict did not affect this deploy' 0 \
+  'did not affect this deploy'
+
+# The case this exists to catch: the deploy role is missing one of the four IAM
+# actions, so the probe is inert. Today that only surfaces during a real Red
+# rollup — i.e. exactly when it is too late. The dry run must name it loudly on
+# an otherwise-passing deploy, without failing that deploy.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'ERROR|An error occurred (AccessDenied) when calling the DescribeInstancesHealth operation\n' \
+  >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: an inert probe does not fail a healthy deploy' 0 \
+  'SUCCESS: environment'
+check 'ENG-878 dry run: but it is reported as INERT, not quietly swallowed' 0 \
+  'probe dry run: verdict=UNKNOWN'
+check 'ENG-878 dry run: and names the denied AWS call' 0 'AccessDenied'
+
+# A genuinely unhealthy target under a Green rollup is still only an
+# observation: the dry run reports it and the deploy's own verdict stands.
+# Making the dry run able to fail a deploy would turn a diagnostic into a new
+# and untested gate.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'i-0d6a42c54cfc58bd7\tunhealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: never changes the deploy verdict' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: reports UNHEALTHY as an observation' 0 \
+  'probe dry run: verdict=UNHEALTHY'
+
+# Default off: no flag, no extra AWS calls, output identical to before. This is
+# the property the merged fix deliberately has, and the dry run must not cost
+# every deploy four API calls to keep it.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 dry run: off by default' 0 'SUCCESS: environment'
+# ENG-1277: here-string, not a pipe — see the check() fix above for why.
+if grep -qF 'probe dry run' <<<"${LAST_OUTPUT}"; then
+  printf '  FAIL ENG-878 dry run: off by default emits no probe output\n       output:\n%s\n' \
+    "${LAST_OUTPUT}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-878 dry run: off by default emits no probe output'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# The Red-rollup path is authoritative and must be unchanged by the flag: with
+# the dry run on, a real lagging rollup still passes through the normal probe
+# and reports the lag, not a dry-run observation.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: the authoritative Red path is unaffected' 0 'lagging aggregate'
+
+# A stalled probe must not hold the script open past the step's timeout and turn
+# an already-confirmed deploy into a false failure — the exact defect this whole
+# change removes, which the diagnostic would otherwise reintroduce. The probe is
+# abandoned on its own budget and reported as INERT.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'SLEEP|30\n' >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
+  EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS='2'
+check 'ENG-878 dry run: a stalled probe never fails the deploy' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: the stall is reported, not swallowed' 0 'was abandoned'
+check 'ENG-878 dry run: and a stalled probe reads as INERT' 0 'probe dry run: INERT'
+
+# Abandoning the probe must kill the stalled AWS call itself, not just the shell
+# wrapping it: a surviving descendant keeps the script's stdout/stderr open and
+# can hold the already-successful step until the workflow timeout kills it.
+TESTS_RUN=$((TESTS_RUN + 1))
+stall_pid=$(cat "$M/stall_pid" 2>/dev/null || true)
+if [ -n "${stall_pid}" ] && ! kill -0 "${stall_pid}" 2>/dev/null; then
+  printf 'PASS: ENG-878 dry run: the stalled AWS descendant is killed, not just its wrapper\n'
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: ENG-878 dry run: the stalled AWS descendant is killed, not just its wrapper (pid=%s)\n' "${stall_pid:-<none>}"
+fi
+
+# With almost none of the deploy budget left, the diagnostic is skipped outright
+# rather than spending the seconds the script needs to exit on its own terms.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
+  EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS='9999'
+check 'ENG-878 dry run: skipped when the budget is nearly spent' 0 'probe dry run: SKIPPED'
+check 'ENG-878 dry run: skipping still leaves the deploy successful' 0 'SUCCESS: environment'
+
+# ---------------------------------------------------------------------------
+# ENG-1127: an aborted rollout is recoverable, not terminal.
+#
+# 2026-08-11, PR #2313: an ASG replacement instance joined 31s before the deploy
+# landed, ran its self-startup pipeline concurrently with app-deploy, and both
+# staged into /var/app/staging/. One flipped it to /var/app/current/ and the
+# other's container_command then died on the missing directory. EB got 3-of-4,
+# aborted the rollout, and reverted the environment's version pointer.
+#
+# verify_deployment saw Ready-on-the-old-version and declared "this will never
+# converge" — which was false. Nothing was wrong with the bundle or the config;
+# the next deploy to land (PR #2352, 28 minutes later) applied cleanly and took
+# the environment Green. The cost of calling it terminal is a red PR and a
+# ~30 runner-minute re-run of a suite that had just passed.
+#
+# So: this exact signature re-applies within the existing budget. Every other
+# terminal condition is untouched, and a terminal pattern still wins outright.
+# ---------------------------------------------------------------------------
+
+ABORT_EVENTS='During an aborted deployment, some instances may have deployed the new application version.	Failed to deploy application.	Unsuccessful command execution on instance id(s) '"'"'i-05f5717b884b5ec85'"'"'. Aborting the operation.'
+
+# The rollout aborts once, the re-apply converges, and the job goes green.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: an aborted rollout is re-applied instead of failing the job' 0 \
+  'SUCCESS: environment'
+check 'ENG-1127: the re-apply is announced, not silent' 0 \
+  'aborted the rollout on a subset of instances'
+
+# Bounded. An abort that keeps aborting still fails — but with the real reason,
+# not the false "will never converge" claim.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: a repeating abort still fails the job' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-1127: and the failure names the abort rather than claiming it never converges' 1 \
+  'aborted the rollout of version'
+
+# The re-apply is opt-outable, so a bad day can be pinned back to old behaviour
+# without a code change.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1' EB_ABORT_MAX_RETRIES='0'
+check 'ENG-1127: EB_ABORT_MAX_RETRIES=0 restores the immediate failure' 1 \
+  'EB_DEPLOY_FAILED'
+
+# Safety: a genuine terminal rejection must still fail immediately even when an
+# abort event is sitting next to it. Terminal wins; recoverable never masks it.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}	Configuration validation exception: Invalid option value" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: a terminal pattern still wins over a co-occurring abort' 1 \
+  'Elastic Beanstalk REJECTED this update'
+
+# ---------------------------------------------------------------------------
+
+# ENG-764 — every deploy must recreate the termination lifecycle hook before
+# update-environment can retire an old instance. A one-time console hook is
+# lost when EB replaces its ASG, silently reviving deploy-killed scheduled runs.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(grep -c '^put-lifecycle-hook$' "$M/operations" 2>/dev/null || true)" = 1 ]; then
+  pass 'ENG-764: the deploy installs exactly one termination lifecycle hook'
+else
+  printf '  FAIL ENG-764: the deploy installs exactly one termination lifecycle hook\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+hook_line=$(grep -n '^put-lifecycle-hook$' "$M/operations" | cut -d: -f1 || true)
+update_line=$(grep -n '^update-environment$' "$M/operations" | head -1 | cut -d: -f1 || true)
+if [ -n "$hook_line" ] && [ -n "$update_line" ] && [ "$hook_line" -lt "$update_line" ]; then
+  pass 'ENG-764: the lifecycle hook is installed before update-environment'
+else
+  printf '  FAIL ENG-764: lifecycle hook must precede update-environment (hook=%s update=%s)\n' \
+    "${hook_line:-missing}" "${update_line:-missing}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if grep -q -- '--lifecycle-hook-name agentweb-drain-before-terminate' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--heartbeat-timeout 900' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--default-result CONTINUE' "$M/put_lifecycle_hook_args" 2>/dev/null; then
+  pass 'ENG-764: the installed hook keeps the reviewed name and bounded fail-open settings'
+else
+  printf '  FAIL ENG-764: hook arguments do not match the reviewed safety contract\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# Passing control in the red phase: the existing deploy behavior is unchanged
+# until the new hook assertions above are implemented.
+check 'ENG-764 control: the underlying deploy still reaches success' 0 'SUCCESS: environment'
+
+M=$(new_mock_dir)
+printf '255\n' >"$M/put_lifecycle_hook_exit"
+printf 'AccessDenied: not authorized to perform autoscaling:PutLifecycleHook\n' \
+  >"$M/put_lifecycle_hook_error"
+run_deploy "$M"
+check 'ENG-764: a denied lifecycle-hook install fails the deploy closed' 1 \
+  'refusing to start a deploy that could cut off scheduled work'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if ! grep -q '^update-environment$' "$M/operations"; then
+  pass 'ENG-764: hook failure happens before update-environment can terminate an instance'
+else
+  printf '  FAIL ENG-764: update-environment ran after the hook failed\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+M=$(new_mock_dir)
+printf 'None\n' >"$M/asg_name"
+run_deploy "$M"
+check 'ENG-764: an environment with no ASG fails loudly' 1 \
+  'returned no Auto Scaling group'
+
+# ---------------------------------------------------------------------------
+# ENG-1522 — the clock seam must never reach production.
+#
+# now_seconds() honours EB_CLOCK_FILE so this suite can drive time from the
+# mocked event sequence instead of the wall clock. That seam is harmless only
+# while it stays test-only: a workflow that set EB_CLOCK_FILE would freeze the
+# deploy's sense of time, and every budget in eb-deploy.sh -- the overall run
+# deadline, the settle timeout, the health settle window, the EB rejection
+# grace -- is a comparison against now_seconds(). A frozen clock means none of
+# them can ever expire, so a hung or rejected deploy would poll forever instead
+# of failing, in the script whose false-success and non-convergence modes cost
+# ~17h (ENG-865) and ~29h (ENG-836) of production downtime.
+#
+# No script under test here: this asserts the workflows themselves, the same
+# shape as paths-filter-hygiene.test.sh. It lives in this suite rather than a
+# new file on purpose -- three suites have already been found orphaned and
+# silently red in this repo (staging-deploy-gate, coverage-report,
+# paths-filter negation), and this one is already wired into `CI script tests`.
+printf '\nENG-1522: the clock seam is test-only\n'
+
+WORKFLOW_DIR="${SCRIPT_DIR}/../workflows"
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+clock_offenders=""
+for wf in "${WORKFLOW_DIR}"/*.yml "${WORKFLOW_DIR}"/*.yaml; do
+  [ -e "${wf}" ] || continue
+  if grep -qE '(^|[^A-Z_])EB_CLOCK_FILE' "${wf}"; then
+    clock_offenders="${clock_offenders} $(basename "${wf}")"
+  fi
+done
+if [ -z "${clock_offenders}" ]; then
+  pass 'ENG-1522: no workflow sets EB_CLOCK_FILE'
+else
+  printf '  FAIL ENG-1522: workflow(s) reference EB_CLOCK_FILE:%s\n' "${clock_offenders}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# Self-check. Current exposure is zero, so without proving the detector can
+# fail, a broken scan and a clean repo are indistinguishable -- exactly the
+# fail-open shape CodeRabbit caught in paths-filter-hygiene.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+probe_dir="$(mktemp -d "${WORKDIR}/wfprobe.XXXXXX")"
+printf 'jobs:\n  deploy:\n    env:\n      EB_CLOCK_FILE: /tmp/x\n' >"${probe_dir}/bad.yml"
+probe_hits=""
+for wf in "${probe_dir}"/*.yml; do
+  grep -qE '(^|[^A-Z_])EB_CLOCK_FILE' "${wf}" && probe_hits="yes"
+done
+if [ -n "${probe_hits}" ]; then
+  pass 'ENG-1522: self-check — the scan detects a workflow that does set it'
+else
+  printf '  FAIL ENG-1522: the EB_CLOCK_FILE scan cannot detect an offender (fail-open)\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# The production default must remain a real clock read.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+real_now=$(env -u EB_CLOCK_FILE bash -c \
+  "$(sed -n '/^now_seconds() {/,/^}/p' "${EB_DEPLOY_SCRIPT}"); now_seconds")
+if [ "${real_now}" -gt 1000000000 ]; then
+  pass 'ENG-1522: with EB_CLOCK_FILE unset, now_seconds() returns real epoch time'
+else
+  printf '  FAIL ENG-1522: now_seconds() did not fall back to date +%%s when unset\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# ENG-1183 — the deploy budgets must be consistent with the deployment policy.
+#
+# Three numbers govern a deploy and they are declared in two different files:
+# `timeout-minutes` and EB_TOTAL_TIMEOUT_SECONDS/EB_SETTLE_TIMEOUT_SECONDS in
+# deploy.yml, and EB's own command Timeout in backend/.ebextensions. Nothing
+# related them to each other, so they drifted: the settle cap sat on the
+# script's 600s default -- a Rolling-era number -- for the two months after
+# rolling.config switched the environment to Immutable on 2026-07-01.
+#
+# The settle cap is not a soft wait. On expiry wait_for_environment_ready()
+# calls fail(), so an environment that is merely busy is reported as
+# "Version was NOT applied". Under Immutable, busy-for-longer-than-600s is
+# ordinary: 24 consecutive production deploys measured median ~535s, max 1352s.
+#
+# These are structural assertions over the workflow and the EB config -- no
+# script under test -- the same shape as the ENG-1522 block above, and they
+# live in this suite for the same reason: it is already wired into
+# `CI script tests`, and orphaned suites in this repo have a habit of going
+# silently red (staging-deploy-gate, coverage-report, paths-filter negation).
+printf '\nENG-1183: deploy budgets are consistent with the deployment policy\n'
+
+REPO_ROOT="${SCRIPT_DIR}/../.."
+DEPLOY_WORKFLOW="${WORKFLOW_DIR}/deploy.yml"
+
+# Emits one `job|timeout-minutes|total|settle` record per step that actually
+# runs eb-deploy.sh. Steps are flushed when the next one starts, so the `run:`
+# line at the bottom of a step is still attributed to it.
+eb_budget_records() {
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/     { job=$1; sub(/:$/,"",job); next }
+    /^      - /                           { if (has) print job "|" tmo "|" tot "|" stl
+                                            has=0; tmo=""; tot=""; stl="" }
+    /^        timeout-minutes:/           { tmo=$2 }
+    /EB_TOTAL_TIMEOUT_SECONDS:/           { v=$2; gsub(/[^0-9]/,"",v); tot=v }
+    /EB_SETTLE_TIMEOUT_SECONDS:/          { v=$2; gsub(/[^0-9]/,"",v); stl=v }
+    /run: bash \.github\/scripts\/eb-deploy\.sh/ { has=1 }
+    END                                   { if (has) print job "|" tmo "|" tot "|" stl }
+  ' "$1"
+}
+
+# The script's own default, read rather than hardcoded: raising it there instead
+# of in the workflow is an equally valid fix and must keep this suite green.
+DEFAULT_SETTLE=$(grep -m1 '^EB_SETTLE_TIMEOUT_SECONDS=' "${EB_DEPLOY_SCRIPT}")
+DEFAULT_SETTLE="${DEFAULT_SETTLE##*:-}"   # ...:-600}"  ->  600}"
+DEFAULT_SETTLE="${DEFAULT_SETTLE%%\}*}"   # 600}"       ->  600
+
+# EB's command Timeout on the Immutable environment. Waiting less than this
+# means failing a deploy while EB still considers the in-flight command live.
+EB_COMMAND_TIMEOUT=""
+for cfg in "${REPO_ROOT}"/backend/.ebextensions/*.config; do
+  [ -e "${cfg}" ] || continue
+  if grep -qE 'DeploymentPolicy:[[:space:]]*Immutable' "${cfg}"; then
+    EB_COMMAND_TIMEOUT=$(awk '/^[[:space:]]+Timeout:[[:space:]]*[0-9]+/ {print $2; exit}' "${cfg}")
+  fi
+done
+
+# Worst observed single Immutable rollout on production (1352s) plus margin.
+# What must remain of the budget after settling to still run our own deploy.
+MIN_OWN_DEPLOY_SECONDS=1400
+
+BUDGET_RECORDS=$(eb_budget_records "${DEPLOY_WORKFLOW}")
+
+# Fail-open guard first: every assertion below is a no-op if the extractor
+# matched nothing, which is indistinguishable from a clean repo.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(printf '%s\n' "${BUDGET_RECORDS}" | grep -c '|')" -ge 2 ]; then
+  pass 'ENG-1183: the budget extractor found both eb-deploy.sh steps'
+else
+  printf '  FAIL ENG-1183: extractor found %s eb-deploy.sh step(s) in deploy.yml (fail-open)\n' \
+    "$(printf '%s\n' "${BUDGET_RECORDS}" | grep -c '|')"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ -n "${EB_COMMAND_TIMEOUT}" ]; then
+  pass "ENG-1183: read EB command Timeout=${EB_COMMAND_TIMEOUT}s from the Immutable config"
+else
+  printf '  FAIL ENG-1183: no .ebextensions config declares DeploymentPolicy: Immutable with a Timeout\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+while IFS='|' read -r job tmo tot stl; do
+  [ -n "${job}" ] || continue
+  [ -n "${stl}" ] || stl="${DEFAULT_SETTLE}"
+  step_budget=$(( tmo * 60 ))
+
+  # The script budget must expire first, or the runner SIGKILLs it mid-poll and
+  # the diagnostic that names the real cause is replaced by "step timed out".
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${tot}" -lt "${step_budget}" ]; then
+    pass "ENG-1183: ${job} script budget ${tot}s expires before the ${step_budget}s step timeout"
+  else
+    printf '  FAIL ENG-1183: %s budget %ss >= step timeout %ss; the script can never report why\n' \
+      "${job}" "${tot}" "${step_budget}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${stl}" -lt "${tot}" ]; then
+    pass "ENG-1183: ${job} settle cap ${stl}s fits inside the ${tot}s budget"
+  else
+    printf '  FAIL ENG-1183: %s settle cap %ss >= budget %ss\n' "${job}" "${stl}" "${tot}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  # Immutable-only bounds. partner-deploy is a different application with no
+  # .ebextensions in this repo and ~60s deploys, so the 600s default is already
+  # 10x headroom there and these two would be meaningless. If the environment
+  # ever stops being Immutable these are skipped rather than compared against
+  # an empty timeout -- the check above already went red naming that as the
+  # reason, and every number here would need re-deriving anyway.
+  case "${job}" in
+    backend-*) ;;
+    *) continue ;;
+  esac
+  [ -n "${EB_COMMAND_TIMEOUT}" ] || continue
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${stl}" -ge "${EB_COMMAND_TIMEOUT}" ]; then
+    pass "ENG-1183: ${job} settle cap ${stl}s >= EB command Timeout ${EB_COMMAND_TIMEOUT}s"
+  else
+    printf '  FAIL ENG-1183: %s settle cap %ss gives up before EB command Timeout %ss; a busy-but-healthy environment is failed as "Version was NOT applied"\n' \
+      "${job}" "${stl}" "${EB_COMMAND_TIMEOUT}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  headroom=$(( tot - stl ))
+  if [ "${headroom}" -ge "${MIN_OWN_DEPLOY_SECONDS}" ]; then
+    pass "ENG-1183: ${job} leaves ${headroom}s after settling for its own Immutable rollout"
+  else
+    printf '  FAIL ENG-1183: %s leaves only %ss after settling, below the %ss an Immutable rollout has been measured to need\n' \
+      "${job}" "${headroom}" "${MIN_OWN_DEPLOY_SECONDS}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+done <<EOF
+${BUDGET_RECORDS}
+EOF
+
+# Self-check. Every assertion above currently passes, so without proving the
+# extractor can see a violation, a broken parser reads exactly like a healthy
+# repo -- the fail-open shape CodeRabbit caught in paths-filter-hygiene.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+budget_probe_dir="$(mktemp -d "${WORKDIR}/budgetprobe.XXXXXX")"
+cat >"${budget_probe_dir}/deploy.yml" <<'PROBE'
+jobs:
+  backend-deploy:
+    steps:
+      - name: Deploy to Elastic Beanstalk and verify the environment took it
+        timeout-minutes: 10
+        env:
+          EB_TOTAL_TIMEOUT_SECONDS: '600'
+          EB_SETTLE_TIMEOUT_SECONDS: '30'
+        run: bash .github/scripts/eb-deploy.sh
+PROBE
+probe_record=$(eb_budget_records "${budget_probe_dir}/deploy.yml")
+if [ "${probe_record}" = "backend-deploy|10|600|30" ]; then
+  pass 'ENG-1183: self-check — the extractor reads a step it has never seen'
+else
+  printf '  FAIL ENG-1183: extractor returned %s on the probe workflow (fail-open)\n' \
+    "${probe_record:-<nothing>}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
 
 # ---------------------------------------------------------------------------
 

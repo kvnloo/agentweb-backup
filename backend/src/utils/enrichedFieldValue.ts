@@ -37,6 +37,9 @@ export interface EnrichedFieldMeta {
   sourceQuote?: string;
   confidence?: 'high' | 'medium' | 'low';
   enrichedAt: string;          // ISO
+  /** Date the underlying data describes, when it differs from fetch time
+   *  (e.g. Enigma card revenue for the 12 months ending this date). YYYY-MM-DD. */
+  asOf?: string;
   enrichedJobId?: string;
   /** Whether this value was served from a provider cache rather than a live API call.
    *  Absent on legacy records written before this field was added. */

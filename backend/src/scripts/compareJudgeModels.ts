@@ -63,7 +63,10 @@ async function main() {
           session.messages || [],
           session.messageCount ?? session.messages?.length ?? 0,
           judge,
-          session.sessionType
+          session.sessionType,
+          // ENG-1961: an offline model bake-off is platform work, not any
+          // customer's — named rather than left to the `system` placeholder.
+          { feature: 'platform:judge_eval' },
         );
         const dt = Date.now() - t0;
         row.scores[judge.llmModel!] = result.score;

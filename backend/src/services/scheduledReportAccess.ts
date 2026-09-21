@@ -18,17 +18,29 @@ import { userDb } from './db';
  * list, unchanged behavior.
  */
 
-// Admin-only tools that READ other users' cross-account data. Curated subset of
-// ADMIN_SKILL_TOOL_NAMES (agentModeService) — only the tools whose output can
-// place another account's data into a report. Keep this list complete: a
-// missing entry is a false-negative that lets cross-account data through.
+// Tools whose output can place another account's data into a report. Mostly a
+// curated subset of ADMIN_SKILL_TOOL_NAMES (agentModeService) — those are
+// admin-only end to end. The 3 ENG-1801 entries below are an exception: they
+// are ordinary customer-facing tools that only read cross-account data when
+// the caller is an admin AND passes client_id (see getMetaCredentials);
+// listed here unconditionally since this guard has no way to see whether a
+// given historical run's calledFunctions entry was client_id-scoped, and
+// treating every call as potentially cross-account is the safe direction of
+// error. Keep this list complete: a missing entry is a false-negative that
+// lets cross-account data through.
 export const CROSS_ACCOUNT_USER_DATA_TOOLS = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'monitor_lead_volume',
+  'check_account_tracking_health',
+  'diagnose_leads_at_zero',
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'list_meta_ads_campaigns',
+  'call_meta_ads_insights_api',
+  'get_meta_ads_metrics',
 ];
 
 /**
@@ -158,4 +170,175 @@ export async function resolveAuthorizedReportRecipients(params: {
   }
 
   return { authorized, withheld, restricted: true };
+}
+
+// ── Delivery state + remediation (ENG-1552) ─────────────────────────────────
+//
+// SHADOW MODE BY DEFAULT. Everything customer-visible that ENG-1552 adds — the
+// activation 400s, skipping generation, withholding empty reports, restricting
+// digests, the read-back field — only takes effect when
+// SCHEDULED_REPORT_DELIVERY_ENFORCEMENT=true. Until then each check still runs and
+// what it WOULD have done is logged (`[ENG-1552 shadow]`) and recorded internally,
+// so it can be watched and tuned before any customer sees it (user decision,
+// 2026-09-18). Customer behavior with the flag unset is unchanged from before.
+
+export function deliveryEnforcementEnabled(): boolean {
+  return process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT === 'true';
+}
+
+/** One grep-able line per decision shadow mode did not act on. */
+export function logShadowDecision(wouldHave: string, detail: Record<string, unknown>): void {
+  console.warn(`[ENG-1552 shadow] would have ${wouldHave}: ${JSON.stringify(detail)}`);
+}
+//
+// The guard above decides WHO may receive a sensitive report, but only at send
+// time and without leaving a trace. What follows is the state around it: each
+// run's delivery outcome is persisted on the schedule as a `deliveryLog`, and a
+// schedule that cannot deliver gets one remediation object naming the fix.
+
+export type ReportDeliveryState =
+  | 'generated'
+  | 'withheld'
+  | 'delivery_attempted'
+  | 'delivered'
+  | 'recipient_confirmed';
+
+export type ReportDeliveryReason =
+  | 'no_authorized_recipients'
+  | 'empty_content'
+  | 'provider_error'
+  | 'suppressed_nonprod';
+
+export interface ReportDeliveryLogEntry {
+  runId: string;
+  state: ReportDeliveryState;
+  reason?: ReportDeliveryReason;
+  authorizedRecipients?: string[];
+  withheldRecipients?: string[];
+  missingPermission?: string;
+  /** recipient_confirmed only: who recorded the confirmation. */
+  confirmedBy?: string;
+  at: string;
+}
+
+export type RecipientRemediationCode = 'no_authorized_recipients';
+
+export interface RecipientRemediation {
+  code: RecipientRemediationCode;
+  scheduleId: string;
+  runId?: string;
+  owner: string;
+  /**
+   * ONLY the subset of the schedule's OWN configured recipients that qualify —
+   * never the platform admin roster. Listing that to a customer would itself be
+   * the cross-account leak this guard exists to prevent.
+   */
+  eligibleRecipients: string[];
+  missingPermission: string;
+  /** One of a fixed set of sentences — never interpolated upstream error text. */
+  safeAction: string;
+}
+
+const REMEDIATION_SAFE_ACTION: Record<RecipientRemediationCode, string> = {
+  no_authorized_recipients:
+    'This report uses cross-account data, so it can only be sent to admin users. Add an admin recipient, or remove the cross-account tools from the schedule, then run it again.',
+};
+
+const REMEDIATION_MISSING_PERMISSION: Record<RecipientRemediationCode, string> = {
+  no_authorized_recipients: 'isAdmin',
+};
+
+export function buildRecipientRemediation(params: {
+  code: RecipientRemediationCode;
+  scheduleId: string;
+  owner?: string | null;
+  runId?: string;
+  eligibleRecipients?: string[];
+}): RecipientRemediation {
+  return {
+    code: params.code,
+    scheduleId: params.scheduleId,
+    ...(params.runId ? { runId: params.runId } : {}),
+    owner: params.owner || 'unknown',
+    eligibleRecipients: [...(params.eligibleRecipients || [])],
+    missingPermission: REMEDIATION_MISSING_PERMISSION[params.code],
+    safeAction: REMEDIATION_SAFE_ACTION[params.code],
+  };
+}
+
+/**
+ * Whether a schedule should be treated as producing a sensitive report BEFORE it
+ * runs. Two cheap signals: the previous run actually used a cross-account tool
+ * (`lastKnownSensitive`), or the schedule requires one. The second matters
+ * because the first only exists after a run has already paid for generation.
+ * This only decides whether to check recipients early; the send-time guard
+ * still re-classifies every run on its own.
+ */
+export function scheduleLikelySensitive(schedule: {
+  lastKnownSensitive?: boolean;
+  requiredFunctionCalls?: string[] | null;
+} | null | undefined): boolean {
+  if (!schedule) return false;
+  return schedule.lastKnownSensitive === true || reportContainsCrossAccountData(schedule.requiredFunctionCalls || null);
+}
+
+/**
+ * Persist one delivery-state transition. Best-effort by design: losing a log
+ * entry must never fail a run or an email, so this never throws.
+ */
+export async function recordReportDeliveryState(
+  scheduleId: string | undefined | null,
+  entry: Omit<ReportDeliveryLogEntry, 'at'> & { at?: string },
+  extra?: { lastKnownSensitive?: boolean },
+): Promise<void> {
+  if (!scheduleId) return;
+  try {
+    const { scheduleDb } = await import('./db');
+    await scheduleDb.appendDeliveryLogEntry(scheduleId, { ...entry, at: entry.at || new Date().toISOString() }, extra);
+  } catch (error) {
+    console.error(`Failed to record delivery state "${entry.state}" for schedule ${scheduleId}:`, error);
+  }
+}
+
+/**
+ * ENG-1552 activation gate: a schedule that will deliver a cross-account report
+ * must have at least one recipient allowed to receive it. Returns the remediation
+ * to send back, or null when the schedule may go live.
+ *
+ * Only the "authorized" half is checked here. "At least one recipient" is already
+ * held where it applies (create falls back to the requester's address; update
+ * refuses to clear the last one, ENG-1836), and a schedule with no recipients —
+ * a pre-filled silent run, an auto-created outreach schedule (ENG-1723) —
+ * delivers nothing externally, so there is nothing to authorize.
+ */
+export async function checkScheduleActivationRecipients(params: {
+  scheduleId: string;
+  recipients: string[];
+  ownerEmail?: string | null;
+  schedule: { lastKnownSensitive?: boolean; requiredFunctionCalls?: string[] | null };
+}): Promise<RecipientRemediation | null> {
+  const recipients = (params.recipients || []).filter(Boolean);
+  if (recipients.length === 0 || !scheduleLikelySensitive(params.schedule)) return null;
+  const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail: params.ownerEmail, isSensitive: true });
+  if (authz.authorized.length > 0) return null;
+  return buildRecipientRemediation({
+    code: 'no_authorized_recipients',
+    scheduleId: params.scheduleId,
+    owner: params.ownerEmail,
+    eligibleRecipients: authz.authorized,
+  });
+}
+
+/**
+ * ENG-1552 read-back: the most recent delivery-state entry for each run, keyed by
+ * runId. The log is append-only and ordered, so the last entry for a run wins.
+ */
+export function latestDeliveryByRun(
+  log: ReportDeliveryLogEntry[] | null | undefined,
+): Record<string, ReportDeliveryLogEntry> {
+  const latest: Record<string, ReportDeliveryLogEntry> = {};
+  for (const entry of Array.isArray(log) ? log : []) {
+    if (entry && typeof entry.runId === 'string') latest[entry.runId] = entry;
+  }
+  return latest;
 }

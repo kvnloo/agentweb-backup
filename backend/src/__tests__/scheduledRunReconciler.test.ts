@@ -10,6 +10,7 @@
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => ['*']),
   getAllowedSkills: jest.fn(async () => ['*']),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -31,13 +32,14 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
-  generateMarketingResponseWorkerService: { runInWorker: jest.fn() },
+  generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
 
 jest.mock('../services/db', () => ({
   scheduleDb: {
     getInFlightSchedules: jest.fn(),
     claimAbandonedRun: jest.fn(),
+    updateSchedule: jest.fn().mockResolvedValue(undefined),
     addRunResult: jest.fn().mockResolvedValue(undefined),
   },
   userDb: { getUserById: jest.fn() },
@@ -63,7 +65,11 @@ jest.mock('../services/skillService', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { scheduleDb } from '../services/db';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { reconcileStaleScheduledRuns, recoverAbandonedScheduledRun } from '../controllers/agentModeController';
+import {
+  reconcileStaleScheduledRuns,
+  recoverAbandonedScheduledRun,
+  zeroAssistantIncompleteMessage,
+} from '../controllers/agentModeController';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -98,6 +104,7 @@ beforeEach(() => {
   jest.spyOn(console, 'error').mockImplementation(() => {});
   jest.spyOn(console, 'log').mockImplementation(() => {});
   mockScheduleDb.claimAbandonedRun.mockResolvedValue(true);
+  (mockScheduleDb as any).updateSchedule.mockResolvedValue(undefined);
   mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
 });
 
@@ -249,6 +256,148 @@ describe('recoverAbandonedScheduledRun', () => {
     expect(mockAlert.mock.calls[0][0].subject).toContain('Abandoned Run Recovered');
   });
 
+  /**
+   * ENG-971 (Greptile). Without a resume marker this requeue RESTARTS the task from
+   * scratch, and claimAbandonedRun with no resumeSessionId also REMOVES any marker
+   * already stored — so an unresumable/unreadable run whose publish already landed
+   * would have its production side effect repeated.
+   */
+  it('does not restart from scratch when the abandoned run already published', async () => {
+    const schedule = scheduleWithLease();
+    // Unresumable transcript that nonetheless contains a publish from THIS attempt.
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        tool_call_id: 'p1',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
+    ] as any);
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2];
+    expect(requeue).toBeNull();
+    // Suppressing the requeue is not enough: an ACTIVE schedule still fires on its
+    // ordinary cadence and would restart from scratch, repeating the publish.
+    const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+      (c: any[]) => c[1]?.status === 'paused'
+    );
+    expect(paused).toBeDefined();
+  });
+
+  it('does not pause on a single transient transcript read failure', async () => {
+    // One blip, then a clean read showing nothing published this attempt.
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock)
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValue([] as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeUndefined();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
+  });
+
+  it('does not restart from scratch when the transcript cannot be read at all', async () => {
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2];
+    expect(requeue).toBeNull();
+  });
+
+  it('still restarts a run that published nothing', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([] as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2] as any;
+    expect(requeue).not.toBeNull();
+    expect(requeue.nextRunTime).toEqual(expect.any(String));
+  });
+
+  it('ignores a publish that belongs to an EARLIER attempt of the same session', async () => {
+    const schedule = scheduleWithLease();
+    // Publish timestamped BEFORE this attempt's lease.startedAt (20 min ago).
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      {
+        role: 'tool',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 90 * 60 * 1000).toISOString(),
+      },
+    ] as any);
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    // Recovery proceeds: this attempt published nothing, so pausing would strand a
+    // live schedule over an earlier run's work.
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeUndefined();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
+  });
+
+  // The mirror of the runScheduledChat lease-hold: claimAbandonedRun is what REMOVES
+  // the stale lease, so a pause attempted after it has already given away the only
+  // guard. If the pause will not persist we must not claim at all.
+  it('does not claim (so the lease stands) when the pause will not persist', async () => {
+    const schedule = scheduleWithLease();
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        tool_call_id: 'p1',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
+    ] as any);
+    (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    const won = await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(won).toBe(false);
+    // Never claimed: the lease remains, so no fresh run can start and repeat the publish.
+    expect(mockScheduleDb.claimAbandonedRun).not.toHaveBeenCalled();
+  });
+
+  it('claims normally once the pause has persisted', async () => {
+    const schedule = scheduleWithLease();
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        tool_call_id: 'p1',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
+    ] as any);
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeDefined();
+    expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalled();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).toBeNull();
+  });
+
   it('does not annotate the session or alert when the claim is lost', async () => {
     mockScheduleDb.claimAbandonedRun.mockResolvedValue(false);
     const schedule = scheduleWithLease();
@@ -326,5 +475,80 @@ describe('recoverAbandonedScheduledRun — resume decision (ENG-657)', () => {
 
     // Over cap → requeue is null, so there is no resume marker to carry.
     expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalledWith('sched-1', 'run-abc', null);
+  });
+});
+
+// ENG-764: when a run is abandoned because its OWNING PROCESS DIED (an EB immutable
+// deploy terminating the instance mid-run — prod-verified for session d7e4863c), the
+// reconciler knows the cause exactly: it writes "the owning process terminated mid-run"
+// into session.error. The user-facing placeholder, however, used the ENG-209 *budget*
+// copy — telling the user their job was too large and to "split the request into
+// smaller batches". That is a misdiagnosis of the user's own workload for an outage on
+// our side, and it directly contradicts the error written six lines later. ENG-826
+// already established one honest message per failure class (budget / transient /
+// system); the abandoned-by-infra class needs its own rather than borrowing budget's.
+describe('recoverAbandonedScheduledRun — honest abandonment copy (ENG-764)', () => {
+  // Died mid-tool-execution → NOT resumable, so the placeholder path is taken.
+  const danglingTranscript = [
+    { role: 'system', content: 'automated run' },
+    { role: 'user', content: 'Enrich the CRM leads.' },
+    { role: 'assistant', content: 'Enriching…', tool_calls: [
+      { id: 'c1', function: { name: 'enrich_leads_execute' } },
+      { id: 'c2', function: { name: 'enrich_leads_execute' } },
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: '{"processedCount":5}' },
+  ];
+
+  async function recoverAndReadPlaceholder(): Promise<string> {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(danglingTranscript as any);
+    const schedule = scheduleWithLease();
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+    const call = mockChatbotDb.addMessageToSession.mock.calls[0][1] as any;
+    return String(call.content);
+  }
+
+  it('does not blame the size of the user\'s job or tell them to split into smaller batches', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).not.toMatch(/split the request into smaller batches/i);
+    expect(content).not.toMatch(/fewer items per run/i);
+    expect(content).not.toMatch(/dozens of competitors/i);
+  });
+
+  it('does not attribute the abandonment to a time or memory budget it did not hit', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).not.toMatch(/time or memory budget/i);
+  });
+
+  it('states the real cause (the process running it stopped) and that it retries automatically', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).toMatch(/interrupted|stopped/i);
+    expect(content).toMatch(/deployment|restart|server/i);
+    expect(content).toMatch(/retried automatically/i);
+  });
+
+  it('keeps the jobIncomplete/isErrorMessage markers the scoring and resume paths key off', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(danglingTranscript as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    // Copy changed, contract did NOT: sessionScoringService.endsWithRunFailurePlaceholder
+    // and resumePlan.isRunFailurePlaceholder both detect this turn via these flags.
+    expect(mockChatbotDb.addMessageToSession.mock.calls[0][1]).toMatchObject({
+      role: 'assistant',
+      metadata: { jobIncomplete: true, isErrorMessage: true },
+    });
+    expect(mockChatbotDb.updateSessionError.mock.calls[0][1]).toMatch(/abandoned/i);
+  });
+
+  it('leaves the in-process budget failure copy untouched (no cross-contamination)', async () => {
+    // A genuine budget overrun still gets the "split into smaller batches" guidance —
+    // that advice is correct for THAT class and must not be collateral damage here.
+    expect(zeroAssistantIncompleteMessage({ isGenerationTimeout: true })).toMatch(
+      /split the request into smaller batches/i
+    );
   });
 });

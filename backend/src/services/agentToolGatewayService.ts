@@ -1,4 +1,5 @@
-import { toolResultError } from '../utils/toolResultError';
+import { createHash } from 'crypto';
+import { toolResultError, ToolResultPolicyBlockedError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 
@@ -215,6 +216,30 @@ const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 // reduced-request recovery paths (sync=false, smaller window/limit) still run before the
 // aggregate cap engages — only a sustained, multi-bucket timeout spiral trips it.
 const CHAT_HISTORY_FAILURE_BUDGET = 6;
+// ENG-1668 follow-up: scoping call_google_ads_api's breaker per (entity, action,
+// target) (googleAdsFailureScope, below) fixed the false cross-action blocking that
+// caused this ticket, but it also means each of the tool's ~35+ entity/action
+// combinations now gets its OWN fresh 2-3-failure allowance — a model that fails a
+// DIFFERENT combination every attempt (rather than repeating one mistake) could
+// burn far more failed calls than the old shared-bucket breaker ever allowed before
+// tripping anything. Same gap class ENG-291 hit with get_chat_history's cost-scoped
+// buckets; same fix shape: a coarse run-scoped cap on TOTAL call_google_ads_api
+// failures regardless of which scope they land in. Kept run-scoped (not session-wide
+// like CHAT_HISTORY_FAILURE_BUDGET) deliberately: a stale count should not persist
+// into an unrelated later turn and reintroduce the over-blocking this ticket was
+// about. Threshold well above the worst real session on record (8 failures, all pre-
+// dating the hoist fix that now prevents most of them outright) and well below the
+// theoretical worst-case drift, so only a genuine multi-vector spiral trips it.
+// Env-overridable (not just a hardcoded guess): there's no real production traffic
+// yet to tune this against, so ops can adjust it from observed telemetry without a
+// deploy once there is.
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+const GOOGLE_ADS_RUN_FAILURE_BUDGET = readPositiveIntEnv('GOOGLE_ADS_RUN_FAILURE_BUDGET', 10);
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
 
@@ -225,8 +250,13 @@ const EXPENSIVE_MEDIA_TOOLS = new Set([
 
 const runFailureCounts = new Map<string, Map<string, number>>();
 
+// ENG-1668 follow-up: in-flight reservations for the run-scoped aggregate budget
+// below, keyed by `${runId}\0${toolName}`. See findTrippedRunBudget/reserveRunBudgetSlot.
+const pendingRunBudgetReservations = new Map<string, number>();
+
 export function _resetAgentToolFailureBreaker(): void {
   runFailureCounts.clear();
+  pendingRunBudgetReservations.clear();
 }
 
 function errorHead(error: unknown): string {
@@ -296,8 +326,89 @@ function chatHistoryFailureScope(args: unknown): string {
   return `sync=${sync}|limit=${limit}|hours=${hours}`;
 }
 
+// ENG-969: get_lead_details returns a structured not-found failure ("The
+// specified lead does not exist in this list") for a lead_id/list_id pair
+// that doesn't resolve — a normal per-entity outcome, not a retry spiral.
+// Verified in production session 6082779b-f9f1-4e38-a8eb-34abbc3da419: three
+// DIFFERENT lead ids each 404'd against the wrong list (unscoped, so all
+// three shared the tool-wide '' bucket) and tripped the breaker at threshold
+// 3, permanently blocking every later call in the run — including ones with
+// corrected, valid list_id + lead_id. Scope by the target lead (exactly like
+// the ENG-182/ENG-313 LinkedIn per-recipient scoping above) so a miss on one
+// lead doesn't block a call for a different lead; a genuine repeat on the
+// SAME lead still trips.
+function leadDetailsFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const listId = typeof record.list_id === 'string' ? record.list_id.trim() : '';
+  const leadId = typeof record.lead_id === 'string' ? record.lead_id.trim() : '';
+  // Hash rather than slice to ERROR_KEY_LENGTH: two DIFFERENT (list_id, lead_id)
+  // pairs must never collapse into the same breaker bucket just because they
+  // share a long common prefix — a truncated slice could otherwise merge
+  // unrelated targets and reintroduce the exact cross-lead blocking this scope
+  // exists to prevent. JSON-encode the pair rather than joining with a plain
+  // "|" delimiter: list_id/lead_id are caller-controlled strings, so a literal
+  // "|" inside one could make two DIFFERENT pairs (e.g. ("a|b","c") and
+  // ("a","b|c")) hash identically — JSON.stringify's quoting makes the
+  // boundary between the two values unambiguous regardless of content.
+  return createHash('sha256').update(JSON.stringify([listId, leadId])).digest('hex');
+}
+
+// ENG-1636: scope Meta failures to one (entity, action, target) so a bucket cannot
+// lock the whole tool — six per-ad tracking-preflight refusals froze every read-back
+// and the corrected retry for the rest of the run (Phoenix, session 822c1ed4). Most
+// specific id wins so an AD write and an account-wide LIST never share a bucket.
+// JSON-encode like the lead scope above: ids are caller-controlled strings, so a
+// plain delimiter could make two different targets collide into one scope.
+function metaMarketingFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const entity = str(record.entity_type).toUpperCase();
+  const action = str(record.action).toUpperCase();
+  const target = str(record.ad_id) || str(record.ad_set_id) || str(record.campaign_id) || str(record.account_id);
+  if (!entity && !action && !target) return '';
+  return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
+}
+
+// ENG-1668: same shared-bucket class as ENG-1636 above, hit on call_google_ads_api
+// instead of Meta. Verified against production session 87334a61-2e06-4018-960e-
+// 9e7759403423: a BUDGET UPDATE call missing budget_resource_name tripped the
+// tool-wide bucket, then blocked the model's very next, fully corrected KEYWORD
+// UPDATE and KEYWORD ADD_NEGATIVE calls — reporting the stale BUDGET UPDATE error
+// for both even though neither one touched a budget. Most-specific resource name
+// wins so a write against one entity and a read/list against another never share
+// a bucket; JSON-encode like the scopes above so no id can forge a collision.
+// campaign_resource_name is checked before budget_resource_name: CAMPAIGN UPDATE
+// can optionally carry budget_resource_name to reassign a campaign onto a shared
+// budget (emma/tools.ts's CAMPAIGN action matrix), so two DIFFERENT campaigns
+// reassigned to the SAME shared budget must not collide into one scope just
+// because they share that value — campaign_resource_name is the actual identity
+// of what's being updated there, budget_resource_name is a payload field on it.
+function googleAdsFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  const entity = str(record.entity_type).toUpperCase();
+  const action = str(record.action).toUpperCase();
+  const target =
+    str(record.campaign_resource_name) ||
+    str(record.budget_resource_name) ||
+    str(record.ad_group_resource_name) ||
+    str(record.criterion_resource_name) ||
+    str(record.ad_resource_name) ||
+    str(record.asset_group_resource_name) ||
+    str(record.conversion_action_resource_name) ||
+    str(record.customer_id);
+  if (!entity && !action && !target) return '';
+  return createHash('sha256').update(JSON.stringify([entity, action, target])).digest('hex');
+}
+
 function failureScope(toolName: string, args: unknown): string {
   if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
+  if (toolName === 'get_lead_details') return leadDetailsFailureScope(args);
+  if (toolName === 'call_meta_marketing_api') return metaMarketingFailureScope(args);
+  if (toolName === 'call_google_ads_api') return googleAdsFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -419,9 +530,24 @@ function findTrippedSessionTimeout(
  * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
  * expensive-media budget tools, and now also for any timeout-class failure
  * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
- * a per-run one, since the model retries it across separate user turns/runs. */
+ * a per-run one, since the model retries it across separate user turns/runs.
+ *
+ * ENG-1220: a rate_limit-class failure on a media tool (gpt-image-2 429s) is
+ * transient — the gateway's own retryability guidance tells the model to wait
+ * and retry it. Counting it toward the tiny (2) session-wide media budget the
+ * same as a permanent failure (safety-filter rejection, invalid args) locked
+ * generate_image for the rest of the session even though the rate limit clears.
+ * Exclude rate_limit specifically so a real retry spiral (any other class)
+ * still trips the budget, but a temporary 429 does not. Hard-quota exhaustion
+ * (OpenAI/Azure `insufficient_quota`, "exceeded your current quota") is also
+ * 429-shaped but permanent, not transient — classifyToolErrorClass buckets it
+ * as 'quota_exceeded', a distinct class from 'rate_limit', so it is NOT
+ * exempted here and still counts toward the session-wide media budget. */
 function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
-  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
+  if (mediaFailureBudget(toolName) != null) {
+    return classifyToolErrorClass(error) !== 'rate_limit';
+  }
+  return classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
@@ -448,6 +574,53 @@ function countToolFailures(runId: string, toolName: string): number {
     if (key.startsWith(prefix)) total += count;
   }
   return total;
+}
+
+// ENG-1668 follow-up: countToolFailures only reflects CONFIRMED failures — recorded
+// after execute() resolves. Concurrent same-run tool calls (Promise.all — the exact
+// shape of the production incident, 4 call_google_ads_api calls dispatched in one
+// turn) all run their check synchronously before any sibling's execute() settles, so
+// every one of them sees the SAME stale confirmed count and none accounts for the
+// others. Track in-flight attempts — reserved the instant a call passes every check
+// and commits to executing, released once its outcome is known either way — and fold
+// them into the threshold. This closes the race without predicting outcomes: a
+// reservation only ever nudges a SIBLING call in the same synchronous burst; it's
+// never held past its own call resolving, and a call that succeeds never converts its
+// reservation into a permanent failure.
+function reserveRunBudgetSlot(runId: string, toolName: string): void {
+  if (toolName !== 'call_google_ads_api') return;
+  const key = `${runId}\0${toolName}`;
+  const isNewKey = !pendingRunBudgetReservations.has(key);
+  pendingRunBudgetReservations.set(key, (pendingRunBudgetReservations.get(key) ?? 0) + 1);
+  // Same defensive LRU bound as runFailureCounts (MAX_TRACKED_RUNS) — a reservation
+  // is normally released the instant its own execute() settles, so this map should
+  // stay near-empty, but an execute() that never resolves (no timeout wrapper found
+  // around it in toolDispatch.ts's runOne) would otherwise leave a permanent phantom
+  // entry with no other cleanup path.
+  if (isNewKey && pendingRunBudgetReservations.size > MAX_TRACKED_RUNS) {
+    const oldest = pendingRunBudgetReservations.keys().next().value;
+    if (oldest !== undefined) pendingRunBudgetReservations.delete(oldest);
+  }
+}
+
+function releaseRunBudgetSlot(runId: string, toolName: string): void {
+  if (toolName !== 'call_google_ads_api') return;
+  const key = `${runId}\0${toolName}`;
+  const current = pendingRunBudgetReservations.get(key) ?? 0;
+  if (current <= 1) pendingRunBudgetReservations.delete(key);
+  else pendingRunBudgetReservations.set(key, current - 1);
+}
+
+// ENG-1668 follow-up: a run-scoped backstop, separate from aggregateFailureBudget
+// above — that one is keyed by budgetScopeId (session-wide, for tools whose failures
+// are deliberately tracked cross-run), this one by runId directly, using the SAME
+// per-run counts every per-scope breaker check already writes via recordToolFailure,
+// plus any in-flight reservation (see above) for concurrency safety.
+function findTrippedRunBudget(runId: string, toolName: string): { count: number; budget: number } | null {
+  if (toolName !== 'call_google_ads_api') return null;
+  const pending = pendingRunBudgetReservations.get(`${runId}\0${toolName}`) ?? 0;
+  const count = countToolFailures(runId, toolName) + pending;
+  return count >= GOOGLE_ADS_RUN_FAILURE_BUDGET ? { count, budget: GOOGLE_ADS_RUN_FAILURE_BUDGET } : null;
 }
 
 function findTrippedBudget(runId: string, toolName: string): { count: number; budget: number } | null {
@@ -529,6 +702,23 @@ const READ_PREFIXES = [
   'read_',
   'search_',
 ];
+
+// ENG-1668 follow-up: the nested-wrapper hoist below is generic across EVERY tool
+// in the registry, not just call_google_ads_api — a wide blast radius for a fix
+// aimed at one specific mistake. Restrict it to keys that actually look like an
+// invented catch-all wrapper (the real mistake pattern: the model reaches for a
+// generic word for "the real arguments", e.g. `params`), rather than firing on ANY
+// undeclared object-valued key. This is the difference between "any future tool
+// whose schema happens to reuse a property name inside some unrelated stray
+// object could theoretically get silently reinterpreted" and "only these ~15 known
+// generic names can ever trigger a hoist" — a tool author adding a new tool does
+// not need to know this mechanism exists to be safe from it, because their own
+// schema's real field names are never treated as wrapper candidates.
+const LIKELY_WRAPPER_KEY_NAMES = new Set([
+  'params', 'param', 'args', 'arguments', 'data', 'payload',
+  'fields', 'field', 'filters', 'filter', 'options', 'config',
+  'input', 'body', 'values', 'updates', 'attributes', 'properties',
+]);
 
 const DEFAULT_ARG_ALIASES: Record<string, string[]> = {
   content_draft: [
@@ -644,6 +834,58 @@ export function validateAndRepairToolArgs(
 
   for (const key of Object.keys(repairedArgs)) {
     if (properties[key]) continue;
+
+    // ENG-1668: a common LLM mistake — inventing a wrapper object (e.g.
+    // `params: { criterion_resource_name: ... }`) around fields that actually
+    // belong at the top level, instead of matching the flat schema. Verified in
+    // production session 87334a61-2e06-4018-960e-9e7759403423: the model supplied
+    // every required resource-name argument, just nested one level too deep, and
+    // the handler reported them as missing since it only reads top-level args.
+    // Hoist the wrapper's own keys up to the top level — either an exact
+    // property-name match, or (ENG-1668 follow-up) the SAME alias resolution
+    // applied to top-level keys below, so a nested key that is BOTH misplaced
+    // AND misnamed (e.g. `params: { criterion: ... }` instead of
+    // criterion_resource_name) is still caught rather than silently dropped.
+    // Only fills empty slots — never overwrites a value already present at the
+    // top level — only applies to a wrapper key that isn't itself a declared
+    // property, so a genuinely nested schema field (e.g. this same tool's
+    // `address` object for CAMPAIGN ADD_PROXIMITY) is left untouched — and (ENG-1668
+    // follow-up) only fires for keys that look like an invented wrapper
+    // (LIKELY_WRAPPER_KEY_NAMES above), not any arbitrary undeclared object-valued
+    // key, to keep this tool-agnostic mechanism's blast radius narrow. Hoists apply
+    // one at a time so a second nested key can't clobber the first's target once
+    // it's filled.
+    const wrapperValue = repairedArgs[key];
+    if (
+      LIKELY_WRAPPER_KEY_NAMES.has(key.toLowerCase())
+      && wrapperValue && typeof wrapperValue === 'object' && !Array.isArray(wrapperValue)
+    ) {
+      const nested = wrapperValue as Record<string, unknown>;
+      let hoistedAny = false;
+      for (const nestedKey of Object.keys(nested)) {
+        const nestedTarget = properties[nestedKey] && repairedArgs[nestedKey] === undefined
+          ? nestedKey
+          : !properties[nestedKey]
+          ? findAliasTarget({
+              key: nestedKey,
+              value: nested[nestedKey],
+              properties,
+              required,
+              existingArgs: repairedArgs,
+              allowExplicitAliasRepair: true,
+              allowSemanticUrlRepair: lowRiskRepairAllowed,
+            })
+          : null;
+        if (!nestedTarget) continue;
+        repairedArgs[nestedTarget] = nested[nestedKey];
+        repairs.push(`${key}.${nestedKey}->${nestedTarget}`);
+        hoistedAny = true;
+      }
+      if (hoistedAny) {
+        delete repairedArgs[key];
+        continue;
+      }
+    }
 
     const aliasTarget = findAliasTarget({
       key,
@@ -767,7 +1009,19 @@ export function summarizeAgentToolPolicyFlags(
   const entries = decisions
     .filter((decision): decision is AgentToolPolicyDecision => Boolean(decision))
     .flatMap((decision) =>
-      decision.flags.map((flag) => `${decision.toolName}:${flag.code}:${flag.severity}`)
+      decision.flags.map((flag) => {
+        const base = `${decision.toolName}:${flag.code}:${flag.severity}`;
+        // ENG-1668 follow-up: args_repaired is the one flag whose message carries
+        // per-call detail (toolDispatch.ts embeds validateAndRepairToolArgs's
+        // `repairs` list, e.g. "params.criterion_resource_name->criterion_resource_name")
+        // rather than a fixed template. Without it, this telemetry line shows only
+        // a bare repair COUNT (see argsRepairedCount in agentModeService.ts) —
+        // diagnosing an unexpected repair meant re-deriving it from raw args in a
+        // session dump. Every other flag code's message is a static per-tool
+        // template that adds nothing beyond the code itself, so they're
+        // intentionally left out to avoid bloating every tool call's telemetry line.
+        return flag.code === 'args_repaired' ? `${base}(${flag.message})` : base;
+      })
     );
 
   return entries.length > 0 ? entries.join(',') : undefined;
@@ -821,6 +1075,21 @@ export async function executeAgentToolThroughGateway(
       };
     }
 
+    const trippedRunBudget = findTrippedRunBudget(input.runId, policyDecision.toolName);
+    if (trippedRunBudget) {
+      return {
+        status: 'error',
+        error: new AgentToolBudgetExceededError(
+          policyDecision.toolName,
+          trippedRunBudget.count,
+          trippedRunBudget.budget,
+          'run',
+        ),
+        policyDecision,
+        durationMs: Math.max(0, now() - startedAt),
+      };
+    }
+
     const recipientScope = failureScope(policyDecision.toolName, input.args);
 
     // Session-scoped timeout aggregate first (ENG-167 follow-up) — a tool that's
@@ -863,6 +1132,13 @@ export async function executeAgentToolThroughGateway(
     }
   }
 
+  // ENG-1668 follow-up: reserve this attempt against the run-scoped aggregate
+  // BEFORE awaiting execute(), so a sibling call dispatched concurrently in the
+  // same batch sees this attempt when it runs its own findTrippedRunBudget check
+  // above — closing the check-then-act race under concurrent same-run tool calls.
+  // Always released in `finally` below, regardless of outcome.
+  if (input.runId) reserveRunBudgetSlot(input.runId, policyDecision.toolName);
+
   try {
     const result = await input.execute();
     // A resolved result can still encode a failure ({ success: false } /
@@ -874,9 +1150,19 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      // ENG-1636: a ToolResultPolicyBlockedError is a gate refusing BY DESIGN
+      // (blocked:true + reason — `by_design` per toolFailureType). The refusal names
+      // its own remedy and invites a corrected call; counting it as a malfunction let
+      // six identical pre-flight refusals trip the breaker and refuse that exact
+      // corrected retry. Deliberate refusals are not failures; nothing is recorded —
+      // and nothing is cleared either, since a refusal is not a success.
+      const deliberateRefusal = structuredFailure instanceof ToolResultPolicyBlockedError;
+      if (!deliberateRefusal && input.runId) {
+        recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
+      }
       if (
-        input.budgetScopeId
+        !deliberateRefusal
+        && input.budgetScopeId
         && input.budgetScopeId !== input.runId
         && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {
@@ -924,6 +1210,8 @@ export async function executeAgentToolThroughGateway(
       policyDecision,
       durationMs: Math.max(0, now() - startedAt),
     };
+  } finally {
+    if (input.runId) releaseRunBudgetSlot(input.runId, policyDecision.toolName);
   }
 }
 
@@ -961,6 +1249,13 @@ function classifyToolEffect(toolName: string, args: unknown): AgentToolEffect {
       action === 'ARCHIVE'
     )
       return 'internal_write';
+    return 'read';
+  }
+
+  if (toolName === 'call_attio_api') {
+    const action = stringField(args, 'action').toUpperCase();
+    if (action === 'REMOVE_ENTRIES') return 'destructive';
+    if (action === 'CREATE' || action === 'ADD_ENTRIES') return 'internal_write';
     return 'read';
   }
 
@@ -1191,6 +1486,31 @@ function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: b
 
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
+
+  // Measured in Unicode characters (code points) via `Array.from`, which is what
+  // JSON Schema `maxLength` means. The schema is what we advertise to the model,
+  // so this validator must enforce exactly that and nothing stricter.
+  //
+  // The downstream runtime guard is held to the same unit — see
+  // accountMemoryDb.addMemory in services/db.ts, which also counts code points.
+  // Both sides must move together: measuring UTF-16 code units here would reject
+  // 1,001 emoji that the declared `maxLength: 2000` plainly accepts, which is a
+  // contract stricter than its schema — the exact defect ENG-821 exists to fix.
+  if (typeof value === 'string' && typeof schema?.maxLength === 'number') {
+    // ENG-1048: state the received length and the overflow, not just the limit.
+    // Knowing only the ceiling makes the correction guess-and-check — a reported
+    // run walked save_memory content down 2926 → 2306 → 2128 → 1817 against a
+    // 2000 limit, one model turn per guess, and those rejections also crowd real
+    // tool results out of the context window (ENG-940).
+    const received = Array.from(value).length;
+    if (received > schema.maxLength) {
+      issues.push({
+        code: 'invalid_args',
+        path: `$.${name}`,
+        message: `Argument "${name}" must be at most ${schema.maxLength} character(s) — received ${received}; remove at least ${received - schema.maxLength}.`,
+      });
+    }
+  }
 
   if (Array.isArray(value)) {
     if (typeof schema?.minItems === 'number' && value.length < schema.minItems) {

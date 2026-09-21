@@ -14,7 +14,15 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserIdIncludingOrgShared: jest.fn(),
   getAccountsWithOwnerIncludingOrgShared: jest.fn(),
   getAccountById: jest.fn(),
+  getAccountByIdConsistent: jest.fn(),
   isTokenValid: jest.fn(),
+  // ENG-1616 extracted this as the one shared platform allowlist and
+  // postOnConnectedAccount now filters through it (agentModeService.ts). A
+  // jest.mock factory replaces the whole module, so an export missing here
+  // resolves undefined and .includes() throws inside the SUT's try/catch,
+  // silently downgrading every account lookup to 'not found'. Mirrors the
+  // same constant already mocked in scheduledPublishConsentGuard.test.ts.
+  SOCIAL_POSTING_PLATFORMS: ['twitter', 'linkedin', 'instagram', 'youtube'],
 }));
 
 jest.mock('../services/socialPlatformService', () => ({
@@ -25,7 +33,7 @@ jest.mock('../services/socialPlatformService', () => ({
 
 // Import after mocks
 import { AgentModeService } from '../services/agentModeService';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountsWithOwnerIncludingOrgShared, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountsWithOwnerIncludingOrgShared, getAccountById, getAccountByIdConsistent, isTokenValid } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
 describe('AgentModeService - Social Media Tools', () => {
@@ -35,6 +43,7 @@ describe('AgentModeService - Social Media Tools', () => {
   const mockGetAccountsByUserIdIncludingOrgShared = getAccountsByUserIdIncludingOrgShared as jest.MockedFunction<typeof getAccountsByUserIdIncludingOrgShared>;
   const mockGetAccountsWithOwnerIncludingOrgShared = getAccountsWithOwnerIncludingOrgShared as jest.MockedFunction<typeof getAccountsWithOwnerIncludingOrgShared>;
   const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
+  const mockGetAccountByIdConsistent = getAccountByIdConsistent as jest.MockedFunction<typeof getAccountByIdConsistent>;
   const mockIsTokenValid = isTokenValid as jest.MockedFunction<typeof isTokenValid>;
   const mockSocialPlatformService = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
 
@@ -83,6 +92,9 @@ describe('AgentModeService - Social Media Tools', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetAccountByIdConsistent.mockImplementation((...args: Parameters<typeof getAccountById>) =>
+      mockGetAccountById(...args)
+    );
     service = new AgentModeService();
   });
 
@@ -211,8 +223,56 @@ describe('AgentModeService - Social Media Tools', () => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
     });
 
+    // ENG-827 (Greptile, security): admission to publish is granted BEFORE the slow
+    // work — resolving accounts, downloading media, uploading a video (minutes on
+    // YouTube). A consent withdrawal landing during that work must still stop the
+    // post, so the handler re-validates at its last moment before committing.
+    it('does NOT create the post when consent is withdrawn while the call is in flight', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        {
+          assertPublishStillAuthorized: async () => ({
+            success: false as const,
+            error: 'post_on_connected_account was not executed: this unattended scheduled run is not authorized to publish.',
+          }),
+        }
+      );
+
+      // Not reaching the adapter IS the fix — the post cannot be un-made.
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not authorized to publish');
+    });
+
+    it('posts normally when the in-flight re-check still allows it', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        { assertPublishStillAuthorized: async () => null }
+      );
+
+      expect(mockAdapter.createPost).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
+
     it('should successfully post content to account', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockResolvedValue({
         success: true,
         message: 'Posted successfully',
@@ -232,7 +292,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'Hello from the API!',
         [],
-        'user-123'
+        'user-123',
+        // ENG-827: the last-moment consent re-check, undefined outside a gated
+        // scheduled dispatch so interactive posting is unchanged.
+        undefined
       );
       expect(result.success).toBe(true);
       expect(result.post_id).toBe('urn:li:share:123');
@@ -254,6 +317,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('should return error when adapter fails due to expired token', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.postOnConnectedAccount(
@@ -268,6 +332,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('should handle adapter errors', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn API error'));
 
       const result = await service.postOnConnectedAccount(
@@ -278,6 +343,68 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to post');
+    });
+
+    // ENG-1300: the LinkedIn adapter attaches the real HTTP status as .code on
+    // its rethrown errors (see linkedInAdapter.test.ts) — prove it survives all
+    // the way through postOnConnectedAccount's own catch to the returned result,
+    // so classifyToolErrorClass sees 'auth' instead of the generic Error/bug.
+    it('ENG-1300 — carries the adapter-attached .code through to the result', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      const codedError: any = new Error('LinkedIn access token expired. Please reconnect your account.');
+      codedError.code = 401;
+      mockAdapter.createPost.mockRejectedValue(codedError);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Test content'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+    });
+
+    it('does not create a LinkedIn post after its account disconnects', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(null);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123', 'urn:li:organization:123456', 'Do not publish', []
+      );
+
+      expect(mockGetAccountByIdConsistent).toHaveBeenCalledWith(
+        'urn:li:organization:123456', 'user-123', 'linkedin'
+      );
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+    });
+
+    it('does not create a LinkedIn post after an org-shared account is unshared', async () => {
+      const initiallySharedAccount = {
+        ...mockLinkedInAccount,
+        userId: 'owner-user-456',
+        sharedWithOrg: true,
+      };
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([initiallySharedAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue({
+        ...mockLinkedInAccount,
+        userId: 'owner-user-456',
+        sharedWithOrg: false,
+      } as any);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123', 'urn:li:organization:123456', 'Do not publish', []
+      );
+
+      expect(mockGetAccountByIdConsistent).toHaveBeenCalledWith(
+        'urn:li:organization:123456', 'owner-user-456', 'linkedin'
+      );
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
     });
 
     // ── Auto-resolution (no account_id provided) ──
@@ -356,6 +483,62 @@ describe('AgentModeService - Social Media Tools', () => {
     });
   });
 
+  // ENG-827 (Greptile, security): the mixed-action tools publish too — an X thread,
+  // a LinkedIn repost — and the dispatcher now hands them the same last-moment
+  // re-check. A callback that is attached but never consumed enforces nothing.
+  describe('mid-flight consent withdrawal on the action-scoped publishing tools', () => {
+    const withdrawn = {
+      assertPublishStillAuthorized: async () => ({
+        success: false as const,
+        error: 'twitter_manage_post was not executed: this unattended scheduled run is not authorized to publish.',
+      }),
+    };
+
+    it('ABANDONS an X thread when consent is withdrawn after account resolution', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { account_id: 'x-1', platform: 'twitter', userId: 'user-123' },
+      ] as any);
+
+      const result = await service.twitterManagePost(
+        'user-123',
+        { action: 'post_thread', tweets: ['one', 'two'] },
+        withdrawn
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not authorized to publish');
+    });
+
+    it('ABANDONS a LinkedIn repost before it resolves the account', async () => {
+      const result = await service.linkedinManagePost(
+        'user-123',
+        { action: 'repost', account_id: 'urn:li:organization:123456', post_urn: 'urn:li:ugcPost:1' },
+        withdrawn
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not authorized to publish');
+      // The public write is never reached — that is the property under test.
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when no re-check is attached — a read call pays nothing', async () => {
+      // The dispatcher attaches the hook only for a call it classified as
+      // publishing, so an analytics read arrives with no hook at all.
+      mockGetAccountById.mockResolvedValue(null as any);
+
+      const result = await service.linkedinManagePost(
+        'user-123',
+        { action: 'repost', account_id: 'urn:li:organization:123456', post_urn: 'urn:li:ugcPost:1' }
+      );
+
+      // Got past the gate and into the handler proper.
+      expect(mockGetAccountById).toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Account not found');
+    });
+  });
+
   describe('loadConnectedAccountPosts', () => {
     const mockAdapter = {
       createPost: jest.fn(),
@@ -368,6 +551,15 @@ describe('AgentModeService - Social Media Tools', () => {
 
     beforeEach(() => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
+      // ENG-1385: existence is now gated by resolveAccessibleAccount, which reads
+      // getAccountsWithOwnerIncludingOrgShared, not getAccountsByUserId directly.
+      // Every test in this block is an "own account" case (org-shared coverage
+      // lives in agentModeService.socialOrgShared.test.ts) — mirror whatever the
+      // test configures on getAccountsByUserId, tagged with the caller as owner,
+      // so the account resolves the same way through both lookups.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockImplementation(async (uid: string) =>
+        (await mockGetAccountsByUserId(uid)).map((a: any) => ({ ...a, userId: uid }))
+      );
     });
 
     it('should load posts for company page account', async () => {
@@ -597,7 +789,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should load metrics for company page account', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.getAccountMetrics.mockResolvedValue({
         followers: [{ followerCount: 1000, timeRange: { start: 1234567890 } }],
@@ -609,7 +803,13 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:organization:123456'
       );
 
-      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(mockLinkedInAccount, 'user-123', undefined, undefined);
+      // The resolved account carries the owner tag added by the org-shared lookup.
+      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(
+        { ...mockLinkedInAccount, userId: 'user-123' },
+        'user-123',
+        undefined,
+        undefined
+      );
       expect(result.success).toBe(true);
       expect(result.metrics).toBeDefined();
       expect(result.metrics.followers).toBeDefined();
@@ -617,7 +817,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return error when account not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([] as any);
 
       const result = await service.loadConnectedAccountMetrics(
         'user-123',
@@ -629,7 +829,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle token refresh through adapter when token is expired', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       // The adapter will handle token refresh, so we test successful metrics fetch
       mockAdapter.getAccountMetrics.mockResolvedValue({
         followers: [{ followerCount: 2000 }],
@@ -647,7 +849,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle adapter errors gracefully', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.getAccountMetrics.mockRejectedValue(new Error('LinkedIn API error'));
 
@@ -687,7 +891,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         undefined,
-        'user-123'
+        'user-123',
+        // ENG-827: the consent re-check, run inside the adapter after the token
+        // refresh. Undefined here — this is not a scheduled run.
+        undefined
       );
     });
 
@@ -707,7 +914,8 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         'Great post!',
-        'user-123'
+        'user-123',
+        undefined
       );
     });
 
@@ -751,6 +959,61 @@ describe('AgentModeService - Social Media Tools', () => {
     });
   });
 
+  describe('LinkedIn write connection revalidation', () => {
+    it('does not comment when the account disconnects after the duplicate check', async () => {
+      const mockAdapter = {
+        getComments: jest.fn().mockResolvedValue([]),
+        createComment: jest.fn(),
+      };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      mockGetAccountById
+        .mockResolvedValueOnce(mockLinkedInAccount as any)
+        .mockResolvedValueOnce(null);
+
+      const result = await service.commentOnLinkedInPost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123', 'A real comment'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+    });
+
+    it('does not react when the account disconnects after eligibility is checked', async () => {
+      const mockAdapter = { createReaction: jest.fn() };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      // Eligible at listing time, gone by the pre-write re-read.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
+      mockGetAccountById.mockResolvedValueOnce(null);
+
+      const result = await service.reactToLinkedInPost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123', 'LIKE'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+    });
+
+    it('does not repost when the account disconnects after eligibility is checked', async () => {
+      const mockAdapter = { createRepost: jest.fn() };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      mockGetAccountById
+        .mockResolvedValueOnce(mockLinkedInAccount as any)
+        .mockResolvedValueOnce(null);
+
+      const result = await service.linkedinRepost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createRepost).not.toHaveBeenCalled();
+    });
+  });
+
   describe('linkedinManagePost', () => {
     it('should dispatch repost action', async () => {
       jest.spyOn(service, 'linkedinRepost').mockResolvedValue({ success: true, message: 'ok' });
@@ -762,7 +1025,7 @@ describe('AgentModeService - Social Media Tools', () => {
         commentary: 'Nice!',
       });
 
-      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!');
+      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!', undefined);
     });
 
     it('should dispatch comment action', async () => {
@@ -775,7 +1038,7 @@ describe('AgentModeService - Social Media Tools', () => {
         comment_text: 'Hello',
       });
 
-      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined);
+      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined, undefined);
     });
 
     it('should dispatch list_comments action', async () => {

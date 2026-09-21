@@ -15,6 +15,7 @@ const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [
 jest.mock('../services/agentModeService', () => ({
   agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
 }));
+jest.mock('../utils/llmService', () => ({ createLLMService: () => ({ generateJSONContent: async () => ({}) }) }));
 
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
@@ -91,7 +92,10 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
 
     await runOrgWaterfall(makeLead({ email: 'jane@acme.com' }));
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    // Apollo/enrich.so calls carry the caller's userId on main so the provider can be
+    // billed and rate-limited per user. Production is correct; the assertions were left
+    // at the old arity.
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
   });
 
   it('prefers the website domain over an institutional email domain', async () => {
@@ -100,7 +104,7 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
 
     await runOrgWaterfall(makeLead({ email: 'sofronie@alum.mit.edu', website: 'https://www.acme.com' }));
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
   });
 
   it('prefers a business email domain over a stale/personal website URL', async () => {
@@ -110,7 +114,7 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
     // Business email (acme.com) must win over a stale/personal website (oldsite.io).
     await runOrgWaterfall(makeLead({ email: 'jane@acme.com', website: 'https://www.oldsite.io' }));
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
   });
 
   it('uses the CURRENT email domain over a stale stored emailDomain (Greptile P1)', async () => {
@@ -121,7 +125,7 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
     // (oldcorp.com) lingers — the current email must win, not the former employer.
     await runOrgWaterfall(makeLead({ email: 'person@newcorp.com', emailDomain: 'oldcorp.com' }));
 
-    expect(matchOrg).toHaveBeenCalledWith('newcorp.com');
+    expect(matchOrg).toHaveBeenCalledWith('newcorp.com', { userId: 'user-1' });
   });
 
   it('uses a business stored emailDomain when the current email is free-mail', async () => {
@@ -132,6 +136,6 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
     // the resolved business domain is a stronger signal than the free-mail address.
     await runOrgWaterfall(makeLead({ email: 'john@gmail.com', emailDomain: 'acme.com' }));
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
   });
 });

@@ -11,6 +11,7 @@
  */
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => []),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -27,6 +28,9 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    // ENG-892: model resolution is orthogonal to what this suite asserts —
+    // pass the requested id through unchanged.
+    resolveGenerationModel: jest.fn((model: string) => ({ model, fellBack: false, requestedModel: model })),
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
     getScheduledChatsDefaultModel: jest.fn(),
@@ -39,7 +43,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
-  generateMarketingResponseWorkerService: { runInWorker: jest.fn() },
+  generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
 
 jest.mock('../services/db', () => ({
@@ -157,6 +161,15 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
       sources: [],
       responseMessages: [],
     } as any);
+  });
+
+  // ENG-1118: a parked run is not a finished one — it resumes into the SAME session, so
+  // keep its browser rather than handing the resume a blank page. The idle sweep still
+  // reclaims it if the human never answers.
+  it('keeps the session\'s browser when the run parks on a user question', async () => {
+    await runScheduledChat(schedule, 'test-user-123', false);
+
+    expect(generateMarketingResponseWorkerService.releaseSessionClients).not.toHaveBeenCalled();
   });
 
   it('returns pending_user_input, notifies the owner, and does not send a normal result email', async () => {

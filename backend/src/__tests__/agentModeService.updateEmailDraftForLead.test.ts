@@ -2,8 +2,6 @@
 
 // Mock OpenAI before importing agentModeService (which creates module-level openai instance)
 // Create the mock function inside the factory to ensure it's accessible
-const mockChatCompletionsCreate = jest.fn();
-
 jest.mock('openai', () => {
   // Create mock function that will be shared
   const createMock = jest.fn();
@@ -32,13 +30,21 @@ jest.mock('../services/db', () => ({
     getLeadEngagements: jest.fn(),
     updateLead: jest.fn(),
     canOrgMemberAccessList: jest.fn(),
-  }
+  },
+  userDb: {
+    getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { crmDb } from '../services/db';
+import { crmDb, userDb, orgDb } from '../services/db';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 
 // Get the mock function from global scope
 const getMockCreate = () => (global as any).__openaiMockCreate as jest.Mock;
@@ -58,6 +64,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
     mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
     mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
+    jest.spyOn(agentModeService, 'getReportGenerationDefaultModel').mockResolvedValue('gpt-5.5');
 
     // Default: allow access (most tests use list owned by userId)
     mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
@@ -70,6 +77,10 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       // If mockCreate is not available, create a fallback
       console.warn('OpenAI mock not found, tests may fail');
     }
+    jest.spyOn(agentModeService, 'callLLM').mockImplementation(
+      (model: string, messages: any[], options: any) =>
+        mockCreate({ model, messages, ...options }),
+    );
   });
 
   describe('Success cases', () => {
@@ -184,9 +195,17 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
+      expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.5' }));
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
-      expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
+      // ENG-945: this prompt embeds formattedContent wholesale, so it must ask
+      // for the pre-ENG-945 coverage (40 competitors in full) and must NOT be
+      // given the tool-result paging instructions — there is no tool to call
+      // here, and offset chatter could leak into customer-facing copy.
+      expect(mockReadMarketStrategy).toHaveBeenCalledWith(
+        userId,
+        expect.objectContaining({ minCompetitorsInFull: 40, pagingHints: false }),
+      );
       // list.userId === userId here (same user), so listOwnerId === userId
       expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined, userId);
       expect(crmDb.updateLead).toHaveBeenCalled();
@@ -440,7 +459,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(result.message).toContain('Access denied');
     });
 
-    it('should allow access when user is an org member of the list owner', async () => {
+    it('should allow access when user is a listed crm.editor of the list owner (ENG-1049)', async () => {
       const listId = 'list1';
       const leadId = 'lead1';
       const userId = 'user1';
@@ -452,8 +471,14 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John' };
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      // canOrgMemberAccessList returns true because same org
-      mockCrmDb.canOrgMemberAccessList.mockResolvedValue(true);
+      mockUserDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-org-member' ? { userId: 'other-org-member', orgId: 'org-A' } as any : { userId: id, orgId: 'org-A' } as any)
+      );
+      mockOrgDb.getOrgById.mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: [userId] } },
+      } as any);
       (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
       (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
       mockReadBrandGuidelines.mockResolvedValue({ exists: false });
@@ -469,9 +494,35 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(mockCrmDb.canOrgMemberAccessList).toHaveBeenCalledWith(userId, mockList);
       // Should use the list owner's userId for sender lookup, not the org member's
       expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined, 'other-org-member');
+    });
+
+    it('should deny access when user is a same-org member but not a CRM editor (ENG-1049)', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+
+      const mockList = { listId, name: 'Org List', userId: 'other-org-member' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      mockUserDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === 'other-org-member' ? { userId: 'other-org-member', orgId: 'org-A' } as any : { userId: id, orgId: 'org-A' } as any)
+      );
+      mockOrgDb.getOrgById.mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: [] } },
+      } as any);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId, leadId, instruction, sessionId, userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
     });
 
     it('should return error if lead not found', async () => {

@@ -234,6 +234,77 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.analysis).not.toContain('![Analysis Result]');
   });
 
+  // ─── ENG-1295: generated CSV data returned as inlineData must not be dropped ─
+  // Prod session d789c175 (2026-08-17): Gemini's code-execution sandbox returned a
+  // computed per-ad-group breakdown as inlineData with mimeType text/csv (not via
+  // stdout/codeExecutionResult). The old code discarded ANY non-image inlineData as
+  // presumed Vega-Lite chart JSON, so the caller only ever saw the model's separate
+  // narrative `text` summary — ungrounded by the real computed numbers — which is
+  // exactly how perform_data_analysis reported hallucinated ad-group names/counts.
+  test('surfaces generated CSV data returned as inlineData instead of silently dropping it', async () => {
+    const csv = 'ad_group,impressions,clicks\nBrand Terms,10432,521\nCompetitor Terms,8811,290';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Here is the Q3 ad group breakdown.' },
+                {
+                  inlineData: {
+                    data: Buffer.from(csv, 'utf-8').toString('base64'),
+                    mimeType: 'text/csv'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down Q3 performance by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Brand Terms');
+    expect(result.analysis).toContain('Competitor Terms');
+    expect(result.analysis).toContain(csv);
+  });
+
+  test('surfaces generated CSV data returned as inline_data (snake_case) instead of silently dropping it', async () => {
+    const csv = 'ad_group,impressions,clicks\nBrand Terms,10432,521\nCompetitor Terms,8811,290';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: 'Here is the Q3 ad group breakdown.' },
+                {
+                  inline_data: {
+                    data: Buffer.from(csv, 'utf-8').toString('base64'),
+                    mime_type: 'text/csv'
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down Q3 performance by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.codeExecuted).toBe(true);
+    expect(result.analysis).toContain('Brand Terms');
+    expect(result.analysis).toContain('Competitor Terms');
+    expect(result.analysis).toContain(csv);
+  });
+
   test('skips inline_data (snake_case) with non-image mimeType', async () => {
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
@@ -322,7 +393,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     mockedGetS3ObjectAsString.mockResolvedValueOnce(csvContent);
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
-        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }] } }]
+        // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+        // other execution signal) is required alongside the narrative text part.
+        candidates: [{ content: { parts: [{ text: 'Analysis complete.' }, { codeExecutionResult: { output: 'foo,1\nbar,2' } }] } }]
       }
     });
 
@@ -367,7 +440,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     });
     mockedAxiosPost.mockResolvedValueOnce({
       data: {
-        candidates: [{ content: { parts: [{ text: 'Done.' }] } }]
+        // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+        // other execution signal) is required alongside the narrative text part.
+        candidates: [{ content: { parts: [{ text: 'Done.' }, { codeExecutionResult: { output: 'combined output' } }] } }]
       }
     });
 
@@ -440,7 +515,9 @@ describe('AgentModeService.performDataAnalysis', () => {
     const s3Key = `tool-responses/${sessionId}/get_chat_history.json`;
     mockedGetS3ObjectAsString.mockResolvedValueOnce('{"sessions":[{"cost":1.5}],"total":1.5}');
     mockedAxiosPost.mockResolvedValueOnce({
-      data: { candidates: [{ content: { parts: [{ text: 'Done.' }] } }] }
+      // ENG-1295 hard guard: file_urls was supplied, so a codeExecutionResult (or
+      // other execution signal) is required alongside the narrative text part.
+      data: { candidates: [{ content: { parts: [{ text: 'Done.' }, { codeExecutionResult: { output: 'total: 1.5' } }] } }] }
     });
 
     const result = await (service as any).performDataAnalysis([s3Key], 'Total the cost.', 'user-1');
@@ -805,6 +882,221 @@ describe('AgentModeService.performDataAnalysis', () => {
     expect(result.message).toMatch(/did not return|incomplete|try again|rephrase|simplif/i);
     expect(result.message).not.toBe('No analysis results received from Gemini');
   });
+
+  // ─── ENG-1295 hardening: hard guard, self-consistency check, provenance stub ─
+
+  test('rejects a narrative-only response when file_urls were supplied and no code execution occurred', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from('col1,col2\na,b'),
+      headers: { 'content-type': 'text/csv' }
+    });
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [{ text: 'Here is my summary of the data.' }] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.csv'], 'Break down by group.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('execution_failed');
+    expect(result.message).toContain('narrative summary');
+  });
+
+  test('rejects the second of two identical calls when the generated CSV grouping-key set changes', async () => {
+    const csv1 = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+    const csv2 = 'ad_group,impressions\nBrand Terms,100\nGame Analytics Platform,50';
+
+    mockedAxiosPost
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown one.' },
+          { inlineData: { data: Buffer.from(csv1, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      })
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown two.' },
+          { inlineData: { data: Buffer.from(csv2, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    expect(first.success).toBe(true);
+
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    expect(second.success).toBe(false);
+    expect(second.error).toBe('inconsistent_result');
+    expect(second.message).toContain('DIFFERENT set of result names');
+  });
+
+  test('does not flag a repeat call as inconsistent when the grouping-key values match', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+
+    mockedAxiosPost.mockResolvedValue({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-1');
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+  });
+
+  test('does not apply the self-consistency check across different userIds', async () => {
+    const csv1 = 'ad_group,impressions\nBrand Terms,100';
+    const csv2 = 'ad_group,impressions\nDifferent Name,100';
+
+    mockedAxiosPost
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown one.' },
+          { inlineData: { data: Buffer.from(csv1, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      })
+      .mockResolvedValueOnce({
+        data: { candidates: [{ content: { parts: [
+          { text: 'Breakdown two.' },
+          { inlineData: { data: Buffer.from(csv2, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+        ] } }] }
+      });
+
+    const instruction = 'Break down Q3 performance by ad group.';
+    const first = await (service as any).performDataAnalysis([], instruction, 'user-1');
+    const second = await (service as any).performDataAnalysis([], instruction, 'user-2');
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+  });
+
+  test('appends a provenance stub with rows_in/rows_out/distinct grouping-key values alongside generated CSV data', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from(JSON.stringify({ results: [{ id: 1 }, { id: 2 }, { id: 3 }] })),
+      headers: { 'content-type': 'application/json' }
+    });
+
+    const csv = 'ad_group,impressions\nBrand Terms,100\nCompetitor Terms,50';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] } }
+    );
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.json'], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('**Provenance:**');
+    expect(result.analysis).toContain('rows_in: 3');
+    expect(result.analysis).toContain('rows_out: 2');
+    expect(result.analysis).toContain('distinct grouping-key values (2): Brand Terms, Competitor Terms');
+  });
+
+  test('returns a distinct invalid_argument error for a raw Gemini 400 that is not a payload-size rejection', async () => {
+    const badRequestError: any = new Error('Request failed with status code 400');
+    badRequestError.response = { status: 400 };
+    mockedAxiosPost.mockRejectedValueOnce(badRequestError);
+
+    const result = await (service as any).performDataAnalysis([], 'Analyze the dataset.', 'user-1');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('invalid_argument');
+    expect(result.message).toContain('HTTP 400');
+  });
+
+  // ─── ENG-1295 hardening: intra-CSV id/name collision, grounding, narrative caveat ─
+
+  test('flags (without rejecting) a generated CSV that maps the same id to two different names', async () => {
+    // Deliberately informational, not a hard reject: a real entity (an ad group, a
+    // CRM lead's company) can legitimately be renamed within a query's date window,
+    // which produces this exact shape from genuinely correct source data — we can't
+    // tell "renamed" apart from "fabricated" from the CSV alone.
+    const csv = 'ad_group_id,ad_group_name,impressions\n199836788398,Product Analytics Platform,100\n199836788398,Game Analytics Platform,50';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(result.analysis).toContain('199836788398');
+    expect(result.analysis).toContain('map to more than one name');
+  });
+
+  test('does not flag a CSV where each id consistently maps to exactly one name', async () => {
+    const csv = 'ad_group_id,ad_group_name,impressions\n111,Brand Terms,100\n222,Competitor Terms,50';
+
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
+  });
+
+  test('flags unverified ids in the provenance stub when they cannot be found in the raw source', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: Buffer.from(JSON.stringify({ results: [{ id: '111', name: 'Brand Terms' }] })),
+      headers: { 'content-type': 'application/json' }
+    });
+
+    const csv = 'ad_group_id,ad_group_name,impressions\n111,Brand Terms,100\n999,Fabricated Group,50';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis(['https://files.test/data.json'], 'Break down by ad group id and name.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('1 of 2 id(s)');
+    expect(result.analysis).toContain('could not be found in the raw source');
+  });
+
+  test('appends an explicit caveat that the narrative prose is unverified when both text and CSV data are present', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { text: 'Breakdown by ad group.' },
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).toContain('has not been independently verified');
+  });
+
+  test('does not append the unverified-narrative caveat when there is no narrative text part', async () => {
+    const csv = 'ad_group,impressions\nBrand Terms,100';
+    mockedAxiosPost.mockResolvedValueOnce({
+      data: { candidates: [{ content: { parts: [
+        { inlineData: { data: Buffer.from(csv, 'utf-8').toString('base64'), mimeType: 'text/csv' } }
+      ] } }] }
+    });
+
+    const result = await (service as any).performDataAnalysis([], 'Break down by ad group.', 'user-1');
+
+    expect(result.success).toBe(true);
+    expect(result.analysis).not.toContain('has not been independently verified');
+  });
 });
 
 describe('perform_data_analysis in DEFAULT_FOUNDATION_TOOLS', () => {
@@ -886,6 +1178,53 @@ describe('formatToolError for perform_data_analysis', () => {
     it('falls through to generic guidance for unrecognized manage_scheduled_chat errors', () => {
       const result = (svc as any).formatToolError('manage_scheduled_chat', 'Internal server error');
       expect(result).toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    // ENG-1672: a schedule write blocked by DynamoDB's 400KB item ceiling must tell
+    // the model this is NOT retryable as-is, point it at the diagnostics tool, and
+    // NOT fall through to the generic "adjust the plan" guidance.
+    it('returns size-block guidance and points at storage diagnostics for a too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save (about 391KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is 10240 characters — shorten it and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    // ENG-1672 (code review follow-up): the controller throws 3 distinct
+    // "too large to save" message shapes (the one above, plus these two) — all
+    // must hit this branch, not just the first one a test happened to cover.
+    it('returns size-block guidance for the run-history-shed variant of the too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit would mean dropping 3 saved runs from this schedule's history at once. The starting message is 10240 characters — shorten it and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    it('returns size-block guidance for the plain over-the-ceiling variant of the too-large-to-save error', () => {
+      const result = (svc as any).formatToolError(
+        'manage_scheduled_chat',
+        "Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. Shorten the starting message and try again."
+      );
+      expect(result).toContain('get_scheduled_chat_storage_diagnostics');
+      expect(result).toMatch(/not.*transient|NOT a transient/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    });
+
+    // ENG-1672: a bare connection-level failure (e.g. the self-call's "fetch
+    // failed") gives no HTTP response at all, so the write's outcome is unknown —
+    // it may have already applied. The model must check current state instead of
+    // blindly resubmitting, which risks a redundant prompt-revision entry.
+    it('returns a check-before-retry warning for a bare network failure, not a generic retry prompt', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'fetch failed');
+      expect(result).toContain('list_scheduled_chats');
+      expect(result).toMatch(/may have already applied|outcome is unknown/i);
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
     });
   });
 });

@@ -9,16 +9,28 @@ dependencies:
   - playwright
   - pytest
   - pip:
-    - browser-use==0.8.0
+    # Matches requirements.txt and the version actually running in production
+    # (confirmed via `pip show browser-use` on the live ruiw process). A prior
+    # attempt (Jan 2026) to move to 0.8.0 broke web_agent.py's imports
+    # (browser_use.browser.browser.Browser/BrowserConfig don't exist in 0.8.0)
+    # and was abandoned — environment.yml was left pinned to 0.8.0 anyway,
+    # which meant a truly fresh `conda env create` was broken. Not attempting
+    # the browser-use upgrade here; that's a separate, pre-existing, unresolved
+    # effort out of scope for ENG-389.
+    - browser-use[memory]==0.1.48
     - aiohttp>=3.8.0
     - beautifulsoup4>=4.9.3
     - python-dotenv>=0.19.0
     - langchain>=0.1.0
     - langchain-openai>=0.0.5
     - langchain-anthropic>=0.1.1
+    - langchain-aws
+    - watchdog
+    - resend
     - humanize
     - openai>=1.12.0
     - cryptography>=42.0.0
     - google-cloud-storage>=2.10.0
-    - google-cloud-discoveryengine>=1.0.0
+    - google-cloud-discoveryengine
+    - google-cloud-secret-manager>=2.20.0
     - google-genai>=1.8.0

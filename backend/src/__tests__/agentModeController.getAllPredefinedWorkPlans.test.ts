@@ -80,6 +80,45 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
     expect(res.status).not.toHaveBeenCalled();
   });
 
+  // ENG-1469: the canonical customer projection rides alongside the legacy
+  // keys above — existing consumers reading the legacy shape are unaffected.
+  it('includes the canonical customer-facing display projection alongside legacy keys', async () => {
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        title: 'Onboarding',
+        description: '<p>Get started</p>',
+        category: 'Strategy',
+        steps: [{ stepCount: 1, title: 'Step 1', userInstructions: 'secret agent-only text' }],
+        showInAgentMode: true,
+        visibility: 'system' as const,
+        isBuiltIn: true,
+        createdAt: '2026-01-01',
+        updatedAt: '2026-01-01',
+      },
+    ];
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue(mockPlans);
+
+    const req = mockRequest();
+    const res = mockResponse();
+
+    await agentModeController.getAllPredefinedWorkPlans(req, res);
+
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    expect(result[0].display).toEqual(
+      expect.objectContaining({
+        id: 'plan-1',
+        title: 'Onboarding',
+        summary: 'Get started',
+        categories: ['strategy'],
+        steps: [{ position: 1, label: 'Step 1' }],
+        nextPlanIds: [],
+      }),
+    );
+    // The projection never leaks agent-only instructions.
+    expect(JSON.stringify(result[0].display)).not.toContain('secret agent-only text');
+  });
+
   it('should return empty array when no work plans exist', async () => {
     mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([]);
 
@@ -146,6 +185,52 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
 
     expect(mockWorkPlanService.getWorkPlansByOwner).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith([]);
+  });
+
+  // ENG-1802: the dedup key used to be `.toLowerCase()` only, so two templates
+  // whose titles differ only by underscore/hyphen-vs-space (e.g. a stored
+  // "Founder_Linkedin_Sales_Readiness_Audit" vs a naturally-typed "Founder
+  // Linkedin Sales Readiness Audit") deduped as DIFFERENT entries instead of
+  // one. Switched to normalizeWorkPlanTitleForMatch, the same separator/case
+  // normalization applyPredefinedWorkPlan already uses (ENG-1794).
+  it('dedupes titles that differ only by separator/case (ENG-1802)', async () => {
+    const publicPlan = {
+      planId: 'plan-public',
+      title: 'Founder_Linkedin_Sales_Readiness_Audit',
+      description: 'Public plan',
+      steps: [{ stepCount: 1, title: 'Step 1', requiredFunctionCalls: [] }],
+      showInAgentMode: true,
+      visibility: 'system' as const,
+      isBuiltIn: true,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    };
+    const privatePlan = {
+      planId: 'plan-private',
+      title: 'Founder LinkedIn Sales Readiness Audit', // spaced/mixed-case variant of the same title
+      description: 'Private plan',
+      steps: [{ stepCount: 1, title: 'Step 1', requiredFunctionCalls: [] }],
+      showInAgentMode: true,
+      visibility: 'private' as const,
+      isBuiltIn: false,
+      ownerId: 'user-123',
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    };
+
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([publicPlan]);
+    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'user-123', email: 'test@example.com' } } as any);
+    mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([privatePlan]);
+
+    const req = mockRequest();
+    const res = mockResponse();
+
+    await agentModeController.getAllPredefinedWorkPlans(req, res);
+
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    // Only the private plan survives the dedupe (private plans are listed first).
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('plan-private');
   });
 
   it('should handle errors gracefully', async () => {

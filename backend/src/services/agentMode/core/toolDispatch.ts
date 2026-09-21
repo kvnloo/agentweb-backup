@@ -27,8 +27,15 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
+import {
+  buildToolResponseS3Header,
+  buildToolResponseUnavailableHeader,
+} from '../../../utils/toolResponseS3Ref';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -53,6 +60,30 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
   'generate_image',
   'generate_video',
   'generate_voiceover',
+]);
+
+/**
+ * ENG-1331: MEDIA_GEN_TOOLS' three rate-limited generation APIs share a time-budget
+ * deferral + auto-continuation mechanism (ENG-510/ENG-1239) that
+ * `playwright_browser_take_screenshot` never joined — even though a
+ * Playwright-rendered asset loop (e.g. a display-ad size matrix: create_html_file +
+ * one screenshot per size) hits the exact same "one batch exceeds the run's wall
+ * clock" failure. Without deferral eligibility it just runs until the whole-turn
+ * hard cap, with no deferral marker and no auto-resume — production evidence: a
+ * 12-size render stopped at 4 with nothing surfaced, then the closing synthesis
+ * claimed all 12 (the false-completion-claim guard now catches THAT symptom, but
+ * this is the mechanism that let the run truncate unannounced in the first place).
+ *
+ * Superset of MEDIA_GEN_TOOLS used ONLY for the deferral / asset-count /
+ * duration-tracking checks below — deliberately NOT folded into MEDIA_GEN_TOOLS
+ * itself, which also drives forced-serial batching (`hasMultipleMediaGenTools`
+ * below) and the confirmation-gate-pause check in `mediaGenProducedAsset`, both
+ * legitimately specific to rate-limited external generation APIs and not
+ * applicable to a local, unrate-limited browser screenshot.
+ */
+export const DEFERRABLE_ASSET_TOOLS = new Set<string>([
+  ...MEDIA_GEN_TOOLS,
+  'playwright_browser_take_screenshot',
 ]);
 
 /**
@@ -112,6 +143,112 @@ export function mediaGenProducedAsset(toolName: string, result: any): boolean {
     return false;
   }
   return true;
+}
+
+/** Minimal shape of a persisted assistant message this reads — deliberately loose so it
+ * doesn't need to import the full ChatMessage type from chatbotService. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string; duplicateOf?: string }>;
+  } | null;
+}
+
+/**
+ * ENG-1239: `priorMediaCallKeys` (see executePreparedTools above) only ever contains what
+ * the CALLER threads in — every fresh turn starts it as `new Map()`
+ * (agentModeService.ts), so a media auto-continuation (a brand-new turn, not a later
+ * iteration of the SAME turn) got no code-level dedupe protection at all against the
+ * model re-emitting an already-completed generate_image call — only the LLM-prompt
+ * "already generated" awareness block, which relies on the model actually obeying it.
+ *
+ * This reconstructs the identical key shape (`name:stableStringify(args)` →
+ * tool_call_id) from PERSISTED session history instead, so a continuation turn can seed
+ * the dispatcher's dedupe map with what already actually happened — the dispatcher then
+ * refuses a genuine duplicate outright, the same hard guarantee same-turn iterations
+ * already get. Only counts a call that actually produced an asset (matches
+ * `mediaGenProducedAsset` / `countsAsAsset` above: no error, not deferred, not a
+ * confirmation-gate pause) — a failed or deferred call must stay retryable, not be
+ * mistaken for a duplicate. Bounded to `sinceMs` so an old, unrelated, coincidentally-
+ * identical request from a much earlier session/turn is never treated as a duplicate.
+ */
+export function seedMediaCallKeysFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceMs: number,
+): Map<string, string> {
+  const seeded = new Map<string, string>();
+  if (!Array.isArray(messages)) return seeded;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    const rawTs = message.timestamp || message.metadata?.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    for (const tc of toolCalls) {
+      // ENG-1331: deliberately MEDIA_GEN_TOOLS here, not the broader
+      // DEFERRABLE_ASSET_TOOLS — see the dedupe-key check below for why
+      // playwright_browser_take_screenshot must stay OUT of this reconstruction.
+      if (!tc?.name || !MEDIA_GEN_TOOLS.has(tc.name)) continue;
+      if (tc.error || !tc.result || tc.result.deferred === true || tc.result.success === false) continue;
+      if (!mediaGenProducedAsset(tc.name, tc.result)) continue;
+      const key = `${tc.name}:${stableStringify(tc.arguments)}`;
+      if (!seeded.has(key)) seeded.set(key, tc.id || '');
+    }
+  }
+  return seeded;
+}
+
+/**
+ * ENG-426: session-wide cap on `WEB_SEARCH_TOOL_NAMES` calls. Prod incident: a research
+ * turn made 193 web searches (73 file reads, 503 retained messages, 17.4M prompt tokens,
+ * $8.68) before an outer time limit ended it — the loop's exact-match anti-loop signature
+ * check (name + byte-identical arguments) never caught it, because each search varied its
+ * query text. This is a volume cap, not a dedupe: every prior call in the session counts
+ * regardless of arguments or outcome, so the model can't outrun it by rephrasing the query.
+ *
+ * Mirrors Claude Code's own fix for the identical failure mode ("Added a session-wide
+ * limit on WebSearch tool calls (default 200) to stop runaway search loops",
+ * `CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION`). Default set well above legitimate heavy
+ * single-topic research (rarely >20-30 distinct searches) while decisively catching a
+ * runaway. Override with AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION.
+ */
+export const SEARCH_CALL_SESSION_CAP = Math.max(
+  1,
+  parseInt(process.env.AGENT_MODE_MAX_SEARCH_CALLS_PER_SESSION || '60', 10) || 60,
+);
+
+/**
+ * ENG-426: count prior `WEB_SEARCH_TOOL_NAMES` calls across the WHOLE persisted session
+ * history. Deliberately NOT time-bounded (unlike `seedMediaCallKeysFromHistory` above) —
+ * a session naturally resets to zero the moment the user starts a new chat (a fresh
+ * `sessionId` has empty history), which is AgentMode's equivalent of Claude Code's
+ * `/clear`, so there is no old-unrelated-session risk to bound against here. Counts every
+ * call regardless of success/failure/arguments: this bounds the tool's volume, it does not
+ * detect duplicates.
+ */
+export function seedSearchCallCountFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+): number {
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const tc of toolCalls) {
+      // CodeRabbit (PR #2633): appendSuppressedDuplicate ALSO pushes a ledger entry with
+      // the collapsed call's name and a `duplicateOf` id (see executePreparedTools below)
+      // so the next LLM turn isn't left with an orphaned tool_call_id — but that entry
+      // never actually dispatched (no network call, no budget spent). Counting it here
+      // would inflate a later turn's seeded count for a search that only ran once.
+      if (tc?.duplicateOf) continue;
+      if (tc?.name && WEB_SEARCH_TOOL_NAMES.has(tc.name)) count++;
+    }
+  }
+  return count;
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
@@ -212,13 +349,17 @@ export interface ToolDispatchPorts {
   formatToolError: (toolName: string, errorMessage: string) => string;
   /** upload a playwright screenshot data-url to S3; returns { url } or null */
   uploadScreenshotToS3: (dataUrl: string, userId: string) => Promise<{ url: string } | null>;
-  /** upload a large tool response to S3; returns { success, key } */
+  /**
+   * upload a large tool response to S3; returns { success, key }.
+   * It reports failure by RETURNING success:false with `error` — it swallows its
+   * own exceptions — so callers must check the result, not just catch (ENG-940).
+   */
   uploadFileToS3WithPath: (
     content: string,
     fileName: string,
     contentType: string,
     path: string,
-  ) => Promise<{ success: boolean; key?: string }>;
+  ) => Promise<{ success: boolean; key?: string; error?: string }>;
   /** build the CRM-data-changed socket payload for a mutating tool (or null) */
   buildCrmDataChangedPayload: (toolName: string, functionArgs: any) => any;
   /** the socket event name for CRM data changes */
@@ -288,6 +429,14 @@ export interface ExecutePreparedToolsInput {
    */
   generationHardCapMs?: number;
   /**
+   * The turn's REAL wall-clock cap (epoch ms) — the ENG-907 budget, set only when the
+   * caller actually armed `withGenerationTimeout`. Unlike the two media deadlines above
+   * this is not an invented ceiling: callers that impose no cap (scheduled, Slack, GTM,
+   * email) leave it undefined. Tools that must return a result before the turn is
+   * guillotined bound their own work with it (ENG-1133's lead import).
+   */
+  turnHardCapMs?: number;
+  /**
    * Longest media-call wall-clock duration (ms) observed so far this run, across prior
    * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
    * latency rather than a guess. The dispatcher returns an updated value each iteration.
@@ -305,6 +454,22 @@ export interface ExecutePreparedToolsInput {
    * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
    */
   priorMediaCallKeys?: Map<string, string>;
+  /**
+   * ENG-936: optional approved image source URLs that must be used for image
+   * revisions. When supplied, a confirm=true `generate_image` call is rejected
+   * unless every requested input image is in this allow-list.
+   */
+  approvedRevisionImageSources?: string[];
+  /**
+   * ENG-426: count of `WEB_SEARCH_TOOL_NAMES` calls already made this SESSION before
+   * this iteration — seeded from persisted history via `seedSearchCallCountFromHistory`
+   * plus any earlier iterations of this same turn (the loop accumulates
+   * `searchCallsThisIteration` across iterations, same pattern as media asset tracking
+   * above). The cap check always runs; defaulting to 0 only means a caller that doesn't
+   * thread this through (or a unit test) starts counting from zero for that one call,
+   * so cross-iteration/cross-turn accumulation requires wiring it, as agentModeService.ts does.
+   */
+  priorSearchCallCount?: number;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -334,6 +499,60 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+  /**
+   * ENG-426: number of `WEB_SEARCH_TOOL_NAMES` calls ALLOWED to execute this iteration
+   * (i.e. not rejected by the session search-call cap). The loop adds this to its
+   * running `priorSearchCallCount` and threads the total into the next iteration, the
+   * same accumulate-and-thread pattern as `mediaAssetsProduced`/`mediaAssetsProducedThisRun`.
+   */
+  searchCallsThisIteration: number;
+}
+
+/**
+ * ENG-936: normalize image input fields into a single string array for source checks.
+ */
+function getInputImages(toolCallArgs: any): string[] {
+  const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
+  if (typeof rawInputImages === 'string') return [rawInputImages];
+  if (!Array.isArray(rawInputImages)) return [];
+  return rawInputImages.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * ENG-936: ensure a revision-style image edit binds to an explicitly approved
+ * source URL before execution. A false pass here means `confirm=true` was issued
+ * for the wrong source and must be stopped before gateway execution.
+ */
+function isApprovedImageSourceForRevision(
+  args: any,
+  approvedSources: string[] | undefined,
+): { approved: boolean; errorMessage?: string } {
+  if (!approvedSources || approvedSources.length === 0) {
+    return { approved: true };
+  }
+
+  const inputImages = getInputImages(args);
+  if (!Array.isArray(inputImages) || inputImages.length === 0) {
+    return {
+      approved: false,
+      errorMessage:
+        `generate_image confirmation requires explicit approved source inputImages. ` +
+        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
+    };
+  }
+
+  const mismatch = inputImages.find((url) => !approvedSources.includes(url));
+  if (!mismatch) {
+    return { approved: true };
+  }
+
+  return {
+    approved: false,
+    errorMessage:
+      `generate_image source mismatch under confirmation gate. ` +
+      `Expected one of: ${approvedSources.join(', ')}. ` +
+      `Received: ${mismatch}`,
+  };
 }
 
 /**
@@ -371,8 +590,11 @@ export async function executePreparedTools(
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
     generationHardCapMs,
+    turnHardCapMs,
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
+    approvedRevisionImageSources,
+    priorSearchCallCount = 0,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -384,6 +606,25 @@ export async function executePreparedTools(
   let skillsUpdated = false;
   let mediaAssetsProduced = 0;
   let mediaBudgetDeferred = false;
+  // ENG-426: search calls ALLOWED to execute this iteration (see SEARCH_CALL_SESSION_CAP).
+  let searchCallsThisIteration = 0;
+  // ENG-1945 follow-up: install_skills calls that already ran an eager head-start
+  // execution in Phase 1 below (so a sibling call gated by the newly-installed skill,
+  // appearing later in this SAME batch, sees it unlocked). Keyed by tool_call_id so
+  // Phase 2's runOne can replay this outcome instead of executing install_skills a
+  // second time for the identical call — see the eager block below for why a second,
+  // independent execution is unsafe rather than merely redundant.
+  const eagerToolOutcomes = new Map<string, ToolExecOutcome>();
+  // Same, but keyed by (name + args) signature rather than tool_call_id: the eager
+  // block below runs BEFORE the shared same-turn dedupe check further down (that
+  // check's own suppression bookkeeping — messages/ledger/counters — must stay
+  // ordered after every call has had a chance to unlock siblings, so it can't be
+  // moved earlier to gate the eager execution itself). Without this, two
+  // install_skills calls with IDENTICAL arguments emitted in the same batch (the
+  // model repeats itself) would each run the eager execution for real — the second
+  // one re-recording a failure/re-mutating session state for a call the later
+  // dedupe check goes on to suppress as a duplicate anyway.
+  const eagerInstallSkillsByArgs = new Map<string, ToolExecOutcome>();
 
   // Phase 1: Validate and prepare tool calls (synchronous)
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
@@ -458,7 +699,12 @@ export async function executePreparedTools(
 
   for (const toolCall of responseToolCalls) {
     try {
-      const functionArgs = JSON.parse(toolCall.function.arguments);
+      // ENG-1477: a large or quote-rich value (report titles with a quoted
+      // phrase, HTML content with attribute quotes) sometimes comes back with
+      // an inner `"` the model failed to escape, which JSON.parse reads as an
+      // early string terminator. Retry through a repair pass before failing —
+      // see repairToolCallArguments.ts for the observed failure signature.
+      const functionArgs = parseToolCallArguments(toolCall.function.arguments);
 
       // Enforce skill-based tool access; block admin-only tools without admin access,
       // block context-restricted/shared-session tools even if the LLM hallucinates them.
@@ -482,14 +728,47 @@ export async function executePreparedTools(
         continue;
       }
 
-      if (publishedSkillsCount > 0 && sessionAssociatedSkillIdsCount > 0 && !allowedToolNames.has(toolCall.function.name)) {
-        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
+      // ENG-426: session-wide search-call budget. Checked against calls already
+      // ALLOWED (prior turns + earlier this iteration loop), so a call that itself
+      // trips the cap is rejected before counting toward its own limit.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)
+          && priorSearchCallCount + searchCallsThisIteration >= SEARCH_CALL_SESSION_CAP) {
+        const used = priorSearchCallCount + searchCallsThisIteration;
+        const errorMsg =
+          `Search budget reached: this session has already used ${used} web-search calls `
+          + `(limit ${SEARCH_CALL_SESSION_CAP}). Stop searching. Answer now using what you've `
+          + `already found, or tell the user you've hit the research limit and ask how they'd `
+          + `like to proceed.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
 
-      if (toolCall.function.name === 'install_skills') {
-        skillsUpdated = true;
+      if (publishedSkillsCount > 0 && sessionAssociatedSkillIdsCount > 0 && !allowedToolNames.has(toolCall.function.name)) {
+        /*
+         * The install directive alone left the model with no instruction for the case where the
+         * install ALSO fails. Observed in a live delegated session: the gate refused
+         * `audit_ad_utm_coverage`, `install_skills` was refused, and the model then ran an
+         * unrelated AD LIST and presented a confident "UTM Tagging Audit Summary — PASS, 6/6
+         * tagged" table built from it. A downstream truthfulness guard appended a correction,
+         * but underneath the fabricated table — a correction is not a substitute for not
+         * fabricating.
+         *
+         * ENG-1844 review (found while working a different ticket, bundled in per Manan):
+         * this used to name ONE specific cause ("for example it is not available on this
+         * subscription") and tell the model to assert it plainly. install_skills refuses for
+         * FOUR distinct reasons (unentitled/billing, unavailable/catalog gap, unresolved/bad
+         * id, forbidden/role) — see `describeRejections` — and ENG-1795 exists specifically
+         * because collapsing the non-billing ones into a billing claim is false. This fires
+         * BEFORE install_skills ever runs, so asserting a specific cause here pre-empts its
+         * own accurate, already-bucketed reason. Defer to that instead of guessing.
+         *
+         * The prefix is unchanged: `classifyToolErrorClass` keys 'tool_unavailable' off it.
+         */
+        const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`
+          + ` If install_skills cannot install it, STOP — do NOT guess or assume why (it is not always a billing/subscription limit). Relay install_skills' own response message to the user exactly as it states the reason.`
+          + ` Do NOT run a different tool and present its output as this tool's result: reporting that a specific check ran, or passed, is a claim about THAT check, and substituting other data makes the claim false.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
       }
 
       const initialPolicyDecision = ports.evaluateAgentToolPolicy({
@@ -499,6 +778,10 @@ export async function executePreparedTools(
         isSharedSession: isInteractiveShare,
         enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
       });
+
+      if (toolCall.function.name === 'install_skills') {
+        skillsUpdated = true;
+      }
 
       const inputSchema = ports.getToolInputSchema(toolCall.function.name);
       const contractResult = ports.validateAndRepairToolArgs({
@@ -542,6 +825,103 @@ export async function executePreparedTools(
         continue;
       }
 
+      if (toolCall.function.name === 'install_skills') {
+        /*
+         * ENG-1945: a model very commonly emits install_skills AND a tool that skill
+         * gates in the SAME batch ("install the browser skill, then navigate"). Phase 2
+         * below runs every prepared call's tool ONLY after this whole Phase-1 loop
+         * finishes gating every call in the batch against `allowedToolNames` — so the
+         * sibling navigate/snapshot/etc. call, appearing later in this same array, was
+         * rejected as "not available" a beat before the install it depends on actually
+         * took effect.
+         *
+         * Run install_skills HERE instead — once, for real, through the gateway — the
+         * moment it has cleared every preflight gate every other tool call clears before
+         * reaching Phase 2 (schema validation/repair above, policy allow-check just
+         * above). That ordering matters, not just for consistency: running it any
+         * earlier (e.g. on the raw pre-repair args, before the policy gate) could
+         * execute — and mutate session state via addAssociatedSkills — for a call this
+         * same loop iteration goes on to preflight-reject a moment later, leaving the
+         * model told the call never happened while it actually did.
+         *
+         * The outcome is cached by tool_call_id in `eagerToolOutcomes` and Phase 2's
+         * runOne replays it instead of executing install_skills a SECOND time for the
+         * identical call. A second independent execution is not just redundant, it is
+         * actively unsafe for the repeated-failure breaker: a rejected install (bad
+         * skillId, unentitled skill) classifies as a FAST_TRIP error class
+         * (skill_install_refused/subscription_blocked/invalid_args — 2-failure
+         * threshold), and the gateway's own failure counter is keyed by run+tool+scope,
+         * not by tool_call_id — so two executions of ONE model-emitted call would
+         * record two failures and trip the breaker after a single turn instead of two,
+         * silently halving the model's real retry budget and replacing install_skills'
+         * accurate, bucketed rejection reason with a generic "stop retrying" message on
+         * what the model experiences as its very next attempt.
+         */
+        const argsKey = stableStringify(preparedFunctionArgs);
+        let outcome = eagerInstallSkillsByArgs.get(argsKey);
+        if (!outcome) {
+          // Same execute_tool span shape runOne (Phase 2) creates for every other tool —
+          // this eager call is install_skills' only real execution now, so it must be the
+          // one carrying the span, or the tool would vanish from OTel entirely.
+          const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} install_skills`, {
+            [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
+            [ATTR_GEN_AI_TOOL_NAME]: 'install_skills',
+            [ATTR_SESSION_ID]: sessionId,
+          });
+          outcome = await ports.executeAgentToolThroughGateway({
+            toolName: 'install_skills',
+            args: preparedFunctionArgs,
+            policyDecision,
+            runId: agentRuntimeRunId,
+            budgetScopeId: sessionId,
+            execute: () => ports.executePreparedAgentTool({
+              llmModel,
+              toolName: 'install_skills',
+              functionArgs: preparedFunctionArgs,
+              userId,
+              sessionId,
+              mockMode,
+              isDelegatedAccess,
+            }),
+          });
+          endExecuteToolSpan(span, outcome.status === 'error'
+            ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }
+            : {});
+        }
+        eagerInstallSkillsByArgs.set(argsKey, outcome);
+        eagerToolOutcomes.set(toolCall.id, outcome);
+        const result = outcome.status === 'success' ? outcome.result : undefined;
+        if (Array.isArray(result?.installedToolNames)) {
+          result.installedToolNames.forEach((name: string) => allowedToolNames.add(name));
+        }
+      }
+
+      if (
+        toolCall.function.name === 'generate_image'
+        && Array.isArray(approvedRevisionImageSources)
+        && approvedRevisionImageSources.length > 0
+      ) {
+        const sourceCheck = isApprovedImageSourceForRevision(
+          preparedFunctionArgs,
+          approvedRevisionImageSources,
+        );
+        if (!sourceCheck.approved) {
+          const errorMsg = sourceCheck.errorMessage || 'generate_image rejected: unapproved source image.';
+          const guidance = appendRetryabilityGuidance(
+            ports.formatToolError(toolCall.function.name, errorMsg),
+            'invalid_args',
+          );
+          appendPreflightToolFailure(
+            toolCall,
+            preparedFunctionArgs,
+            errorMsg,
+            guidance,
+            policyDecision,
+          );
+          continue;
+        }
+      }
+
       // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
       // was already accepted this turn and the tool isn't exempt, collapse this
       // one — do NOT execute it. Still answer its tool_call_id with a tool-role
@@ -552,12 +932,21 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
-      // ENG-510: cross-iteration dedupe for MEDIA-GEN tools only. The per-iteration check
+      // ENG-510: cross-iteration dedupe for MEDIA_GEN_TOOLS only. The per-iteration check
       // above misses an identical generate_image re-emitted in a LATER iteration of the
       // same turn (e.g. resuming after a timeout, the model re-requests an image it already
       // made). Suppress it if that exact call already produced an asset earlier this turn.
-      // Media-only so a legitimately-repeated mutating call (send_email) is never blocked;
-      // only successful generations are recorded, so a failed call can still be retried.
+      //
+      // ENG-1331: deliberately NOT extended to playwright_browser_take_screenshot, unlike
+      // the deferral/asset-count/duration checks above. generate_image's dedupe protects
+      // against re-paying for an expensive, rate-limited external API call; a screenshot is
+      // a cheap local action with the opposite risk profile — this exact template's own QA
+      // step ("Fix and re-render failures before delivery") calls for re-taking a screenshot
+      // with the SAME dimension-based filename after correcting a problem, and this dedupe
+      // would silently swallow that legitimate re-render as a false "already done" duplicate,
+      // leaving the broken original in place with no error surfaced. Media-only (not
+      // screenshot) so a legitimately-repeated mutating call (send_email) is also never
+      // blocked; only successful generations are recorded, so a failed call can still retry.
       if (
         MEDIA_GEN_TOOLS.has(toolCall.function.name)
         && priorMediaCallKeys?.has(dedupeKey)
@@ -568,31 +957,63 @@ export async function executePreparedTools(
       }
       seenToolCallKeys.set(dedupeKey, toolCall.id);
 
+      // ENG-426: count this call toward the session search-call budget only once it has
+      // cleared same-turn/cross-iteration dedupe and is genuinely about to execute — an
+      // exact-duplicate call suppressed above never reaches the gateway, so it shouldn't
+      // consume budget either.
+      if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+        searchCallsThisIteration++;
+      }
+
       preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision, dedupeKey });
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
-      // arguments verdict alongside the formatted error.
+      // ENG-124: unparseable args are never retryable as-is — EXCEPT when the
+      // arguments were genuinely truncated mid-stream (ENG-1477 follow-up):
+      // there is no bad argument to fix there, so "fix your args" is actively
+      // wrong guidance and just burns retries on cosmetic variations of an
+      // already-complete call. classifyToolErrorClass recognizes
+      // TruncatedToolCallArgumentsError by name and routes it to the
+      // retryable 'truncated_response' class instead of the hardcoded
+      // 'invalid_args' used for every other parse failure.
       const errorContent = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
-        'invalid_args',
+        error instanceof TruncatedToolCallArgumentsError ? classifyToolErrorClass(error) : 'invalid_args',
       );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }
   }
 
-  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait
-  // happens in order) or when multiple media-gen calls are batched (rate limits),
-  // parallel otherwise.
+  // Phase 2: Execute tools — sequential if wait_seconds is present (so the wait happens
+  // in order) or multiple screenshot calls are batched (see hasMultipleScreenshotCalls),
+  // bounded-concurrent when multiple media-gen calls are batched (rate limits), parallel
+  // otherwise.
   const hasWaitTool = preparedCalls.some(({ toolCall }) => toolCall.function.name === 'wait_seconds');
   const hasMultipleMediaGenTools = preparedCalls.length > 1 && preparedCalls.some(({ toolCall }) =>
     toolCall.function.name === 'generate_image' || toolCall.function.name === 'generate_video' || toolCall.function.name === 'generate_voiceover'
   );
+  // ENG-1331: unlike the 3 rate-limited generation APIs above, multiple
+  // playwright_browser_take_screenshot calls in one turn act on the SAME shared browser
+  // page (resize-then-screenshot per size) — running them with bounded concurrency would
+  // race on that shared state, not just on a provider rate limit. Force strict sequential
+  // instead, alongside wait_seconds, so each call's deferral decision also settles
+  // race-free against the prior one's result (the plain parallel path below assumes at
+  // most one deferrable-asset call ever reaches it — see its comment).
+  const hasMultipleScreenshotCalls = preparedCalls.length > 1 && preparedCalls.filter(({ toolCall }) =>
+    toolCall.function.name === 'playwright_browser_take_screenshot'
+  ).length > 1;
 
   let toolResults: DispatchToolResult[];
 
   const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
+    // ENG-1945 follow-up: install_skills already ran (for real, through the gateway) in
+    // Phase 1 above so a sibling call gated by it could unlock within the same batch —
+    // replay that outcome instead of executing it again. See the Phase-1 eager block for
+    // why a second execution is unsafe, not merely redundant.
+    const cachedOutcome = eagerToolOutcomes.get(toolCall.id);
+    if (cachedOutcome) return cachedOutcome;
+
     // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
     // its outcome shape, and error propagation are untouched.
     const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
@@ -623,6 +1044,15 @@ export async function executePreparedTools(
           // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
           // killed mid-wait by the generation timeout (ENG-124).
           runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+          // The turn's real cap, for tools that must hand a result back before the turn
+          // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
+          // a soft media-only budget, so it both under-budgets the work and, once it has
+          // passed, would report no time left while the turn still has minutes.
+          turnHardCapMs,
+          // ENG-1945 follow-up: the server's own id for the run THIS call is executing
+          // within, so a tool (report_product_issues) can verify a same-turn claim against
+          // ground truth instead of requiring the model to know/supply an opaque id.
+          agentRuntimeRunId,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
@@ -643,8 +1073,14 @@ export async function executePreparedTools(
     functionArgs: any,
   ): DispatchToolResult =>
     outcome.status === 'success'
-      ? { status: 'success', toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision }
-      : { status: 'error', toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
+      // A handler may decline to run at all and say so with `deferred: true`
+      // (ENG-822's anonymous account-scoped refusal). That is neither a success
+      // nor a failure — same accounting as the media-budget deferral below — so
+      // it maps to 'deferred' rather than being counted either way.
+      ? ((outcome.result as any)?.deferred === true
+          ? { status: 'deferred' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision }
+          : { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision })
+      : { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
 
   // Per-run media-generation time budget. Once the run is over its deadline AND has
   // already produced at least one asset (this run, including earlier calls in this
@@ -660,7 +1096,10 @@ export async function executePreparedTools(
   // ENG-510: run-wide longest media-call duration, seeded from prior iterations and
   // updated as calls settle below, so the adaptive reserve reflects real latency.
   let longestMediaCallMs = longestMediaCallMsThisRun;
-  const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  // ENG-1331: DEFERRABLE_ASSET_TOOLS (MEDIA_GEN_TOOLS + playwright_browser_take_screenshot)
+  // — broader than the name once was, so a Playwright render loop gets the same
+  // deferral/asset-counting/duration-tracking treatment as generate_image et al.
+  const isDeferrableAssetTool = (toolCall: any) => DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name);
   // Fixed soft-budget deadline passed (the original, fast-image assumption).
   const softBudgetExceeded = (): boolean =>
     mediaGenerationDeadlineMs != null && Date.now() > mediaGenerationDeadlineMs;
@@ -673,7 +1112,7 @@ export async function executePreparedTools(
     && longestMediaCallMs > 0
     && (generationHardCapMs - Date.now()) < longestMediaCallMs;
   const shouldDeferMedia = (toolCall: any): boolean =>
-    isMediaGenTool(toolCall)
+    isDeferrableAssetTool(toolCall)
     && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1
     && (softBudgetExceeded() || withinOneMediaCallOfHardCap());
   const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
@@ -686,21 +1125,22 @@ export async function executePreparedTools(
   // this batch" consistent with the calledFunctions / mediaAssetsProduced counters.
   const countsAsAsset = (dr: DispatchToolResult): boolean =>
     dr.status === 'success'
-    && isMediaGenTool(dr.toolCall)
+    && isDeferrableAssetTool(dr.toolCall)
     && !ports.toolResultError(dr.result)
     && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
   // ENG-510: track how long a media call actually took so the adaptive reserve (and the
   // value returned to the loop) reflects real latency. Updated as each call settles so a
   // later call in the SAME batch already sees the earlier call's duration.
   const recordMediaDuration = (dr: DispatchToolResult): void => {
-    if (isMediaGenTool(dr.toolCall) && dr.status !== 'deferred') {
+    if (isDeferrableAssetTool(dr.toolCall) && dr.status !== 'deferred') {
       longestMediaCallMs = Math.max(longestMediaCallMs, dr.duration || 0);
     }
   };
 
-  if (hasWaitTool) {
+  if (hasWaitTool || hasMultipleScreenshotCalls) {
     // Strict sequential: wait_seconds must take effect in emission order, so nothing
-    // batched with it may overlap it.
+    // batched with it may overlap it; multiple screenshot calls share one browser page
+    // (see hasMultipleScreenshotCalls above) and must not race on it either.
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
@@ -739,9 +1179,10 @@ export async function executePreparedTools(
       });
     }
   } else {
-    // Parallel path carries at most one media-gen call (a solo call; any media call
-    // batched with other tools forces the sequential path above), so a single
-    // pre-launch deferral check is race-free.
+    // Parallel path carries at most one deferrable-asset call (a solo call; a media-gen
+    // call batched with other tools forces the bounded-concurrency path above, and 2+
+    // screenshot calls force the strict-sequential path above), so a single pre-launch
+    // deferral check is race-free.
     const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs, policyDecision }) => {
       if (shouldDeferMedia(toolCall)) {
         return makeDeferred(toolCall, functionArgs, policyDecision);
@@ -872,9 +1313,11 @@ export async function executePreparedTools(
         pendingCounterUpdates[toolCall.function.name] =
           (pendingCounterUpdates[toolCall.function.name] || 0) + counterIncrement;
 
-        // Track media assets produced this iteration so the loop can carry a running
-        // per-run total into the next call's time-budget decision.
-        if (MEDIA_GEN_TOOLS.has(toolCall.function.name)) {
+        // Track media/deferrable assets produced this iteration so the loop can carry a
+        // running per-run total into the next call's time-budget decision (ENG-1331:
+        // includes playwright_browser_take_screenshot, consistent with shouldDeferMedia's
+        // "≥1 asset produced this batch" gate above).
+        if (DEFERRABLE_ASSET_TOOLS.has(toolCall.function.name)) {
           mediaAssetsProduced += 1;
         }
       }
@@ -903,27 +1346,60 @@ export async function executePreparedTools(
       // then cap the in-memory copy to prevent worker OOM.
       const S3_IN_MEMORY_CAP = 20_000;
       if (typeof toolContent === 'string' && toolContent.length > toolResponseS3Threshold) {
-        try {
-          const uploadResult = await ports.uploadFileToS3WithPath(
-            toolContent,
-            `${toolCall.id}.txt`,
-            'text/plain',
-            `tool-responses/${sessionId}`,
-          );
-          if (uploadResult.success && uploadResult.key) {
-            const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-            const preview = toolContent.length > S3_IN_MEMORY_CAP
-              ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-              : toolContent;
-            toolContent = header + preview;
+        // ENG-940: this offload is the ONLY thing that keeps the payload readable
+        // once the trimmer compresses this message, so a failure here is not a
+        // cosmetic miss — it is silent data loss on a later turn. Retry once (the
+        // common failure is a transient S3 blip), and if it still cannot be stored
+        // say so in the message rather than letting it pass for a small response.
+        // Note uploadFileToS3WithPath reports failure by RETURNING {success:false};
+        // the catch only covers a port that throws.
+        let uploadedKey: string | undefined;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 2 && !uploadedKey; attempt++) {
+          try {
+            const uploadResult = await ports.uploadFileToS3WithPath(
+              toolContent,
+              `${toolCall.id}.txt`,
+              'text/plain',
+              `tool-responses/${sessionId}`,
+            );
+            if (uploadResult.success && uploadResult.key) uploadedKey = uploadResult.key;
+            else lastError = uploadResult.error;
+          } catch (e) {
+            lastError = e;
           }
-        } catch (e) {
-          console.error('AgentMode: Failed to save large tool response to S3:', e);
+        }
+
+        if (uploadedKey) {
+          const header = buildToolResponseS3Header(uploadedKey, toolContent.length);
+          // ENG-1054: seal the slice instead of leaving the JSON it cut open. A bare
+          // substring lands mid-string/mid-object, and a model handed an unterminated
+          // structure completes it rather than answering — that is where the
+          // production `}]` final answer came from.
+          const preview = toolContent.length > S3_IN_MEMORY_CAP
+            ? sealTruncatedPayload(toolContent.substring(0, S3_IN_MEMORY_CAP))
+            : toolContent;
+          toolContent = header + preview;
+        } else {
+          console.error(
+            `AgentMode: Failed to save large ${toolCall.function.name} response ` +
+            `(${toolContent.length} chars) to S3 after 2 attempts:`,
+            lastError,
+          );
+          // Keep the payload in full for THIS turn — it is now the only copy —
+          // and prepend the notice so the loss is visible on every later turn.
+          toolContent = buildToolResponseUnavailableHeader(toolContent.length) + toolContent;
         }
       }
 
+      // ENG-1054: seal here too. This cap is a SECOND bare cut on the same payload,
+      // reached when the S3 offload above failed and left the content full-size —
+      // an unsealed slice here would reopen the JSON just as the preview one did.
       const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > maxToolContentSize
-        ? toolContent.substring(0, maxToolContentSize) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+        ? sealTruncatedPayloadWithNotice(
+          toolContent.substring(0, maxToolContentSize),
+          '[Content truncated for storage — original size: ' + toolContent.length + ' chars]',
+        )
         : toolContent;
       (messages as any[]).push({
         tool_call_id: toolCall.id,
@@ -942,8 +1418,14 @@ export async function executePreparedTools(
       // ask the user to reply "continue" — the asset-awareness block then resumes the
       // batch on the next turn without regenerating the already-saved images.
       const { toolCall, functionArgs } = toolResult;
-      const deferContent =
-        `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
+      // A handler-supplied deferral (ENG-822) carries its own instruction and
+      // reason; only the media-budget deferral gets the media prose below.
+      const handlerDeferral = (toolResult as any).result?.deferred === true
+        ? (toolResult as any).result
+        : null;
+      const deferContent = handlerDeferral?.message
+        ? String(handlerDeferral.message)
+        : `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
         + `The image(s) already generated this session are saved. `
         + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining, then ask them to reply "continue" to generate the rest. `
         + `When they continue, generate ONLY the still-missing assets (see the already-generated assets list), then mark the step complete.`;
@@ -951,7 +1433,7 @@ export async function executePreparedTools(
         id: toolCall.id,
         name: toolCall.function.name,
         arguments: functionArgs || toolCall.function.arguments,
-        result: { deferred: true, reason: 'media_generation_time_budget' },
+        result: handlerDeferral || { deferred: true, reason: 'media_generation_time_budget' },
         duration: 0,
       });
       messages.push({
@@ -959,7 +1441,15 @@ export async function executePreparedTools(
         role: 'tool',
         name: toolCall.function.name,
         content: deferContent,
-        metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+        // CodeRabbit (PR #2479): mediaBudgetDeferred must mean exactly what it says — a
+        // genuine per-turn media time-budget pause — not any deferral. A handler-supplied
+        // deferral (ENG-822's anonymous-account-scoped refusal, or any future one) carries
+        // its own unrelated reason and is a deliberate, permanent policy decision, never
+        // meant to be auto-retried. Durability checks (hasPersistedMediaBudgetDeferral,
+        // hasUnresolvedMediaDeferral) key off exactly this flag to decide whether to
+        // auto-resume, so tagging it unconditionally would have made those checks retry a
+        // policy refusal as if it were a timing issue.
+        metadata: { timestamp: new Date().toISOString(), ...(handlerDeferral ? {} : { mediaBudgetDeferred: true }) },
       });
     } else {
       const { toolCall, functionArgs, error, duration } = toolResult;
@@ -974,8 +1464,18 @@ export async function executePreparedTools(
         duration,
       });
 
-      failedCounterUpdates[toolCall.function.name] =
-        (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      // ENG-1626 / ENG-1636: a ToolResultPolicyBlockedError (result.blocked===true
+      // + a reason, e.g. set_work_plan_status's out-of-order/missing-calls/
+      // insufficient-assets gates) is the tool refusing BY DESIGN, not a
+      // malfunction. agentToolGatewayService already excludes these from the
+      // repeated-failure breaker for the same reason; this counter feeds
+      // session.failedFunctions, the exact field the failure-cluster telemetry
+      // and this issue's "failed 2x" reading were built from, so it needs the
+      // same carve-out or a self-correcting gate refusal reads as an infra flake.
+      if (!(error instanceof ToolResultPolicyBlockedError)) {
+        failedCounterUpdates[toolCall.function.name] =
+          (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+      }
 
       // ENG-124: the model-visible error carries (a) what failed (formatToolError
       // names the tool + reason, with per-tool fix text), and (b+c) an explicit
@@ -1004,5 +1504,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys, searchCallsThisIteration };
 }

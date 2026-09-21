@@ -1,3 +1,4 @@
+import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
  *
@@ -10,17 +11,17 @@
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function ctx(context: any) {
-  return { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
-}
-
-function jsonResult(data: unknown) {
-  return { content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] };
-}
+// ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
+// share them instead of keeping a second copy. Behaviour unchanged.
+import { ctx, jsonResult, CLIENT_ID_SCHEMA_PROPERTY } from './toolHelpers';
+import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
+import { resolveClientScopedContext } from './adminClientScope';
+import { executeCrossAccountLeadAdd, normalizeAddLeadPayload, previewLeadAdd, resolveDryRunFlag } from './manageLeadsCrossAccountAdd';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -191,13 +192,19 @@ mcpToolRegistry.register({
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
         llm_model: { type: 'string', description: 'LLM model to use (optional)' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 no threshold below the hard usage cap restricts or rewrites a model, so this is never consulted. The server remains authoritative on model eligibility and on the hard cap.' },
         media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
     }
   },
   execute: async (args: any, context: any) => {
-    const body: any = { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model };
+    const body: any = {
+      sessionId: args.session_id,
+      userMessage: args.message,
+      llmModel: args.llm_model,
+      llmBackupModel: args.backup_model,
+    };
     if (args.media_urls && args.media_urls.length > 0) {
       body.attachments = args.media_urls.map((url: string) => {
         const filename = url.split('/').pop()?.split('?')[0] || 'image';
@@ -265,20 +272,119 @@ mcpToolRegistry.register({
   },
 });
 
+// ENG-2057: expose the customer work-plan lifecycle as discrete outcomes so
+// connector discovery can rank launch and structured answering independently.
+// Keep both lifecycle tools public: external agents need the launch and unblock pair.
+mcpToolRegistry.register({
+  name: 'emma_launch_work_plan',
+  requiresUserAccount: true,
+  definition: {
+    name: 'emma_launch_work_plan',
+    description: 'Launch an accessible predefined work plan in an existing Emma session. Find a plan with list_predefined_work_plans first, then poll progress with emma_get_session. Refuses to replace a different active work plan.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        plan_id: { type: 'string', description: 'The predefined plan ID. Alias: work_plan_id.' },
+        work_plan_id: { type: 'string', description: 'Alias for plan_id.' },
+      },
+      required: ['session_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const planId = args.plan_id ?? args.work_plan_id;
+    if (typeof planId !== 'string' || planId.trim() === '') {
+      return jsonResult({ success: false, message: 'plan_id (or work_plan_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}/work-plan`,
+      context: ctx(context),
+      body: { planId },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_answer_work_plan_input',
+  definition: {
+    name: 'emma_answer_work_plan_input',
+    description: 'Answer a pending structured work-plan input request shown by emma_get_session. Values must be keyed by the field IDs in pendingWorkPlanInput. A plain emma_send_message does not submit these structured values.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'The Emma session ID.' },
+        request_id: { type: 'string', description: 'The pendingWorkPlanInput.requestId. Alias: work_plan_request_id.' },
+        work_plan_request_id: { type: 'string', description: 'Alias for request_id.' },
+        values: { type: 'object', additionalProperties: true, description: 'Answers keyed by pendingWorkPlanInput field ID.' },
+        label: { type: 'string', description: 'Optional chat-visible summary. Defaults to a neutral submission message.' },
+      },
+      required: ['session_id', 'values'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const requestId = args.request_id ?? args.work_plan_request_id;
+    if (typeof requestId !== 'string' || requestId.trim() === '') {
+      return jsonResult({ success: false, message: 'request_id (or work_plan_request_id) is required.' });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/agent-mode/generate',
+      context: ctx(context),
+      body: {
+        sessionId: args.session_id,
+        userMessage: typeof args.label === 'string' && args.label.trim() !== ''
+          ? args.label
+          : 'Submitted requested work plan details.',
+        workPlanInputAnswer: { requestId, values: args.values },
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
 mcpToolRegistry.register({
   name: 'emma_get_session',
   definition: {
     name: 'emma_get_session',
-    description: 'Get details of an Emma chat session by ID. Includes pendingUserQuestion when a blocking AskUserQuestion is awaiting or was recently answered — check its status before assuming a run has completed; resolve an "awaiting" one with emma_answer_question, never with a plain emma_send_message reply.',
+    description: 'Get details of an Emma chat session by ID, including the active workPlan summary and pendingWorkPlanInput when structured details are awaiting an answer. Pass run_id to check durable terminal status: completion_confirmed means the run ended, not that it succeeded. Missing records and detached handoffs remain unconfirmed. Check pendingUserQuestion and pendingWorkPlanInput before assuming a run has completed; resolve them with emma_answer_question and emma_answer_work_plan_input respectively, never with a plain emma_send_message reply.',
     inputSchema: {
       type: 'object',
-      properties: { session_id: { type: 'string', description: 'The session ID' } },
+      properties: {
+        session_id: { type: 'string', description: 'The session ID' },
+        run_id: { type: 'string', description: 'The run_id returned by a detached task (runId from emma_send_message). Pass it to check durable terminal status.' },
+      },
       required: ['session_id']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${args.session_id}`, context: ctx(context) });
-    return jsonResult(data);
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/session/${encodeURIComponent(args.session_id)}`, context: ctx(context) });
+    let run: AgentRunStatus | null = null;
+    if (typeof args.run_id === 'string' && args.run_id) {
+      try {
+        const record: any = await mcpFetch({
+          method: 'GET', path: `/api/agent-mode/runs/${encodeURIComponent(args.run_id)}`, context: ctx(context),
+        });
+        // This is a network boundary: validate identity and every field used as evidence.
+        if (record && record.runId === args.run_id && record.sessionId === args.session_id &&
+            ['running', 'completed', 'failed', 'interrupted'].includes(record.status) &&
+            (record.finishReason == null || typeof record.finishReason === 'string')) {
+          run = { runId: record.runId, sessionId: record.sessionId, status: record.status,
+            finishReason: record.finishReason ?? null };
+        }
+      } catch {
+        // A refusal, missing record or operational failure is never completion evidence.
+      }
+    }
+    return jsonResult({
+      ...data,
+      run,
+      // Terminal means the request ended, not that all detached or continuation work did.
+      completion_confirmed: run !== null && run.status !== 'running' &&
+        !['detached_still_building', 'timeout_partial_media', 'timeout_partial_work'].includes(run.finishReason ?? '') &&
+        data?.pendingUserQuestion?.status !== 'awaiting' && data?.pendingWorkPlanInput?.status !== 'awaiting',
+    });
   }
 });
 
@@ -295,17 +401,39 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'emma_list_models',
+  definition: {
+    name: 'emma_list_models',
+    description: 'List the Emma models currently selectable for this account. Every entitled model stays selectable right up to the hard usage cap; only a paused account returns an empty list with canGenerate false. scheduleBackupModels is a legacy field and no longer restricts anything.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/model-options', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── Tasks ──────────────────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'list_tasks',
   definition: {
     name: 'list_tasks',
-    description: 'List all tasks owned by the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all tasks owned by the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/tasks', context: ctx(context) });
+  /** Lists tasks for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/tasks',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_tasks')
+    });
     return jsonResult(data);
   }
 });
@@ -470,11 +598,20 @@ mcpToolRegistry.register({
   name: 'list_scheduled_chats',
   definition: {
     name: 'list_scheduled_chats',
-    description: 'List all scheduled chats for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all scheduled chats for the authenticated user, or a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/scheduled-chats', context: ctx(context) });
+  /** Lists scheduled chats for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/agent-mode/scheduled-chats',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_scheduled_chats')
+    });
     return jsonResult(data);
   }
 });
@@ -505,7 +642,9 @@ mcpToolRegistry.register({
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
         llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
+        revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
@@ -533,6 +672,7 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
@@ -556,8 +696,31 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+
+        // ENG-827: the publish setting never travels on this generic body — that route
+        // ignores it, so a revoke sent there would be silently dropped. It goes to the
+        // dedicated revoke-only endpoint, and it goes FIRST: if the ordinary update then
+        // fails, the schedule is already in the SAFER (not publishing) state. Revoking
+        // afterwards would leave publishing enabled whenever the second call failed.
+        //
+        // ONE DIRECTION ONLY. The endpoint rejects anything but `authorized: false`, so
+        // no argument the model can pass turns publishing on. Do not name the underlying
+        // schedule field anywhere in this file — a source-scanning test
+        // (schedulePublishApproval.mcpGuard.test.ts) enforces that it stays unwritable
+        // through the generic surface.
+        let publishConsent: any;
+        if (args.revoke_autopublish === true) {
+          publishConsent = await mcpFetch({
+            method: 'POST',
+            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            context: c,
+            body: { authorized: false },
+          });
+        }
+
+        if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
-        return jsonResult(data);
+        return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
         const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });
@@ -659,6 +822,27 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'get_scheduled_chat_storage_diagnostics',
+  definition: {
+    name: 'get_scheduled_chat_storage_diagnostics',
+    description: 'Diagnose why a scheduled chat is failing to save with a size-related error, or check whether one is at risk of it. DynamoDB caps a schedule at 400KB; this returns a byte-usage breakdown (current prompt, saved prompt-edit history, saved run history) against that limit and, when the schedule is under storage pressure, the one corrective action the user can take. Returns byte counts only — never the schedule\'s actual prompt or run content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'The scheduled chat ID to diagnose' }
+      },
+      required: ['schedule_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/storage-diagnostics`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Schedule Templates ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -687,7 +871,11 @@ mcpToolRegistry.register({
         name: { type: 'string', description: 'Template name (create/update)' },
         description: { type: 'string', description: 'Template description (create/update)' },
         category: { type: 'string', description: 'Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)' },
-        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Visibility: system (admin-created, always visible), private (only visible to creator), public (approved, visible to all), pending_review (submitted for admin review). Default: private. (create/update)' },
+        visibility: { type: 'string', enum: ['private', 'pending_review'], description: "Visibility, on 'update' only. 'create' ALWAYS produces a private template and ignores this field. "
+          + "Only these two are settable here: 'private' (visible to you alone) and 'pending_review' "
+          + "(submitted for an administrator to approve). 'system' and 'public' are platform-wide and "
+          + "admin-only — asking for them is refused, not silently downgraded. To share a template with "
+          + "everyone, set 'pending_review' and an administrator approves or rejects it (ENG-1716)." },
         starting_message: { type: 'string', description: 'The prompt/message template. Use {{variable_name}} for variables. (create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, type: { type: 'string', enum: ['text', 'long_text', 'file'] } }, required: ['name'] }, description: 'Variable definitions (auto-extracted from message if not provided)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to verify in scheduled chat output (create/update)' },
@@ -771,6 +959,7 @@ mcpToolRegistry.register({
         variable_values: { type: 'object', description: 'Variable values for the template placeholders' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted.' },
       },
       required: ['template_id']
     }
@@ -785,6 +974,7 @@ mcpToolRegistry.register({
     if (args.variable_values !== undefined) body.variableValues = args.variable_values;
     if (args.run_count !== undefined) body.runCount = args.run_count;
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+    if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
     const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
@@ -796,11 +986,20 @@ mcpToolRegistry.register({
   name: 'list_lead_lists',
   definition: {
     name: 'list_lead_lists',
-    description: 'List all lead lists for the authenticated user.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List all lead lists for the authenticated user, or for a specific client (admin-only, via client_id).',
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/crm/lists', context: ctx(context) });
+  /** Lists lead lists for the caller, or (admin-only) for `args.client_id`'s account. */
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/crm/lists',
+      context: await resolveClientScopedContext(context, args?.client_id, 'list_lead_lists')
+    });
     return jsonResult(data);
   }
 });
@@ -847,29 +1046,160 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── CRM drip / nurture sequences, read-only (ENG-962) ──────────────────────
+//
+// `get_leads_by_crm_criteria` scopes WHO a campaign targets; this tool inspects
+// the campaign itself. Read-only by construction: list + inspect + enrollment
+// counts only. Create/activate/pause live in the sibling ENG-442 work
+// (manage_crm_sequence, ENG-963/964) behind the send-safety gate and must
+// never be added here.
+
+mcpToolRegistry.register({
+  name: 'list_crm_sequences',
+  definition: {
+    name: 'list_crm_sequences',
+    description: `List the CRM email drip / nurture sequences on the caller's account, and inspect one with enrollment counts. Read-only — safe to call any time, including in a scheduled run. It cannot create, start, pause, or otherwise change a sequence; to change one, use the CRM UI.
+
+Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`audience\` (who the drip worker actually enrolls — auto-enroll lists, never the aspirational trigger), \`step_count\`, \`is_sending\` (true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence), and \`enrollment_count\` when a single sequence is inspected.
+
+An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summary line. That is a valid answer meaning "no campaigns exist", not an error — report it as such instead of retrying or guessing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['draft', 'active', 'paused', 'archived'],
+          description: 'Only return sequences in this status. Omit to return all of them.',
+        },
+        sequence_id: {
+          type: 'string',
+          description: 'Inspect one sequence: returns its summary plus enrollment counts. Omit to list all.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const { summarizeSequence } = await import('../../services/crmSequenceRead');
+    try {
+      // Inspect-one path: summary + enrollment counts. The routes 403 when the
+      // sequence belongs to another user, so cross-account reads fail closed
+      // at the API boundary, not in this tool.
+      if (typeof args?.sequence_id === 'string' && args.sequence_id.trim()) {
+        const sequenceId = args.sequence_id.trim();
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+        });
+        const sequence = data?.sequence;
+        if (!sequence) return jsonResult({ error: `Sequence not found: ${sequenceId}` });
+        let enrollment_count: unknown = undefined;
+        let enrollment_error: string | undefined = undefined;
+        try {
+          const enrollments = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}/enrollments`,
+            context: ctx(context),
+          });
+          enrollment_count = enrollments?.stats ?? enrollments?.enrollments?.length ?? undefined;
+        } catch (err: any) {
+          // Surface enrollment-endpoint failures explicitly instead of
+          // silently dropping the count (CodeRabbit, PR #2974): the
+          // inspect-one contract promises an enrollment count, and a 401/403,
+          // timeout, or 5xx here must not read as "zero enrollments".
+          enrollment_count = undefined;
+          enrollment_error = err?.message || String(err);
+        }
+        return jsonResult({
+          ...summarizeSequence(sequence),
+          enrollment_count,
+          ...(enrollment_error ? { enrollment_error } : {}),
+        });
+      }
+
+      const data = await mcpFetch({
+        method: 'GET',
+        path: '/api/crm/sequences',
+        context: ctx(context),
+      });
+
+      const all = Array.isArray(data?.sequences) ? data.sequences : [];
+      const filtered =
+        typeof args?.status === 'string' ? all.filter((s: any) => s?.status === args.status) : all;
+      const sequences = filtered.map(summarizeSequence);
+      const activeCount = sequences.filter((s: any) => s.is_sending).length;
+
+      return jsonResult({
+        total: sequences.length,
+        active_count: activeCount,
+        sequences,
+        summary:
+          sequences.length === 0
+            ? typeof args?.status === 'string'
+              ? `No CRM drip sequences match status "${args.status}".`
+              : 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
+      });
+    } catch (err: any) {
+      return jsonResult({ success: false, error: err?.message || String(err) });
+    }
+  },
+});
+
 mcpToolRegistry.register({
   name: 'manage_leads',
   definition: {
     name: 'manage_leads',
-    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list".',
+    description: 'Add, get, update, or delete leads in a list. Use action: "add", "get", "update", "delete", or "list". Admin-only: pass client_id to act on a specific client\'s list instead of the caller\'s own — supported for "list", "get", and "add" (ENG-1557 v1: admin creates one lead on a customer\'s behalf, behind a feature flag; pass dry_run:true to preview first without writing anything). Still rejected for "update"/"delete" — those need a broader authorization review.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['list', 'add', 'get', 'update', 'delete'], description: 'Action to perform' },
         list_id: { type: 'string', description: 'The lead list ID' },
         lead_id: { type: 'string', description: 'Lead ID (for get/update)' },
-        leads: { type: 'array', description: 'Array of lead objects to add (for add action)' },
+        leads: { type: 'array', description: 'Exactly one lead object to add, wrapped in an array (for add action)' },
         lead_ids: { type: 'array', items: { type: 'string' }, description: 'Lead IDs to delete (for delete action)' },
         updates: { type: 'object', description: 'Fields to update (for update action)' },
         limit: { type: 'number', description: 'Max leads to return (list action)' },
-        last_key: { type: 'string', description: 'Pagination key (list action)' }
+        last_key: { type: 'string', description: 'Pagination key (list action)' },
+        client_id: {
+          type: 'string',
+          description: "Admin-only. Scope to a specific client's list instead of the caller's own — accepts the client's email or userId. Supported for 'list', 'get', and 'add'. For 'add', the real write additionally requires the MANAGE_LEADS_CROSS_ACCOUNT_ADD_ENABLED flag; dry_run:true always works regardless of the flag. Still rejected for 'update'/'delete' (broader authorization review pending).",
+        },
+        dry_run: {
+          type: 'boolean',
+          description: '"add" action only. When true, preview what would be created (list resolution, permission check, duplicate-email check) without creating anything. Advisory, not exhaustive — some real-write validations (e.g. selectedSenderId) aren\'t replicated, so a preview success doesn\'t guarantee the real write will succeed. Works regardless of client_id or the cross-account-add feature flag. Must be a real boolean if provided.',
+        },
       },
       required: ['action', 'list_id']
     }
   },
+  /**
+   * CRUD dispatch for a lead list's leads. `args.client_id` (admin-only) scopes
+   * `list`/`get`/`add` to a specific client's list; `update`/`delete` reject it
+   * outright (ENG-1557: broader cross-account mutation is still pending
+   * authorization review — `add` graduated out under ENG-1557 v1, scoped
+   * narrowly and feature-flagged, see manageLeadsCrossAccountAdd.ts).
+   */
   execute: async (args: any, context: any) => {
-    const c = ctx(context);
     const listId = args.list_id;
+    const hasClientId = args.client_id !== undefined && args.client_id !== null;
+    // Only update/delete remain blanket-rejected — add graduated out under
+    // ENG-1557 v1. Still reject ANY present client_id (not just non-empty
+    // strings — CodeRabbit, PR #2651) rather than silently falling through.
+    const isRejectedWrite = (args.action === 'update' || args.action === 'delete') && hasClientId;
+    if (isRejectedWrite) {
+      throw new Error(
+        `client_id is not supported for manage_leads action "${args.action}" — cross-account writes for this action are pending a broader ENG-1557 authorization review. Only "list", "get", and "add" support client_id today.`
+      );
+    }
+    if (args.action === 'add' && hasClientId) {
+      return executeCrossAccountLeadAdd(args, context);
+    }
+    const isWriteAction = args.action === 'add' || args.action === 'update' || args.action === 'delete';
+    const c = isWriteAction ? ctx(context) : await resolveClientScopedContext(context, args.client_id, 'manage_leads');
     switch (args.action) {
       case 'list': {
         const qp: Record<string, string> = {};
@@ -879,7 +1209,19 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'add': {
-        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: { leads: args.leads } });
+        const leadPayload = normalizeAddLeadPayload(args.leads);
+        if (resolveDryRunFlag(args.dry_run)) {
+          // Must match httpClient.ts's own acting-identity resolution
+          // (`context.userId || context.agentUserId`) exactly — otherwise an
+          // internal service-to-service caller (userId deliberately distinct
+          // from agentUserId, see mcpServerCore.ts) gets a preview checked
+          // against a different identity than the one that actually performs
+          // the real write a moment later.
+          const actingUserId = c.userId || c.agentUserId;
+          const preview = await previewLeadAdd(actingUserId, listId, leadPayload);
+          return jsonResult({ dryRun: true, ...preview });
+        }
+        const data = await mcpFetch({ method: 'POST', path: `/api/crm/lists/${listId}/leads`, context: c, body: leadPayload });
         return jsonResult(data);
       }
       case 'get': {
@@ -914,7 +1256,7 @@ mcpToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Search leads across lists using structured filters.',
+    description: 'Search leads across lists using structured filters. Admin-only: pass client_id to search a specific client\'s leads instead of the caller\'s own.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -932,14 +1274,16 @@ mcpToolRegistry.register({
           },
           description: 'Array of filter conditions'
         },
-        limit: { type: 'number', description: 'Max results (default 20, max 50)' }
+        limit: { type: 'number', description: 'Max results (default 20, max 50)' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: ['list_id', 'filters']
     }
   },
+  /** Searches leads for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
-      method: 'POST', path: '/api/emma/search-leads', context: ctx(context),
+      method: 'POST', path: '/api/emma/search-leads', context: await resolveClientScopedContext(context, args.client_id, 'search_leads'),
       body: { list_id: args.list_id, filters: args.filters, limit: args.limit }
     });
     return jsonResult(data);
@@ -1241,6 +1585,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'create_blog_article',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'create_blog_article',
     description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3.',
@@ -1272,6 +1618,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'publish_blog_article',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'publish_blog_article',
     description: 'Publish a blog article to CMS (Basehub or Webflow). Takes title, description, hero image URL, and blog HTML URL from create_blog_article. CRITICAL: Always review with user before publishing.',
@@ -1290,11 +1638,16 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last moment before the article goes live on the CMS.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return { success: false, message: withdrawn.error };
     const { agentModeService } = await import('../../services/agentModeService');
     return await agentModeService.publishBlogArticle(
       args.title, args.description, args.hero_image_url, args.blog_html_url,
       context?.userId, context?.sessionId,
-      args.status, args.author, args.categories
+      args.status, args.author, args.categories,
+      // The check above guards entry; this one rides through the HTML fetch inside.
+      context?.assertPublishStillAuthorized
     );
   }
 });
@@ -1305,25 +1658,44 @@ mcpToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'List all connected social media and integration accounts.',
+    description: `List all connected social media and integration accounts.
+
+GOOGLE ADS SPEND RISK (ENG-1362). google_ads rows carry test_account and can_spend.
+  test_account: true = Google guarantees the account CANNOT serve ads and CANNOT spend.
+  test_account: false = real, billable.
+  test_account absent = never recorded; treat as billable.
+  can_spend = false ONLY when test_account is true.
+Never infer this from account_name — a fully billable account can be named "Test".
+
+Admin-only: pass client_id to list a specific client's connected accounts instead of the caller's own.`,
     inputSchema: {
       type: 'object',
       properties: {
-        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' }
+        platform: { type: 'string', description: 'Filter by platform (e.g., "linkedin", "meta", "unipile")' },
+        client_id: CLIENT_ID_SCHEMA_PROPERTY
       },
       required: []
     }
   },
+  /** Lists connected accounts for the caller, or (admin-only) for `args.client_id`'s account. */
   execute: async (args: any, context: any) => {
     const qp: Record<string, string> = {};
     if (args.platform) qp.platform = args.platform;
-    const data = await mcpFetch({ method: 'GET', path: '/api/oauth/connected-accounts', context: ctx(context), queryParams: qp });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/oauth/connected-accounts',
+      context: await resolveClientScopedContext(context, args.client_id, 'list_connected_accounts'),
+      queryParams: qp
+    });
     return jsonResult(data);
   }
 });
 
 mcpToolRegistry.register({
   name: 'post_on_account',
+  internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'post_on_account',
     description: 'Post content on a connected social media account.',
@@ -1338,6 +1710,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before this becomes a live post.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
       body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
@@ -1352,7 +1727,7 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic.',
+    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic. IMPORTANT: a returned "deployed" status means the BUILD succeeded, not that the page is launch-ready — check the response\'s launchReadiness field (or call get_deployment_status) before telling the user the page is ready to send traffic to. If launchReadiness.ready is false, relay the reasons plainly instead of calling it done.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1669,7 +2044,7 @@ mcpToolRegistry.register({
   name: 'get_deployment_status',
   definition: {
     name: 'get_deployment_status',
-    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits.',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits. The response\'s launchReadiness field is a SEPARATE signal from status/buildStatus: a page can build and deploy successfully and still not be launch-ready (failed post-deploy smoke test, no conversion tracking installed). Check launchReadiness.ready before telling the user the page is ready to send traffic to — if false, relay launchReadiness.reasons plainly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1726,6 +2101,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before the deployment goes live.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST',
       path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
@@ -1770,6 +2148,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'install_skills',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'install_skills',
     description: 'Install skills by their IDs. Pass ALL skill IDs you need in a single call — do not call this tool multiple times. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
@@ -1899,7 +2279,6 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'generate_image',
-  internal: true,
   definition: {
     name: 'generate_image',
     description: 'Generate images using AI image generation models.',
@@ -1912,9 +2291,10 @@ mcpToolRegistry.register({
         quality: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Quality', default: 'medium' },
         input_images: { type: 'array', items: { type: 'string' }, description: 'Input images for editing' },
         logo_image: { type: 'string', description: 'Logo image URL to add' },
-        image_model: { type: 'string', description: 'Model to use' }
+        image_model: { type: 'string', description: 'Model to use' },
+        category: { type: 'string', enum: ['ad', 'organic_post'], description: "Use-case declaration for the human eval queue: 'ad' for paid ad creatives, 'organic_post' for organic social/content imagery" }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context: any) => {
@@ -1924,7 +2304,8 @@ mcpToolRegistry.register({
         prompt: args.prompt, filename: args.filename,
         size: args.size || '1024x1024', quality: args.quality || 'medium',
         input_images: args.input_images || [],
-        image_model: args.image_model, logo_image: args.logo_image
+        image_model: args.image_model, logo_image: args.logo_image,
+        category: args.category
       }
     });
     return jsonResult(data);
@@ -1934,6 +2315,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'send_email',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'send_email',
     description: 'Read, search, and send emails across connected email accounts (Gmail, Outlook, etc.).',
@@ -1968,14 +2351,69 @@ mcpToolRegistry.register({
 
 // ─── Predefined Work Plans (admin-only) ─────────────────────────────────────
 
+// This tool's own parameters are snake_case, but /api/admin/work-plans reads the
+// step fields in camelCase, so a snake_case step field used to be silently
+// dropped (the plan saved with requiredFunctionCalls: [] and no error). Accept
+// either casing and hand the route the camelCase names it reads (ENG-889).
+const WORK_PLAN_STEP_ALIASES: Record<string, string> = {
+  required_function_calls: 'requiredFunctionCalls',
+  skill_ids: 'skillIds',
+  user_instructions: 'userInstructions',
+  step_count: 'stepCount',
+  expected_asset_count: 'expectedAssetCount',
+  expected_asset_count_tools: 'expectedAssetCountTools',
+};
+
+const normalizeWorkPlanSteps = (steps: any): any => {
+  if (!Array.isArray(steps)) return steps;
+  return steps.map((step: any) => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
+    const normalized: any = {};
+    // Copy everything that is already canonical first, then fill the gaps from
+    // snake_case aliases. Two passes rather than one because a single pass is
+    // key-order dependent: with `{required_function_calls, requiredFunctionCalls}`
+    // the later key would overwrite whatever the earlier one resolved to.
+    for (const [key, value] of Object.entries(step)) {
+      if (!WORK_PLAN_STEP_ALIASES[key]) normalized[key] = value;
+    }
+    for (const [key, value] of Object.entries(step)) {
+      const alias = WORK_PLAN_STEP_ALIASES[key];
+      if (!alias) continue;
+      // A camelCase value supplied alongside its snake_case twin wins — but
+      // JSON has no undefined, so a model emitting an unset field emits null.
+      // Treating that null as "present" would shadow a good snake_case value.
+      if (normalized[alias] === undefined || normalized[alias] === null) {
+        normalized[alias] = value;
+      }
+    }
+    return normalized;
+  });
+};
+
+/**
+ * Work plan steps are stored as a whole array, so PUT /api/admin/work-plans/:id
+ * replaces every step with the payload. Callers amending a single step used to
+ * silently delete the rest (ENG-890); the helpers below add merge semantics and
+ * a fail-closed guard around destructive replacements. They all run on steps
+ * that normalizeWorkPlanSteps has already put in canonical camelCase.
+ */
+
+
 mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
     name: 'list_predefined_work_plans',
-    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title.',
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: 'List the predefined work plan templates available to start. Non-admin users see published templates (system/public) plus their own and org-shared private plans. Admins (or admin-delegated sessions) get the full management list including unpublished and pending-review plans. To begin one, call launch_predefined_work_plan with the chosen title. Returns a compact listing shape by default (id, title, category, autocomplete, visibility, display) -- pass verbose=true only if you need a template\'s full per-step body (description, userInstructions, skillIds, requiredFunctionCalls), and pair it with plan_id (the id from a prior compact listing, or the exact title) to scope the full detail to that one template instead of the whole catalog. Prefer the default shape for browsing/matching, and always pass plan_id alongside verbose=true when you already know which template you want -- verbose without plan_id re-fetches full detail for every accessible template and may exceed the response-size threshold, getting offloaded to search_tool_response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        verbose: { type: 'boolean', description: 'Return the full legacy shape (every step\'s complete body) instead of the compact listing. Defaults to false.' },
+        plan_id: { type: 'string', description: 'Only used with verbose=true. Scope the full-detail response to the one template matching this id/planId or exact title, instead of the whole catalog.' },
+      },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
+  execute: async (args: any, context: any) => {
     // Role-aware: admins (or admin-delegated sessions) get the full management
     // list via the admin route; everyone else gets the published/launchable set
     // via the public agent-mode route. Both go through authenticateToken.
@@ -1990,7 +2428,60 @@ mcpToolRegistry.register({
     }
     const path = isAdmin ? '/api/admin/work-plans' : '/api/agent-mode/public/plans';
     const data = await mcpFetch({ method: 'GET', path, context: c });
-    return jsonResult(data);
+    // ENG-1814: the raw HTTP response carries every step's full body (description,
+    // userInstructions, skillIds, requiredFunctionCalls) for every accessible template --
+    // trivially exceeds the platform's 8,000-char tool-response-to-S3 threshold for any
+    // non-trivial catalog, forcing the model into a fragile multi-step
+    // search_tool_response/read_tool_response detour just to find a specific title (the
+    // detour that mis-selected a near-duplicate title in the live-reproduced ENG-1814
+    // incident). launch_predefined_work_plan (applyPredefinedWorkPlan) never consumes
+    // this tool's output -- it re-fetches its own candidates independently -- so nothing
+    // needs the full shape here by default. Real external MCP clients (confirmed via
+    // mcp_tool_used telemetry -- claude_ai OAuth callers) DO call this tool though, and
+    // unlike launch_predefined_work_plan, an external end user reading the response
+    // (via their own client's LLM) could legitimately want a template's full step
+    // detail -- so the full legacy shape stays reachable behind an explicit opt-in
+    // rather than being silently removed.
+    if (args?.verbose === true) {
+      // Round-4 review finding: verbose alone re-fetches full detail for the WHOLE
+      // catalog, reopening the same oversized-response/S3-offload mechanism this PR
+      // fixes -- for a caller who usually only wants one template's detail. plan_id
+      // scopes the response to just the matching template(s) so the common case
+      // (verbose + plan_id together) never re-triggers that risk; verbose alone with
+      // no plan_id is still allowed (there's a real, if rarer, use case for "diff
+      // every template's full detail at once") but isn't the guided default.
+      const scoped = args?.plan_id && Array.isArray(data)
+        ? data.filter((p: any) => p.id === args.plan_id || p.planId === args.plan_id || p.title === args.plan_id)
+        : data;
+      return jsonResult(scoped);
+    }
+    const { projectWorkPlanForCustomer } = await import('../../services/workPlanCustomerProjection');
+    // Return only what a listing/matching consumer needs by default: the
+    // already-built, already-tested ENG-1469 safe projection (`display`) plus the few
+    // top-level fields launch/recommend calls actually reference.
+    const compact = Array.isArray(data)
+      ? data.map((p: any) => ({
+          // Non-admin (getAllPredefinedWorkPlans) already remaps to `id`. Admin
+          // (getAllWorkPlans -> raw WorkPlan records) never has `id` at all -- only
+          // `planId`, the interface's actual primary key (workPlanService.ts) -- so
+          // `p.id` alone silently dropped the identifier entirely for every
+          // admin/delegated listing (JSON.stringify drops an undefined key), worse
+          // than the pre-fix raw passthrough. Fall back to `planId` so both shapes
+          // keep a real identifier under the `id` key recommend/launch expect.
+          id: p.id ?? p.planId,
+          title: p.title,
+          category: p.category,
+          autocomplete: p.autocomplete,
+          visibility: p.visibility,
+          // Non-admin already carries the computed ENG-1469 projection under
+          // `display`. Admin (raw WorkPlan records) only ever has the raw,
+          // often-undefined WorkPlanDisplayMetadataV1 shape (`stepLabels`, not
+          // `steps`) -- compute the same projection here so admin/delegated
+          // listings get equally useful disambiguating context.
+          display: p.display?.steps ? p.display : (projectWorkPlanForCustomer(p) ?? p.display),
+        }))
+      : data;
+    return jsonResult(compact);
   }
 });
 
@@ -1998,7 +2489,7 @@ mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
     name: 'manage_predefined_work_plan',
-    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes.',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. A replace stores exactly what you send, so a field you omit on a step is erased too — an update that would drop steps, or blank fields on the steps it keeps, is rejected unless confirmed. Every step change comes back as a stepsChange diff summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2012,6 +2503,11 @@ mcpToolRegistry.register({
         show_in_agent_mode: { type: 'boolean', description: 'Whether to show in agent mode (create/update)' },
         show_login_signup: { type: 'string', enum: ['after_plan_completed', 'always'], description: 'When to show login/signup (create/update)' },
         default_model: { type: 'string', description: 'Default LLM model (create/update)' },
+        category: { type: 'string', description: 'Plan category shown in the admin list, e.g. Paid Ads, Strategy, Content (create/update)' },
+        // Deliberately no `visibility` parameter. The route accepts it, but
+        // exposing it here would let a model publish a draft plan to every user
+        // — or unpublish a live one — off a single misread instruction. Leave
+        // that transition to a human in the portal (ENG-889).
         steps: {
           type: 'array',
           items: {
@@ -2019,11 +2515,25 @@ mcpToolRegistry.register({
             properties: {
               title: { type: 'string' },
               description: { type: 'string' },
-              required_function_calls: { type: 'array', items: { type: 'string' } }
+              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
+              skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
+              userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
+              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
+              expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many assets have been produced SINCE THE PREVIOUS STEP RESOLVED — an earlier step\'s assets never count toward a later step\'s requirement. Omit for steps with no fixed asset count. Alias: expected_asset_count.' },
+              expectedAssetCountTools: { type: 'array', items: { type: 'string' }, description: 'Which tool name(s) count toward expectedAssetCount, for a step that calls more than one asset-producing tool that aren\'t interchangeable (e.g. a step that builds a few reusable HTML templates via create_html_file AND takes one screenshot per requested size via playwright_browser_take_screenshot — only the screenshot count is "the N things"). Named tools are summed. Omit when the step calls only one asset-producing tool, or when every asset-producing tool it calls should count as the same deliverable — the count then falls back to the largest count among them. Alias: expected_asset_count_tools.' }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update)'
+          description: 'Work plan steps. On create this is the full plan. On update this REPLACES the entire steps array unless steps_mode="merge". Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under "warnings".'
+        },
+        steps_mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact. In "merge", send ONLY the fields you are actually changing on each step, plus stepCount to say which step you mean: every field you include is applied, so passing a title you did not mean to change RENAMES that step. Do not fill in placeholder values for fields you are leaving alone.'
+        },
+        confirm_step_removal: {
+          type: 'boolean',
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount, expectedAssetCountTools) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2033,7 +2543,7 @@ mcpToolRegistry.register({
     const c = ctx(context);
     switch (args.action) {
       case 'create': {
-        const body: any = { title: args.title, steps: args.steps };
+        const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2041,11 +2551,14 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
+        if (args.category !== undefined) body.category = args.category;
         const data = await mcpFetch({ method: 'POST', path: '/api/admin/work-plans', context: c, body });
         return jsonResult(data);
       }
       case 'update': {
-        const body: any = { title: args.title, steps: args.steps };
+        // `steps` is deliberately not set here — it is only ever assigned below,
+        // after the current plan has been read (ENG-890).
+        const body: any = { title: args.title };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2053,7 +2566,114 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        if (args.category !== undefined) body.category = args.category;
+
+        // Steps replace the whole array server-side, so read the current plan
+        // first and either merge into it or refuse an unconfirmed shrink.
+        let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+        if (args.steps !== undefined) {
+          if (!Array.isArray(args.steps)) {
+            return jsonResult({ error: 'steps must be an array of step objects' });
+          }
+          const mode: 'merge' | 'replace' = args.steps_mode === 'merge' ? 'merge' : 'replace';
+          // Canonicalize the casing once, up front, so the merge matcher and the
+          // replace payload both see the same camelCase fields the route reads
+          // (ENG-889). Merging raw aliases would drop them on the stored step.
+          const incomingSteps: any[] = normalizeWorkPlanSteps(args.steps);
+
+          let existingSteps: any[] | undefined;
+          try {
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            existingSteps = Array.isArray(current?.steps) ? current.steps : [];
+            // Stake the read: everything below is judged against these steps, so
+            // a write that lands in between has to fail rather than quietly make
+            // that judgement wrong (ENG-890).
+            body.expectedStepsRev = current?.steps_rev ?? null;
+          } catch (error: any) {
+            // Fail closed in both modes: without the current steps we can
+            // neither merge nor tell whether a replace would delete steps, and
+            // writing blind is exactly the silent deletion this guards against.
+            return jsonResult({ error: `Cannot safely update work plan ${args.plan_id}: failed to read its current steps (${error?.message || error}). Retry, or re-send with the full steps array once the plan is readable.` });
+          }
+
+          if (mode === 'merge') {
+            const ambiguous = findAmbiguousMergeTargets(existingSteps || [], incomingSteps);
+            if (ambiguous.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: ${ambiguous.length === 1 ? 'a step title matches' : 'some step titles match'} more than one step, so there is no way to tell which one to amend.`,
+                ambiguousSteps: ambiguous,
+                howToProceed: [
+                  'Retry with stepCount on each ambiguous step to name the one you mean (call action="get" to see the current numbering).',
+                ],
+              });
+            }
+            const conflicting = findConflictingMergeTargets(existingSteps || [], incomingSteps);
+            if (conflicting.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.`,
+                conflictingSteps: conflicting,
+                howToProceed: [
+                  'Combine the changes for each step into a single entry, then retry.',
+                ],
+              });
+            }
+            body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
+          } else {
+            body.steps = incomingSteps;
+            if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
+              const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: action=update replaces the entire steps array, and this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+                stepsWouldBeRemoved: preview.stepsRemoved,
+                removedStepTitles: preview.droppedStepTitles,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true (send the complete new steps array).',
+                ],
+              });
+            }
+
+            // Same failure, one level down: the step count is untouched but the
+            // steps come back gutted, which is what happens when a caller
+            // re-types the array from memory as title+description.
+            const contentLoss = findStepContentLoss(existingSteps || [], body.steps);
+            if (contentLoss.length > 0 && args.confirm_step_removal !== true) {
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+                stepsWouldBeRemoved: 0,
+                stepContentLoss: contentLoss,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To keep these steps as they are, re-send each one with its current fields (call action="get" first if you no longer have them).',
+                  'To intentionally clear them, retry with confirm_step_removal=true.',
+                ],
+              });
+            }
+          }
+          if (existingSteps) {
+            stepsChange = summarizeStepChange(existingSteps, body.steps, mode);
+          }
+        }
+
+        let data: any;
+        try {
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        } catch (error: any) {
+          // The stake above was rejected. Nothing was written, and a blind retry
+          // would re-send a payload built from steps that no longer exist.
+          if (String(error?.message || '').includes('409')) {
+            return jsonResult({
+              error: `Work plan ${args.plan_id} changed while this update was being prepared, so nothing was saved.`,
+              howToProceed: [
+                'Re-read the plan with action="get" and retry the change against its current steps.',
+              ],
+            });
+          }
+          throw error;
+        }
+        if (stepsChange && data && typeof data === 'object' && !Array.isArray(data)) {
+          return jsonResult({ ...data, stepsChange });
+        }
         return jsonResult(data);
       }
       case 'delete': {
@@ -2191,7 +2811,30 @@ mcpToolRegistry.register({
   name: 'get_chat_history',
   definition: {
     name: 'get_chat_history',
-    description: 'Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don\'t have them (slower but ensures all scores are present).',
+    description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
+
+SCORING COVERAGE — a null satisfactionScore is NOT self-explanatory. Under sync=true every session carries scoringOutcome {status, reason}, and the response carries scoringSummary {scored, skipped, failed, notAttempted, timedOut}:
+- status 'scored' — a score was generated on this call.
+- status 'skipped' — deliberately not scored; reason says which rule (in-flight, already-scored, no-task-session, test-run, no-user-message, admin-override). 'in-flight' means the run had not finished at read time, so it is legitimately unscorable — NOT a failure.
+- status 'failed' — scoring was attempted and errored (reason carries the error). The session IS in the cohort and is missing a score it should have. Report these; do not present the window as fully scored.
+- status 'not-attempted' — the sync pass ran out of its wall-clock budget before this session. Same effect as 'failed' for coverage: the session is unscored and nothing re-attempts it later.
+Any non-zero failed/notAttempted count means the satisfaction figures under-sample the window. Say so explicitly, with the counts, rather than reporting an average as if coverage were complete. scoringOutcome and scoringSummary are null when sync was not requested.
+
+MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
+- attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
+- attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran, INCLUDING when the picker is one of several models that ran (a multi-model run is never "agreement" — it is never equal to the single-value picker, so the picker's involvement doesn't collapse it); collapses to a single model name only when exactly one model ran and it is the picker, or when there is nothing to contrast (selection-only). When attributionBasis is 'partial-transcript' it carries its own "(partial — N of M assistant turns unlabelled)" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.
+- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, partialAttributionSessions, truncated, byModel: [{model, sessions, share}] }, byModel sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. partialAttributionSessions counts how many of sessionsWithModelData were only partially labelled (qualify the shares as approximate when this is > 0). truncated (also returned top-level, sibling of sessions) is true when more sessions exist in the requested range beyond the limit parameter — when true, do not present modelMix, or sessions, as covering the full range; say so, or re-run with a higher limit. Null when no session in range has any resolvable attribution.
+
+The two underlying fields are also returned, and they are NOT interchangeable:
+- llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
+- generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
+
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
+
+Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2245,8 +2888,47 @@ mcpToolRegistry.register({
       let dislikes = 0;
       let longestWaitMs = 0;
       let maxHeapMB = 0;
+      // ENG-892: session.llmModel is only what the model picker last stored — a
+      // selection, not provenance. Each assistant message carries the model that
+      // actually produced it (written after model resolution and any backup-model
+      // switch), so derive real attribution from the transcript.
+      const generationModels = new Set<string>();
+      // ENG-892 follow-on: estimated_cost bills cache tokens, but total_tokens
+      // excludes them, so cost/token on a cache-heavy scheduled run reads ~100x
+      // the real rate (a live session: 371 total_tokens vs 156,013 cache-creation
+      // tokens for $2.94). Surface them so cost and tokens can be reconciled.
+      let cacheCreationTokens = 0;
+      let cacheReadTokens = 0;
+      // Per-model cost split. totalCost is one session-wide number, so a multi-model
+      // session gave a per-model breakdown nothing to divide by — the per-turn cost
+      // and model are both already here, so allocate rather than make callers guess.
+      // Accumulated in whole micro-USD, the unit costs are already computed in
+      // (usageRecorderService.computeCostMicroUsd). Rounding each bucket to 6dp on
+      // the way out while deriving the residual from unrounded floats put the three
+      // reported numbers on different bases, so they could fail to sum to totalCost —
+      // the exact reconciliation the tool description tells consumers to rely on.
+      const costMicroByModel: Record<string, number> = {};
+      // Assistant turns carrying no model, counted regardless of cost: a turn with
+      // no recorded spend still means the transcript is only partially labelled, and
+      // keying that off cost alone let a partial set read as authoritative.
+      let unlabelledAssistantTurns = 0;
+      // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
+      // "partial" can be quantified (N of M) rather than just flagged.
+      let assistantTurnCount = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        assistantTurnCount++;
+        const turnCost = msg?.usage?.estimated_cost || 0;
+        if (typeof msg?.llm === 'string' && msg.llm) {
+          generationModels.add(msg.llm);
+          if (turnCost) {
+            costMicroByModel[msg.llm] = (costMicroByModel[msg.llm] || 0) + Math.round(turnCost * 1e6);
+          }
+        } else {
+          unlabelledAssistantTurns++;
+        }
+        cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
+        cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
         if (msg?.metadata?.feedback?.type === 'like') likes++;
         if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
         if (Array.isArray(msg?.metadata?.iterationTimings)) {
@@ -2274,6 +2956,51 @@ mcpToolRegistry.register({
         };
       }
 
+      const attributedModels: string[] | null = generationModels.size > 0
+        ? [...generationModels]
+        : (session.llmModel ? [session.llmModel] : null);
+      const attributionBasis: 'transcript' | 'partial-transcript' | 'selection-only' | null =
+        generationModels.size > 0
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
+          : (session.llmModel ? 'selection-only' : null);
+      // ENG-1313: the Daily Satisfaction Score Report named the picker
+      // (llmModel) instead of the model that ran even after ENG-892 exposed
+      // attributedModels — building the report's per-session line was still a
+      // judgement call the reporting agent had to make correctly every time,
+      // and it silently reverted to the field named `llmModel` on sight. Same
+      // fix pattern as ENG-892: pre-compute the exact display line so there is
+      // no choice left to make. Only names the picker when it disagrees with
+      // what ran — agreement (or selection-only, where there is nothing to
+      // contrast) collapses to a single value.
+      //
+      // Greptile P1 (ENG-1313 review): a partial-transcript session's
+      // attributedModels only lists the turns that DID record a model, so
+      // printing it bare (as "the" model line) presents an incomplete list as
+      // complete — a model used only by an unlabelled turn goes unnamed with
+      // no signal that anything is missing. Append an explicit "(partial — N
+      // of M assistant turns unlabelled)" qualifier whenever attributionBasis
+      // is 'partial-transcript', so modelLine can still be printed verbatim
+      // without silently overstating its own completeness.
+      const partialQualifier = attributionBasis === 'partial-transcript'
+        ? ` (partial — ${unlabelledAssistantTurns} of ${assistantTurnCount} assistant turns unlabelled)`
+        : '';
+      // CodeRabbit (ENG-1313 review): "agreement" must mean the picker is the
+      // WHOLE story — exactly one model ran and it is the picker — not merely
+      // that the picker is somewhere among several models that ran. The old
+      // `!includes()` check treated a picker-plus-backup run (picker ran, and
+      // so did another model) as agreement, dropping the "picker:" label even
+      // though a second model's involvement is exactly the kind of fact this
+      // field exists to surface. Per acceptance criterion 1 (ENG-1313):
+      // "when picker ≠ generation it shows both" — a multi-model
+      // `attributedModels` is never equal to the single-value picker, so it
+      // must take the "picker: X · ran: Y" form regardless of whether the
+      // picker happens to be one of the models that ran.
+      const modelLine: string | null = attributedModels
+        ? (session.llmModel && (attributedModels.length !== 1 || attributedModels[0] !== session.llmModel)
+            ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}${partialQualifier}`
+            : `${attributedModels.join(', ')}${partialQualifier}`)
+        : null;
+
       return {
         sessionId: session.sessionId,
         userId: session.userId,
@@ -2283,11 +3010,49 @@ mcpToolRegistry.register({
         portalType: session.portalType || null,
         sessionType: session.sessionType || null,
         llmModel: session.llmModel || null,
+        generationModels: generationModels.size > 0 ? [...generationModels] : null,
+        // ENG-892: pre-resolve the attribution so the agent never has to choose
+        // between two model-shaped fields. The original mis-report happened
+        // because a field named `llmModel` sat in the payload and got named on
+        // sight; a stored account memory still instructs grouping cost by it.
+        // Emitting the answer (plus how trustworthy it is) removes that judgement
+        // call rather than relying on the agent to make it correctly.
+        attributedModels,
+        attributionBasis,
+        // ENG-1313: the exact string the per-session report line should use
+        // verbatim — see the modelLine computation above.
+        modelLine,
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
-        totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
+        cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
+          ? { creation: cacheCreationTokens, read: cacheReadTokens }
+          : null,
+        costByModel: Object.keys(costMicroByModel).length > 0
+          ? Object.fromEntries(
+              Object.entries(costMicroByModel).map(([m, micro]) => [m, micro / 1e6])
+            )
+          : null,
+        // The residual, on the SAME micro-USD basis as the buckets and as the
+        // totalCost reported above, so the three always reconcile exactly. Captures
+        // both spend on unlabelled turns and cost that never lands on an assistant
+        // turn at all (tool/image spend is in totalCost but in no turn's usage —
+        // measured at $1.92 on a real $100 session), which a turn-only sum would
+        // silently drop from a per-model breakdown.
+        unattributedCost: (() => {
+          if (session.totalCost == null) return null;
+          const totalMicro = Math.round(Number(session.totalCost) * 1e6);
+          const attributedMicro = Object.values(costMicroByModel).reduce((a, b) => a + b, 0);
+          const residualMicro = totalMicro - attributedMicro;
+          return residualMicro > 0 ? residualMicro / 1e6 : null;
+        })(),
+        // Same micro-USD basis as costByModel/unattributedCost below, so the three
+        // reconcile exactly rather than each being rounded independently.
+        totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
+        // ENG-929: under sync=true, why this session does or does not have a
+        // score. Null when sync was not requested (nothing was attempted).
+        scoringOutcome: session.scoringOutcome || null,
         feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,
         longestWaitMs: longestWaitMs > 0 ? longestWaitMs : null,
         maxHeapMB: maxHeapMB > 0 ? Math.round(maxHeapMB) : null,
@@ -2296,13 +3061,79 @@ mcpToolRegistry.register({
       };
     });
 
+    // Greptile P1 (ENG-1313 review): the admin route paginates with a cursor
+    // (`nextCursor`, non-null when more sessions exist beyond `limit`), but
+    // this tool previously dropped it entirely — so a limit-truncated result
+    // was returned with no signal that it was incomplete. Any range-wide
+    // aggregate computed only over the returned page (modelMix below, but
+    // this also applies to `count`/`sessions`) needs that signal surfaced,
+    // not silently presented as covering the full requested range.
+    const truncated = (data as any)?.nextCursor != null;
+
+    // ENG-1313 acceptance criterion 3: the model-mix section must be computed
+    // from attributedModels (transcript-derived where available), never from
+    // llmModel — otherwise a fleet-wide default-model switch stays invisible
+    // because every session still shows its old picker selection. Counted per
+    // session (not per turn), against attributedModels only, so this can never
+    // be pulled toward llmModel by accident.
+    const modelMixCounts: Record<string, number> = {};
+    let sessionsWithModelData = 0;
+    // Greptile P1 (ENG-1313 review): sessions with only partial transcript
+    // attribution are still counted (their known models are real), but the
+    // count of how many are partial travels with the aggregate so a consumer
+    // can qualify the shares rather than presenting them as exact.
+    let partialAttributionSessions = 0;
+    for (const s of formattedSessions) {
+      if (!s.attributedModels) continue;
+      sessionsWithModelData++;
+      if (s.attributionBasis === 'partial-transcript') partialAttributionSessions++;
+      for (const m of s.attributedModels as string[]) {
+        modelMixCounts[m] = (modelMixCounts[m] || 0) + 1;
+      }
+    }
+    const modelMix = sessionsWithModelData > 0
+      ? {
+          sessionsWithModelData,
+          partialAttributionSessions,
+          truncated,
+          byModel: Object.entries(modelMixCounts)
+            .map(([model, sessions]) => ({ model, sessions, share: sessions / sessionsWithModelData }))
+            .sort((a, b) => b.sessions - a.sessions || a.model.localeCompare(b.model)),
+        }
+      : null;
+
     return jsonResult({
       sessions: formattedSessions,
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      // ENG-929: coverage of THIS sync pass. Null when sync was not requested.
+      scoringSummary: (data as any)?.scoringSummary || null,
+      truncated,
+      modelMix,
+      // ENG-1332: requested-range/scored/skipped counts for sync=true calls, so
+      // a report can state its own coverage/denominator honestly instead of
+      // inferring one from sessions.length. Null when sync=false — no scoring
+      // pass ran, so there is nothing to report coverage on.
+      scoringCoverage: (data as any)?.scoringCoverage ?? null,
     });
   }
+});
+
+// ─── Organization Diagnostics (admin-only) ─────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'inspect_orphaned_org_join_requests',
+  definition: {
+    name: 'inspect_orphaned_org_join_requests',
+    description: 'Inspect pending organization join requests whose user record no longer exists. Admin-only, read-only; repair is not supported by this tool.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  execute: async (_args: any, context: any) => jsonResult(await mcpFetch({
+    method: 'GET',
+    path: '/api/admin/org-diagnostics/orphaned-org-join-requests',
+    context: ctx(context),
+  })),
 });
 
 // ─── Client Health Assessment (admin-only) ──────────────────────────────────
@@ -2373,6 +3204,227 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
     const data = await mcpFetch({
       method: 'GET',
       path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'check_account_tracking_health',
+  definition: {
+    name: 'check_account_tracking_health',
+    description: `Check Meta pixel/CAPI health and destination-URL coverage for a specific client's ad account. Admin-only tool, read-only — never sends a real alert, always runs in dry-run mode against this one account.
+
+Resolves the client (email or name) to their Meta ad account via the same lookup assess_client_health uses, then runs the tracking-integrity check scoped to that one account only.
+
+Returns:
+- 'summary': aggregate counts (blackouts, tokenErrors, fetchErrors, healthy, destinationAlerts, destinationOk, etc.) — since this call is scoped to exactly one account, a nonzero count on any of these describes THIS account, not a fleet-wide total.
+- 'summary.capturedAlerts': the specific findings that would have alerted, each with a subject, message, and structured context — this is the actual evidence (which pixel, which destination check, why) behind the aggregate counts above.
+
+Use this to check "is the pixel broken" / "is CAPI deployed" / "does this ad's destination actually carry a pixel this account owns" BEFORE concluding a lead-volume or CTR/CPM anomaly is caused by tracking failure rather than a genuine performance issue — the same reasoning monitor_lead_volume's 'requiresTrackingValidation' field already points here for.
+
+If the client has no connected Meta ad account, this returns an error rather than a health result — check assess_client_health first if account connectivity itself is in question.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const healthData: any = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    if (!healthData?.success || !healthData?.health?.client?.userId) {
+      return jsonResult({ success: false, error: healthData?.message || `Could not resolve client "${args.client_name_or_email}"` });
+    }
+    const userId = healthData.health.client.userId;
+    const adAccountId = healthData.health.ads_layer?.ad_account_id;
+    if (!adAccountId) {
+      return jsonResult({ success: false, error: `Client "${args.client_name_or_email}" has no connected Meta ad account — nothing to check.` });
+    }
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/admin/tracking-monitor/run',
+      context: ctx(context),
+      body: { dryRun: true, userId, adAccountId },
+    });
+    return jsonResult({ success: true, client: healthData.health.client, ...data });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'diagnose_leads_at_zero',
+  definition: {
+    name: 'diagnose_leads_at_zero',
+    description: `Discriminate between look-alike causes for a client's "leads at zero" symptom, per connected Meta ad account. Admin-only, read-only.
+
+Evaluates five causes — pixel_capi_broken, landing_page_unreachable, budget_exhausted, genuine_demand_drop, normal_variance — using monitor_lead_volume and the tracking-health sweep as evidence, and applies a strict discrimination gate: 'determined' is only returned when exactly one cause has DIRECT supporting evidence and every other checkable cause has been ruled out. 'budget_exhausted' has no evidence source anywhere in this system today and is always reported as 'unchecked'. 'genuine_demand_drop' can be ruled out but never confirmed here either — a real drought requires a Conversion Tracking Validator pass this tool cannot run, so it stops at 'unchecked' rather than a confident but unvalidated 'supported'. Neither blocks a determined diagnosis on a different, well-evidenced cause — both are always disclosed.
+
+⚠ When the result is 'could_not_determine', do NOT pick a cause anyway and do NOT recommend an action — report it as an honest diagnosis gap, listing which causes remain live/unchecked. A confidently wrong diagnosis is worse than an honest "could not determine" — this is the one thing this tool must never be used to work around.
+
+Returns one diagnosis per connected Meta ad account, each with: outcome ('determined'|'could_not_determine'), concludedCause (null unless determined), causes (every cause evaluated, with its verdict and evidence — always read this, not just the top-line outcome), and reason (populated only when could_not_determine).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/l2-diagnose/leads-at-zero/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'monitor_lead_volume',
+  definition: {
+    name: 'monitor_lead_volume',
+    description: `Report spend and CRM-landed leads per Meta ad campaign per day for a specific client, and flag campaigns whose lead volume has collapsed relative to THAT CAMPAIGN'S OWN history. Admin-only tool.
+
+Trigger is distribution-aware, not a fixed day count: a campaign is flagged only when its trailing 7-day lead average falls below its OWN 5th-percentile historical floor. A campaign needs at least 14 days of baseline history (excluding the trailing window) before it can be flagged at all — with less, status is 'insufficient_history', not 'normal' or 'drought'.
+
+⚠ A flagged campaign ('status': 'drought') is NOT a confirmed drought — 'requiresTrackingValidation' is always true on that verdict, and you MUST run Conversion Tracking Validator on the same client before reporting it as a real issue. Pixel/CAPI breakage produces the same signal as a genuine lead collapse, and this tool cannot distinguish them.
+
+⚠ The response also includes 'unattributedContext' and 'totalUnattributedLeads' at the ACCOUNT level, separate from every campaign's own totals. A nonzero unattributed count is normal (not every ad carries a matchable UTM) — NEVER read it as evidence any specific campaign's volume collapsed, and never subtract it from a campaign's lead total.
+
+Returns one report per connected Meta ad account for the client.
+
+⚠ If the response has 'truncated': true, the underlying data read was cut short and every verdict in this response (including 'normal' ones) may be based on incomplete history — narrow the since/until window and retry rather than reporting any of it as final.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        },
+        since: {
+          type: 'string',
+          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+        },
+        until: {
+          type: 'string',
+          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const query = new URLSearchParams();
+    if (args.since) query.set('since', args.since);
+    if (args.until) query.set('until', args.until);
+    const qs = query.toString();
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/lead-volume-monitor/${encodeURIComponent(args.client_name_or_email)}${qs ? `?${qs}` : ''}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+// ─── Admin landing-page discovery/reassociation (ENG-721, admin-only) ───────
+
+mcpToolRegistry.register({
+  name: 'resolve_landing_page_by_url',
+  definition: {
+    name: 'resolve_landing_page_by_url',
+    description: `Resolve a landing page by its live URL or domain across ALL accounts. Admin-only tool.
+
+Use this when a customer references a live page (e.g. "https://acme.agentwebforms.com/book-a-demo") and you need to find which account owns it — list_landing_pages only shows the calling user's own pages.
+
+Returns matches with the page record (id, status, lead list), the owner (userId, email, orgId), and the canonical live URL. Returns 404 when no page matches. If \`scannedAll\` is false the lookup hit its scan cap and a non-match is inconclusive.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The live page URL or bare hostname to resolve, e.g. "https://acme.agentwebforms.com/book-a-demo" or "acme.agentwebforms.com".'
+        }
+      },
+      required: ['url']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'share_landing_page_with_org',
+  definition: {
+    name: 'share_landing_page_with_org',
+    description: `Enable org-level visibility for a landing page's owner organization and grant named org members edit access. Admin-only tool.
+
+Works entirely through share settings — no page duplication, no redeploy, no raw database access. The members must already belong to the page owner's organization. Returns the updated share state plus each member's effective access (canView/canEdit) so you can verify the grant took effect.
+
+Find the page id first with resolve_landing_page_by_url or list_landing_pages.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page id.' },
+        member_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Org member emails (or userIds) to grant edit access.'
+        }
+      },
+      required: ['page_id', 'member_emails']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/admin/landing-pages/${encodeURIComponent(args.page_id)}/org-share`,
+      context: ctx(context),
+      body: { memberEmails: args.member_emails }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page_effective_view',
+  definition: {
+    name: 'get_landing_page_effective_view',
+    description: `Report what a specific user actually sees for a landing page: whether they can view it, whether they can edit it, the canonical live URL, deploy status, and the connected lead list. Admin-only tool.
+
+Use this after share_landing_page_with_org to verify the target member's effective access, or to diagnose "user can't see the page" reports.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page id.' },
+        member: { type: 'string', description: 'The user to check — email or userId.' }
+      },
+      required: ['page_id', 'member']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/admin/landing-pages/${encodeURIComponent(args.page_id)}/effective-view?member=${encodeURIComponent(args.member)}`,
       context: ctx(context)
     });
     return jsonResult(data);
@@ -2450,82 +3502,6 @@ Typical prompts this answers:
       path: '/api/onboarding/users',
       context: ctx(context),
       queryParams: Object.keys(queryParams).length > 0 ? queryParams : undefined,
-    });
-    return jsonResult(data);
-  },
-});
-
-// ─── CRM lead segmentation ──────────────────────────────────────────────────
-
-mcpToolRegistry.register({
-  name: 'get_leads_by_crm_criteria',
-  definition: {
-    name: 'get_leads_by_crm_criteria',
-    description: `Preview which CRM leads (from AW-Leads, scoped to the caller's own lead lists) match a segment query. Use this before creating a drip campaign to confirm who will be targeted. Read-only — does not persist a campaign.
-
-Supported criteria (all optional; leaving a criterion unset means "any"):
-- \`lifecycle\`: lifecycle stage of the lead. One of \`unknown\`, \`inbox\`, \`signed_up\`, \`in_deal\`, \`trialing\`, \`paying\`, \`at_risk\`, \`churned\`.
-- \`min_heat_score\`: minimum heat score (0-100). Leads below this score are excluded. Missing heat scores count as 0.
-- \`utm_source\`: exact-match filter on the lead's attribution source (e.g. \`linkedin\`, \`google\`, \`newsletter\`).
-- \`lead_list_id\`: scope to a single lead list. If omitted, every list owned by the caller is searched.
-- \`limit\`: maximum number of sample leads to return (default 20, max 100). The \`total\` field always reflects the full matching count.
-
-Example:
-  action inputs: { lifecycle: "trialing", min_heat_score: 50, limit: 10 }
-  response: { total: 42, sampleSize: 10, leads: [...], criteria: {...} }`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        lifecycle: {
-          type: 'string',
-          enum: [
-            'unknown',
-            'inbox',
-            'signed_up',
-            'in_deal',
-            'trialing',
-            'paying',
-            'at_risk',
-            'churned',
-          ],
-          description: 'Lifecycle stage filter.',
-        },
-        min_heat_score: {
-          type: 'number',
-          description: 'Minimum heat score (0-100). Leads below this value are excluded.',
-        },
-        utm_source: {
-          type: 'string',
-          description: 'Exact-match filter on attribution source (e.g. linkedin, google).',
-        },
-        lead_list_id: {
-          type: 'string',
-          description: 'Restrict to a single lead list. Omit to search every list owned by caller.',
-        },
-        limit: {
-          type: 'integer',
-          description: 'Sample size to return. Default 20, max 100.',
-        },
-      },
-      required: [],
-      additionalProperties: false,
-    },
-  },
-  execute: async (args: any, context: any) => {
-    const body: Record<string, any> = {};
-    if (typeof args.lifecycle === 'string') body.lifecycle = args.lifecycle;
-    if (typeof args.min_heat_score === 'number')
-      body.minHeatScore = args.min_heat_score;
-    if (typeof args.utm_source === 'string') body.utmSource = args.utm_source;
-    if (typeof args.lead_list_id === 'string')
-      body.leadListId = args.lead_list_id;
-    if (typeof args.limit === 'number') body.limit = args.limit;
-
-    const data = await mcpFetch({
-      method: 'POST',
-      path: '/api/drip-campaigns/preview-segment',
-      context: ctx(context),
-      body,
     });
     return jsonResult(data);
   },
@@ -2808,11 +3784,16 @@ mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
-    description: "Get the current user's account status, subscription plan, and usage.",
-    inputSchema: { type: 'object', properties: {}, required: [] }
+    description: "Get the current user's account status, subscription plan, and usage. Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    inputSchema: {
+      type: 'object',
+      properties: { client_id: CLIENT_ID_SCHEMA_PROPERTY },
+      required: []
+    }
   },
-  execute: async (_args: any, context: any) => {
-    const c = ctx(context);
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
+  execute: async (args: any, context: any) => {
+    const c = await resolveClientScopedContext(context, args?.client_id, 'get_account_status');
 
     // Plan/status comes from /api/auth/me. Let auth errors propagate — if we can't
     // resolve the account, returning a fake "status" would be misleading.
@@ -2830,10 +3811,26 @@ mcpToolRegistry.register({
 
     // Curate a stable, minimal shape. Never echo the raw /me payload — it carries
     // sensitive fields (stripe ids, tokens, internal flags).
+    //
+    // ENG-1540: `subscription_status` is only ever populated on the org OWNER's
+    // record by a live Stripe subscription sync — an owner whose paid access
+    // was granted out-of-band (admin/manual comp, no Stripe subscription object)
+    // never gets the field set at all, org members riding that owner's billing
+    // inherit the same gap, and it stays unset indefinitely (no ongoing owner
+    // -side sync ever revisits it). Defaulting that absence to the literal
+    // 'inactive' told a currently-paying-and-unblocked Pro customer their
+    // subscription was inactive. A paid, non-Free plan with no persisted status
+    // means "active but never synced", not "inactive".
+    // `||`, not `??`: auth.ts's own sync trigger (`!user.subscription_status`)
+    // already treats an empty string as missing, so this has to match or a
+    // stray '' would pass through unresolved instead of deriving a real status.
+    const subscriptionStatus =
+      me?.subscription_status ||
+      (me?.subscriptionType && me.subscriptionType !== 'Free' ? 'active' : 'inactive');
     return jsonResult({
       email: me?.email ?? null,
       subscription_plan: me?.subscriptionType ?? 'Free',
-      subscription_status: me?.subscription_status ?? 'inactive',
+      subscription_status: subscriptionStatus,
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,

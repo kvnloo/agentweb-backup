@@ -1,3 +1,7 @@
+import {
+  normaliseUserDataField,
+  NormalisableUserDataField,
+} from './metaUserDataNormalisation';
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import axios from 'axios';
 import * as crypto from 'crypto';
@@ -11,6 +15,11 @@ export interface MetaAdsCampaignParams {
   objective: string;
   status?: string;
   special_ad_categories?: string[];
+  // Lifetime hard-stop spend cap for the campaign, in the ad account currency's MINOR units
+  // (cents) — e.g. 300000 = $3,000. Kept in minor units to match Meta's own field and the
+  // long-standing CAMPAIGN UPDATE pass-through, which already applies this value verbatim;
+  // converting only here would silently reinterpret every existing caller's number by 100x.
+  spend_cap?: number;
 }
 
 export interface MetaAdsAdSetParams {
@@ -32,6 +41,12 @@ export interface MetaAdsAdSetParams {
   // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
   // website optimization goals.
   destination_type?: string;
+  // Dayparting (ENG-842). Meta requires a lifetime_budget (and therefore end_time) for this to take
+  // effect — agentModeService.createMetaAdsAdSet enforces that rule and defaults pacing_type to
+  // ['day_parting'] whenever adset_schedule is present and pacing_type was not explicitly set,
+  // because Meta silently ignores adset_schedule without it.
+  adset_schedule?: Array<{ start_minute: number; end_minute: number; days: number[]; timezone_type?: string }>;
+  pacing_type?: string[];
 }
 
 export interface MetaPlacementAsset {
@@ -101,6 +116,145 @@ export interface CapiUsage {
 }
 
 /**
+ * Meta's default page on the list edges is 25 records. Asking for a larger page fetches the
+ * same data in fewer round trips — it does not fetch more data, and it is not what bounds the
+ * read; `META_LIST_MAX_PAGES` is.
+ */
+export const META_LIST_PAGE_SIZE = 100;
+
+/**
+ * Hard bound on how far a single list call will walk (100 x 25 = 2,500 records). Every real
+ * ad account we serve is far inside this. Crossing it returns `truncated: true` rather than a
+ * silently short list — see `MetaService.drainCursor`.
+ */
+export const META_LIST_MAX_PAGES = 25;
+
+/**
+ * Wall-clock ceiling for one paginated list walk.
+ *
+ * Page count alone bounds the WORK but not the TIME: `drainCursor` awaits each page
+ * sequentially, so 25 slow pages compound into a request that is technically bounded and
+ * practically hung. This PR is what made that compounding possible — the previous code issued a
+ * single request — so the tail it introduced is bounded here.
+ *
+ * Deliberately NOT a per-call transport timeout: that would have to be configured on the SDK's
+ * shared HTTP layer and would silently change every other Meta call in this service. A single
+ * hung request was already possible before this change and is not what this guards.
+ *
+ * Crossing it returns `truncated: true`, reusing the same "incomplete, do not conclude absence"
+ * contract as the page bound rather than inventing a second failure mode.
+ */
+export const META_LIST_MAX_MS = 45_000;
+
+
+/**
+ * Ceiling on how long ONE Graph read may block this request.
+ *
+ * The page bound limits how MANY calls happen; `META_LIST_MAX_MS` limits the loop; neither
+ * limits a SINGLE call that never answers. A hung request parks execution inside `await`, so
+ * the loop's own clock check never runs again.
+ *
+ * ⚠ Applied ONLY to the read paths in this file (ownership lookup, initial list, each page).
+ * It is deliberately NOT installed on the SDK's shared HTTP layer, because that layer is a
+ * process-wide singleton (`FacebookAdsApi.init` -> `setDefaultApi`) whose `Http.request` is a
+ * static with no per-call options — patching it would put a client-side deadline on every WRITE
+ * too. A timed-out write is the dangerous case: pausing an ad or creating a campaign may have
+ * SUCCEEDED on Meta's side while we report failure, so a retry double-creates, or we tell a
+ * customer an ad is still running when we just paused it. Abandoning a READ has no such
+ * ambiguity — nothing changed.
+ *
+ * Deliberately generous. A 100-record ad list with nested `creative{...}` expansion is a genuinely
+ * heavy Graph call, and the costly mistake here is the opposite of the obvious one: too short a
+ * deadline breaks reads that work today, which is a REGRESSION, while too long merely extends a
+ * wait that was previously unbounded anyway. So this is a backstop against a hang, not a latency
+ * target. One slow page fits inside META_LIST_MAX_MS; a second cannot, so the loop then stops and
+ * reports `truncated` rather than grinding on.
+ *
+ * ⚠ That last sentence holds for the 45s default and NOT for the launch path, which passes
+ * `maxMs: META_LAUNCH_READ_MAX_MS` (240s) — there roughly eight slow pages fit. Deliberate: a
+ * truncated read refuses a launch rather than degrading an answer, so stopping early is the
+ * expensive outcome. Worst case is the 240s loop plus one in-flight 30s page, ~270s, against
+ * nginx `proxy_read_timeout` and the ALB `IdleTimeout` of 600s — checked, with headroom.
+ */
+export const META_READ_CALL_TIMEOUT_MS = 30_000;
+
+/** Which node a list read was actually scoped to. Empty object means account-wide. */
+export interface MetaAdListScope {
+  campaignId?: string;
+  adSetId?: string;
+}
+
+/**
+ * Statuses that must never appear in a list of an account's ads.
+ *
+ * `effective_status` is sent as a request param, but Meta's documented habit with a param it
+ * does not support on a given edge is to IGNORE it — that is precisely the bug this file is
+ * fixing, where `adset_id` was accepted and discarded. `effective_status` is proven on the
+ * account edge; on the campaign/ad-set node edges we do not get to assume it, and a silently
+ * ignored status filter would start reporting deleted and archived ads as real ones.
+ *
+ * So the same intent is enforced client-side as a net. Deliberately a DENY list, not an allow
+ * list: an allow list would silently drop any status Meta adds later, which is the same
+ * class of silent omission this whole change exists to remove.
+ */
+const NON_LIVE_AD_STATUSES = new Set(['DELETED', 'ARCHIVED']);
+
+/**
+ * A list read plus the truth about its completeness.
+ *
+ * ENG-1476 / ENG-1584 both came from returning a bare array: page 1 of 25 is indistinguishable
+ * from a whole account once it is just `any[]`, so every caller downstream reported a partial
+ * read as a complete one. `truncated` exists so that is no longer expressible.
+ */
+export interface MetaAdListResult {
+  ads: any[];
+  truncated: boolean;
+  pagesFetched: number;
+  scope: MetaAdListScope;
+}
+
+/** Same contract as `MetaAdListResult`, for the ad-creative edge. */
+export interface MetaAdCreativeListResult {
+  creatives: any[];
+  truncated: boolean;
+  pagesFetched: number;
+  scope: MetaAdListScope;
+}
+
+/**
+ * Same contract, for the campaign edge. No `scope` field: a campaign list is not scoped to a
+ * parent the way ad sets/ads are (`options.campaignId` selects ONE campaign directly rather
+ * than filtering a list), so there is nothing to name here.
+ */
+export interface MetaCampaignListResult {
+  campaigns: any[];
+  truncated: boolean;
+  pagesFetched: number;
+}
+
+/** Same contract as `MetaAdListResult`, for the ad-set edge (scoped by campaign). */
+export interface MetaAdSetListResult {
+  adSets: any[];
+  truncated: boolean;
+  pagesFetched: number;
+  scope: MetaAdListScope;
+}
+
+/** Same contract, for the custom-audience edge. Not scopable by campaign/ad set. */
+export interface MetaCustomAudienceListResult {
+  audiences: any[];
+  truncated: boolean;
+  pagesFetched: number;
+}
+
+/** Same contract, for the pixels (adspixels) edge. Not scopable by campaign/ad set. */
+export interface MetaPixelListResult {
+  pixels: any[];
+  truncated: boolean;
+  pagesFetched: number;
+}
+
+/**
  * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
  * header is a JSON object keyed by ad account id, each value an array with one
  * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
@@ -129,6 +283,33 @@ function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The one sentence every ad-account ownership refusal carries (`assertOwnedByAccount`).
+ *
+ * A constant, not a literal repeated at the read site, because the pairing is load-bearing: a
+ * caller that has to tell "this node belongs to another ad account" apart from "Meta blipped"
+ * gets it wrong silently if the wording drifts, and gets it wrong in the permissive direction.
+ */
+export const META_ACCOUNT_SCOPE_REFUSAL_MARKER = 'is not available in the selected ad account';
+
+/**
+ * True only for a refusal thrown by the ad-account ownership guard — never for a transient
+ * Graph failure.
+ *
+ * Both arrive at a caller's `catch` as an Error, and they mean opposite things. A timeout, a
+ * 5xx or a rate limit says "we could not look"; this says "we looked, and the node is out of
+ * scope". A caller that treats the second as the first degrades to a best-effort path and
+ * carries on with a node it has been told not to touch.
+ *
+ * Deliberately does NOT match `assertNodeInAccount`'s unverifiable-lookup message ("Could not
+ * verify the requested … please retry"), which is a genuine transient and must keep the
+ * best-effort behaviour.
+ */
+export function isMetaAccountScopeRefusal(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null | undefined)?.message;
+  return typeof message === 'string' && message.includes(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
 }
 
 export class MetaService {
@@ -172,8 +353,15 @@ export class MetaService {
    */
   private static readonly CAMPAIGN_READ_FIELDS = [
     'id', 'name', 'status', 'objective',
-    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
+    // ENG-1625: both are real, documented Campaign GET fields (effective_status already
+    // used for ads at listAds) that a post-deploy read-back legitimately wants — status
+    // alone doesn't reflect ad-set/ad-level pausing, and special_ad_categories is a
+    // CREATE-time param worth verifying stuck. Missing from the allow-list, a request for
+    // either threw loudly (by design, ENG-398) rather than silently dropping — but that
+    // meant a routine verification read failed instead of just answering the question.
+    'effective_status', 'special_ad_categories',
   ] as const;
 
   private static readonly AD_SET_READ_FIELDS = [
@@ -300,6 +488,84 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+    MetaService.assertValidSpendCap(params.spend_cap);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
+  }
+
+  /**
+   * `spend_cap` is a whole number of minor currency units, so anything else is a caller
+   * mistake we should catch rather than forward: a fraction (1000.5), a negative, a NaN from
+   * a bad parse, or a string. Meta would reject most of these, but as an opaque "Invalid
+   * parameter" — and on CREATE that rejection arrives AFTER the campaign question is settled,
+   * where a clear pre-flight message costs nothing. 0 is rejected here too, matching Meta,
+   * which refuses it explicitly ("Spend Cap Can't Be Zero", subcode 1885099): removing a cap
+   * is a different operation, not a cap of nothing.
+   */
+  public static assertValidSpendCap(value: unknown): void {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+      throw new Error(
+        `Campaign "spend_cap" must be a positive whole number of cents (e.g. 300000 = $3,000) — got ${JSON.stringify(value)}. ` +
+        `It is NOT in dollars: multiply the amount the user asked for by 100. ` +
+        `To remove an existing cap, do not send 0 — Meta rejects that.`
+      );
+    }
+  }
+
+  /**
+   * Params `createCampaign` actually forwards to Meta, plus the ones this layer legitimately
+   * consumes before the call (the objective gate's `objective_quote`, the write-confirmation
+   * gate's `confirm`, and the wrapper-injected `account_id`). Anything else a caller sends on
+   * CAMPAIGN CREATE is dropped by createCampaign's literal-key allow-list.
+   */
+  private static readonly CAMPAIGN_CREATE_APPLIED_PARAMS = [
+    'name', 'objective', 'status', 'special_ad_categories', 'spend_cap',
+    'advantage_campaign_budget', 'budget_amount',
+  ] as const;
+
+  private static readonly CAMPAIGN_CREATE_CONSUMED_PARAMS = [
+    'account_id', 'objective_quote', 'confirm', 'fields',
+  ] as const;
+
+  /**
+   * Reject a CAMPAIGN CREATE param that would not be applied, BEFORE anything is created.
+   * A silently-dropped param plus a success message is how a campaign was created with no
+   * spend cap while the operator was told the cap was in place (ENG-1018) — money-affecting
+   * fields must fail loudly. Rejecting pre-flight means nothing is created, so the caller
+   * fixes the params and retries with no orphaned campaign to clean up.
+   *
+   * This deliberately refuses ANY param outside the mapped set, including genuine Meta
+   * campaign fields. Forwarding those was tried and reverted: a live create with
+   * `start_time` on the test ad account was accepted by Meta with no error and then
+   * IGNORED (the campaign read back the 1969 epoch placeholder — campaign scheduling comes
+   * from the ad sets), while `buying_type` in the same call applied. Passing a field through
+   * therefore does not mean it takes effect, and we cannot tell which is which without
+   * per-field knowledge — so forwarding would have rebuilt this very bug one layer up:
+   * accepted, reported successful, never applied. A loud refusal that names the field is
+   * worse UX and better behaviour.
+   */
+  private static assertNoUnappliedCampaignCreateParams(params: Partial<MetaAdsCampaignParams>): void {
+    const handled = new Set<string>([
+      ...MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS,
+      ...MetaService.CAMPAIGN_CREATE_CONSUMED_PARAMS,
+    ]);
+    const unapplied = Object.keys(params || {}).filter(
+      key => !handled.has(key) && (params as any)[key] !== undefined
+    );
+    if (unapplied.length === 0) return;
+
+    throw new Error(
+      `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
+      `to the campaign, so this create was rejected instead of silently ignoring them. ` +
+      `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
+      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars) — ` +
+      `do NOT pass daily_budget/lifetime_budget here. ` +
+      `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Scheduling (start_time/stop_time) comes from the campaign's AD SETS — Meta accepts those ` +
+      `on a campaign create and then ignores them, so set them on AD_SET CREATE. ` +
+      `Ad-set fields (bid_strategy, bid_amount, targeting, ` +
+      `optimization_goal, billing_event, end_time) belong on AD_SET CREATE too.`
+    );
   }
 
   /**
@@ -331,6 +597,9 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+
+    MetaService.assertValidSpendCap(params.spend_cap);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
   /**
@@ -687,6 +956,117 @@ export class MetaService {
    * callers can distinguish "we could not ask" from "nothing was granted". Storing
    * an empty array in the former case would later read as an authoritative refusal.
    */
+  /**
+   * Can this token actually read ads data for this ad account, right now?
+   *
+   * WHY A REAL READ AND NOT A SCOPE LOOKUP (ENG-1158)
+   * -------------------------------------------------
+   * Two independent grants have to line up before an ads read works, and only
+   * one of them is visible in a token's scopes:
+   *
+   *   1. the USER granting our app `ads_read` at the OAuth dialog, and
+   *   2. the AD ACCOUNT's owner granting that user access to that ad account.
+   *
+   * Production account 922903076601160 has (1) and not (2). Verified live:
+   * `/me/permissions` reports `ads_read` and `ads_management` as granted with
+   * nothing declined, while the very same token gets
+   * "(#200) Ad account owner has NOT grant ads_management or ads_read permission"
+   * from that ad account. Any capability answer derived from scopes alone
+   * therefore reports "capable" for exactly the account that cannot read — the
+   * trap `utils/metaAdsScope.ts` was written to avoid, one level further down.
+   *
+   * So we ask the only question that has an authoritative answer: we try. The
+   * cheapest read on the ad account node is enough; verified live to succeed on
+   * a working account and to return the (#200) refusal on the broken one.
+   *
+   * Returns 'unknown' for anything that is not a clear yes or a clear ads-scope
+   * refusal — a rate limit or an outage must never be read as incapability.
+   */
+  public async probeAdsAccountAccess(
+    accessToken: string,
+    adAccountId: string
+  ): Promise<'accessible' | 'denied' | 'unknown'> {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const id = `act_${String(adAccountId).replace('act_', '')}`;
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/${id}` +
+          `?fields=id&access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (body?.id) return 'accessible';
+      if (!body?.error) return 'unknown';
+
+      // Reuse the deliberately strict predicate rather than re-deciding here:
+      // Meta stamps a whole family of unrelated failures as permission errors,
+      // and only one of them means "no ads access".
+      const { isMetaAdsScopeRefusal } = await import('../utils/metaAdsScope');
+      if (isMetaAdsScopeRefusal({ structuredError: body.error, message: body.error?.message })) {
+        return 'denied';
+      }
+      return 'unknown';
+    } catch (error: any) {
+      console.warn(`[MetaService] probeAdsAccountAccess failed: ${error?.message ?? error}`);
+      return 'unknown';
+    }
+  }
+
+  /**
+   * When `probeAdsAccountAccess` has just returned 'denied', which of the two
+   * independent grants is actually missing? (ENG-1158 follow-up)
+   *
+   * The ad-account refusal alone cannot say — Meta stamps the same (#200)
+   * shape whether the app never got `ads_read` or the app has it and the ad
+   * account's owner just hasn't granted this person access to that asset.
+   * Telling an owner who already granted the app scope to "reconnect and
+   * approve Ads permissions" sends them through a flow that cannot fix
+   * anything and leaves them locked out with no correct next step.
+   *
+   * Deliberately calls `/me/permissions`, NOT `debug_token` (`getGrantedScopes`).
+   * `debug_token` authenticates with an APP token and only answers for a token
+   * minted by the app whose credentials are currently configured — verified
+   * live to fail with "(#100) The App_id in the input_token did not match the
+   * Viewing App" on this repo's own dev test accounts, which would have made
+   * this classifier silently inert wherever that mismatch holds. `/me/permissions`
+   * authenticates with the USER token being classified, same as
+   * `probeAdsAccountAccess`, so it carries no such precondition — this is the
+   * exact call the original investigation used to diagnose account
+   * 922903076601160 live.
+   *
+   * present + granted → the app grant is confirmed, so the ad account itself is
+   * the gap ('asset'). Absent or declined → the app was never granted the scope
+   * ('oauth'). Undetermined (the call itself failed) → 'unknown', which callers
+   * must treat as "fall back to the OAuth-tier message" rather than guess.
+   */
+  public async classifyAdsRefusalTier(accessToken: string): Promise<'oauth' | 'asset' | 'unknown'> {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (!Array.isArray(body?.data)) {
+        console.warn(
+          `[MetaService] classifyAdsRefusalTier: /me/permissions returned an unexpected shape: ${body?.error?.message ?? 'no data array'}`
+        );
+        return 'unknown';
+      }
+
+      const { META_ADS_READ_SCOPES } = await import('../utils/metaAdsScope');
+      const hasAdsScope = body.data.some(
+        (p: any) =>
+          (META_ADS_READ_SCOPES as readonly string[]).includes(String(p?.permission).trim()) &&
+          p?.status === 'granted'
+      );
+      return hasAdsScope ? 'asset' : 'oauth';
+    } catch (error: any) {
+      console.warn(`[MetaService] classifyAdsRefusalTier failed: ${error?.message ?? error}`);
+      return 'unknown';
+    }
+  }
+
   public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
     try {
       const { getMetaCredentials } = await import('../utils/secretsManager');
@@ -875,10 +1255,20 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
-      const result = await campaign.get(fields);
-      return result._data;
+      /*
+       * `adAccountId` was accepted and never used: a node id is global, so this returned any
+       * campaign the token could reach. It matters more here than on a plain list, because one
+       * caller renders the result's NAME into the confirmation prompt a user approves — so an id
+       * from another ad account disclosed that account's campaign name to this user, which is
+       * precisely the oracle behaviour assertOwnedByAccount refuses to produce.
+       */
+      const result = await campaign.get(MetaService.withOwnershipField(fields));
+      const data = { ...(result?._data ?? {}) };
+      MetaService.assertOwnedByAccount(data.account_id, campaignId, 'Campaign', adAccountId);
+      delete data.account_id;
+      return data;
     } catch (error) {
       return this.handleError(error, 'getCampaign');
     }
@@ -894,12 +1284,19 @@ export class MetaService {
    * previously invisible (ENG-398). `options.campaignId` fetches that one campaign
    * directly (the Graph edge has no id filter) and returns it as a one-element list so
    * LIST semantics are preserved.
+   *
+   * ⚠ ENG-1625 follow-up: the account-wide read used to fetch ONE page with no limit, no
+   * deadline, and no drain — the exact ENG-1476/ENG-1584 shape (`Found ${totalCount}
+   * campaign(s)` with no bound was the sentence that told an Every.io customer a
+   * protected ad did not exist). Paginates and reports truncation the same way `listAds`
+   * does. Returns a result object rather than a bare array so truncation cannot be
+   * dropped on the floor by a caller that just maps over it.
    */
   public async listCampaigns(
     adAccountId: string,
     accessToken: string,
-    options: { campaignId?: string; fields?: string | string[] } = {}
-  ) {
+    options: { campaignId?: string; fields?: string | string[]; maxPages?: number } = {}
+  ): Promise<MetaCampaignListResult> {
     // Validate the requested fields BEFORE any API round-trip so an unsupported field is
     // a loud, dependency-free error rather than a silently-reduced payload.
     const fields =
@@ -907,18 +1304,45 @@ export class MetaService {
       [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.campaignId) {
-        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
-        const campaign = new Campaign(options.campaignId);
-        const result = await campaign.get(fields);
-        return [result._data];
+      // `!== undefined`, not truthiness: `''` is the input `resolveScopeId` exists to REFUSE, and
+      // a truthy test skipped the branch entirely and fell through to the account-wide list —
+      // the silent widening the guard was written to stop, on the one input that names it.
+      if (options.campaignId !== undefined && options.campaignId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.campaignId, 'campaign_id')!;
+        this.log(`Fetching single campaign ${wantedId}`, { fields });
+        const campaign = new Campaign(wantedId);
+        // A node id is global — `new Campaign(id)` is NOT bounded by the ad account the way
+        // the `/act_X/` edge is, and one Meta OAuth token routinely spans several ad accounts.
+        // Without a check the selected-account scope is advisory: a caller could read a campaign
+        // from an account it never selected.
+        //
+        // `account_id` is requested ALONGSIDE the caller's fields so ownership is answered by the
+        // same response as the payload — one round trip, and no separate probe that could fail on
+        // its own and refuse a read which would otherwise have succeeded.
+        const result = await MetaService.withReadDeadline<any>(
+          () => campaign.get(MetaService.withOwnershipField(fields)),
+          'single campaign fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Campaign', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { campaigns: [data], truncated: false, pagesFetched: 1 };
       }
       const account = new AdAccount(`act_${adAccountId}`);
-      this.log(`Listing campaigns for account: ${adAccountId}`, { fields });
-      const campaigns = await account.getCampaigns(fields);
-      return campaigns.map((c: any) => c._data);
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
+      this.log(`Listing campaigns for account: ${adAccountId}`, { fields, ...params });
+      const cursor = await MetaService.withReadDeadline(async () => account.getCampaigns(fields, params), 'campaign list');
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+      return { campaigns: items.map((c: any) => c._data ?? c), truncated, pagesFetched };
     } catch (error) {
-      return this.handleError(error, 'listCampaigns');
+      // handleError always throws — a failed read must never look like "no campaigns".
+      return this.handleError(error, 'listCampaigns') as never;
     }
   }
 
@@ -946,6 +1370,15 @@ export class MetaService {
         finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
       }
 
+      // Campaign hard-stop spend cap, in minor units (cents), forwarded verbatim — the same
+      // way CAMPAIGN UPDATE has always sent it. This allow-list used to omit spend_cap
+      // entirely, so a create that asked for a cap produced an UNCAPPED campaign and still
+      // reported success (ENG-1018). The caller verifies the applied value with a read-back;
+      // this only guarantees the request reaches Meta.
+      if (params.spend_cap !== undefined && params.spend_cap !== null) {
+        finalParams.spend_cap = params.spend_cap;
+      }
+
       this.log(`Attempting createCampaign with literal keys:`, finalParams);
       
       // Request 'id' back to ensure we don't get an empty return
@@ -958,11 +1391,18 @@ export class MetaService {
 
   /**
    * Update campaign
+   *
+   * ENG-1724: a campaign id is a GLOBAL node id, so without this check the write reached any
+   * campaign the token could touch, not just one in the caller's selected ad account — the
+   * write-side counterpart to the read-side gap `getCampaign` already closed. Required (not
+   * optional like the read-side scoping on `getAdSet`/`getAd`): a read has legitimate unscoped
+   * callers reading their own back-reference; a write does not.
    */
-  public async updateCampaign(accessToken: string, campaignId: string, params: any) {
+  public async updateCampaign(accessToken: string, campaignId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Updating campaign ${campaignId} with params:`, params);
       await campaign.update([], params);
       return { success: true };
@@ -973,11 +1413,15 @@ export class MetaService {
 
   /**
    * Delete a campaign
+   *
+   * ENG-1724: same reasoning as `updateCampaign` above — a delete is the write this guard
+   * matters most for, since it is irreversible.
    */
-  public async deleteCampaign(accessToken: string, campaignId: string) {
+  public async deleteCampaign(accessToken: string, campaignId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
+      await MetaService.verifyWriteOwnership(campaign, campaignId, 'Campaign', adAccountId);
       this.log(`Deleting campaign ${campaignId}`);
       await campaign.delete([], {});
       return { success: true };
@@ -987,7 +1431,7 @@ export class MetaService {
   }
 
   /**
-   * List ad sets for an ad account.
+   * List ad sets for an ad account, optionally scoped to one campaign.
    *
    * `options.fields` selects which config fields to read (validated; unsupported fields
    * throw loudly). When omitted, the default list now includes the fields that define
@@ -995,33 +1439,80 @@ export class MetaService {
    * promoted_object, bid_strategy — which the wrapper previously could not read despite
    * being able to WRITE them on CREATE (ENG-398, verify-after-write). `options.adSetId`
    * fetches that one ad set directly and returns it as a one-element list, preserving
-   * LIST semantics. The legacy `campaignId` positional filter is unchanged.
+   * LIST semantics.
+   *
+   * ⚠ ENG-1625 follow-up, two defects in the old code at once:
+   * 1. Campaign scoping went through a bare `campaign_id` param on `/act_X/adsets`. Meta's
+   *    own docs for the account-level adsets edge list only date_preset/effective_status/
+   *    is_completed/time_range — `campaign_id` is not among them, the exact shape ENG-1476
+   *    found and fixed for the ads edge (`/act_X/ads` silently ignores a bare adset_id/
+   *    campaign_id param and returns the whole account). Scoping now goes through Meta's
+   *    own node edge (`/{campaign_id}/adsets`) instead, which makes the scope structurally
+   *    impossible to ignore — a bad id is an error, never a silent account-wide result.
+   *    (Live confirmation against a real ad account was not possible from this workspace —
+   *    no path to a live Meta access token was available; see the PR body.)
+   * 2. No pagination — the old code returned exactly one page (ENG-1584's shape).
+   *
+   * Returns a result object rather than a bare array so truncation cannot be dropped on the
+   * floor by a caller that just maps over it.
    */
   public async listAdSets(
     adAccountId: string,
     accessToken: string,
     campaignId?: string,
-    options: { adSetId?: string; fields?: string | string[] } = {}
-  ) {
+    options: { adSetId?: string; fields?: string | string[]; maxPages?: number } = {}
+  ): Promise<MetaAdSetListResult> {
     // Validate requested fields BEFORE any API round-trip (loud, never silently reduced).
     const fields =
       this.resolveReadFields(options.fields, MetaService.AD_SET_READ_FIELDS, 'ad set') ??
       [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
-      if (options.adSetId) {
-        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
-        const adSet = new AdSet(options.adSetId);
-        const result = await adSet.get(fields);
-        return [result._data];
+      // Same reason as the single-campaign branch above.
+      if (options.adSetId !== undefined && options.adSetId !== null) {
+        const wantedId = MetaService.resolveScopeId(options.adSetId, 'ad_set_id')!;
+        this.log(`Fetching single ad set ${wantedId}`, { fields });
+        const adSet = new AdSet(wantedId);
+        // Same global-node-id boundary, and the same one-round-trip check, as the single
+        // campaign fetch above.
+        const result = await MetaService.withReadDeadline<any>(
+          () => adSet.get(MetaService.withOwnershipField(fields)),
+          'single ad set fetch',
+        );
+        const data = { ...(result?._data ?? {}) };
+        MetaService.assertOwnedByAccount(data.account_id, wantedId, 'Ad set', adAccountId);
+        // Always requested for the check, never by the caller: `account_id` is in neither
+        // READ_FIELDS allow-list, so resolveReadFields would have thrown on an explicit request
+        // for it. Dropped unconditionally, so the payload is exactly what the caller selected.
+        delete data.account_id;
+        return { adSets: [data], truncated: false, pagesFetched: 1, scope: { adSetId: wantedId } };
       }
-      const account = new AdAccount(`act_${adAccountId}`);
-      const params = campaignId ? { campaign_id: campaignId } : {};
-      this.log(`Listing ad sets for account: ${adAccountId}`, { fields, ...params });
-      const adSets = await account.getAdSets(fields, params);
-      return adSets.map((as: any) => as._data);
+
+      const wantedCampaign = MetaService.resolveScopeId(campaignId, 'campaign_id');
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
+
+      const scope: MetaAdListScope = {};
+      let source: any;
+      if (wantedCampaign) {
+        scope.campaignId = wantedCampaign;
+        source = new Campaign(wantedCampaign);
+        // Node reads are not account-scoped by construction the way the account edge is —
+        // same tenancy boundary listAds/listAdCreatives already enforce.
+        await this.assertNodeInAccount(source, wantedCampaign, 'Campaign', adAccountId);
+      } else {
+        source = new AdAccount(`act_${adAccountId}`);
+      }
+
+      this.log(`Listing ad sets for account: ${adAccountId}`, { fields, scope });
+      const cursor = await MetaService.withReadDeadline(() => source.getAdSets(fields, params), 'ad set list');
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+      return { adSets: items.map((as: any) => as._data ?? as), truncated, pagesFetched, scope };
     } catch (error) {
-      return this.handleError(error, 'listAdSets');
+      // handleError always throws — a failed read must never look like "no ad sets".
+      return this.handleError(error, 'listAdSets') as never;
     }
   }
 
@@ -1058,6 +1549,10 @@ export class MetaService {
       // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
       // present so the payload is byte-identical to before when the caller passes nothing.
       if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
+      // Dayparting (ENG-842). Emitted only when present so the payload is byte-identical to before
+      // for every existing caller that never sends a schedule.
+      if (params.adset_schedule !== undefined) adSetParams[AdSet.Fields.adset_schedule] = params.adset_schedule;
+      if (params.pacing_type !== undefined) adSetParams[AdSet.Fields.pacing_type] = params.pacing_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;
@@ -1080,14 +1575,48 @@ export class MetaService {
    * Get a single ad set with the fields needed to confirm a write target
    * (name + the campaign it belongs to).
    */
-  public async getAdSet(accessToken: string, adSetId: string) {
+  public async getAdSet(
+    accessToken: string,
+    adSetId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
-      const fields = ['id', 'name', 'status', 'campaign_id'];
+      // ENG-838 AC4: the read-back after a create has to be able to prove the
+      // spend-shaping settings landed, so the delivery fields ride along with
+      // the write-target fields. Requesting more fields does not change the
+      // shape callers already read (id/name/status/campaign_id).
+      const fields = [
+        'id', 'name', 'status', 'campaign_id',
+        'bid_strategy', 'bid_amount', 'daily_budget', 'lifetime_budget',
+        'start_time', 'end_time'
+      ];
       this.log(`Fetching ad set: ${adSetId}`);
-      const result = await adSet.get(fields);
-      return result._data;
+      /*
+       * `adAccountId !== undefined/null`, not a truthiness test.
+       *
+       * `if (adAccountId)` treats a caller that SUPPLIED an empty string as one that supplied
+       * nothing, and skips the ownership check entirely — so a scope that failed to resolve
+       * silently widened the read to any ad set the token can reach. getCampaign fails closed
+       * on exactly that input (assertOwnedByAccount refuses when the selected account is
+       * blank); these two now agree. `undefined`/`null` still means "not supplied" and
+       * legitimately opts out, which is what the post-write read-back callers rely on. Same
+       * distinction resolveScopeId already draws for scope ids.
+       */
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await adSet.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adSetId, 'Ad set', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAdSet');
     }
@@ -1095,11 +1624,15 @@ export class MetaService {
 
   /**
    * Update ad set
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAdSet` already has.
    */
-  public async updateAdSet(accessToken: string, adSetId: string, params: any) {
+  public async updateAdSet(accessToken: string, adSetId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Updating ad set ${adSetId} with params:`, params);
       await adSet.update([], params);
       return { success: true };
@@ -1110,11 +1643,14 @@ export class MetaService {
 
   /**
    * Delete an ad set
+   *
+   * ENG-1724: same reasoning as `updateAdSet` above.
    */
-  public async deleteAdSet(accessToken: string, adSetId: string) {
+  public async deleteAdSet(accessToken: string, adSetId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
+      await MetaService.verifyWriteOwnership(adSet, adSetId, 'Ad set', adAccountId);
       this.log(`Deleting ad set ${adSetId}`);
       await adSet.delete([], {});
       return { success: true };
@@ -1124,73 +1660,70 @@ export class MetaService {
   }
 
   /**
-   * List ad creatives for an ad account
+   * List ad creatives, optionally scoped to one ad set.
+   *
+   * Paginates and reports truncation for the same reason `listAds` does — this edge was the
+   * other half of ENG-1476, where "Found 25 ad creative(s)" was the whole account's worth of
+   * creatives as far as any caller could tell.
+   *
+   * ⚠ Meta exposes no `/{campaign_id}/adcreatives` edge, so there is no campaign scope here.
+   * A campaign-scoped creative question is answered by `listAds({ campaignId })`, which already
+   * returns `creative{...}` inline on each ad. The tool description says so explicitly.
    */
-  public async listAdCreatives(adAccountId: string, accessToken: string) {
+  public async listAdCreatives(
+    adAccountId: string,
+    accessToken: string,
+    options: { adSetId?: string; maxPages?: number } = {}
+  ): Promise<MetaAdCreativeListResult> {
     try {
       this.initApi(accessToken);
-      const account = new AdAccount(`act_${adAccountId}`);
       const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type', 'link_url', 'object_story_spec', 'url_tags'];
-      this.log(`Listing ad creatives for account: ${adAccountId}`, { fields });
-      const creatives = await account.getAdCreatives(fields);
-      return creatives.map((c: any) => c._data);
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
+
+      const wantedAdSet = MetaService.resolveScopeId(options.adSetId, 'ad_set_id');
+
+      const scope: MetaAdListScope = {};
+      let source: any;
+      if (wantedAdSet) {
+        scope.adSetId = wantedAdSet;
+        source = new AdSet(wantedAdSet);
+        // Same tenancy boundary as listAds — an ad-set id is global, the token spans accounts.
+        await this.assertNodeInAccount(source, wantedAdSet, 'Ad set', adAccountId);
+      } else {
+        source = new AdAccount(`act_${adAccountId}`);
+      }
+
+      this.log(`Listing ad creatives for account: ${adAccountId}`, { fields, scope });
+      const cursor = await MetaService.withReadDeadline(
+        () => source.getAdCreatives(fields, params),
+        'ad creative list',
+      );
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+
+      return {
+        creatives: items.map((c: any) => c._data ?? c),
+        truncated,
+        pagesFetched,
+        scope
+      };
     } catch (error) {
-      return this.handleError(error, 'listAdCreatives');
+      // handleError always throws — see listAds.
+      return this.handleError(error, 'listAdCreatives') as never;
     }
   }
 
   /**
-   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   * Return caller-resolved creative `url_tags` verbatim.
    *
-   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
-   * this both honours a caller who hand-authored tracking and preserves the
-   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
-   *
-   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
-   * utm_campaign / utm_content as Meta click-time macros).
-   *
-   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
-   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
-   * param on the click URL. We therefore omit any UTM key the reference URL already
-   * carries; if it carries them all, `utmQueryString` returns "" and we return
-   * undefined so the caller writes no `url_tags` field at all.
-   *
-   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
-   * on the creative, but there is only one tag string. We reference `params.link_url`
-   * (the single-image/video link, and the carousel fallback link at :989). Carousels
-   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
-   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
-   * reference URL exists at all, we omit nothing and emit the full set.
+   * Customer defaults and per-lander overrides are resolved in AgentMode, where
+   * both the authenticated customer and optional lander id are available. This
+   * Meta boundary deliberately does not implement a second precedence system.
    */
   private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
-    if (params.url_tags) {
-      return params.url_tags;
-    }
-
-    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
-    // creative (the top-level link and every carousel card). So a key must be omitted
-    // if ANY of those links already carries it — emitting it would give that link the
-    // param twice, and a duplicated utm_source corrupts the very attribution this
-    // feature exists to produce. The cost is that a card the user tagged only
-    // partially may stay under-tagged; that is strictly better than a duplicate.
-    const linkUrls = [
-      params.link_url,
-      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
-    ].filter((u): u is string => Boolean(u));
-
-    const omit = new Set<string>();
-    for (const url of linkUrls) {
-      const keys = readUtmKeys(url);
-      // Unreadable link → we cannot know what it already carries, so we do not tag at
-      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
-      // (precise) error; tagging must never be the thing that breaks an ad build.
-      if (!keys) return undefined;
-      for (const k of keys) omit.add(k);
-    }
-
-    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
-    const tags = utmQueryString(spec, omit);
-    return tags || undefined;
+    return params.url_tags || undefined;
   }
 
   /**
@@ -1432,12 +1965,388 @@ export class MetaService {
   }
 
   /**
-   * List ads for an ad account
+   * Drain a Meta SDK `Cursor` into a single array.
+   *
+   * The SDK's Cursor extends Array but only ever holds ONE PAGE: `next()` REPLACES its
+   * contents rather than appending (see the SDK's `cursor.js` -> `_loadPage` -> `this.set()`).
+   * So `const xs = await account.getAds(...); xs.map(...)` reads page 1 — Meta's default 25
+   * records — and nothing else. That is ENG-1476 / ENG-1584: 25 records reported as an
+   * entire ad account, which told a customer an ad they were protecting did not exist.
+   *
+   * `maxPages` is a real bound, not a formality. An unbounded walk of a large account is a
+   * latency risk AND produces a payload big enough to be offloaded to S3 — and the offloaded
+   * read path is itself where ENG-1584's false negative surfaced. So when we stop early we
+   * report `truncated: true` and the caller must say so. We never return a short list that
+   * looks complete: that is the entire defect being fixed here.
    */
-  public async listAds(adAccountId: string, accessToken: string, adSetId?: string) {
+  /**
+   * Bound the wait on a single Graph read.
+   *
+   * ⚠ Honest about what this does: it bounds how long WE wait, not how long the socket stays
+   * open. Without an SDK hook for `AbortSignal` (there is none — see META_READ_CALL_TIMEOUT_MS)
+   * the underlying request is abandoned rather than cancelled, and the connection closes on its
+   * own. For a read that is safe: no side effect is left half-applied, and the caller gets an
+   * answer instead of hanging. That distinction is exactly why this is not applied to writes.
+   */
+  private static async withReadDeadline<T>(
+    op: () => Promise<T>,
+    what: string,
+    budgetMs: number = META_READ_CALL_TIMEOUT_MS,
+  ): Promise<T> {
+    // Never longer than the per-call ceiling, and never long enough to outlive a caller's own
+    // remaining budget. At least 1ms so a deadline is always a real one.
+    const limitMs = Math.max(1, Math.min(budgetMs, META_READ_CALL_TIMEOUT_MS));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const inFlight = op();
+
+    /*
+     * ⚠ Claim the rejection NOW, before racing.
+     *
+     * When the deadline wins, `inFlight` is still pending. If it rejects later nothing is
+     * listening, so it surfaces as an unhandledRejection — and the global handler in server.ts
+     * logs `reason` in full. A Meta FacebookRequestError carries the request URL, and a PAGED
+     * Graph URL carries the access token in its query string. So an un-awaited late failure
+     * would print a live credential into the logs.
+     *
+     * `.catch()` here marks it handled without consuming it: `inFlight` still settles normally
+     * for the race below.
+     */
+    inFlight.catch(() => { /* superseded by the deadline; swallowed on purpose */ });
+
+    try {
+      return await Promise.race([
+        inFlight,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Meta ${what} did not respond within ${limitMs}ms`)),
+            limitMs,
+          );
+          // Never hold the event loop open just for this timer.
+          (timer as any)?.unref?.();
+        }),
+      ]);
+    } finally {
+      // Always clear it — a pending timer per page would otherwise pile up across a long walk.
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async drainCursor(
+    cursor: any,
+    maxPages: number,
+    /** Wall-clock budget for this walk. Defaults to the ordinary read ceiling. */
+    maxMs: number = META_LIST_MAX_MS,
+  ): Promise<{ items: any[]; truncated: boolean; pagesFetched: number }> {
+    /*
+     * Normalise the bound before it is used as one. `maxPages` arrives from a caller-supplied
+     * option, and `?? META_LIST_MAX_PAGES` only covers `undefined` — `Infinity` and `NaN` both
+     * make `pagesFetched >= maxPages` permanently false, which turns the "hard bound" documented
+     * on META_LIST_MAX_PAGES into an unbounded walk that accumulates every page in memory.
+     * Anything not a positive safe integer falls back to the default, and valid values are
+     * clamped, so the ceiling is real rather than merely described.
+     */
+    const pageLimit = Number.isSafeInteger(maxPages) && maxPages > 0
+      ? Math.min(maxPages, META_LIST_MAX_PAGES)
+      : META_LIST_MAX_PAGES;
+
+    // `getAds`/`getAdCreatives` already fetched page 1 (getEdge defaults fetchFirstPage=true).
+    const items: any[] = Array.isArray(cursor) ? [...cursor] : [];
+    let pagesFetched = 1;
+
+    // A plain array (tests, or any non-cursor) carries no paging: one page, nothing more.
+    const canPage = typeof cursor?.hasNext === 'function' && typeof cursor?.next === 'function';
+    if (!canPage) return { items, truncated: false, pagesFetched };
+
+    // Same normalisation discipline as `pageLimit` above: a caller-supplied budget that is not a
+    // positive safe integer must not quietly become an unbounded walk.
+    const budgetMs = Number.isSafeInteger(maxMs) && maxMs > 0 ? maxMs : META_LIST_MAX_MS;
+    const deadline = Date.now() + budgetMs;
+
+    while (cursor.hasNext()) {
+      if (Date.now() >= deadline) {
+        this.log(`Stopped paginating at the ${budgetMs}ms wall-clock bound`, {
+          pagesFetched,
+          itemsSoFar: items.length,
+        });
+        return { items, truncated: true, pagesFetched };
+      }
+      if (pagesFetched >= pageLimit) {
+        this.log(`Stopped paginating at the ${pageLimit}-page bound`, { pagesFetched, itemsSoFar: items.length });
+        return { items, truncated: true, pagesFetched };
+      }
+      try {
+        /*
+         * Give the page only the budget the WALK still has.
+         *
+         * The wall-clock check above gates whether a new page STARTS; on its own that let a page
+         * beginning at 44s of a 45s budget run for a further META_READ_CALL_TIMEOUT_MS, overshooting
+         * the overall deadline by nearly the whole per-call ceiling. Clamping to whatever remains
+         * makes META_LIST_MAX_MS an actual bound on the walk rather than a bound on its start times.
+         */
+        await MetaService.withReadDeadline(
+          () => cursor.next(),
+          'page fetch',
+          deadline - Date.now(),
+        );
+      } catch (e: any) {
+        /*
+         * A page-N failure must not throw away pages 1..N-1. Adding pagination added this
+         * failure mode — before, there was no second request to fail — and discarding good
+         * data over a transient blip would be a regression introduced by the fix.
+         *
+         * Returning the partial set is safe precisely BECAUSE `truncated` exists: it carries
+         * the "this list is incomplete, do not conclude absence" contract that the rest of
+         * this change is built on. What would be unsafe is returning it as complete.
+         *
+         * Deliberately not logging the error object: the SDK attaches the request URL to
+         * FacebookRequestError, and a paged URL carries the access token in its query string.
+         */
+        this.log(`Pagination stopped early after a page error; returning a partial list`, {
+          pagesFetched,
+          itemsSoFar: items.length,
+          reason: typeof e?.message === 'string' ? e.message.slice(0, 200) : 'unknown',
+        });
+        return { items, truncated: true, pagesFetched };
+      }
+      items.push(...cursor);
+      pagesFetched++;
+    }
+
+    return { items, truncated: false, pagesFetched };
+  }
+
+  /** Add `account_id` to a field selection so a single-entity read can verify its own ownership. */
+  private static withOwnershipField(fields: string[]): string[] {
+    return fields.includes('account_id') ? fields : [...fields, 'account_id'];
+  }
+
+  /**
+   * Fetch a node's own `account_id` and verify it against `adAccountId` via `assertOwnedByAccount`
+   * — the shared pre-write ownership check for `updateCampaign`/`deleteCampaign`/`updateAdSet`/
+   * `deleteAdSet`/`updateAd`/`deleteAd` (ENG-1724).
+   *
+   * The Graph `.get()` call here has its OWN try/catch, deliberately separate from each write
+   * method's outer one. Without it, a Graph failure DURING this ownership check (a transient
+   * 5xx, a malformed response — anything short of an actual ownership mismatch) fell through to
+   * the write's generic `catch (error) { return this.handleError(error, ...); }`, and
+   * `handleError` copies `error.response?.data`/`error_user_msg`/etc. into the thrown error
+   * largely unsanitized — correct for a failed WRITE (the caller needs Meta's real reason), but
+   * this failure never reached the write at all. `assertOwnedByAccount`'s own refusal is
+   * provably marker-only (see its doc comment); this closes the one path beside it that could
+   * still carry raw Graph content — a Graph error message can embed account/business/page names,
+   * which is exactly what the ownership check exists to keep from leaking. `refuse()` below
+   * throws a fixed, generic message instead, same anti-oracle bar as the check it guards.
+   */
+  private static async verifyWriteOwnership(
+    node: { get: (fields: string[]) => Promise<any> },
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): Promise<void> {
+    let ownerData: Record<string, any>;
+    try {
+      const owner = await node.get(MetaService.withOwnershipField([]));
+      ownerData = { ...((owner as any)?._data ?? {}) };
+    } catch (error) {
+      console.error(`[MetaService] ownership check failed for ${nodeLabel} ${nodeId}:`, error);
+      throw new Error(
+        `Could not verify ownership of the requested ${nodeLabel.toLowerCase()} before this write. Retry; if it persists, verify the object in Meta Ads Manager.`,
+      );
+    }
+    MetaService.assertOwnedByAccount(ownerData.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
+  /**
+   * Resolve a scope id that was SUPPLIED versus one that was omitted.
+   *
+   * `if (adSetId)` treats an explicitly-supplied empty string as absent, so a caller asking to
+   * scope a read silently gets a broader one — a campaign-wide or account-wide list returned
+   * for a request that named an ad set. That is the exact defect this change exists to remove,
+   * so an empty scope id is refused rather than quietly widened.
+   *
+   * `undefined`/`null` means "not supplied" and legitimately selects the broader source.
+   */
+  private static resolveScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (!trimmed) {
+      throw new Error(
+        `${label} was supplied but empty. Refusing to widen this read to a broader scope — ` +
+        `omit ${label} entirely to list without it.`,
+      );
+    }
+    return trimmed;
+  }
+
+  /**
+   * Bind a campaign / ad-set node to the SELECTED ad account before reading through it.
+   *
+   * ⚠ This is a tenancy boundary, not a nicety. Listing through `new AdAccount('act_X')` was
+   * implicitly account-scoped: Meta could only ever hand back X's ads. Reading through
+   * `new Campaign(id)` / `new AdSet(id)` is NOT — a node id addresses a node globally, and one
+   * Meta OAuth token routinely reaches several ad accounts. Without this check a caller could
+   * select account A, pass a campaign id from account B, and receive B's ads labelled as A's.
+   *
+   * `getMetaCredentials` validates the selected account and returns its token; it says nothing
+   * about the node. The token being valid is not the same as the node being in scope. This
+   * mirrors the guard `AD_CREATIVE GET` already applies for exactly this reason (ENG-471).
+   *
+   * Fails closed on every uncertain branch: an unverifiable owner is refused, not returned.
+   */
+  private async assertNodeInAccount(
+    node: any,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string
+  ): Promise<void> {
+    /*
+     * Separate "this node belongs to someone else" from "Meta could not be reached to answer".
+     * Only the first is a tenancy violation. Failing the second identically would break a
+     * legitimate read over a transient blip while protecting nobody, so the lookup is retried
+     * once — the same reasoning the S3 offload path already applies.
+     *
+     * This costs nothing in strictness: a genuine mismatch refuses on both attempts, and an
+     * unreachable lookup still ends in a refusal rather than an unverified read.
+     */
+    let data: any;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2 && data === undefined; attempt++) {
+      try {
+        const node_ = await MetaService.withReadDeadline<any>(
+          () => node.get(['account_id']),
+          `${nodeLabel.toLowerCase()} ownership lookup`,
+        );
+        data = node_?._data ?? {};
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    if (data === undefined) {
+      // Distinguishable in logs, deliberately not to the caller — see the refusal note below.
+      console.warn(
+        `[MetaService] scope ownership unverifiable for ${nodeLabel} ${nodeId}: ` +
+        `${(lastError as any)?.message ?? 'unknown error'}`,
+      );
+      throw new Error(
+        `Could not verify the requested ${nodeLabel.toLowerCase()} against the selected ad account; ` +
+        `please retry.`,
+      );
+    }
+
+    MetaService.assertOwnedByAccount(data.account_id, nodeId, nodeLabel, adAccountId);
+  }
+
+  /**
+   * Compare an ALREADY-READ `account_id` against the selected ad account and refuse a mismatch.
+   *
+   * Split out of `assertNodeInAccount` so a caller about to read the node anyway can request
+   * `account_id` in the SAME call and check it here — one round trip instead of two. That
+   * matters on the single-entity paths: a separate probe would double the Graph calls on a
+   * routine read-back path AND add a failure mode of its own, refusing a read that would
+   * otherwise have succeeded because the probe blipped. Edge-scoped callers still need
+   * `assertNodeInAccount`, having no payload response to fold the field into.
+   */
+  /**
+   * Public so the one guard that predates it (`AD_CREATIVE GET` in agentModeService) can share
+   * this exact refusal instead of hand-rolling a near-copy that names the owning account.
+   */
+  public static assertOwnedByAccount(
+    ownerAccountId: unknown,
+    nodeId: string,
+    nodeLabel: string,
+    adAccountId: string,
+  ): void {
+    const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
+    const owner = norm(ownerAccountId);
+    const selected = norm(adAccountId);
+
+    /*
+     * ⚠ The refusal must not describe the OTHER tenant.
+     *
+     * Naming the owning account turns this guard into an oracle: anyone able to guess a node id
+     * could learn which ad account owns it, which is cross-account disclosure of exactly the
+     * kind the guard exists to prevent — a block that answers the question it is refusing.
+     *
+     * So the caller (and the model, and ultimately the user) gets the SAME marker sentence on
+     * every failed branch, and the owning account never appears in any of them — the log keeps
+     * that. What may differ after the marker is the remedy, because "select the other account"
+     * is right for a mismatch and impossible when Meta reported no owner at all; see `refuse`.
+     */
+    /*
+     * One marker sentence for every branch, but the REMEDY may differ.
+     *
+     * The marker is what `isMetaAccountScopeRefusal` keys on, so it must not vary — a caller
+     * that stops recognising a refusal degrades past a guard it was told to respect, and for a
+     * write that means proceeding to confirmation on a node the guard refused. What may vary is
+     * the sentence after it, and it should: "select that account and try again" is the right
+     * remedy when the node lives in a DIFFERENT account, and no remedy at all when Meta simply
+     * did not tell us who owns it. Naming an action the user cannot take is the ENG-1636 shape.
+     *
+     * Neither variant discloses the owning account — that is the oracle this guard exists to
+     * refuse, and the discriminating detail stays in the server log.
+     */
+    const OTHER_ACCOUNT_REMEDY = 'If it belongs to a different ad account, select that account and try again.';
+    const refuse = (serverDetail: string, remedy: string = OTHER_ACCOUNT_REMEDY): never => {
+      console.warn(`[MetaService] scope ownership refused: ${serverDetail}`);
+      throw new Error(
+        `The requested ${nodeLabel.toLowerCase()} ${META_ACCOUNT_SCOPE_REFUSAL_MARKER}. ${remedy}`,
+      );
+    };
+
+    if (!owner) {
+      // Fails closed on purpose: the field was requested, so its absence means the assumption
+      // behind this check no longer holds — not that the node is in scope.
+      refuse(
+        `no account_id on ${nodeLabel} ${nodeId}`,
+        `Meta did not report which ad account owns it, so ownership could not be CONFIRMED — ` +
+        `this is a failed check, not a proven mismatch. Retry; if it persists, verify the object ` +
+        `in Meta Ads Manager and that the intended ad account is selected.`,
+      );
+    }
+    // Both sides must be known. An empty selected account cannot be compared against anything,
+    // so treating it as "no mismatch" would pass every node the token can reach.
+    if (!selected) {
+      /*
+       * OUR failure, not the user's, and it must not read like theirs.
+       *
+       * This fires when no ad account could be resolved for the request — a credential or
+       * wiring problem on our side. The shared remedy ("it belongs to a different ad account,
+       * select that one") accuses the user of pointing at someone else's node, which is a
+       * confusing, unactionable thing to read about your own campaign. It is the same mistake
+       * that shipped as "in ad account (undefined)" earlier in this work.
+       */
+      refuse(
+        `no selected account resolved for ${nodeLabel} ${nodeId}`,
+        `No ad account could be determined for this request, so ownership could not be checked. ` +
+        `This is a connection problem, not a permissions one — reconnect Meta in Settings, or ` +
+        `name the ad account explicitly, then try again.`,
+      );
+    }
+    if (owner !== selected) {
+      refuse(`${nodeLabel} ${nodeId} owned by ${owner}, selected ${selected}`);
+    }
+  }
+
+  /**
+   * List ads, optionally scoped to one campaign or one ad set.
+   *
+   * ⚠ Scoping goes through Meta's own node edges (`/{campaign_id}/ads`, `/{adset_id}/ads`),
+   * NOT through `params.adset_id` / `params.campaign_id`. Meta **silently ignores** those as
+   * bare params on the `/act_X/ads` edge and hands back the whole account — the filter looks
+   * applied and is not (ENG-1476). Querying the node instead makes the scope structurally
+   * impossible to ignore: a bad id is an error, never a silent account-wide result.
+   *
+   * Returns a result object rather than a bare array so truncation cannot be dropped on the
+   * floor by a caller that just maps over it.
+   */
+  public async listAds(
+    adAccountId: string,
+    accessToken: string,
+    adSetId?: string,
+    options: { campaignId?: string; maxPages?: number } = {}
+  ): Promise<MetaAdListResult> {
     try {
       this.initApi(accessToken);
-      const account = new AdAccount(`act_${adAccountId}`);
       const fields = [
         'id', 'name', 'status', 'effective_status', 'adset_id', 'campaign_id',
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec}'
@@ -1449,14 +2358,48 @@ export class MetaService {
           'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
           'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
           'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
-        ]
+        ],
+        // Bigger pages mean fewer round trips for the same data, not more data.
+        limit: META_LIST_PAGE_SIZE
       };
-      if (adSetId) params.adset_id = adSetId;
-      this.log(`Listing ads for account: ${adAccountId}`, { fields, ...params });
-      const ads = await account.getAds(fields, params);
-      return ads.map((a: any) => a._data);
+
+      // Most-specific scope wins: an ad set lives inside a campaign, so asking for both and
+      // honouring the ad set is the narrower, more useful read.
+      const wantedAdSet = MetaService.resolveScopeId(adSetId, 'ad_set_id');
+      const wantedCampaign = MetaService.resolveScopeId(options.campaignId, 'campaign_id');
+
+      const scope: MetaAdListScope = {};
+      let source: any;
+      if (wantedAdSet) {
+        scope.adSetId = wantedAdSet;
+        source = new AdSet(wantedAdSet);
+        // Node reads are not account-scoped by construction the way the account edge is.
+        await this.assertNodeInAccount(source, wantedAdSet, 'Ad set', adAccountId);
+      } else if (wantedCampaign) {
+        scope.campaignId = wantedCampaign;
+        source = new Campaign(wantedCampaign);
+        await this.assertNodeInAccount(source, wantedCampaign, 'Campaign', adAccountId);
+      } else {
+        source = new AdAccount(`act_${adAccountId}`);
+      }
+
+      this.log(`Listing ads for account: ${adAccountId}`, { fields, scope, ...params });
+      const cursor = await MetaService.withReadDeadline(() => source.getAds(fields, params), 'ad list');
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+
+      const ads = items
+        .map((a: any) => a._data ?? a)
+        // Net for a status filter Meta may have ignored on a node edge — see NON_LIVE_AD_STATUSES.
+        .filter((a: any) => !NON_LIVE_AD_STATUSES.has(String(a?.effective_status ?? '').toUpperCase()));
+
+      return { ads, truncated, pagesFetched, scope };
     } catch (error) {
-      return this.handleError(error, 'listAds');
+      // handleError always throws — a failed read must never look like "no ads",
+      // which a caller would report as an empty-but-complete account.
+      return this.handleError(error, 'listAds') as never;
     }
   }
 
@@ -1528,12 +2471,24 @@ export class MetaService {
    * `campaignId` scopes the read to one campaign via Meta's `filtering` param; the caller
    * ALSO filters client-side, so a filter the API ignores can never attribute another
    * campaign's ads to this one.
+   *
+   * ⚠ ENG-1625 follow-up: paginates and reports truncation for the same ENG-1584 reason
+   * `listAds` does — the old code returned exactly one page, and a silently short audit is
+   * an attribution-correctness problem (it feeds the ENG-926/ENG-885 foundation), not just a
+   * UI annoyance. Scoping is left as `filtering` here, unchanged — unlike a bare `campaign_id`
+   * param, Meta's `filtering` operator is a documented, general-purpose Graph API mechanism,
+   * not the same unsupported-param shape ENG-1476 found on this edge.
    */
   public async listAdsForUtmAudit(
     adAccountId: string,
     accessToken: string,
     campaignId?: string,
-  ): Promise<Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>> {
+    options: { maxPages?: number; maxMs?: number } = {},
+  ): Promise<{
+    items: Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>;
+    truncated: boolean;
+    pagesFetched: number;
+  }> {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
@@ -1548,13 +2503,31 @@ export class MetaService {
           'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
           'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
         ],
+        limit: META_LIST_PAGE_SIZE,
       };
       if (campaignId) {
         params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
       }
       this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
-      const ads = await account.getAds(fields, params);
-      return ads.map((a: any) => {
+      /*
+       * The FIRST page must honour the caller's budget too.
+       *
+       * `drainCursor` applies `maxMs` to the pages it walks, but this initial fetch went through
+       * the fixed per-call ceiling — so a caller arriving with its budget already spent still
+       * paid for one full read. The launch gate's `Math.max(1_000, …)` floor made that concrete:
+       * an exhausted wall still bought a 30s page. Capped to whatever the caller actually has.
+       */
+      const cursor = await MetaService.withReadDeadline(
+        async () => account.getAds(fields, params),
+        'UTM audit ad list',
+        options.maxMs,
+      );
+      const { items: pages, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES,
+        options.maxMs,
+      );
+      const items = pages.map((a: any) => {
         const data = a._data ?? a;
         const creative = data.creative;
         const urlTags = (creative?._data ?? creative)?.url_tags;
@@ -1565,6 +2538,7 @@ export class MetaService {
           urlTags: typeof urlTags === 'string' && urlTags.trim() ? urlTags : undefined,
         };
       });
+      return { items, truncated, pagesFetched };
     } catch (error) {
       // handleError always throws — a failed read must never look like "no ads"
       // (which the audit would report as a vacuously tagged, healthy account).
@@ -1596,7 +2570,14 @@ export class MetaService {
   /**
    * Get a single ad with its creative reference
    */
-  public async getAd(accessToken: string, adId: string) {
+  public async getAd(
+    accessToken: string,
+    adId: string,
+    /** When supplied, the node is verified to belong to this ad account before anything is
+     *  returned. Optional so existing read-back callers are unchanged; the callers whose result
+     *  reaches a user-facing prompt pass it. Same treatment getAdSet received. */
+    adAccountId?: string,
+  ) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
@@ -1608,10 +2589,49 @@ export class MetaService {
         'creative{id,name,body,title,image_url,thumbnail_url,object_story_spec,status}'
       ];
       this.log(`Fetching ad: ${adId}`);
-      const result = await ad.get(fields);
-      return result._data;
+      /*
+       * An ad id is a GLOBAL node id, so this returns any ad the token can reach — and one Meta
+       * OAuth token routinely spans several ad accounts. buildMetaWriteConfirmation renders this
+       * result's NAME into the prompt the user approves, so an ad_id from another ad account
+       * disclosed that account's ad name to this user. getCampaign and getAdSet were both given
+       * this check; getAd, the resolver sitting between them, was not.
+       */
+      // Fails closed on a supplied-but-empty account id, exactly as getAdSet and getCampaign do:
+      // "" is a scope that failed to resolve, not a caller opting out of scoping.
+      const scoped = adAccountId !== undefined && adAccountId !== null;
+      const result = await ad.get(
+        scoped ? MetaService.withOwnershipField(fields) : fields,
+      );
+      const data = { ...(result?._data ?? {}) };
+      if (scoped) {
+        MetaService.assertOwnedByAccount(data.account_id, adId, 'Ad', adAccountId);
+        delete data.account_id;
+      }
+      return data;
     } catch (error) {
       return this.handleError(error, 'getAd');
+    }
+  }
+
+  /**
+   * Resolve an ad's parent campaign without crossing the selected ad-account boundary.
+   * Only the three ownership fields are requested, and the existing read deadline keeps
+   * a stalled Graph request on the launch gate's fail-closed path.
+   */
+  public async getAdCampaignIdForAccount(accessToken: string, adAccountId: string, adId: string): Promise<string | undefined> {
+    try {
+      this.initApi(accessToken);
+      const result = await MetaService.withReadDeadline(
+        () => new Ad(adId).get(['id', 'campaign_id', 'account_id']),
+        'ad parent campaign',
+      );
+      const data: any = (result as any)?._data ?? result;
+      const selectedAccountId = String(adAccountId).trim().replace(/^act_/, '');
+      const ownerAccountId = String(data?.account_id ?? '').trim().replace(/^act_/, '');
+      if (!selectedAccountId || !ownerAccountId || ownerAccountId !== selectedAccountId) return undefined;
+      return typeof data?.campaign_id === 'string' && data.campaign_id ? data.campaign_id : undefined;
+    } catch (error) {
+      return this.handleError(error, 'getAdCampaignIdForAccount') as never;
     }
   }
 
@@ -1634,7 +2654,11 @@ export class MetaService {
         'child_attachments{link,image_hash,picture,name,description,video_id,call_to_action}},' +
         'video_data{video_id,image_hash,image_url,title,message,call_to_action}}';
       const fields = [
-        'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
+        // account_id is requested so callers can bind the returned node to the ad
+        // account they intended to read (ENG-471). A Meta OAuth token can span
+        // several ad accounts, so a creative id alone does not identify a tenant.
+        // Additive for existing callers, which simply ignore the extra field.
+        'id', 'account_id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
         'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
@@ -1645,13 +2669,48 @@ export class MetaService {
     }
   }
 
+  /** Render one existing ad or creative in a Meta placement. */
+  public async generateAdPreview(accessToken: string, nodeId: string, adFormat: string) {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const response = await axios.get(
+        `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(nodeId)}/previews`,
+        {
+          params: { ad_format: adFormat, access_token: accessToken },
+          timeout: META_READ_CALL_TIMEOUT_MS,
+          maxContentLength: 1_000_000,
+        },
+      );
+      const rows = response?.data?.data;
+      if (
+        !Array.isArray(rows)
+        || rows.length === 0
+        || rows.some((row: any) => !row || typeof row.body !== 'string' || row.body.trim().length === 0)
+      ) {
+        throw new Error('Meta returned an invalid ad preview response.');
+      }
+      return rows.map((row: any) => ({ body: row.body }));
+    } catch (error) {
+      const responseData = (error as any)?.response?.data;
+      const safeError = new Error((error as any)?.message || 'Meta ad preview request failed.');
+      if (responseData) {
+        (safeError as any).response = { data: responseData };
+      }
+      return this.handleError(safeError, 'generateAdPreview');
+    }
+  }
+
   /**
    * Update ad
+   *
+   * ENG-1724: see `updateCampaign` above — same global-node-id gap, write-side counterpart to
+   * the read-side scoping `getAd` already has.
    */
-  public async updateAd(accessToken: string, adId: string, params: any) {
+  public async updateAd(accessToken: string, adId: string, params: any, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Updating ad ${adId} with params:`, params);
       await ad.update([], params);
       return { success: true };
@@ -1662,11 +2721,14 @@ export class MetaService {
 
   /**
    * Delete an ad
+   *
+   * ENG-1724: same reasoning as `updateAd` above.
    */
-  public async deleteAd(accessToken: string, adId: string) {
+  public async deleteAd(accessToken: string, adId: string, adAccountId: string) {
     try {
       this.initApi(accessToken);
       const ad = new Ad(adId);
+      await MetaService.verifyWriteOwnership(ad, adId, 'Ad', adAccountId);
       this.log(`Deleting ad ${adId}`);
       await ad.delete([], {});
       return { success: true };
@@ -1806,9 +2868,18 @@ export class MetaService {
   }
 
   /**
-   * List Custom Audiences
+   * List Custom Audiences.
+   *
+   * ⚠ ENG-1625 follow-up: the old code hard-capped `limit: 50`, fetched exactly one page,
+   * and returned a bare array — no truncation signal past that cap. Same ENG-1584 shape as
+   * the other list edges. Returns a result object so truncation cannot be dropped on the
+   * floor by a caller that just maps over it.
    */
-  public async listCustomAudiences(adAccountId: string, accessToken: string) {
+  public async listCustomAudiences(
+    adAccountId: string,
+    accessToken: string,
+    options: { maxPages?: number } = {}
+  ): Promise<MetaCustomAudienceListResult> {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
@@ -1824,11 +2895,20 @@ export class MetaService {
         // agentModeService's executeAudienceCampaignLaunch.
         'lookalike_spec',
       ];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
       this.log(`Listing custom audiences for account: ${adAccountId}`, { fields });
-      const audiences = await account.getCustomAudiences(fields, { limit: 50 });
-      return audiences.map((a: any) => a._data);
+      const cursor = await MetaService.withReadDeadline(
+        async () => account.getCustomAudiences(fields, params),
+        'custom audience list',
+      );
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+      return { audiences: items.map((a: any) => a._data ?? a), truncated, pagesFetched };
     } catch (error) {
-      return this.handleError(error, 'listCustomAudiences');
+      // handleError always throws — a failed read must never look like "no audiences".
+      return this.handleError(error, 'listCustomAudiences') as never;
     }
   }
 
@@ -2200,21 +3280,37 @@ export class MetaService {
   }
 
   /**
-   * List ad pixels associated with an ad account
+   * List ad pixels associated with an ad account.
+   *
+   * ⚠ ENG-1625 follow-up: the old code called the Graph API directly with `fetchWithRetry`
+   * (bypassing the SDK's Cursor entirely) and read only `data.data`, ignoring `paging.next` —
+   * one page, no bound, no truncation signal, the same ENG-1584 shape as every other edge in
+   * this file. The SDK's `AdAccount.getAdsPixels` exposes the same edge as a proper Cursor
+   * (confirmed against the installed SDK), so this now goes through the same
+   * withReadDeadline/drainCursor path as every other list method here instead of a
+   * bespoke fetch. Returns a result object so truncation cannot be dropped on the floor by a
+   * caller that just maps over it.
    */
-  public async listPixels(adAccountId: string, accessToken: string) {
+  public async listPixels(
+    adAccountId: string,
+    accessToken: string,
+    options: { maxPages?: number } = {}
+  ): Promise<MetaPixelListResult> {
     try {
-      const apiVersion = process.env.META_API_VERSION || 'v25.0';
-      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,last_fired_time,is_created_by_business&access_token=${accessToken}`;
-      const { fetchWithRetry } = await import('../utils/metaApiFetch');
-      const response = await fetchWithRetry(url);
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error.message || 'Failed to list pixels');
-      }
-      return data.data || [];
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = ['id', 'name', 'last_fired_time', 'is_created_by_business'];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
+      this.log(`Listing pixels for account: ${adAccountId}`, { fields });
+      const cursor = await MetaService.withReadDeadline(async () => account.getAdsPixels(fields, params), 'pixel list');
+      const { items, truncated, pagesFetched } = await this.drainCursor(
+        cursor,
+        options.maxPages ?? META_LIST_MAX_PAGES
+      );
+      return { pixels: items.map((p: any) => p._data ?? p), truncated, pagesFetched };
     } catch (error) {
-      return this.handleError(error, 'listPixels');
+      // handleError always throws — a failed read must never look like "no pixels".
+      return this.handleError(error, 'listPixels') as never;
     }
   }
 
@@ -2257,7 +3353,15 @@ export class MetaService {
   public async resolveMetaPixelForUser(
     user: any,
     userId: string,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2270,7 +3374,7 @@ export class MetaService {
       }
 
       const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, accounts[0].accountId);
-      const pixels = await this.listPixels(accountId, accessToken);
+      const { pixels } = await this.listPixels(accountId, accessToken);
 
       if (!pixels || pixels.length === 0) {
         return { unresolved: true, reason: `No Meta pixel found on ad account ${accountId}` };
@@ -2282,6 +3386,175 @@ export class MetaService {
       return { pixelId: pixels[0].id, accountId };
     } catch (error: any) {
       return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
+   * Calendly's resolution (ENG-1141) — deliberately NOT resolveMetaPixelForUser, because
+   * a booking webhook is unattended (no human to prompt when ambiguous), so this defaults
+   * to the caller's first connected account and its first pixel instead of refusing. An
+   * explicit `stored` choice (the Calendly card's own account/pixel dropdowns) always wins
+   * when both fields are present. Never throws, same AC3 guarantee as resolveMetaPixelForUser.
+   */
+  /**
+   * Does the stored pixel still exist on its (still-connected) account?
+   *
+   * Cache-first by design: `/pixels` already caches the customer's full pixel set per user and
+   * invalidates it on connect/disconnect, so a warm entry answers this for free. Only a cold
+   * cache costs one Graph call, scoped to the single stored account rather than a full fan-out.
+   *
+   * FAILS OPEN. If the check itself cannot run — expired token, Graph outage, malformed record —
+   * the answer is "keep the customer's explicit choice". Falling back to auto-resolution on an
+   * outage would silently repoint a working configuration at a different pixel, which is worse
+   * than briefly honoring one that may have been deleted (that case degrades visibly: the CAPI
+   * send fails and is recorded in the job's `failures`).
+   *
+   * The partial result is deliberately NOT written back into the /pixels cache: it covers one
+   * account, and storing it would make a later full read believe the customer has no others.
+   */
+  private async storedPixelStillExists(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string },
+  ): Promise<boolean> {
+    try {
+      const { getCachedPixels } = await import('./metaPixelsCache');
+      const cached = getCachedPixels(userId);
+      if (cached) {
+        return cached.some((p) => p.pixelId === stored.pixelId && p.accountId === stored.accountId);
+      }
+
+      const { getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // Two failures that must NOT be treated alike (Greptile round 5 on #2384).
+      //
+      // Credentials failing is evidence about the stored pair itself: that account's token is
+      // gone or unusable, so keeping the selection would send every later booking down a path
+      // whose credentials cannot resolve — retried to exhaustion while a healthy pixel on
+      // another connected account sits unused. That is the exact failure the connectivity
+      // check exists to prevent, so treat it as "not usable" and let the search continue.
+      let credentials: { accountId: string; accessToken: string };
+      try {
+        credentials = await getMetaAccountCredentials(user, userId, stored.accountId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} has no usable credentials ` +
+          `(${error?.message}) — falling back to auto-resolution`,
+        );
+        return false;
+      }
+
+      // A Graph failure is evidence about Meta, not about the choice. Keep it: repointing a
+      // working configuration because of a transient outage is worse than briefly honoring a
+      // pixel that may have been deleted, which degrades visibly as a recorded CAPI failure.
+      try {
+        const { pixels } = await this.listPixels(credentials.accountId, credentials.accessToken);
+        return (pixels || []).some((p: any) => p.id === stored.pixelId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Could not reach Meta to verify stored pixel ${stored.pixelId} ` +
+          `(keeping the customer's choice): ${error?.message}`,
+        );
+        return true;
+      }
+    } catch (error: any) {
+      // The cache lookup or module import failed — nothing learned about the pair either way.
+      console.warn(
+        `[Meta] Could not verify stored pixel ${stored.pixelId} (keeping the customer's choice): ${error?.message}`,
+      );
+      return true;
+    }
+  }
+
+  public async resolveMetaPixelWithDefault(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string } | undefined,
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // The stored pair is a snapshot of a choice made earlier, so it can outlive the
+      // connection it names — the customer disconnects that Meta account, or a reconnect
+      // issues a different account id. Honoring it blindly sends every later booking down
+      // a path whose credentials no longer resolve: the CAPI leg throws, the job is marked
+      // failed and retried to exhaustion, and a healthy pixel on another connected account
+      // is never tried (Greptile P1 on #2384; Pass 1 of this feature had this check and the
+      // Pass-2 rework dropped it). The check is LOCAL — it reads the already-loaded user
+      // record — deliberately not a Graph round-trip on every booking just to confirm a
+      // stored choice. A pixel deleted from a still-connected account therefore still gets
+      // honored here and surfaces as a CAPI failure instead; catching that would cost a
+      // per-booking API call, which this resolver exists to avoid.
+      if (stored?.pixelId && stored?.accountId) {
+        let storedAccountStillConnected = true;
+        try {
+          storedAccountStillConnected = getConnectedMetaAccountsList(user)
+            .some((account: { accountId: string }) => account.accountId === stored.accountId);
+        } catch {
+          // Unreadable/malformed user record: keep the customer's explicit choice rather
+          // than silently downgrading it to "whatever account comes first".
+          storedAccountStillConnected = true;
+        }
+        if (storedAccountStillConnected) {
+          // The account surviving is only half of staleness — the pixel itself can be deleted
+          // from an account that is still connected (Greptile round 4 on #2384). Verified via
+          // the shared /pixels cache, so the common case (a customer who just looked at the
+          // picker, or any second booking inside the TTL) costs no Graph traffic at all.
+          if (await this.storedPixelStillExists(user, userId, stored)) {
+            return { pixelId: stored.pixelId, accountId: stored.accountId };
+          }
+          console.warn(
+            `[Meta] Stored Calendly attribution pixel ${stored.pixelId} no longer exists on account ` +
+            `${stored.accountId} — falling back to auto-resolution`,
+          );
+        }
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} is no longer connected — falling back to auto-resolution`,
+        );
+      }
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+
+      // Search every connected account in order for the first one that actually has
+      // a pixel — the whole point of this resolver is "always resolvable once ANY
+      // connected account has a pixel," so it can't stop at accounts[0] just because
+      // that particular account happens to have none (a real regression caught live:
+      // a customer's first-listed account had 0 pixels while a later one had 1, and
+      // the naive accounts[0]-only version reproduced the exact silent-skip bug this
+      // resolver exists to fix). One account's failure (expired token, Graph error)
+      // is skipped, not fatal — the next account still gets a fair try.
+      let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      // A caught failure here is a credential refresh or a Graph call going wrong, not a
+      // statement about how this account is configured — so the result is unresolved but
+      // retryable, unlike "every connected account genuinely has zero pixels".
+      let sawTransientFailure = false;
+      for (const account of accounts) {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
+          const { pixels } = await this.listPixels(accountId, accessToken);
+          if (pixels && pixels.length > 0) {
+            return { pixelId: pixels[0].id, accountId };
+          }
+        } catch (error: any) {
+          lastReason = error?.message || lastReason;
+          sawTransientFailure = true;
+        }
+      }
+      return { unresolved: true, reason: lastReason, transient: sawTransientFailure };
+    } catch (error: any) {
+      // An unexpected throw out of the resolver itself is likewise not a configuration fact.
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel', transient: true };
     }
   }
 
@@ -2319,6 +3592,26 @@ export class MetaService {
        *  current time when absent/invalid (an older, not-yet-regenerated capture route
        *  never sent one, or the caller's own validation rejected it as implausible). */
       eventTimeSeconds?: number;
+      /** Meta standard event name. Defaults to 'Lead' (this function's original/only
+       *  caller, webhooks.ts's form-submission forward-lead). Callers for a different
+       *  conversion type — e.g. calendlyWebhook.ts sending 'Schedule' for a booking,
+       *  per ENG-524's PRD and matching ENG-522's sendScheduleEvent — pass it explicitly. */
+      eventName?: string;
+      /** ENG-926 §C: Meta's `custom_data`, emitted only when present so every existing
+       *  caller's payload is byte-identical to what it was before this field existed.
+       *  `value`/`currency` are what make a closed-won `Purchase` usable for Meta's
+       *  value-based bidding — without them the event counts but carries no revenue. */
+      customData?: { value?: number; currency?: string };
+      /** Meta's `action_source`. Defaults to 'website', which is correct for this
+       *  function's original callers (a real form submission, and ENG-522's booking flow)
+       *  and keeps their payloads unchanged.
+       *
+       *  A CRM status change is NOT a website event — nobody was on a page — and claiming
+       *  otherwise misdescribes where the conversion happened. Meta validates this field:
+       *  probed against Graph v25 on 2026-08-14, 'system_generated' and 'website' are both
+       *  accepted while a bogus value is rejected with "Invalid Action Source Parameter",
+       *  so acceptance here is meaningful rather than the API ignoring the field. */
+      actionSource?: string;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2327,17 +3620,31 @@ export class MetaService {
     try {
       const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
+      // Normalisation rules live in metaUserDataNormalisation.ts, where they are pinned by
+      // hash against Meta's own fbevents.js output. They are NOT interchangeable per field:
+      // `em` keeps `.`/`+`/`@`, `ph` keeps digits only, `fn`/`ln` drop everything that is
+      // not alphanumeric. See that module's header for how each rule was established.
+      //
+      // Empty means "no usable value" and the field is omitted entirely — hashing an empty
+      // string produces a real, constant hash that Meta would accept as if it identified a
+      // person, shared by every customer who left the field blank.
+      const hashedOrOmit = (field: NormalisableUserDataField, raw?: string): string[] | undefined => {
+        const normalised = normaliseUserDataField(field, raw);
+        return normalised ? [sha256(normalised)] : undefined;
+      };
+
       const userData: Record<string, any> = {};
-      if (event.email) userData.em = [sha256(event.email.trim().toLowerCase())];
-      // Meta's documented CAPI normalization for `ph`: digits only, then strip any leading
-      // zero(s) (a common national-dialing-prefix artifact, e.g. a UK number entered as
-      // "07911123456" should normalize the same as "7911123456" before country-code
-      // prefixing). This does not add a missing country code — no user locale is available
-      // here — so a phone entered without one will still under-match; that's a data-quality
-      // gap, not something this normalization step can fix on its own.
-      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, '').replace(/^0+/, ''))];
-      if (event.firstName) userData.fn = [sha256(event.firstName.trim().toLowerCase())];
-      if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
+      const em = hashedOrOmit('em', event.email);
+      if (em) userData.em = em;
+      const ph = hashedOrOmit('ph', event.phone);
+      if (ph) userData.ph = ph;
+      // Previously trimmed and lowercased only, so every name carrying punctuation or an
+      // internal space hashed differently from Meta's version of the same name — "van der
+      // Berg" and "O'Brien" never matched, silently, on every event we have ever sent.
+      const fn = hashedOrOmit('fn', event.firstName);
+      if (fn) userData.fn = fn;
+      const ln = hashedOrOmit('ln', event.lastName);
+      if (ln) userData.ln = ln;
       if (event.clientIp) userData.client_ip_address = event.clientIp;
       if (event.userAgent) userData.client_user_agent = event.userAgent;
       if (event.fbp) userData.fbp = event.fbp;
@@ -2353,18 +3660,25 @@ export class MetaService {
           ? (event.eventTimeSeconds as number)
           : Math.floor(Date.now() / 1000);
 
+      // Only build custom_data when there is something to put in it — an empty object
+      // would still be a payload change for every existing caller.
+      const customData: Record<string, any> = {};
+      if (typeof event.customData?.value === 'number') customData.value = event.customData.value;
+      if (event.customData?.currency) customData.currency = event.customData.currency;
+
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
       const body = {
         access_token: accessToken,
         data: [
           {
-            event_name: 'Lead',
+            event_name: event.eventName || 'Lead',
             event_id: event.eventId,
             event_time: eventTime,
-            action_source: 'website',
+            action_source: event.actionSource || 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,
+            ...(Object.keys(customData).length > 0 ? { custom_data: customData } : {}),
           },
         ],
       };
@@ -2381,6 +3695,53 @@ export class MetaService {
         const message = data?.error?.message || `CAPI send failed with HTTP ${response.status}`;
         console.error(`[MetaService] sendCapiLeadEvent failed for pixel ${pixelId}: ${message}`);
         return { success: false, error: message, usage };
+      }
+
+      // The ONLY record of what identity actually left this process, and the reason it exists
+      // is specific: Meta's `/stats?aggregation=match_keys` does NOT report `fbc` or `fbp`.
+      // Verified 2026-08-18 across three production pixels carrying real paid traffic and ~15
+      // distinct event types — zero occurrences of either, including on a lander proven to set
+      // both cookies. So an absent `fbc` there is NOT evidence it was never sent, and ENG-926's
+      // AC2 was once judged failed on exactly that inference (§50, corrected in §55).
+      //
+      // Until someone has Business Manager access, this line is the only send-side proof
+      // available — §42 recorded the gap as "nothing logs it".
+      //
+      // KEY NAMES ONLY, never values: every entry here is PII (`em`/`ph`/`fn`/`ln` hashes,
+      // `client_ip_address`, `client_user_agent`) or a click identifier (`fbc`/`fbp`).
+      const sentKeys = Object.keys(userData).sort();
+
+      console.log(
+        `[MetaService] CAPI ${event.eventName || 'Lead'} accepted — pixel ${pixelId} ` +
+        `event_id=${event.eventId} user_data keys: ` +
+        `${sentKeys.join(',') || '(none)'}`,
+      );
+
+      // ENG-926 §F — persist what that log line says, so send-side identity coverage is a
+      // TREND rather than a grep. The card asks to track Event Match Quality over time and
+      // Meta sells no such API, so the half we own is: of the conversions we actually sent,
+      // what fraction carried each key. `fn`/`ln` were hashed wrong for 24 days and nothing
+      // could see it, because the only symptom is a number quietly lower than it should be.
+      //
+      // ⚠ Awaited, and wrapped so it can NEVER throw. Meta has already ACCEPTED this
+      // conversion by the time we get here — it cannot be recalled — so a storage fault must
+      // not turn a delivered conversion into a reported failure, nor provoke a relay retry of
+      // an event Meta already counted. Awaited rather than fire-and-forget because a floating
+      // promise outliving the Jest environment is exactly the ENG-1286 shape, and a DynamoDB
+      // update is ~10ms against a CAPI round trip of hundreds.
+      try {
+        const [{ recordCapiKeySend }, { addCapiKeyCounters }] = await Promise.all([
+          import('./metaCapiKeyCoverage'),
+          import('./metaCapiKeyCoverageDb'),
+        ]);
+        await recordCapiKeySend(
+          { pixelId, eventName: event.eventName, keys: sentKeys, nowMs: Date.now() },
+          { addCounters: addCapiKeyCounters },
+        );
+      } catch (coverageError: any) {
+        console.warn(
+          `[MetaService] CAPI key coverage not recorded for pixel ${pixelId}: ${coverageError?.message}`,
+        );
       }
 
       return { success: true, fbtraceId: data.fbtrace_id, usage };

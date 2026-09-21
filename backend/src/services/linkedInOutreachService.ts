@@ -5,6 +5,41 @@ import { userDb } from './db';
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
 // Twitter/X support is suspended — see dev.md for details.
 
+/**
+ * Does this error prove the LinkedIn session is gone, as opposed to merely failing?
+ *
+ * The distinction is the whole point. A timeout, a 5xx or a transport blip says
+ * nothing about session validity, and treating one as a disconnection suppresses a
+ * healthy account behind a false reconnect prompt (ENG-281). Only Unipile's explicit
+ * disconnect code, a 401, or an AUTH_ERROR classification are proof.
+ *
+ * Exported so every caller that persists or blocks on this verdict — the session
+ * probe, the sync cron's health recorder — shares one definition. Two copies of a
+ * safety predicate is one copy too many.
+ */
+export function isProvenDisconnectError(error: any): boolean {
+  // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
+  // `structuredError`. Read both so classification can't depend on which layer threw.
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification =
+    structured?.classification || error?.body?.classification || error?.classification;
+  // 403 is deliberately NOT proof. `handleError` classifies 401 AND 403 as
+  // AUTH_ERROR, but a 403 is a permission/plan/endpoint restriction — the session
+  // is alive, we are just not allowed to do that thing. This predicate used to feed
+  // a 10-minute in-memory cache where a wrong verdict expired harmlessly; it now
+  // persists `needs_reconnect`, withholds scheduled runs, and emails a paying
+  // customer that their account is broken. That is not a mistake worth making on a
+  // 403.
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return (
+    code === 'errors/disconnected_account' ||
+    classification === 'AUTH_ERROR' ||
+    Number(status) === 401
+  );
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -26,7 +61,29 @@ export class LinkedInOutreachService {
   // another. Note: the per-recipient "Should delay new invitation" rejection does
   // NOT arm this breaker — that one is specific to a single recipient.
   private invitationCooldownUntil: Map<string, number> = new Map();
+
+  /**
+   * True while this account is inside the ENG-126 account-level invitation cooldown.
+   *
+   * Exposed so callers can tell "this send will not reach LinkedIn" BEFORE paying a
+   * pacing slot for it. The breaker below short-circuits the network call entirely,
+   * so a paced caller would otherwise sleep the full gap and consume one of the
+   * account's hourly writes for zero LinkedIn traffic — for up to an hour, on every
+   * queued invite.
+   */
+  isUnderInvitationCooldown(accountId: string): boolean {
+    const until = this.invitationCooldownUntil.get(accountId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.invitationCooldownUntil.delete(accountId);
+    return false;
+  }
   private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
+  // Per-account people-search capability verdict (ENG-975). See
+  // probeSearchCapability below for why this exists; cached per account so a
+  // paging loop or a run that tries several queries pays at most one probe.
+  private searchCapabilityCache: Map<string, { state: 'ok' | 'degraded'; timestamp: number }> = new Map();
+  private static readonly SEARCH_CAPABILITY_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -102,6 +159,14 @@ export class LinkedInOutreachService {
       ? new Error(structuredError.message)
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
+    // ENG-1300: classifyToolErrorClass (and toolResultError's reconstruction)
+    // only look at a top-level .status/.statusCode/.code — structuredError.status
+    // computed above is nested and invisible to them, so every caller through
+    // handleError classified as generic Error/bug regardless of the real HTTP
+    // status. Mirror it to the top level so all of them pick it up at once.
+    if (!Number.isNaN(status)) {
+      (enhancedError as any).code = status;
+    }
     throw enhancedError;
   }
 
@@ -369,21 +434,12 @@ export class LinkedInOutreachService {
         state = 'connected';
       }
     } catch (error: any) {
-      // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
-      // `structuredError`. Read both so the classification cannot depend on which
-      // layer threw.
+      // Only a proven-dead signal may say "disconnected"; everything else is
+      // indeterminate and the caller decides. See isProvenDisconnectError.
+      state = isProvenDisconnectError(error) ? 'disconnected' : 'unknown';
       const structured = error?.structuredError;
       const code = structured?.code || error?.body?.code || error?.code || '';
       const status = structured?.status || error?.body?.status || error?.status;
-      const classification = structured?.classification || error?.body?.classification || error?.classification;
-      // Only these mean "the LinkedIn session is gone". A timeout or transport
-      // failure proves nothing about the session, so it must not be reported as
-      // a disconnection to a caller that would block on it.
-      const definitivelyDisconnected =
-        code === 'errors/disconnected_account' ||
-        classification === 'AUTH_ERROR' ||
-        Number(status) === 401;
-      state = definitivelyDisconnected ? 'disconnected' : 'unknown';
       this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''}) → ${state}`);
     }
     this.connectedStatusCache.set(accountId, { state, timestamp: Date.now() });
@@ -394,6 +450,97 @@ export class LinkedInOutreachService {
     // Unchanged semantics for every pre-existing caller: anything that is not a
     // proven-live session is `false`, including an indeterminate probe.
     return (await this.probeAccountSession(accountId)) === 'connected';
+  }
+
+  /**
+   * A maximally broad control query. Any LinkedIn account whose people search
+   * works at all matches this; a zero on it is about the ACCOUNT, not the query.
+   */
+  static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
+
+  /**
+   * Concurrency cap for filterByCompanySize's per-employer lookups (ENG-1558
+   * follow-up). Each distinct employer costs two sequential outbound calls
+   * (resolve name -> id, then fetch the company profile), so an unthrottled
+   * `Promise.all` over a page with 15-20 distinct employers could fire
+   * 30-40 concurrent Unipile requests from a single search — an
+   * uncomfortable burst against the shared/platform-fallback account other
+   * users are also hitting. Chunking bounds it to
+   * `2 * COMPANY_SIZE_LOOKUP_CONCURRENCY` concurrent requests at a time,
+   * matching the plain chunked-Promise.all pattern already used elsewhere
+   * in this codebase for external lookups (e.g. emailDeliverabilityService's
+   * MX_LOOKUP_CONCURRENCY) rather than pulling in a semaphore/library.
+   */
+  static readonly COMPANY_SIZE_LOOKUP_CONCURRENCY = 5;
+
+  /**
+   * People-search capability canary (ENG-975).
+   *
+   * An account can lose its people-search capability while leaving profile
+   * reads and invitation lists fully functional. Confirmed cause for the
+   * reported outage: an open Unipile incident (2026-08) — LinkedIn is rolling
+   * out changes to Classic Search account by account, so a given account either
+   * searches normally or returns zero for everything. A commercial-use limit,
+   * search restriction or soft block produces the same shape. Whatever the
+   * cause, Unipile relays it as HTTP 200 with
+   * `items: []` and `paging.total_count: 0`, which is byte for byte what a
+   * genuine no-match looks like. So a zero-result search alone cannot tell
+   * "nobody matches" from "this account can no longer search", and callers that
+   * assume the former report a false empty (0 invites sent, 0 leads imported)
+   * on what is actually an outage.
+   *
+   * This re-runs one broad control query on the same account to break the tie:
+   *   'ok'        — the control matched people, so the caller's zero is real.
+   *   'degraded'  — the control ALSO returned zero: search is broken for this
+   *                 account. Callers should fail loudly.
+   *   'unknown'   — the probe itself failed. Same philosophy as the ENG-281
+   *                 session probe: an indeterminate probe proves nothing, so it
+   *                 is never cached and must never block the caller.
+   *
+   * Deliberately NOT called from `searchPeople`. CRM enrichment runs narrow
+   * person-name searches that legitimately return zero all day; probing there
+   * would double those calls against LinkedIn's rate limits. The guard belongs
+   * to the agent-facing callers, where a false empty is what reaches the user.
+   */
+  async probeSearchCapability(accountId: string): Promise<'ok' | 'degraded' | 'unknown'> {
+    const cached = this.searchCapabilityCache.get(accountId);
+    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.SEARCH_CAPABILITY_TTL_MS) {
+      return cached.state;
+    }
+    let state: 'ok' | 'degraded';
+    try {
+      const client = await this.getClient();
+      const result = await LinkedInOutreachService.withTimeout(
+        client.request.send({
+          method: 'POST',
+          path: ['linkedin', 'search'],
+          parameters: { account_id: accountId },
+          headers: { 'Content-Type': 'application/json' },
+          body: {
+            api: 'classic',
+            category: 'people',
+            keywords: LinkedInOutreachService.SEARCH_CAPABILITY_CANARY_KEYWORDS,
+          },
+        }) as Promise<any>,
+        LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS,
+        `LinkedIn search capability probe for ${accountId}`,
+      ) as any;
+      state = Array.isArray(result?.items) && result.items.length > 0 ? 'ok' : 'degraded';
+    } catch (error: any) {
+      // Not cached: a probe that could not run says nothing about the account.
+      this.warn(`Search capability probe could not run — treating as indeterminate`, {
+        accountId,
+        reason: error?.message,
+      });
+      return 'unknown';
+    }
+    this.searchCapabilityCache.set(accountId, { state, timestamp: Date.now() });
+    this.log(`Search capability probe`, { accountId, state });
+    return state;
+  }
+
+  clearSearchCapabilityCache(accountId: string): void {
+    this.searchCapabilityCache.delete(accountId);
   }
 
   /**
@@ -885,14 +1032,21 @@ export class LinkedInOutreachService {
    *
    * Structured ID filters (`company_id`, `location_id`, `industry_id`,
    * `school_id`) are forwarded as top-level body keys per Unipile's classic
-   * people-search schema (arrays of numeric IDs; `industry` is an object with
-   * include/exclude arrays). See https://developer.unipile.com/docs/linkedin-search.
+   * people-search schema — all four as flat arrays of numeric ID strings,
+   * `industry` included (ENG-1299: an earlier `{ include, exclude }` object
+   * shape for industry 400'd every structured search with "Expected union
+   * value", silently degrading to a keyword-only search that drops the
+   * industry/location constraints). See
+   * https://developer.unipile.com/docs/linkedin-search.
    *
    * When the caller passes free-text (e.g. `company: 'Microsoft'`) without the
    * matching `*_id`, this method calls UnipileSearchParamService.resolveTopId()
    * to look up the LinkedIn entity ID. Resolver miss (null) or resolver error
    * → fall back to the original `advanced_keywords` free-text behavior so the
-   * search never blocks on resolution failures.
+   * search never blocks on resolution failures. When that happens, the result
+   * carries `degraded: true` and `droppedFacets` (the facet names that
+   * couldn't be resolved to a structured ID) so callers get a deterministic
+   * signal instead of having to infer degradation themselves (ENG-1299).
    */
   async searchPeople(accountId: string, params: {
     keywords?: string;
@@ -921,6 +1075,12 @@ export class LinkedInOutreachService {
       const client = await this.getClient();
 
       let body: any;
+      // Facet names whose free-text couldn't be resolved to an ID and fell
+      // back to `advanced_keywords` (keyword-only matching for that facet,
+      // not a true structured filter). Surfaced on the result as `degraded`
+      // so the caller has a deterministic signal instead of having to infer
+      // degradation from the request shape (ENG-1299).
+      let droppedFacets: string[] = [];
 
       if (cursor) {
         // Pagination: cursor wins over url because the cursor payload already
@@ -965,7 +1125,7 @@ export class LinkedInOutreachService {
 
         if (resolvedCompanyId) body.company = [resolvedCompanyId];
         if (resolvedLocationId) body.location = [resolvedLocationId];
-        if (resolvedIndustryId) body.industry = { include: [resolvedIndustryId], exclude: [] };
+        if (resolvedIndustryId) body.industry = [resolvedIndustryId];
         if (resolvedSchoolId) body.school = [resolvedSchoolId];
 
         // Free-text fallback for anything that didn't resolve (and for title
@@ -980,6 +1140,7 @@ export class LinkedInOutreachService {
         if (Object.keys(advanced).length > 0) {
           body.advanced_keywords = advanced;
         }
+        droppedFacets = Object.keys(advanced).filter((key) => key !== 'title');
       }
 
       const result = await client.request.send({
@@ -990,6 +1151,9 @@ export class LinkedInOutreachService {
         body
       });
       this.log(`Search returned results`, { result });
+      if (droppedFacets.length > 0 && result && typeof result === 'object' && !Array.isArray(result)) {
+        return { ...result, degraded: true, droppedFacets };
+      }
       return result;
     } catch (error: any) {
       return this.handleError(error, 'searchPeople');
@@ -1004,6 +1168,111 @@ export class LinkedInOutreachService {
    */
   async resolveCompanyId(company: string, accountId: string): Promise<string | null> {
     return this.resolveSearchParamId('COMPANY', company, accountId);
+  }
+
+  /**
+   * Filter search-people result items by their current employer's headcount
+   * (ENG-1558). Unipile has no native headcount filter for the People search
+   * category — only for Companies — so this resolves each item's employer
+   * NAME (from `work_experience`, free text) to a company ID via the same
+   * cached resolver `searchPeople` itself uses, then reads `employee_count`
+   * off the cached company profile (UnipileCompanyService — 30-day TTL, same
+   * service the `get-company` tool action already uses). Both hops are
+   * already-cached lookups; nothing new to cache here.
+   *
+   * A candidate whose employer can't be resolved, or whose profile carries
+   * no employee_count, is EXCLUDED rather than silently let through — the
+   * caller explicitly asked for a size-filtered list, so an unverifiable
+   * result is worse than a smaller, honest one. `excludedUnverifiable`
+   * reports how many so the caller can be transparent about it (mirrors the
+   * ENG-1002 anonymizedFiltered pattern), the same way an out-of-network
+   * result or a reach limit gets reported instead of silently vanishing.
+   *
+   * No-op (returns items unchanged) when neither bound is given, so callers
+   * that never ask for this pay no extra latency or Unipile calls.
+   */
+  async filterByCompanySize(
+    items: any[],
+    range: { min?: number; max?: number },
+    accountId: string,
+  ): Promise<{ items: any[]; excludedUnverifiable: number }> {
+    // CodeRabbit: contradictory or negative bounds would otherwise silently
+    // exclude every verifiable candidate (min > max fails both comparisons
+    // for any real count) with no signal to the caller about why — fail
+    // fast instead of burning employer lookups on an unsatisfiable range.
+    if (
+      (range.min != null && range.min < 0) ||
+      (range.max != null && range.max < 0) ||
+      (range.min != null && range.max != null && range.min > range.max)
+    ) {
+      throw new Error('company_size_min and company_size_max must be non-negative and min must not exceed max');
+    }
+    if (range.min == null && range.max == null) return { items, excludedUnverifiable: 0 };
+
+    const employerOf = (item: any): string | null => {
+      const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+      const current = exp.find((w: any) => w?.current) || exp[0];
+      return typeof current?.company === 'string' && current.company.trim()
+        ? current.company.trim()
+        : null;
+    };
+
+    // Resolve each DISTINCT employer once, not once per candidate — a page
+    // of results routinely has several candidates at the same company.
+    const uniqueNames = Array.from(
+      new Set(items.map(employerOf).filter((n): n is string => !!n)),
+    );
+
+    const headcountByName = new Map<string, number | null>();
+    const lookupOne = async (name: string) => {
+      try {
+        const companyId = await this.resolveCompanyId(name, accountId);
+        if (!companyId) { headcountByName.set(name, null); return; }
+        const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+        // CodeRabbit: getCompanyProfile has no timeout of its own — one hung
+        // Unipile request would otherwise stall this whole lookup batch
+        // (Promise.all never settles until every member does). Bound it and
+        // treat a timeout as unverifiable, same as any other lookup failure.
+        const result = await LinkedInOutreachService.withTimeout(
+          getUnipileCompanyService().getCompany(companyId, accountId),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn company lookup for ${companyId}`,
+        );
+        const count =
+          typeof result.rawData?.employee_count === 'number'
+            ? result.rawData.employee_count
+            : typeof result.rawData?.insights?.employeesCount?.totalCount === 'number'
+            ? result.rawData.insights.employeesCount.totalCount
+            : null;
+        headcountByName.set(name, count);
+      } catch (error: any) {
+        // A single company lookup failing (rate limit, transient 5xx) must
+        // not fail the whole search — treat that one employer as
+        // unverifiable, same as a resolver miss.
+        this.log(`Company size lookup failed for "${name}" — treating as unverifiable`, {
+          reason: error?.message,
+        });
+        headcountByName.set(name, null);
+      }
+    };
+    // Chunked, not one big Promise.all — see COMPANY_SIZE_LOOKUP_CONCURRENCY.
+    const CONCURRENCY = LinkedInOutreachService.COMPANY_SIZE_LOOKUP_CONCURRENCY;
+    for (let i = 0; i < uniqueNames.length; i += CONCURRENCY) {
+      const batch = uniqueNames.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(lookupOne));
+    }
+
+    let excludedUnverifiable = 0;
+    const filtered = items.filter((item) => {
+      const name = employerOf(item);
+      const count = name ? headcountByName.get(name) ?? null : null;
+      if (count == null) { excludedUnverifiable++; return false; }
+      if (range.min != null && count < range.min) return false;
+      if (range.max != null && count > range.max) return false;
+      return true;
+    });
+
+    return { items: filtered, excludedUnverifiable };
   }
 
   private async resolveSearchParamId(
@@ -1257,12 +1526,30 @@ export class LinkedInOutreachService {
   ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
     const client = await this.getClient();
 
-    // Step 1: find the chat between our account and this attendee
-    const chatsResult = await client.messaging.getAllChatsFromAttendee({
-      attendee_id: attendeeId,
-      account_id,
-      limit: 1,
-    });
+    // Step 1: find the chat between our account and this attendee.
+    // Unipile only has a chat_attendee record once a chat exists — a 1st-degree
+    // connection who has never been messaged has no such record, so this 404s
+    // instead of resolving with items: []. That is "no conversation yet", not a
+    // failure (ENG-1623), so classify it the same way handleError would and swallow
+    // only the NOT_FOUND case; anything else (auth/session/etc.) still propagates.
+    let chatsResult;
+    try {
+      chatsResult = await client.messaging.getAllChatsFromAttendee({
+        attendee_id: attendeeId,
+        account_id,
+        limit: 1,
+      });
+    } catch (error: any) {
+      try {
+        await this.handleError(error, 'getMessagesWithContact');
+      } catch (enhanced: any) {
+        if (enhanced?.structuredError?.classification === 'NOT_FOUND') {
+          this.log('getMessagesWithContact: no chat_attendee record yet (never messaged)', { attendeeId, account_id });
+          return [];
+        }
+        throw enhanced;
+      }
+    }
 
     if (!chatsResult?.items?.length) {
       this.log('getMessagesWithContact: no chat found for attendee', { attendeeId, account_id });
@@ -1377,6 +1664,18 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
+    const { accountId } = await this.resolveAccountIdWithSource(userId);
+    return accountId;
+  }
+
+  /**
+   * Same resolution as resolveAccountId, but also reports whether the
+   * returned account came from the user's own connected accounts or the
+   * site-wide shared pool. Callers whose responses carry viewer-relative data
+   * (network_distance, dedup-against-pending-invites) need this to avoid
+   * silently presenting another account's network as the user's own (ENG-1198).
+   */
+  async resolveAccountIdWithSource(userId: string): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
     // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
     //    session is still live. A single disconnected account must not shadow a
     //    working one, nor force a needless fall-through to the shared site-wide
@@ -1391,7 +1690,7 @@ export class LinkedInOutreachService {
       const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
       for (const account of userAccounts) {
         if (await this.isAccountConnected(account.account_id)) {
-          return account.account_id;
+          return { accountId: account.account_id, usedSharedAccount: false };
         }
         this.log(`User account ${account.account_id} is disconnected — trying next own account`);
       }
@@ -1408,14 +1707,14 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (await this.isAccountConnected(account.account_id)) {
-            return account.account_id;
+            return { accountId: account.account_id, usedSharedAccount: true };
           }
           this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
 
-    return null;
+    return { accountId: null, usedSharedAccount: false };
   }
 
   /**

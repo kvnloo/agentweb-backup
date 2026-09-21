@@ -12,8 +12,12 @@
  *
  * This module is deliberately dependency-light and its translation is pure/exported
  * so the request<->response mapping (the risky part of a provider-transport change)
- * can be characterization-tested without the SDK or the network.
+ * can be characterization-tested without the SDK or the network. The single
+ * exception is the synthesised tool-call id, which must be unique per session and
+ * therefore draws randomness — see `mintToolCallId` (ENG-1206).
  */
+
+import { randomBytes } from 'crypto';
 
 /** Minimal shape of the OpenAI chat-completions params the agent loop passes in. */
 export interface OpenAIChatParams {
@@ -29,6 +33,18 @@ export interface OpenAIChatParams {
 /** Per-request timeout matching the Vertex/Bedrock adapters (5 min). */
 export const GEMINI_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Keep provider SDKs from interpreting invalid caller deadlines as immediate or unbounded. */
+export function normalizeProviderRequestTimeoutMs(
+  requestedTimeoutMs: unknown,
+  fallbackTimeoutMs: number,
+): number {
+  return typeof requestedTimeoutMs === 'number'
+    && Number.isFinite(requestedTimeoutMs)
+    && requestedTimeoutMs > 0
+    ? requestedTimeoutMs
+    : fallbackTimeoutMs;
+}
+
 export interface GeminiRequestOptions {
   /** maxOutputTokens fallback when the caller does not specify one. */
   defaultMaxTokens: number;
@@ -37,52 +53,135 @@ export interface GeminiRequestOptions {
 }
 
 /**
- * Strip JSON-Schema keywords the Gemini function-declaration schema rejects.
- * Gemini accepts an OpenAPI-3.0 subset; meta/compositional keywords like
- * `$schema`, `$ref`, `$defs`, and `additionalProperties` cause a 400. Applied
- * recursively; everything else (type/properties/items/required/enum/description/
- * anyOf/nullable) is preserved.
- *
- * Also drops any `x-*` vendor-extension keyword (e.g. `x-aliases`, used across
- * many tool schemas — search_tool_response, read_tool_response, etc. — to let
- * the model call a param by an alternate name). Gemini's schema validator
- * rejects unknown properties outright, so every tool carrying one 400s the
- * whole request the moment tools are attached — this broke 100% of real
- * gemini-3.5-flash tool-calling turns in prod (never caught by unit tests,
- * whose fixture schemas didn't happen to use an x-* keyword).
- *
- * Also drops `oneOf`/`allOf`/`const` — confirmed absent from the `@google/genai`
- * `Schema` type (only `anyOf` is supported), same class of bug as `x-aliases`.
- * Bedrock already needed an equivalent sanitizer (sanitizeSchemaForBedrock in
- * agentModeService.ts) for these exact keywords, because dynamically-discovered
- * MCP tool schemas (GitHub, etc. — arbitrary, not authored in this repo) can
- * carry them even though no hand-written tool here currently does.
- *
- * ENG-826: also normalizes a JSON-Schema union `type` array (e.g.
- * `type: ['array', 'string']`, as used by emma/tools.ts — get_meta_ads_metrics
- * campaign_ids, gmail send to/cc/bcc). Gemini's function-declaration `Schema.type`
- * is a SINGLE OpenAPI type; a union array 400s the ENTIRE request the moment such
- * a tool is attached, so every gemini-3.5-flash agent turn carrying one terminated
- * with zero assistant output and null tokens (the ENG-826 silent-failure
- * signature) while Claude/Bedrock — which accept the union — ran fine. We collapse
- * the union to a single type: `array` is kept when present (so `items` stays
- * meaningful and the model can pass a list), otherwise the first non-`null` member;
- * a `null` member becomes `nullable: true`. Array-only keywords are dropped when
- * the resolved type is not `array`.
+ * Every field the `@google/genai` `Schema` type models — i.e. the complete set of
+ * keywords a Gemini function declaration accepts. Kept in sync with `Schema` in
+ * `@google/genai/dist/genai.d.ts`.
  */
-export function sanitizeGeminiSchema(schema: any): any {
-  if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
+/**
+ * Deepest sub-schema nesting we will emit. Two independent ceilings meet here:
+ *
+ *  - ours: unbounded recursion on a circular schema overflows the stack and kills the
+ *    worker mid-turn, reproducing the zero-assistant-output signature this whole
+ *    ticket is about;
+ *  - Gemini's: the request 400s with `Message recursion depth exceeds maximum of 64`.
+ *    That budget is in PROTOBUF messages, not schema levels, and an object level costs
+ *    two of them (Schema -> properties entry -> Schema) where an array level costs one.
+ *    Measured against the live API: a 40-deep array chain is accepted, a 30-deep OBJECT
+ *    chain is not, and 25 is.
+ *
+ * 20 sits under the tighter (object) ceiling with margin, and is still far beyond any
+ * real tool schema — the deepest in this repo is single digits — so it only ever fires
+ * on a pathological or circular third-party MCP schema.
+ */
+const MAX_SCHEMA_DEPTH = 20;
+
+/** Degradations accumulated while sanitizing one tool schema, reported once at the end. */
+interface SanitizeReport {
+  /** Nodes flattened to a leaf by the cycle guard or the depth cap. */
+  truncated: number;
+  /** Arrays whose element type was recovered from `prefixItems`/`contains`. */
+  salvagedItems: number;
+  /** Arrays whose element type had to be invented as `string`. */
+  blindItems: number;
+}
+
+export const GEMINI_SCHEMA_KEYWORDS = new Set([
+  'anyOf', 'default', 'description', 'enum', 'example', 'format', 'items',
+  'maxItems', 'maxLength', 'maxProperties', 'maximum', 'minItems', 'minLength',
+  'minProperties', 'minimum', 'nullable', 'pattern', 'properties',
+  'propertyOrdering', 'required', 'title', 'type',
+]);
+
+/**
+ * Reduce a JSON Schema to the OpenAPI-3.0 subset a Gemini function declaration
+ * accepts. Gemini's validator rejects ANY unknown field outright — the whole
+ * request 400s the moment one offending tool is attached, so the agent turn dies
+ * before the first token with zero assistant output and null tokens/cost.
+ *
+ * ENG-845: this is an ALLOWLIST of the keywords `@google/genai`'s `Schema` models,
+ * not a denylist of known-bad ones. The denylist form regressed three times — it
+ * grew `x-*` (ENG-737: `x-aliases` on search_tool_response et al broke 100% of
+ * gemini tool turns), then `oneOf`/`allOf`/`const`, then union `type` arrays
+ * (ENG-826, the defect that actually killed the LinkedIn Post Factory runs) — and
+ * each time the gap only surfaced as a production outage, because the schemas that
+ * carry the missing keyword are third-party: `mcpClientService` registers whatever
+ * `tools/list` returns as `tool.inputSchema`, verbatim, as the function parameters.
+ * No enumeration of bad keywords can stay complete against that; only an allowlist
+ * closes the class.
+ *
+ * The concrete headroom this buys is a version bump away rather than live today:
+ * prod runs the pinned `@playwright/mcp` 0.0.70, whose 21 tools carry only
+ * `$schema`/`additionalProperties` (both already denied). 0.0.78 adds `browser_drop`,
+ * whose `data` property carries `propertyNames` — verified against the real API to
+ * 400 the ENTIRE request under the old denylist and to be accepted under this
+ * allowlist. The `github` stdio server in `mcp_config.ts` is the same shape of
+ * exposure once a user configures its secret. Keywords verified to 400 the request:
+ * `propertyNames`, `examples`, `exclusiveMinimum`/`exclusiveMaximum`, `multipleOf`,
+ * `uniqueItems`, `readOnly`, `deprecated`, `contentEncoding`, `not`.
+ *
+ * The filter is POSITION-AWARE: `properties` maps parameter NAMES to sub-schemas, so
+ * its keys must never be keyword-filtered (a parameter legitimately named `const` or
+ * `additionalProperties` would otherwise be deleted from the declaration, leaving the
+ * model unable to supply it). Only `properties` values, `items` and `anyOf` hold
+ * sub-schemas and are recursed into; `default`/`example` hold literal instance data
+ * and pass through untouched.
+ *
+ * ENG-826: a JSON-Schema union `type` array (e.g. `type: ['array', 'string']`, as
+ * used by emma/tools.ts — get_meta_ads_metrics campaign_ids, gmail send to/cc/bcc)
+ * is collapsed to the SINGLE OpenAPI type Gemini's `Schema.type` allows: `array` is
+ * kept when present (so `items` stays meaningful and the model can pass a list),
+ * else `object` when the node actually carries `properties`, else the first non-`null`
+ * member; a `null` member becomes `nullable: true`. Array-only keywords are dropped
+ * when the resolved type is not `array`. Claude/Bedrock accept the union, which is
+ * why only gemini-3.5-flash runs failed.
+ */
+export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any>, report?: SanitizeReport): any {
+  // NOTE: the explicit arrow matters — `map(sanitizeGeminiSchema)` would pass the
+  // array INDEX as `depth`, silently truncating every member past the limit.
+  if (Array.isArray(schema)) return schema.map((entry) => sanitizeGeminiSchema(entry, depth, ancestors, report));
   if (!schema || typeof schema !== 'object') return schema;
-  const DROP = new Set([
-    '$schema', '$id', '$ref', '$defs', 'definitions',
-    'additionalProperties', 'unevaluatedProperties', 'patternProperties',
-    'oneOf', 'allOf', 'const',
-  ]);
+
+  // Degradations are collected across the whole traversal and reported ONCE by the
+  // outermost call, so a pathological schema logs a single summary rather than a line
+  // per node. Silence is what made the original ENG-845 failure so expensive to find.
+  const notes: SanitizeReport = report ?? { truncated: 0, blindItems: 0, salvagedItems: 0 };
+
+  // A schema reachable from itself recurses forever, as does a pathologically deep
+  // one; either would take down the worker with a stack overflow rather than a 400.
+  // JSON `$ref` can't produce this (it is stripped before we recurse), but a
+  // dereferenced or hand-built circular object can. Both cases TRUNCATE to a leaf:
+  // the node keeps its own keywords and loses only its children, which stays a valid
+  // schema instead of dropping the parameter outright.
+  const path = ancestors ?? new Set<any>();
+  const truncate = path.has(schema) || depth >= MAX_SCHEMA_DEPTH;
+  if (!truncate) path.add(schema);
+  else notes.truncated++;
+
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (DROP.has(key) || key.startsWith('x-')) continue;
-    out[key] = sanitizeGeminiSchema(value);
+    if (!GEMINI_SCHEMA_KEYWORDS.has(key)) continue;
+    if (key === 'properties') {
+      // Keys here are parameter names, not keywords — recurse into the values only.
+      if (truncate || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const properties: any = {};
+      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub, depth + 1, path, notes);
+      out.properties = properties;
+    } else if (key === 'items') {
+      // Gemini's `items` is a single Schema; a draft-07 tuple array 400s with
+      // `Unknown name "0" at ...items`. Keep the first element so the parameter
+      // stays usable instead of dropping the element schema outright.
+      if (truncate) continue;
+      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value, depth + 1, path, notes);
+    } else if (key === 'anyOf') {
+      if (truncate) continue;
+      out.anyOf = sanitizeGeminiSchema(value, depth + 1, path, notes);
+    } else {
+      out[key] = value;
+    }
   }
+  // Leave the path as we found it so a schema object legitimately SHARED between two
+  // sibling branches is still expanded in both — only true ancestry counts as a cycle.
+  if (!truncate) path.delete(schema);
   if (Array.isArray(out.type)) {
     const members = out.type.filter((t: any) => typeof t === 'string');
     const nonNull = members.filter((t: string) => t !== 'null');
@@ -104,7 +203,52 @@ export function sanitizeGeminiSchema(schema: any): any {
       delete out.maxItems;
     }
   }
+  // Gemini REQUIRES `items` on an array — `{ type: 'array' }` alone 400s the whole
+  // request with `properties[x].items: missing field`. Several paths can strip it: a
+  // degenerate tuple (`items: []`), a schema that declared `array` without `items` at
+  // all, and depth/cycle truncation above.
+  //
+  // Guessing `string` is the LAST resort, because an invented element type is a lie the
+  // model acts on: told an array-of-objects is an array-of-strings, it sends strings,
+  // execute() rejects them against the ORIGINAL schema, and the user sees a tool error.
+  // So first salvage a real element type from the draft-2020 keywords the allowlist
+  // drops before we ever reach here — `prefixItems` (the modern tuple form, which
+  // `@playwright/mcp` and other draft-2020 schemas use instead of tuple `items`) and
+  // `contains`. Both describe the element and are strictly better than a guess.
+  if (out.type === 'array' && !isUsableItems(out.items)) {
+    const donor = Array.isArray((schema as any).prefixItems)
+      ? (schema as any).prefixItems[0]
+      : (schema as any).contains;
+    if (donor && typeof donor === 'object' && !Array.isArray(donor)) {
+      const salvaged = sanitizeGeminiSchema(donor, depth + 1, path, notes);
+      if (isUsableItems(salvaged)) {
+        out.items = salvaged;
+        notes.salvagedItems++;
+      }
+    }
+    if (!isUsableItems(out.items)) {
+      out.items = { type: 'string' };
+      notes.blindItems++;
+    }
+  }
+
+  // Outermost call reports once. These are all cases where the request now SUCCEEDS
+  // where it previously 400'd or crashed — but with a schema less precise than the tool
+  // author wrote, so it must not pass silently.
+  if (depth === 0 && !report && (notes.truncated || notes.blindItems || notes.salvagedItems)) {
+    console.warn('Gemini schema sanitizer degraded a tool schema:', {
+      truncatedNodes: notes.truncated,        // cycle or depth cap hit
+      salvagedArrayItems: notes.salvagedItems, // element type recovered from prefixItems/contains
+      guessedArrayItems: notes.blindItems,     // element type invented as `string`
+      maxDepth: MAX_SCHEMA_DEPTH,
+    });
+  }
   return out;
+}
+
+/** Gemini needs a typed sub-schema here; an empty or non-object `items` still 400s. */
+function isUsableItems(items: any): boolean {
+  return !!items && typeof items === 'object' && !Array.isArray(items) && typeof items.type === 'string';
 }
 
 /** Convert one OpenAI message `content` value into an array of Gemini parts. */
@@ -157,19 +301,33 @@ export function toGeminiRequest(
   opts: GeminiRequestOptions,
 ): { model: string; contents: any[]; config: any } {
   // Gemini matches function results to calls by NAME, not id, so pre-map every
-  // assistant tool_call id -> {name, signed}. `signed` = the call carries a Gemini
-  // thoughtSignature: gemini-3.5-flash (a thinking model) REQUIRES that signature to
-  // be echoed back on the functionCall part, or the next turn 400s
-  // ("Function call is missing a thought_signature"). Unsigned calls — from the
-  // compat path or a pre-fix session — are degraded to text so no unsigned
-  // functionCall part is ever sent (and their results are degraded to text too, to
-  // keep functionResponse paired with a functionCall).
-  const toolCallInfo = new Map<string, { name: string; signed: boolean }>();
+  // assistant tool_call id -> {name, structural}. A thinking model REQUIRES the
+  // thoughtSignature it issued to be echoed back, or the next turn 400s
+  // ("Function call is missing a thought_signature"), so a turn we cannot send
+  // structurally is degraded to text instead (its results too, to keep every
+  // functionResponse paired with a functionCall).
+  //
+  // ENG-1054: signature presence is a property of the TURN, not of the call.
+  // Gemini signs only the FIRST functionCall part of a multi-call turn and returns
+  // its siblings unsigned — so treating `signed` per-call degraded 77 of 105 calls
+  // in the production session, dumping ~111 KB of tool JSON into the conversation
+  // as prose. That is what taught the model to reply with transcribed tool output
+  // (a 20,081-char echo) and, once a payload was cut mid-JSON, with the bare `}]`
+  // that ended the run.
+  //
+  // Verified live against gemini-3.1-pro-preview rather than assumed:
+  //   - an unsigned functionCall with NO signed sibling  -> 400 (the case above)
+  //   - unsigned functionCalls ALONGSIDE a signed sibling in the same turn
+  //     -> ACCEPTED (it is exactly the shape Gemini itself returned)
+  // So a turn keeps its structural form when ANY of its calls is signed, and only
+  // a wholly-unsigned turn (legacy/compat history) still degrades to text.
+  const toolCallInfo = new Map<string, { name: string; structural: boolean }>();
   for (const msg of params.messages) {
     if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      const turnIsSigned = msg.tool_calls.some((tc: any) => !!tc?.thought_signature);
       for (const tc of msg.tool_calls) {
         if (tc?.id && tc?.function?.name) {
-          toolCallInfo.set(tc.id, { name: tc.function.name, signed: !!tc.thought_signature });
+          toolCallInfo.set(tc.id, { name: tc.function.name, structural: turnIsSigned });
         }
       }
     }
@@ -199,15 +357,21 @@ export function toGeminiRequest(
     } else if (msg.role === 'assistant') {
       const parts = contentToParts(msg.content);
       if (Array.isArray(msg.tool_calls)) {
+        const turnIsSigned = msg.tool_calls.some((tc: any) => !!tc?.thought_signature);
         for (const tc of msg.tool_calls) {
           let args: any = {};
           try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
-          if (tc.thought_signature) {
-            // Echo the thoughtSignature back — required for a thinking-model tool turn.
-            parts.push({ functionCall: { name: tc.function?.name, args }, thoughtSignature: tc.thought_signature });
+          if (turnIsSigned) {
+            // Echo the turn back in the shape Gemini produced it: the signature on
+            // whichever part carried one, siblings structural but unsigned. Attaching
+            // a sibling's signature would be a forgery, and omitting the part loses
+            // the call — both are worse than reproducing what we were given.
+            const part: any = { functionCall: { name: tc.function?.name, args } };
+            if (tc.thought_signature) part.thoughtSignature = tc.thought_signature;
+            parts.push(part);
           } else {
-            // No signature (legacy/compat history) → degrade to text; an unsigned
-            // functionCall part would 400 the whole request.
+            // Nothing in this turn is signed (legacy/compat history) → degrade to
+            // text; a lone unsigned functionCall part would 400 the whole request.
             parts.push({ text: `[Previously called ${tc.function?.name}(${tc.function?.arguments || '{}'})]` });
           }
         }
@@ -216,7 +380,7 @@ export function toGeminiRequest(
     } else if (msg.role === 'tool') {
       const info = toolCallInfo.get(msg.tool_call_id);
       const name = info?.name || msg.name || 'tool';
-      if (info && !info.signed) {
+      if (info && !info.structural) {
         // Its call was degraded to text above, so pair the result as text too
         // (a functionResponse with no matching functionCall part would 400).
         const resultText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
@@ -242,7 +406,12 @@ export function toGeminiRequest(
     maxOutputTokens: params.max_completion_tokens || opts.defaultMaxTokens,
     // Match the 5-min per-request budget of the Vertex/Bedrock adapters instead of
     // inheriting the SDK default (long research turns are exactly where this runs).
-    httpOptions: { timeout: opts.requestTimeoutMs ?? GEMINI_REQUEST_TIMEOUT_MS },
+    httpOptions: {
+      timeout: normalizeProviderRequestTimeoutMs(
+        opts.requestTimeoutMs,
+        GEMINI_REQUEST_TIMEOUT_MS,
+      ),
+    },
   };
   if (systemParts.length > 0) config.systemInstruction = systemParts.join('\n');
   if (params.temperature !== undefined && params.temperature !== null) {
@@ -272,6 +441,32 @@ export function toGeminiRequest(
  * response the agent loop reads (`choices[0].message`, `finish_reason`,
  * `stop_reason`, `usage`). Pure.
  */
+/**
+ * Gemini returns no id on a functionCall, so the adapter mints one. It has to be
+ * unique for the life of the SESSION, not merely within one response.
+ *
+ * `toolDispatch` offloads a large tool response to
+ * `tool-responses/{sessionId}/{toolCall.id}.txt`, so two turns that each open
+ * with the same tool would write the same key and the later page would silently
+ * destroy the earlier one. That is ENG-1206, observed in prod session
+ * d5898ffd: `get_leads` page 2 overwrote page 1 at `call_get_leads_0.txt`, the
+ * follow-up read came back `not_found`, and the agent answered from a set it
+ * could no longer assemble.
+ *
+ * A per-response index alone is what caused the bug. A content hash would be no
+ * better — the exact failure was the SAME tool called with the SAME arguments on
+ * consecutive turns. Hence a random suffix, which also stops a model guessing a
+ * neighbouring key (it invented `call_read_tool_response_1.txt` in that session)
+ * instead of using the key it was handed.
+ *
+ * The name is kept for debuggability and sanitised because the id becomes an S3
+ * object name.
+ */
+function mintToolCallId(name: unknown, indexInResponse: number): string {
+  const safeName = String(name || 'fn').replace(/[^A-Za-z0-9_-]/g, '_');
+  return `call_${safeName}_${indexInResponse}_${randomBytes(4).toString('hex')}`;
+}
+
 export function fromGeminiResponse(resp: any): any {
   const candidate = resp?.candidates?.[0];
   const parts: any[] = candidate?.content?.parts || [];
@@ -285,7 +480,7 @@ export function fromGeminiResponse(resp: any): any {
     if (part.thought === true) continue;
     if (part.functionCall) {
       const toolCall: any = {
-        id: `call_${part.functionCall.name || 'fn'}_${toolCalls.length}`,
+        id: mintToolCallId(part.functionCall.name, toolCalls.length),
         type: 'function',
         function: {
           name: part.functionCall.name,
@@ -381,6 +576,14 @@ export function fromGeminiResponse(resp: any): any {
       completion_tokens: completionTokens,
       total_tokens: usage.totalTokenCount || (promptTokens + completionTokens),
       cache_read_input_tokens: cacheReadTokens,
+      // ENG-1188/ENG-1301: always 0, not a measurement. Unlike Bedrock/Anthropic,
+      // Gemini's generateContent response carries no "cache write" counter — a
+      // cache write there is a separate caches.create() call with its own
+      // billing, and this codebase never calls it (no caching is implemented for
+      // Gemini at all yet; see ENG-1301). Do not read a session's
+      // cacheTokens.creation as evidence caching never engaged — cacheReadTokens
+      // above is the field that would show Google's automatic/implicit caching,
+      // if any, taking effect.
       cache_creation_input_tokens: 0,
     },
   };
@@ -403,14 +606,17 @@ export interface GeminiNativeClientDeps {
  * gemini branch of callLLM.
  */
 export function createGeminiNativeClient(deps: GeminiNativeClientDeps): {
-  chat: { completions: { create: (params: OpenAIChatParams) => Promise<any> } };
+  chat: { completions: { create: (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => Promise<any> } };
 } {
   return {
     chat: {
       completions: {
-        create: async (params: OpenAIChatParams) => {
+        create: async (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => {
           const client = await deps.getClient();
-          const req = toGeminiRequest(params, { defaultMaxTokens: deps.defaultMaxTokens });
+          const req = toGeminiRequest(params, {
+            defaultMaxTokens: deps.defaultMaxTokens,
+            requestTimeoutMs: requestOptions?.timeout,
+          });
           const resp = await client.models.generateContent(req);
           return fromGeminiResponse(resp);
         },

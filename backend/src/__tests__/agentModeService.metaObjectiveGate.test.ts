@@ -284,6 +284,67 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       };
     }
 
+    it('reuses a human-answered bare-kind objective card and persists its correlator consumption record', async () => {
+      const source = answeredQuestion('OUTCOME_LEADS', {
+        questionId: 'model-card-1',
+        kind: 'meta_objective',
+        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for lead conversions.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
+      });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
+
+      const result = await callApi(service, validParams(), 'session-1');
+
+      expect(result.success).toBe(true);
+      expect(metaService.createCampaign).toHaveBeenCalled();
+      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
+      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
+      expect(persisted.options[0].payload).toMatchObject({ objective: 'OUTCOME_LEADS', sourceQuestionId: 'model-card-1' });
+    });
+
+    it.each([
+      ['a label/payload mismatch', answeredQuestion('OUTCOME_TRAFFIC', {
+        kind: 'meta_objective',
+        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_TRAFFIC' } }],
+      })],
+      ['a different-account kind', answeredQuestion('OUTCOME_LEADS', {
+        kind: 'meta_objective:999999999|test|||NONE',
+        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
+      })],
+    ])('re-asks with carry-over context for %s', async (_case, source) => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
+
+      const result = await callApi(service, validParams(), 'session-1');
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
+      expect(persisted.intro).toMatch(/answered an objective question earlier/i);
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('does not reuse a loose objective card for a second differently-named campaign', async () => {
+      const source = answeredQuestion('OUTCOME_LEADS', {
+        questionId: 'model-card-1',
+        kind: 'meta_objective',
+        options: [{ id: 'x', label: 'Leads', consequence: 'Optimize for leads.', recommended: true, why: 'Best fit', payload: { objective: 'OUTCOME_LEADS' } }],
+      });
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: source });
+      await callApi(service, validParams({ name: 'Campaign One' }), 'session-1');
+      const consumed = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
+
+      jest.clearAllMocks();
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        pendingUserQuestion: source,
+        answeredQuestions: { consumed: consumed },
+      });
+      (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue({});
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_2' });
+
+      const second = await callApi(service, validParams({ name: 'Campaign Two' }), 'session-1');
+      expect(second.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
     it('ALLOWS via the LIVE pendingUserQuestion slot and applies the gate-resolved objective VERBATIM', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
@@ -344,7 +405,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }, 'session-1');
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(result.message).toContain('"name"');
       expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
@@ -360,7 +421,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
@@ -369,7 +430,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }); // no sessionId
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
       expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
     });
   });

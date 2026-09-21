@@ -1,6 +1,5 @@
 import request from 'supertest';
 import express from 'express';
-import orgRoutes from '../routes/org';
 
 // Mock user state
 let mockUser: any = {
@@ -13,6 +12,8 @@ let mockUser: any = {
 
 let mockUsers: Record<string, any> = {};
 let mockOrgs: Record<string, any> = {};
+let mockSubscriptionType = 'Starter';
+let mockSubscriptionResolution: { subscriptionType: string; resolved: boolean } | undefined;
 
 // Mock auth middleware
 jest.mock('../middleware/auth', () => ({
@@ -38,23 +39,16 @@ jest.mock('../services/db', () => ({
       }
       return Promise.resolve(mockUsers[userId]);
     }),
-    // Mirrors the real atomic transaction: check-and-set with no await in
-    // between, so it can't be raced within a single test's synchronous mock
-    // body — matching what the real DynamoDB transaction guarantees.
-    joinOrgWithCapacityCheck: jest.fn((userId: string, orgId: string, orgRole: string, maxMembers: number) => {
+    // Mirrors the real conditional write: a user who already belongs to an org
+    // is rejected, checked and set with no await in between so it cannot be
+    // raced within a single test's synchronous mock body.
+    joinOrg: jest.fn((userId: string, orgId: string, orgRole: string) => {
       const user = mockUsers[userId];
       if (!user) return Promise.resolve('already_in_org');
       if (user.orgId) return Promise.resolve('already_in_org');
-      const org = mockOrgs[orgId];
-      // Fail closed: a missing memberCount is never seeded from a live count
-      // here — only the reviewed backfill migration is allowed to initialize
-      // it. A live path just requires it to already exist and be under cap.
-      if (org?.memberCount === undefined) return Promise.resolve('not_migrated');
-      if (org.memberCount >= maxMembers) return Promise.resolve('org_full');
       user.orgId = orgId;
       user.orgRole = orgRole;
       user.pendingOrgInvite = null;
-      org.memberCount += 1;
       return Promise.resolve('joined');
     }),
     clearOrgMembership: jest.fn((userId: string) => {
@@ -63,16 +57,14 @@ jest.mock('../services/db', () => ({
         const orgId = user.orgId;
         delete user.orgId;
         delete user.orgRole;
-        // Fail closed: skip the decrement entirely if memberCount isn't set
-        // yet, rather than seeding it here (non-fatal, matches real behavior).
-        if (orgId && mockOrgs[orgId] && mockOrgs[orgId].memberCount !== undefined) {
-          mockOrgs[orgId].memberCount = Math.max(0, mockOrgs[orgId].memberCount - 1);
-        }
       }
       return Promise.resolve();
     }),
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     createOrg: jest.fn((org: any) => {
       mockOrgs[org.orgId] = org;
       return Promise.resolve(org);
@@ -100,18 +92,59 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-// Mock email service
-jest.mock('../services/emailService', () => ({
-  emailService: {
-    sendEmail: jest.fn().mockResolvedValue(undefined),
-  },
+// Mock email service.
+//
+// ENG-1112: this is the seam that keeps the invite route off the wire. `routes/org.ts`
+// reaches email through `await import("../services/emailService")`, whose real
+// implementation calls `resendService.sendEmail` → the Resend SDK → an HTTPS POST to
+// api.resend.com. Without this mock the invite tests below would send real mail on any
+// host where `dev/AgentWeb/Resend` resolves, and `emailService.sendEmail` swallows send
+// failures by design (ENG-164) — so the suite would stay green either way. The transport
+// guard installed in `beforeEach` is the belt to this mock's braces: it asserts the
+// absence of traffic rather than trusting that the mock registered.
+const mockSendEmail = jest.fn().mockResolvedValue({ id: 'test-email' });
+jest.mock('../services/chatbotService', () => ({ chatbotDb: {} }));
+jest.mock('../services/resendService', () => ({ resendService: { sendEmail: mockSendEmail } }));
+jest.mock('../services/subscriptionService', () => ({
+  getUserSubscriptionType: jest.fn(() => Promise.resolve(mockSubscriptionType)),
+  getUserSubscriptionResolution: jest.fn(() => Promise.resolve(
+    mockSubscriptionResolution ?? { subscriptionType: mockSubscriptionType, resolved: true },
+  )),
 }));
+const orgRoutes = require('../routes/org').default;
+
+// ---------------------------------------------------------------------------
+// Outbound-transport guard (ENG-1112, same shape as seo.orgAnalytics.test.ts)
+//
+// These routes should make zero outbound requests, so the guard throws on *any* host
+// instead of returning a plausible `ok`. Returning ok would let a regression — a new
+// un-mocked send, or this file's emailService mock failing to register — pass quietly,
+// which is precisely how a live Resend POST hid here in the first place.
+// ---------------------------------------------------------------------------
+const attemptedFetches: string[] = [];
+const realFetch = global.fetch;
+
+function installNoNetworkGuard() {
+  attemptedFetches.length = 0;
+  global.fetch = jest.fn((input: any) => {
+    const url = typeof input === 'string' ? input : input?.url;
+    attemptedFetches.push(String(url));
+    throw new Error(
+      `org.test.ts attempted a live network call to ${url}. These routes must not reach ` +
+        `third-party APIs — a request to api.resend.com sends real mail.`
+    );
+  }) as unknown as typeof fetch;
+}
 
 let app: express.Application;
 
 describe('Organization routes', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Re-installed per test: `clearMocks` wipes call history, and a fresh guard keeps
+    // each test's `attemptedFetches` assertions independent of run order.
+    installNoNetworkGuard();
+    mockSendEmail.mockResolvedValue(undefined);
     mockOrgs = {};
     mockUsers = {
       'user-1': {
@@ -130,10 +163,22 @@ describe('Organization routes', () => {
       },
     };
     mockUser = mockUsers['user-1'];
+    mockSubscriptionType = 'Starter';
+    mockSubscriptionResolution = undefined;
 
     app = express();
     app.use(express.json());
     app.use('/api/org', orgRoutes);
+  });
+
+  afterEach(() => {
+    // Every test in this file, not just the invite ones: no route here has any business
+    // touching the network.
+    expect(attemptedFetches).toEqual([]);
+  });
+
+  afterAll(() => {
+    global.fetch = realFetch;
   });
 
   // === FAIL cases ===
@@ -157,6 +202,38 @@ describe('Organization routes', () => {
       expect(res.status).toBe(400);
     });
 
+    it.each(['Free', 'Demo'])('refuses a %s user before it creates an organization', async (subscriptionType) => {
+      mockSubscriptionType = subscriptionType;
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/starter.*required/i);
+      expect(mockOrgs).toEqual({});
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it('returns a retryable error when subscription resolution is unavailable', async () => {
+      mockSubscriptionType = 'Free';
+      mockSubscriptionResolution = { subscriptionType: 'Free', resolved: false };
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(503);
+      expect(res.body.error).toMatch(/subscription.*try again/i);
+      expect(mockOrgs).toEqual({});
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it.each(['Starter', 'Basic', 'Pro', 'Complete', 'Partner', 'Super Premium', 'Managed'])('allows a %s user to create an organization', async (subscriptionType) => {
+      mockSubscriptionType = subscriptionType;
+
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
+    });
+
     // === SUCCESS case ===
     it('should create an org and set user as owner', async () => {
       const res = await request(app).post('/api/org').send({ name: 'My Org' });
@@ -164,9 +241,7 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.data.name).toBe('My Org');
       expect(res.body.data.ownerUserId).toBe('user-1');
-      expect(res.body.data.maxMembers).toBe(5);
       // Owner is the first member — seeded directly, no transaction needed.
-      expect(res.body.data.memberCount).toBe(1);
 
       // User should be updated with orgId and owner role
       expect(mockUsers['user-1'].orgId).toBe(res.body.data.orgId);
@@ -211,7 +286,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -233,7 +307,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -265,7 +338,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -304,6 +376,7 @@ describe('Organization routes', () => {
           meta_targeting_brief: 'VP Sales and RevOps leaders at B2B SaaS companies',
         },
       ];
+      mockUsers['user-1'].icpCompletedAt = '2026-06-20T00:00:00.000Z';
 
       const res = await request(app).post('/api/org/org-1/copy-profile').send({});
 
@@ -317,6 +390,48 @@ describe('Organization routes', () => {
           buyerPersonas: ['VP Sales and RevOps leaders at B2B SaaS companies'],
         },
       ]);
+      // ENG-1955 follow-up (Greptile P1): this is a system copy of the
+      // owner's own icpResult generation, not a fresh manual edit — must be
+      // backdated to icpCompletedAt, not stamped with copy-time `now()`, or
+      // the org's very first "Use my ICP" click after copy-profile would
+      // wrongly look like a genuine correction and skip the icpResult cache
+      // for every member forever.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-20T00:00:00.000Z');
+    });
+
+    it('falls back to copy-time now() for icpUpdatedAt when the owner has no icpCompletedAt (defensive — should not normally happen)', async () => {
+      mockUsers['user-1'].icpResult = [
+        { name: 'A', pain: 'p', desire: 'd', objection: 'o', meta_targeting_brief: 'm' },
+      ];
+      delete mockUsers['user-1'].icpCompletedAt;
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(typeof mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('string');
+    });
+
+    it('preserves the existing icpUpdatedAt when icp is already populated (this copy only fills competitors)', async () => {
+      mockUsers['user-1'].marketStrategy = {
+        businessOverview: 'Existing overview.',
+        competitors: [],
+        icp: [{ title: 'Existing ICP', description: '', valueProposition: '', buyerPersonas: [] }],
+        createdAt: '2026-06-20T00:00:00.000Z',
+        updatedAt: '2026-06-20T00:00:00.000Z',
+        icpUpdatedAt: '2026-06-19T00:00:00.000Z',
+      };
+      mockUsers['user-1'].competitorResult = {
+        per_icp: [
+          { icp_id: 'icp-1', competitor_names: ['Some Competitor'], offer_angles: ['Angle'], meta_targeting_brief: 'brief' },
+        ],
+      };
+
+      const res = await request(app).post('/api/org/org-1/copy-profile').send({});
+
+      expect(res.status).toBe(200);
+      expect(mockOrgs['org-1'].marketStrategy.competitors.length).toBeGreaterThan(0);
+      // icp content untouched by this copy — icpUpdatedAt must not move either.
+      expect(mockOrgs['org-1'].marketStrategy.icpUpdatedAt).toBe('2026-06-19T00:00:00.000Z');
     });
 
     it('copies competitors from onboarding results when marketStrategy is missing', async () => {
@@ -383,7 +498,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
         pendingInvites: [],
       };
       mockUsers['user-1'].orgId = 'org-1';
@@ -421,6 +535,87 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.message).toMatch(/invitation sent/i);
     });
+
+    // ENG-1112: "send an invite" above asserts only the HTTP envelope. The route's whole
+    // point — that an invite email is actually composed, addressed to the invitee, and
+    // carries a working accept link — was never asserted, so the handler could have sent
+    // nothing, sent to the wrong address, or omitted the token and this suite would still
+    // have passed. Assert the intent against the mocked transport instead.
+    it('composes the invite email: recipient, subject, and an accept link carrying the stored token', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'Member@Example.com' });
+      expect(res.status).toBe(200);
+
+      expect(mockSendEmail).toHaveBeenCalledTimes(1);
+      const [{ to, subject, text, html }] = mockSendEmail.mock.calls[0];
+
+      // Addressed to the invitee, normalised to lower case — the same value stored on
+      // the org's pendingInvites, so accept-invite can match it.
+      expect(to).toBe('member@example.com');
+      const storedInvite = mockOrgs['org-1'].pendingInvites.at(-1);
+      expect(storedInvite.email).toBe('member@example.com');
+
+      expect(subject).toBe("You're invited to join Test Org on AgentWeb");
+
+      // The link must carry the *stored* token and org, or the invitee cannot accept.
+      const expectedLink =
+        `http://localhost:5174/org/accept-invite` +
+        `?token=${storedInvite.inviteToken}&orgId=org-1`;
+      expect(text).toContain(expectedLink);
+      expect(html).toContain(`href="${expectedLink}"`);
+
+      // Inviter is named from the acting user, and the org name is rendered in the body.
+      expect(text).toContain('Test Owner');
+      expect(html).toContain('Test Org');
+
+      // A 64-hex-char token: the route mints 32 random bytes. A truncated or predictable
+      // token would be an authorization defect, not a cosmetic one.
+      expect(storedInvite.inviteToken).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('stamps pendingOrgInvite on an existing account so login routes them to accept-invite', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+      expect(res.status).toBe(200);
+
+      const storedInvite = mockOrgs['org-1'].pendingInvites.at(-1);
+      expect(mockUsers['user-2'].pendingOrgInvite).toEqual({
+        orgId: 'org-1',
+        inviteToken: storedInvite.inviteToken,
+      });
+    });
+
+    it('still creates the invite when the email transport fails — and reports success', async () => {
+      // The handler swallows send failures on purpose ("Don't fail the invite if email
+      // fails"). Pinned here because it is exactly why a live-send regression was
+      // invisible: a rejected POST to api.resend.com produced a 200 and a green suite.
+      mockSendEmail.mockRejectedValueOnce(new Error('transport down'));
+
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
+    });
+
+    // Replaces the removed maxMembers/memberCount capacity tests. Org size is no
+    // longer capped: tiers are usage-based, not seat-based, so there is nothing
+    // for a seat limit to enforce. Orgs that predate this still carry a stored
+    // maxMembers attribute; nothing reads it, so it is inert.
+    it('does not cap org size — an invite succeeds well past the old limit of 5', async () => {
+      for (let i = 0; i < 12; i++) {
+        mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
+      }
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'thirteenth@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('ignores a stale maxMembers attribute left on an org created before the cap was removed', async () => {
+      (mockOrgs['org-1'] as any).maxMembers = 5;
+      (mockOrgs['org-1'] as any).memberCount = 5;
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'sixth@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
   });
 
   describe('POST /api/org/accept-invite - accept invite', () => {
@@ -429,8 +624,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 1,
         pendingInvites: [{
           email: 'member@example.com',
           inviteToken: 'valid-token',
@@ -487,32 +680,6 @@ describe('Organization routes', () => {
       expect(mockUsers['user-2'].orgRole).toBe('member');
     });
 
-    it('fails loudly (no silent drop) when the org is already at maxMembers — atomic capacity check', async () => {
-      mockOrgs['org-1'].maxMembers = 1;
-      mockOrgs['org-1'].memberCount = 1;
-      const res = await request(app).post('/api/org/accept-invite').send({
-        orgId: 'org-1',
-        inviteToken: 'valid-token',
-      });
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/full/i);
-      // The invite must not be silently consumed on failure.
-      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
-    });
-
-    it('fails closed (not silently seeded) when memberCount has not been backfilled yet', async () => {
-      delete mockOrgs['org-1'].memberCount;
-      const res = await request(app).post('/api/org/accept-invite').send({
-        orgId: 'org-1',
-        inviteToken: 'valid-token',
-      });
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/not yet ready/i);
-      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
-    });
-
     it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
       const res = await request(app).post('/api/org/accept-invite').send({
         orgId: 'org-1',
@@ -536,8 +703,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -556,12 +721,11 @@ describe('Organization routes', () => {
       expect(res.status).toBe(400);
     });
 
-    it('should succeed and remove member, decrementing memberCount', async () => {
+    it('should succeed and remove the member', async () => {
       const res = await request(app).delete('/api/org/org-1/members/user-2');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBeUndefined();
-      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 
@@ -571,8 +735,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -580,19 +742,31 @@ describe('Organization routes', () => {
       mockUsers['user-2'].orgRole = 'member';
     });
 
-    it('should fail if owner tries to leave', async () => {
+    // Behavior change (ENG-954): what blocks the owner is being the LAST owner,
+    // not being the owner. The old 400 fired unconditionally and told them to
+    // "transfer ownership" via a route that was never built, which made the
+    // primary owner permanently unable to leave their own org. Now it is a 409
+    // naming the actual remedy, and it lifts as soon as a second owner exists.
+    it('should fail if the only owner tries to leave, naming the remedy', async () => {
       const res = await request(app).post('/api/org/org-1/leave');
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/owner cannot leave/i);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/only owner/i);
+      expect(res.body.error).toMatch(/promote another member/i);
     });
 
-    it('should succeed for a member, decrementing memberCount', async () => {
+    it('should succeed for an owner once a second owner exists', async () => {
+      mockUsers['user-2'].orgRole = 'owner';
+      const res = await request(app).post('/api/org/org-1/leave');
+      expect(res.status).toBe(200);
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it('should succeed for a member', async () => {
       mockUser = mockUsers['user-2'];
       const res = await request(app).post('/api/org/org-1/leave');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBeUndefined();
-      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 
@@ -602,7 +776,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';

@@ -10,10 +10,9 @@ import hashlib
 from urllib.parse import quote
 import aiohttp
 from browser_use.agent.views import ActionResult
-from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
-from pydantic import SecretStr
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from aws_utils import get_dynamodb_resource, get_s3_client
+import secrets_manager
+from openrouter_gateway import get_openrouter_llm
 import html
 import time
 import uuid
@@ -34,9 +33,6 @@ logger = logging.getLogger(__name__)
 
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
-
-# Global variable for vision support
-global_use_vision = True
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -97,18 +93,19 @@ def create_jwt_token(user_id: str) -> str:
     """
     try:
         import jwt
-        from datetime import datetime, timedelta
-        
-        jwt_secret = os.getenv('JWT_SECRET')
+        from datetime import datetime, timedelta, timezone
+
+        jwt_secret = secrets_manager.get_jwt_secret()
         if not jwt_secret:
             logger.error("JWT_SECRET environment variable not set")
             return None
-            
+
         # Create payload with user_id and expiration
+        now = datetime.now(timezone.utc)
         payload = {
             'userId': user_id,
-            'exp': datetime.utcnow() + timedelta(hours=1),  # Token expires in 1 hour
-            'iat': datetime.utcnow()
+            'exp': now + timedelta(hours=1),  # Token expires in 1 hour
+            'iat': now
         }
         
         # Create JWT token
@@ -139,10 +136,7 @@ def generate_content_hash(content: Any) -> str:
 
 def get_downloads_path(user_id: Optional[str] = None, execution_id: Optional[str] = None) -> str:
     """Get the downloads path for storing task outputs
-    
-    This is a shared utility function used by both web_agent.py and deep_research_agent.py
-    to ensure consistent file storage location.
-    
+
     Args:
         user_id: Optional user ID to create user-specific directory
         execution_id: Optional execution ID to create execution-specific directory
@@ -238,314 +232,9 @@ def get_agent_code_base_path(user_id: str, task_id: Optional[str] = None) -> str
     
     return base_path
 
-def get_aws_bedrock_llm(model_name: str):
-    """Initialize AWS Bedrock language model"""
-    try:
-        # Get Bedrock client with no retries
-        bedrock = get_bedrock_client()
-
-        return ChatBedrock(
-            client=bedrock,
-            model_id=model_name,
-            model_kwargs={"temperature": 0.0}
-        )
-    except Exception as e:
-        if "AccessDeniedException" in str(e):
-            logger.error("Error: The AWS user lacks permission to invoke Claude model in Bedrock.")
-            logger.error("Please ensure the user has the necessary permissions and the model exists.")
-            sys.exit(1)
-        raise
-
-def get_azure_openai_llm(model_name: str):
-    """Initialize Azure OpenAI language model"""
-    try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
-            azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Azure OpenAI: {e}")
-        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
-        sys.exit(1)
-
-def get_azure_openai_llm2(model_name: str):
-    """Initialize Azure OpenAI language model"""
-    try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT2'),
-            azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY2'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION2', '2024-12-01-preview'),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Azure OpenAI: {e}")
-        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
-        sys.exit(1)
-
-def get_azure_openai_llm3(model_name: str):
-    """Initialize Azure OpenAI language model"""
-    try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
-        
-        return AzureChatOpenAI(
-            model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT3'),
-            azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY3'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION3', '2025-01-01-preview'),
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Azure OpenAI: {e}")
-        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
-        sys.exit(1)
-
-def get_azure_openai_llm_o1(model_name: str):
-    """Initialize Azure OpenAI language model"""
-    try:
-        deployment_name = model_name # use model name as deployment name in Azure portal
-        
-        # O1 series model does not support temperature
-        return AzureChatOpenAI(
-            model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
-            azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12')
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Azure OpenAI: {e}")
-        logger.error("Please ensure all Azure OpenAI environment variables are set correctly.")
-        sys.exit(1)
-
-def get_deepseek_llm(model_name: str):
-    """Initialize DeepSeek language model"""
-    global global_use_vision
-    try:
-        global_use_vision = False
-        api_key = os.getenv('DEEPSEEK_API_KEY')
-        if not api_key:
-            raise ValueError('DEEPSEEK_API_KEY is not set')
-            
-        return ChatOpenAI(
-            base_url='https://api.deepseek.com',
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing DeepSeek: {e}")
-        logger.error("Please ensure DEEPSEEK_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_pld_deepseek_llm(model_name: str):
-    """Initialize DeepSeek language model hosted on Pale Blue Dot"""
-    global global_use_vision
-    try:
-        global_use_vision = False
-        api_key = os.getenv('PLD_DEEPSEEK_API_KEY')
-        if not api_key:
-            raise ValueError('PLD_DEEPSEEK_API_KEY is not set')
-            
-        return ChatOpenAI(
-            base_url='https://www.palebluedot.ai/api',
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing DeepSeek: {e}")
-        logger.error("Please ensure PLD_DEEPSEEK_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_openai_llm(model_name: str):
-    if model_name == "gpt-5":
-        # Use Gemini 2.5 Flash as a proxy for gpt-5
-        return get_gemini_llm("gemini-2.5-flash")
-    
-    """Initialize OpenAI language model"""
-    try:
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise ValueError('OPENAI_API_KEY is not set')
-            
-        return ChatOpenAI(
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-    except Exception as e:
-        logger.error(f"Error initializing OpenAI: {e}")
-        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_openai_llm_think(model_name: str):
-    """Initialize OpenAI language model"""
-    global global_use_vision
-    try:
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise ValueError('OPENAI_API_KEY is not set')
-            
-        # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
-        global_use_vision = False
-        logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
-        return ChatOpenAI(
-            model=model_name,
-            api_key=SecretStr(api_key),
-            disabled_params={"parallel_tool_calls": None}
-        )
-    except Exception as e:
-        logger.error(f"Error initializing OpenAI: {e}")
-        logger.error("Please ensure OPENAI_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
-def get_gemini_llm(model_name: str, code_execution: bool = False):
-    """Initialize Google Gemini language model"""
-    try:
-        api_key = os.getenv('GEMINI_API_KEY')
-        if not api_key:
-            raise ValueError('GEMINI_API_KEY is not set')
-            
-        # Import here to avoid requiring the package for all users
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        
-        llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            api_key=SecretStr(api_key),
-            temperature=0.0
-        )
-
-        # Enable code execution for Gemini models only if requested
-        if code_execution:
-            return llm.bind(code_execution=True)
-        else:
-            return llm
-
-    except ImportError:
-        logger.error("langchain_google_genai package is not installed. Install it with: pip install langchain-google-genai")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Error initializing Gemini: {e}")
-        logger.error("Please ensure GEMINI_API_KEY environment variable is set correctly.")
-        sys.exit(1)
-
 def get_llm(full_llm_name: str) -> Tuple[Any, str]:
-    """Get the appropriate language model based on provided configuration
-    
-    Args:
-        full_llm_name: Full LLM name in format platform->provider->model
-        
-    Returns:
-        Tuple containing the initialized LLM and the full LLM name
-    """
-    # Define valid platform-provider-model combinations with their initialization functions
-    # Each provider can have a default function that will be used for any model not explicitly listed
-    VALID_CONFIGURATIONS = {
-        "aws": {
-            "anthropic": {
-                "__default__": get_aws_bedrock_llm,  # Default function for any AWS Anthropic model
-                "anthropic.claude-3-5-sonnet-20241022-v2:0": get_aws_bedrock_llm,
-                "us.anthropic.claude-3-7-sonnet-20250219-v1:0": get_aws_bedrock_llm
-            }
-        },
-        "azure": {
-            "openai": {
-                "__default__": get_azure_openai_llm,  # Default function for any Azure OpenAI model
-                "gpt-4o": get_azure_openai_llm,
-                "o1-mini": get_azure_openai_llm_o1,
-                "gpt-4.1": get_azure_openai_llm2,
-                "gpt-5-chat": get_azure_openai_llm3,
-            }
-        },
-        "deepseek": {
-            "deepseek": {
-                "__default__": get_deepseek_llm,  # Default function for any DeepSeek model
-                "deepseek-reasoner": get_deepseek_llm
-            }
-        },
-        "pld": {
-            "deepseek": {
-                "__default__": get_pld_deepseek_llm,  # Default function for any PLD DeepSeek model
-                "DeepSeek-R1": get_pld_deepseek_llm
-            }
-        },
-        "openai": {
-            "openai": {
-                "__default__": get_openai_llm,  # Default function for any OpenAI model
-                "gpt-4o": get_openai_llm,
-                "gpt-4o-mini": get_openai_llm,
-                "o3-mini": get_openai_llm_think,
-                "gpt-5": get_openai_llm,
-            }
-        },
-        "google": {
-            "google": {
-                "__default__": get_gemini_llm,  # Default function for any Google Gemini model
-                "gemini-2.0-flash": get_gemini_llm,
-                "gemini-2.5-pro-preview-03-25": get_gemini_llm,
-                "gemini-2.5-pro-preview-05-06": get_gemini_llm,
-                "gemini-2.5-pro": get_gemini_llm,
-                "gemini-2.0-flash-exp": get_gemini_llm,
-                "gemini-2.5-flash": get_gemini_llm
-            }
-        }
-    }
-
-    try:
-        # Split the full LLM name but only convert platform and provider to lowercase
-        parts = full_llm_name.split('->')
-        if len(parts) != 3:
-            raise ValueError(f"Invalid format: {full_llm_name}")
-            
-        platform = parts[0].lower()
-        provider = parts[1].lower()
-        model_name = parts[2]  # Keep original case for model name
-    except ValueError:
-        logger.error(f"Invalid FULL_LLM_NAME format: {full_llm_name}")
-        logger.error("Format should be <platform>-><provider>-><model>")
-        sys.exit(1)
-    
-    logger.info(f"Initializing LLM - Platform: {platform}, Provider: {provider}, Model: {model_name}")
-
-    # Get the provider mapping for the platform
-    platform_config = VALID_CONFIGURATIONS.get(platform)
-    if not platform_config:
-        logger.error(f"Unsupported platform: {platform}")
-        logger.error(f"Valid platforms are: {list(VALID_CONFIGURATIONS.keys())}")
-        sys.exit(1)
-
-    # Get the model mapping for the provider
-    provider_config = platform_config.get(provider)
-    if not provider_config:
-        logger.error(f"Invalid provider '{provider}' for platform '{platform}'")
-        logger.error(f"Valid providers for {platform} are: {list(platform_config.keys())}")
-        sys.exit(1)
-
-    # Get the initialization function for the model
-    init_func = provider_config.get(model_name)
-    if not init_func:
-        # Try to use the default function for this provider
-        default_func = provider_config.get("__default__")
-        if default_func:
-            logger.info(f"Model '{model_name}' not explicitly configured for provider '{provider}' on platform '{platform}', using default function")
-            init_func = default_func
-        else:
-            logger.error(f"Invalid model '{model_name}' for provider '{provider}' on platform '{platform}' and no default function available")
-            logger.error(f"Valid models are: {[k for k in provider_config.keys() if k != '__default__']}")
-            sys.exit(1)
-
-    # Initialize the LLM using the mapped function
-    return init_func(model_name), full_llm_name
+    """Initialize an OpenRouter-backed model while retaining its persisted label."""
+    return get_openrouter_llm(full_llm_name), full_llm_name
 
 def upload_task_result_files(downloads_path: str, execution_id: str) -> List[Dict[str, str]]:
     """Upload task result files from downloads directory to S3
@@ -1171,8 +860,7 @@ def check_new_information(previous_result, current_result):
             logger.info("Missing previous or current result for comparison")
             return False, None
             
-        # Use the current Azure GPT-5 deployment for comparison
-        llm = get_azure_openai_llm3('gpt-5-chat')
+        llm = get_openrouter_llm('azure->openai->gpt-5-chat')
         
         # Prepare the prompt for the LLM
         prompt = f"""
@@ -1437,7 +1125,7 @@ async def call_github_api(
     repo = "agentweb-agentcode"
     
     # Get GitHub API key
-    github_api_key = os.getenv('GITHUB_API_KEY')
+    github_api_key = secrets_manager.get_github_api_key()
     if not github_api_key:
         return 401, {}, "GitHub API key not found in environment"
     
@@ -1722,7 +1410,7 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
                 iterations=100000,
             )
             # Convert JWT_SECRET to bytes for key derivation
-            secret_bytes = os.getenv('JWT_SECRET').encode('utf-8')
+            secret_bytes = secrets_manager.get_jwt_secret().encode('utf-8')
             key = kdf.derive(secret_bytes)
             
             # Create AESGCM instance with derived key
@@ -1733,11 +1421,11 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
             signed_password = decrypted.decode('utf-8')
             
             # Decode the signed password
-            decoded = jwt.decode(signed_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(signed_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
         except Exception as e:
             # If decryption fails, try as old signed format
             logger.info("Decryption failed, trying old signed format")
-            decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(encrypted_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
 
         # For shared passwords, verify against the original sharer's userId
         expected_user_id = shared_by if shared_by else user_id
@@ -2048,4 +1736,4 @@ __all__ = [
     'get_all_configs',
     'parse_json',
     'is_page_broken'
-] 
+]

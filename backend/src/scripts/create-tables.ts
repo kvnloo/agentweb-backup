@@ -239,6 +239,84 @@ const createTaskExecutionsTable = async () => {
   }
 };
 
+// Create Async Job Queue table — generic crash-safety net for any webhook receiver's
+// fire-and-forget processing (ENG-524). One table for every integration, discriminated
+// by `source`, rather than a table per integration: a new source just registers a
+// processor function, no schema change. See backend/src/services/asyncJobQueue.ts.
+const createAsyncJobQueueTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AsyncJobQueue`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StatusCreatedAtIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Calendly Orphaned Webhooks table — last-resort durable record of a
+// Calendly webhook_id that couldn't be either deleted remotely OR durably
+// enqueued for cleanup retry (both AW-AsyncJobQueue writes exhausted). Greptile
+// P1 on #2291 (round 15/16): the async job queue is itself the thing failing to
+// accept writes in exactly this scenario, so a fallback that ALSO writes to that
+// same table has no value — this is a genuinely separate table so the fallback
+// actually has a chance of succeeding when the queue table specifically (not
+// DynamoDB broadly) is the problem. Keyed by `<userId>_<calendlyUserUri>` so a
+// later /connect for that exact identity can look itself up directly (no listing,
+// preserving the same tenant-safety guarantee as the local-account-record check —
+// see calendlyAuth.ts's provisionCalendlyWebhook). See
+// services/calendlyWebhookCleanupQueue.ts.
+const createCalendlyOrphanedWebhooksTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CalendlyOrphanedWebhooks`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Waitlist table
 const createWaitlistTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1787,6 +1865,157 @@ const createUsageRecordsTable = async () => {
   }
 };
 
+// Append-only, per-charge LLM audit evidence. eventId is the uniqueness/dedup
+// key (caller-controlled, not reliably date-prefixed); the GSI below on
+// occurredAt is what makes a billing subject's charges queryable by month.
+const createLlmChargeEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LlmChargeEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'billingUserId', KeyType: 'HASH' }, { AttributeName: 'eventId', KeyType: 'RANGE' }],
+    // eventId is caller-controlled and not reliably date-prefixed (provider
+    // response IDs, engine task-derived keys) -- monthly queries go through
+    // occurredAt, which is always a real timestamp. See llmChargeAuditDb.ts.
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
+// ENG-1250 §1: the cross-vendor immutable spend ledger. Approved by Harsha on
+// 2026-09-03 with every parameter named — key shape, GSI, retention, fields.
+//
+// NO TTL, deliberately. AW-LlmChargeEvents above expires rows at 365 days; this
+// one is the evidence behind "a pause is explainable to the cent" (AC3), so
+// there is no `ttl` attribute and nothing to enable in the console. Its absence
+// is the decision, not the usual missed manual step.
+const createSpendEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SpendEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ],
+    // eventId is the caller-supplied idempotency token and does not sort by
+    // time, so month/range queries go through this index -- the same defect
+    // ENG-1251 had to retrofit onto AW-LlmChargeEvents after monthly queries
+    // were found silently missing events.
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    // Immutable no-TTL money ledger: guard against an accidental delete
+    // (matches ensureCriticalTables.ts).
+    DeletionProtectionEnabled: true,
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
+const createSpendProjectionTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SpendProjection`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'billingMonth', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'billingMonth', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    DeletionProtectionEnabled: true, // ENG-1250 §3b — admission projection, guard it
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
+// ENG-1217 AC9: append-only audit for customer-confirmed model switches, so a
+// change can be explained and undone. Sort key is `{changedAt}#{changeId}` —
+// timestamp FIRST, so a date-range query works on the base table and this needs
+// no GSI. That is the deliberate difference from AW-LlmChargeEvents above, whose
+// caller-controlled `eventId` did not sort by time and had to have an index
+// added after monthly queries were found silently missing events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds — 365d). Enable DynamoDB native
+// TTL on the `ttl` attribute manually, same as UsageRecords/LoopEvents.
+// Append-only audit of customer-confirmed model changes (ENG-1217 AC9).
+// Sort key is `${changedAt}#${changeId}` so the base table is range-queryable by
+// day without a GSI -- llmChargeAuditDb keyed on a caller-controlled id and had
+// to add one after date-range queries silently missed events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds, 365d). Enable DynamoDB native TTL
+// on the `ttl` attribute MANUALLY -- CreateTable does not configure it, and
+// nothing at runtime will report that it is missing. Same manual step as the
+// UsageRecords/LoopEvents/AgentRuns tables.
+export const createModelChangeAuditTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+
+  // `recordModelChange` writes a 365-day `ttl`, but CreateTable does not enable
+  // expiry -- so without this the attribute is decorative and audit rows are kept
+  // forever. Attempted here rather than left to a runbook line because nothing at
+  // runtime reports it missing: the failure mode is silent, indefinite retention
+  // of customer billing decisions.
+  //
+  // Run unconditionally, including on the already-exists path, since a table
+  // created before this shipped has TTL off.
+  //
+  // Never fatal. `dynamodb:UpdateTimeToLive` is not always granted to the role
+  // running setup, and refusing to finish table creation over a retention setting
+  // would be the wrong trade -- so it says plainly what is left to do instead.
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (error.code === 'ValidationException' && /already enabled/i.test(error.message || '')) return;
+    console.warn(
+      `[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. ` +
+      `Audit rows are retained indefinitely until someone runs: aws dynamodb update-time-to-live ` +
+      `--table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`,
+    );
+  }
+};
+
 // Create Agent Runs table (run-survival core — durable run records +
 // idempotency submit-locks; see services/agentMode/runStore.ts). Single pk
 // hash key with two item kinds: run#<runId>, idem#<key>.
@@ -1932,6 +2161,55 @@ const createSocialEngagementTrackingTable = async () => {
       }
     ],
     BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-916: per-campaign, per-day ad metrics + CRM lead-count snapshots.
+// New, empty, additive-only table — doesn't touch or migrate any existing data.
+//
+// NOT Meta-specific. One store serves Meta, Google Ads and LinkedIn Ads: the HASH key is
+// `${platform}#${accountId}#${campaignId}` because a single user holds several accounts on the
+// same platform (mvarma has two Meta ad accounts, in INR and USD), so platform+campaign alone
+// would collide. Ingestion stays per-platform — the three disagree on units, pagination and how
+// long a figure keeps moving (Meta settles at 28 days, Google attributes for up to 90) — but the
+// storage and everything reading it are shared.
+//
+// entityKey+date is the full key; the daily cron overwrites the settling window each run, which
+// is a deliberate idempotent overwrite, not a duplicate-prevention concern.
+const createAdsMetricsSnapshotsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsMetricsSnapshots`,
+    AttributeDefinitions: [
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      { AttributeName: 'date', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'date', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-date-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'date', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
   };
 
   try {
@@ -2291,6 +2569,8 @@ const main = async () => {
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
+    await createAsyncJobQueueTable();
+    await createCalendlyOrphanedWebhooksTable();
     await createWaitlistTable();
     await createSubscribersTable();
     await createTaskSchedulesTable();
@@ -2322,10 +2602,15 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createMcpSessionsTable();
     await createUsageRecordsTable();
+    await createLlmChargeEventsTable();
+    await createSpendEventsTable();
+    await createSpendProjectionTable();
+    await createModelChangeAuditTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();
     await createSocialEngagementTrackingTable();
+    await createAdsMetricsSnapshotsTable();
     await createBrowserCookiesTable();
     await createOrganizationsTable();
     await createScheduleTemplatesTable();
@@ -2352,6 +2637,16 @@ const main = async () => {
     await createCodingAgentRunsTable();
     await createV0UsageTable();
     await createAgentRunsTable();
+    await createMetaCapiKeyCoverageTable();
+    await createAdsThresholdsTable();
+    await createAdsOutcomeLedgerTable();
+    await createContactEventsTable();
+    await createCustomDomainsTable();
+    await createLeadMagnetConfigsTable();
+    await createOnboardingLoopRunsTable();
+    await createPromptSignalsTable();
+    await createEvaluationsTable();
+    await createAccountCapabilityRequirementsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -2984,7 +3279,346 @@ const createV0UsageTable = async () => {
   }
 };
 
+// Create Account Capability Requirements table (ENG-1541 remainder — persisted per-account
+// capability tracking so the renewal-integration-health cron remembers state across runs
+// instead of re-deriving everything from scratch, and so a human correction can suppress a
+// specific occurrence without silencing the mechanism permanently). Only ever created for
+// users whose paid-ads intent is or was true; a user who has never needed the capability
+// never gets a row. No GSI — nothing queries across users by capability today.
+const createAccountCapabilityRequirementsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AccountCapabilityRequirements`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'capability', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'capability', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Run if this script is called directly
 if (require.main === module) {
   main();
 }
+
+// Create Meta CAPI key-coverage table (ENG-926 §F — send-side identity-key coverage)
+//
+// One item per pixel, per UTC day, per event name. Counters are incremented with `ADD`, so
+// no item ever needs initialising and a newly-added identity key needs no migration — an
+// absent attribute correctly reads as zero for the period we were not sending it.
+//
+// No GSI, deliberately: every read is "one pixel over a date range", which the primary key
+// already serves. A per-customer view resolves that customer's pixels first, which keeps
+// `userId` off the CAPI send path entirely.
+const createMetaCapiKeyCoverageTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MetaCapiKeyCoverage`,
+    AttributeDefinitions: [
+      { AttributeName: 'pixelId', AttributeType: 'S' },
+      // `<YYYY-MM-DD>#<eventName>` — date leads so a windowed Query is a plain range over
+      // the sort key rather than a filter across the whole partition.
+      { AttributeName: 'sk', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'pixelId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-918 — per-client detection thresholds with provenance, audit history and revert.
+//
+// Keyed on the AD ACCOUNT, not the user: one ad account can sit on several user records, so
+// per-user thresholds would resolve differently depending on which record happened to be read.
+// The composite `<platform>#<accountId>` matches `AW-AdsMetricsSnapshots`' `entityKey` convention
+// rather than inventing a second shape, and keeps a Meta ad-account id from colliding with a
+// numerically identical Google customer id.
+//
+// No GSI, deliberately: every read is "all parameters for one ad account" or "one parameter for
+// one ad account", both of which the primary key already serves. A few dozen items per account.
+const createAdsThresholdsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsThresholds`,
+    AttributeDefinitions: [
+      // `<platform>#<accountId>` — e.g. `meta#1842363582956923`.
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      // e.g. `creativeFatigue.frequencyCritical`.
+      { AttributeName: 'paramKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'paramKey', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1550 — outcome ledger: what the agent predicted a recommendation would do, and later
+// whether it was right. Keyed on the AD ACCOUNT (`<platform>#<accountId>`), same reasoning as
+// AW-AdsThresholds. GSI on status+evaluationDate lets a future scoring cron find "pending, past
+// due" rows without a table scan; no cron reads it yet, but it costs nothing to add up front.
+const createAdsOutcomeLedgerTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AdsOutcomeLedger`,
+    AttributeDefinitions: [
+      { AttributeName: 'entityKey', AttributeType: 'S' },
+      { AttributeName: 'recommendationId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'evaluationDate', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'entityKey', KeyType: 'HASH' },
+      { AttributeName: 'recommendationId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StatusEvaluationDateIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'evaluationDate', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/contactEventsDb.ts: contact timeline and webhook replay lookup.
+const createContactEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ContactEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'contactId', AttributeType: 'S' },
+      { AttributeName: 'eventTimestamp', AttributeType: 'S' },
+      { AttributeName: 'sourceRecordId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'contactId', KeyType: 'HASH' },
+      { AttributeName: 'eventTimestamp', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'sourceRecordId-index',
+        KeySchema: [
+          { AttributeName: 'sourceRecordId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/customDomainService.ts: get/delete by id; list by userId.
+const createCustomDomainsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CustomDomains`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/leadMagnetConfigDb.ts: CRUD by configId; slug/enabled reads are scans.
+const createLeadMagnetConfigsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LeadMagnetConfigs`,
+    AttributeDefinitions: [
+      { AttributeName: 'configId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'configId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — cron/onboardingLoop.ts: one log item per generated runId.
+const createOnboardingLoopRunsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-OnboardingLoopRuns`,
+    AttributeDefinitions: [
+      { AttributeName: 'runId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'runId', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-1758 AC3 — services/promptSignalsService.ts: signals by UUID; recent signals by prompt version.
+const createPromptSignalsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-PromptSignals`,
+    AttributeDefinitions: [
+      { AttributeName: 'signalId', AttributeType: 'S' },
+      { AttributeName: 'promptVersion', AttributeType: 'S' },
+      { AttributeName: 'ts', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'signalId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'PromptVersionIndex',
+        KeySchema: [
+          { AttributeName: 'promptVersion', KeyType: 'HASH' },
+          { AttributeName: 'ts', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Evaluations table (sandbox policy/audit rows + dataset overlay, ENG-1870/ENG-1908).
+// Registered here for inventory/dev-environment completeness only — the production table
+// already exists and this call is a no-op against it (ResourceInUseException, caught below);
+// no schema, data, or IAM change. Single flat PK, no SK/GSI: `evaluationStore.ts` keys every
+// row `evaluation/<userId>` (policy) or `evaluation/<userId>/audit/<uuid>` (audit trail) and
+// finds the audit rows for one user with a table-wide Scan+FilterExpression, which is fine at
+// this table's low cardinality (one sandbox account at a time).
+const createEvaluationsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Evaluations`,
+    AttributeDefinitions: [
+      { AttributeName: 'evaluationKey', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'evaluationKey', KeyType: 'HASH' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};

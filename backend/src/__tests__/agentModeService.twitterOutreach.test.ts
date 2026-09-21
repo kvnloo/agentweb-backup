@@ -238,7 +238,7 @@ describe('AgentModeService.twitterManagePost', () => {
   // ── Happy paths ──
   it('reply calls postTweet with inReplyToTweetId option', async () => {
     const res = await service.twitterManagePost('u', { action: 'reply', text: 'yo', in_reply_to_tweet_id: '555' });
-    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' });
+    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' }, undefined);
     expect(res.success).toBe(true);
   });
 
@@ -259,6 +259,11 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.error).toContain('Forbidden');
     expect(res.error).toContain('appropriate oauth1 app permissions');
     expect(res.error).not.toBe('Request failed with code 403');
+    // ENG-1300: twitterManagePost's catch has the same describeXApiError
+    // flattening twitterOutreach's did — this asserts the numeric status rides
+    // along on the result so classifyToolErrorClass sees 'auth', not the
+    // generic 'Error' class the message text alone cannot match.
+    expect(res.code).toBe(403);
   });
 
   it('surfaces the read-only reconnect guard error verbatim', async () => {
@@ -273,13 +278,16 @@ describe('AgentModeService.twitterManagePost', () => {
 
   it('post_thread forwards the tweets array', async () => {
     const res = await service.twitterManagePost('u', { action: 'post_thread', tweets: ['a', 'b'] });
-    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b']);
+    // ENG-827: the per-tweet consent re-check is threaded in; undefined outside a
+    // gated scheduled dispatch, so interactive threads post exactly as before.
+    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b'], undefined);
     expect(res.data).toHaveLength(2);
   });
 
   it('quote_tweet calls quoteTweet with text and tweet_id', async () => {
     const res = await service.twitterManagePost('u', { action: 'quote_tweet', text: 'nice tweet!', tweet_id: 'tw42' });
-    expect(mockQuoteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'nice tweet!', 'tw42');
+    // ENG-827: the trailing arg is the consent re-check, undefined outside a scheduled run.
+    expect(mockQuoteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'nice tweet!', 'tw42', undefined);
     expect(res.success).toBe(true);
     expect(res.data.id).toBe('qt1');
   });
@@ -307,7 +315,7 @@ describe('AgentModeService.twitterManagePost', () => {
 
   it('retweet calls retweetTweet with tweet_id', async () => {
     const res = await service.twitterManagePost('u', { action: 'retweet', tweet_id: 'tw42' });
-    expect(mockRetweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(mockRetweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', undefined);
     expect(res.success).toBe(true);
     expect(res.data.retweeted).toBe(true);
   });
@@ -700,6 +708,22 @@ describe('AgentModeService.twitterOutreach', () => {
     const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/list\.read|reconnect/i);
+  });
+
+  it('ENG-1300: preserves the mapListScopeError 403 code on the returned result, not just its message', async () => {
+    // Mirrors what TwitterService.mapListScopeError actually throws (a 403-coded
+    // Error) rather than a plain Error, so this exercises the exact shape that
+    // reaches _twitterOutreachImpl's catch in production. Asserting only the
+    // message text (as the test above does) passed even when `.code` was
+    // silently dropped here — this is the assertion that would have caught it.
+    const scopeError: Error & { code?: number } = new Error(
+      'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+    );
+    scopeError.code = 403;
+    mockGetListTweets.mockRejectedValueOnce(scopeError);
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
+    expect(res.success).toBe(false);
+    expect(res.code).toBe(403);
   });
 
   it('block calls blockUser with handle', async () => {

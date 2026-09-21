@@ -168,4 +168,95 @@ describeLive('ENG-737 live native gemini adapter', () => {
       expect(typeof choice.message.content).toBe('string');
     }
   });
+
+  it('accepts a third-party MCP schema carrying keywords no denylist covered (ENG-845)', async () => {
+    // `browser_drop` from `@playwright/mcp` 0.0.78 — the playwright MCP server is
+    // registered in the prod `mcp_servers` setting and its tools are passed through
+    // to the model exactly as `tools/list` returns them (prod pins 0.0.70, which
+    // predates this tool, so this covers the next bump). Under the old denylist this
+    // 400'd live with `Unknown name "propertyNames"`, which would kill the whole turn
+    // with zero assistant output. The extra draft-2020 keywords alongside it
+    // (`examples`, `exclusiveMinimum`, `uniqueItems`) each 400 the same way.
+    const client = makeClient();
+    const res: any = await client.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: 'user', content: 'Use browser_drop to drop the text "hello" onto the target "e5".' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'browser_drop',
+          description: 'Drop data onto an element',
+          parameters: {
+            $schema: 'https://json-schema.org/draft/2020-12/schema',
+            type: 'object',
+            properties: {
+              target: { type: 'string', description: 'Target element reference' },
+              data: {
+                description: 'Data to drop, as a map of MIME type to string value.',
+                type: 'object',
+                propertyNames: { type: 'string' },
+                additionalProperties: { type: 'string' },
+              },
+              paths: { type: 'array', items: { type: 'string' }, uniqueItems: true },
+              retries: { type: 'number', exclusiveMinimum: 0, examples: [1, 2] },
+            },
+            required: ['target'],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: 'auto',
+    });
+    // No ApiError thrown = the sanitized schema was accepted by the real API.
+    const choice = res.choices[0];
+    if (choice.message.tool_calls) {
+      expect(choice.message.tool_calls[0].function.name).toBe('browser_drop');
+    } else {
+      expect(typeof choice.message.content).toBe('string');
+    }
+  });
+
+  it('sanitizes NESTED sub-schemas, not just the top level (ENG-845)', async () => {
+    // `anyOf` is the one composition keyword the genai `Schema` models, so it survives
+    // the allowlist — which makes its members model-facing and means they must be
+    // sanitized too. Confirmed against this API: an unknown keyword nested inside an
+    // `anyOf` member 400s the whole request exactly as a top-level one does —
+    //   Unknown name "contentEncoding" at '...properties[0].value.any_of[0]'
+    // and two levels down, through a member's own `properties` —
+    //   Unknown name "propertyNames" at '...any_of[0].properties[0].value'
+    // Both paths are covered here so the recursion can't silently regress to a
+    // top-level-only filter, which would reopen the zero-assistant-output class.
+    const client = makeClient();
+    const res: any = await client.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: 'user', content: 'Call store_payload with the string payload "v1".' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'store_payload',
+          description: 'Store a payload supplied either as a string or as a structured object',
+          parameters: {
+            type: 'object',
+            properties: {
+              payload: {
+                description: 'Either an encoded string or a structured record.',
+                anyOf: [
+                  { type: 'string', contentEncoding: 'base64', pattern: '^v\\d+$' },
+                  { type: 'object', properties: { id: { type: 'string', propertyNames: { type: 'string' } } } },
+                ],
+              },
+            },
+            required: ['payload'],
+          },
+        },
+      }],
+      tool_choice: 'auto',
+    });
+    const choice = res.choices[0];
+    if (choice.message.tool_calls) {
+      expect(choice.message.tool_calls[0].function.name).toBe('store_payload');
+    } else {
+      expect(typeof choice.message.content).toBe('string');
+    }
+  });
 });

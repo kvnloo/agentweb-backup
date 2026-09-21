@@ -37,8 +37,10 @@ import {
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+  ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -218,6 +220,54 @@ describe('tracing: happy path span topology + attributes', () => {
     expect(chat.attributes[ATTR_GEN_AI_RESPONSE_FINISH_REASONS]).toEqual(['tool_calls']);
   });
 
+  it('records the served model on the run span, distinct from the requested one (ENG-1210 AC14)', async () => {
+    // The span opens with the model as requested. When a transient error moves the
+    // run onto a backup, the trace must not still claim the original served it —
+    // otherwise the trace and the agent_run_verdict row credit different models.
+    startInvokeAgentSpan('run-sub', { sessionId: 's', llmModel: 'claude-opus-4-8' });
+    endInvokeAgentSpan('run-sub', { verdict: 'ok', responseModel: 'gemini-3.1-flash-lite' });
+    await flushTelemetry();
+
+    const [span] = exporter.getFinishedSpans();
+    expect(span.attributes[ATTR_GEN_AI_REQUEST_MODEL]).toBe('claude-opus-4-8');
+    expect(span.attributes[ATTR_GEN_AI_RESPONSE_MODEL]).toBe('gemini-3.1-flash-lite');
+  });
+
+  it('omits the served model when the caller does not know it', async () => {
+    startInvokeAgentSpan('run-nomodel', { sessionId: 's' });
+    endInvokeAgentSpan('run-nomodel', { verdict: 'ok' });
+    await flushTelemetry();
+
+    const [span] = exporter.getFinishedSpans();
+    expect(span.attributes[ATTR_GEN_AI_RESPONSE_MODEL]).toBeUndefined();
+    expect(span.attributes[ATTR_RUN_VERDICT]).toBe('ok');
+  });
+
+  it('records the served model on a FAILED run too', async () => {
+    // Raised by CodeRabbit on PR #2447. The success path and the omitted-model
+    // path were covered; the error path was not -- and that is the one where
+    // model attribution earns its keep, since "which model was serving when this
+    // failed" is the whole question a failed run raises.
+    //
+    // It is also the path most likely to regress: `endInvokeAgentSpan` sets the
+    // error and status before ending the span, so a future edit that returns
+    // early on error would silently drop the model and nothing else would notice.
+    startInvokeAgentSpan('run-err-model', { sessionId: 's', llmModel: 'claude-opus-4-8' });
+    endInvokeAgentSpan('run-err-model', {
+      verdict: 'failed',
+      error: new Error('provider exploded'),
+      responseModel: 'gemini-3.1-flash-lite',
+    });
+    await flushTelemetry();
+
+    const [span] = exporter.getFinishedSpans();
+    expect(span.attributes[ATTR_GEN_AI_RESPONSE_MODEL]).toBe('gemini-3.1-flash-lite');
+    // The pre-existing failure semantics must survive alongside it.
+    expect(span.attributes[ATTR_RUN_VERDICT]).toBe('failed');
+    expect(span.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span.events.some((e) => e.name === 'exception')).toBe(true);
+  });
+
   it('getRunTraceId returns the active trace id while the run is open, undefined after end', async () => {
     startInvokeAgentSpan('run-tid', { sessionId: 's' });
     const traceId = getRunTraceId('run-tid');
@@ -259,6 +309,16 @@ describe('tracing: happy path span topology + attributes', () => {
     await flushTelemetry();
     const chatSpan = exporter.getFinishedSpans().find((s) => s.name.startsWith('chat'))!;
     expect(chatSpan.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  it('chat span records an explicit transport provider for task-class gateway routes', async () => {
+    startInvokeAgentSpan('run-gateway-provider', { sessionId: 's' });
+    const chat = startRunChildSpan('run-gateway-provider', 'chat gpt-5.4', {});
+    endChatSpan(chat, { model: 'gpt-5.4', provider: 'openrouter', response: { choices: [] } });
+    endInvokeAgentSpan('run-gateway-provider', { verdict: 'ok' });
+    await flushTelemetry();
+    const chatSpan = exporter.getFinishedSpans().find((s) => s.name.startsWith('chat'))!;
+    expect(chatSpan.attributes[ATTR_GEN_AI_PROVIDER_NAME]).toBe('openrouter');
   });
 
   it('double end + restart of the same runId does not throw', () => {
@@ -312,6 +372,9 @@ describe('semconv: provider mapping mirrors callLLM routing', () => {
     ['gemini-2.5-pro', 'gemini'],
     ['anthropic.claude-sonnet-4-5', 'aws.bedrock'],
     ['claude-opus-4-8', 'gcp.vertex_ai'],
+    ['openrouter/openai/gpt-5.6-sol', 'openrouter'],
+    ['openrouter/deepseek/deepseek-v4-flash', 'openrouter'],
+    ['openrouter/anthropic/claude-sonnet-5', 'openrouter'],
     ['gpt-5', 'azure.ai.openai'],
   ])('%s -> %s', (model, provider) => {
     expect(providerForModel(model)).toBe(provider);

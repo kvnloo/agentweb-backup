@@ -64,6 +64,8 @@ import {
   normalizeUsageFromResponse,
   meterUsageFromResponse,
   bedrockModelIdFromArn,
+  normalizeCacheDetails,
+  normalizeAnthropicCacheCreation,
 } from '../utils/llmClients';
 
 const mockRecordUsage = recordUsage as jest.Mock;
@@ -74,6 +76,68 @@ const meterCtx = { userId: 'user-1', feature: 'chat', sessionId: 'sess-1' };
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe('llmClients normalizers', () => {
+  // ENG-1134: the Bedrock Converse wrapper answers in OpenAI shape while carrying
+  // Anthropic's cache counters, so it dispatches to normalizeOpenAIUsage rather
+  // than normalizeAnthropicUsage. Reading only prompt_tokens_details recorded its
+  // cache as zero — and cache is the bulk of Bedrock traffic, so that under-counted
+  // the spend roughly fourfold in the ledger the cost cap is enforced against.
+
+  it('falls back to Anthropic-style cache reads when OpenAI details are absent', () => {
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_read_input_tokens: 4000,
+      })
+    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 4000 });
+  });
+
+  it('prefers the OpenAI cached_tokens field when both shapes are present', () => {
+    // A genuine OpenAI response must not be reinterpreted through the fallback.
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        prompt_tokens_details: { cached_tokens: 40 },
+        cache_read_input_tokens: 4000,
+      })
+    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 });
+  });
+
+  it('carries Anthropic cache writes and their TTL split when reported', () => {
+    // ENG-893 prices writes by the TTL actually applied, so the breakdown has to
+    // survive normalization or 1h writes bill at the 5m rate.
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_creation_input_tokens: 700,
+        cache_creation: { ephemeral_1h_input_tokens: 700 },
+      })
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 25,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 700,
+      cacheWriteByTtl: { '1h': 700 },
+    });
+  });
+
+  it('emits a cache-write count without a TTL split when none is reported', () => {
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_creation_input_tokens: 700,
+      })
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 25,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 700,
+    });
+  });
+
   it('normalizes OpenAI chat usage including cached prompt tokens', () => {
     expect(
       normalizeOpenAIUsage({
@@ -330,6 +394,30 @@ describe('meterUsageFromResponse', () => {
     expect(() => meterUsageFromResponse(ctx, 42 as any)).not.toThrow();
     // still records the call (zero tokens) rather than dropping it silently
     expect(mockMeterUserUsage).toHaveBeenCalled();
+  });
+
+  it('derives eventId from response.id when the caller does not supply one (ENG-1251)', () => {
+    meterUsageFromResponse(ctx, { id: 'chatcmpl-abc123', usage: { prompt_tokens: 5, completion_tokens: 1 } });
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: 'chatcmpl-abc123' })
+    );
+  });
+
+  it('prefers a caller-supplied eventId over response.id', () => {
+    meterUsageFromResponse(
+      { ...ctx, eventId: 'explicit-id' },
+      { id: 'chatcmpl-abc123', usage: { prompt_tokens: 5, completion_tokens: 1 } }
+    );
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: 'explicit-id' })
+    );
+  });
+
+  it('leaves eventId undefined when neither the caller nor the response supplies one', () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 5, completion_tokens: 1 } });
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: undefined })
+    );
   });
 
   it('never propagates a metering error to the caller', () => {
@@ -1386,3 +1474,109 @@ async function wrapAndCall(client: any, sdkResponse: any): Promise<any> {
   setUnderlyingResolution(client, sdkResponse);
   return client.chat.completions.create({ model: sdkResponse.model });
 }
+
+
+/**
+ * ENG-893 — cache-write cost is billed at the TTL the provider APPLIED, so these
+ * two normalizers decide real money. Requesting `ttl: '1h'` is not a guarantee of
+ * getting it, and the same model id is used by paths with different TTLs, so a
+ * dropped or mis-parsed breakdown silently mis-bills by 60% in one direction or
+ * the other.
+ */
+describe('normalizeCacheDetails (Bedrock Converse usage.cacheDetails)', () => {
+  it('sums tokens per TTL bucket', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: '1h', inputTokens: 84210 },
+        { ttl: '5m', inputTokens: 1200 },
+      ])
+    ).toEqual({ '1h': 84210, '5m': 1200 });
+  });
+
+  it('merges repeated buckets rather than letting the last one win', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: '1h', inputTokens: 100 },
+        { ttl: '1h', inputTokens: 50 },
+      ])
+    ).toEqual({ '1h': 150 });
+  });
+
+  it('returns undefined for a missing, empty, or non-array value', () => {
+    // undefined means "no breakdown" — the caller then falls back to the
+    // model's declared rate rather than billing zero.
+    expect(normalizeCacheDetails(undefined)).toBeUndefined();
+    expect(normalizeCacheDetails(null)).toBeUndefined();
+    expect(normalizeCacheDetails([])).toBeUndefined();
+    expect(normalizeCacheDetails({ ttl: '1h' })).toBeUndefined();
+  });
+
+  it('skips entries with a non-string ttl or a non-positive token count', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: 3600, inputTokens: 500 },
+        { ttl: '5m', inputTokens: 0 },
+        { ttl: '1h', inputTokens: 'not-a-number' },
+        { ttl: '1h', inputTokens: 700 },
+      ])
+    ).toEqual({ '1h': 700 });
+  });
+
+  it('returns undefined when nothing survives filtering', () => {
+    expect(normalizeCacheDetails([{ ttl: '1h', inputTokens: 0 }])).toBeUndefined();
+  });
+
+  it('reaches the ledger through normalizeBedrockUsage', () => {
+    expect(
+      normalizeBedrockUsage({
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheWriteInputTokens: 84210,
+        cacheDetails: [{ ttl: '1h', inputTokens: 84210 }],
+      }).cacheWriteByTtl
+    ).toEqual({ '1h': 84210 });
+  });
+});
+
+describe('normalizeAnthropicCacheCreation (Messages API usage.cache_creation)', () => {
+  it('maps the ephemeral_* fields onto TTL buckets', () => {
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 1200,
+        ephemeral_1h_input_tokens: 84210,
+      })
+    ).toEqual({ '5m': 1200, '1h': 84210 });
+  });
+
+  it('omits zero buckets so a 5m-only write is not reported as mixed', () => {
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 1200,
+        ephemeral_1h_input_tokens: 0,
+      })
+    ).toEqual({ '5m': 1200 });
+  });
+
+  it('returns undefined for missing, non-object, or all-zero input', () => {
+    expect(normalizeAnthropicCacheCreation(undefined)).toBeUndefined();
+    expect(normalizeAnthropicCacheCreation(null)).toBeUndefined();
+    expect(normalizeAnthropicCacheCreation('nope')).toBeUndefined();
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 0,
+        ephemeral_1h_input_tokens: 0,
+      })
+    ).toBeUndefined();
+  });
+
+  it('reaches the ledger through normalizeAnthropicUsage', () => {
+    expect(
+      normalizeAnthropicUsage({
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 1200,
+        cache_creation: { ephemeral_5m_input_tokens: 1200 },
+      }).cacheWriteByTtl
+    ).toEqual({ '5m': 1200 });
+  });
+});

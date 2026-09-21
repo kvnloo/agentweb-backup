@@ -147,6 +147,28 @@ describe('SkillController', () => {
   });
 
   describe('POST /api/skills (createSkill)', () => {
+    it('passes a safe welcomeMessage and preserves the exact legacy call when absent', async () => {
+      (skillService.createSkill as jest.Mock).mockResolvedValue({ skillId: 'skill-brief' });
+      mockRequest.body = { name: 'Brief', description: 'd', welcomeMessage: '**Bring context.**' };
+      await createSkill(mockRequest as Request, mockResponse as Response);
+      expect(skillService.createSkill).toHaveBeenLastCalledWith(
+        'Brief', 'd', [], undefined, undefined, '**Bring context.**'
+      );
+
+      mockRequest.body = { name: 'Legacy', description: 'd' };
+      await createSkill(mockRequest as Request, mockResponse as Response);
+      expect(skillService.createSkill).toHaveBeenLastCalledWith('Legacy', 'd', [], undefined, undefined);
+    });
+
+    it.each(['<script>alert(1)</script>', '<iframe src=x></iframe>', null])(
+      'rejects unsafe welcomeMessage with the existing envelope: %s', async (welcomeMessage) => {
+        mockRequest.body = { name: 'Unsafe', description: 'd', welcomeMessage };
+        await createSkill(mockRequest as Request, mockResponse as Response);
+        expect(mockResponse.status).toHaveBeenCalledWith(400);
+        expect(skillService.createSkill).not.toHaveBeenCalled();
+      }
+    );
+
     it('should create skill with valid data', async () => {
       const mockSkill = {
         skillId: 'skill-123',
@@ -341,6 +363,21 @@ describe('SkillController', () => {
   });
 
   describe('PUT /api/skills/:skillId (updateSkill)', () => {
+    it('passes through a safe welcomeMessage and rejects hostile updates before persistence', async () => {
+      mockRequest.params = { skillId: 'skill-123' };
+      (skillService.getSkill as jest.Mock).mockResolvedValue({ skillId: 'skill-123', name: 'Skill', description: 'd' });
+      mockRequest.body = { welcomeMessage: 'Updated **brief**.' };
+      await updateSkill(mockRequest as Request, mockResponse as Response);
+      expect(skillService.updateSkill).toHaveBeenLastCalledWith(expect.objectContaining({ welcomeMessage: 'Updated **brief**.' }));
+
+      jest.clearAllMocks();
+      (skillService.getSkill as jest.Mock).mockResolvedValue({ skillId: 'skill-123', name: 'Skill', description: 'd' });
+      mockRequest.body = { welcomeMessage: '<form action=x></form>' };
+      await updateSkill(mockRequest as Request, mockResponse as Response);
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(skillService.updateSkill).not.toHaveBeenCalled();
+    });
+
     it('should update existing skill', async () => {
       const existingSkill = {
         skillId: 'skill-123',

@@ -1,9 +1,11 @@
 import { Request, Response } from 'express';
+import type { WorkPlanInputRequest } from '../services/agentMode/core/workPlanInputRequest';
 
 // Mock all dependencies before importing the controller
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -15,9 +17,15 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
+    getSupportedModels: jest.fn(),
+    resolveGenerationModel: jest.fn((model: string) => ({ model, fellBack: false, requestedModel: model })),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
   },
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn(),
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
@@ -50,6 +58,7 @@ jest.mock('../services/tokenUsageService', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { progressStore } from '../utils/sseProgress';
 import { agentModeController } from '../controllers/agentModeController';
 
@@ -57,6 +66,16 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const mockProgressStore = progressStore as jest.Mocked<typeof progressStore>;
+const mockGetEffectiveLlmUsagePolicy = getEffectiveLlmUsagePolicy as jest.Mock;
+
+const optimizedPolicy = {
+  version: 'starter-v1',
+  enforcementState: 'enforce' as const,
+  optimizationCostThresholdMicroUsd: 30_000_000,
+  hardCostThresholdMicroUsd: 60_000_000,
+  optimizedModelIds: ['gemini-3.1-flash-lite'],
+  optimizedDefaultModel: 'gemini-3.1-flash-lite',
+};
 
 describe('AgentModeController - ishare Model Selection', () => {
   const mockSessionId = 'test-session-123';
@@ -93,6 +112,18 @@ describe('AgentModeController - ishare Model Selection', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getSupportedModels.mockResolvedValue([
+      'gemini-3-pro-preview',
+      'gemini-3.1-flash-lite',
+      'gpt-5-chat-2',
+    ]);
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123',
+      policy: null,
+      costUsedMicroUsd: 0,
+      tokenUsed: 0,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+    });
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
@@ -202,6 +233,52 @@ describe('AgentModeController - ishare Model Selection', () => {
         })
       );
     });
+
+    it('should expose a pending work-plan input request to interactive plan clients', async () => {
+      const pendingWorkPlanInput: WorkPlanInputRequest = {
+        requestId: 'request-1',
+        stepCount: 1,
+        title: 'Connect your event',
+        prompt: 'Add the guest-list URL and registration window.',
+        fields: [
+          { id: 'guestListUrl', label: 'Guest-list URL', type: 'url', required: true },
+        ],
+        status: 'awaiting',
+        createdAt: new Date().toISOString(),
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSessionWithModel,
+        pendingWorkPlanInput,
+      });
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        on: jest.fn(),
+      } as unknown as Request;
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.getSharedConversation(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          session: expect.objectContaining({
+            pendingWorkPlanInput: {
+              requestId: 'request-1',
+              stepCount: 1,
+              title: 'Connect your event',
+              prompt: 'Add the guest-list URL and registration window.',
+              fields: [{ id: 'guestListUrl', label: 'Guest-list URL', type: 'url', required: true }],
+              status: 'awaiting',
+              createdAt: pendingWorkPlanInput.createdAt,
+            },
+          }),
+        }),
+      );
+    });
   });
 
   describe('generateSharedResponse', () => {
@@ -265,6 +342,101 @@ describe('AgentModeController - ishare Model Selection', () => {
         expect.any(Function)
       );
       expect(mockRes.json).toHaveBeenCalled();
+    });
+
+    it('honors a stored premium model on a shared session past the former optimization threshold (ENG-1211)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123',
+        policy: optimizedPolicy,
+        costUsedMicroUsd: 30_000_000,
+        tokenUsed: 1,
+        mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
+      });
+
+      const req = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        body: { userMessage: 'Test message', attachments: [] },
+        on: jest.fn(),
+      } as unknown as Request;
+      const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateSharedResponse(req, res);
+
+      // The stored model is dispatched unchanged; provider failure handling stays
+      // inside the single OpenRouter request.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          llmModel: 'gemini-3-pro-preview',
+        }),
+        expect.any(Function),
+      );
+    });
+
+    it('stamps the honored model on an unstamped legacy shared session (ENG-1211)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
+      mockAgentModeService.getSupportedModels.mockResolvedValue([
+        'gemini-3-pro-preview',
+        'gemini-3.1-flash-lite',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+        'gpt-5-chat-2',
+      ]);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123',
+        policy: {
+          ...optimizedPolicy,
+          optimizedModelIds: ['gemini-3.1-flash-lite', 'anthropic.claude-haiku-4-5-20251001-v1:0'],
+        },
+        costUsedMicroUsd: 30_000_000,
+        tokenUsed: 1,
+        mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
+      });
+
+      const req = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        body: { userMessage: 'Test message', attachments: [] },
+        on: jest.fn(),
+      } as unknown as Request;
+      const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateSharedResponse(req, res);
+
+      // The session is stamped with the model policy actually honored.
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenLastCalledWith(
+        mockSessionId,
+        'gemini-3-pro-preview',
+        expect.objectContaining({
+          effectiveModel: 'gemini-3-pro-preview',
+          modelSelection: 'honored',
+          modelSelectionReason: 'requested_model_allowed',
+        }),
+      );
+    });
+
+    it('makes no provider call when the shared-session owner is paused by cost policy', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123',
+        policy: optimizedPolicy,
+        costUsedMicroUsd: 60_000_000,
+        tokenUsed: 1,
+        mode: { usageMode: 'paused', admissionAllowed: false, reason: 'hard_threshold_reached' },
+      });
+
+      const req = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        body: { userMessage: 'Test message', attachments: [] },
+        on: jest.fn(),
+      } as unknown as Request;
+      const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateSharedResponse(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(429);
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
     it('should return 401 if conversable token is missing', async () => {

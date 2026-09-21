@@ -23,7 +23,7 @@
 
 export type Confidence = 'high' | 'medium' | 'low';
 
-export type FieldConfidenceProvider = 'apollo' | 'enrich.so';
+export type FieldConfidenceProvider = 'apollo' | 'enrich.so' | 'enigma';
 
 /** Identifier used to make the match. Some fields could be promoted/demoted
  *  based on signal strength in the future. */
@@ -123,6 +123,18 @@ const ENRICHSO_FIELD_CONFIDENCE: Record<string, Confidence> = {
   summary: 'medium',
 };
 
+/**
+ * Enigma per-field confidence (ENG-1388). Card revenue is measured from a card
+ * transaction panel, but it is a floor, not total revenue (±20–30% of true card
+ * revenue for about two thirds of brands, per Enigma). 'medium' keeps it out of
+ * the verified tier so the UI and Emma caveat it.
+ */
+const ENIGMA_FIELD_CONFIDENCE: Record<string, Confidence> = {
+  card_revenue_12m: 'medium',
+  card_revenue_period_end: 'high',     // the period Enigma reports is exact
+  card_revenue_yoy_growth: 'medium',
+};
+
 // ─── API ────────────────────────────────────────────────────────────────────
 
 /**
@@ -153,6 +165,8 @@ export function getFieldConfidence(
   const table =
     provider === 'apollo'
       ? APOLLO_FIELD_CONFIDENCE
-      : ENRICHSO_FIELD_CONFIDENCE;
+      : provider === 'enigma'
+        ? ENIGMA_FIELD_CONFIDENCE
+        : ENRICHSO_FIELD_CONFIDENCE;
   return table[field] ?? 'medium';
 }

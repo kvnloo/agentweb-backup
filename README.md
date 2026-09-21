@@ -355,7 +355,7 @@ This creates a public URL that Slack can use to send approval button interaction
 **Additional Slack Configuration** - Configure Event Subscriptions in your Slack app (https://api.slack.com/apps):
 - **Event Subscriptions** → Enable Events
 - **Request URL**: `https://your-backend-url.com/api/slack/events` (e.g., `https://abc123.ngrok.io/api/slack/events` for local dev)
-- **Subscribe to bot events** → Add `app_mention`
+- **Subscribe to bot events** → Add `app_mention` + `message.im` (DMs; Emma answers 1:1 DMs without a mention, identity-resolved via verified Slack email)
 - Set `SLACK_BOT_TOKEN` in your `.env` file
 
 ### Frontend Setup for Development

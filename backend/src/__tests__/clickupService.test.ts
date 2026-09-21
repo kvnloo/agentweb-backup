@@ -603,16 +603,16 @@ describe('clickupService', () => {
   });
 
   describe('createDoc', () => {
-    it('should create a doc and return id and name', async () => {
+    it('should create a doc with create_page:false and return id and name', async () => {
       mockAxiosPost.mockResolvedValueOnce({
         data: { id: 'doc-new-1', name: 'My New Doc' },
       });
 
-      const result = await createDoc('ck_token', 'ws-1', 'My New Doc', '# Hello\n\nWorld');
+      const result = await createDoc('ck_token', 'ws-1', 'My New Doc');
       expect(result).toEqual({ id: 'doc-new-1', name: 'My New Doc' });
       expect(mockAxiosPost).toHaveBeenCalledWith(
         'https://api.clickup.com/api/v3/workspaces/ws-1/docs',
-        { name: 'My New Doc', content: '# Hello\n\nWorld' },
+        { name: 'My New Doc', create_page: false },
         { headers: { Authorization: 'ck_token', 'Content-Type': 'application/json' } }
       );
     });
@@ -620,17 +620,8 @@ describe('clickupService', () => {
     it('should propagate API errors', async () => {
       mockAxiosPost.mockRejectedValueOnce(new Error('Forbidden'));
 
-      await expect(createDoc('ck_token', 'ws-1', 'Doc', 'content'))
+      await expect(createDoc('ck_token', 'ws-1', 'Doc'))
         .rejects.toThrow('Forbidden');
-    });
-
-    it('should handle empty content', async () => {
-      mockAxiosPost.mockResolvedValueOnce({
-        data: { id: 'doc-empty', name: 'Empty Doc' },
-      });
-
-      const result = await createDoc('ck_token', 'ws-1', 'Empty Doc', '');
-      expect(result).toEqual({ id: 'doc-empty', name: 'Empty Doc' });
     });
   });
 

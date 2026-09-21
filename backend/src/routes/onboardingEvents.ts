@@ -33,6 +33,14 @@ const MAX_EVENTS_PER_USER = 50;
 // Cap per-event payload to prevent abuse / runaway DynamoDB item size.
 const MAX_DATA_BYTES = 2048;
 
+// These beta funnel signals are analytics-only. They are persisted in the
+// event log, but must never create a lifecycle transition or timeline entry.
+const LATERAL_ONBOARDING_EVENTS = new Set([
+  "voice_onboarding_presented",
+  "voice_onboarding_started",
+  "voice_onboarding_text_fallback",
+]);
+
 /**
  * POST /api/onboarding/events
  * Body: { event: string, data?: object }
@@ -100,10 +108,29 @@ router.post("/events", authenticateToken, async (req, res) => {
     // Append + cap to the last MAX_EVENTS_PER_USER events (FIFO drop).
     const appended = [...existing, newEvent].slice(-MAX_EVENTS_PER_USER);
 
-    const newStage = deriveOnboardingStage(appended, {
+    const derivedStage = deriveOnboardingStage(appended, {
       lastActiveAt: (user as any).lastActiveAt,
     });
-    const previousStage = (user as any).onboardingStage ?? null;
+    const hasPersistedStage = Object.prototype.hasOwnProperty.call(
+      user,
+      "onboardingStage",
+    );
+    const previousStage = hasPersistedStage
+      ? (user as any).onboardingStage ?? null
+      : null;
+    const hasPriorLifecycleEvent = existing.some(
+      (item) => !LATERAL_ONBOARDING_EVENTS.has(item?.event),
+    );
+    // Analytics-only voice events must not create or change lifecycle state.
+    // They remain in the event stream, while all lifecycle consumers see the
+    // previously persisted stage unchanged.
+    const newStage = LATERAL_ONBOARDING_EVENTS.has(event)
+      ? hasPersistedStage
+        ? previousStage
+        : derivedStage === "signed_up_no_start" && !hasPriorLifecycleEvent
+          ? null
+          : derivedStage
+      : derivedStage;
 
     const updated = await userDb.updateUser(userId, {
       onboardingEvents: appended,
@@ -116,7 +143,12 @@ router.post("/events", authenticateToken, async (req, res) => {
 
     // Mirror stage transitions into the contact activity timeline.
     // Fire-and-forget — must never break the onboarding event handler.
-    if (newStage && newStage !== previousStage && user.email) {
+    if (
+      newStage &&
+      newStage !== previousStage &&
+      !LATERAL_ONBOARDING_EVENTS.has(event) &&
+      user.email
+    ) {
       onOnboardingStageChanged({
         userId,
         email: user.email,
@@ -177,9 +209,29 @@ router.get("/events/me", authenticateToken, async (req, res) => {
     )
       ? ((user as any).onboardingEvents as OnboardingEvent[])
       : [];
-    const stage = deriveOnboardingStage(events, {
+    // Persisted stage is authoritative when present, including null for a
+    // first lifecycle-neutral voice event. Falling back to derivation keeps
+    // this endpoint compatible with users created before stage persistence.
+    const hasPersistedStage = Object.prototype.hasOwnProperty.call(
+      user,
+      "onboardingStage",
+    );
+    const derivedStage = deriveOnboardingStage(events, {
       lastActiveAt: (user as any).lastActiveAt,
     });
+    const hasPriorLifecycleEvent = events.some(
+      (item) => !LATERAL_ONBOARDING_EVENTS.has(item?.event),
+    );
+    const hasLateralEvent = events.some((item) =>
+      LATERAL_ONBOARDING_EVENTS.has(item?.event),
+    );
+    const stage = hasPersistedStage
+      ? (user as any).onboardingStage
+      : hasLateralEvent &&
+          !hasPriorLifecycleEvent &&
+          derivedStage === "signed_up_no_start"
+        ? null
+        : derivedStage;
     return res.json({
       onboardingEvents: events,
       onboardingStage: stage,

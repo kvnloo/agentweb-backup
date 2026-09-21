@@ -20,6 +20,9 @@ jest.mock("../services/workPlanService", () => ({
     createWorkPlan: jest.fn(),
     getWorkPlan: jest.fn(),
     updateWorkPlan: jest.fn(),
+    approveWorkPlan: jest.fn(),
+    rejectWorkPlan: jest.fn(),
+    submitForReview: jest.fn(),
   },
 }));
 
@@ -203,5 +206,433 @@ describe("backwards compat — steps without userInstructions still work", () =>
     expect(res.status).toBe(201);
     const arg = workPlanService.createWorkPlan.mock.calls[0][0];
     expect(arg.steps[0].userInstructions).toBeUndefined();
+  });
+});
+
+// ─── ENG-889 ────────────────────────────────────────────────────────────────
+// Third instance of the same defect the tests above cover: the route rebuilds
+// each step from a fixed field list, so anything outside that list is dropped
+// on a 200/201 with no signal. userInstructions was the first casualty, the
+// snake_case `required_function_calls` alias the second (ENG-889), and
+// expectedAssetCount — the asset-count completion gate's input — the third.
+// These tests pin both halves: the field round-trips, and an unrecognized
+// field is reported back to the caller instead of vanishing.
+const STEP_WITH_ASSET_COUNT = {
+  stepCount: 1,
+  title: "Generate 3 Images Per Hook",
+  description: "generate 3 images per hook (18 total)",
+  requiredFunctionCalls: ["generate_image"],
+  expectedAssetCount: 18,
+};
+
+describe("expectedAssetCount pass-through", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.createWorkPlan.mockResolvedValue({
+      planId: "plan-assets",
+      title: "Creative Hub",
+      steps: [STEP_WITH_ASSET_COUNT],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-assets",
+      title: "Creative Hub",
+      steps: [],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("forwards step.expectedAssetCount on admin create", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT], visibility: "system" });
+
+    expect(res.status).toBe(201);
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("forwards step.expectedAssetCount on admin update", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/plan-assets")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT] });
+
+    expect(res.status).toBe(200);
+    const arg = workPlanService.updateWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("forwards step.expectedAssetCount on user create", async () => {
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT] });
+
+    expect(res.status).toBe(201);
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("omits expectedAssetCount entirely when the caller did not send it", async () => {
+    await request(app)
+      .post("/api/admin/work-plans")
+      .send({ title: "Plain", steps: [{ stepCount: 1, title: "Step" }], visibility: "system" });
+
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect("expectedAssetCount" in arg.steps[0]).toBe(false);
+  });
+});
+
+describe("unrecognized step fields are reported, not silently dropped", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.createWorkPlan.mockResolvedValue({
+      planId: "plan-warn",
+      title: "Warned",
+      steps: [{ stepCount: 1, title: "Step" }],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-warn",
+      title: "Warned",
+      steps: [],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("names the ignored field and its 1-based step on admin create", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Warned",
+        steps: [
+          { stepCount: 1, title: "Step 1" },
+          { stepCount: 2, title: "Step 2", mystery_field: ["x"] },
+        ],
+        visibility: "system",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([
+      "step 2: ignored unrecognized field 'mystery_field'",
+    ]);
+  });
+
+  it("lists every ignored field on a step", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Warned",
+        steps: [{ stepCount: 1, title: "Step 1", alpha: 1, beta: 2 }],
+        visibility: "system",
+      });
+
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized fields 'alpha', 'beta'",
+    ]);
+  });
+
+  it("reports ignored fields on admin update too", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/plan-warn")
+      .send({ title: "Warned", steps: [{ stepCount: 1, title: "Step 1", nope: true }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized field 'nope'",
+    ]);
+  });
+
+  it("reports ignored fields on user create too", async () => {
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Warned", steps: [{ stepCount: 1, title: "Step 1", nope: true }] });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized field 'nope'",
+    ]);
+  });
+
+  it("leaves the response shape untouched when every field is recognized", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Clean",
+        steps: [{
+          stepCount: 1,
+          title: "Step 1",
+          description: "d",
+          userInstructions: "u",
+          requiredFunctionCalls: ["a"],
+          skillIds: ["s"],
+          expectedAssetCount: 3,
+        }],
+        visibility: "system",
+      });
+
+    expect(res.status).toBe(201);
+    expect("warnings" in res.body).toBe(false);
+  });
+});
+
+describe("user PUT is consistent with every other write path", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-user",
+      title: "Mine",
+      steps: [],
+      ownerId: "user-1",
+      visibility: "private",
+      isBuiltIn: false,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("normalizes steps rather than storing the caller's object verbatim", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/plan-user")
+      .send({ steps: [{ title: "Step", expectedAssetCount: 4, mystery: 1 }] });
+
+    expect(res.status).toBe(200);
+    const arg = workPlanService.updateWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0]).toMatchObject({ stepCount: 1, title: "Step", expectedAssetCount: 4 });
+    expect("mystery" in arg.steps[0]).toBe(false);
+  });
+
+  it("reports the discarded field instead of persisting it silently", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/plan-user")
+      .send({ steps: [{ title: "Step", mystery: 1 }] });
+
+    expect(res.body.warnings).toEqual(["step 1: ignored unrecognized field 'mystery'"]);
+  });
+});
+
+describe("a non-array steps payload is rejected, not crashed on", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Owned + private, so the user route's ownership check passes and we reach
+    // the payload validation this describe is actually about.
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "p", title: "T", steps: [], ownerId: "user-1",
+      visibility: "private", isBuiltIn: false,
+      createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("returns 400 from the admin PUT instead of a 500 from inside .map", async () => {
+    const res = await request(app).put("/api/admin/work-plans/p").send({ steps: "not an array" });
+
+    expect(res.status).toBe(400);
+    expect(workPlanService.updateWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 from the user PUT too", async () => {
+    const res = await request(app).put("/api/user-work-plans/p").send({ steps: { a: 1 } });
+
+    expect(res.status).toBe(400);
+    expect(workPlanService.updateWorkPlan).not.toHaveBeenCalled();
+  });
+});
+
+describe("a plan deleted between read and write answers 404, not 500", () => {
+  const stored = {
+    planId: "p", title: "T", steps: [], ownerId: "user-1",
+    visibility: "private", isBuiltIn: false,
+    createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue(stored);
+    // updateWorkPlan's attribute_exists guard now rejects a vanished plan
+    // instead of the old put silently resurrecting it.
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan not found"));
+  });
+
+  it("on the admin PUT", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.message).toBe("Work plan not found");
+  });
+
+  it("on the user PUT", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("still returns 500 for a genuine failure", async () => {
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(500);
+  });
+});
+
+// ENG-890: the MCP tool's destructive-step guard reads the plan, decides the
+// payload is safe, then writes. A competing write in that window makes the
+// decision stale, so the guard has to be able to stake its read.
+describe("a step revision lets a caller stake the plan it inspected", () => {
+  const stored = {
+    planId: "p", title: "T", steps: [{ stepCount: 1, title: "S" }], ownerId: "user-1",
+    visibility: "system", isBuiltIn: true,
+    createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+    steps_rev: "rev-1",
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue(stored);
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("forwards expectedStepsRev to the service on the admin PUT", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(
+      expect.any(Object),
+      { expectedStepsRev: "rev-1" },
+    );
+  });
+
+  it("forwards a null revision, which is not the same as not staking one", async () => {
+    // null means "the plan I read had no revision yet" — a real precondition.
+    // Dropping it would let a write land on a plan that has since gained one.
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: null });
+
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(
+      expect.any(Object),
+      { expectedStepsRev: null },
+    );
+  });
+
+  it("stakes nothing when the caller did not send one", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    // An empty stake, which the service reads as "unconditioned" — the key's
+    // absence is the signal, so this must not carry expectedStepsRev at all.
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(expect.any(Object), {});
+  });
+
+  it("never persists expectedStepsRev as a plan field", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(workPlanService.updateWorkPlan.mock.calls[0][0]).not.toHaveProperty("expectedStepsRev");
+  });
+
+  it("returns the revision the write produced, not the stale one it read", async () => {
+    // `updated` is built by spreading the plan that was read, so it carries the
+    // pre-write revision. Echoing that back hands the caller a value its own
+    // write has already superseded — a guaranteed 409 on the next staked write.
+    workPlanService.updateWorkPlan.mockResolvedValue("rev-2");
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.steps_rev).toBe("rev-2");
+  });
+
+  it("answers 409, not 500, when the plan moved under the caller", async () => {
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan steps changed"));
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/changed/i);
+  });
+
+  it("answers 409 on the user PUT too", async () => {
+    // The user route only edits a plan the caller owns, so it needs the private
+    // shape — a system plan is refused at the authorization check.
+    workPlanService.getWorkPlan.mockResolvedValue({
+      ...stored, visibility: "private", isBuiltIn: false, ownerId: "user-1",
+    });
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan steps changed"));
+
+    const res = await request(app)
+      .put("/api/user-work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// Raised by Greptile on PR #2269. These three now stake the plan they read, so
+// they can fail with a conflict — which without a mapping falls through to the
+// generic 500 and reads as "the server broke" rather than "retry".
+describe("review transitions answer 409 on a lost race", () => {
+  const conflict = () => new Error("Work plan steps changed");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "p", title: "T", steps: [], ownerId: "user-1",
+      visibility: "pending_review", isBuiltIn: false,
+      createdAt: "2026-08-05T00:00:00Z", updatedAt: "2026-08-05T00:00:00Z",
+    });
+  });
+
+  it("on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/changed/i);
+  });
+
+  it("on reject", async () => {
+    workPlanService.rejectWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/reject").send({ feedback: "no" });
+    expect(res.status).toBe(409);
+  });
+
+  it("on submit for review", async () => {
+    workPlanService.submitForReview.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/user-work-plans/p/submit-for-review");
+    expect(res.status).toBe(409);
+  });
+
+  it("still returns 500 for a genuine failure on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
+    expect(res.status).toBe(500);
   });
 });

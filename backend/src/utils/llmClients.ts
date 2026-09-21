@@ -46,6 +46,8 @@ export interface NormalizedUsage {
   outputTokens: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  /** ENG-893: cache-write tokens split by the TTL the provider actually applied. */
+  cacheWriteByTtl?: Record<string, number>;
 }
 
 // ── Per-provider usage normalizers ────────────────────────────────────────────
@@ -55,7 +57,23 @@ export function normalizeOpenAIUsage(usage: any): NormalizedUsage {
   return {
     inputTokens: usage?.prompt_tokens || 0,
     outputTokens: usage?.completion_tokens || 0,
-    cacheReadTokens: usage?.prompt_tokens_details?.cached_tokens || 0,
+    // ENG-1134: the Anthropic-style fields are read as a fallback because the
+    // Bedrock Converse wrapper answers in OpenAI shape while carrying Anthropic's
+    // cache counters — so it dispatches HERE, not to normalizeAnthropicUsage.
+    // Reading only `prompt_tokens_details.cached_tokens` recorded its cache as
+    // zero, and cache is the bulk of Bedrock traffic. Real OpenAI responses do
+    // not carry these keys, so the fallback is inert for them.
+    cacheReadTokens:
+      usage?.prompt_tokens_details?.cached_tokens || usage?.cache_read_input_tokens || 0,
+    // Emitted only when actually present, so a genuine OpenAI response yields the
+    // exact same object it always did — the fallback adds nothing for callers
+    // that never had cache writes to begin with.
+    ...(usage?.cache_creation_input_tokens
+      ? { cacheWriteTokens: usage.cache_creation_input_tokens }
+      : {}),
+    ...(normalizeAnthropicCacheCreation(usage?.cache_creation)
+      ? { cacheWriteByTtl: normalizeAnthropicCacheCreation(usage?.cache_creation) }
+      : {}),
   };
 }
 
@@ -74,7 +92,24 @@ export function normalizeBedrockUsage(usage: any): NormalizedUsage {
     outputTokens: usage?.outputTokens || 0,
     cacheReadTokens: usage?.cacheReadInputTokens || 0,
     cacheWriteTokens: usage?.cacheWriteInputTokens || 0,
+    cacheWriteByTtl: normalizeCacheDetails(usage?.cacheDetails),
   };
+}
+
+/**
+ * Bedrock's `usage.cacheDetails` -> `{ '1h': 84210 }`. ENG-893: the ledger bills
+ * cache writes at the rate for the TTL that was APPLIED, which is not necessarily
+ * the one we requested, so this breakdown has to survive normalization.
+ */
+export function normalizeCacheDetails(cacheDetails: any): Record<string, number> | undefined {
+  if (!Array.isArray(cacheDetails) || cacheDetails.length === 0) return undefined;
+  const byTtl: Record<string, number> = {};
+  for (const detail of cacheDetails) {
+    const ttl = typeof detail?.ttl === 'string' ? detail.ttl : undefined;
+    const tokens = Number(detail?.inputTokens) || 0;
+    if (ttl && tokens > 0) byTtl[ttl] = (byTtl[ttl] || 0) + tokens;
+  }
+  return Object.keys(byTtl).length > 0 ? byTtl : undefined;
 }
 
 /** Gemini: usageMetadata{promptTokenCount, candidatesTokenCount, cachedContentTokenCount}. */
@@ -98,7 +133,29 @@ export function normalizeAnthropicUsage(usage: any): NormalizedUsage {
     outputTokens: usage?.output_tokens || 0,
     cacheReadTokens: usage?.cache_read_input_tokens || 0,
     cacheWriteTokens: usage?.cache_creation_input_tokens || 0,
+    cacheWriteByTtl: normalizeAnthropicCacheCreation(usage?.cache_creation),
   };
+}
+
+/**
+ * Anthropic Messages API `usage.cache_creation`
+ * ({ ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }) -> `{ '5m': n }`.
+ *
+ * ENG-893: the Messages-shape counterpart of Bedrock Converse's `cacheDetails`.
+ * Both must normalize, because a single model id is used by paths with
+ * different TTLs — agent-mode asks Sonnet 4.6 for 1h while codingAgentService
+ * uses the same id with no ttl — so cost has to follow the response.
+ */
+export function normalizeAnthropicCacheCreation(
+  cacheCreation: any
+): Record<string, number> | undefined {
+  if (!cacheCreation || typeof cacheCreation !== 'object') return undefined;
+  const byTtl: Record<string, number> = {};
+  const fiveMin = Number(cacheCreation.ephemeral_5m_input_tokens) || 0;
+  const oneHour = Number(cacheCreation.ephemeral_1h_input_tokens) || 0;
+  if (fiveMin > 0) byTtl['5m'] = fiveMin;
+  if (oneHour > 0) byTtl['1h'] = oneHour;
+  return Object.keys(byTtl).length > 0 ? byTtl : undefined;
 }
 
 /**
@@ -153,6 +210,8 @@ export interface MeterFromResponseContext {
   feature: string;
   sessionId?: string;
   taskId?: string;
+  /** ENG-1251: explicit override; when omitted, meterUsageFromResponse derives one from `response.id`. */
+  eventId?: string;
 }
 
 /**
@@ -191,6 +250,13 @@ export function meterUsageFromResponse(
   try {
     const usage =
       normalizeUsageFromResponse(response) ?? { inputTokens: 0, outputTokens: 0 };
+    // ENG-1251: fall back to the provider response's own id when the caller
+    // doesn't supply one. Stable across a re-processed/retried response,
+    // distinct across genuinely separate calls — closes the retry-defeats-
+    // dedup Greptile P1 for every caller of this shared entry point without
+    // requiring each of them to plumb through their own idempotency key.
+    const derivedEventId: string | undefined =
+      ctx.eventId ?? (typeof response?.id === "string" ? response.id : undefined);
     const meterCtx = {
       userId: ctx.userId,
       billingUserId: ctx.billingUserId,
@@ -200,10 +266,12 @@ export function meterUsageFromResponse(
       feature: ctx.feature,
       sessionId: ctx.sessionId,
       taskId: ctx.taskId,
+      eventId: derivedEventId,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens,
+      cacheWriteByTtl: usage.cacheWriteByTtl,
     };
     if (opts?.mode === "burn") {
       void recordUsage(meterCtx);
@@ -236,6 +304,7 @@ function fireRecord(
       outputTokens: usage.outputTokens,
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens,
+      cacheWriteByTtl: usage.cacheWriteByTtl,
       sessionId: ctx.sessionId,
       taskId: ctx.taskId,
     });

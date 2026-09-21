@@ -6,6 +6,7 @@ jest.mock('../services/subscriptionService', () => ({
     'get_marketing_tips',
     'analyze_competitors',
   ]),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -22,6 +23,9 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    // ENG-892: model resolution is orthogonal to what this suite asserts —
+    // pass the requested id through unchanged.
+    resolveGenerationModel: jest.fn((model: string) => ({ model, fellBack: false, requestedModel: model })),
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
     getScheduledChatsDefaultModel: jest.fn(),
@@ -44,6 +48,7 @@ jest.mock('../services/agentModeService', () => ({
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
+    releaseSessionClients: jest.fn(),
   },
 }));
 
@@ -265,7 +270,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           passed: true,
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
 
@@ -319,7 +326,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           passed: true,
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
 
@@ -367,7 +376,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Stored response from error case',
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
   });

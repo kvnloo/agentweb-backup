@@ -390,7 +390,7 @@ describe('SEO Agent Mode Tools', () => {
         seoDomains: ['example.com'],
       });
 
-      // Mock runReport calls: overall, pages engagement, daily, traffic sources
+      // Mock runReport calls: overall, pages engagement, pages sessions, daily, traffic sources
       mockRunReport
         .mockResolvedValueOnce([{
           rows: [{
@@ -403,7 +403,8 @@ describe('SEO Agent Mode Tools', () => {
             ]
           }]
         }])
-        .mockResolvedValueOnce([{ rows: [] }])
+        .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }])
         .mockResolvedValueOnce([{ rows: [] }]);
 
@@ -490,7 +491,7 @@ describe('SEO Agent Mode Tools', () => {
         seoDomains: ['example.com'],
       });
 
-      // overall, pages engagement, daily, traffic sources (with conversions), conversions-by-source
+      // overall, pages engagement, pages sessions, daily, traffic sources (with conversions), conversions-by-source
       mockRunReport
         .mockResolvedValueOnce([{
           rows: [{
@@ -500,6 +501,7 @@ describe('SEO Agent Mode Tools', () => {
           }]
         }])
         .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }]) // daily
         .mockResolvedValueOnce([{              // traffic sources with conversions
           rows: [{
@@ -528,6 +530,7 @@ describe('SEO Agent Mode Tools', () => {
       mockRunReport
         .mockResolvedValueOnce([{ rows: [] }]) // overall
         .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }]) // daily
         .mockResolvedValueOnce([{ rows: [] }]) // traffic sources
         .mockResolvedValueOnce([{              // conversions by source+event
@@ -575,6 +578,57 @@ describe('SEO Agent Mode Tools', () => {
 
       expect(result.metrics[0].conversionsBySource).toBeDefined();
       expect(result.metrics[0].conversionsBySource).toHaveLength(0);
+    });
+
+    // ENG-829: GA4's `conversions` metric is historical — key-event marking is not
+    // retroactive and un-marking an event does not purge already-collected conversion
+    // rows. So `page_view`/`scroll` appearing in conversionsBySource does NOT prove they
+    // are currently starred as key events. Emma asserted exactly that (and told the user
+    // to "un-mark" events that were never marked) purely from this payload's field name.
+    describe('key-event semantics caveat (ENG-829)', () => {
+      const runAnalytics = async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          userId: 'test-user',
+          googleAnalyticsPropertyId: '123456',
+        });
+        mockRunReport.mockResolvedValue([{ rows: [] }]);
+        const tool = emmaToolRegistry.getTool('get_website_analytics');
+        return await tool!.execute({}, { userId: 'test-user' });
+      };
+
+      it('states that conversion counts are historical and not retroactive', async () => {
+        const result = await runAnalytics();
+
+        expect(typeof result.key_event_semantics).toBe('string');
+        expect(result.key_event_semantics).toContain('not retroactive');
+        expect(result.key_event_semantics).toContain('historical');
+      });
+
+      it('forbids inferring current key-event configuration from the payload', async () => {
+        const result = await runAnalytics();
+
+        expect(result.key_event_semantics).toContain('does NOT mean');
+        expect(result.key_event_semantics).toContain('currently marked');
+        // The escalation in ENG-829 came from asserting these two events were starred.
+        expect(result.key_event_semantics).toContain('page_view');
+        expect(result.key_event_semantics).toContain('scroll');
+      });
+
+      it('tells Emma no tool reads key-event configuration and how to verify it', async () => {
+        const result = await runAnalytics();
+
+        expect(result.key_event_semantics).toContain('No tool available here reads');
+        expect(result.key_event_semantics).toContain('browser tools');
+      });
+
+      it('does not advertise conversionsBySource as key-event configuration', () => {
+        const tool = emmaToolRegistry.getTool('get_website_analytics');
+        const description: string = tool!.definition.description;
+
+        expect(description).not.toContain('key-event/conversion breakdown');
+        expect(description).toContain('historical');
+        expect(description).toContain('not which events are currently marked as key events');
+      });
     });
   });
 

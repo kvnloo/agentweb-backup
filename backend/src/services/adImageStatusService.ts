@@ -15,6 +15,8 @@
  * Result shape: 3 image variants — id, imageUrl, prompt.
  */
 
+import { randomUUID } from "crypto";
+
 export type AdImageStatus = "idle" | "running" | "ready" | "failed";
 
 export interface AdImageVariant {
@@ -54,6 +56,18 @@ export interface AdImageResult {
 export interface AdImageStatusFields {
   adImageStatus?: AdImageStatus;
   adImageStartedAt?: string;
+  /**
+   * Per-run nonce, stamped by `adImageStartPatch`. This — NOT
+   * `adImageStartedAt` — is what identifies the run that owns the axis, so
+   * that only that run may publish a terminal state (see
+   * `failAdImageRunIfOwned`). A start timestamp cannot do the job: it has
+   * millisecond resolution, so two runs starting in the same millisecond get
+   * byte-identical stamps and each would be authorised to write off the
+   * other. Undefined on records written before this shipped, and on eager-DAG
+   * invocations that never went through the start patch — the guard falls
+   * back to timestamp ordering there.
+   */
+  adImageRunId?: string;
   adImageCompletedAt?: string;
   adImageDurationMs?: number;
   adImageError?: string;
@@ -83,10 +97,18 @@ const MAX_URL_LEN = 1024;
 const MAX_PROMPT_LEN = 2000;
 const MAX_ERROR_LEN = 512;
 
-export function adImageStartPatch(now: Date = new Date()): AdImageStatusFields {
+/**
+ * `mint` is injectable so tests can assert deterministically — same
+ * convention as `ensurePersonaIds` in icpStatusService.
+ */
+export function adImageStartPatch(
+  now: Date = new Date(),
+  mint: () => string = () => `adimg_${randomUUID()}`,
+): AdImageStatusFields {
   return {
     adImageStatus: "running",
     adImageStartedAt: now.toISOString(),
+    adImageRunId: mint(),
     adImageCompletedAt: undefined,
     adImageDurationMs: undefined,
     adImageError: undefined,

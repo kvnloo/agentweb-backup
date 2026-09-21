@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "act_120000000000001/insights",
+    "query": {
+      "level": "campaign",
+      "fields": "impressions,spend,actions,date_start,date_stop",
+      "time_increment": "1",
+      "date_preset": "last_7d",
+      "limit": "5000"
+    }
+  },
+  "status": 200,
+  "body": {
+    "report_run_id": "1200000000000172"
+  }
+}

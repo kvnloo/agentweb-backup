@@ -3,8 +3,6 @@ import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
   Box,
-  Tabs,
-  Tab,
   Typography,
   Paper,
   Table,
@@ -21,7 +19,6 @@ import {
   CardContent,
   TextField,
   Chip,
-  Container,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -45,6 +42,13 @@ import {
   Divider,
   Switch,
 } from "@mui/material";
+import { alpha } from "@mui/material/styles";
+import { ADMIN_NAVIGATION_SECTIONS, ADMIN_TAB_MAP, ADMIN_TABS } from "./adminNavigation";
+
+// One-line descriptions shown under the page title (copy from the approved ENG-1707 mock).
+const ADMIN_TAB_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  users: "Manage access, status, and account health.",
+};
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
@@ -65,6 +69,7 @@ import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
 import XCostBreakdownBody, { XOrgUsageRollup } from "../components/admin/XCostBreakdownBody";
+import SpendLedgerBody, { SpendLedgerPayload } from "../components/admin/SpendLedgerBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -106,6 +111,7 @@ import {
   Search as SearchIcon,
   Email as EmailIcon,
   BarChart as BarChartIcon,
+  ReceiptLong as ReceiptLongIcon,
   ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
@@ -272,7 +278,6 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply monitoring for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -296,6 +301,12 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  llmUsageCredits?: {
+    month: string;
+    totalPurchasedMicroUsd?: number;
+    totalAdminGrantedMicroUsd?: number;
+    totalMigrationOffsetMicroUsd?: number;
+  };
   extraCostUsage?: {
     month: string;
     totalCost: number;
@@ -760,35 +771,8 @@ const ChatDialog = ({
 export default function AdminDashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
   
-  // Tab mapping for URL parameters
-  const TAB_MAP = {
-    overview: 0,
-    announcements: 1,
-    users: 2,
-    waitlist: 3,
-    tasks: 4,
-    workflows: 5,
-    'chat-history': 6,
-    'knowledge-base': 7,
-    'agent-mode': 8,
-    'image-models': 9,
-    'default-prompts': 10,
-    'benchmarks': 11,
-    'subscriptions': 12,
-    'mcp-servers': 13,
-    'result-endpoints': 14,
-    'scoring-judges': 15,
-    'crm': 16,
-    'revenue': 17,
-    'funnel': 18,
-    'alert-emails': 19,
-    'onboarding': 20,
-    'connected-accounts': 21,
-    'contractors': 22,
-    'emma-mcp': 23,
-    'costs': 24,
-    'usage-cost': 25,
-  };
+  // Stable deep-link mapping; presentation groups live in adminNavigation.ts.
+  const TAB_MAP = ADMIN_TAB_MAP;
   
   // Get initial tab value from URL or default to Users
   const getInitialTabValue = () => {
@@ -957,11 +941,24 @@ export default function AdminDashboard() {
   const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
   const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
   const xBreakdownReqRef = useRef(0);
-  const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
-  const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
-  const [grantBonusEmail, setGrantBonusEmail] = useState("");
-  const [grantBonusAmount, setGrantBonusAmount] = useState("");
-  const [grantBonusLoading, setGrantBonusLoading] = useState(false);
+
+  // ── Cross-vendor spend ledger (ENG-1838, over the ENG-1250 §7 read models) ──
+  // Sibling of the two breakdowns above, but sourced from the immutable
+  // AW-SpendEvents ledger rather than the daily aggregate: per-call, every
+  // metered vendor at once, and the only one that can show reservations.
+  const [spendLedgerUser, setSpendLedgerUser] = useState<User | null>(null);
+  const [spendLedgerMonth, setSpendLedgerMonth] = useState<string>("");
+  const [spendLedgerData, setSpendLedgerData] = useState<SpendLedgerPayload | null>(null);
+  const [spendLedgerLoading, setSpendLedgerLoading] = useState(false);
+  const [spendLedgerError, setSpendLedgerError] = useState<string | null>(null);
+  const spendLedgerReqRef = useRef(0);
+  const [usageCreditDialogOpen, setUsageCreditDialogOpen] = useState(false);
+  const [usageCreditUserId, setUsageCreditUserId] = useState<string | null>(null);
+  const [usageCreditEmail, setUsageCreditEmail] = useState("");
+  const [usageCreditAmount, setUsageCreditAmount] = useState("");
+  const [usageCreditReason, setUsageCreditReason] = useState("");
+  const [usageCreditIdempotencyKey, setUsageCreditIdempotencyKey] = useState("");
+  const [usageCreditLoading, setUsageCreditLoading] = useState(false);
   const [introEmailDialogOpen, setIntroEmailDialogOpen] = useState(false);
   const [introEmailUserId, setIntroEmailUserId] = useState<string | null>(null);
   const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
@@ -1120,7 +1117,9 @@ export default function AdminDashboard() {
       const costAllowanceMap: Record<string, number | null> = {};
       types.forEach((t: any) => {
         allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
-        costAllowanceMap[t.name] = t.monthlyCostAllowance ?? null;
+        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
+          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
+          : (t.monthlyCostAllowance ?? null);
       });
       setSubscriptionTypeAllowanceMap(allowanceMap);
       setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
@@ -1210,6 +1209,46 @@ export default function AdminDashboard() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xBreakdownUser?.userId, xBreakdownMonth]);
+
+  // ── Cross-vendor spend ledger (ENG-1838) ──
+  const fetchSpendLedger = async (userId: string, month: string) => {
+    const reqId = ++spendLedgerReqRef.current;
+    const isStale = () => reqId !== spendLedgerReqRef.current;
+    setSpendLedgerLoading(true);
+    setSpendLedgerError(null);
+    try {
+      // The route resolves the billing ROOT itself, so passing a member's id is
+      // safe and the response says whose ledger came back.
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/spend/breakdown`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
+      );
+      if (isStale()) return;
+      setSpendLedgerData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      setSpendLedgerData(null);
+      setSpendLedgerError(
+        error.response?.data?.error || error.response?.data?.message || "Failed to load the spend ledger"
+      );
+    } finally {
+      if (!isStale()) setSpendLedgerLoading(false);
+    }
+  };
+
+  const openSpendLedger = (user: User) => {
+    setSpendLedgerUser(user);
+    setSpendLedgerData(null);
+    setSpendLedgerError(null);
+    setSpendLedgerMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  useEffect(() => {
+    if (spendLedgerUser && spendLedgerMonth) {
+      fetchSpendLedger(spendLedgerUser.userId, spendLedgerMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spendLedgerUser?.userId, spendLedgerMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -2667,40 +2706,6 @@ export default function AdminDashboard() {
     }
   };
 
-  // Toggle Slack suggested-reply monitoring for a user. `enabled` true = suggestions on.
-  const handleToggleSlackSuggestedReplies = async (userId: string, enabled: boolean) => {
-    // Optimistically reflect the change so the switch responds immediately.
-    setUsers((prevUsers: User[]) =>
-      prevUsers.map((user: User) =>
-        user.userId === userId ? { ...user, slackSuggestedRepliesDisabled: !enabled } : user
-      )
-    );
-    try {
-      const response = await axios.put(
-        buildApiUrl(`/api/admin/users/${userId}/slack-suggested-replies`),
-        { enabled },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      setUsers((prevUsers: User[]) =>
-        prevUsers.map((user: User) =>
-          user.userId === userId
-            ? { ...user, slackSuggestedRepliesDisabled: response.data.slackSuggestedRepliesDisabled ?? !enabled }
-            : user
-        )
-      );
-      setSuccess(`Slack suggested replies ${enabled ? "enabled" : "disabled"} successfully!`);
-    } catch (error: any) {
-      console.error("Error updating slack suggested replies setting:", error);
-      setError(error.response?.data?.message || "Failed to update slack suggested replies setting");
-      // Revert optimistic update on failure.
-      setUsers((prevUsers: User[]) =>
-        prevUsers.map((user: User) =>
-          user.userId === userId ? { ...user, slackSuggestedRepliesDisabled: enabled } : user
-        )
-      );
-    }
-  };
-
   const handleSaveAdminSlackChannel = async () => {
     try {
       setAdminSlackChannelLoading(true);
@@ -3119,35 +3124,48 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleGrantTokenBonus = async () => {
-    if (!grantBonusUserId || !grantBonusAmount) return;
-    const amount = parseInt(grantBonusAmount.replace(/,/g, ''), 10);
-    if (isNaN(amount) || amount <= 0) {
-      setError("Bonus amount must be a positive number");
+  const handleGrantUsageCredit = async () => {
+    if (!usageCreditUserId || !usageCreditAmount || !usageCreditReason.trim()) return;
+    const amountUsd = Number(usageCreditAmount.replace(/,/g, ''));
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      setError("Usage credit must be a positive dollar amount");
       return;
     }
     try {
-      setGrantBonusLoading(true);
+      setUsageCreditLoading(true);
       const response = await axios.post(
-        buildApiUrl(`/api/admin/users/${grantBonusUserId}/token-bonus`),
-        { bonusTokens: amount },
+        buildApiUrl(`/api/admin/users/${usageCreditUserId}/llm-usage-credit`),
+        {
+          amountUsd,
+          reason: usageCreditReason.trim(),
+          idempotencyKey: usageCreditIdempotencyKey,
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       if (response.status === 200) {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
-            user.userId === grantBonusUserId
-              ? { ...user, tokenAllowanceBonus: response.data.tokenAllowanceBonus }
+            user.userId === usageCreditUserId
+              ? {
+                  ...user,
+                  llmUsageCredits: {
+                    ...(user.llmUsageCredits || { month: response.data.month }),
+                    month: response.data.month,
+                    totalAdminGrantedMicroUsd: Math.round(response.data.totalAdminGrantedUsd * 1_000_000),
+                  },
+                }
               : user
           )
         );
-        setSuccess(`Granted ${amount.toLocaleString()} bonus tokens to ${grantBonusEmail}`);
-        setGrantBonusDialogOpen(false);
+        setSuccess(response.data.granted
+          ? `Granted $${amountUsd.toFixed(2)} of one-time usage to ${usageCreditEmail}`
+          : "This usage credit was already granted; no duplicate was added.");
+        setUsageCreditDialogOpen(false);
       }
     } catch (error: any) {
-      setError(error.response?.data?.message || "Failed to grant token bonus");
+      setError(error.response?.data?.message || "Failed to grant usage credit");
     } finally {
-      setGrantBonusLoading(false);
+      setUsageCreditLoading(false);
     }
   };
 
@@ -3363,7 +3381,9 @@ export default function AdminDashboard() {
     "Market Research",
     "Competitor Analysis",
     "Other",
-  ];
+];
+
+const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
   const marketingChannelOptions = [
     "Meta",
@@ -3375,52 +3395,132 @@ export default function AdminDashboard() {
     "Other",
   ];
 
+  const currentAdminTab = ADMIN_TABS.find((adminTab) => adminTab.value === tabValue);
+
   if (adminError) {
     return <Alert severity="error">{adminError}</Alert>;
   }
 
   return (
-    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
-      <Typography variant="h4" component="h1" gutterBottom>
-        Admin Dashboard
-      </Typography>
-
-      <Paper sx={{ width: "100%", mt: 3 }}>
-        <Box sx={{ borderBottom: 1, borderColor: "divider" }}>
-          <Tabs
-            value={tabValue}
-            onChange={handleTabChange}
-            aria-label="admin tabs"
-            variant="scrollable"
-            scrollButtons="auto"
-          >
-            <Tab label="Overview" {...a11yProps(0)} />
-            <Tab label="Announcements" {...a11yProps(1)} />
-            <Tab label="Users" {...a11yProps(2)} />
-            <Tab label="Waitlist" {...a11yProps(3)} />
-            <Tab label="Tasks" {...a11yProps(4)} />
-            <Tab label="Workflows" {...a11yProps(5)} />
-            <Tab label="Chat History" {...a11yProps(6)} />
-            <Tab label="Knowledge Base" {...a11yProps(7)} />
-            <Tab label="Agent Mode" {...a11yProps(8)} />
-            <Tab label="Image Models (Legacy)" {...a11yProps(9)} />
-            <Tab label="Default Prompts" {...a11yProps(10)} />
-            <Tab label="Benchmarks" {...a11yProps(11)} />
-            <Tab label="Subscriptions" {...a11yProps(12)} />
-            <Tab label="MCP Servers" {...a11yProps(13)} />
-            <Tab label="Result Endpoints" {...a11yProps(14)} />
-            <Tab label="Scoring Judges" {...a11yProps(15)} />
-            <Tab label="CRM" {...a11yProps(17)} />
-            <Tab label="Revenue" {...a11yProps(18)} />
-            <Tab label="Funnel" {...a11yProps(19)} />
-            <Tab label="Alert Emails" {...a11yProps(18)} />
-            <Tab label="Onboarding" {...a11yProps(20)} />
-            <Tab label="Connected Accounts" {...a11yProps(21)} />
-            <Tab label="Contractors" {...a11yProps(22)} />
-            <Tab label="Emma MCP" {...a11yProps(23)} />
-            <Tab label="LLM Costs" {...a11yProps(24)} />
-            <Tab label="Usage & Cost" {...a11yProps(25)} />
-          </Tabs>
+    <>
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: { xs: "column", md: "row" },
+        alignItems: "stretch",
+        flexGrow: 1,
+        minHeight: { md: "calc(100vh - 58px)" },
+        bgcolor: "background.default",
+      }}
+    >
+      {/* Admin sidebar — seven named sections (ENG-1707 round 2). Grouping is presentational; ?tab= deep links are unchanged. */}
+      <Box
+        component="nav"
+        aria-label="Admin sections"
+        sx={{
+          width: { xs: "100%", md: 232 },
+          flexShrink: 0,
+          bgcolor: "background.paper",
+          borderRight: { md: "1px solid" },
+          borderBottom: { xs: "1px solid", md: 0 },
+          borderColor: "divider",
+          px: 1.25,
+          py: 1.5,
+          position: { md: "sticky" },
+          top: 0,
+          alignSelf: { md: "flex-start" },
+          maxHeight: { xs: 280, md: "100vh" },
+          overflowY: "auto",
+          scrollbarWidth: "thin",
+          scrollbarColor: (theme) => `${alpha(theme.palette.text.primary, 0.16)} transparent`,
+          "&::-webkit-scrollbar": { width: 6 },
+          "&::-webkit-scrollbar-thumb": { bgcolor: (theme) => alpha(theme.palette.text.primary, 0.16), borderRadius: 3 },
+        }}
+      >
+        {ADMIN_NAVIGATION_SECTIONS.map((section, sectionIndex) => (
+          <Box key={section.label} sx={{ mb: 0.75 }}>
+            <Typography
+              component="div"
+              sx={{
+                px: 1.25,
+                pt: sectionIndex === 0 ? 0.5 : 1.5,
+                pb: 0.5,
+                fontSize: "0.625rem",
+                fontWeight: 700,
+                letterSpacing: "0.07em",
+                textTransform: "uppercase",
+                color: "text.disabled",
+              }}
+            >
+              {section.label}
+            </Typography>
+            {section.tabs.map((adminTab) => {
+              const selected = tabValue === adminTab.value;
+              return (
+                <Button
+                  key={adminTab.slug}
+                  role="tab"
+                  aria-selected={selected}
+                  {...a11yProps(adminTab.value)}
+                  onClick={(event) => handleTabChange(event, adminTab.value)}
+                  fullWidth
+                  disableElevation
+                  sx={{
+                    justifyContent: "flex-start",
+                    textAlign: "left",
+                    my: "1px",
+                    px: 1.25,
+                    py: 0.875,
+                    minHeight: 0,
+                    borderRadius: "6px",
+                    fontSize: "0.8125rem",
+                    lineHeight: 1.35,
+                    fontWeight: selected ? 700 : 500,
+                    color: selected ? "primary.dark" : "text.secondary",
+                    bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "transparent",
+                    "&:hover": { bgcolor: selected ? (theme) => alpha(theme.palette.primary.main, 0.14) : "background.default", color: selected ? "primary.dark" : "text.primary" },
+                    "&.Mui-focusVisible": { boxShadow: (theme) => `0 0 0 2px ${alpha(theme.palette.primary.main, 0.35)}` },
+                  }}
+                >
+                  {adminTab.label}
+                </Button>
+              );
+            })}
+          </Box>
+        ))}
+      </Box>
+      <Box sx={{ minWidth: 0, flexGrow: 1, display: "flex", flexDirection: "column" }}>
+        {/* Page header for the selected admin surface: title, optional description, and surface-level actions. */}
+        <Box
+          sx={{
+            px: 3,
+            pt: 3,
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "flex-start",
+            gap: 1.5,
+          }}
+        >
+          <Box sx={{ flexGrow: 1, minWidth: 200 }}>
+            <Typography component="h1" sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, letterSpacing: "-0.01em" }}>
+              {currentAdminTab?.label ?? "Admin"}
+            </Typography>
+            {currentAdminTab && ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug] && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+                {ADMIN_TAB_DESCRIPTIONS[currentAdminTab.slug]}
+              </Typography>
+            )}
+          </Box>
+          {tabValue === ADMIN_TAB_MAP.users && (
+            <Box sx={{ display: "flex", gap: 1, flexShrink: 0, flexWrap: "wrap" }}>
+              <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
+                Resync Payments
+              </Button>
+              <Button variant="contained" size="small" disableElevation startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
+                Sync to CRM
+              </Button>
+            </Box>
+          )}
         </Box>
 
         <TabPanel value={tabValue} index={0}>
@@ -4156,9 +4256,9 @@ export default function AdminDashboard() {
             const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0 || subscriptionExpired.length > 0;
             if (!hasAttention) return null;
             return (
-              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderRadius: 2, boxShadow: "none", borderColor: (theme) => alpha(theme.palette.error.main, 0.35), bgcolor: (theme) => alpha(theme.palette.error.main, 0.08) }}>
                 <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
-                  ⚠️ Attention Needed
+                  Attention needed
                 </Typography>
                 {pastDue.length > 0 && (
                   <Box sx={{ mb: 1.5 }}>
@@ -4211,8 +4311,8 @@ export default function AdminDashboard() {
               </Paper>
             );
           })()}
-          {/* Summary cards - Stripe-style muted design */}
-          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+          {/* Summary cards — one even row on desktop, wraps to a grid on narrower widths */}
+          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))", md: "repeat(4, minmax(0, 1fr))", lg: "repeat(7, minmax(0, 1fr))" }, gap: 1.25, mb: 2.5 }}>
             {(() => {
               const active = contextUsers.filter(u => u.isActive !== false);
               const paying = contextUsers.filter(u => u.subscription_status === "active");
@@ -4238,15 +4338,15 @@ export default function AdminDashboard() {
                 { label: "Showing", value: sortedUsers.length, sub: undefined },
               ];
             })().map((stat) => (
-              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
-                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
-                  {stat.value}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
+              <Paper key={stat.label} variant="outlined" sx={{ px: 1.75, py: 1.5, minWidth: 0, borderRadius: 2, boxShadow: "none", borderColor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.35) : "divider", bgcolor: stat.warn ? (theme) => alpha(theme.palette.error.main, 0.08) : "background.paper" }}>
+                <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontSize: "0.6875rem", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {stat.label}
                 </Typography>
+                <Typography sx={{ fontSize: "1.25rem", fontWeight: 700, lineHeight: 1.3, mt: 0.25, color: stat.warn ? "error.main" : "text.primary" }}>
+                  {stat.value}
+                </Typography>
                 {stat.sub && (
-                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.6875rem", mt: 0.25, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {stat.sub}
                   </Typography>
                 )}
@@ -4254,13 +4354,13 @@ export default function AdminDashboard() {
             ))}
           </Box>
           {/* Filter bar */}
-          <Box sx={{ display: "flex", gap: 1.5, mb: 2, alignItems: "center" }}>
+          <Box sx={{ display: "flex", gap: 1.25, mb: 2, alignItems: "center", flexWrap: "wrap" }}>
             <TextField
               size="small"
               placeholder="Search users..."
               value={userSearchQuery}
               onChange={(e) => setUserSearchQuery(e.target.value)}
-              sx={{ minWidth: 240 }}
+              sx={{ flex: "1 1 220px", maxWidth: 360 }}
               InputProps={{
                 startAdornment: (
                   <InputAdornment position="start">
@@ -4305,7 +4405,7 @@ export default function AdminDashboard() {
                 />
               }
               label={<Typography variant="body2">Has usage</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             <FormControlLabel
               control={
@@ -4319,35 +4419,18 @@ export default function AdminDashboard() {
                 />
               }
               label={<Typography variant="body2">Hide bots</Typography>}
-              sx={{ ml: 0 }}
+              sx={{ ml: 0, mr: 0, whiteSpace: "nowrap" }}
             />
             {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all" || userFilterHasUsage || !userFilterHideBotLike) && (
               <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); setUserFilterHasUsage(false); setUserFilterHideBotLike(true); loadUsers(true); }}>
                 Clear
               </Button>
             )}
-            <Box sx={{ flexGrow: 1 }} />
-            <Button variant="outlined" size="small" startIcon={resyncPaymentsLoading ? <CircularProgress size={14} /> : <SyncIcon />} onClick={handleResyncPayments} disabled={resyncPaymentsLoading}>
-              Resync Payments
-            </Button>
-            <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
-              Sync to CRM
-            </Button>
           </Box>
-          <Box sx={{ mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-              <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channels:</Typography>
-              <Button
-                variant="contained"
-                size="small"
-                onClick={handleSaveAdminSlackChannel}
-                disabled={adminSlackChannelLoading}
-              >
-                {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
-              </Button>
-              {adminSlackChannelSaved && (
-                <Typography variant="caption" color="success.main">Saved!</Typography>
-              )}
+          <Box sx={{ mb: 2, px: 1.75, py: 1.25, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, bgcolor: 'background.default', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ minWidth: 150 }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600, lineHeight: 1.3 }}>Admin Slack channels</Typography>
+              <Typography variant="caption" color="text.secondary">Where admin alerts are posted</Typography>
             </Box>
             <Autocomplete
               multiple
@@ -4376,11 +4459,24 @@ export default function AdminDashboard() {
                   />
                 ))
               }
-              sx={{ maxWidth: 560 }}
+              sx={{ flex: '1 1 280px', maxWidth: 560, bgcolor: 'background.paper', borderRadius: 2 }}
               noOptionsText={availableSlackChannelsLoading ? "Loading channels…" : "No channels found — make sure the bot is added to the channels"}
             />
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={handleSaveAdminSlackChannel}
+                disabled={adminSlackChannelLoading}
+              >
+                {adminSlackChannelLoading ? <CircularProgress size={16} /> : 'Save'}
+              </Button>
+              {adminSlackChannelSaved && (
+                <Typography variant="caption" color="success.main">Saved</Typography>
+              )}
+            </Box>
             {adminSlackChannels.length > 0 && (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, flexBasis: '100%' }}>
                 {adminSlackChannels.map((id) => {
                   const ch = availableSlackChannels.find((c) => c.id === id);
                   return (
@@ -4398,7 +4494,7 @@ export default function AdminDashboard() {
               </Box>
             )}
           </Box>
-          <TableContainer component={Paper} variant="outlined">
+          <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, boxShadow: "none" }}>
             <Table size="small">
               <TableHead>
                 <TableRow sx={{ "& th": { fontWeight: 600, fontSize: "0.75rem", color: "text.secondary", textTransform: "uppercase", letterSpacing: "0.05em", py: 1.5 } }}>
@@ -4791,23 +4887,6 @@ export default function AdminDashboard() {
                                       resolveSlackChannelNames(channels);
                                     }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
                                   </Box>
-                                  {(() => {
-                                    const hasChannels = (user.slackChannels && user.slackChannels.length > 0) || !!user.slackChannel;
-                                    if (!hasChannels) return null;
-                                    return (
-                                      <FormControlLabel
-                                        sx={{ mt: 0.5, ml: 0 }}
-                                        control={
-                                          <Switch
-                                            size="small"
-                                            checked={!user.slackSuggestedRepliesDisabled}
-                                            onChange={(e) => handleToggleSlackSuggestedReplies(user.userId, e.target.checked)}
-                                          />
-                                        }
-                                        label={<Typography variant="caption">Suggested replies</Typography>}
-                                      />
-                                    );
-                                  })()}
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
@@ -4953,11 +5032,6 @@ export default function AdminDashboard() {
                                         </Typography>
                                       );
                                     })() : <Typography variant="body2" color="text.disabled">—</Typography>}
-                                    {user.roles?.includes("customer") && (
-                                      <Tooltip title="Grant Bonus Tokens">
-                                        <IconButton size="small" onClick={() => { setGrantBonusUserId(user.userId); setGrantBonusEmail(user.email); setGrantBonusAmount(""); setGrantBonusDialogOpen(true); }} color="primary"><AddIcon fontSize="small" /></IconButton>
-                                      </Tooltip>
-                                    )}
                                   </Box>
                                   {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
                                     <Box sx={{ mt: 0.5 }}>
@@ -4981,17 +5055,33 @@ export default function AdminDashboard() {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
                                       const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      const credits = user.llmUsageCredits?.month === currentMonth
+                                        ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000
+                                        : 0;
                                       return (
                                         <Typography variant="body2">
-                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : "∞"}
+                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
+                                          {credits > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+${credits.toFixed(2)} credits)</Typography>}
                                           <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
                                         </Typography>
                                       );
                                     })() : <Typography variant="body2" color="text.disabled">—</Typography>}
                                     {user.roles?.includes("customer") && (
-                                      <Tooltip title="View per-model burn breakdown">
-                                        <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
-                                      </Tooltip>
+                                      <>
+                                        <Tooltip title="Grant one-time usage credit">
+                                          <IconButton size="small" onClick={() => {
+                                            setUsageCreditUserId(user.userId);
+                                            setUsageCreditEmail(user.email);
+                                            setUsageCreditAmount(String(DEFAULT_ADMIN_USAGE_CREDIT_USD));
+                                            setUsageCreditReason("");
+                                            setUsageCreditIdempotencyKey(globalThis.crypto?.randomUUID?.() || `grant_${Date.now()}`);
+                                            setUsageCreditDialogOpen(true);
+                                          }} color="primary"><AddIcon fontSize="small" /></IconButton>
+                                        </Tooltip>
+                                        <Tooltip title="View per-model burn breakdown">
+                                          <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                        </Tooltip>
+                                      </>
                                     )}
                                   </Box>
                                 </Grid>
@@ -5010,6 +5100,34 @@ export default function AdminDashboard() {
                                       </Typography>
                                       <Tooltip title="View per-tool X (Twitter) cost breakdown">
                                         <IconButton size="small" onClick={() => openXBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    </Box>
+                                  </Grid>
+                                )}
+                                {/* Cross-vendor spend ledger (ENG-1838). Separate from the two
+                                    cost figures above because it answers a different question:
+                                    those are "what did this user burn on X / on models", this is
+                                    "where did this billing subject's whole month go, and why is
+                                    it paused" — from the immutable per-call ledger. */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <HelpCaption
+                                      label="Spend ledger"
+                                      help="Every AgentWeb-paid call for this billing subject this month, LLM and vendor alike, from the immutable spend ledger: by provider, feature, member and session, plus open reservations and the allowance comparison with how much of the month's LLM spend it covers. It does not explain a pause (the live cap counts LLM spend only). Read-only; nothing here changes a balance."
+                                    />
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                      <Typography variant="body2" color="text.secondary">
+                                        LLM + vendors, this month
+                                      </Typography>
+                                      <Tooltip title="Open the spend ledger (LLM + vendors)">
+                                        <IconButton
+                                          size="small"
+                                          onClick={() => openSpendLedger(user)}
+                                          color="primary"
+                                          data-testid={`open-spend-ledger-${user.userId}`}
+                                        >
+                                          <ReceiptLongIcon fontSize="small" />
+                                        </IconButton>
                                       </Tooltip>
                                     </Box>
                                   </Grid>
@@ -6654,8 +6772,8 @@ export default function AdminDashboard() {
         <TabPanel value={tabValue} index={25}>
           <UsageCostByUserTab />
         </TabPanel>
-
-      </Paper>
+        </Box>
+      </Box>
 
       {/* Satisfaction Score Override Popover */}
       <Popover
@@ -6793,34 +6911,46 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Bonus Tokens Dialog */}
-      <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
-        <DialogTitle>Grant Bonus Tokens</DialogTitle>
+      {/* Grant one-time provider-cost usage credit dialog */}
+      <Dialog open={usageCreditDialogOpen} onClose={() => setUsageCreditDialogOpen(false)}>
+        <DialogTitle>Grant One-Time Usage Credit</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
-            Grant additional tokens to <strong>{grantBonusEmail}</strong> for the current month.
+            Extend <strong>{usageCreditEmail}</strong>&apos;s cost-based hard limit for the current month. This expires at the monthly reset and is recorded in the audit ledger.
+            {" "}The standard one-time grant is ${DEFAULT_ADMIN_USAGE_CREDIT_USD}; edit the amount only when a different approved grant applies.
           </DialogContentText>
           <TextField
             autoFocus
             fullWidth
-            label="Bonus Tokens"
-            value={grantBonusAmount}
-            onChange={(e) => setGrantBonusAmount(e.target.value)}
-            placeholder="e.g. 50000"
-            type="text"
-            inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+            label="Provider usage credit (USD)"
+            value={usageCreditAmount}
+            onChange={(e) => setUsageCreditAmount(e.target.value)}
+            placeholder={`${DEFAULT_ADMIN_USAGE_CREDIT_USD}.00`}
+            type="number"
+            inputProps={{ min: 0.01, step: 0.01 }}
+          />
+          <TextField
+            fullWidth
+            required
+            multiline
+            minRows={2}
+            sx={{ mt: 2 }}
+            label="Reason / campaign"
+            value={usageCreditReason}
+            onChange={(e) => setUsageCreditReason(e.target.value)}
+            placeholder="e.g. GROW-106 founder event credit"
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setGrantBonusDialogOpen(false)} disabled={grantBonusLoading}>
+          <Button onClick={() => setUsageCreditDialogOpen(false)} disabled={usageCreditLoading}>
             Cancel
           </Button>
           <Button
-            onClick={handleGrantTokenBonus}
+            onClick={handleGrantUsageCredit}
             variant="contained"
-            disabled={grantBonusLoading || !grantBonusAmount}
+            disabled={usageCreditLoading || !usageCreditAmount || !usageCreditReason.trim()}
           >
-            {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
+            {usageCreditLoading ? <CircularProgress size={24} /> : "Grant Credit"}
           </Button>
         </DialogActions>
       </Dialog>
@@ -6924,6 +7054,39 @@ export default function AdminDashboard() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setXBreakdownUser(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Cross-vendor spend ledger (ENG-1838 / ENG-1250 §7) */}
+      <Dialog open={!!spendLedgerUser} onClose={() => setSpendLedgerUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>Spend ledger — {spendLedgerUser?.email}</span>
+          <TextField
+            select
+            size="small"
+            label="Month"
+            value={spendLedgerMonth}
+            onChange={(e) => setSpendLedgerMonth(e.target.value)}
+            sx={{ width: 170 }}
+          >
+            {recentMonthOptions(12).map((m) => (
+              <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+            ))}
+          </TextField>
+        </DialogTitle>
+        <DialogContent dividers>
+          {spendLedgerLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : spendLedgerError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }} data-testid="spend-ledger-error">
+              {spendLedgerError}
+            </Typography>
+          ) : (
+            <SpendLedgerBody data={spendLedgerData} />
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSpendLedgerUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
@@ -8390,7 +8553,7 @@ export default function AdminDashboard() {
           </Button>
         </DialogActions>
       </Dialog>
-    </Container>
+    </>
   );
 }
 
@@ -8405,6 +8568,8 @@ const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [sidebarAddendum, setSidebarAddendum] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
+  const [newChatNamedTemplate, setNewChatNamedTemplate] = useState("Hey {firstName}! Let's get after it");
+  const [newChatAnonymousText, setNewChatAnonymousText] = useState("Hey! Let's get after it");
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
@@ -8414,6 +8579,7 @@ const AgentModeSettings = () => {
   const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
+  const [savingNewChatHeroGreeting, setSavingNewChatHeroGreeting] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
@@ -8460,6 +8626,7 @@ const AgentModeSettings = () => {
 
       // Load welcome message
       await loadWelcomeMessage();
+      await loadNewChatHeroGreeting();
 
       // Load conversation starters
       await loadConversationStarters();
@@ -8605,6 +8772,20 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading welcome message:', error);
       throw error;
+    }
+  };
+
+  const loadNewChatHeroGreeting = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (typeof response.data?.namedTemplate === 'string' && typeof response.data?.anonymousText === 'string') {
+        setNewChatNamedTemplate(response.data.namedTemplate);
+        setNewChatAnonymousText(response.data.anonymousText);
+      }
+    } catch (loadError) {
+      console.error('Error loading New Chat hero greeting:', loadError);
     }
   };
 
@@ -9273,6 +9454,45 @@ const AgentModeSettings = () => {
       setError('Failed to save welcome message');
     } finally {
       setSavingWelcomeMessage(false);
+    }
+  };
+
+  const saveNewChatHeroGreeting = async () => {
+    try {
+      setSavingNewChatHeroGreeting(true);
+      setError('');
+      setSuccess('');
+      const response = await axios.put(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        namedTemplate: newChatNamedTemplate,
+        anonymousText: newChatAnonymousText,
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      setNewChatNamedTemplate(response.data.namedTemplate);
+      setNewChatAnonymousText(response.data.anonymousText);
+      setSuccess('New Chat greeting updated successfully!');
+    } catch (saveError: any) {
+      console.error('Error saving New Chat hero greeting:', saveError);
+      setError(saveError.response?.data?.error || 'Failed to save New Chat greeting');
+    } finally {
+      setSavingNewChatHeroGreeting(false);
+    }
+  };
+
+  const resetNewChatHeroGreeting = async () => {
+    try {
+      setSavingNewChatHeroGreeting(true);
+      setError('');
+      setSuccess('');
+      const response = await axios.delete(buildApiUrl('/api/agent-mode/new-chat-hero-greeting'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setNewChatNamedTemplate(response.data.namedTemplate);
+      setNewChatAnonymousText(response.data.anonymousText);
+      setSuccess('Reset New Chat greeting to default.');
+    } catch (resetError) {
+      console.error('Error resetting New Chat hero greeting:', resetError);
+      setError('Failed to reset New Chat greeting');
+    } finally {
+      setSavingNewChatHeroGreeting(false);
     }
   };
 
@@ -10168,6 +10388,56 @@ const AgentModeSettings = () => {
             variant="outlined"
             sx={{ fontFamily: 'monospace', '& .MuiInputBase-input': { color: 'text.secondary' } }}
           />
+        </CardContent>
+      </Card>
+
+      {/* New Chat hero greeting — presentation only, never injected into Emma's prompt. */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Box>
+              <Typography variant="h6">New Chat greeting</Typography>
+              <Typography variant="body2" color="text.secondary">
+                The short greeting beside Emma's onboarding head. It is not chat context or a workplan message.
+              </Typography>
+            </Box>
+            <Box>
+              <Button variant="outlined" onClick={resetNewChatHeroGreeting} disabled={savingNewChatHeroGreeting} sx={{ mr: 1 }}>
+                Reset to Default
+              </Button>
+              <Button variant="contained" onClick={saveNewChatHeroGreeting} disabled={savingNewChatHeroGreeting}>
+                {savingNewChatHeroGreeting ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+          <TextField
+            fullWidth
+            label="Named greeting"
+            value={newChatNamedTemplate}
+            onChange={(event) => setNewChatNamedTemplate(event.target.value)}
+            helperText={`${newChatNamedTemplate.length}/120 characters. Use {firstName} exactly once. Example: Hey {firstName}! Let's get after it`}
+            inputProps={{ maxLength: 120 }}
+            sx={{ mb: 2 }}
+          />
+          <TextField
+            fullWidth
+            label="Anonymous greeting"
+            value={newChatAnonymousText}
+            onChange={(event) => setNewChatAnonymousText(event.target.value)}
+            helperText={`${newChatAnonymousText.length}/120 characters. Shown when the account has no explicit display name. Plain text only.`}
+            inputProps={{ maxLength: 120 }}
+          />
+          <Box mt={2} p={2} sx={{ bgcolor: 'action.hover', borderRadius: 1 }}>
+            <Typography variant="caption" color="text.secondary" display="block" gutterBottom>
+              Preview
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-named-preview">
+              Named (e.g. Harsha): {newChatNamedTemplate.split('{firstName}').join('Harsha')}
+            </Typography>
+            <Typography variant="body2" data-testid="new-chat-greeting-anonymous-preview">
+              Anonymous: {newChatAnonymousText}
+            </Typography>
+          </Box>
         </CardContent>
       </Card>
 

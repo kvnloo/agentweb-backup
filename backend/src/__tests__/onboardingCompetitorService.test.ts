@@ -680,6 +680,7 @@ describe("onboardingCompetitorService", () => {
             icp: [{ title: "preserved", description: "icp", valueProposition: "vp", buyerPersonas: [] }],
             createdAt: "2026-04-01T00:00:00.000Z",
             updatedAt: "2026-04-01T00:00:00.000Z",
+            icpUpdatedAt: "2026-04-01T00:00:00.000Z",
           },
         });
       userDb.updateUser.mockResolvedValue({});
@@ -709,6 +710,54 @@ describe("onboardingCompetitorService", () => {
       expect(mirrorWrite.marketStrategy.updatedAt).not.toBe(
         "2026-04-01T00:00:00.000Z",
       );
+      // ENG-1955 follow-up: this write never touches `icp`, so
+      // icpUpdatedAt must survive UNCHANGED even though updatedAt bumps —
+      // userDb.updateUser fully replaces the marketStrategy map, so
+      // dropping this field here would erase a real ICP edit's timestamp
+      // and silently reintroduce the staleness bug on the very next
+      // GET /icp/filters call, for every onboarded user (this competitor
+      // mirror runs unconditionally right after ICP generation).
+      expect(mirrorWrite.marketStrategy.icpUpdatedAt).toBe(
+        "2026-04-01T00:00:00.000Z",
+      );
+    });
+
+    it("preserves a MISSING icpUpdatedAt as missing, rather than inventing one (ENG-1955 follow-up)", async () => {
+      const personas = [samplePersona(1), samplePersona(2)];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+          icps: personas,
+          competitorStatus: "running",
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-25T11:59:00.000Z",
+        })
+        // No icpUpdatedAt on the existing record at all (pre-ENG-1955 data).
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          marketStrategy: {
+            businessOverview: "existing overview",
+            competitors: [],
+            icp: [],
+            createdAt: "2026-04-01T00:00:00.000Z",
+            updatedAt: "2026-04-01T00:00:00.000Z",
+          },
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm([
+        sampleCompetitorResp(1),
+        sampleCompetitorResp(2),
+      ]);
+      await triggerCompetitorStrategyForUser("user-1", { llm: llm as any });
+
+      const mirrorWrite = userDb.updateUser.mock.calls[1][1];
+      expect(mirrorWrite.marketStrategy.icpUpdatedAt).toBeUndefined();
     });
   });
 });

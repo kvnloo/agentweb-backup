@@ -3,16 +3,19 @@
   "version": "28.4.1",
   "main": "dist/server.js",
   "scripts": {
+    "prepare": "node scripts/install-git-hooks.mjs || true",
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --exit-child --transpile-only src/server.ts",
-    "build": "node --max-old-space-size=6144 ./node_modules/typescript/bin/tsc",
+    "build": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc -p tsconfig.build.json",
     "typecheck": "node --max-old-space-size=6144 ./node_modules/typescript/bin/tsc --noEmit",
     "test": "node --max-old-space-size=4096 node_modules/.bin/jest --maxWorkers=2 --forceExit",
     "test:watch": "jest --watch",
     "test:coverage": "node --max-old-space-size=4096 node_modules/.bin/jest --coverage --maxWorkers=2 --forceExit",
+    "test:e2e:usage-runway": "node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --roots=./src/__tests__/e2e --testPathIgnorePatterns=/node_modules/ --testMatch='**/usage-runway.e2e.test.ts' --forceExit",
     "test:twins": "node --max-old-space-size=4096 node_modules/.bin/jest --forceExit --roots=./src/__tests__/twins --testPathIgnorePatterns=/node_modules/",
     "test:twins:setup": "ts-node scripts/twinsSetup.ts",
     "test:twins:teardown": "ts-node scripts/twinsTeardown.ts",
+    "refresh:openrouter-params": "ts-node --transpile-only src/scripts/refreshOpenRouterParamSnapshot.ts",
     "create-tables": "ts-node src/scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
     "test:mcp-race": "ts-node src/scripts/test-mcp-race-condition.ts",
@@ -27,7 +30,7 @@
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.26.4",
     "@anthropic-ai/sdk": "^0.80.0",
-    "@aws-sdk/client-bedrock-runtime": "^3.948.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.972.0",
     "@google-analytics/data": "^5.2.1",
     "@google-cloud/discoveryengine": "^2.1.0",
     "@google-cloud/speech": "^7.3.0",
@@ -52,7 +55,6 @@
     "@runwayml/sdk": "^3.7.0",
     "@slack/web-api": "^7.9.3",
     "@types/aws-sdk": "^2.7.4",
-    "@types/axios": "^0.9.36",
     "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
@@ -112,6 +114,8 @@
     "remark-html-katex": "^4.0.1",
     "remark-math": "^6.0.0",
     "resend": "^6.0.3",
+    "robots-parser": "^3.0.1",
+    "sanitize-html": "^2.17.7",
     "sharp": "^0.33.5",
     "socket.io": "^4.8.1",
     "stripe": "^18.2.1",
@@ -132,6 +136,7 @@
     "@types/jest": "^29.5.14",
     "@types/jsdom": "^28.0.0",
     "@types/pdf-parse": "^1.1.1",
+    "@types/sanitize-html": "^2.16.1",
     "@types/supertest": "^6.0.3",
     "@types/uuid": "^10.0.0",
     "jest": "^29.7.0",
@@ -140,5 +145,10 @@
     "ts-jest": "^29.4.4",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0"
+  },
+  "overrides": {
+    "sanitize-html": {
+      "htmlparser2": "10.1.0"
+    }
   }
 }

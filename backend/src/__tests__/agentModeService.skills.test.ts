@@ -56,6 +56,10 @@ jest.mock('../mcp/client/toolRegistry', () => ({
 
 // Import the mocked modules to access the mock functions
 import { skillService } from '../services/skillService';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { retryabilityLine, isFastTripErrorClass } from '../services/agentMode/core/errorRetryability';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+import { NON_DISPATCHABLE_FAILURE_TYPES } from '../loops/instances/agent-mode/failureRuleSet';
 import { chatbotDb } from '../services/chatbotService';
 
 
@@ -99,6 +103,12 @@ describe('AgentModeService - Skills', () => {
       expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['skill-1', 'skill-2']);
     });
 
+    /*
+     * ENG-1795. This test previously asserted the SUBSCRIPTION message for an id it names
+     * "invalid" — the conflation, written down as an expectation. An unknown id is an ID
+     * failure; reporting it as a plan limitation sends a paying customer to sales for
+     * something sales cannot fix.
+     */
     it('should return error for invalid skill IDs', async () => {
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
 
@@ -108,8 +118,539 @@ describe('AgentModeService - Skills', () => {
         'session-123'
       );
 
-      expect(result.message).toContain('not available with your current subscription');
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).toContain('invalid-skill-1');
+      expect(result.unresolvedSkillIds).toEqual(['invalid-skill-1']);
+      // The whole point: no billing claim reaches the customer for a lookup failure.
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
+      expect(result.message).not.toMatch(/not on their plan/i);
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+    });
+
+    /*
+     * ENG-1795 — the branch that had NO coverage at all.
+     *
+     * `getAllowedSkills` is mocked to `['*']` suite-wide, so every pre-existing test that
+     * asserted "not available with your current subscription" was run against a user entitled
+     * to everything. The message was pinned in five places and the condition it describes was
+     * never once constructed. These two tests build the real thing: a published skill that
+     * exists and is deliberately NOT in the account's allowedSkills.
+     */
+    describe('refusal cause is reported accurately (ENG-1795)', () => {
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      const gatedSkill = {
+        skillId: 'premium-ads', name: 'Premium Ads', description: 'Paid tier only',
+        toolNames: ['run_premium_ad'], isPublished: true, visibility: 'public',
+      };
+
+      const realUserDb = require('../services/db').userDb;
+      afterEach(() => {
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+        // The admin-check mocks below mutate the db module in place. Without this they leak
+        // into every later test and silently change which bucket __admin_tools__ lands in.
+        require('../services/db').userDb = realUserDb;
+      });
+
+      it('reports a genuinely un-entitled skill as a subscription limit', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gatedSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gatedSkill]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['some-other-skill']);
+
+        const result = await agentModeService.installSkills(['premium-ads'], 'user-123', 'session-123');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('not available with your current subscription');
+        expect(result.message).toContain('premium-ads');
+        expect(result.unentitledSkillIds).toEqual(['premium-ads']);
+        // This branch is the one where the plan claim is TRUE — it must survive the split.
+        expect(result.message).toMatch(/not on their plan/i);
+        expect(result.message).not.toMatch(/could not resolve/i);
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('subscription_blocked');
+      });
+
+      it('keeps the causes separate when one call mixes them', async () => {
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gatedSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gatedSkill]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['some-other-skill']);
+
+        const result = await agentModeService.installSkills(
+          ['premium-ads', 'no-such-skill'], 'user-123', 'session-123'
+        );
+
+        expect(result.unentitledSkillIds).toEqual(['premium-ads']);
+        expect(result.unresolvedSkillIds).toEqual(['no-such-skill']);
+        /*
+         * The ids must not be pooled under one verdict. A mixed refusal classified
+         * `subscription_blocked` would put `no-such-skill` back under a billing verdict —
+         * the exact conflation this change removes — so the unknown id wins the classification.
+         */
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('invalid_args');
+      });
+
+      it('makes no billing claim when the catalog lookup itself fails', async () => {
+        /*
+         * The FIRST getPublishedSkills call must succeed: installSkills builds the display
+         * catalog (via getSkillsAvailableToUser, which the suite delegates to getPublishedSkills)
+         * before any rejection exists to classify. Rejecting from the start instead trips
+         * installSkills' own outer try/catch and returns "An error occurred while installing
+         * skills." — which passes every assertion below identically on unfixed code, and
+         * therefore proves nothing. Only the SECOND call, inside classifySkillRejections,
+         * exercises the branch under test.
+         */
+        (skillService.getPublishedSkills as jest.Mock)
+          .mockResolvedValueOnce([])
+          .mockRejectedValue(new Error('dynamo down'));
+
+        const result = await agentModeService.installSkills(['premium-ads'], 'user-123', 'session-123');
+
+        /*
+         * An unproven absence must never be reported as an entitlement failure. If we cannot
+         * read the catalog we cannot know why the id was rejected, so the one thing we must
+         * not do is assert the customer's plan is at fault.
+         */
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('These skills are currently unavailable to install');
+        expect(result.message).not.toMatch(/not available with your current subscription/i);
+        expect(result.message).not.toMatch(/not on their plan/i);
+        expect(result.unentitledSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toEqual(['premium-ads']);
+        // Proves the classifier's catch ran, rather than installSkills' outer handler.
+        expect(result.message).not.toMatch(/an error occurred while installing skills/i);
+      });
+
+      it('routes an unavailable refusal to a class that FORBIDS substitution', async () => {
+        /*
+         * The class is not cosmetic — toolDispatch appends `retryabilityLine(class)` directly
+         * beneath this message. `empty_result`, the intuitive pick, says "the call succeeded
+         * but returned nothing … broaden the query or try a different source": it contradicts
+         * the refusal's own no-substitution sentence, and telling a model to try another
+         * source beneath a refusal is exactly how ENG-1625 produced a fabricated audit table.
+         * `tool_unavailable` ends "Do NOT present another tool's output as this tool's result".
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+        const cls = classifyToolErrorClass(new Error(result.message));
+        expect(cls).toBe('skill_install_refused');
+
+        /*
+         * The class is not cosmetic — toolDispatch appends `retryabilityLine(cls)` directly
+         * beneath this message, so its text is read by the model as the verdict. Assert the
+         * PROPERTIES that matter rather than the wording, so a future rephrase does not have
+         * to touch this test but a semantic regression does:
+         */
+        const line = retryabilityLine(cls);
+        expect(line).toMatch(/do not substitute another tool's output/i);   // the ENG-1625 guard
+        expect(line).not.toMatch(/the call succeeded/i);                    // it did not
+        expect(line).not.toMatch(/try a different source/i);                // that IS substitution
+        expect(line).not.toMatch(/install the required skill via install_skills/i); // circular here
+        expect(line).not.toMatch(/not available in this session/i);         // install_skills ran
+
+        /*
+         * The guarantee is DISPATCHABILITY, not the literal string 'bug' — `bug` is already the
+         * default for an unrecognised class, so asserting it alone passes whether or not the
+         * mapping exists. What must hold is that this class stays OUT of
+         * NON_DISPATCHABLE_FAILURE_TYPES: `unavailable` IS the ENG-1237 catalog bug, and the
+         * previous class (`model_uninstalled_tool`) silently dropped it from the investigate set.
+         */
+        const ft = classifyToolFailureType(cls);
+        expect(ft).toBe('bug');
+        expect(NON_DISPATCHABLE_FAILURE_TYPES.has(ft)).toBe(false);
+        expect(isFastTripErrorClass(cls)).toBe(true);
+      });
+
+      it('does not let a hallucinated skill ID hijack the error class', async () => {
+        /*
+         * Rejected ids are interpolated into the classified sentence, and on the unresolved
+         * path they are strings the MODEL invented. Before the markers were matched first,
+         * an id containing "403"/"500"/"404" was picked up by the embedded-status patterns —
+         * "500" yielded `upstream_5xx`, which is RETRYABLE, so a permanent refusal advertised
+         * itself as worth retrying.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        for (const badId of ['UTM Audit 404 Report', '500', 'ads 403 manager', 'install_skills_helper']) {
+          const result = await agentModeService.installSkills([badId], 'user-123', 'session-123');
+          expect(classifyToolErrorClass(new Error(result.message))).toBe('invalid_args');
+        }
+      });
+
+      it('does NOT claim a role restriction when the admin check itself fails', async () => {
+        /*
+         * `getSkillsForDisplay` adds the admin bundle inside a try/catch that swallows a
+         * `getUserById` failure, so during a DynamoDB blip a REAL admin is refused exactly like
+         * a non-admin. Asserting a role restriction there tells them "not a temporary fault"
+         * when it is exactly that, and `by_design` hides the outage from triage.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+        const mockDb = require('../services/db');
+        mockDb.userDb = { getUserById: jest.fn().mockRejectedValue(new Error('dynamo down')) };
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).not.toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/not a temporary fault/i);
+        // ...and it must stay visible to triage rather than being filed as working-as-designed.
+        const cls = classifyToolErrorClass(new Error(result.message));
+        expect(classifyToolFailureType(cls, result.message)).toBe('bug');
+      });
+
+      it('a genuine admin installs the bundle rather than being refused at all', async () => {
+        // The counterpart to the case above: when the lookup SUCCEEDS and the user is an admin,
+        // getSkillsForDisplay puts the bundle in their catalog, so there is no refusal to
+        // classify. This pins that the refusal path is reached only when something is wrong.
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+        const mockDb = require('../services/db');
+        mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: true }) };
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.success).toBe(true);
+        expect(result.forbiddenSkillIds).toBeUndefined();
+        expect(result.unavailableSkillIds).toBeUndefined();
+      });
+
+      it('keeps admin tools a role restriction even when the catalog read fails', async () => {
+        // Confirmed non-admin — the only state in which a role restriction may be asserted.
+        require('../services/db').userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: false }) };
+        /*
+         * The admin bucket is decided by a static id comparison that needs no catalog at all.
+         * Left below the try/catch, a catalog failure dropped it into the `unavailable`
+         * fallback — which asserts "this account is permitted to use it" and "support can look
+         * into it", the two false claims the forbidden bucket exists to remove. A failed lookup
+         * must not silently undo a decision that never depended on the lookup.
+         */
+        (skillService.getPublishedSkills as jest.Mock)
+          .mockResolvedValueOnce([])
+          .mockRejectedValue(new Error('dynamo down'));
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/permitted to use it/i);
+        expect(result.message).not.toMatch(/support can look into it/i);
+      });
+
+      it('PARTIAL install: the no-substitution instruction is present there too', async () => {
+        /*
+         * It matters MORE here than on the full-refusal branch. There, the dispatcher's
+         * downgrade attaches an error class whose retryability line carries its own stop
+         * signal. Here `success: true` means no class is ever assigned, so this sentence is the
+         * only thing between "the one skill the gated tool needed was the one refused" and the
+         * model presenting another tool's output as that tool's result.
+         */
+        const realSkill = {
+          skillId: 'crm-skill', name: 'CRM', description: 'CRM tools',
+          toolNames: ['search_leads'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([realSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([realSkill]);
+
+        const result = await agentModeService.installSkills(
+          ['crm-skill', 'no-such-id'], 'user-123', 'session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toMatch(/do not substitute/i);
+      });
+
+      it('does not let an un-entitled skill ID hijack the error class either', async () => {
+        /*
+         * The entitlement sentence was the one quarter left unguarded: it was matched by a
+         * pattern below the embedded-status regex, so a published skillId beginning with a
+         * "500"-shaped token classified `upstream_5xx` — which is RETRYABLE, appending "Wait
+         * briefly, then retry ONCE" beneath a permanent billing refusal.
+         */
+        const gated = {
+          skillId: '500-error-playbook', name: 'Playbook', description: 'x',
+          toolNames: ['t'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([gated]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([gated]);
+        (getAllowedSkills as jest.Mock).mockResolvedValue(['something-else']);
+
+        const result = await agentModeService.installSkills(['500-error-playbook'], 'user-123', 'session-123');
+
+        expect(result.unentitledSkillIds).toEqual(['500-error-playbook']);
+        expect(classifyToolErrorClass(new Error(result.message))).toBe('subscription_blocked');
+      });
+
+      it('classifies a role refusal as by_design, not as a bug to investigate', async () => {
+        /*
+         * `forbidden` and `unavailable` share an error class, but they are opposite kinds of
+         * event. An admin-only bundle refused to a non-admin is a ROLE boundary working as
+         * designed — routing it to `bug` seeds an "investigate the handler + propose a
+         * robustness fix" proposal in failure triage for behaviour that is correct.
+         *
+         * `unavailable` must stay `bug`: it IS the ENG-1237 catalog defect.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const forbidden = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+        const fCls = classifyToolErrorClass(new Error(forbidden.message));
+        expect(classifyToolFailureType(fCls, forbidden.message)).toBe('by_design');
+        expect(NON_DISPATCHABLE_FAILURE_TYPES.has(classifyToolFailureType(fCls, forbidden.message))).toBe(true);
+
+        const unavailable = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+        const uCls = classifyToolErrorClass(new Error(unavailable.message));
+        expect(classifyToolFailureType(uCls, unavailable.message)).toBe('bug');
+      });
+
+      it('a MIXED refusal stays investigable — the catalog half is a real defect', async () => {
+        /*
+         * Built from REAL `installSkills` output, not a hand-written approximation.
+         *
+         * `classifyToolFailureType` distinguishes the two buckets by matching prose that
+         * `describeRejections` generates — "requires admin access" present, "permitted to use
+         * it" absent. A literal fixture pins the classifier against ITSELF and not against the
+         * producer, so rewording the unavailable sentence would silently flip a real mixed
+         * refusal from `bug` to `by_design` — dropping the ENG-1237 catalog half out of the
+         * investigate set — with no test failing. Deriving the fixture is what makes a reword
+         * break here instead of in production.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const mixed = await agentModeService.installSkills(
+          ['__admin_tools__', '__other_skills__'], 'user-123', 'session-123'
+        );
+
+        // Both causes really are present in one message — otherwise this proves nothing.
+        expect(mixed.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(mixed.unavailableSkillIds).toEqual(['__other_skills__']);
+
+        const cls = classifyToolErrorClass(new Error(mixed.message));
+        expect(classifyToolFailureType(cls, mixed.message)).toBe('bug');
+
+        // And an absent message must never be read as "working as designed".
+        expect(classifyToolFailureType('skill_install_refused', undefined)).toBe('bug');
+      });
+
+      it('describes admin tools as a role restriction, not a billing or support matter', async () => {
+        // Confirmed non-admin — the only state in which a role restriction may be asserted.
+        require('../services/db').userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', isAdmin: false }) };
+        /*
+         * __admin_tools__ is gated on isAdmin/delegation. Bucketing it as "unavailable" told a
+         * non-admin "this account is permitted to use it … support can look into it" — both
+         * false, and the same species of error as the billing claim: it routes the user to a
+         * team that cannot help, and confirms the id is real and theirs to use.
+         */
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+        const result = await agentModeService.installSkills(['__admin_tools__'], 'user-123', 'session-123');
+
+        expect(result.forbiddenSkillIds).toEqual(['__admin_tools__']);
+        expect(result.message).toMatch(/requires admin access/i);
+        expect(result.message).not.toMatch(/permitted to use it/i);
+        expect(result.message).not.toMatch(/support can look into it/i);
+        expect(result.message).not.toMatch(/not available with your current subscription/i);
+      });
+
+      it('PARTIAL install: a hallucinated ID is not reported as a billing limit', async () => {
+        /*
+         * The path the original split missed. It returns `success: true` because something
+         * installed, so toolResultError yields null and NO classifier runs — this prose is
+         * the only thing the model reads. It used to append a flat "N skill(s) were not
+         * available with your subscription" over every rejected id regardless of cause, so a
+         * made-up id reached a paying customer as a billing statement. `message` is in
+         * extractMinimalToolResult's allowlist, so it persisted into the ledger too.
+         */
+        const realSkill = {
+          skillId: 'crm-skill', name: 'CRM', description: 'CRM tools',
+          toolNames: ['search_leads'], isPublished: true, visibility: 'public',
+        };
+        (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([realSkill]);
+        (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([realSkill]);
+
+        const result = await agentModeService.installSkills(
+          ['crm-skill', 'no-such-id'], 'user-123', 'session-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.installedSkills).toEqual(['CRM']);
+        expect(result.message).not.toMatch(/were not available with your subscription/i);
+        expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+        expect(result.unresolvedSkillIds).toEqual(['no-such-id']);
+      });
+    });
+
+    /*
+     * Observed live (delegated session a1a6345a, Phoenix): the skill gate refused
+     * `audit_ad_utm_coverage`, this install was refused by subscription, and the model then ran
+     * an unrelated AD LIST and presented a confident "UTM Tagging Audit Summary — PASS, 6/6
+     * tagged" table built from it, as though the audit had run. A downstream truthfulness guard
+     * appended a correction, but BELOW the fabricated table.
+     *
+     * The model cannot be unit-tested into honesty, but the two inputs it reasons from can be
+     * pinned: this refusal must read as a hard failure, and it must carry an explicit
+     * instruction not to substitute another tool's output for the gated one.
+     */
+    it('reports a subscription refusal as a hard failure, not an ambiguous message', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      // `success` was previously left undefined here while the success path sets `success: true`,
+      // so a refusal did not necessarily read as a failure at all.
+      expect(result.success).toBe(false);
+    });
+
+    it('tells the model not to substitute another tool for the one that needed the skill', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+
+      /*
+       * The no-substitution instruction is the invariant here, and it must hold on EVERY
+       * refusal branch — the Phoenix session's fabricated audit table did not depend on which
+       * reason the install was refused for. ENG-1795 split one refusal into three; the clause
+       * is appended once, outside the branch, so this assertion now covers all of them.
+       */
+      expect(result.message).toMatch(/do not substitute/i);
+      // Was `/not on their plan/i`: this fixture is an entitled-but-empty `__other_skills__`,
+      // which is not a plan limitation at all, so asserting that phrasing pinned the bug.
+      expect(result.message).toMatch(/currently unavailable to install/i);
+      expect(result.message).not.toMatch(/not on their plan/i);
+    });
+
+    /*
+     * The outcome has to survive MINIMIZATION, not just be returned.
+     *
+     * The dispatcher does not store the result — it stores
+     * `extractMinimalToolResult(result, 'install_skills')`, and that function's default branch
+     * returns `{}`. So a refusal that reads perfectly here can still reach the ledger as an
+     * empty object with no `success: false` at all, and anything downstream reading the ledger
+     * to find out whether the install worked sees a shape indistinguishable from a clean one.
+     *
+     * That is not hypothetical: `extractMinimalToolResult`'s own ENG-1207 comment records
+     * `reconcileUnconsumedCursors` being inert in production for exactly this reason while all
+     * of its unit tests passed, because those tests built ledger entries by hand and so never
+     * crossed this function. This test crosses it deliberately.
+     */
+    it('a refused install still reads as a failure AFTER ledger minimization', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+
+      const refusal = await agentModeService.installSkills(['__other_skills__'], 'user-123', 'session-123');
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(refusal, 'install_skills');
+
+      expect(ledgerResult.success).toBe(false);
+      // The refusal must still be readable in the ledger, not just in the returned object.
+      // (ENG-1795: `__other_skills__` with an empty pool is the UNAVAILABLE branch, not the
+      // subscription one — what this test guards is that a refusal survives minimization at
+      // all, which is independent of which branch produced it.)
+      expect(String(ledgerResult.message)).toMatch(/currently unavailable to install/i);
+    });
+
+    it('a PARTIAL install survives minimization as partial, not as a clean success', async () => {
+      // success:true (something installed) + the refused ids. Without the ids the ledger says
+      // only "the install succeeded", which is true and useless: the one skill the gated tool
+      // needed may be exactly the one that was refused.
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.success).toBe(true);
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.success).toBe(true);
+      expect(ledgerResult.rejectedSkillIds).toEqual(['utm-audit']);
+    });
+
+    /*
+     * The real incident shape, and the one the earlier version of this fix quietly did not
+     * cover: `installSkills` resolves rejected ids against `getSkillsForDisplay` ->
+     * `getSkillsAvailableToUser`, which is ALREADY filtered to this user's subscription tier. A
+     * skill rejected FOR being outside that tier was excluded from that map before
+     * `rejectedSkillIds` was even computed, so resolving `rejectedToolNames` against it always
+     * found nothing — the exact skill the notice most needs to name resolved to an empty array,
+     * silently falling back to the unscoped (turn-global) path every time. `utm-audit` here is a
+     * real, published skill (present in the FULL catalog, `getPublishedSkills`) that this user's
+     * tier does not include (absent from `getSkillsAvailableToUser`) — the live incident's shape,
+     * not a skill that simply does not exist.
+     */
+    it('resolves rejectedToolNames for a skill excluded by subscription tier, not just an unknown id', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan, matching how a subscription refusal
+      // actually reaches installSkills in production.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit'],
+        'user-123',
+        'session-123',
+      );
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit']);
+      expect(partial.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toEqual(['audit_ad_utm_coverage']);
+    });
+
+    /*
+     * Regression: a rejection mixing a real skill id with a virtual one (`__admin_tools__`,
+     * `__other_skills__`) used to resolve rejectedToolNames from the real id ONLY — a non-empty
+     * array that reads as a fully scoped rejection while silently dropping every admin/other
+     * tool from it. A gated admin tool refused the same turn would then wrongly read as
+     * available, since its name is absent from a rejectedToolNames that looks complete. The
+     * field must be omitted entirely rather than partially populated, so the notice's per-tool
+     * scoping falls back to its safe (unscoped) path instead of a falsely precise one.
+     */
+    it('omits rejectedToolNames entirely when one of the rejected ids cannot be resolved (mixed real + virtual id)', async () => {
+      const fullCatalog = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        {
+          skillId: 'utm-audit',
+          name: 'UTM Audit',
+          description: 'Desc',
+          toolNames: ['audit_ad_utm_coverage'],
+          isPublished: true,
+        },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(fullCatalog);
+      // Tier-filtered: only skill-1 is on this user's plan — utm-audit resolves via the full
+      // catalog fallback, same as the subscription-tier test above.
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([fullCatalog[0]]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      // Both utm-audit AND __admin_tools__ are rejected together in the SAME call. utm-audit
+      // resolves fine (via the full-catalog fallback); __admin_tools__ never enters availableById
+      // (non-admin, non-delegated caller) and never appears in getPublishedSkills (it is
+      // synthesized, not a real published skill), so it cannot resolve in either catalog. The old
+      // code read this as a fully-scoped rejection naming only utm-audit's tool — silently
+      // dropping every admin tool from it.
+      const partial = await agentModeService.installSkills(
+        ['skill-1', 'utm-audit', '__admin_tools__'],
+        'user-123',
+        'session-123',
+        false,
+      );
+
+      expect(partial.rejectedSkillIds).toEqual(['utm-audit', '__admin_tools__']);
+      expect(partial.rejectedToolNames).toBeUndefined();
+
+      const ledgerResult = (agentModeService as any).extractMinimalToolResult(partial, 'install_skills');
+      expect(ledgerResult.rejectedToolNames).toBeUndefined();
     });
 
     it('should filter out unpublished skills', async () => {
@@ -233,7 +774,7 @@ describe('AgentModeService - Skills', () => {
       expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['skill-1', '__other_skills__']);
     });
 
-    it('should allow an org member to install a private skill owned by another org member', async () => {
+    it('allows a restricted subscriber to install a sharing-enabled same-org private skill', async () => {
       const orgId = 'org-abc';
       const orgMemberUserId = 'member-user-456';
       const orgPrivateSkill = {
@@ -251,9 +792,14 @@ describe('AgentModeService - Skills', () => {
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([orgPrivateSkill]);
       (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
 
-      // Patch the dynamic import of db so getUserById returns the org member
       const mockDb = require('../services/db');
-      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: orgMemberUserId, orgId }) };
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: orgMemberUserId, orgId, orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId, ownerUserId: 'owner-user-123',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['org-private-skill-1']);
 
       const result = await agentModeService.installSkills(
         ['org-private-skill-1'],
@@ -283,9 +829,16 @@ describe('AgentModeService - Skills', () => {
       // getSkillsAvailableToUser does NOT return org skill for outsider
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
 
-      // Outsider is in a different org
       const mockDb = require('../services/db');
-      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: outsiderUserId, orgId: 'org-different' }) };
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: outsiderUserId, orgId: 'org-different', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId: 'org-different', ownerUserId: 'other-owner',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+
+      // Pinned explicitly: without this the test inherits getPublishedSkills from an earlier
+      // case and would flip buckets if that unrelated fixture ever changed.
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
 
       const result = await agentModeService.installSkills(
         ['org-private-skill-1'],
@@ -293,8 +846,75 @@ describe('AgentModeService - Skills', () => {
         'session-xyz'
       );
 
-      expect(result.message).toContain('not available with your current subscription');
+      /*
+       * ENG-1795: "could not resolve" is both more accurate AND less leaky here. The old
+       * subscription wording implicitly confirmed to an outsider that `org-private-skill-1`
+       * exists and is merely unpurchased; an unresolvable id reveals nothing about another
+       * org's private catalog.
+       */
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+    });
+    it('rejects a same-org private skill when skill sharing is disabled', async () => {
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: false, editors: [] } } }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+      const result = await agentModeService.installSkills(['org-private'], 'member-1', 'session-1');
+      expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
+      // ENG-1795: sharing being switched off is a config state, not a billing one.
+      expect(result.message).toContain('Could not resolve these skill IDs to any known skill');
+      expect(result.message).not.toMatch(/not available with your current subscription/i);
+      expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
+    });
+
+    it('installs __other_skills__ when only an unpublished org-shared skill claims the remaining tools (ENG-1237 production repro)', async () => {
+      // Mirrors the harsha@agentweb.pro session: getSkillsAvailableToUser mixes a
+      // published skill in with an unpublished org-shared draft skill (included for
+      // install purposes only). Before the fix, the draft skill's toolNames silently
+      // counted as "associated", leaving no unassociated tools, so __other_skills__
+      // never appeared in getSkillsForDisplay and install_skills(['__other_skills__'])
+      // rejected with "not available with your current subscription".
+      const orgId = 'org-1';
+      const userId = 'harsha-user-id';
+      const publishedSkill = {
+        skillId: 'crm-skill', name: 'CRM & Lead Management', description: 'CRM tools',
+        toolNames: ['search_leads'], isPublished: true,
+      };
+      const unpublishedOrgSkill = {
+        skillId: 'draft-landing-pages', name: 'Landing Pages (draft)', description: 'Landing page tools',
+        toolNames: ['list_landing_pages'], isPublished: false, ownerId: 'other-owner', orgId, visibility: 'private',
+      };
+
+      const mockTools = [
+        { name: 'search_leads', definition: { function: { description: 'search leads' } } },
+        { name: 'list_landing_pages', definition: { function: { description: 'list landing pages' } } },
+      ];
+
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([publishedSkill, unpublishedOrgSkill]);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId, orgId, orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId, ownerUserId: 'other-owner',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const result = await agentModeService.installSkills(
+        ['__other_skills__'],
+        userId,
+        'session-0e73690d'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('other_skills');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-0e73690d', ['__other_skills__']);
     });
   });
 
@@ -407,6 +1027,27 @@ describe('AgentModeService - Skills', () => {
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('orphan_tool');
       expect(result[0].description).toBe('orphan desc');
+    });
+
+    it('should NOT treat a tool as associated when only an unpublished (private/org-shared) skill claims it (ENG-1237)', () => {
+      // loadAuthorizedSkillCatalog's org-sharing bypass mixes unpublished private/
+      // org skills into the same list passed here — a draft skill nobody published
+      // must not be able to silently steal a tool out of __other_skills__ for the
+      // whole org.
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'draft1', name: 'Draft Skill', toolNames: ['tool1', 'orphan_tool'], isPublished: false }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('orphan_tool');
     });
 
     it('should exclude infrastructure tools', () => {
@@ -683,6 +1324,91 @@ describe('AgentModeService - Skills', () => {
     });
   });
 
+  // ENG-508 / ENG-867: the "LinkedIn Profile Reader" skill grants exactly one tool,
+  // linkedin_outreach. Prove that installing it makes that tool reach a session's
+  // toolbox — even for a user whose subscription does NOT include it (the Founder
+  // audit case) — and that WITHOUT the skill the tool is excluded, which is the
+  // stale-headline pre-fix state. This exercises the real getFilteredTools gating.
+  describe('LinkedIn Profile Reader skill grant (ENG-508)', () => {
+    beforeEach(async () => {
+      const mockTools = [
+        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
+        { name: 'you_search_web', definition: { function: { name: 'you_search_web', description: 'Search the web' } } },
+        { name: 'linkedin_outreach', definition: { function: { name: 'linkedin_outreach', description: 'LinkedIn outreach incl. get-profile' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      await agentModeService.initialize();
+
+      // Realistic subscription filter: only the explicitly-allowed names survive.
+      const { filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      (mockFilterFn as jest.Mock).mockImplementation((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+    });
+
+    it('exposes linkedin_outreach when the skill is installed, even under a subscription that omits it', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      // Subscription grants NOTHING extra — the tool must come solely from the
+      // session-installed skill's toolNames (getFilteredTools session-tool bypass).
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce([]);
+
+      // Precomputed allowed set = what buildSkillContext produces once the
+      // "LinkedIn Profile Reader" skill (toolNames: ['linkedin_outreach']) is associated.
+      const withSkill = new Set(['install_skills', 'linkedin_outreach']);
+      const result = await agentModeService.getFilteredTools('user-123', withSkill, []);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).toContain('linkedin_outreach');
+    });
+
+    // The step the tests below this one used to ASSUME: buildSkillContext turning the
+    // real skill RECORD into the allowed-tool set. It is gated on the skill being in
+    // the user's subscription-allowed IDs, and every tier here uses an explicit list —
+    // so a published-but-unenrolled skill silently contributes nothing.
+    it('unions linkedin_outreach from the real skill record only when the tier allows the skillId', async () => {
+      const { buildProfileReaderSkill } = require('../scripts/seed-eng508-linkedin-profile-reader-skill');
+      const skill = buildProfileReaderSkill('profile-reader-id');
+      expect(skill.toolNames).toEqual(['linkedin_outreach']);
+
+      // ENROLLED: skillId present in the subscription-allowed list → tool is granted.
+      const enrolled = (agentModeService as any).buildSkillContext(
+        [skill],
+        ['profile-reader-id'], // userAllowedSkillIds (explicit, non-wildcard tier)
+        [],
+        ['profile-reader-id']
+      );
+      expect(enrolled.allowedToolNames.has('linkedin_outreach')).toBe(true);
+
+      // NOT ENROLLED: same published skill, but the tier's explicit list omits it →
+      // its tools are dropped and the audit falls back to the stale search path.
+      const unenrolled = (agentModeService as any).buildSkillContext(
+        [skill],
+        ['some-other-skill-id'],
+        [],
+        ['profile-reader-id']
+      );
+      expect(unenrolled.allowedToolNames.has('linkedin_outreach')).toBe(false);
+    });
+
+    it('excludes linkedin_outreach when the skill is NOT installed (pre-fix stale-headline state)', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce([]);
+
+      // No LinkedIn skill associated → the authenticated tool is unreachable and the
+      // model can only fall back to you_search_web (the stale search cache).
+      const withoutSkill = new Set(['install_skills', 'you_search_web']);
+      const result = await agentModeService.getFilteredTools('user-123', withoutSkill, []);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).not.toContain('linkedin_outreach');
+      expect(toolNames).toContain('you_search_web');
+    });
+  });
+
   describe('updateConversationContext', () => {
     it('should add/update Installed Skills message', () => {
       const messages: any[] = [
@@ -888,7 +1614,8 @@ describe('AgentModeService - Skills', () => {
       // exposed to every tenant. It lives in ADMIN_SKILL_TOOL_NAMES instead.
       expect(foundationTools.has('get_registration_status')).toBe(false);
       // S3 overflow retrieval tools must always be available so the LLM can read
-      // large tool responses that were offloaded to S3 by the 10KB overflow mechanism.
+      // large tool responses that were offloaded to S3 by the
+      // TOOL_RESPONSE_S3_THRESHOLD overflow mechanism.
       expect(foundationTools.has('search_tool_response')).toBe(true);
       expect(foundationTools.has('read_tool_response')).toBe(true);
     });
@@ -903,6 +1630,9 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getAdminToolNames', () => {
+    it('ENG-1870 makes the evaluation lifecycle available to Emma administrators', () => {
+      expect(agentModeService.getAdminToolNames()).toContain('evaluation_workspace');
+    });
     it('does not expose manage_user_guide (ENG-163: legacy Notion write tool removed)', () => {
       // The admin tool registry (ADMIN_SKILL_TOOL_NAMES) must no longer carry the
       // retired manage_user_guide Notion write tool.
@@ -1066,9 +1796,60 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getSkillsForDisplay', () => {
+    it('returns a full authorized Skill snapshot without widening the display projection', async () => {
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([{ skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: [], isPublished: true, welcomeMessage: 'Start here.' }]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      await expect(agentModeService.getAuthorizedSkill('skill-1', 'user-1')).resolves.toEqual(expect.objectContaining({ welcomeMessage: 'Start here.' }));
+    });
+    it('fails closed when an upstream catalog returns another user\'s pending-review skill', async () => {
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([{ skillId: 'pending', name: 'Pending', description: 'd', toolNames: [], ownerId: 'owner-1', visibility: 'pending_review', isPublished: true }]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+      expect(result).toEqual([]);
+    });
+    it('admits an enabled same-org private skill when the restricted subscription includes it', async () => {
+      const orgSkill = { skillId: 'org-skill', name: 'Org Skill', description: 'd', toolNames: ['read_tool'], ownerId: 'owner-1', orgId: 'org-1', visibility: 'private', isPublished: false };
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: true, editors: [] } } }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([orgSkill]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue([]);
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+      expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', 'org-1');
+      expect(result).toEqual([expect.objectContaining({ skillId: 'org-skill' })]);
+    });
+    it('does not admit another member\'s private skill when org skill sharing is disabled', async () => {
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: false, editors: [] } } }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+      expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
+      expect(result).toEqual([]);
+    });
+    it.each(['user', 'org'])('preserves owned and public skills when the %s lookup fails transiently', async (failure) => {
+      const catalog = [
+        { skillId: 'own', name: 'Own', description: 'd', toolNames: [], ownerId: 'member-1' },
+        { skillId: 'public', name: 'Public', description: 'd', toolNames: [], isPublished: true },
+      ];
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: failure === 'user'
+        ? jest.fn().mockRejectedValue(new Error('transient'))
+        : jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockRejectedValue(new Error('transient')) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue(catalog);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+      expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
+      expect(result.map(skill => skill.skillId)).toEqual(['own', 'public']);
+    });
     it('should return published skills with installed status and toolNames', async () => {
       const publishedSkills = [
-        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true },
+        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true, welcomeMessage: 'Do not expose.' },
         { skillId: 'skill-2', name: 'Image Gen', description: 'Image tools', toolNames: ['generate_image'], isPublished: true },
       ];
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
@@ -1081,6 +1862,7 @@ describe('AgentModeService - Skills', () => {
         expect.objectContaining({ skillId: 'skill-1', name: 'Web Search', installed: true, toolNames: ['search_web'] }),
         expect.objectContaining({ skillId: 'skill-2', name: 'Image Gen', installed: false, toolNames: ['generate_image'] }),
       ]));
+      expect(result.find(skill => skill.skillId === 'skill-1')).not.toHaveProperty('welcomeMessage');
     });
 
     it('should filter skills by subscription when not wildcard', async () => {
@@ -1143,6 +1925,45 @@ describe('AgentModeService - Skills', () => {
       expect(otherSkill).toBeDefined();
       expect(otherSkill!.name).toBe('Other Skills');
       expect(otherSkill!.toolNames).toContain('orphan_tool');
+    });
+
+    it('does not double-list a tool under Other Skills when an unpublished skill\'s own card already shows it (ENG-1237 follow-up)', async () => {
+      // The ENG-1237 fix correctly stops an unpublished skill from removing its
+      // tools from the installable __other_skills__ pool — but that skill's own
+      // card in this same response already lists those toolNames. This is a
+      // display-only dedup: `draft_tool` must still count toward whether
+      // __other_skills__ appears at all and must still be installable through it,
+      // it just shouldn't be repeated in the rendered toolNames list.
+      const unpublishedOrgSkill = {
+        skillId: 'draft-skill', name: 'Draft Skill', description: 'd',
+        toolNames: ['draft_tool'], isPublished: false, ownerId: 'owner-1', orgId: 'org-1', visibility: 'private',
+      };
+      const mockDb = require('../services/db');
+      mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
+        orgId: 'org-1', ownerUserId: 'owner-1',
+        shareSettings: { skills: { enabled: true, editors: [] } },
+      }) };
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([unpublishedOrgSkill]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const mockToolRegistry = (agentModeService as any).toolRegistry;
+      mockToolRegistry.getAllTools.mockReturnValue([
+        { name: 'draft_tool', definition: { function: { description: 'Claimed by the draft skill' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'Claimed by nothing' } } },
+      ]);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+
+      const draftCard = result.find(s => s.skillId === 'draft-skill');
+      const otherSkill = result.find(s => s.skillId === '__other_skills__');
+      expect(draftCard!.toolNames).toContain('draft_tool');
+      // Still installable/present because the real pool is non-empty (ENG-1237 behavior).
+      expect(otherSkill).toBeDefined();
+      expect(otherSkill!.toolNames).toContain('orphan_tool');
+      // But not repeated — it's already shown on the draft skill's own card.
+      expect(otherSkill!.toolNames).not.toContain('draft_tool');
     });
   });
 });

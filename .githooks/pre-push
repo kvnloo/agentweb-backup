@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# agentweb pre-push: local verification before a push can trigger a ~31 runner-minute CI pair.
+# Installed by `npm ci` / `npm install` in backend/ (backend/package.json "prepare" ->
+# git config core.hooksPath .githooks). Bypass: `git push --no-verify` or AGENTWEB_SKIP_PREPUSH=1.
+# All logic lives in backend/scripts/ci-prepush.mjs (and backend/scripts/prepush/logic.mjs) so it
+# is cross-platform (mac dev boxes, the Argusoft EC2 box, the swarm box) and unit-testable; this
+# shim only checks the bypass, finds node, and forwards stdin. See ENG-1277.
+set -uo pipefail
+if [ "${AGENTWEB_SKIP_PREPUSH:-}" = "1" ]; then
+  echo "pre-push: skipped (AGENTWEB_SKIP_PREPUSH=1). CI is the backstop." >&2
+  exit 0
+fi
+ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$ROOT/backend/scripts/ci-prepush.mjs"
+if [ ! -f "$SCRIPT" ]; then
+  echo "pre-push: $SCRIPT missing (checkout predates the hook) — nothing to run." >&2
+  exit 0
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "pre-push: node not found on PATH — skipping local verification. CI is the backstop." >&2
+  exit 0
+fi
+# stdin carries "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref
+exec node "$SCRIPT" --remote "$1" --url "$2"

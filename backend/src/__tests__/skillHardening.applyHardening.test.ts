@@ -123,6 +123,13 @@ describe("planSkillChange", () => {
       addTools: ["list_connected_accounts"],
     });
     expect(res.appended).toEqual(["safety"]);
+    // requiredTools stays list_connected_accounts only (reverted, CodeRabbit
+    // finding 2026-08-25): the universal safety block must not instruct
+    // calling linkedin_outreach, since it's applied to skills that don't all
+    // carry that tool (Blindspot 5 — a skill without it would get a prompt
+    // instructing a tool call it can't make). Skills that DO send LinkedIn
+    // outreach carry their own additive daily-cap instruction instead — see
+    // seed-eng617-leadgen-skills.ts's LINKEDIN_PREMIUM_CAP_ASK.
     expect(res.addedTools).toEqual(["list_connected_accounts"]);
     expect(res.skill.systemPrompt).toContain(BLOCKS.safety.marker);
   });
@@ -134,7 +141,10 @@ describe("planSkillChange setPrompt (Blindspot 4 empty prompts)", () => {
     const res = planSkillChange(skill, { skillId: "s", setPrompt: "basicSubscription" });
     expect(res.promptSet).toBe(true);
     expect(res.changed).toBe(true);
-    expect(res.skill.systemPrompt).toBe(MIN_PROMPTS.basicSubscription);
+    // ENG-1336: publish-deferring prompts auto-carry the publishGate fallback block.
+    expect(res.skill.systemPrompt).toContain(MIN_PROMPTS.basicSubscription);
+    expect(res.appended).toContain("publishGate");
+    expect(res.skill.systemPrompt).toContain(BLOCKS.publishGate.marker);
   });
 
   it("does NOT overwrite a skill that already has a systemPrompt", () => {
@@ -169,5 +179,38 @@ describe("planSkillChange setPrompt (Blindspot 4 empty prompts)", () => {
     expect(res.skill.systemPrompt).toContain("meeting intelligence");
     expect(res.skill.systemPrompt).toContain(BLOCKS.failure.marker);
     expect(res.addedTools).toEqual(["x_tool"]);
+  });
+});
+
+describe("planSkillChange publish-auth fallback (ENG-1336)", () => {
+  it("auto-adds publishGate when setPrompt=linkedInEngagement omits blocks", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "linkedInEngagement" });
+    expect(res.promptSet).toBe(true);
+    expect(res.appended).toContain("publishGate");
+    expect(res.skill.systemPrompt).toContain(BLOCKS.publishGate.marker);
+  });
+
+  it("auto-adds publishGate when setPrompt=basicSubscription omits blocks", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "basicSubscription" });
+    expect(res.appended).toContain("publishGate");
+    expect(res.skill.systemPrompt).toContain(BLOCKS.publishGate.marker);
+  });
+
+  it("does not duplicate publishGate when already requested", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, {
+      skillId: "s",
+      setPrompt: "linkedInEngagement",
+      blocks: ["publishGate"],
+    });
+    expect(res.appended.filter((k) => k === "publishGate")).toHaveLength(1);
+  });
+
+  it("leaves non-deferring prompts untouched", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "crmDraft" });
+    expect(res.appended).not.toContain("publishGate");
   });
 });

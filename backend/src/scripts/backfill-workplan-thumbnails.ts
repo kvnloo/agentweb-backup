@@ -41,8 +41,10 @@ async function generateWithRetry(
   service: WorkPlanThumbnailService,
   plan: WorkPlan,
   attempt = 1,
-): Promise<WorkPlan> {
+): Promise<WorkPlan | null> {
   try {
+    // null when the plan was deleted, or a newer thumbnail action won, while
+    // this generation was running — nothing to backfill in either case.
     return await service.generateAIThumbnail(plan);
   } catch (err: any) {
     if (attempt >= MAX_RETRIES) throw err;
@@ -65,7 +67,7 @@ async function processChunk(
         console.log(`  ⏳ Generating thumbnail for "${plan.title}" (${plan.planId})...`);
         const updated = await generateWithRetry(service, plan);
 
-        if (updated.thumbnail_source === 'ai' && updated.thumbnail_url) {
+        if (updated?.thumbnail_source === 'ai' && updated.thumbnail_url) {
           console.log(`  ✅ Success: "${plan.title}" → ${updated.thumbnail_url}`);
           return {
             planId: plan.planId,

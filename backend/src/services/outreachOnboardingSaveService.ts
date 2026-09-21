@@ -34,6 +34,7 @@
 
 import { crmDb } from "./db";
 import type { PreviewProspect } from "./outreachProspectPreviewService";
+import { isAnonymizedSearchLead } from "../utils/anonymizedLinkedInLead";
 
 /** A draft message for each prospect, keyed by the prospect's stable `id`
  *  (the same id the preview endpoint emitted and the FE keyed its draft
@@ -157,9 +158,15 @@ export async function saveOutreachProspects(
       };
     }
 
-    const leads = prospects.map((p) =>
-      mapProspectToLead(p, drafts[p?.id], args.icpId),
-    );
+    // ENG-1002: belt-and-braces. The preview endpoint already drops LinkedIn's
+    // anonymized out-of-network hits, but this write is driven by whatever the
+    // client posts back — a stale bundle, or a hand-rolled call, could still
+    // carry placeholders. They have no name, email or profile URL, so they
+    // would land as un-dedupable nameless leads that every later import
+    // re-creates.
+    const leads = prospects
+      .map((p) => mapProspectToLead(p, drafts[p?.id], args.icpId))
+      .filter((lead) => !isAnonymizedSearchLead(lead));
 
     await crmDb.batchCreateLeads(leadListId, leads);
 

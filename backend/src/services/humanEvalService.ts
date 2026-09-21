@@ -5,6 +5,7 @@ import { asLoopId, asSubjectId, type NormalizedEvent } from '../loops/core/types
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { chatbotDb } from './chatbotService';
+import { userDb } from './db';
 import {
   getSlackUserDisplayName,
   getSlackUserEmail,
@@ -112,8 +113,10 @@ export interface HumanEvalCandidate {
   outputSummary: string;
   originalRequest?: string;
   action?: HumanEvalAction;
-  slackChannel: string;
-  slackMessageTs: string;
+  /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
+   *  candidate still persists and is reviewable via the queue API either way. */
+  slackChannel?: string;
+  slackMessageTs?: string;
   feedback: HumanEvalFeedback[];
   createdAt: string;
   updatedAt: string;
@@ -341,7 +344,6 @@ export class HumanEvalService {
       throw new Error('outputSummary is required');
     }
 
-    const slackChannel = await this.getEvalChannel();
     const reviewer = this.getReviewerForType(input.reviewType);
     const reviewerSlackUserId = await this.getReviewerSlackUserId(reviewer);
     const candidateId = uuidv4();
@@ -350,17 +352,10 @@ export class HumanEvalService {
     const preparedInput = await this.prepareCandidateInput(input, candidateId);
     const chatUrl = await this.resolveChatUrl(preparedInput);
 
-    const message = this.buildSlackMessage({
-      ...preparedInput,
-      candidateId,
-      reviewer,
-      reviewerSlackUserId,
-      chatUrl,
-      normalizedCategory: category,
-    });
-
-    const posted = await this.slack.postSlackMessage(slackChannel, message);
-
+    // ENG-1854: persistence no longer depends on a Slack post succeeding (or even being
+    // attempted) — a prior version built the Slack message and posted it BEFORE writing to
+    // DynamoDB, so a Slack outage or an unconfigured channel silently dropped the candidate
+    // entirely, not just the notification. Write the record first, unconditionally.
     const candidate: HumanEvalCandidate = {
       candidateId,
       reviewType: input.reviewType,
@@ -376,8 +371,6 @@ export class HumanEvalService {
       outputSummary: preparedInput.outputSummary.trim(),
       originalRequest: preparedInput.originalRequest?.trim() || undefined,
       action: preparedInput.action,
-      slackChannel: posted.channel || slackChannel,
-      slackMessageTs: posted.ts,
       feedback: [],
       createdAt: now,
       updatedAt: now,
@@ -389,12 +382,50 @@ export class HumanEvalService {
       ConditionExpression: 'attribute_not_exists(candidateId)',
     }).promise();
 
-    await this.settings.setSetting(
-      this.threadMappingKey(candidate.slackChannel, candidate.slackMessageTs),
-      candidate.candidateId,
-      'Slack thread to human eval candidate mapping',
-      'human-eval',
-    );
+    const postingReason = await this.slackPostingReasonFor(input.userId);
+    if (postingReason) {
+      try {
+        const slackChannel = await this.getEvalChannel();
+        const message = postingReason === 'exception'
+          ? this.buildConciseExceptionMessage({
+              reviewer,
+              reviewerSlackUserId,
+              chatUrl,
+              artifactUrl: preparedInput.artifactUrl,
+            })
+          : this.buildSlackMessage({
+              ...preparedInput,
+              candidateId,
+              reviewer,
+              reviewerSlackUserId,
+              chatUrl,
+              normalizedCategory: category,
+              userEmail: await this.resolveUserEmail(input.userId),
+            });
+        const posted = await this.slack.postSlackMessage(slackChannel, message);
+
+        candidate.slackChannel = posted.channel || slackChannel;
+        candidate.slackMessageTs = posted.ts;
+
+        await this.db.update({
+          TableName: HUMAN_EVAL_QUEUE_TABLE,
+          Key: { candidateId },
+          UpdateExpression: 'SET slackChannel = :c, slackMessageTs = :t',
+          ExpressionAttributeValues: { ':c': candidate.slackChannel, ':t': candidate.slackMessageTs },
+        }).promise();
+
+        await this.settings.setSetting(
+          this.threadMappingKey(candidate.slackChannel, candidate.slackMessageTs),
+          candidate.candidateId,
+          'Slack thread to human eval candidate mapping',
+          'human-eval',
+        );
+      } catch (err: any) {
+        // Fail open: the candidate is already persisted and reviewable via the queue API
+        // even if the Slack post itself failed (e.g. channel not configured).
+        console.warn('[human-eval] Slack post failed, candidate persisted without it:', err?.message || err);
+      }
+    }
 
     return candidate;
   }
@@ -438,6 +469,27 @@ export class HumanEvalService {
     await this.appendFeedback(candidate, feedback);
     await this.addFeedbackToSession(candidate, feedback);
     await this.learning.recordFeedback(candidate, feedback);
+
+    // ENG-1687: acknowledge receipt in-thread immediately. Feedback was
+    // previously recorded (and, for the 3 known action types, silently acted
+    // on) with zero reply — a reviewer who posts feedback with no visible
+    // confirmation has no way to tell "recorded, working on it" from "the
+    // bot never saw this." Every reply gets an ack; only candidates with a
+    // known runnable action additionally get an auto-action note.
+    const ackLines = [
+      `:inbox_tray: Got it, <@${input.slackUserId}> — feedback recorded on candidate \`${candidate.candidateId}\`.`,
+    ];
+    if (candidate.action) {
+      ackLines.push('Running the auto-action now; the revised result will post back to this thread when ready.');
+    } else {
+      ackLines.push('No automatic re-run is wired for this review type yet — this will be actioned manually.');
+    }
+    void this.slack
+      .postSlackMessage(input.channel, ackLines.join('\n'), input.threadTs)
+      .catch((err: any) => {
+        console.warn('[human-eval] failed to post Slack ack reply:', err?.message || err);
+      });
+
     void this.actions.run(candidate, feedback).catch((err: any) => {
       console.warn('[human-eval] failed to run feedback action:', err?.message || err);
     });
@@ -664,12 +716,35 @@ export class HumanEvalService {
     }
   }
 
+  /**
+   * Whose chat produced this candidate. Matt asked for the account's email on the card: the
+   * reviewer otherwise can't tell which customer an artifact belongs to without opening the
+   * chat link, which is the context-free-noise complaint ENG-1853/1854 exist to fix.
+   *
+   * Deliberately fail-safe and resolved only for the Slack message — never let a user lookup
+   * decide whether a candidate posts at all. `getUserById` is a GSI query that can throw on a
+   * transient DynamoDB error; swallowing it here means the card just omits the line, instead of
+   * the error bubbling into createCandidate's posting try/catch and silently costing the whole
+   * notification.
+   */
+  private async resolveUserEmail(userId: string | undefined): Promise<string | undefined> {
+    if (!userId) return undefined;
+    try {
+      const user = await userDb.getUserById(userId);
+      return user?.email || undefined;
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve user email for the Slack card:', err?.message || err);
+      return undefined;
+    }
+  }
+
   private buildSlackMessage(input: CreateHumanEvalCandidateInput & {
     candidateId: string;
     reviewer: HumanEvalReviewer;
     reviewerSlackUserId?: string;
     chatUrl?: string;
     normalizedCategory: HumanEvalCategory;
+    userEmail?: string;
   }): string {
     const reviewerMention = input.reviewerSlackUserId
       ? `<@${input.reviewerSlackUserId}>`
@@ -687,6 +762,7 @@ export class HumanEvalService {
       `*Human eval: ${reviewTypeLabel(input.reviewType)}*`,
       showCategory ? `*Category:* ${humanEvalCategoryLabel(input.normalizedCategory)}` : '',
       `Reviewer: ${reviewerMention}`,
+      input.userEmail ? `*User:* ${input.userEmail}` : '',
       '',
       input.artifactUrl ? `*Output:* <${input.artifactUrl}|open output>` : '',
       input.chatUrl ? `*Chat:* <${input.chatUrl}|open associated chat>` : '',
@@ -715,15 +791,103 @@ export class HumanEvalService {
     return channel.trim();
   }
 
+  /**
+   * ENG-1854: switch for #eval-queue Slack fan-out, default ON — an explicit 'false' is an
+   * unconditional kill switch. (It shipped default-off; the default was flipped back once the
+   * two real noise sources — routine lead-enrichment pings and cross-path duplicates — were
+   * fixed independently of this toggle.) The queue itself (creation, persistence, the admin
+   * read API) is unaffected either way; this only gates whether a candidate additionally gets
+   * posted to Slack. DB-backed (not an env var) so it's flippable without a redeploy, same
+   * reasoning as `getEvalChannel`'s own setting above.
+   *
+   * Returns why (if at all) this candidate should be posted — the caller uses this to pick
+   * the message format: a normal global-toggle post gets the full multi-field message, an
+   * exception-list post gets a deliberately concise one (ENG-1854 item 6 — "one concise
+   * reviewer assignment/link", not the same noisy format this ticket exists to quiet down).
+   */
+  private async slackPostingReasonFor(userId: string | undefined): Promise<'global' | 'exception' | false> {
+    // Deliberately fail-safe: `settingsService.getSetting` re-throws on a DynamoDB error, and
+    // this is called AFTER the candidate is already persisted (createCandidate's whole point
+    // is that persistence must never depend on anything Slack-related succeeding). A transient
+    // settings-lookup failure defaults to "don't post" rather than letting the exception
+    // propagate out of createCandidate — which would skip the caller's own post-persist steps
+    // (e.g. autoHumanEvalService's dedupe-key write) and risk a duplicate candidate on retry.
+    try {
+      // Round-3 review finding: an explicit 'false' here is meant to be a genuine emergency
+      // stop — checked FIRST and unconditionally, so it isn't silently bypassed by any entry
+      // on the exception list. The exception list's job is to keep specific accounts posting
+      // through the ORDINARY default state, not to survive someone deliberately hitting the
+      // kill switch. Checking exceptions first (as an earlier version of this did) would mean
+      // "a single explicit false is the full rollback lever" stops being true the moment the
+      // exception list is non-empty — currently harmless since it ships empty, but a real
+      // footgun waiting for whenever that changes.
+      const globalToggle = await this.settings.getSetting('human_eval_slack_posting_enabled');
+      if (globalToggle?.settingValue === 'false') return false;
+
+      if (userId) {
+        // Now that the default is ON (below), this list's practical role has narrowed: it no
+        // longer decides WHETHER a candidate posts (that already happens for everyone unless
+        // the kill switch above fired) — it only selects the concise message FORMAT for
+        // specific accounts, distinct from the ordinary verbose one. Kept for when a real
+        // named-packet flow needs it (see the PR's own note on Haven/Every not currently
+        // routing through this pipeline at all).
+        const exceptions = await this.settings.getSetting('human_eval_slack_posting_exception_user_ids');
+        const exceptionIds = (exceptions?.settingValue || '')
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean);
+        if (exceptionIds.includes(userId)) return 'exception';
+      }
+      // Default ON: absent, or anything other than an explicit 'false' (already handled
+      // above), means posting is enabled. Flipped from the original default-off (ENG-1854's
+      // initial ask) once the two real noise sources were fixed independently of this toggle —
+      // the lead-enrichment anomaly gate is unconditional, so it stays quiet regardless of this
+      // setting; this now only governs creative_image/landing_page (which always needed a
+      // human's eyes) and any genuine lead-enrichment failures.
+      return 'global';
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve Slack posting toggle, defaulting to not posting:', err?.message || err);
+      return false;
+    }
+  }
+
+  /** ENG-1854 item 6: one line, one mention, one link — not the full field dump. */
+  private buildConciseExceptionMessage(input: {
+    reviewer: HumanEvalReviewer;
+    reviewerSlackUserId?: string;
+    chatUrl?: string;
+    artifactUrl?: string;
+  }): string {
+    const reviewerMention = input.reviewerSlackUserId
+      ? `<@${input.reviewerSlackUserId}>`
+      : input.reviewer === 'fangfang'
+        ? 'Fangfang'
+        : 'Matt';
+    const link = input.chatUrl || input.artifactUrl;
+    return link
+      ? `${reviewerMention} — new review ready: <${link}>`
+      : `${reviewerMention} — new review ready.`;
+  }
+
   private async getReviewerSlackUserId(reviewer: HumanEvalReviewer): Promise<string | undefined> {
-    const settingName = reviewer === 'fangfang'
-      ? 'human_eval_reviewer_fangfang_slack_user_id'
-      : 'human_eval_reviewer_matt_slack_user_id';
-    const envName = reviewer === 'fangfang'
-      ? 'HUMAN_EVAL_FANGFANG_SLACK_USER_ID'
-      : 'HUMAN_EVAL_MATT_SLACK_USER_ID';
-    const setting = await this.settings.getSetting(settingName);
-    return (setting?.settingValue || process.env[envName])?.trim() || undefined;
+    // ENG-1854: this runs before createCandidate's db.put — same fail-safe reasoning as
+    // slackPostingReasonFor. Unguarded, a transient settings-lookup failure here would throw
+    // out of createCandidate before the record is ever persisted, silently dropping the
+    // candidate the same way the pre-PR bug did. The return type is already optional, so a
+    // plain-text reviewer-name fallback in buildSlackMessage handles the missing-ID case fine.
+    try {
+      const settingName = reviewer === 'fangfang'
+        ? 'human_eval_reviewer_fangfang_slack_user_id'
+        : 'human_eval_reviewer_matt_slack_user_id';
+      const envName = reviewer === 'fangfang'
+        ? 'HUMAN_EVAL_FANGFANG_SLACK_USER_ID'
+        : 'HUMAN_EVAL_MATT_SLACK_USER_ID';
+      const setting = await this.settings.getSetting(settingName);
+      return (setting?.settingValue || process.env[envName])?.trim() || undefined;
+    } catch (err: any) {
+      console.warn('[human-eval] failed to resolve reviewer Slack user id, continuing without it:', err?.message || err);
+      return undefined;
+    }
   }
 
   private async getCandidateIdForThread(channel: string, threadTs: string): Promise<string | null> {

@@ -12,10 +12,17 @@ const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [
 jest.mock('../services/agentModeService', () => ({
   agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
 }));
+// chatbotService loads its knowledge base at module import time. Keep this
+// enrichment test on the in-process fixture instead of fetching Mintlify docs.
+jest.mock('../services/docsKnowledgeSource', () => {
+  const actual = jest.requireActual('../services/docsKnowledgeSource');
+  return { ...actual, fetchMintlifyDocsContent: jest.fn().mockResolvedValue('') };
+});
 
 import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
+import * as llmServiceModule from '../utils/llmService';
 import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
@@ -36,6 +43,23 @@ function mockApolloService(matchPerson = makeMatchPerson()): jest.SpyInstance {
   const svc = { matchPerson, matchOrg: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
   jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
   return jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+}
+
+// ENG-1111: when Apollo's mapped fields don't cover every requested field (e.g.
+// linkedin_url isn't in Apollo's raw person data), the person_identity waterfall step
+// falls through to an LLM confirmation call via generateJSONContent
+// (enrichmentV3RealDeps.ts's apollo-tier extraction branch) regardless of what a given
+// test is actually exercising. Without stubbing it, that call reached the real,
+// unmocked LLM client. Resolving to {} matches the "LLM found nothing" path these tests
+// already rely on for their assertions (none of them assert on the LLM-derived value).
+function mockLLMNoData() {
+  const generateJSONContent = jest.fn().mockResolvedValue({});
+  const generateJSONContentWithWebSearch = jest.fn().mockResolvedValue({});
+  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({
+    generateJSONContent,
+    generateJSONContentWithWebSearch,
+  } as any);
+  return { generateJSONContent, generateJSONContentWithWebSearch };
 }
 
 function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
@@ -93,8 +117,12 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }));
+    // Two expected args: production calls matchPerson(input, { userId }), and
+    // toHaveBeenCalledWith compares the WHOLE argument list — a one-arg expectation can
+    // never match a two-arg call, so this negative passed no matter what was sent.
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ email: expect.anything() }), expect.anything());
   });
 
   it('calls matchPerson with emailDomain when website absent but emailDomain present', async () => {
@@ -121,6 +149,7 @@ describe('fetchApolloPerson — no email, name+website path', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -171,6 +200,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
   it('calls matchPerson with email when email present', async () => {
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({ email: 'jane@acme.com' });
@@ -186,12 +216,13 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
   });
 
   it('prefers email over name+domain when both present', async () => {
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({
@@ -212,8 +243,8 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
       refreshFields: new Set(),
     });
 
-    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }));
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).toHaveBeenCalledWith(expect.objectContaining({ email: 'jane@acme.com' }), { userId: 'user-1' });
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 
   it('passes the lead name alongside the email so matchPerson can run its identity gate', async () => {
@@ -223,6 +254,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
     // trusted. The name must be threaded even when email is present.
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' });
@@ -240,9 +272,10 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
 
     expect(matchPersonSpy).toHaveBeenCalledWith(
       expect.objectContaining({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' }),
+      { userId: 'user-1' },
     );
     // Still must NOT send domain on the email path (preserves cache-key behavior).
-    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }));
+    expect(matchPersonSpy).not.toHaveBeenCalledWith(expect.objectContaining({ domain: expect.anything() }), expect.anything());
   });
 });
 
@@ -301,13 +334,14 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@gmail.com', { userId: 'user-1' });
   });
 
   it('calls reverseLookup for business email', async () => {
     const reverseLookup = jest.fn().mockResolvedValue(null);
     mockEnrichSoService(reverseLookup);
     jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     await deps.resolveIdentity({
@@ -318,7 +352,7 @@ describe('enrichSoReverseLookup adapter', () => {
       mode: 'enrich',
     });
 
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 
@@ -339,6 +373,7 @@ describe('enrichSoFindEmail adapter', () => {
 
     expect(findEmail).toHaveBeenCalledWith(
       expect.objectContaining({ firstName: 'Jane', lastName: 'Doe', domain: 'acme.com' }),
+      { userId: 'user-1' },
     );
   });
 
@@ -361,7 +396,7 @@ describe('enrichSoFindEmail adapter', () => {
     if (!result.ok) return;
     expect(result.resolved.email).toBe('jane@acme.com');
     // reverse-lookup should be chained automatically after email found
-    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com');
+    expect(reverseLookup).toHaveBeenCalledWith('jane@acme.com', { userId: 'user-1' });
   });
 });
 

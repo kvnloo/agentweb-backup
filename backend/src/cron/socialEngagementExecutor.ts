@@ -1,8 +1,8 @@
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
-import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import { isCronEnabled } from '../utils/instanceState';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
@@ -112,6 +112,66 @@ Reply with EXACTLY one of these values (no other text):
 type LinkedInReaction = 'LIKE' | 'PRAISE' | 'EMPATHY' | 'INTEREST' | 'APPRECIATION' | 'ENTERTAINMENT';
 const VALID_REACTIONS: LinkedInReaction[] = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'];
 
+type EngagementSettings = {
+    enablePostDiscovery?: boolean;
+    enableAsPostEngager?: boolean;
+    preferredActions?: string[];
+    enableCommentDiscovery?: boolean;
+    commentPreferredActions?: string[];
+    personality?: { presets: string[]; custom?: string };
+};
+
+type EngagementConnection = ConnectedAccount & {
+    engagementSettings?: EngagementSettings;
+};
+
+type ScheduledActionAuthorizationInput = {
+    userId: string;
+    platform: string;
+    ownerAccountId: string;
+    engagingAccountId: string;
+    actionType: string;
+    targetType: string;
+};
+
+type AuthorizedScheduledAction = {
+    engagingConnection: EngagementConnection;
+    ownerConnection: EngagementConnection;
+};
+
+class ScheduledActionAuthorizationRevoked extends Error {
+    constructor() {
+        super('Scheduled social engagement action is no longer authorized');
+        this.name = 'ScheduledActionAuthorizationRevoked';
+    }
+}
+
+const POST_ACTION_REQUIREMENTS: Record<string, string[]> = {
+    like: ['like'],
+    comment: ['comment'],
+    comment_and_like: ['comment', 'like'],
+};
+
+const COMMENT_ACTION_REQUIREMENTS: Record<string, string[]> = {
+    like_comment: ['like'],
+    reply_comment: ['reply'],
+    like_and_reply_comment: ['like', 'reply'],
+};
+
+function includesAllActions(
+    preferredActions: unknown,
+    requiredActions: string[],
+    defaultActions: string[]
+): boolean {
+    // These defaults deliberately mirror the scanner. Nullish legacy arrays mean
+    // "use the product default"; an explicit empty/malformed value is an opt-out
+    // and must fail closed.
+    const actions = preferredActions == null
+        ? defaultActions
+        : Array.isArray(preferredActions) ? preferredActions : [];
+    return requiredActions.every(action => actions.includes(action));
+}
+
 function getLinkedInAdapter(): LinkedInAdapter {
     return new LinkedInAdapter();
 }
@@ -161,6 +221,10 @@ export class SocialEngagementExecutor {
     }
 
     private async processAction(action: any) {
+        if (isEvaluationUser(action?.userId)) {
+            await (await import('../services/evaluationStore')).evaluationStore.discardJob(action.userId, action.scheduleId);
+            return;
+        }
         const { userId, variableValues, scheduleId } = action;
         const { postId, commentId, commentText, platform, ownerAccountId, engagingAccountId, actionType, targetType } = variableValues || {};
 
@@ -174,57 +238,34 @@ export class SocialEngagementExecutor {
             return;
         }
 
-        if (!postId || !platform || !engagingAccountId) {
+        if (!postId || !platform || !ownerAccountId || !engagingAccountId || !actionType || !targetType) {
             console.warn(`[Executor] Skipping invalid action ${scheduleId}: missing required fields.`);
             await this.markActionDone(scheduleId);
             return;
         }
 
+        const authorizationInput: ScheduledActionAuthorizationInput = {
+            userId,
+            platform,
+            ownerAccountId,
+            engagingAccountId,
+            actionType,
+            targetType,
+        };
+        const authorizedAction = await this.getAuthorizedScheduledAction(authorizationInput);
+        if (!authorizedAction) {
+            // A schedule is only a delayed intent. Current account state and consent are
+            // the authority to perform the LinkedIn write, so fail closed when either
+            // has changed since scheduling.
+            console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action is no longer authorized by current account settings.`);
+            await this.discardUnauthorizedAction(scheduleId, authorizationInput, postId, commentId);
+            return;
+        }
+
+        const { engagingConnection, ownerConnection } = authorizedAction;
         const engagingOwnerId = userId;
 
-        const engagingUser = await userDb.getUserById(engagingOwnerId);
-        if (!engagingUser || !engagingUser.connected_accounts) {
-            console.warn(`[Executor] Engaging user ${engagingOwnerId} not found or has no connected accounts.`);
-            await this.markActionDone(scheduleId);
-            return;
-        }
-
-        const engagingConnection = engagingUser.connected_accounts.find(
-            (c: ConnectedAccount) => c.account_id === engagingAccountId && c.platform === platform
-        );
-
-        if (!engagingConnection) {
-            console.warn(`[Executor] Engaging account ${engagingAccountId} not found for user ${engagingOwnerId}.`);
-            await this.markActionDone(scheduleId);
-            return;
-        }
-
         console.log(`[Executor] Engaging as: "${engagingConnection.account_name}" (${engagingAccountId})`);
-
-        // Re-validate the action against the current config — the user may have changed
-        // settings after this action was scheduled.
-        const engagerSettings = engagingConnection.engagementSettings || {};
-        if (targetType === 'comment' && engagerSettings.commentPreferredActions) {
-            // comment auto-reply: engager IS the post owner, check commentPreferredActions
-            const commentPrefs: string[] = engagerSettings.commentPreferredActions;
-            const requiresReply = actionType === 'reply_comment' || actionType === 'like_and_reply_comment';
-            const requiresLike = actionType === 'like_comment' || actionType === 'like_and_reply_comment';
-            const replyRevoked = requiresReply && !commentPrefs.includes('reply');
-            const likeRevoked = requiresLike && !requiresReply && !commentPrefs.includes('like');
-            if (replyRevoked || likeRevoked) {
-                console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action no longer permitted by current commentPreferredActions=${JSON.stringify(commentPrefs)}`);
-                await this.markActionDone(scheduleId);
-                return;
-            }
-        } else if (targetType !== 'comment' && engagerSettings.preferredActions) {
-            // post engagement: check engager's preferredActions
-            const postPrefs: string[] = engagerSettings.preferredActions;
-            if (actionType === 'comment' && !postPrefs.includes('comment')) {
-                console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action no longer permitted by current preferredActions=${JSON.stringify(postPrefs)}`);
-                await this.markActionDone(scheduleId);
-                return;
-            }
-        }
 
         // Load engagement memory and personality for personalized comments
         const engagerMemory = engagingConnection.engagementMemory?.content || '';
@@ -239,17 +280,21 @@ export class SocialEngagementExecutor {
         try {
             if (targetType === 'comment') {
                 generated = await this.executeCommentAction(
-                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType, engagerMemory, engagerPersonality
+                    adapter, authorizationInput, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType, engagerMemory, engagerPersonality
                 );
             } else {
-                // Default: post engagement
                 generated = await this.executePostAction(
-                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType, engagerMemory, engagerPersonality
+                    adapter, authorizationInput, engagingConnection, ownerConnection, engagingOwnerId, postId, actionType, engagerMemory, engagerPersonality
                 );
             }
             success = true;
             console.log(`[Executor] Action ${scheduleId} completed successfully.`);
         } catch (err: any) {
+            if (err instanceof ScheduledActionAuthorizationRevoked) {
+                console.log(`[Executor] Skipping ${actionType} on ${scheduleId}: action was revoked before its LinkedIn write.`);
+                await this.discardUnauthorizedAction(scheduleId, authorizationInput, postId, commentId);
+                return;
+            }
             errorMsg = err?.message || String(err);
             console.error(`[Executor] Action ${scheduleId} failed:`, errorMsg);
             // Rate limit is transient — retry in 30 minutes; all other errors are permanent
@@ -289,16 +334,108 @@ export class SocialEngagementExecutor {
         console.log(`[Executor] ════ Action ${scheduleId} done ════\n`);
     }
 
+    /**
+     * A queued action never grants durable permission to use a LinkedIn token.
+     * Re-read the primary User record and validate every participant's current
+     * settings immediately before executing it. `getUserById` alone is unsafe
+     * here because its GSI can briefly return credentials removed by disconnect.
+     */
+    private async getAuthorizedScheduledAction(
+        input: ScheduledActionAuthorizationInput
+    ): Promise<AuthorizedScheduledAction | null> {
+        if (input.platform !== 'linkedin') return null;
+
+        const user = await userDb.getUserByIdConsistent(input.userId);
+        if (!user || user.engagementPaused === true || !Array.isArray(user.connected_accounts)) {
+            return null;
+        }
+
+        const accounts = user.connected_accounts as EngagementConnection[];
+        const engagingConnection = accounts.find(
+            account => account.account_id === input.engagingAccountId && account.platform === input.platform
+        );
+        const engagerSettings = engagingConnection?.engagementSettings;
+        if (!engagingConnection || !engagerSettings) return null;
+
+        if (input.targetType === 'post') {
+            const requiredActions = POST_ACTION_REQUIREMENTS[input.actionType];
+            const ownerConnection = accounts.find(
+                account => account.account_id === input.ownerAccountId && account.platform === input.platform
+            );
+            const ownerSettings = ownerConnection?.engagementSettings;
+
+            if (!requiredActions || !ownerConnection || !ownerSettings) return null;
+            if (engagerSettings.enableAsPostEngager !== true || ownerSettings.enablePostDiscovery !== true) {
+                return null;
+            }
+            if (!includesAllActions(engagerSettings.preferredActions, requiredActions, ['like', 'comment'])
+                || !includesAllActions(ownerSettings.preferredActions, requiredActions, ['like'])) {
+                return null;
+            }
+            return { engagingConnection, ownerConnection };
+        }
+
+        if (input.targetType === 'comment') {
+            const requiredActions = COMMENT_ACTION_REQUIREMENTS[input.actionType];
+            if (!requiredActions || input.ownerAccountId !== input.engagingAccountId) return null;
+            if (engagerSettings.enableCommentDiscovery !== true
+                || !includesAllActions(engagerSettings.commentPreferredActions, requiredActions, ['reply'])) {
+                return null;
+            }
+            return { engagingConnection, ownerConnection: engagingConnection };
+        }
+
+        return null;
+    }
+
+    private async requireAuthorizedScheduledAction(
+        input: ScheduledActionAuthorizationInput
+    ): Promise<AuthorizedScheduledAction> {
+        const authorized = await this.getAuthorizedScheduledAction(input);
+        if (!authorized) throw new ScheduledActionAuthorizationRevoked();
+        return authorized;
+    }
+
+    /**
+     * Remove the scanner's provisional tracking reservation when consent is
+     * withdrawn before any LinkedIn write. Otherwise a `queued` record would
+     * block the same still-recent post forever after the owner re-enables the
+     * automation. This is deliberately not called after a partial compound
+     * action, where a comment or reply may already have been published.
+     */
+    private async discardUnauthorizedAction(
+        scheduleId: string,
+        input: ScheduledActionAuthorizationInput,
+        postId: string,
+        commentId?: string
+    ): Promise<void> {
+        try {
+            await socialEngagementTrackingDb.deleteEngagement({
+                userId: input.userId,
+                postId,
+                commentId: input.targetType === 'comment' ? commentId : undefined,
+                engagingAccountId: input.engagingAccountId,
+                actionType: input.actionType,
+                scheduleId,
+            });
+        } catch (error) {
+            // The schedule is still terminalized below. A transient cleanup error
+            // must never turn revoked consent into a retryable LinkedIn action.
+            console.warn(`[Executor] Could not release tracking reservation for revoked action ${scheduleId}:`, error);
+        }
+        await this.markActionDone(scheduleId);
+    }
+
     // ────────────────────────────────────────────────────────────────────────────
     // POST ENGAGEMENT
     // ────────────────────────────────────────────────────────────────────────────
 
     private async executePostAction(
         adapter: LinkedInAdapter,
-        engagingConnection: ConnectedAccount,
+        authorizationInput: ScheduledActionAuthorizationInput,
+        engagingConnection: EngagementConnection,
+        ownerConnection: EngagementConnection,
         engagingUserId: string,
-        ownerAccountId: string | undefined,
-        ownerUserId: string,
         postId: string,
         actionType: string,
         engagerMemory?: string,
@@ -308,7 +445,7 @@ export class SocialEngagementExecutor {
         const doComment = actionType === 'comment' || actionType === 'comment_and_like';
 
         // Fetch post content and owner context once — used for both comment generation and reaction selection
-        const { content: postContent, ownerConnection } = await this.fetchPostContext(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
+        const { content: postContent } = await this.fetchPostContext(adapter, engagingConnection, ownerConnection, engagingUserId, postId);
         const ownerContext = ownerConnection
             ? { name: ownerConnection.account_name, memory: ownerConnection.engagementMemory?.content }
             : undefined;
@@ -334,7 +471,8 @@ export class SocialEngagementExecutor {
                     } else {
                         generatedText = comment;
                         console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
-                        await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
+                        const current = await this.requireAuthorizedScheduledAction(authorizationInput);
+                        await adapter.createComment(current.engagingConnection, postId, generatedText, engagingUserId);
                         console.log(`[Executor] Comment posted on post ${postId}`);
                     }
                 }
@@ -344,11 +482,13 @@ export class SocialEngagementExecutor {
         if (doLike) {
             try {
                 reactionType = await this.generateReactionType(postContent || '', engagingUserId);
-                await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
+                const current = await this.requireAuthorizedScheduledAction(authorizationInput);
+                await adapter.createReaction(current.engagingConnection, postId, reactionType, engagingUserId);
                 console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
             } catch (likeErr: any) {
-                if (doComment) {
-                    // Like is secondary in comment_and_like — comment already succeeded.
+                if (doComment && generatedText) {
+                    // Like is secondary in comment_and_like — the comment already
+                    // succeeded, so do not retry and risk posting it twice.
                     // Log and continue so the action is marked completed rather than retried,
                     // which would post a duplicate comment.
                     console.warn(`[Executor] Like sub-action failed (comment already succeeded), continuing:`, likeErr?.message);
@@ -364,35 +504,26 @@ export class SocialEngagementExecutor {
 
     private async fetchPostContext(
         adapter: LinkedInAdapter,
-        engagingConnection: ConnectedAccount,
+        engagingConnection: EngagementConnection,
+        ownerConnection: EngagementConnection,
         engagingUserId: string,
-        ownerAccountId: string | undefined,
-        ownerUserId: string,
         postId: string
-    ): Promise<{ content: string | null; ownerConnection?: ConnectedAccount }> {
-        let ownerConnection: ConnectedAccount | undefined;
+    ): Promise<{ content: string | null }> {
         try {
             // Prefer fetching via the owner's account (has direct DB/API access to the post)
             let fetchConnection = engagingConnection;
             let fetchUserId = engagingUserId;
-            if (ownerAccountId && ownerAccountId !== engagingConnection.account_id) {
-                const ownerUser = await userDb.getUserById(ownerUserId);
-                const ownerConn = ownerUser?.connected_accounts?.find(
-                    (c: ConnectedAccount) => c.account_id === ownerAccountId
-                );
-                if (ownerConn) {
-                    fetchConnection = ownerConn;
-                    fetchUserId = ownerUserId;
-                    ownerConnection = ownerConn;
-                }
+            if (ownerConnection.account_id !== engagingConnection.account_id) {
+                fetchConnection = ownerConnection;
+                fetchUserId = engagingUserId;
             }
 
             const content = await adapter.getPost(fetchConnection, postId, fetchUserId);
-            if (content) return { content, ownerConnection };
+            if (content) return { content };
         } catch (err) {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
-        return { content: null, ownerConnection };
+        return { content: null };
     }
 
     /**
@@ -436,23 +567,14 @@ export class SocialEngagementExecutor {
             if (recentComments && recentComments.length > 0) {
                 systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent comments you've already written. Make sure your new comment is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: `Post content: ${postContent}` },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: `Post content: ${postContent}` },
+            ], {
                 temperature: COMMENT_TEMPERATURE,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_comment' },
+                taskClass: 'scheduled_background',
             });
-            // Charge automated engagement spend to the account owner's quota — policy:
-            // every LLM call with a real userId is billed to that user, nothing absorbed.
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_comment',
-            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
@@ -466,21 +588,14 @@ export class SocialEngagementExecutor {
 
     private async generateReactionType(content: string, engagingUserId?: string): Promise<LinkedInReaction> {
         try {
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: REACTION_SYSTEM_PROMPT },
-                    { role: 'user', content: content || '[No content available]' },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: REACTION_SYSTEM_PROMPT },
+                { role: 'user', content: content || '[No content available]' },
+            ], {
                 temperature: 0.1,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_reaction' },
+                taskClass: 'scheduled_background',
             });
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_reaction',
-            }, completion);
             const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
             if (VALID_REACTIONS.includes(raw)) return raw;
             console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
@@ -496,7 +611,8 @@ export class SocialEngagementExecutor {
 
     private async executeCommentAction(
         adapter: LinkedInAdapter,
-        engagingConnection: ConnectedAccount,
+        authorizationInput: ScheduledActionAuthorizationInput,
+        engagingConnection: EngagementConnection,
         engagingUserId: string,
         postId: string,
         commentId: string | undefined,
@@ -531,7 +647,8 @@ export class SocialEngagementExecutor {
                 } else {
                     generatedText = reply;
                     console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
-                    await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
+                    const current = await this.requireAuthorizedScheduledAction(authorizationInput);
+                    await adapter.createComment(current.engagingConnection, postId, generatedText, engagingUserId, commentId);
                     console.log(`[Executor] Reply posted on comment ${commentId}`);
                 }
             }
@@ -540,11 +657,13 @@ export class SocialEngagementExecutor {
         if (doLike) {
             try {
                 reactionType = await this.generateReactionType(commentText || '', engagingUserId);
-                await adapter.createReaction(engagingConnection, commentId, reactionType, engagingUserId);
+                const current = await this.requireAuthorizedScheduledAction(authorizationInput);
+                await adapter.createReaction(current.engagingConnection, commentId, reactionType, engagingUserId);
                 console.log(`[Executor] Reacted "${reactionType}" on comment ${commentId}`);
             } catch (likeErr: any) {
-                if (doReply) {
-                    // Like is secondary in like_and_reply_comment — reply already succeeded.
+                if (doReply && generatedText) {
+                    // Like is secondary in like_and_reply_comment — the reply already
+                    // succeeded, so do not retry and risk posting it twice.
                     // Log and continue so the action is marked completed rather than retried,
                     // which would post a duplicate reply.
                     console.warn(`[Executor] Like sub-action failed (reply already succeeded), continuing:`, likeErr?.message);
@@ -573,22 +692,14 @@ export class SocialEngagementExecutor {
             if (recentComments && recentComments.length > 0) {
                 systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent replies you've already written. Make sure your new reply is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: `Comment: ${commentText}` },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: `Comment: ${commentText}` },
+            ], {
                 temperature: COMMENT_TEMPERATURE,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_reply' },
+                taskClass: 'scheduled_background',
             });
-            // Charge automated reply spend to the account owner's quota (all-cost-to-user policy).
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_reply',
-            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);

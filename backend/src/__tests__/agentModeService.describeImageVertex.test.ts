@@ -48,7 +48,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
 
   it('downloads + base64-encodes the image for a claude-* model and sends a data URI', async () => {
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
-    mockAxiosGet.mockResolvedValue({ data: pngBytes, headers: { 'content-type': 'image/png' } });
+    mockAxiosGet.mockResolvedValue({ status: 200, data: pngBytes, headers: { 'content-type': 'image/png' } });
 
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')

@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+import secrets_manager
 from aws_utils import get_dynamodb_resource
 from task_utils import check_new_information
 import requests # Added for fetching HTML content
@@ -201,8 +202,8 @@ def send_task_notification(to_email, task_name, task_id, execution_status, execu
         
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
-        smtp_user = os.getenv('SMTP_USER')
-        smtp_pass = os.getenv('SMTP_PASS')
+        smtp_user = secrets_manager.get_smtp_user()
+        smtp_pass = secrets_manager.get_smtp_pass()
         from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
 
@@ -290,8 +291,8 @@ def send_task_results(to_email, task_name, task_id, execution_status, result=Non
         
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
-        smtp_user = os.getenv('SMTP_USER')
-        smtp_pass = os.getenv('SMTP_PASS')
+        smtp_user = secrets_manager.get_smtp_user()
+        smtp_pass = secrets_manager.get_smtp_pass()
         from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
 
@@ -658,8 +659,8 @@ def send_oncall_alert(task_name, task_id, error, llm_names_tried):
     try:
         smtp_host = os.getenv('SMTP_HOST', 'smtp.gmail.com')
         smtp_port = int(os.getenv('SMTP_PORT', '587'))
-        smtp_user = os.getenv('SMTP_USER')
-        smtp_pass = os.getenv('SMTP_PASS')
+        smtp_user = secrets_manager.get_smtp_user()
+        smtp_pass = secrets_manager.get_smtp_pass()
         from_email = os.getenv('FROM_EMAIL')
         site_domain = os.getenv('SITE_DOMAIN', 'http://localhost:3000')
         oncall_emails = os.getenv('ONCALL_EMAIL_LIST', '').split(',')

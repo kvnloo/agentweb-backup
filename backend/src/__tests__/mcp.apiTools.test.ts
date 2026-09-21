@@ -38,6 +38,7 @@ const mockMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
 
 // Import the registry (which gets populated by apiTools import)
 import { mcpToolRegistry } from '../mcp/server/registry';
+import type { SessionScoringStatus } from '../services/scoreBackfill';
 
 // Import apiTools to trigger tool registrations
 import '../mcp/server/apiTools';
@@ -87,7 +88,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'send_email', 'save_file', 'post_on_account'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);
@@ -95,6 +96,7 @@ describe('apiTools', () => {
         expect(externalNames).not.toContain(name);
       }
       expect(allNames).not.toContain('search_web');
+      expect(externalNames).toContain('generate_image');
     });
 
     it('should NOT register old tool names (portal_*, read_brand_guidelines, etc.)', () => {
@@ -395,6 +397,29 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── generate_image category declaration (ENG-343) ───────────────────
+  // The service guard makes a missing category fail visibly, but the guard alone
+  // only converts a silent miscategorization into a hard failure — it cannot make
+  // the model supply the value. `required` is what actually gets the category
+  // declared. If it is dropped here, the model stops sending it and EVERY image
+  // generation fails at the guard, so this schema is load-bearing, not cosmetic.
+  // Read via getTool() so the assertion still holds if listing ever flips.
+  describe('generate_image category declaration (ENG-343)', () => {
+    const schema = () => mcpToolRegistry.getTool('generate_image')!.definition.inputSchema;
+
+    it('requires category so the model must declare the eval use case', () => {
+      expect(schema().required).toContain('category');
+    });
+
+    it('constrains category to exactly the two reviewable use cases', () => {
+      expect(schema().properties.category.enum).toEqual(['ad', 'organic_post']);
+    });
+
+    it('does not offer uncategorized as a producible value', () => {
+      expect(schema().properties.category.enum).not.toContain('uncategorized');
+    });
+  });
+
   // ─── Emma delegation capability discovery (ENG-257) ──────────────────
   // External MCP clients (e.g. Claude) only see these tool descriptions, and
   // there is no ads/marketing execution tool in the external set — that work
@@ -640,6 +665,925 @@ describe('apiTools', () => {
       expect(session.maxHeapMB).toBeNull();
     });
 
+    // ENG-892: `llmModel` is only the model picker's selection — it records what a
+    // client PATCHed, not what generated the text. The per-message `llm` written after
+    // model resolution is the real provenance, and the two diverge often enough to
+    // mis-label the daily satisfaction and cost reports.
+    it('should report the models that actually generated turns, not just the picker', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-picker-mismatch',
+          userId: 'user-4',
+          title: 'Picker says one thing, transcript says another',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          // A live voice model: callLLM throws for these, so it cannot have produced a token.
+          llmModel: 'gemini-3.1-flash-live-preview',
+          messages: [
+            { role: 'user', content: 'Analyse my funnel' },
+            { role: 'assistant', content: 'Working on it', llm: 'anthropic.claude-opus-5' },
+            { role: 'tool', content: '{}', name: 'get_website_analytics' },
+            { role: 'assistant', content: 'Here are the results', llm: 'anthropic.claude-opus-5' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Both kept — the mismatch between them is itself signal.
+      expect(session.llmModel).toBe('gemini-3.1-flash-live-preview');
+      expect(session.generationModels).toEqual(['anthropic.claude-opus-5']);
+    });
+
+    it('should list every generation model when a session switches mid-run', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-backup-switch',
+          userId: 'user-5',
+          title: 'Backup model kicked in',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          llmModel: 'claude-sonnet-4-5',
+          messages: [
+            { role: 'user', content: 'Go' },
+            { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+            { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            // Deduped, not repeated.
+            { role: 'assistant', content: 'Third', llm: 'anthropic.claude-opus-5' },
+            // Assistant turns with no recorded provenance contribute nothing.
+            { role: 'assistant', content: 'Fourth' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.generationModels).toEqual(['anthropic.claude-opus-5', 'gpt-5-chat-2']);
+    });
+
+    it('should return null generationModels when no message records a model', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-no-provenance',
+          userId: 'user-6',
+          title: 'Legacy session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          llmModel: 'gpt-4o',
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // null, not [] — degrades to the pre-ENG-892 behaviour of reporting only the picker.
+      expect(session.generationModels).toBeNull();
+      expect(session.llmModel).toBe('gpt-4o');
+      // ...but attribution still resolves, flagged as unverified.
+      expect(session.attributedModels).toEqual(['gpt-4o']);
+      expect(session.attributionBasis).toBe('selection-only');
+    });
+
+    it('should pre-resolve attributedModels from the transcript when provenance exists', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-eng829',
+          userId: 'user-7',
+          title: 'GA4 Upstream Funnel Tracking',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          // The ENG-829 shape: picker holds a live voice model that cannot emit a token.
+          llmModel: 'gemini-3.1-flash-live-preview',
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi', llm: 'anthropic.claude-opus-5' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // The agent is handed the answer, not a choice between two model-shaped fields.
+      expect(session.attributedModels).toEqual(['anthropic.claude-opus-5']);
+      expect(session.attributionBasis).toBe('transcript');
+      // Both underlying fields stay available — the mismatch is still signal.
+      expect(session.llmModel).toBe('gemini-3.1-flash-live-preview');
+    });
+
+    it('should null both attribution fields when nothing is recorded at all', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-empty',
+          userId: 'user-8',
+          title: 'No model anywhere',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [{ role: 'user', content: 'Hello' }],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.attributedModels).toBeNull();
+      expect(session.attributionBasis).toBeNull();
+      expect(session.modelLine).toBeNull();
+    });
+
+    // ENG-1313: the Daily Satisfaction Score Report named the picker
+    // (llmModel) instead of the model that ran, because building the
+    // per-session model line was left to the reporting agent's own judgement
+    // even after ENG-892 pre-resolved attributedModels. Pre-computing the
+    // exact display line — like ENG-892 pre-computed attributedModels itself —
+    // removes that judgement call instead of trusting the agent to make it.
+    describe('modelLine (ENG-1313 per-session model line)', () => {
+      it('shows both picker and the model that ran, in "picker: X · ran: Y" form, when they mismatch', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-picker-mismatch',
+            userId: 'user-4',
+            title: 'Picker says one thing, transcript says another',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            messages: [
+              { role: 'assistant', content: 'Working on it', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Here are the results', llm: 'anthropic.claude-opus-5' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5');
+      });
+
+      // ENG-1313 acceptance criterion 2, replayed against the exact fixture named
+      // in the issue: session f4c58f8e (Ed's xCures/GA4 session from the 08-01
+      // report) recorded 33 assistant turns, all on anthropic.claude-opus-5, while
+      // the picker still held a stale voice selection from before the 07-31
+      // fleet-wide Opus 5 switch.
+      it('replays the 08-01 report fixture (session f4c58f8e): names anthropic.claude-opus-5 as the model that ran', async () => {
+        const assistantTurns = Array.from({ length: 33 }, (_, i) => ({
+          role: 'assistant',
+          content: `Turn ${i + 1}`,
+          llm: 'anthropic.claude-opus-5',
+        }));
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'f4c58f8e',
+            userId: 'user-ed',
+            title: 'xCures GA4 tracking',
+            createdAt: '2026-08-01T00:00:00Z',
+            updatedAt: '2026-08-01T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            satisfactionScore: { score: 2, reason: 'stuck', evaluatedAt: '2026-08-01T01:00:00Z', evaluatedMessageIndex: 33 },
+            messages: [
+              { role: 'user', content: 'Why is GA4 not tracking?' },
+              ...assistantTurns,
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributedModels).toEqual(['anthropic.claude-opus-5']);
+        expect(session.attributionBasis).toBe('transcript');
+        expect(session.modelLine).toBe('picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5');
+      });
+
+      it('shows just the resolved model, with no "picker:" prefix, when the picker agrees with what ran', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-agree',
+            userId: 'user-9',
+            title: 'Picker matches transcript',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'Hi', llm: 'anthropic.claude-opus-5' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('anthropic.claude-opus-5');
+        expect(session.modelLine).not.toContain('picker:');
+      });
+
+      it('shows just the resolved model, with no "picker:" prefix, when attribution is selection-only (nothing to contrast)', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-selection-only',
+            userId: 'user-10',
+            title: 'Legacy session, no transcript provenance',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gpt-4o',
+            messages: [{ role: 'assistant', content: 'Hi' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributionBasis).toBe('selection-only');
+        expect(session.modelLine).toBe('gpt-4o');
+        expect(session.modelLine).not.toContain('picker:');
+      });
+
+      it('lists every model that ran, comma-joined, on a mid-session backup-model switch', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-backup-switch',
+            userId: 'user-5',
+            title: 'Backup model kicked in',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'claude-sonnet-4-5',
+            messages: [
+              { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('picker: claude-sonnet-4-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
+      });
+
+      // CodeRabbit (ENG-1313 review): the picker being one of several models
+      // that ran is NOT "agreement" — a naive `attributedModels.includes(llmModel)`
+      // check would wrongly collapse this to a bare "anthropic.claude-opus-5,
+      // gpt-5-chat-2" and drop the fact that a backup model also fired,
+      // because the picker happens to be the FIRST model in the list rather
+      // than absent from it entirely (the case the prior test covers).
+      it('still shows "picker: X · ran: Y" when the picker is the first of two models that ran, not absent from the list', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-picker-also-ran',
+            userId: 'user-6',
+            title: 'Picker ran, then a backup model also ran',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributedModels).toEqual(['anthropic.claude-opus-5', 'gpt-5-chat-2']);
+        expect(session.modelLine).toBe('picker: anthropic.claude-opus-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
+      });
+
+      // Greptile P1 (ENG-1313 review): a partial-transcript modelLine must not
+      // read as complete — it only names the turns that DID record a model.
+      it('appends a "(partial — N of M assistant turns unlabelled)" qualifier when attribution is only partial', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-partial',
+            userId: 'user-11',
+            title: 'Some turns unlabelled',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'b' }, // unlabelled
+              { role: 'assistant', content: 'c' }, // unlabelled
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributionBasis).toBe('partial-transcript');
+        expect(session.modelLine).toBe('anthropic.claude-opus-5 (partial — 2 of 3 assistant turns unlabelled)');
+      });
+
+      it('appends the partial qualifier alongside the picker-mismatch format when both apply', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-partial-mismatch',
+            userId: 'user-12',
+            title: 'Mismatched picker, and only partially labelled',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            messages: [
+              { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'b' }, // unlabelled
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe(
+          'picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5 (partial — 1 of 2 assistant turns unlabelled)'
+        );
+      });
+    });
+
+    // ENG-1313 acceptance criterion 3: the model-mix section must be computed
+    // from generation models (attributedModels), never llmModel, so a
+    // fleet-wide default-model flip is visible as a step change the next day
+    // instead of being invisible because every session still shows its old
+    // picker selection.
+    describe('modelMix (ENG-1313 model-mix / share-of-sessions section)', () => {
+      it('computes share of sessions per model from attributedModels, not from the picker', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [
+            // Picker is stale on both, but the transcript agrees: both ran opus-5.
+            {
+              sessionId: 'sess-a', userId: 'u-a', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'gemini-3.1-flash-live-preview',
+              messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+            },
+            {
+              sessionId: 'sess-b', userId: 'u-b', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'claude-sonnet-4-5',
+              messages: [{ role: 'assistant', content: 'b', llm: 'anthropic.claude-opus-5' }],
+            },
+            // Third session actually ran on a different model.
+            {
+              sessionId: 'sess-c', userId: 'u-c', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'gpt-5-chat-2',
+              messages: [{ role: 'assistant', content: 'c', llm: 'gpt-5-chat-2' }],
+            },
+          ],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        // If this were keyed by llmModel (the pre-fix behaviour), the mix would
+        // show 3 distinct picker values with 1 session each — the fleet-wide
+        // move to opus-5 would be invisible. Keyed by attributedModels it is a
+        // clear 2-vs-1 majority.
+        expect(parsed.modelMix.sessionsWithModelData).toBe(3);
+        expect(parsed.modelMix.byModel).toEqual([
+          { model: 'anthropic.claude-opus-5', sessions: 2, share: 2 / 3 },
+          { model: 'gpt-5-chat-2', sessions: 1, share: 1 / 3 },
+        ]);
+      });
+
+      // Greptile P1 (ENG-1313 review): sessions with only partial transcript
+      // attribution are real signal, but the aggregate must say how much of
+      // itself is exact vs partial rather than presenting shares as precise.
+      it('counts partially-labelled sessions in the mix but reports how many via partialAttributionSessions', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [
+            {
+              sessionId: 'sess-full', userId: 'u-f', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'anthropic.claude-opus-5',
+              messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+            },
+            {
+              sessionId: 'sess-partial', userId: 'u-p', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'anthropic.claude-opus-5',
+              messages: [
+                { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+                { role: 'assistant', content: 'b' }, // unlabelled
+              ],
+            },
+          ],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix.sessionsWithModelData).toBe(2);
+        expect(parsed.modelMix.partialAttributionSessions).toBe(1);
+      });
+
+      // Greptile P1 (ENG-1313 review): a limit-truncated range must not present
+      // its aggregate as covering the full requested range.
+      it('flags modelMix (and the top-level response) as truncated when the admin route returns a pagination cursor', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-page-1', userId: 'u-1', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+          }],
+          nextCursor: 'opaque-cursor-more-results-exist',
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+          limit: 1,
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.truncated).toBe(true);
+        expect(parsed.modelMix.truncated).toBe(true);
+      });
+
+      it('reports truncated: false when the admin route has no further pages', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-last-page', userId: 'u-1', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.truncated).toBe(false);
+        expect(parsed.modelMix.truncated).toBe(false);
+      });
+
+      it('returns null when no session in range has any resolvable model attribution', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-empty-2', userId: 'u-e', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            messages: [{ role: 'user', content: 'hi' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix).toBeNull();
+      });
+
+      // The top-level truncation signal is independent of whether any session
+      // had resolvable model attribution — a range can be fully truncated with
+      // zero attributed sessions in the returned page, and that still needs to
+      // be visible even though modelMix itself is null.
+      it('still reports the top-level truncated flag when modelMix is null', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-empty-3', userId: 'u-e2', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            messages: [{ role: 'user', content: 'hi' }],
+          }],
+          nextCursor: 'opaque-cursor-more-results-exist',
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix).toBeNull();
+        expect(parsed.truncated).toBe(true);
+      });
+    });
+
+    it('should direct the model-mix section to attributedModels via the precomputed modelMix field', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('modelLine');
+      expect(description).toContain('modelMix');
+    });
+
+    // Cache tokens are billed but excluded from total_tokens, so cost/token ratios
+    // computed from totalTokens alone are off by ~100x on cache-heavy scheduled runs
+    // (a real session: 371 total_tokens, 156,013 cache-creation tokens, $2.94).
+    it('should surface cache tokens so cost is reconcilable against tokens', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-cache-heavy',
+          userId: 'user-9',
+          title: 'Scheduled: connection watcher',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'run' },
+            {
+              role: 'assistant', content: 'ok', llm: 'anthropic.claude-opus-4-8',
+              usage: {
+                prompt_tokens: 299, completion_tokens: 72, total_tokens: 371,
+                cache_creation_input_tokens: 156013, cache_read_input_tokens: 0,
+                estimated_cost: 2.93512875,
+              },
+            },
+            {
+              role: 'assistant', content: 'done', llm: 'anthropic.claude-opus-4-8',
+              usage: {
+                prompt_tokens: 98, completion_tokens: 542, total_tokens: 640,
+                cache_creation_input_tokens: 0, cache_read_input_tokens: 4000,
+                estimated_cost: 0.28309575,
+              },
+            },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.cacheTokens).toEqual({ creation: 156013, read: 4000 });
+    });
+
+    it('should return null cacheTokens when no turn recorded any cache usage', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-no-cache',
+          userId: 'user-10',
+          title: 'No caching',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'hi' },
+            {
+              role: 'assistant', content: 'hello', llm: 'gpt-5-chat-2',
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, estimated_cost: 0.001 },
+            },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // null, not {creation:0,read:0} — nothing to explain for non-caching sessions.
+      expect(session.cacheTokens).toBeNull();
+    });
+
+    // Greptile P1: attributedModels listed every model but totalCost stayed a single
+    // session-wide number, so a per-model cost breakdown had to guess, duplicate or
+    // drop the cost. The per-turn data to split it already exists.
+    it('should allocate cost per model on a multi-model session', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-multi',
+          userId: 'user-11',
+          title: 'Mixed-model session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.5,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b', llm: 'gemini-3.5-flash', usage: { estimated_cost: 0.3 } },
+            { role: 'assistant', content: 'c', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 0.2 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toEqual({
+        'anthropic.claude-opus-5': 1.2,
+        'gemini-3.5-flash': 0.3,
+      });
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    // Greptile P1: a session mixing labelled and unlabelled assistant turns still
+    // returned a non-null generationModels, so a partial set read as complete.
+    // Surface the unattributed spend instead of silently dropping it.
+    it('should surface spend on turns that recorded no model', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-partial',
+          userId: 'user-12',
+          title: 'Partially labelled',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.4,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b', usage: { estimated_cost: 0.4 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toEqual({ 'anthropic.claude-opus-5': 1.0 });
+      // Non-null means the model list does NOT account for all spend.
+      expect(session.unattributedCost).toBe(0.4);
+      expect(session.attributionBasis).toBe('partial-transcript');
+    });
+
+    // Greptile 4/5 follow-up: an unlabelled turn carrying no cost left
+    // unattributedCost null, so a partial transcript still claimed 'transcript'.
+    // Real shape — prod session 8fb98376 has 2 unlabelled turns and a ~$0 delta.
+    it('should mark attribution partial even when the unlabelled turn has no cost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-partial-nocost',
+          userId: 'user-14',
+          title: 'Partial, no cost on the gap',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.0,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.attributionBasis).toBe('partial-transcript');
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    // Greptile 4/5 follow-up: totalCost includes tool spend that never lands on an
+    // assistant turn, so costByModel alone understates the session. Real shape —
+    // prod session 7cac004d: $100.19 total vs $98.28 across turns.
+    it('should count non-turn (tool) spend as unattributed', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-tool-cost',
+          userId: 'user-15',
+          title: 'Tool spend outside the turns',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 3.0,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 2.0 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Every assistant turn is labelled, so attribution is not partial...
+      expect(session.attributionBasis).toBe('transcript');
+      // ...but $1.00 of session spend still is not attributable to any model.
+      expect(session.unattributedCost).toBe(1.0);
+      // The invariant consumers can rely on: sum(costByModel) + unattributed = totalCost.
+      const summed = Object.values(session.costByModel as Record<string, number>)
+        .reduce((a, b) => a + b, 0);
+      expect(summed + session.unattributedCost).toBeCloseTo(session.totalCost, 6);
+    });
+
+    it('should null costByModel and unattributedCost when no turn records cost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-nocost',
+          userId: 'user-13',
+          title: 'No usage',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'hello', llm: 'gpt-5-chat-2' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toBeNull();
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    // Greptile: buckets were rounded individually while the residual was derived
+    // from unrounded buckets and totalCost was rounded separately, so the three
+    // could disagree — on a contract the description tells consumers to rely on.
+    // Sub-micro-dollar turn costs make the drift visible: each bucket rounds to
+    // zero, so a residual computed from unrounded values reported nothing while
+    // totalCost still rounded up to 1 micro-dollar.
+    it('should keep cost components reconciling under rounding', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-rounding',
+          userId: 'user-16',
+          title: 'Sub-micro turn costs',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 0.0000008,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'model-a', usage: { estimated_cost: 0.0000004 } },
+            { role: 'assistant', content: 'b', llm: 'model-b', usage: { estimated_cost: 0.0000004 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Compare in whole micro-dollars — the unit the payload is rounded to.
+      const micro = (n: number) => Math.round(n * 1e6);
+      const bucketMicro = Object.values(session.costByModel ?? {})
+        .reduce((a: number, b) => a + micro(b as number), 0);
+      const residualMicro = micro(session.unattributedCost ?? 0);
+
+      expect(bucketMicro + residualMicro).toBe(micro(session.totalCost));
+    });
+
+    // Real shape: prod sessions 12b68d41 and 6219e856 have per-turn costs summing a
+    // few micro-dollars ABOVE the stored session total. Report null rather than a
+    // negative "unattributed spend", and never rescale the buckets to force a fit.
+    it('should report null rather than a negative residual when turns exceed the total', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-over',
+          userId: 'user-17',
+          title: 'Turn costs slightly exceed the session total',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.000000,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'model-a', usage: { estimated_cost: 0.600002 } },
+            { role: 'assistant', content: 'b', llm: 'model-b', usage: { estimated_cost: 0.400002 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.unattributedCost).toBeNull();
+      // Buckets are reported as measured, not scaled down to fit totalCost.
+      expect(session.costByModel).toEqual({ 'model-a': 0.600002, 'model-b': 0.400002 });
+    });
+
+    it('should tell consumers to split cost with costByModel, not the model list', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('costByModel');
+      expect(description).toContain('unattributedCost');
+    });
+
+    it('should warn that totalTokens excludes billed cache tokens', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('totalTokens EXCLUDES');
+      expect(description).toContain('cacheTokens');
+    });
+
+    it('should direct attribution to attributedModels and override stale cost-grouping guidance', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      // The guidance, not just the field names — the reports name a model because the
+      // payload label invites it, so the primacy instruction is the fix's mechanism.
+      expect(description).toContain('use attributedModels');
+      // A live account memory on the reporting account still tells the agent to group
+      // cost by llmModel; the description has to outrank it explicitly.
+      expect(description).toContain('Never group or attribute cost by llmModel');
+      expect(description).toContain('saved memory');
+    });
+
     it('should include delegateInfo when session was started by admin delegation', async () => {
       mockMcpFetch.mockResolvedValue({
         sessions: [{
@@ -689,6 +1633,104 @@ describe('apiTools', () => {
       const session = parsed.sessions[0];
 
       expect(session.delegateInfo).toBeNull();
+    });
+
+    // ENG-929: sync=true promises to score everything unscored. A scorer that
+    // failed and a session that is legitimately unscorable both came back as
+    // `satisfactionScore: null`, so the daily report silently under-sampled —
+    // and the sessions it dropped were disproportionately the long, expensive
+    // ones. The outcome must reach the caller.
+    it('should surface the per-session scoring outcome and a coverage summary under sync=true', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [
+          {
+            sessionId: 'sess-failed',
+            userId: 'user-1',
+            title: 'Scheduled: long expensive run',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'failed', reason: 'Scoring LLM call timed out after 40000ms' },
+            messages: [{ role: 'user', content: 'run' }, { role: 'assistant', content: 'done' }],
+          },
+          {
+            sessionId: 'sess-inflight',
+            userId: 'user-2',
+            title: 'Scheduled: still running',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'skipped', reason: 'in-flight' },
+            messages: [{ role: 'user', content: 'run' }],
+          },
+        ],
+        scoringSummary: { scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false },
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+        sync: true,
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toEqual({
+        status: 'failed',
+        reason: 'Scoring LLM call timed out after 40000ms',
+      });
+      expect(parsed.sessions[1].scoringOutcome).toEqual({ status: 'skipped', reason: 'in-flight' });
+      expect(parsed.scoringSummary).toEqual({
+        scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false,
+      });
+    });
+
+    it('should report a null scoringOutcome when sync was not requested', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-plain',
+          userId: 'user-1',
+          title: 'Plain',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toBeNull();
+      expect(parsed.scoringSummary).toBeNull();
+    });
+
+    it('should tell the caller that a null satisfactionScore is not the same as a failed one', () => {
+      const tool = mcpToolRegistry.getTool('get_chat_history');
+      expect(tool?.definition.description).toMatch(/scoringOutcome/);
+      expect(tool?.definition.description).toMatch(/failed/i);
+    });
+
+    // The description is the only contract an external agent sees. If it documents
+    // a status literal the code never emits, an agent filtering on the documented
+    // spelling silently drops that cohort — which is the ENG-929 failure mode.
+    it('documents the scoringOutcome status literals exactly as the code emits them', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      const emittedStatuses: SessionScoringStatus[] = [
+        'scored', 'skipped', 'failed', 'not-attempted',
+      ];
+      for (const status of emittedStatuses) {
+        expect(description).toContain(`status '${status}'`);
+      }
+      // camelCase is the scoringSummary *count* key, never a status value.
+      expect(description).not.toContain("status 'notAttempted'");
     });
   });
 
@@ -808,6 +1850,40 @@ describe('apiTools', () => {
       });
     });
 
+    it('ENG-1540: reports "active" (not "inactive") for a paid plan whose status was never backfilled', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        // A Pro account granted out-of-band (no Stripe subscription object ever
+        // synced `subscription_status` onto the record) — the xCures/Ed Mongiovi
+        // shape: real Pro access, but the field itself was never set.
+        if (opts.path === '/api/auth/me') return { email: 'paid@xcures.com', subscriptionType: 'Pro' };
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.subscription_plan).toBe('Pro');
+      expect(parsed.subscription_status).toBe('active');
+    });
+
+    it('ENG-1540: treats an empty-string subscription_status as missing, same as auth.ts\'s sync trigger', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        // auth.ts's lazy Stripe sync guards on `!user.subscription_status`, which
+        // is true for '' as well as undefined — this default has to agree, or a
+        // stray '' would pass straight through unresolved instead of deriving
+        // a real status from the paid subscriptionType.
+        if (opts.path === '/api/auth/me') return { email: 'paid@xcures.com', subscriptionType: 'Pro', subscription_status: '' };
+        if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        throw new Error(`Unexpected path: ${opts.path}`);
+      });
+
+      const result = await mcpToolRegistry.execute('get_account_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.subscription_status).toBe('active');
+    });
+
     it('should treat a missing/non-array keys payload as zero api keys', async () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
@@ -848,4 +1924,66 @@ describe('apiTools', () => {
     });
   });
 
+});
+
+describe('ENG-1015 durable session polling', () => {
+  const context = { userId: 'user-123', agentUserId: 'user-123' };
+  const session = { sessionId: 's1', messages: [], hasActiveProgress: false };
+  async function poll(runId?: string) {
+    const result = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: runId }, context);
+    return JSON.parse(result.content[0].text);
+  }
+  beforeEach(() => mockMcpFetch.mockReset());
+  it('does not infer completion from an idle session without a run ID', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session);
+    expect((await poll()).completion_confirmed).toBe(false);
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+  it.each(['completed', 'failed', 'interrupted'])('confirms durable terminal status %s for the requested session and run', async status => {
+    const run = { runId: 'r1', sessionId: 's1', status, finishReason: 'stop' };
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    const body = await poll('r1');
+    expect(body.completion_confirmed).toBe(true);
+    expect(body.run).toEqual(run);
+    expect(mockMcpFetch).toHaveBeenLastCalledWith({ method: 'GET', path: '/api/agent-mode/runs/r1', context });
+  });
+  it.each([
+    null, [], 'completed', {},
+    { runId: 'r1', sessionId: 's1', status: 'running' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: 'detached_still_building' },
+    { runId: 'r1', sessionId: 'other', status: 'completed' },
+    { runId: 'other', sessionId: 's1', status: 'completed' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: {} },
+  ])('withholds confirmation for absent, malformed, unrelated or detached evidence: %j', async run => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingUserQuestion: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits work-plan input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingWorkPlanInput: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it.each(['timeout_partial_media', 'timeout_partial_work'])(
+    'does not confirm partial timeout finish reason %s',
+    async finishReason => {
+      mockMcpFetch.mockResolvedValueOnce(session)
+        .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed', finishReason });
+      expect((await poll('r1')).completion_confirmed).toBe(false);
+    }
+  );
+  it('withholds confirmation if the run endpoint fails', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockRejectedValueOnce(new Error('404'));
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('preserves session refusal and does not attempt the run read', async () => {
+    mockMcpFetch.mockRejectedValueOnce(new Error('Forbidden'));
+    await expect(mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: 'r1' }, context))
+      .rejects.toThrow('Forbidden');
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
 });

@@ -23,6 +23,8 @@
  */
 
 import { linkedInOutreachService } from "./linkedInOutreachService";
+import { isAnonymizedSearchItem } from "../utils/anonymizedLinkedInLead";
+import { usablePublicIdentifier, usableProfileUrl } from "../utils/linkedInAnonymizedProfile";
 
 /**
  * Output shape for a single prospect card. Matches the FE
@@ -165,11 +167,15 @@ export function mapUnipileItemToPreview(item: any): PreviewProspect {
 
   // Build clean LinkedIn URL from slug; fall back to stripping the messy
   // miniProfileUrn off `profile_url` when no slug is present.
+  // Both branches reject LinkedIn's anonymized sentinel: `public_identifier` can be
+  // the literal string "undefined", and `profile_url` is built from that same value,
+  // so either one alone still yields a /in/undefined that belongs to nobody.
   let linkedin_url = "";
-  if (typeof safeItem.public_identifier === "string" && safeItem.public_identifier) {
-    linkedin_url = `https://www.linkedin.com/in/${safeItem.public_identifier}`;
-  } else if (typeof safeItem.profile_url === "string" && safeItem.profile_url) {
-    linkedin_url = safeItem.profile_url.split("?")[0];
+  const usableSlug = usablePublicIdentifier(safeItem.public_identifier);
+  if (usableSlug) {
+    linkedin_url = `https://www.linkedin.com/in/${usableSlug}`;
+  } else {
+    linkedin_url = usableProfileUrl(safeItem.profile_url) ?? "";
   }
 
   // Stable id for FE list-keying. Prefer Unipile provider id, then slug,
@@ -255,6 +261,13 @@ export function mapUnipileItemToPreview(item: any): PreviewProspect {
  *                                            { error } envelope from
  *                                            `handleError`. Route returns
  *                                            502.
+ *                       'search_unavailable' — the raw Unipile response was
+ *                                            empty AND a probeSearchCapability
+ *                                            control query confirms the
+ *                                            account can't search at all
+ *                                            (ENG-975/ENG-1559) — a platform
+ *                                            outage, not "no prospects match".
+ *                                            Route returns 503.
  */
 export type PreviewResult =
   | {
@@ -265,7 +278,11 @@ export type PreviewResult =
     }
   | {
       ok: false;
-      error: "no_filters" | "no_linkedin_account" | "unipile_error";
+      error:
+        | "no_filters"
+        | "no_linkedin_account"
+        | "unipile_error"
+        | "search_unavailable";
       message?: string;
     };
 
@@ -354,7 +371,34 @@ export async function searchProspectsPreview(
     ? searchResult!.items
     : [];
 
-  const items = rawItems.slice(0, limit).map(mapUnipileItemToPreview);
+  // ENG-975/ENG-1559: an empty raw response is ambiguous — it means either
+  // "nobody matches" or "this account can no longer search" (a Unipile/
+  // LinkedIn outage relays as HTTP 200 with items:[], byte-for-byte
+  // identical to a genuine no-match). This preview always runs a fresh
+  // first-page search (no cursor/pagination here), so there's no
+  // "running out of pages" case to exempt — mirrors the check
+  // `agentModeService`'s search-people action runs before it will report an
+  // empty result as fact. Checked on the RAW response, before the ENG-1002
+  // anonymized-item filter below, so a genuinely degraded account is never
+  // misread as "every result happened to be out-of-network".
+  if (rawItems.length === 0) {
+    const capability = await linkedInOutreachService.probeSearchCapability(accountId);
+    if (capability === "degraded") {
+      return { ok: false, error: "search_unavailable" };
+    }
+  }
+
+  // ENG-1002: drop LinkedIn's anonymized out-of-network hits BEFORE the slice.
+  // These cards are handed straight to POST /api/onboarding/outreach/save,
+  // which persists them via crmDb.batchCreateLeads — so an unfiltered
+  // placeholder becomes a nameless, un-dedupable CRM lead exactly the way the
+  // agent-mode import used to create them. Filtering ahead of the slice also
+  // means the user gets `limit` real prospects instead of losing card slots to
+  // profiles they cannot see, open or contact.
+  const items = rawItems
+    .filter((item) => !isAnonymizedSearchItem(item))
+    .slice(0, limit)
+    .map(mapUnipileItemToPreview);
 
   return {
     ok: true,

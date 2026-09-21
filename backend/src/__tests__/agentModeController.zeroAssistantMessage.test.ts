@@ -67,6 +67,14 @@ describe('zeroAssistantIncompleteMessage classification', () => {
       ).toBe(true);
     });
 
+    it('classifies a drain-window dispatch race (ENG-1166) as budget, not system', () => {
+      const msg = zeroAssistantIncompleteMessage(
+        new Error('Worker is draining — no new requests accepted'),
+      );
+      expect(isBudgetMessage(msg)).toBe(true);
+      expect(isSystemMessage(msg)).toBe(false);
+    });
+
     it('classifies a zero-assistant-output run (ran but emitted nothing) as budget', () => {
       const msg = zeroAssistantIncompleteMessage({ code: 'ZERO_ASSISTANT_OUTPUT' });
       expect(isBudgetMessage(msg)).toBe(true);
@@ -142,6 +150,7 @@ describe('zeroAssistantIncompleteMessage classification', () => {
   describe('classifyZeroAssistantFailure returns the failureClass stamped on metadata', () => {
     it.each([
       ['budget', new Error("Request exceeds the model's maximum context length")],
+      ['budget', new Error('Worker is draining — no new requests accepted')],
       ['transient', Object.assign(new Error('rate limited'), { status: 429 })],
       ['system', new Error('I encountered an issue processing your request.')],
       ['system', null],

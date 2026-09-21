@@ -1,3 +1,386 @@
+## ENG-1907: sandbox mode phase 1 — the `eval_` principal becomes a real portal account (2026-09-12)
+
+ENG-1870 shipped a separate mini-product for evaluations (server-rendered `/evaluation` page, a
+single-shot Gemini with no tools, a toy simulator, an HTTP allowlist that 403'd every real route).
+Harsha rejected it on sight: the candidate never touched the product. Phase 1 of ENG-1906 keeps the
+lifecycle that was good — `eval_<uuid>` identity, the `AW-Evaluations` policy row, atomic
+provision/revoke/audit, reviewer assignment, the `scope:'evaluation'` delegate token — and
+inverts the boundary: a **denylist** (connector OAuth, MCP OAuth/servers/API keys, Stripe, org,
+Featurebase identity, public share links, session transfer, Clarity replay registration,
+`/api/admin`), socket admission on the same policy check, and **class-based** tool denial
+(`SANDBOX_TOOL_CLASSES` in `evaluationPolicy.ts`) enforced in all three dispatchers. Everything
+unclassified — Meta tools included — reaches its normal handler. No Meta simulation exists yet
+(phase 2/3), so a phase-1 sandbox account simply has no Meta connection.
+
+Assumptions worth knowing when this bites later:
+
+- **`getAllUsers` now excludes `eval_` principals by default** (`{ includeSandbox: true }` opts
+  in). That single filter is what keeps a take-home account out of the activation CRM sync,
+  onboarding nudges, Meta crons, renewal alerts, LLM unit economics and revenue listings. The one
+  caller that opts in is the partner-portal roster (`GET /api/admin/users`) because Access Portal
+  lives there. If a sweep ever bypasses `getAllUsers` (the renewal cron's `scanWithFilter` did),
+  it needs its own `isEvaluationUser` skip — one test per enumerator pins the current set.
+- **Oncall suppression is keyed on identity, never a caller flag.** `sendAgentModeOncallAlert`
+  resolves the session owner when no `userId` is passed, so the 30 call sites are untouched. It
+  fails open: a lookup error still pages for a real customer.
+- **Reliability telemetry skips sandbox runs entirely** (run ids remembered at
+  `recordAgentModeRunStarted`, cleared on the terminal event) because
+  `agentReliabilitySnapshotCron` has no per-user filter and feeds the closure gate's
+  `failedRunRate`/`degradedRunRate`.
+- **`install_skills` is deliberately outside the `connectors` class** even though it matches the
+  `install_` prefix — denying it would strip every non-foundation tool from Emma.
+- **A policy row without `deniedToolClasses` denies every class** (fail closed; this is also what
+  the pre-phase-1 row for the Ryan take-home looks like). The store's `get()` normalizes legacy
+  fields (`materials`, `artifacts`, `simulation`, `remaining`) away instead of throwing.
+- **Provision refuses without the `Sandbox` tier row** (`scripts/ensure-sandbox-tier.ts`,
+  compare-and-set append) because an unknown tier name fails *open* to every page, connector and
+  skill in `subscriptionService`. The AW-Users item is written with `subscriptionType: 'Sandbox'`,
+  seeded `brandGuidelines` (else the portal forces onboarding, which runs real brand extraction),
+  and never `adAccount` — `routes/meta.ts` and Emma's Meta credential resolver would otherwise
+  fall back to AgentWeb's shared production Meta token.
+- Local TDD ran under Node 20 (`/usr/local/bin/node`); the default Node 26 on the Mac cannot load
+  `jsonwebtoken`. Merge evidence is the Atem run.
+
+## ENG-1624: the "stopped caching the private key" claim describes a bug that never reached `main` (2026-08-31)
+
+A second correction to this same PR's history (see the entry directly below for the
+first). Commit `22bd000c6`'s message also says: "Also stop caching the parsed
+service-account secret (private key included) on `driveServiceAccountCredentials` —
+only `client_email` is needed... so keep just that." Read on its own, that describes
+fixing a security exposure that existed in the codebase.
+
+It didn't. `git log -p -- backend/src/services/agentModeService.ts` shows
+`driveServiceAccountCredentials` (the field that cached the full parsed secret) was
+introduced AND removed within this same unmerged PR branch — added by an earlier
+stage of the pipeline run that produced this PR, then replaced with the narrower
+`driveServiceAccountEmail` by the commit whose message makes the claim.
+`origin/main` never had a `driveServiceAccountCredentials` field at any point;
+`getGoogleDriveClient()` there never cached anything beyond what this PR adds. So
+nothing was "removed" in the sense of undoing a production exposure — the vulnerable
+code was draft-only and never shipped. What this PR actually does is *add* a narrow
+`driveServiceAccountEmail` cache (just the email, needed to name the account in a
+share-access error) and document why the rest of the secret isn't retained. That's
+good hygiene, but it's not the removal of a private-key leak, and describing it that
+way overstates what happened. Left uncorrected in the commit itself (same reasoning
+as the entry below — rewriting a pushed, already-in-PR commit isn't worth a
+force-push for a wording fix); noting the correction here instead.
+
+## ENG-1624: sub-folder KB traversal fix is correct; one commit's stated motivation isn't (2026-08-31)
+
+Independent re-verification against the live prod session (`822c1ed4-133e-4081-b8c9-ee43547fd463`,
+pulled from `AW-ChatSessions` + `AW-ChatMessages`, since the session record's own `messages` list is
+empty and the real transcript lives in the separate messages table) confirms the fix. The two actual
+failures — matching the session's own `failedFunctions` counter — were both
+`materialize_knowledge_base_asset`, at `2026-08-27T15:49:26Z` (file-not-found against the registered
+root) and `15:49:36Z` ("Not authorized" against the sub-folder itself). That's ~1.5h before the
+issue's stated "~17:19–17:24Z" window, which is actually when the deferred-ads deployment ran and
+step 9 completed with 0 ads — close to when the customer's Slack complaint landed (10:31 PDT =
+17:31Z), not when the tool itself failed. All four Drive KB call sites
+(`materializeKnowledgeBaseAsset`, `readGoogleDriveSharedFile`, `listKnowledgeBaseFiles`,
+`searchKnowledgeBase`) now route through `getGoogleDriveFolderTreeIds`; `tsc` and the 195 targeted
+tests pass post-merge with `main`.
+
+One inaccuracy survives in the commit log: `22bd000c6`'s message claims "search_knowledge_base was
+the call actually exercised by the failing Phoenix session." The transcript shows otherwise —
+`search_knowledge_base` was called exactly once in that session, at `18:55:59Z`, *after* Harsha's
+manual sub-folder registration had already unblocked `materialize` (`18:50–18:52Z`), for an
+unrelated query ("Do Not Say marketing guardrails") that Emma herself determined belonged to a
+different client's KB entry, not Phoenix's. The fix to `searchKnowledgeBase`'s Drive branch is still
+correct and worth keeping — same class of bug, independently confirmed by reading the code — the
+commit message's specific attribution to this session is just wrong. Left uncorrected in the commit
+itself (rewriting a pushed, already-in-PR commit isn't worth a force-push for a prose-only fix);
+noting the correction here instead.
+
+## ENG-1484: two correct instructions can still lose to each other (2026-08-23)
+
+ENG-1478 (same day) fixed the Work Plan Capabilities section to tell Emma to check
+`list_predefined_work_plans` on an unprompted goal statement. Live re-test after that fix deployed:
+"I'm interested in making some linkedin posts" *still* skipped the check and drafted 3 posts
+directly, despite a matching accessible plan ("Research Based Linkedin Founder Post") existing.
+
+Root cause: a separate "Page & Feature Tool Reference" table — framed for "a user refers to a page
+or feature by name" — has `"LinkedIn content", "LinkedIn posts", "LinkedIn page" →
+list_connected_account_posts, create_social_media_posts`, an unconditional keyword→tool arrow. Both
+this row and the Work Plan Capabilities paragraph are individually correct for what they're written
+to cover; neither one references the other, so a request that matches both keyword sets resolves
+to whichever pattern is more concrete and direct — the fixed-arrow table row, not the conditional
+paragraph. ENG-1478's fix never got a chance to run.
+
+Fix: added an explicit exception to that one row — a stated GOAL (not a literal "show me the page"
+request) defers to the Work Plan Capabilities check first. Scoped to the one row Harsha actually
+reproduced; the same table has ~15 other keyword→tool rows with the identical latent shape (a goal
+statement could plausibly match any of them before ever reaching a relevant work-plan check), but
+fixing all of them blind, with no reproduced case for the others, risks unintended behavior change
+across many more real flows than this PR can verify. Flagged as a known follow-up, not fixed here.
+
+## ENG-1478: a prompt can describe a branch correctly and still never enter it (2026-08-22)
+
+ENG-1472 added `recommend_predefined_work_plan` (an inline, soft-accept proposal card) and the
+system prompt's "Work Plan Capabilities" section already told Emma which tool to call once a
+goal-matching template was known: *"states a concrete current goal that clearly matches exactly one
+template from list_predefined_work_plans, call recommend_predefined_work_plan..."* That sentence
+reads as complete — it names the trigger, the tool, and the guardrails (ask-if-ambiguous, don't
+re-recommend). It is not: it silently assumes the plan list is already sitting in context.
+
+Live-reproduced (Harsha, 2026-08-22): a fresh chat, "I'm interested in making some linkedin posts",
+with a plan literally named `Research_Based_Linkedin_Founder_Post` accessible to the account —
+no recommendation. The prompt has one line just below this section stating the *active* work
+plan's status "is automatically provided in your context." Nothing says the same about the
+*available templates* — because it isn't true; `list_predefined_work_plans` is a tool call, not
+injected context. The branching instruction was written as if discovering a match were free. For
+an ordinary conversational turn where the user never mentioned work plans, calling an extra
+"informational" tool is exactly the kind of speculative call a model will skip unless told to make
+it — and nothing here told it to.
+
+Fix: added one explicit sentence — check for a match before replying; if `list_predefined_work_plans`
+hasn't already been called this session, call it now, even though the user never asked about work
+plans — plus a line stating outright that templates are not auto-injected the way active-plan status
+is. The rest of the branch (single-match → recommend, ambiguous → one clarifying question, no
+re-recommend) was already correct and is unchanged.
+
+Verification is the same convention every other `agentModeSystemPrompt.*` section uses: string
+assertions against the compiled `AGENT_MODE_SYSTEM_PROMPT` constant
+(`agentModeSystemPrompt.workPlanRecommendation.test.ts`) — this repo has 14 sibling files doing
+exactly this for other guardrails (menu selection, capability denial, lead-import resume, etc.), so
+prompt content here is treated as tested code, not prose. A live multi-turn transcript check (does
+the model actually call the tool now) is the residual proof this test shape can't give — flagged in
+the PR as the one thing NOT covered by a unit assertion, same as it is for every other guardrail in
+this file.
+
+## ENG-1371: deleting a retired gate is easy; the things quietly leaning on it are not (2026-08-19)
+
+Greptile was dropped as a vendor. Its app had already stopped posting — the `Greptile Review`
+check-run is absent on every PR opened after 2026-08-19 ~10:00Z — but all of its code was still on
+`main`, so every run still paid for a 600s poll that could no longer succeed. This removed the
+`greptile-review` job, seven scripts and `greptile.json`. Findings, because almost none of the work
+was the deletion:
+
+- **The gate's failure mode had already inverted, and the error message lied.** `greptile-gate.sh`
+  returns `unavailable` (exit 75, which passes under ENG-1277's policy) only when no verdict exists
+  for **any** commit on the PR. If a stale pre-cutoff review existed, `greptile_alive` was set and
+  the timeout was classified `refused` (exit 1) instead, printing *"Greptile reviewed this head and
+  it did not clear the bar — a real finding, still blocking."* Greptile had not reviewed that head
+  at all. In one captured run the stale review it was ignoring was **5/5**. The `greptile_alive`
+  guard was correct when written and was silently invalidated by ENG-1282 setting
+  `triggerOnUpdates: false` — after that, every PR with one review and one later push hit the false
+  branch. **Two changes that are each individually correct can compose into a lie.**
+- **5 of the 6 open PRs failing `merge-evidence.sh` were failing on this and nothing else**
+  (#2485, #2481, #2399, #2376, #2417). The queue was blocked by a vendor we no longer used.
+- **`merge-evidence.sh` was leaning on the deleted job in a way nothing would have caught.** It used
+  `Require Greptile Review` as its draft discriminator, matched by exact name and **fail-closed on
+  absence** — so a plain `git rm` of the job would have turned every PR into NO_EVIDENCE, disabling
+  the merge gate CLAUDE.md mandates. The replacement was verified before the switch rather than
+  after: both discriminators were run against all 18 open PRs and returned **identical verdicts on
+  18/18**. `MERGE_EVIDENCE_DRAFT_JOB` already existed as an override, so that A/B needed no code
+  change at all — a seam built for renames paid for itself two months later.
+- **`detect-changes` is a strictly better discriminator than the job it replaced.** `greptile-review`
+  needed `always() &&` in front of its draft check because it declared
+  `needs: [detect-changes, backend-tests-a, backend-tests-b]`, and GitHub implicitly ANDs an `if:`
+  with `success()` when the expression names no status-check function — so a path-filtered skip
+  upstream could propagate into the discriminator. `detect-changes` is the root of the graph with no
+  `needs:` at all, so the bare draft check is exactly right. The invariant now asserts **both** the
+  `if:` and the absence of `needs:`.
+- **An invariant that greps for a vendor name goes vacuous the moment the vendor leaves.**
+  `merge-evidence.test.sh` asserted that backend-tests-a/b did not reference `greptile` in their
+  `needs`/`if`. With the job deleted that check could never fail again while appearing to pass —
+  the exact shape of a control that has quietly stopped working. It now asserts the positive
+  property instead: those jobs declare `needs: [detect-changes]` and nothing else, so a reviewer,
+  lint gate or approval job added in front of the suite fails in the PR that adds it.
+- **Renaming fixtures across a suite is not a `sed`.** The regression fixtures modelled two distinct
+  jobs — the discriminator and an ordinary second job that happened to be `Detect changed projects`.
+  A blanket rename collapsed both into one name and produced fixtures with the same job appearing
+  twice with contradictory conclusions; 7 tests went red for reasons unrelated to the change. The
+  ordinary job had to be moved out of the way first, then the discriminator promoted into the freed
+  name. The suite caught all of it, which is the point of it existing.
+- **dev.md already knew.** The ENG-754 entry recorded, on 2026-07-29, that *"`Require Greptile
+  Review` was not actually a required status check — branch protection on `main` required only
+  `Detect changed projects`."* That stayed true for three weeks while `tests.yml` asserted the
+  opposite in three separate comments and ENG-1320 based a vendor decision on it. **A fact recorded
+  once in a log does not propagate to the comments that contradict it.** Branch protection is now
+  being fixed under ENG-1373; the comments here were corrected with this change.
+- **Ride-alongs taken because the files were already open:** `dependabot-integrity-check.test.sh`
+  (20 assertions guarding the one genuinely security-relevant required check) existed but no job
+  ran it; the CLI `--testPathIgnorePatterns` *replaces* rather than extends `jest.config.js`,
+  silently re-including the opt-in twins suites; five jobs had no `timeout-minutes`, inheriting
+  GitHub's 360-minute default; and `eb-config-conflict`'s existing 5-minute ceiling turned out to
+  sit BELOW its own `fetch-depth: 0` checkout cost — it was killed at 4m59s on this very PR, having
+  survived only because the job is path-gated and had run 6 times in 197 runs without drawing the
+  tail. Auditing "jobs with no timeout" and not "jobs whose timeout is wrong" missed it.
+- **The one ride-along that had to be reverted, and why it is the most useful finding here.** Job
+  B's ignore list used `/__tests__/agentMode` while job A selects on `agentMode`, so 23 files ran
+  in BOTH backend jobs on every PR. Making the two lists exact complements looks like free money.
+  It is not: coverage is collected ONLY from `src/utils/**` and ONLY by job B, so **which tests run
+  in job B is what the coverage number measures**. Two of those 23 are
+  `src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`, whose targets sit
+  inside the coverage scope — and every other test touching those two modules is also
+  `agentMode`-named, so excluding the 23 sent both modules to zero. CI went red: branches
+  95.2% -> 93.99%, statements 98.35% -> 97.55%. Reverted, with the measurement recorded in
+  `tests.yml` so the next person does not rediscover it. **A test-selection change in a repo with a
+  coverage gate is a coverage change, whatever it looks like.** Deduplicating the split needs the
+  `collectCoverageFrom` scope decided first — ENG-1376.
+- **Both of my own errors were caught by CI, not by review or by me.** The coverage drop and the
+  timeout kill were each invisible to local suites (391 assertions, all green) because neither is
+  expressible as a script test — one needs the real Jest run, the other needs a real runner and a
+  real clone. The 5-minute timeout in particular had been latent for months. Local suites prove the
+  logic; only the real run prices it.
+
+## ENG-1309: fixing a "prompt bloat causes verbosity" regression without adding to the pile (2026-08-18)
+
+Fix for ENG-1306 (two customers, four sessions, quantified 2x completion-token growth since the
+Opus 5 default switch). Human-written behavioral contract (drafted by Fable from Ed Mongiovi's and
+Vince Magaline's own words, confirmed by Harsha on ENG-1305): yes/no questions get a yes/no first
+line; an explicit stated length is honored within ~20% on the first attempt; factual/config
+questions stay under ~150 words by default; the verified/unverified distinction becomes a compact
+per-claim tag, not two separate lists. Findings, because the shape generalizes:
+
+- **The contract itself said not to do the obvious thing.** ENG-1305's audit named the last two
+  "fix this failure mode" prompt additions (ENG-829, ENG-1187) as contributors to the very
+  regression being fixed here — each one grew the reply by adding a rule that had to be obeyed on
+  every turn. Bolting a third CRITICAL block on top of the same pile would be the identical move
+  that produced ENG-1306. So this PR's one new section (`## Answer Directness & Length`) is
+  offset by removing two already-proven-ineffective instructions it makes redundant: a generic
+  "keep responses concise but informative" bullet (dead weight — the customer complaints are
+  direct proof it was never followed) and a 7-line "Important formatting rules" numbered list that
+  had three separate rules all restating "minimal spacing" and a fourth restating "concise."
+  Net result: **+961 chars / +163 words** on the 66,893-char (now 67,854) `AGENT_MODE_SYSTEM_PROMPT`
+  constant — a real, disclosed increase (+1.4%), not zero, but roughly an order of magnitude
+  smaller than treating this as "just add another block" would have produced, and the new section
+  constrains *output shape* rather than adding another thing to check before answering — a
+  different failure mode than the additive pattern ENG-1305 flagged.
+
+- **Two instructions asking for opposite formats is worse than either alone.** The ENG-829 bullet
+  literally said "keep the two lists visibly separate" — the exact anti-pattern criterion 3 of this
+  ticket's own contract asks to fix. Adding a new "use a compact tag, never two lists" rule
+  *alongside* the old "keep two lists separate" rule would have left the model with two live,
+  contradictory formatting instructions for the same claim-labeling behavior — genuinely
+  underdetermined, and a worse outcome than not fixing it. The old bullet was edited in place
+  (same file, same PR) rather than left for a future cleanup; `agentModeSystemPrompt.answerDirectness.test.ts`
+  asserts the old phrase is gone, not just that the new one exists, specifically to catch a
+  reviewer or future edit reintroducing it as an "addition."
+
+- **The thinking-budget/model-config lever was deliberately not used here**, despite
+  `AGENT_MODE_MAX_OUTPUT_TOKENS` (`agentModeService.ts:197`, raised 12,384→32,000 on ENG-403,
+  07-21) and Bedrock's `ConverseCommand` having no thinking-budget cap (`agentModeService.ts` Claude
+  path, ~L2248) both being named as root-cause contributors in ENG-1305's audit, and Harsha's own
+  decision comment naming "length/thinking-budget config where available" as a preferred lever
+  over prompt prose. Reasons for staying prompt-only in *this* PR: (1) `AGENT_MODE_MAX_OUTPUT_TOKENS`
+  is a single global ceiling shared by every AgentMode feature, including ones that legitimately
+  need long output (GTM plans, audit reports, blog articles) — lowering it to fix short-answer
+  verbosity risks truncating unrelated legitimate long-form generation; a targeted fix needs a
+  per-request-shape cap, not a global one, which is a bigger design than this ticket's contract
+  asks for. (2) Adding a Bedrock `thinking` budget is a live-behavior change across every Opus 5
+  call in the product, not just the four named replay fixtures, and needs its own scoped
+  investigation/testing — Harsha's ENG-1305 decision comment frames ENG-1309 itself as "the fix"
+  (the harness contract), not as the vehicle for that separate lever. Flagging both here so a
+  follow-up isn't accidentally treated as novel: if the harness-only contract proves insufficient
+  once ENG-1314 unblocks real replay evidence, the next lever is a per-request output-length hint
+  derived from the new contract's own thresholds (e.g. cap `max_tokens` lower when no explicit
+  depth was requested), not a global constant change.
+
+- **The real behavioral evidence (replay against the four named production sessions) is
+  infrastructure-blocked, not skipped.** `loops/eval/agentModeReplayFixtures.ts` (ENG-1312,
+  already merged) is the deterministic char/word-threshold harness this contract's own criterion 4
+  calls for ("measured in characters/tokens, not judge score") — it already cites this ticket's
+  exact thresholds (`ENG-1309 criterion 1/2/3`) in `thresholdSource`, and already proves the
+  mechanism catches a regression using a synthetic `'x'.repeat(10524)` payload standing in for the
+  real "today 10,524 chars" figure from criterion 2. It runs on synthetic placeholder content
+  because the real transcript content is a data-exposure decision (ENG-1314), not a code decision —
+  see that module's own doc comment. This PR's tests therefore characterize the only surface a unit
+  test actually owns: that the system prompt *states* the contract in terms an LLM can follow
+  (same idiom `agentModeSystemPrompt.followExplicitDirection.test.ts` established for ENG-1311) —
+  pinned RED (absent) before this change, GREEN (present) after. `agentModeReplayFixtures.test.ts`
+  was re-run unchanged and stays green; this PR doesn't touch that module.
+
+## ENG-1312: the satisfaction judge's blind spot, and a real fixture is a data-exposure decision, not a code one (2026-08-17)
+
+Two customers both reported the judge rewarding exactly the behavior they
+were complaining about — a 20-page reply to a 2-page ask scored 4/5 with
+5/5/5 dimensions, and pushback against a direct instruction scored 5 for
+"excellent reasoning." Findings, because the shape generalizes:
+
+- **The judge only had 3 dimensions and none of them measured length,
+  instruction-following, or unnecessary caution.** `goalCompletion`/
+  `dataAccuracy`/`outputQuality` can all be genuinely high on a reply that is
+  simultaneously a regression — verbosity and permission-asking are
+  orthogonal to correctness. Added `concision`, `instructionCompliance`
+  (both 0-5), and `unnecessaryPermissionRequest` (boolean), plus a rubric
+  rule that pushback against a non-spend/non-publish instruction can't score
+  `outputQuality: 5` — see `VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE` in
+  `sessionScoringService.ts`.
+
+- **New rubric text must be APPENDED, never baked into the hardcoded
+  default.** Production carries a live `default-scoring-prompt` AW-Settings
+  override, and a custom `ScoringJudge.systemPrompt` is entirely
+  user-authored. Editing only `DEFAULT_SCORING_SYSTEM_PROMPT`'s literal text
+  would leave whatever prompt is *actually configured* blind to the new
+  dimensions — the same masking failure (ENG-392) that let this regression
+  hide for two weeks in the first place. Same pattern `NO_TASK_JUDGMENT_CLAUSE`
+  already uses; extended, not reinvented.
+
+- **"Replay fixtures with hard thresholds" sounds MOCKABLE and is, right up
+  until the fixture needs real content.** All five session IDs named in this
+  issue's own acceptance criteria (kept out of this file — see the Linear
+  issue text, not git) are real, existing production `AW-ChatSessions` rows —
+  verified read-only. The mechanism (`loops/eval/agentModeReplayFixtures.ts`)
+  is fully built and tested, but populating it with the REAL transcripts
+  means copying a real customer's verbatim conversation content into
+  permanently-committed, CI-gating git history, readable by every future
+  clone and by Argusoft's external contractors forever. That's a
+  data-exposure call under `autonomous-execution-and-merge.md`'s
+  database/data-plane gate ("a change that can... expose... existing stored
+  data"), not a code call — filed as ENG-1314 (blocks ENG-1312) with three
+  concrete options + a recommendation rather than decided unilaterally. The
+  lesson: "no live third party" and "no data-plane change" are necessary but
+  not sufficient for MOCKABLE — check whether the fixture DATA ITSELF is a
+  live customer's content before assuming the classification holds.
+  Separately (CodeRabbit, PR #2443): the real session IDs, customer/org
+  names, and quoted request text don't need to wait on that decision either
+  — they aren't the transcript content ENG-1314 is scoping, so
+  `agentModeReplayFixtures.ts`'s fixtures use neutral synthetic `id`/`label`
+  values instead, independent of how ENG-1314 resolves.
+
+## ENG-973: the quota gate was one layer above what MCP actually calls (2026-08-08)
+
+`/api/emma/*` is 59 routes (now 60 counting a PATCH the source-level regex sweep missed) and none
+of them checked token usage. Findings from the investigation, because the shape of this mistake
+generalises:
+
+- **The guardrail and the logic sat on different layers.** `checkTokenUsage` appears 3x in
+  `controllers/agentModeController.ts` and 0x in `services/agentModeService.ts`. The `/api/emma/*`
+  routes are thin delegates *to the service*. The design intent — stated at the time as "route
+  everything through agentModeService so external callers cannot bypass Emma's controls" — was
+  therefore never true: delegating to the service hands over the tool logic and skips the
+  controller where the control lives. A protection is only inherited by callers that go through
+  the layer it lives on.
+
+- **Do not enforce at N call sites when N grows.** The obvious fix was 59 `checkTokenUsage` calls.
+  That reproduces the bug at route 60. Enforcement is one router-level middleware plus an explicit
+  `EMMA_ROUTE_BUDGET` classification, with unclassified routes failing closed to metered and a
+  contract test that reads the router's own stack. That test found `PATCH /work-plans/status`
+  within a minute of being written — a route a `grep` for `router.(get|post|put|delete)` had
+  silently skipped. Enumerate from the runtime object, not from the source text.
+
+- **A borrowed `node_modules` produced 18 fake type errors.** The worktree symlinked
+  `backend/node_modules` to the primary checkout, whose `package.json` predates the
+  `@opentelemetry/*` dependencies on `main` (0 references vs 5). `npm run typecheck` reported
+  errors in `observability/tracing.ts` and `twitterService.ts` that had nothing to do with the
+  change. Per ENG-731: check the environment before believing an unexplained red. Unlink (never
+  `rm -rf`, which would follow the symlink into the primary checkout) and `npm ci`.
+
+- **Adjacent finding, filed as ENG-974.** `internal: true` on an MCP tool filters `tools/list` but
+  `registry.execute()` never checks it, and `security.mcpServer.test.ts:199-216` asserts that on
+  purpose: *"if a tool name is known, it can be called. The real defense is that external clients
+  never discover internal tool names."* The ten hidden names include `generate_image`,
+  `send_email` and `google_search_web`. They are hidden because they cost money or send something
+  outward — so this fix bounds the cost half of that exposure by metering the REST routes those
+  tools self-call. The entitlement half remains a decision, because closing it means rewriting a
+  test that deliberately asserts the opposite.
+
+- **The March 2026 IDOR report is genuinely closed.** `c03713f46` prevents external clients from
+  overriding `userId`, and section B of `security.mcpServer.test.ts` regression-tests it (17/17
+  green). The cross-account vector is fixed; what remained were the cost and entitlement holes
+  above, which are different bugs wearing its reputation.
+
 ## ENG-837: EB accepts a deploy and rejects it later, so "no error" from update-environment proves nothing (2026-08-03)
 
 Production was undeployable for ~17 hours on 2026-08-01 and nobody noticed. The deploy job itself
@@ -6977,3 +7360,275 @@ User supplied real transparent PNGs (3-color for header, all-white for footer). 
 
 ### Tests
 `imageGeneration.backgroundRemoval.test.ts` (real Sharp — proves alpha, interior-counter preservation, tolerance, corner-median, WCAG helpers), `agentModeService.removeImageBackground.test.ts` (orchestration, filename, contrast, error paths), `remove_image_background.registration.test.ts` (tool registry + updated descriptions). 107 image-related tests pass; `npx tsc` clean.
+
+## ENG-1063 — a human override for the Greptile 5/5 gate (2026-08-10)
+
+`Require Greptile Review` is a required check on `main` and had no override. Measured across
+`tests.yml` PR runs 2026-07-27..08-10: **35 gate failures to 32 passes** (30 skipped = drafts,
+3 cancelled). **None was an outage** — the gate's own `unavailable` verdict (exit 75) appeared
+zero times; every failure was a landed verdict below the bar. Sampling 14 of the 35: **ten 4/5,
+four 3/5**. So the block was routine and quality-shaped, not flaky, and each refusal forced a
+fix-and-repush to move 4 → 5.
+
+### Assumptions checked, and one that was wrong
+
+- **Branch protection could not deliver this.** `enforce_admins: true` on all three repos, so
+  nobody can bypass — and the only admins are `harshmoney123` and `agentwebdeployer`. The
+  Argusoft team has `push`. Flipping `enforce_admins` would therefore not have unblocked the
+  team at all; it would only have unblocked Harsha, and would simultaneously have handed the
+  bypass to the swarm, which authenticates as `harshmoney123`. Rulesets can express per-team
+  bypass, but a bypass actor bypasses *every* rule in the ruleset, including the test checks.
+  Hence: the override lives in the gate, scoped to exactly the Greptile bar.
+- **GitHub auto-merge needed no change.** It never bypasses a required check, so "auto-merge
+  only on a true 5/5" was already the behaviour; only the human half was missing.
+- **WRONG, and caught before shipping:** the first implementation authorized the overrider via
+  `GET /repos/{owner}/{repo}/collaborators/{login}/permission`. That endpoint requires push
+  access, and `tests.yml` declares `permissions: contents: read, checks: read, issues: read,
+  pull-requests: write` — no scope reaches it. The call would have 403'd on every run and the
+  feature would have been dead on arrival while looking correct in tests, because the test mock
+  was happily serving an endpoint production cannot call. Replaced with `author_association`,
+  which is already on every comment in the payload the gate fetches: zero extra API calls, zero
+  extra token scope. Verified against live comments on #2290/#2300/#2310/#2315/#2318 — the
+  Argusoft team and Harsha all comment as `MEMBER`.
+
+### What that authorization does and does not prove
+
+`OWNER|MEMBER|COLLABORATOR` proves org membership or repo collaboration, **not** a repo write
+bit. In this org that set is the seven accounts in `orgs/AgentWebPro/members` minus the denied
+machine accounts, which is the intended audience. If the org grows past the point where every
+member is trusted to merge backend code, this needs a real permission lookup and the token scope
+to make it — do not quietly widen the trusted set instead.
+
+### Residual gap (tracked)
+
+The swarm commits as `harshmoney123`, the same principal as human-Harsha, so no gate can fully
+separate them. Automation is blocked on its *own* PRs by two independent signals (a
+`swarm/*`/`autofix/*` head branch, or an `Execution-Actor:` attribution line in the body), but on
+a human-authored PR an agent acting as Harsha could still post an override. The structural fix is
+the dedicated bot identity `automated-work-attribution.md` already calls for.
+
+## ENG-967 — "two landing pages returned 0 leads": a real bug, and two lists that do not have it (2026-08-21)
+
+Reported as one bug: two CRM lead lists returned 0 leads on every Inbound Website Lead
+Engagement run since May 2026. Investigating it surfaced a genuine silent-lead-loss defect —
+but **neither reported list is an instance of it.** Both halves are recorded here because the
+fix and the report do not line up, and a future reader will otherwise assume they did.
+
+### The defect that is real, and is fixed here
+
+A landing page can be bound to a lead list that the platform will not accept public
+submissions for. The generated capture route posts to `POST /api/webhooks/forward-lead`,
+which rejects any list with `publicAccessEnabled !== true` with a 403 (`webhooks.ts`) — and
+the visitor is still shown a success screen. The page reports "saving leads to X" while
+dropping every submission, indefinitely.
+
+`crmDb.createLeadList` defaults `publicAccessEnabled` to **false** (`db.ts`), and `/generate`
+has enabled it on the list it binds since ENG-449 — but the two other paths that bind a list
+did not: `PATCH /generated/:id/lead-list` (the portal picker and the agent's MCP equivalent)
+and `/generated/:id/duplicate`. Either could wire a page to a list that could never accept a
+lead.
+
+`ensureLeadListAcceptsPublicSubmissions` now runs on all three paths. It is idempotent (no
+write when the list is already public) and never throws — a failed enabling write returns a
+warning that the PATCH response surfaces, rather than reporting a clean save.
+
+⚠ **`publicAccessEnabled` gates WRITES only.** Its readers are `forward-lead`,
+`crmPublic.ts`'s `POST /leads/:listId`, `crmAutoSyncService` and `admin.ts`; there is no
+public READ path behind it. Enabling it opens an unauthenticated lead-insert on that list —
+which is what a page-bound list is for — and exposes no stored lead to anyone.
+
+### The two reported lists — checked against production, 2026-08-21
+
+| list | name | publicAccess | bound page | live route |
+| --- | --- | --- | --- | --- |
+| `list_1779584823329_md99qvwnk` | LP Leads - 2026 State of AI Marketing | false | **none** | **404** |
+| `list_1779822422539_l5yvansu2` | LP Leads - Emma Partner Network | true | 1 (`110edb3d…`) | 200 |
+
+**Neither is explained by the bug above. Nothing posts to either list.**
+
+- **2026 State of AI Marketing** — no `AW-LandingPages` record names it (`Scan` of all 167
+  records), no code in the `AgentWebPro` org references it (GitHub code search, 0 hits), and
+  `hireemma.ai/2026-state-of-ai-marketing` returns **404**. It is an orphaned list for a page
+  that does not exist. Owned by `harsha@agentweb.pro`, not by the reporter.
+- **Emma Partner Network** — the `AW-LandingPages` record names this list, but the live form
+  does not use it. `/emma-partner-network` posts through `/api/partner-capture` →
+  `PARTNER_LEAD_LIST_ID` → `LANDERS['/emma-partner-network'].listId` =
+  **`list_1780522372186_ve7ebuzp8`** ("Partner Network Briefs"), read from `lib/landers.ts`
+  in `agentweb-landing-page`, not from the doc that describes it. That list is public and has
+  received a brief. The repo's own `LANDERS.md` already calls `l5yvansu2` a **duplicate** and
+  says to delete it.
+
+⚠ **An earlier revision of this section asserted that `md99qvwnk` "is bound to a landing page"
+and that the backfill script below is "the one-time repair" for it. Both were wrong.** They
+were written from the autofix runner, whose IAM role is denied `Scan`/`Query` on
+`AW-LandingPages`, so the binding was inferred rather than read. The script enumerates lists
+*from* `AW-LandingPages.leadListId` and would never have enumerated that list at all. **A
+claim that could not be read was recorded as if it had been** — the failure mode this repo's
+own evidence rules exist to prevent.
+
+### How much of this class exists in production — measured, 2026-08-21
+
+Read-only pass over the whole table, the same logic the backfill applies: **167 landing pages,
+93 distinct page-bound lead lists.**
+
+| | count |
+| --- | --- |
+| private list bound to a page (**the defect**) | **0** |
+| already public, capturing | 27 |
+| already public, zero leads | 63 |
+| **bound list absent from `AW-LeadLists`** | **3** |
+
+**Nothing needs repairing today** — the backfill script would write zero rows, so it does not
+need running and does not need a data-plane request. It stays as the instrument for the next
+time, and as the dry-run diagnostic.
+
+⚠ **The 3 missing lists are the same failure one step further along** — a page POSTing into a
+404 at `forward-lead` rather than a 403. `list_1779684022346_4pi8auc7f` (bound to a **live,
+200-serving** generated page, `lp-demystifying-ai-agentweb-lead-18.vercel.app`),
+`list_1779490637995_k743eormt` (two Every.io records — **a managed client**; its URL did not
+respond to a probe, so its liveness is **unread, not dead**), and `list_1779299615576_cy7dj7h1i`
+(page 404s). `ensureLeadListAcceptsPublicSubmissions` now returns a warning for this state
+instead of reading it as success; repointing an existing page is a judgement call, not a
+backfill.
+
+### Remediation for pages that are already broken
+
+`src/scripts/backfill-eng967-lead-list-public-access.ts`. The code fix only runs on a future
+bind, so it repairs nothing already broken. The script scans `AW-LandingPages` and, for every
+lead list a page names in `leadListId`, enables `publicAccessEnabled` where it is not already
+true. Dry run by default; `--list=<id>` targets one list.
+
+**Bulk production data mutation — needs Harsha's data-plane approval per `CLAUDE.md` before
+anyone runs it with `--apply`.** It deliberately does not touch a list no page binds: a
+private list nothing posts to is private on purpose.
+
+### What is left, and who owns it
+
+Both reported lists need **CRM cleanup, not code** — delete or rename the orphaned
+`md99qvwnk`, and reconcile the Emma Partner Network page record onto the list its form
+actually writes to (or delete the duplicate, as `LANDERS.md` already says). Both are
+production data mutations behind the same data-plane gate.
+
+## ENG-1490 — recommend_predefined_work_plan lost to the "produce drafts without asking" policy (2026-08-23)
+
+Live DynamoDB trace (production `sessionId b71af8c0-afab-4cff-8417-d5148b05d286`) proved Emma calls
+`list_predefined_work_plans`, searches the result across three turns, finds a genuine match, and
+still calls `create_social_media_posts` directly — `recommend_predefined_work_plan` never fires.
+This is NOT a tool-batching race (the list result WAS seen before drafting); it's a prompt conflict.
+
+Root cause: two CRITICAL, apply-to-every-request policies sit much earlier in
+`agentModeSystemPrompt.ts` than the Work Plan Capabilities section (line 488, ~55% through the
+889-line file) and both tell the model to skip confirmation and just produce the deliverable:
+
+- "Decision Framework" (line 70): CLARIFY → CHECK skills → INSTALL → EXECUTE ("use your tools to
+  complete the request"). Never references the work-plan check at all.
+- "When to Ask Questions" (line 122): explicitly names "producing a draft" as exempt from
+  confirmation, and confirmation is required only for spend/publish/irreversible actions.
+
+Fix (this PR): four targeted edits making the recommendation an explicit substitute for drafting,
+not an extra step alongside it — (1) wired the work-plan check into the Decision Framework's
+EXECUTE step, (2) added a named carve-out in "When to Ask Questions" so a matching-plan proposal is
+not treated as a banned "should I proceed?" pause, (3) strengthened the Work Plan Capabilities
+paragraph to state the recommendation replaces drafting, (4) reworded the LinkedIn reference-table
+row from "before drafting" (sequencing) to "instead of ... in this same turn" (substitution). None
+of the spend/publish/irreversible exemption categories were touched.
+
+Verified via dev-environment before/after transcripts (not a single click-through) across 3
+phrasings against a freshly launched test-env: a clear LinkedIn-goal match now calls
+`recommend_predefined_work_plan` and does NOT also draft; a goal with no matching plan in the
+catalog (Google reviews) answers directly with no spurious recommendation; an ad-hoc draft request
+unrelated to any plan (birthday post) still drafts immediately with no pause. Full transcripts in
+the ENG-1490 PR description.
+
+**Known residual risk, not fixed here**: the agent loop's tool-calling is OpenAI-style batched
+(`agentModeService.ts` `responseMessage.tool_calls` can contain N calls executed concurrently via
+`Promise.all` in `toolDispatch.ts` before the next LLM turn) — nothing at the code level prevents a
+future phrasing from batching `list_predefined_work_plans` together with a drafting tool in one
+turn, which would reintroduce this failure mode even with the reworded prompt. The fix here is
+prompt-level only; a code-level sequencing guard (e.g. forcing `recommend_predefined_work_plan`
+decisions to complete before drafting tools are eligible in the same turn) is a larger change and
+was explicitly out of scope for this PR.
+
+**Also not fixed here**: ENG-1484's dev.md note flagged ~15 other "Page & Feature Tool Reference"
+rows with the same latent goal-vs-feature ambiguity as the LinkedIn row. This PR only reworded the
+LinkedIn row's own exception clause (already added in ENG-1484); it did not re-audit those other
+rows for the "before" vs "instead of" framing gap. Flagged for a follow-up, not reproduced per-row.
+
+## ENG-1490 follow-up — audited the other 18 "Page & Feature Tool Reference" rows (2026-08-23)
+
+Full audit of every non-LinkedIn row against the same goal-vs-feature-reference ambiguity, using a
+selection criterion (a row is a candidate only if its primary arrow-target tool CREATES/DRAFTS new
+content or LAUNCHES a new campaign — a "producing a draft"-shaped action per the "When to Ask
+Questions" exemption language, not a read-only/view/list/report row) and a live DynamoDB scan of
+`AW-WorkPlans` for real catalog evidence. Verified via an 8-agent adversarial workflow (7 patches +
+1 independent re-derivation of the "not a candidate" list) before applying — every proposed patch
+came back APPROVE with no edits, exact-text matches confirmed against `origin/main`, zero pinned-test
+collisions found.
+
+**Patched (7 rows), same substitution-framed exception as the LinkedIn row**: paid social/ads
+(strongest catalog evidence — 7+ real ad-campaign plans), landing pages (own trigger keywords already
+include goal phrasing "create/build a landing page"; 3 real matching plans), research/reports/deep
+research (4 real report plans), blog (real "AEO Article Engine" plan, structurally identical to the
+already-production-verified LinkedIn fix), images, videos, and newsletter (last 3 on catalog-agnostic
+reasoning — no exact-title plan confirmed today, but the mechanism no-ops harmlessly when
+`list_predefined_work_plans` returns no match, confirmed live via the "Google reviews" negative-result
+transcript in the original ENG-1490 PR, and the underlying instruction-precedence bug — a specific
+keyword row beating the generic Work Plan Capabilities paragraph — exists independent of today's
+catalog contents).
+
+**Examined and deliberately NOT patched — different bug shape**:
+- **GTM plan row** (`list_gtm_plans`/`read_gtm_plan`) — this row's own tools are read-only; the real
+  gap is that `create_gtm_plan` lives in a separate "GTM Plan Capabilities" section never referenced
+  by this row at all. That's a documentation/cross-reference gap, not the same specific-row-beats-
+  generic-instruction conflict (there's no creation tool on this row to lose the race in the first
+  place). Left as a distinct finding for a possible separate issue, not fixed here.
+- **Tasks/automations row** (`create_task_from_template`) — genuinely creation-capable, but it's
+  already a DIFFERENT templating system (AgentWeb's browser-automation Task Templates, unrelated to
+  predefined Work Plans). Forcing the same exception here would create ambiguity between two
+  competing guided-path systems rather than resolve one. Left unpatched.
+
+**Confirmed correctly excluded (read-only/navigational, no creation tool on the row)**: SEO/GEO, CRM/
+leads, general social-posts view, brand guidelines, website scan (diagnostic on an existing site, not
+a deliverable), market strategy, knowledge base, templates (its own creation tool lives under the
+separate newsletter row instead), books/ebook (row's own tools are read-only despite the word "ebook"
+— possibly a separately stale/incomplete row, different bug class, not investigated further here).
+Google Drive has genuine write tools (`create_folder`, `create_google_doc`) but its trigger phrases
+name a storage location, not a content-creation goal a user would naturally state ("I want to make a
+Google Drive" isn't a real request shape) — excluded on that basis, flagged as the one worth
+rechecking first if this audit's premise is ever found wrong.
+
+New regression test: `agentModeSystemPrompt.goalVsFeatureRowAudit.test.ts` pins all 7 rows' exception
+wording (substitution framing only, never the "before drafting" sequencing that lost to other prompt
+policies in the original bug), confirms the ads spend-confirmation and video CREATE-vs-ANALYZE
+distinctions are preserved, and confirms the excluded read-only rows got no exception added.
+
+**Dev-transcript verification (fresh test-env, real LLM calls, not a click-through)**: ran a
+representative sample of 3 of the 7 patched rows plus a negative control against a freshly launched
+dev environment.
+
+| Phrasing | Tool trace | recommend called? | primary creation tool called? |
+|---|---|---|---|
+| "I want a landing page for my new product launch" | list→search×3→**recommend_predefined_work_plan** | true | `generate_landing_page`: false |
+| "I want to write a blog post about our new feature" | list→read_brand_guidelines→read_market_strategy→search×5→read×7→**recommend_predefined_work_plan** | true | `create_blog_article`: false |
+| "help me launch a Meta ad campaign" | list→search×3→read×5→**recommend_predefined_work_plan** | true | `list_meta_ads_campaigns`: false |
+| "can you write me a haiku about coffee" (negative control) | (no tool calls) | false | n/a |
+
+All three positive cases: Emma checked the plan catalog and proposed a matching plan instead of
+proceeding with the row's primary tool, in the same shape already verified in production for the
+LinkedIn row. Negative control: no spurious recommendation, no spurious tool calls, answered
+directly. Full transcripts in the ENG-1490 follow-up PR.
+
+## ENG-1643 — typed consent resolves only when deterministic (2026-08-29)
+
+An awaiting `ask_user_question` card used to clear whenever the owner typed text, even when that
+text was an unambiguous answer. The correction is a pure, controller-side resolver: one exact
+option id/label match is persisted as a normal `answeredBy: 'user'` answer; a bare affirmative is
+accepted only for a card with exactly one affirmative option (for example Approve/Reject). Bare
+affirmatives on multi-choice cards, ambiguous text, and unrelated text retain the prior
+clear-and-re-ask behavior.
+
+This is an intentional consent-correctness change, not a model-routing or prompt change. It keeps
+the existing optimistic `requireStillAwaiting` write condition, immutable-question gate,
+delegation invariant, and no-model-answerer invariant. Typed provenance uses the existing optional
+answer rationale field; it adds no table, schema, or new persistence path. Focused controller and
+primitive tests cover the three affirmative paths plus multi-choice/ambiguity controls.

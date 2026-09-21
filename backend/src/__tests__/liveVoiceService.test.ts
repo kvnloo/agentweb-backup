@@ -25,8 +25,8 @@ jest.mock('@google/genai', () => ({
   })),
   Modality: { AUDIO: 'AUDIO', TEXT: 'TEXT' },
   MediaResolution: { MEDIA_RESOLUTION_MEDIUM: 'MEDIA_RESOLUTION_MEDIUM' },
-  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW' },
-  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW' },
+  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW', START_SENSITIVITY_HIGH: 'START_SENSITIVITY_HIGH' },
+  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW', END_SENSITIVITY_HIGH: 'END_SENSITIVITY_HIGH' },
   ActivityHandling: { START_OF_ACTIVITY_INTERRUPTS: 'START_OF_ACTIVITY_INTERRUPTS' },
 }));
 
@@ -113,6 +113,7 @@ import {
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
+  drainLiveVoiceToolExecutions,
 } from '../services/liveVoiceService';
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,20 @@ describe('startLiveSession', () => {
     expect(connectionConfig.systemInstruction.parts[0].text).toContain('neutral');
   });
 
+  // ENG-450: voice onboarding must be docs-grounded the same way the text
+  // path is (agentModeSystemPrompt.ts) — consult search_user_guide before
+  // asking the user for manual input on a blocked setup/integration step.
+  it('tells the voice model to consult search_user_guide before manual input', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-voice-docs', 'socket-voice-docs', jest.fn(), 'test-user-id', 'onboarding');
+
+    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
+    expect(systemText).toContain('search_user_guide');
+    expect(systemText.toLowerCase()).toContain('docs.agentweb.pro');
+    expect(systemText.toLowerCase()).toMatch(/before asking.*manual|manual.*search_user_guide|consult.*before/);
+  });
+
   it('directs Emma to use General American English', async () => {
     makeCallbacks();
 
@@ -234,20 +249,31 @@ describe('startLiveSession', () => {
     expect(connectionConfig.systemInstruction.parts[0].text).toContain('General American English');
   });
 
-  it('allows a natural pause before committing the user turn', async () => {
+  // ENG-525: the original LOW/LOW/1200ms tuning (tuned to one heavy dogfooder's
+  // pause-heavy speech pattern) made turn-taking and barge-in feel sluggish
+  // compared to ChatGPT's voice mode for ordinary users. Tightened to HIGH
+  // sensitivity + a sub-second silence window so Emma responds/interrupts
+  // promptly, while keeping some floor so a normal mid-sentence breath doesn't
+  // false-trigger a turn end.
+  it('reacts promptly to end-of-turn and barge-in instead of a long deliberate pause', async () => {
     makeCallbacks();
 
-    await startLiveSession('session-natural-pause', 'socket-pause', jest.fn(), 'test-user-id');
+    await startLiveSession('session-prompt-turn-taking', 'socket-prompt', jest.fn(), 'test-user-id');
 
     const detection = mockLiveConnect.mock.calls[0][0].config
       .realtimeInputConfig.automaticActivityDetection;
     expect(detection).toEqual(expect.objectContaining({
       disabled: false,
-      startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-      endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+      startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
     }));
-    expect(detection.prefixPaddingMs).toBeGreaterThanOrEqual(150);
-    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(1_000);
+    // Snappy, but not a hair-trigger: keep enough of a floor that a normal
+    // in-sentence breath (or a pause-heavy speaker mid-thought) doesn't get
+    // read as end-of-turn — unvalidated with real speech at ship time, so
+    // biased toward the safer end of "snappier than the old 1200ms" rather
+    // than the most aggressive value tested.
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(700);
+    expect(detection.silenceDurationMs).toBeLessThanOrEqual(900);
   });
 
   it('starting a second session for the same sessionId replaces the old one', async () => {
@@ -1301,5 +1327,94 @@ describe('ENG-763 live-voice path does NOT inject a cross-message anti-loop dire
     // The retained anti-attribution guidance still forbids quoting system text as the user's.
     expect(systemText.toLowerCase()).toContain('attribute');
     expect(systemText).not.toMatch(/SYSTEM OVERRIDE/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ENG-1189: drainLiveVoiceToolExecutions — graceful-shutdown drain coverage
+// for Gemini Live tool calls (e.g. manage_scheduled_chat), mirroring
+// drainActiveSessionGenerations' own tests in gracefulShutdown.test.ts.
+// ---------------------------------------------------------------------------
+describe('drainLiveVoiceToolExecutions', () => {
+  it('resolves immediately when no live-voice tool call is in flight', async () => {
+    const start = Date.now();
+    const result = await drainLiveVoiceToolExecutions(5000, 20);
+    expect(Date.now() - start).toBeLessThan(500);
+    expect(result).toEqual({ drained: true, stuckCount: 0 });
+  });
+
+  it('blocks until an in-flight non-onboarding tool call settles, then resolves', async () => {
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-drain-inflight', 'socket-1', jest.fn(), 'test-user-id');
+
+    let resolveTool!: (value: unknown) => void;
+    mockExecuteTool.mockReturnValue(new Promise((resolve) => {
+      resolveTool = resolve;
+    }));
+
+    // manage_scheduled_chat is not in ONBOARDING_LIVE_TOOLS, so this goes
+    // through the tracked toolExecutions path drainLiveVoiceToolExecutions checks.
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-drain-1', name: 'manage_scheduled_chat', args: { action: 'update' } }],
+      },
+    });
+
+    let resolved = false;
+    const drainPromise = drainLiveVoiceToolExecutions(5000, 20).then((r) => {
+      resolved = true;
+      return r;
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(resolved).toBe(false);
+
+    resolveTool({ success: true });
+
+    const result = await drainPromise;
+    expect(resolved).toBe(true);
+    expect(result).toEqual({ drained: true, stuckCount: 0 });
+  });
+
+  it('reports the stuck count instead of hanging once the ceiling is reached', async () => {
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-drain-ceiling', 'socket-1', jest.fn(), 'test-user-id');
+
+    mockExecuteTool.mockReturnValue(new Promise(() => {})); // never settles
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-drain-2', name: 'manage_scheduled_chat', args: { action: 'update' } }],
+      },
+    });
+
+    const result = await drainLiveVoiceToolExecutions(50, 10);
+    expect(result).toEqual({ drained: false, stuckCount: 1 });
+
+    // activeSessions is a module-level singleton with no reset between
+    // tests — this entry's tool call deliberately never settles, so it must
+    // be torn down explicitly or it contaminates every later test's drain.
+    closeLiveSession('session-drain-ceiling');
+  });
+
+  it('does NOT wait on onboarding-safe tools, which bypass toolExecutions tracking', async () => {
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-drain-onboarding', 'socket-1', jest.fn(), 'test-user-id', 'onboarding');
+
+    mockExecuteTool.mockReturnValue(new Promise(() => {})); // never settles
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-drain-3', name: 'read_brand_guidelines', args: {} }],
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const start = Date.now();
+    const result = await drainLiveVoiceToolExecutions(5000, 20);
+    expect(Date.now() - start).toBeLessThan(500);
+    expect(result).toEqual({ drained: true, stuckCount: 0 });
+
+    closeLiveSession('session-drain-onboarding');
   });
 });

@@ -1,5 +1,13 @@
 jest.mock('../controllers/agentModeController', () => ({
   runVerifiedChat: jest.fn().mockResolvedValue({ success: true, toolCalls: [] }),
+  // Mirrors the real isSessionBusyError's contract closely enough for these tests: real
+  // SessionBusyError instances carry `code: 'SESSION_BUSY'`.
+  isSessionBusyError: jest.fn((error: unknown) =>
+    typeof error === 'object' && error !== null && (error as any).code === 'SESSION_BUSY'),
+}));
+
+jest.mock('../services/slackService', () => ({
+  postSlackMessage: jest.fn().mockResolvedValue({ ts: '999.0', channel: 'C_EVAL' }),
 }));
 
 jest.mock('../services/v0Service', () => ({
@@ -24,7 +32,10 @@ import { runEmmaEnrichment } from '../emma/enrichmentToolRunner';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 import { runHumanEvalFeedbackAction } from '../services/humanEvalActionService';
 import { deployLandingPage, iterateLandingPage } from '../services/v0Service';
+import { postSlackMessage } from '../services/slackService';
 import type { HumanEvalCandidate, HumanEvalFeedback } from '../services/humanEvalService';
+
+const mockPostSlackMessage = postSlackMessage as jest.Mock;
 
 const feedback: HumanEvalFeedback = {
   feedbackId: 'C1:178.1',
@@ -166,5 +177,93 @@ describe('runHumanEvalFeedbackAction', () => {
     expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
       category: 'ad',
     }));
+  });
+
+  // ENG-1719: before this fix, a SessionBusyError here propagated straight up to the
+  // caller's bare `.catch(err => console.warn(...))` — but the ack reply already told the
+  // Slack reviewer "the revised result will post back to this thread when ready," so
+  // silence read as the bot having forgotten, not as a retryable, expected collision.
+  it('tells the reviewer to retry, rather than silently dropping it, when the session is busy', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+    );
+
+    await expect(runHumanEvalFeedbackAction(
+      candidate({
+        reviewType: 'creative_image',
+        userId: 'user-1',
+        sessionId: 'session-1',
+        artifactUrl: 'https://example.com/image.png',
+        slackChannel: 'C_EVAL',
+        slackMessageTs: '178.0',
+        action: {
+          type: 'agent_mode_image_revision',
+          userId: 'user-1',
+          sessionId: 'session-1',
+          artifactUrl: 'https://example.com/image.png',
+          filename: 'image.png',
+        },
+      }),
+      feedback,
+    )).resolves.toBeUndefined(); // does not throw/reject — the caller's own bare catch stays silent-safe either way, but this must not surface as an unhandled failure
+
+    expect(mockPostSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringMatching(/busy.*please retry/is),
+      '178.0',
+    );
+  });
+
+  // ENG-1854: slackChannel/slackMessageTs became optional once candidate persistence was
+  // decoupled from a successful Slack post — this candidate shape (no Slack fields at all)
+  // is now a real, reachable state via the queue API, not just a type-system technicality.
+  it('skips the session-busy notice without throwing when the candidate was never posted to Slack', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+    );
+
+    await expect(runHumanEvalFeedbackAction(
+      candidate({
+        reviewType: 'creative_image',
+        userId: 'user-1',
+        sessionId: 'session-1',
+        artifactUrl: 'https://example.com/image.png',
+        slackChannel: undefined,
+        slackMessageTs: undefined,
+        action: {
+          type: 'agent_mode_image_revision',
+          userId: 'user-1',
+          sessionId: 'session-1',
+          artifactUrl: 'https://example.com/image.png',
+          filename: 'image.png',
+        },
+      }),
+      feedback,
+    )).resolves.toBeUndefined();
+
+    expect(mockPostSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('still propagates a genuine (non-busy) failure', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(new Error('LLM provider exploded'));
+
+    await expect(runHumanEvalFeedbackAction(
+      candidate({
+        reviewType: 'creative_image',
+        userId: 'user-1',
+        sessionId: 'session-1',
+        artifactUrl: 'https://example.com/image.png',
+        action: {
+          type: 'agent_mode_image_revision',
+          userId: 'user-1',
+          sessionId: 'session-1',
+          artifactUrl: 'https://example.com/image.png',
+          filename: 'image.png',
+        },
+      }),
+      feedback,
+    )).rejects.toThrow('LLM provider exploded');
+
+    expect(mockPostSlackMessage).not.toHaveBeenCalled();
   });
 });

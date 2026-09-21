@@ -95,3 +95,67 @@ describe('getAccountsWithOwnerIncludingOrgShared', () => {
     expect(matches[0].userId).toBe('caller');
   });
 });
+
+/**
+ * One Google account connected for both Gmail and Drive carries the SAME address
+ * as account_id on both rows — that is the real shape of the account ENG-943 was
+ * filed about. Own accounts were never deduped at all, so a caller has always
+ * seen both of their own; only a teammate's shared accounts were squeezed through
+ * an account_id-only key, which silently dropped whichever came second.
+ *
+ * For a mailbox that is not cosmetic: drop the Gmail row and the mailbox becomes
+ * invisible to resolution again — ENG-943's exact symptom, from a different
+ * cause, and past the reach of the resolver's own "prefer the email platform"
+ * guard because the row never arrives.
+ */
+describe('getAccountsWithOwnerIncludingOrgShared — one address, two platforms', () => {
+  it('keeps a teammate’s shared Gmail and Drive that share one address', async () => {
+    const drive = makeAccount('them@example.com', 'google_drive', true);
+    const gmail = makeAccount('them@example.com', 'gmail', true);
+    mockUsers['caller'] = { userId: 'caller', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'caller', connected_accounts: [] },
+      // Drive first: an account_id-only key lets it swallow the mailbox.
+      { userId: 'owner-b', connected_accounts: [drive, gmail] },
+    ];
+
+    const result = await getAccountsWithOwnerIncludingOrgShared('caller');
+
+    expect(result.map(a => a.platform).sort()).toEqual(['gmail', 'google_drive']);
+    expect(result.every(a => a.userId === 'owner-b')).toBe(true);
+  });
+
+  it('does not let the caller’s own Drive shadow a teammate’s shared Gmail', async () => {
+    // `seen` is seeded from the caller's own accounts across every platform, so
+    // an unrelated own account at the same address hid the shared mailbox.
+    const ownDrive = makeAccount('shared@example.com', 'google_drive', false);
+    const theirGmail = makeAccount('shared@example.com', 'gmail', true);
+    mockUsers['caller'] = { userId: 'caller', orgId: ORG_ID, connected_accounts: [ownDrive] };
+    mockOrgMembers = [
+      { userId: 'caller', connected_accounts: [ownDrive] },
+      { userId: 'owner-b', connected_accounts: [theirGmail] },
+    ];
+
+    const result = await getAccountsWithOwnerIncludingOrgShared('caller');
+
+    const mailbox = result.find(a => a.platform === 'gmail');
+    expect(mailbox).toBeDefined();
+    expect(mailbox!.userId).toBe('owner-b');
+    expect(result.find(a => a.platform === 'google_drive')!.userId).toBe('caller');
+  });
+
+  it('still collapses two members sharing the same account on the same platform', async () => {
+    // Unchanged: same platform AND same id is the same account, first wins.
+    mockUsers['caller'] = { userId: 'caller', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'caller', connected_accounts: [] },
+      { userId: 'owner-b', connected_accounts: [{ ...makeAccount('acct', 'linkedin_ads', true), account_name: 'First' }] },
+      { userId: 'owner-c', connected_accounts: [{ ...makeAccount('acct', 'linkedin_ads', true), account_name: 'Second' }] },
+    ];
+
+    const result = await getAccountsWithOwnerIncludingOrgShared('caller');
+
+    expect(result).toHaveLength(1);
+    expect(result[0].userId).toBe('owner-b');
+  });
+});

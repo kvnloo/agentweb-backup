@@ -1,4 +1,9 @@
+const recordVendorUsage = jest.fn();
+
+jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage }));
+
 import { YouSearchProvider } from '../search/youSearchProvider';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('YouSearchProvider', () => {
   const originalEnv = { ...process.env };
@@ -6,6 +11,22 @@ describe('YouSearchProvider', () => {
   afterEach(() => {
     process.env = { ...originalEnv };
     jest.restoreAllMocks();
+  });
+
+  it('records one allocated, attributed vendor query after a provider-reaching request', async () => {
+    const provider = new YouSearchProvider({
+      apiKey: 'test-you-key',
+      httpClient: { post: jest.fn().mockResolvedValue({ data: { results: { web: [] } } }) } as any,
+    });
+
+    await provider.search({ query: 'meter me', count: 1, userId: 'user-1', purpose: 'agent_research' });
+
+    expect(recordVendorUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1', provider: 'you.com', operation: 'query', unit: 'query',
+      quantity: 1, rateKey: 'query', feature: 'agent_research',
+    }));
+    // ENG-1929: priced by the recorder from the card, $0.0125 per query.
+    expect(getAllocatedRate('you.com', 'query')).toBe(0.0125);
   });
 
   it('posts a You.com Search request with the expected endpoint, auth header, and JSON body', async () => {
@@ -122,23 +143,25 @@ describe('YouSearchProvider', () => {
         post: jest.fn().mockResolvedValue({
           data: {
             results: {
-              web: [{ title: 'Web', url: 'https://example.com/web', description: 'web' }],
-              news: [{ title: 'News', url: 'https://example.com/news', description: 'news' }],
+              web: [{ title: 'Acme rocket skates', url: 'https://example.com/web', description: 'web' }],
+              news: [{ title: 'Acme launches new rocket skates', url: 'https://example.com/news', description: 'news' }],
             },
-            metadata: { query: 'current topic' },
+            metadata: { query: 'acme rocket skates' },
           },
         }),
       } as any,
     });
 
-    const webOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'web' });
-    const newsOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'news' });
+    const webOnly = await provider.search({ query: 'acme rocket skates', count: 5, resultSource: 'web' });
+    // ENG-1050: a news search leads with on-topic news and then supplements from
+    // the (same freshness window, query-ranked) web bucket rather than dropping it.
+    const newsFirst = await provider.search({ query: 'acme rocket skates', count: 5, resultSource: 'news' });
 
     expect(webOnly.provider).toBe('you');
     expect(webOnly.results.map((result) => result.sourceType)).toEqual(['web']);
     expect(webOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'web' }));
-    expect(newsOnly.provider).toBe('you');
-    expect(newsOnly.results.map((result) => result.sourceType)).toEqual(['news']);
-    expect(newsOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'news' }));
+    expect(newsFirst.provider).toBe('you');
+    expect(newsFirst.results.map((result) => result.sourceType)).toEqual(['news', 'web']);
+    expect(newsFirst.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'news' }));
   });
 });

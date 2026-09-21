@@ -557,59 +557,90 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         eventCount: number;
       }> = [];
 
+      // Shared row mapper for the two top-pages queries below (identical dimensions/metrics,
+      // different orderBy) so a page's shape can't drift between the two lists.
+      const mapPageRow = (row: any) => {
+        const dimensions = row.dimensionValues || [];
+        const metrics = row.metricValues || [];
+        const pagePath = dimensions[0]?.value || "";
+        const hostName = dimensions[1]?.value || "";
+        const sessions = parseInt(metrics[0]?.value || "0");
+        const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
+        const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
+        const eventCount = parseInt(metrics[3]?.value || "0");
+
+        let fullUrl = pagePath;
+        if (hostName) {
+          const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+          fullUrl = `https://${hostName}${path}`;
+        } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
+          const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+          fullUrl = `https://${resolved.seoDomains[0]}${path}`;
+        }
+
+        return {
+          pageTitle: pagePath,
+          pagePath: fullUrl,
+          sessions,
+          engagementRate,
+          userEngagementDuration,
+          eventCount,
+        };
+      };
+      const topPagesQueryBase = {
+        property: `properties/${propertyId}`,
+        dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+        dimensions: [
+          { name: "pagePath" },
+          { name: "hostName" },
+        ],
+        metrics: [
+          { name: "sessions" },
+          { name: "engagementRate" },
+          { name: "userEngagementDuration" },
+          { name: "eventCount" },
+        ],
+        limit: 20,
+        ...(dimensionFilter && { dimensionFilter }),
+      };
+
       try {
         const [pagesEngagementResponse] = await gaClient.runReport({
-          property: `properties/${propertyId}`,
-          dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
-          dimensions: [
-            { name: "pagePath" },
-            { name: "hostName" },
-          ],
-          metrics: [
-            { name: "sessions" },
-            { name: "engagementRate" },
-            { name: "userEngagementDuration" },
-            { name: "eventCount" },
-          ],
+          ...topPagesQueryBase,
           orderBys: [
             { metric: { metricName: "userEngagementDuration" }, desc: true },
           ],
-          limit: 20,
-          ...(dimensionFilter && { dimensionFilter }),
         });
-
-        if (pagesEngagementResponse.rows) {
-          pagesEngagementResponse.rows.forEach((row) => {
-            const dimensions = row.dimensionValues || [];
-            const metrics = row.metricValues || [];
-            const pagePath = dimensions[0]?.value || "";
-            const hostName = dimensions[1]?.value || "";
-            const sessions = parseInt(metrics[0]?.value || "0");
-            const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
-            const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
-            const eventCount = parseInt(metrics[3]?.value || "0");
-
-            let fullUrl = pagePath;
-            if (hostName) {
-              const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${hostName}${path}`;
-            } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
-              const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${resolved.seoDomains[0]}${path}`;
-            }
-
-            topPagesByEngagement.push({
-              pageTitle: pagePath,
-              pagePath: fullUrl,
-              sessions,
-              engagementRate,
-              userEngagementDuration,
-              eventCount,
-            });
-          });
-        }
+        (pagesEngagementResponse.rows || []).forEach((row) => {
+          topPagesByEngagement.push(mapPageRow(row));
+        });
       } catch (engagementError: any) {
         console.warn("Error fetching top pages by engagement:", engagementError.message);
+      }
+
+      // Its own sessions-ordered GA4 query — NOT a re-sort of topPagesByEngagement's top-20.
+      // A re-sort of an engagement-limited subset can silently omit a page with heavy volume
+      // but middling engagement (that page never made the engagement top-20 to begin with),
+      // which would make this field wrong in exactly the way ENG-1187 was about: a ranking
+      // presented as authoritative that doesn't actually reflect the true top-N.
+      //
+      // On failure this must NOT fall back to []: an empty array reads as "GA4 has zero
+      // session data for this window," a false claim indistinguishable from a real empty
+      // result. Leave it undefined and surface topPagesBySessionsError instead, so the model
+      // is forced to say the ranking is unverified rather than asserting zero/nothing.
+      let topPagesBySessions: typeof topPagesByEngagement | undefined;
+      let topPagesBySessionsError: string | undefined;
+      try {
+        const [pagesSessionsResponse] = await gaClient.runReport({
+          ...topPagesQueryBase,
+          orderBys: [
+            { metric: { metricName: "sessions" }, desc: true },
+          ],
+        });
+        topPagesBySessions = (pagesSessionsResponse.rows || []).map(mapPageRow);
+      } catch (sessionsError: any) {
+        console.warn("Error fetching top pages by sessions:", sessionsError.message);
+        topPagesBySessionsError = "Could not fetch pages ranked by sessions for this request — do not report zero pages, and do not substitute topPagesByEngagement's ordering as a stand-in ranking by volume.";
       }
 
       // Fetch daily data for timeline
@@ -780,6 +811,8 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
         conversionsBySource,
         topPagesByEngagement,
+        topPagesBySessions,
+        ...(topPagesBySessionsError && { topPagesBySessionsError }),
         dateRange: { startDate: startDateStr, endDate: endDateStr },
       };
     } catch (error: any) {
@@ -795,6 +828,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   const metrics = await Promise.all(metricsPromises);
   return {
     ga4_integration_status: "GA4 is configured and connected. If a page or subdomain shows 0 sessions, it means that domain/subdomain is not sending data to this property — GA4 tracking is not installed there. Do NOT ask the user for a Measurement ID; instead, offer to add GA4 tracking to the missing pages.",
+    key_event_semantics: "The `conversions` numbers (both in `trafficSources` and in `conversionsBySource`) are historical counts of events that were flagged as key events AT COLLECTION TIME. In GA4, marking or un-marking a key event is not retroactive: already-collected rows keep their conversion counts, and newly-marked events have none before the date they were marked. So an event appearing here with conversions > 0 — commonly `page_view` or `scroll` — does NOT mean it is currently marked as a key event, and an event missing from this list does not mean it isn't. No tool available here reads the property's key-event configuration. Do not state, and do not advise un-marking or marking, which events are key events based on this payload: read the GA4 Admin UI (Admin > Events / Key events) with browser tools, or ask the user.",
     configured_properties: gaProperties.map(p => ({ propertyId: p.propertyId, label: p.label })),
     metrics,
     timeframe,

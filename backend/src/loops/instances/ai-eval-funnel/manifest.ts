@@ -35,6 +35,9 @@ export const aiEvalManifest: LoopManifest<NormalizedEvent, AiEvalProposalPayload
     'onboarding_started',
     'complaint_received',
     'icp_match',
+    // ENG-911: the AI-Readiness popup's "book a stack review" CTA fires this
+    // on click — never added here, so every click silently 400'd.
+    'book_started',
   ],
   mutationSurface: [
     { key: 'hero_heading', kind: 'copy' },

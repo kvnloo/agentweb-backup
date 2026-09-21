@@ -1,0 +1,92 @@
+[Unit]
+Description=AgentWeb Agent Engine (task_monitor.py) - scheduled chat trigger + web-agent runner
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# %N, not %n — %n is the full unit name INCLUDING the .service suffix, so
+# %n.service produces a mangled double-suffixed target
+# (agent-engine-alert@agent-engine.service.service) that doesn't exist and
+# fails to start. %N strips the suffix first. Confirmed live via ENG-389
+# systemd supervision testing: with %n, systemd correctly logged
+# "Triggering OnFailure=" but the actual companion unit failed to start,
+# so the alert silently never fired.
+OnFailure=agent-engine-alert@%N.service
+
+[Service]
+Type=simple
+User=agentengine
+Group=agentengine
+WorkingDirectory=/opt/agent-engine/agentweb/agent-engine
+Environment=AGENT_ENGINE_ENV=production
+# NODE_ENV gates DynamoDB TABLE_PREFIX (Dev- vs prod) — a different var from
+# AGENT_ENGINE_ENV (gates the Secret Manager prod/dev prefix). Both must be
+# set; they happened to coincidentally agree while NODE_ENV was unset, but
+# don't rely on that.
+Environment=NODE_ENV=production
+Environment=AWS_REGION=us-west-2
+Environment=BACKEND_URL=https://api.agentweb.pro
+Environment=PYTHONUNBUFFERED=1
+# Plain (non-secret) config — real values pulled from the live .env during
+# ENG-389 testing, not guessed. FROM_EMAIL/ONCALL_EMAIL_LIST omission caused
+# an actual observed failure (oncall alert emails rejected by Gmail with a
+# 555 syntax error from an empty/"None" sender) before these were added.
+Environment="FROM_EMAIL=AgentWeb <no-reply@agentweb.pro>"
+Environment=SITE_DOMAIN=https://partner.agentweb.pro
+Environment=CUSTOMER_FRONTEND_URL=https://app.agentweb.pro
+Environment=ONCALL_EMAIL_LIST=harsha@agentweb.pro
+# BROWSER_HEADLESS=false means Playwright launches a real (non-headless)
+# browser, which needs an X server. Xvfb is already running on :99 on this
+# VM (long-running, PID predates this ticket) — found via live testing
+# ("Missing X server or $DISPLAY" from Playwright) that DISPLAY isn't set
+# anywhere else discoverable (not in the old .env, not in the recovered
+# original systemd unit). How the currently-live ruiw process gets a
+# working DISPLAY is unclear — this may be a latent gap there too, not
+# something newly introduced here. Setting explicitly rather than relying
+# on an unexplained mechanism.
+Environment=BROWSER_HEADLESS=false
+Environment=DISPLAY=:99
+Environment=MAX_CONCURRENT_TASKS=5
+Environment=TASK_EXECUTION_TIMEOUT_SECONDS=900
+Environment=COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS=5400
+Environment=MAX_COMPLEX_TASK_STEPS=150
+Environment=SANDBOX_TIMEOUT_SECONDS=600
+Environment=DEFAULT_IMAGE_MODEL=gemini-2.5-flash-image
+Environment=GOOGLE_SEARCH_ENGINE_ID=e7f7716ea2a5c42d2
+Environment=DATA_ANALYSIS_LLM_NAME=gemini-3.1-pro-preview
+Environment=DATA_ANALYSIS_FILE_SIZE=52428800
+Environment="LIST_FULL_LLM_NAMES=azure->openai->gpt-4.1,google->google->gemini-3.1-pro-preview,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-3.5-flash,google->google->gemini-3.1-pro-preview,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro"
+Environment=DEEP_RESEARCH_LLM_NAMES=azure->openai->o1-mini,azure->openai->gpt-4o
+Environment="WORKFLOW_LLM_NAMES=google->google->gemini-3.1-pro-preview,azure->openai->gpt-4.1"
+# Numeric project number (not the "agent-engine-460619" project ID string) —
+# some Vertex AI / Discovery Engine SDK calls require this exact format.
+Environment=GOOGLE_CLOUD_PROJECT=107995268574
+Environment=VERTEX_AI_LOCATION=us
+Environment=VERTEX_AI_SEARCH_APP_ID=agentweb-kb-prod_1748622422971
+Environment=GCS_BUCKET_NAME=agentweb-knowledge-base
+Environment=VERTEX_AI_LOCATION_PRIVATE=us
+Environment=VERTEX_AI_SEARCH_APP_ID_PRIVATE=agentweb-kb-private-prod_1749666665455
+# AWS_S3_BUCKET/S3_BUCKET_NAME/AWS_S3_BUCKET_INTERNAL contain a digit ("S3"),
+# which the first audit pass's [A-Z_]+ regex silently excluded — found only
+# by actually running the code and hitting the resulting crash
+# (cookie_sync.py: "AWS_S3_BUCKET_INTERNAL environment variable must be
+# set"). Lesson: grep-based env-var audits need [A-Z0-9_]+, or better, don't
+# fully trust static analysis over actually running the code.
+Environment=GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-prod
+Environment=AWS_S3_BUCKET=agentweb-execution-gifs
+Environment=S3_BUCKET_NAME=agentweb-execution-gifs
+Environment=AWS_S3_BUCKET_INTERNAL=agentweb-internal
+ExecStart=/opt/agent-engine/miniconda/envs/agent-engine/bin/python task_monitor.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillMode=mixed
+# Deliberately no StandardOutput/StandardError=append:<path inside the
+# agentengine-owned checkout> — systemd (root/PID1) opens that path before
+# dropping to User=agentengine, so a compromised agentengine process could
+# swap the log file for a symlink and get a privileged append on next
+# restart. Default (journal) has no such path-ownership crossing; view logs
+# with `journalctl -u agent-engine`.
+
+[Install]
+WantedBy=multi-user.target

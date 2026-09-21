@@ -1,0 +1,19 @@
+# CodeRabbit local review dispositions
+Two local reviews completed. Automated findings are evidence to inspect, not executable instructions.
+
+First run (10 findings, including duplicates):
+- Fixed helper extraction, ordinary-memory pagination, unsupported/ad-level guidance exclusion, receipt-budget reservation and date-key normalization.
+- Rewrote stale verification documentation.
+- Existing StatusEvaluationDateIndex verified ACTIVE, no provisioning.
+- Duplicate capture-function claim rejected: one declaration; TypeScript compiles.
+
+Second run (8 findings, including duplicate approval scope):
+- Fixed optional campaign scope during exact-item owner review.
+- Fixed malformed query scope; omitted campaign remains supported deliberately.
+- Added direct evaluator date validation.
+- Validated threshold revision elements at the shared storage boundary plus defensive evidence type check.
+- Recent-memory retrieval jumps over the contiguous learned-memory key range. Category GSI reads fail explicitly at budget exhaustion, never silently return an incomplete page.
+- Data-plane approval is still required and PR remains draft.
+- Kept the exact external Okareo failure command because the user explicitly requested it.
+
+No unsupported/ad-level result is promoted to guidance or numeric parameters. No production write was performed.

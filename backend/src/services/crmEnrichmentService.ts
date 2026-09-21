@@ -1,8 +1,8 @@
 import { crmDb } from './db';
+import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
-import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -12,7 +12,7 @@ import {
   isLinkedInCacheEligible,
   splitFieldsByGroup,
 } from './enrichmentCacheService';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 import type { RawWebResult, RawCacheData } from './enrichmentGroups';
 import {
   buildDataExtractionSystemPrompt,
@@ -180,6 +180,23 @@ export interface LoadAndFilterResult {
   storedLinkedinSearchTemplate: string;
 }
 
+/**
+ * Fields the LLM extraction units may fill: everything a specialist did not
+ * already resolve, minus Enigma card revenue.
+ *
+ * ENG-1388 AC7: no web or LLM tier may ever fill a card-revenue field — those
+ * values are measured or absent. Filtering here covers every unit built below,
+ * including the linkedin and no_context fallbacks that never pass through
+ * splitFieldsByGroup, and the per-field refresh route that reaches them with
+ * forceOverwrite on.
+ */
+export function llmEligibleFields(
+  outputFields: string[],
+  specialistFields: Record<string, unknown>,
+): string[] {
+  return outputFields.filter(f => !(f in specialistFields) && !isCardRevenueField(f));
+}
+
 export class CrmEnrichmentService {
   private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<LoadAndFilterResult> {
     const list = await crmDb.getLeadListById(spec.listId);
@@ -257,130 +274,19 @@ export class CrmEnrichmentService {
     return linkedInOutreachService.resolveAccountId(userId);
   }
 
-  // Default to Azure-hosted gpt-5-chat-2: GA, capacity-stable, ~10s on the
-  // CRM enrichment workload. We previously defaulted to gemini-3-flash-preview,
-  // but Gemini's *-preview shards intermittently queue requests for 200+ s
-  // (the per-call 60s timeout fires, then the fallback eats another minute),
-  // producing 3+ minute previews that often returned all-null fields.
-  // On timeout we fall back to a Gemini GA model so we have cross-vendor
-  // redundancy when one provider is degraded.
+  // Logical models are resolved by AgentMode and sent through OpenRouter, which
+  // owns provider selection and failure handling for this text path.
   private static readonly DEFAULT_ENRICH_MODEL = 'gpt-5-chat-2';
   private static readonly DEFAULT_SUGGEST_MODEL = 'gpt-5-chat-2';
 
-  // Fallback used by llmCallWithTimeout when the primary model times out.
-  // Cross-vendor on purpose — if Azure throttles, Gemini absorbs; if Gemini
-  // queues, Azure absorbs.
-  private static readonly LLM_FALLBACK_MODEL = 'gemini-2.5-flash';
-
-  // Per-call ceiling. The OpenAI SDK aborts the underlying fetch when this
-  // fires. Chosen so the worst case for a 2-sample preview is ~2 min.
+  // Bound an individual enrichment request without retrying it locally.
   private static readonly LLM_CALL_TIMEOUT_MS = 60_000;
-
-  // ── Process-level LLM circuit breaker ────────────────────────────────────
-  // When Gemini's preview model is degraded (queueing requests for minutes),
-  // the per-call fallback eats a fresh 60-s timeout *before* every single
-  // call — wasted compute and latency. The breaker tracks recent timeouts
-  // and, once the threshold is hit, "opens" the circuit so all subsequent
-  // calls go straight to the fallback model for COOLDOWN_MS, then reset.
-  // State is in-memory (per-process) — fine for our single-instance EB
-  // backend; not persisted across restarts.
-  private static readonly LLM_CIRCUIT_THRESHOLD = 3;            // timeouts in window → open
-  private static readonly LLM_CIRCUIT_WINDOW_MS = 5 * 60_000;   // sliding window for counting
-  private static readonly LLM_CIRCUIT_COOLDOWN_MS = 10 * 60_000; // how long the breaker stays open
-  private static llmTimeoutTimestamps: number[] = [];
-  private static llmCircuitOpenUntil = 0;
-
-  private static isLlmCircuitOpen(): boolean {
-    return Date.now() < CrmEnrichmentService.llmCircuitOpenUntil;
-  }
-
-  private static recordLlmTimeout(): void {
-    const now = Date.now();
-    CrmEnrichmentService.llmTimeoutTimestamps =
-      CrmEnrichmentService.llmTimeoutTimestamps.filter(
-        t => now - t < CrmEnrichmentService.LLM_CIRCUIT_WINDOW_MS
-      );
-    CrmEnrichmentService.llmTimeoutTimestamps.push(now);
-    if (
-      CrmEnrichmentService.llmTimeoutTimestamps.length >=
-      CrmEnrichmentService.LLM_CIRCUIT_THRESHOLD
-    ) {
-      CrmEnrichmentService.llmCircuitOpenUntil =
-        now + CrmEnrichmentService.LLM_CIRCUIT_COOLDOWN_MS;
-      console.warn(
-        `[CrmEnrichment] LLM circuit OPEN — primary model is degraded ` +
-        `(${CrmEnrichmentService.LLM_CIRCUIT_THRESHOLD} timeouts in ${CrmEnrichmentService.LLM_CIRCUIT_WINDOW_MS / 60_000} min); ` +
-        `routing to fallback ${CrmEnrichmentService.LLM_FALLBACK_MODEL} for the next ` +
-        `${CrmEnrichmentService.LLM_CIRCUIT_COOLDOWN_MS / 60_000} min`
-      );
-      // Reset the counter so we don't re-open immediately on stale entries
-      // when the cooldown elapses.
-      CrmEnrichmentService.llmTimeoutTimestamps = [];
-    }
-  }
-
-  private static isLlmTimeoutError(err: any): boolean {
-    return (
-      err?.name === 'APIConnectionTimeoutError' ||
-      err?.code === 'ETIMEDOUT' ||
-      err?.message?.toLowerCase?.().includes('timed out') ||
-      err?.message?.toLowerCase?.().includes('timeout')
-    );
-  }
-
-  /**
-   * Run an LLM call with a per-call timeout. On timeout, retry once using
-   * LLM_FALLBACK_MODEL — Gemini occasionally queues `*-preview` requests for
-   * several minutes (we've seen 200–260 s on the same input that returns in
-   * 6 s elsewhere), and the GA model is consistently fast.
-   *
-   * The caller's `call` receives the model id to use so it can swap models
-   * between primary and fallback. Non-timeout errors propagate immediately —
-   * the caller's existing parse-retry path handles malformed responses.
-   */
-  // Returns `any` because the underlying llmClient.chat.completions.create
-  // is typed as `any` (Gemini wrapper around the OpenAI SDK), and a generic T
-  // would just resolve to `unknown` and force casts at every call site.
+  /** A single gateway request; AgentWeb never issues a provider fallback. */
   private static async llmCallWithTimeout(
     call: (model: string) => Promise<any>,
-    primaryModel: string,
-    label: string,
+    model: string,
   ): Promise<any> {
-    const fallback = CrmEnrichmentService.LLM_FALLBACK_MODEL;
-
-    // Circuit open: skip the primary entirely for the cooldown period. Saves
-    // a 60s timeout per call when Gemini's preview model is broadly degraded.
-    if (CrmEnrichmentService.isLlmCircuitOpen()) {
-      console.log(
-        `[CrmEnrichment][llmCallWithTimeout] ${label} circuit OPEN, ` +
-        `routing directly to fallback ${fallback} (skipping ${primaryModel})`
-      );
-      return await call(fallback);
-    }
-
-    try {
-      return await call(primaryModel);
-    } catch (err: any) {
-      if (!CrmEnrichmentService.isLlmTimeoutError(err)) throw err;
-      // Tick the breaker. If this push trips the threshold, the circuit
-      // opens for COOLDOWN_MS and *next* calls skip the primary entirely.
-      CrmEnrichmentService.recordLlmTimeout();
-      console.warn(
-        `[CrmEnrichment][llmCallWithTimeout] ${label} timed out on ${primaryModel} after ` +
-        `${CrmEnrichmentService.LLM_CALL_TIMEOUT_MS}ms, retrying with fallback ${fallback}`
-      );
-      try {
-        return await call(fallback);
-      } catch (retryErr: any) {
-        if (CrmEnrichmentService.isLlmTimeoutError(retryErr)) {
-          throw Object.assign(
-            new Error(`LLM call timed out twice (${label}, primary=${primaryModel}, fallback=${fallback})`),
-            { step: 'llm', timedOut: true },
-          );
-        }
-        throw retryErr;
-      }
-    }
+    return call(model);
   }
 
   static async getEnrichmentConfig(): Promise<{ enrichmentModel: string; dataExtractionModel: string }> {
@@ -452,11 +358,54 @@ export class CrmEnrichmentService {
     return false;
   }
 
+  /**
+   * Reserved / filler domains that belong to no real company. Base names only —
+   * `isPlaceholderDomain` also matches their subdomains.
+   */
+  private static readonly PLACEHOLDER_DOMAINS = new Set([
+    // RFC 2606 reserved second-level names
+    'example.com', 'example.net', 'example.org', 'example.edu', 'example.co',
+    // Canonical filler addresses people type into test/seed rows
+    'company.com', 'yourcompany.com', 'mycompany.com', 'thecompany.com',
+    'domain.com', 'yourdomain.com', 'mydomain.com',
+    'test.com', 'testing.com', 'sample.com', 'notarealdomain.com',
+    // Our own QA domain (matches the onboarding stuck-detector filter)
+    'agenttest.com',
+    'localhost',
+  ]);
+
+  /**
+   * True for reserved / placeholder / QA domains that can never be a real
+   * prospect's employer: RFC 2606 + 6761 reserved names (example.*, .test,
+   * .invalid, .localhost) and the canonical filler domains that show up in
+   * seeded test rows.
+   *
+   * ENG-968: these were treated as ordinary business domains, so junk rows like
+   * `queue-verify@example.com` and `test2@company.com` seeded firmographic
+   * lookups and came back with an invented company, funding_round and revenue.
+   * A couple of these bases (company.com, domain.com) do host real businesses;
+   * refusing to enrich them is the deliberate fail-closed trade — a not-found is
+   * recoverable, a fabricated funding round flowing into ICP scoring is not.
+   */
+  static isPlaceholderDomain(domain: string): boolean {
+    const d = domain.toLowerCase().trim().replace(/\.+$/, '');
+    if (!d) return false;
+    if (CrmEnrichmentService.PLACEHOLDER_DOMAINS.has(d)) return true;
+    // RFC 6761 reserved TLDs.
+    if (/\.(test|example|invalid|localhost)$/.test(d)) return true;
+    // Subdomains of a reserved/filler base (mail.example.com, corp.test.com).
+    for (const base of CrmEnrichmentService.PLACEHOLDER_DOMAINS) {
+      if (d.endsWith(`.${base}`)) return true;
+    }
+    return false;
+  }
+
   static isPersonalEmailDomain(email: string): boolean {
     const domain = (email.split('@')[1] || '').toLowerCase().trim();
     if (!domain) return false;
     if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(domain)) return true;
     if (CrmEnrichmentService.isInstitutionalDomain(domain)) return true;
+    if (CrmEnrichmentService.isPlaceholderDomain(domain)) return true;
     return false;
   }
 
@@ -465,6 +414,7 @@ export class CrmEnrichmentService {
     if (!d) return false;
     if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(d)) return true;
     if (CrmEnrichmentService.isInstitutionalDomain(d)) return true;
+    if (CrmEnrichmentService.isPlaceholderDomain(d)) return true;
     return false;
   }
 
@@ -883,8 +833,20 @@ export class CrmEnrichmentService {
       }
 
       if (profileData) {
-        rawProfile = profileData as Record<string, unknown>;
-        publicIdentifier = profileData?.public_identifier ?? null;
+        // The whole profile object is serialized into the LLM's context below and
+        // stored for the cache-replay path, so rejecting the sentinel only where a
+        // URL gets built leaves the fabricated `/in/undefined` reachable anyway —
+        // the model can read it straight out of the blob, and citation verification
+        // then accepts it because the slug really is in the source context.
+        const sanitizedProfile = withoutFabricatedProfileFields(profileData as Record<string, unknown>);
+        rawProfile = sanitizedProfile;
+        // ENG-1198: Unipile anonymizes out-of-network profiles with
+        // public_identifier literally the string 'undefined' — that string is
+        // truthy, so leaving it here would make the URL construction below (and
+        // the cache-rebuild path in buildLinkedInContextFromCache) synthesize a
+        // fake https://www.linkedin.com/in/undefined and hand it to the
+        // enrichment LLM as a "Resolved LinkedIn profile URL".
+        publicIdentifier = usablePublicIdentifier(profileData?.public_identifier);
         profileId = profileData?.provider_id ?? null;
 
         if (confidence === 'low') {
@@ -894,18 +856,34 @@ export class CrmEnrichmentService {
           // enrichLead) are independent and survive.
           linkedinContext = '';
         } else {
-          const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
-          const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
+          // Read from the SANITIZED copy: on the raw object a fabricated
+          // `public_profile_url` short-circuits this `||` chain and masks a legitimate
+          // `url`/`profile_url` that would otherwise have been used.
+          const rawUrl = sanitizedProfile?.public_profile_url || sanitizedProfile?.url || sanitizedProfile?.profile_url || null;
+          // Rejecting the identifier above is only half of it: Unipile builds
+          // `public_profile_url` from that same bad identifier and sends it too, so
+          // this fallback re-created the very /in/undefined URL the identifier check
+          // had just refused, and handed it to the enrichment LLM as a resolved
+          // profile (ENG-1198 follow-up).
+          const cleanUrl = usableProfileUrl(rawUrl);
           const profileUrl = publicIdentifier
             ? `https://www.linkedin.com/in/${publicIdentifier}`
             : cleanUrl;
-          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
+          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(sanitizedProfile, null, 2)}`;
           if (profileUrl && isEnrichingLinkedin) {
             linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
           }
         }
       } else if (isEnrichingLinkedin && isValidLinkedInUrl && confidence !== 'low') {
-        linkedinContext = `\n\nResolved LinkedIn profile URL: ${linkedinUrl}`;
+        // `isValidLinkedInUrl` is only a `/in/` substring test, so the lead's own
+        // stored URL can BE the fabricated one — earlier enrichment runs wrote
+        // `/in/undefined` back onto `lead.linkedin`, which makes this self-perpetuating.
+        // Citation verification cannot catch it either: it accepts a URL whose slug
+        // appears in the source context, and the slug here is the word "undefined".
+        const storedUrl = usableProfileUrl(linkedinUrl);
+        if (storedUrl) {
+          linkedinContext = `\n\nResolved LinkedIn profile URL: ${storedUrl}`;
+        }
       }
     } catch (err: any) {
       console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
@@ -949,31 +927,24 @@ export class CrmEnrichmentService {
 
     const userPrompt = `Lead context:\n${JSON.stringify(leadContext, null, 2)}\n${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}\n\nExtract only what is explicitly present in the sources above. Do not infer or fabricate any value. Return null for any field not found in the data.`;
 
-    const llmClient = await agentModeService.getClientForModel(dataExtractionModel);
     console.log(`[CrmEnrichment][extractFieldsViaLLM] calling LLM model=${dataExtractionModel} outputFields=${JSON.stringify(spec.outputFields)}`);
     const tLlm = Date.now();
     let response: Record<string, unknown> | null = null;
 
     try {
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
+        (model) => agentModeService.callLLM(model, [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ], {
           temperature: 0,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
           response_format: { type: 'json_object' },
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+          timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+          usageContext: { userId: spec.userId, feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
         dataExtractionModel,
-        'extractFieldsViaLLM:json',
       );
-      meterUsageFromResponse({
-        userId: spec.userId,
-        model: dataExtractionModel,
-        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_extract',
-      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
@@ -984,23 +955,17 @@ export class CrmEnrichmentService {
       const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, retryExample);
 
       const retry = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
+        (model) => agentModeService.callLLM(model, [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: strictRetryPrompt },
+        ], {
           temperature: 0,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: strictRetryPrompt },
-          ],
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+          timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+          usageContext: { userId: spec.userId, feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
         dataExtractionModel,
-        'extractFieldsViaLLM:plain',
       );
-      meterUsageFromResponse({
-        userId: spec.userId,
-        model: dataExtractionModel,
-        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_extract',
-      }, retry);
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
@@ -1114,26 +1079,19 @@ export class CrmEnrichmentService {
     if (claims.length === 0) return;
 
     try {
-      const llmClient = await agentModeService.getClientForModel(enrichConfig.dataExtractionModel);
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: buildCriticSystemPrompt() },
-            { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
-          ],
-          response_format: { type: 'json_object' },
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        (model) => agentModeService.callLLM(model, [
+              { role: 'system', content: buildCriticSystemPrompt() },
+              { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
+            ], {
+            temperature: 0,
+            response_format: { type: 'json_object' },
+            timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+            usageContext: { userId, feature: 'crm_enrichment_critic' },
+            taskClass: 'nonstandard_consumer',
+          }),
         enrichConfig.dataExtractionModel,
-        'criticPass',
       );
-      meterUsageFromResponse({
-        userId,
-        model: enrichConfig.dataExtractionModel,
-        provider: enrichConfig.dataExtractionModel.startsWith('anthropic') || enrichConfig.dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_critic',
-      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       const parsed = JSON.parse(raw) as Record<string, { verdict?: string; reason?: string }>;
       for (const c of claims) {
@@ -1269,7 +1227,7 @@ export class CrmEnrichmentService {
     const specialistFields = specialistOut.resolvedFields;
     const specialistMeta = specialistOut.resolvedMeta;
     const specialistSourceContexts = specialistOut.sourceContexts;
-    const fieldsForLLM = spec.outputFields.filter(f => !(f in specialistFields));
+    const fieldsForLLM = llmEligibleFields(spec.outputFields, specialistFields);
     if (Object.keys(specialistFields).length > 0) {
       console.log(`[CrmEnrichment][enrichLead] specialists resolved ${Object.keys(specialistFields).length} fields lead=${lead.leadId}: ${Object.keys(specialistFields).join(',')}`);
     }
@@ -1309,7 +1267,7 @@ export class CrmEnrichmentService {
       const isPersonalDomain = domain ? CrmEnrichmentService.isPersonalDomain(domain) : false;
       if (domain && !isPersonalDomain) {
         try {
-          const orgResult = await getApolloService().matchOrg(domain);
+          const orgResult = await getApolloService().matchOrg(domain, { userId: spec.userId });
           const techStack = orgResult.organization?.techStack;
           if (techStack && techStack.length > 0) {
             apolloTechStackContext = `Apollo technology data for ${domain}:\n${techStack.join(', ')}`;
@@ -2071,8 +2029,6 @@ export class CrmEnrichmentService {
 
     const userPrompt = `${existingFieldsSection}Enrichment goal or instruction:\n${goal}`;
 
-    const llmClient = await agentModeService.getClientForModel(enrichmentModel);
-
     const fallback = {
       instruction: goal,
       outputFields: [] as string[],
@@ -2085,39 +2041,27 @@ export class CrmEnrichmentService {
 
     let raw = '';
     try {
-      const completion = await llmClient.chat.completions.create({
-        model: enrichmentModel,
-        temperature: 0.2,
-        messages: [
+      const completion = await agentModeService.callLLM(enrichmentModel, [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
-        ],
+        ], {
+        temperature: 0.2,
         response_format: { type: 'json_object' },
+        usageContext: { userId, feature: 'crm_enrichment_suggest' },
+        taskClass: 'nonstandard_consumer',
       });
-      meterUsageFromResponse({
-        userId,
-        model: enrichmentModel,
-        provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_suggest',
-      }, completion);
       raw = completion.choices?.[0]?.message?.content || '';
     } catch (err) {
       // Retry without json_object mode
       try {
-        const retry = await llmClient.chat.completions.create({
-          model: enrichmentModel,
-          temperature: 0.2,
-          messages: [
+        const retry = await agentModeService.callLLM(enrichmentModel, [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: `${userPrompt}\n\nCRITICAL: Return ONLY a valid JSON object. No markdown, no backticks.` },
-          ],
+          ], {
+          temperature: 0.2,
+          usageContext: { userId, feature: 'crm_enrichment_suggest' },
+          taskClass: 'nonstandard_consumer',
         });
-        meterUsageFromResponse({
-          userId,
-          model: enrichmentModel,
-          provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-          feature: 'crm_enrichment_suggest',
-        }, retry);
         raw = retry.choices?.[0]?.message?.content || '';
         raw = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
       } catch (retryErr) {

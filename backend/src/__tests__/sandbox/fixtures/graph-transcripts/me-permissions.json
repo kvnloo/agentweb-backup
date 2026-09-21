@@ -1,0 +1,36 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "me/permissions",
+    "query": {}
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "permission": "read_insights",
+        "status": "granted"
+      },
+      {
+        "permission": "pages_show_list",
+        "status": "granted"
+      },
+      {
+        "permission": "ads_management",
+        "status": "granted"
+      },
+      {
+        "permission": "ads_read",
+        "status": "granted"
+      },
+      {
+        "permission": "business_management",
+        "status": "granted"
+      },
+      {
+        "permission": "public_profile",
+        "status": "granted"
+      }
+    ]
+  }
+}

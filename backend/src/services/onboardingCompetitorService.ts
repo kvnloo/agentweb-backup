@@ -21,6 +21,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { userDb } from "./db";
 import {
@@ -293,7 +294,8 @@ function buildPerIcpUserPrompt(
  *     multiple ICPs)
  *   - description = first 2 distinct offer_angles joined; falls back to
  *     "Identified during onboarding" if none
- *   - cap at 10 (matches the rough ceiling agentMode's MAX_COMPETITORS uses)
+ *   - cap at 10 (a deliberate onboarding-only ceiling; agentMode no longer
+ *     caps the stored competitor list — see ENG-945)
  *
  * Exported for unit testing.
  */
@@ -355,6 +357,7 @@ async function mirrorCompetitorsToMarketStrategy(
       }>;
       createdAt?: string;
       updatedAt?: string;
+      icpUpdatedAt?: string;
     };
     const merged = {
       businessOverview: existing.businessOverview ?? "",
@@ -362,6 +365,16 @@ async function mirrorCompetitorsToMarketStrategy(
       icp: existing.icp ?? [],
       createdAt: existing.createdAt ?? now,
       updatedAt: now,
+      // This write never touches `icp` — carry icpUpdatedAt through
+      // unchanged (like createdAt above), never bump or drop it. userDb's
+      // updateUser fully replaces the marketStrategy map attribute, so
+      // omitting this field here would silently erase a real ICP edit's
+      // timestamp the next time onboarding's competitor step runs — which
+      // fires for essentially every onboarded user right after ICP
+      // generation — and fall back to this write's wall-clock `updatedAt`,
+      // reintroducing the exact staleness bug icpUpdatedAt exists to
+      // prevent (ENG-1955).
+      icpUpdatedAt: existing.icpUpdatedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
   } catch (err) {
@@ -385,6 +398,7 @@ export async function generateCompetitorStrategyForUser(
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
+  usageContext?: LLMUsageContext,
 ): Promise<CompetitorResult> {
   if (!Array.isArray(personas) || personas.length === 0) {
     throw new Error("competitor strategy needs at least one ICP");
@@ -416,9 +430,12 @@ export async function generateCompetitorStrategyForUser(
     const userPrompt = buildPerIcpUserPrompt(brand, persona, searchCtx);
     // generateJsonRobust adds a retry-on-extract-failure layer so a single
     // prose preamble from the LLM doesn't fail the whole per-ICP loop.
+    // ENG-1858: metered to the onboarding user (was feature "unknown" / "system").
     const raw = await llm.generateJsonRobust<PerIcpLlmResponse>(
       COMPETITOR_STRATEGY_SYSTEM_PROMPT,
       userPrompt,
+      undefined,
+      usageContext ?? { feature: "onboarding_competitors" },
     );
     out.push({
       icp_id: persona.name,
@@ -483,7 +500,9 @@ export async function triggerCompetitorStrategyForUser(
 
   const brand = extractIcpBrandContext(u);
   try {
-    const result = await generateCompetitorStrategyForUser(brand, personas, deps);
+    // ENG-1858: attribute and charge the research to this user.
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_competitors" };
+    const result = await generateCompetitorStrategyForUser(brand, personas, deps, usageContext);
     const current = await userDb.getUserById(userId);
     const patch = competitorReadyPatch((current as any) || {}, result);
     if (!patch) return;

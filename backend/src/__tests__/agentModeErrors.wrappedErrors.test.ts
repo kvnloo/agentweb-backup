@@ -99,4 +99,17 @@ describe('isWorkerShutdownError', () => {
   it('should return true for worker crash with code 0', () => {
     expect(isWorkerShutdownError(new Error('Worker process exited with code 0 and signal null'))).toBe(true);
   });
+
+  // ENG-1166: a scheduled run whose dispatch lands in the graceful-shutdown drain
+  // window throws this exact message (generateMarketingResponseWorkerService.ts),
+  // which is the same deploy-timing class as the other two patterns above — it was
+  // just missing from the matcher, so it fell through to the 'system' classification
+  // ("retrying won't help") instead of budget-shaped/transient.
+  it('should return true for the drain-window rejection', () => {
+    expect(isWorkerShutdownError(new Error('Worker is draining — no new requests accepted'))).toBe(true);
+  });
+
+  it('should return false for a message that merely mentions draining', () => {
+    expect(isWorkerShutdownError(new Error('worker draining status unknown'))).toBe(false);
+  });
 });

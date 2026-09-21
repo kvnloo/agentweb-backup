@@ -24,6 +24,12 @@ import {
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
 import './apiTools';
+import './evaluationTools';
+// ENG-982: the job-shaped workflow layer. Additive — registers alongside the
+// granular tools; unlisting those behind tool search is ENG-983.
+import './workflowTools';
+// ENG-1004: tranche 2 (landing pages). Same additive contract.
+import './landingWorkflowTools';
 
 export interface McpSessionContext {
   agentUserId?: string;

@@ -45,7 +45,8 @@ export async function getLinearCredentials(): Promise<LinearCredentials> {
   return getLinearCredentialsForEnv(environment === 'production' ? 'production' : 'development');
 }
 
-async function linearGraphQL(query: string, variables?: Record<string, any>): Promise<any> {
+/** Shared authenticated Linear GraphQL boundary for production adapters. */
+export async function linearGraphQL(query: string, variables?: Record<string, any>): Promise<any> {
   const { apiKey } = await getLinearCredentials();
   const MAX_RETRIES = 3;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -239,6 +240,13 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
  * Optional triage fields (ENG-187): `priority` (Linear enum 1=Urgent 2=High 3=Medium 4=Low),
  * `stateName` (workflow state by name, e.g. "Todo"; falls back to the backlog state when omitted
  * or unknown), `assigneeId` (Linear user uuid).
+ *
+ * Returns `null` — filing nothing — outside production (ENG-1099). This rail files real rows on the
+ * production board, so a test-env/local/preview backend filing through it manufactures issues
+ * indistinguishable from genuine production incidents, and inflates the ENG-240 dedupe clusters that
+ * assume a filed cluster reflects production reality. `sendOncallAlert` sits on the same failure
+ * paths and has always been guarded this way; this uses that same NODE_ENV mechanism deliberately
+ * rather than introducing a second environment convention. Callers must handle `null`.
  */
 export async function createInternalLinearIssue(params: {
   title: string;
@@ -247,7 +255,14 @@ export async function createInternalLinearIssue(params: {
   priority?: number;
   stateName?: string;
   assigneeId?: string;
-}): Promise<LinearIssueResult> {
+}): Promise<LinearIssueResult | null> {
+  if (process.env.NODE_ENV !== 'production') {
+    // Loud, not silent: a developer debugging locally still sees the intake decision it would have made.
+    console.log(
+      `[DEV] Suppressed Linear issue creation: ${params.title} [${params.labelNames.join(', ')}]\n${params.description}`,
+    );
+    return null;
+  }
   const meta = await getTeamMeta();
   const labelIds = resolveLabelIdsLoud(meta, params.labelNames);
   const input: Record<string, any> = {
@@ -376,7 +391,18 @@ export interface OpenIssue {
 const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
 const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
 
-/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see OPEN_STATE_TYPES. */
+/**
+ * List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see
+ * OPEN_STATE_TYPES.
+ *
+ * ARCHIVED CANDIDACY (ENG-730): Linear's default `issues()` query already excludes archived
+ * issues (they only surface with the explicit `includeArchived: true` argument, which this query
+ * deliberately omits) — an archived canonical can therefore never come back as a match here,
+ * belt-and-braces confirmed by the `state.type` whitelist too (an archived issue's underlying
+ * workflow state can be anything, so the whitelist alone would not be a safe guard on its own).
+ * This is a candidacy EXCLUSION, not a post-selection filter (ENG-730 AC2): archived rows never
+ * enter the candidate list in the first place.
+ */
 export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
   const data = await linearGraphQL(
     `query($team: String!, $label: String!, $limit: Int!) {
@@ -393,6 +419,91 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
     { team: TEAM_KEY, label: labelName, limit },
   );
   return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Find the most-recently-archived issue carrying `labelName` whose title or body matches
+ * `isMatch` (ENG-730 AC3). Used ONLY to record lineage — "the archived predecessor this new
+ * canonical replaces" — on a freshly created canonical, never as a dedupe target: archived issues
+ * are permanently excluded from candidacy (see `listOpenIssuesByLabel`).
+ *
+ * `includeArchived: true` is the ONLY way to see archived rows through Linear's API — the default
+ * `issues()` query silently omits them. Best-effort by contract: a lookup failure (network,
+ * schema surprise) must never block filing the new canonical, so callers should catch and log,
+ * never let this throw into the intake path.
+ */
+export async function findMostRecentArchivedIssueByLabel(
+  labelName: string,
+  isMatch: (issue: OpenIssue) => boolean,
+  limit = 50,
+): Promise<OpenIssue | null> {
+  const data = await linearGraphQL(
+    `query($team: String!, $label: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        includeArchived: true,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $label } }
+        }
+      ) { nodes { id identifier title description archivedAt } }
+    }`,
+    { team: TEAM_KEY, label: labelName, limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  // Defense in depth: even though `includeArchived: true` widens the query to include archived
+  // rows, still-open issues remain in the page too — filter to ONLY archived ones so this can
+  // never accidentally be reused as a dedupe-candidate source.
+  const archived = nodes.filter((n) => !!n.archivedAt);
+  const candidate = archived
+    .map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }))
+    .find(isMatch);
+  return candidate || null;
+}
+
+/**
+ * Thrown when a mutation attempts to move an issue into Linear's `Duplicate` state (or otherwise
+ * create a duplicate relation) against a target that is archived. Linear hard-rejects this
+ * server-side ("Issues can only be moved to a duplicate state when a duplicate issue relation
+ * exists") because an archived issue cannot hold a duplicate relation — ENG-730's root cause.
+ * A distinct, named error class so callers can classify this failure instead of it surfacing as
+ * an opaque `Linear API error` string, and so it can never be silently swallowed (ENG-730 AC5).
+ */
+export class ArchivedDuplicateTargetError extends Error {
+  constructor(public readonly targetIssueId: string, cause: string) {
+    super(`Cannot mark duplicate against archived Linear issue ${targetIssueId}: ${cause}`);
+    this.name = 'ArchivedDuplicateTargetError';
+  }
+}
+
+const ARCHIVED_DUPLICATE_TARGET_RE = /can only be moved to a duplicate state when a duplicate issue relation exists/i;
+
+/**
+ * Create a "duplicate" relation from `issueId` onto `canonicalIssueId` (moves `issueId` toward
+ * Linear's Duplicate semantics). ENG-730 AC5: an archived `canonicalIssueId` is Linear's own
+ * hard-rejection case — that specific rejection is reclassified into `ArchivedDuplicateTargetError`
+ * (loud, named, catchable) instead of leaking as an undifferentiated `Linear API error` string that
+ * a caller could plausibly catch-and-ignore. Any other failure propagates unchanged.
+ */
+export async function markIssueDuplicateOf(issueId: string, canonicalIssueId: string): Promise<void> {
+  try {
+    const data = await linearGraphQL(
+      `mutation($input: IssueRelationCreateInput!) {
+        issueRelationCreate(input: $input) { success }
+      }`,
+      { input: { issueId, relatedIssueId: canonicalIssueId, type: 'duplicate' } },
+    );
+    if (!data?.issueRelationCreate?.success) {
+      throw new Error('Linear issueRelationCreate (duplicate) did not report success');
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (ARCHIVED_DUPLICATE_TARGET_RE.test(message)) {
+      throw new ArchivedDuplicateTargetError(canonicalIssueId, message);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -593,6 +704,177 @@ export async function recordLoopAttributionOutcome(
     throw new Error('Linear loop attribution commentCreate failed');
   }
   return { status: 'applied' };
+}
+
+export interface LinearIssueSummary {
+  identifier: string;
+  issueId: string;
+  title: string;
+  priority: number;
+  state: string;
+  stateType: string;
+  labels: string[];
+  assigneeName: string | null;
+  assigneeEmail: string | null;
+  updatedAt: string;
+}
+
+export interface LinearRelatedIssue {
+  identifier: string;
+  title: string;
+  stateType: string;
+}
+
+export interface LinearIssueDetail extends LinearIssueSummary {
+  description: string;
+  team: string;
+  comments: IssueCommentDetail[];
+  subIssues: { identifier: string; title: string; state: string; stateType: string }[];
+  blocks: LinearRelatedIssue[];
+  blockedBy: LinearRelatedIssue[];
+  related: LinearRelatedIssue[];
+  /**
+   * Non-empty when one of the connections above hit its page cap and was cut off — the caller
+   * (an admin making a decision from this data) needs to know the view may be incomplete, not
+   * just find it in a server log (CodeRabbit ENG-789 review).
+   */
+  truncationWarnings: string[];
+}
+
+/**
+ * Search/list issues with filters — the general-purpose admin read behind board-triage tooling
+ * (ENG-789). team defaults to ENG; priorities follow Linear's enum (1=Urgent..4=Low).
+ */
+export async function searchIssues(params: {
+  teamKey?: string;
+  stateTypes?: string[];
+  priorities?: number[];
+  labelName?: string;
+  assigneeEmail?: string;
+  limit?: number;
+}): Promise<LinearIssueSummary[]> {
+  const filter: Record<string, any> = { team: { key: { eq: params.teamKey || TEAM_KEY } } };
+  if (params.stateTypes?.length) filter.state = { type: { in: params.stateTypes } };
+  if (params.priorities?.length) filter.priority = { in: params.priorities };
+  if (params.labelName) filter.labels = { name: { eq: params.labelName } };
+  if (params.assigneeEmail) filter.assignee = { email: { eq: params.assigneeEmail } };
+  const data = await linearGraphQL(
+    `query($filter: IssueFilter!, $limit: Int!) {
+      issues(first: $limit, orderBy: updatedAt, filter: $filter) {
+        nodes {
+          id identifier title priority updatedAt
+          state { name type }
+          labels(first: 50) { nodes { name } }
+          assignee { name email }
+        }
+      }
+    }`,
+    { filter, limit: params.limit ?? 50 },
+  );
+  return (data?.issues?.nodes || []).map((n: any) => ({
+    identifier: n.identifier,
+    issueId: n.id,
+    title: n.title || '',
+    priority: typeof n.priority === 'number' ? n.priority : 0,
+    state: n.state?.name || '',
+    stateType: n.state?.type || '',
+    labels: (n.labels?.nodes || []).map((l: any) => l.name),
+    assigneeName: n.assignee?.name ?? null,
+    assigneeEmail: n.assignee?.email ?? null,
+    updatedAt: n.updatedAt || '',
+  }));
+}
+
+/** Resolve an issue ref ("ENG-42" or a raw Linear uuid) to its internal id. */
+async function resolveIssueId(ref: string): Promise<string> {
+  const m = /^([A-Za-z]+)-(\d+)$/.exec(ref.trim());
+  if (!m) return ref.trim();
+  const data = await linearGraphQL(
+    `query($tk: String!, $n: Float!) { issues(filter: { team: { key: { eq: $tk } }, number: { eq: $n } }, first: 1) { nodes { id } } }`,
+    { tk: m[1].toUpperCase(), n: Number(m[2]) },
+  );
+  const id = data?.issues?.nodes?.[0]?.id;
+  if (!id) throw new Error(`Linear issue "${ref}" not found`);
+  return id;
+}
+
+/**
+ * Full read of a single issue for board triage (ENG-789): detail, comments, and sub-issue /
+ * blocking relationships in one call. `relations`/`inverseRelations` are outgoing/incoming
+ * relation edges (Linear's directional model) — a "blocks" edge FROM this issue means this issue
+ * blocks the related one; a "blocks" edge INTO this issue (inverseRelations) means this issue is
+ * blocked by the related one.
+ */
+export async function getIssueFullDetail(ref: string): Promise<LinearIssueDetail> {
+  const issueId = await resolveIssueId(ref);
+  const data = await linearGraphQL(
+    `query($id: String!) {
+      issue(id: $id) {
+        id identifier title description priority updatedAt
+        state { name type }
+        team { key }
+        labels(first: 50) { nodes { name } }
+        assignee { name email }
+        comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } }
+        children(first: 50) { nodes { identifier title state { name type } } pageInfo { hasNextPage } }
+        relations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } pageInfo { hasNextPage } }
+        inverseRelations(first: 50) { nodes { type relatedIssue { identifier title state { type } } } pageInfo { hasNextPage } }
+      }
+    }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error(`Linear issue "${ref}" not found`);
+  const truncationWarnings: string[] = [];
+  if (issue.comments?.pageInfo?.hasNextPage) {
+    const msg = `issue has >250 comments — comment list is truncated, oldest comments are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
+  }
+  if (issue.children?.pageInfo?.hasNextPage) {
+    const msg = `issue has >50 sub-issues — sub-issue list is truncated, some sub-issues are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
+  }
+  if (issue.relations?.pageInfo?.hasNextPage || issue.inverseRelations?.pageInfo?.hasNextPage) {
+    const msg = `issue has >50 relations on one side — blocking/related issue list is truncated, some are missing`;
+    console.error(`[linear] ${ref}: ${msg}`);
+    truncationWarnings.push(msg);
+  }
+  const toRelated = (nodes: any[]): LinearRelatedIssue[] => nodes
+    .filter((r) => r.relatedIssue)
+    .map((r) => ({
+      identifier: r.relatedIssue.identifier,
+      title: r.relatedIssue.title || '',
+      stateType: r.relatedIssue.state?.type || '',
+    }));
+  const outgoing: any[] = issue.relations?.nodes || [];
+  const incoming: any[] = issue.inverseRelations?.nodes || [];
+  return {
+    identifier: issue.identifier,
+    issueId: issue.id,
+    title: issue.title || '',
+    description: issue.description || '',
+    priority: typeof issue.priority === 'number' ? issue.priority : 0,
+    state: issue.state?.name || '',
+    stateType: issue.state?.type || '',
+    team: issue.team?.key || '',
+    labels: (issue.labels?.nodes || []).map((l: any) => l.name),
+    assigneeName: issue.assignee?.name ?? null,
+    assigneeEmail: issue.assignee?.email ?? null,
+    updatedAt: issue.updatedAt || '',
+    comments: (issue.comments?.nodes || []).map((c: any) => ({ body: c.body || '', createdAt: c.createdAt || '' })),
+    subIssues: (issue.children?.nodes || []).map((c: any) => ({
+      identifier: c.identifier,
+      title: c.title || '',
+      state: c.state?.name || '',
+      stateType: c.state?.type || '',
+    })),
+    blocks: toRelated(outgoing.filter((r) => r.type === 'blocks')),
+    blockedBy: toRelated(incoming.filter((r) => r.type === 'blocks')),
+    related: toRelated([...outgoing, ...incoming].filter((r) => r.type === 'related')),
+    truncationWarnings,
+  };
 }
 
 export interface EngineeringBugStats {

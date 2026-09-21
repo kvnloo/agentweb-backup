@@ -30,11 +30,20 @@ jest.mock('../utils/metaApiFetch', () => ({
   fetchWithRetryAndPaging: jest.fn().mockResolvedValue({ data: [] }),
 }));
 
+jest.mock('../services/adsThresholdsDb', () => ({
+  getThresholdsForAccount: jest.fn().mockResolvedValue([]),
+}));
+
+jest.mock('../services/metaTokenRefresh', () => ({
+  ensureFreshMetaAdAccountToken: jest.fn().mockResolvedValue({ attempted: false, refreshed: false }),
+}));
+
 import { assessClientHealth, listAllClients } from '../services/clientHealthService';
 
 const { userDb } = require('../services/db');
 const { getAccountsByUserId } = require('../services/connectedAccountsDb');
 const { getLandingPagesByOwner, getLandingPagesByOrg } = require('../services/v0Service');
+const { ensureFreshMetaAdAccountToken } = require('../services/metaTokenRefresh');
 
 describe('Client Health - assessClientHealth', () => {
   beforeEach(() => {
@@ -68,6 +77,18 @@ describe('Client Health - assessClientHealth', () => {
     (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([]);
 
     const result = await assessClientHealth(adminUserId, 'nonexistent@example.com');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not found/i);
+  });
+
+  it('never treats a sandbox principal found by email as a client (ENG-1907)', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, email: 'admin@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'eval_take-home', email: 'candidate@example.invalid', connected_accounts: [] });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([]);
+
+    const result = await assessClientHealth(adminUserId, 'candidate@example.invalid');
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/not found/i);
@@ -165,9 +186,805 @@ describe('Client Health - assessClientHealth', () => {
     });
     expect(result.health.ads_layer.connected).toBe(true);
     expect(result.health.ads_layer.active_campaigns).toBe(2);
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
     expect(result.health.creative_variety.distinct_creatives).toBe(3);
     expect(result.health.status).toBeDefined();
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
+  });
+
+  // ENG-1767: the client's OWN connected Meta token, account id resolution, and precedence
+  // against the legacy `adAccount` field.
+  describe('ENG-1767 — connected-account token and account-id precedence', () => {
+    const { getMetaAccessToken } = require('../utils/secretsManager');
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+
+    function mockAdmin() {
+      (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    }
+
+    it('uses the client\'s own connected token, not the shared app-wide token', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-999',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '999999', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_999999/campaigns')
+      );
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('access_token=clients-own-token')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('999999');
+    });
+
+    it('falls back to the shared token only when there is no connected Meta account (legacy-only)', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '777777',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(result.success).toBe(true);
+      expect(getMetaAccessToken).toHaveBeenCalledTimes(1);
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_777777/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('777777');
+    });
+
+    it('mutation: prefers the connected account over a DIFFERING legacy adAccount field, consistently everywhere the id is used', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '111111', // legacy field — must NOT win when a connected account exists
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-222',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      // The connected account's id must win — in the fetch URL AND in the reported ad_account_id —
+      // never the legacy field, and never disagreeing between the two.
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_222222/campaigns')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('222222');
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+    });
+
+    // Review-flagged bug: id and token were previously resolved as two INDEPENDENT `||` chains,
+    // not a genuine matched pair. A connected account with a real ad_account_id but an empty
+    // access_token would pick the connected id (only checked ad_account_id) paired with the
+    // SHARED token (access_token was falsy) — silently reintroducing the exact bug this PR fixes.
+    it('falls back to the legacy id + shared token TOGETHER when the connected account has no usable token, never mixing the two', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '333333',
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-444',
+          account_name: 'Client Meta Ads',
+          // ad_account_id is real, but access_token is falsy — must NOT be treated as usable.
+          config: { account_type: 'ad_account', ad_account_id: '444444', access_token: '' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      // Must use the LEGACY id (333333), not the connected account's id (444444) — using
+      // 444444 with the shared token would be exactly the bug this PR exists to fix.
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('act_333333/campaigns')
+      );
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalledWith(
+        expect.stringContaining('act_444444')
+      );
+      expect(result.health.ads_layer.ad_account_id).toBe('333333');
+      expect(getMetaAccessToken).toHaveBeenCalledTimes(1);
+      expect(ensureFreshMetaAdAccountToken).not.toHaveBeenCalled();
+    });
+
+    it('refreshes the connected token before reading it, and uses the REFRESHED value, not the stale pre-refresh one', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '',
+      });
+      const connectedAccount = {
+        platform: 'meta',
+        account_id: 'meta-555',
+        account_name: 'Client Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '555555', access_token: 'stale-token' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      };
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([connectedAccount]);
+      // Simulate a successful refresh: ensureFreshMetaAdAccountToken mutates config in place,
+      // exactly like the real implementation does on success.
+      (ensureFreshMetaAdAccountToken as jest.Mock).mockImplementationOnce(async (account: any) => {
+        account.config.access_token = 'freshly-refreshed-token';
+        return { attempted: true, refreshed: true };
+      });
+      (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+      const result = await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(ensureFreshMetaAdAccountToken).toHaveBeenCalledWith(connectedAccount, 'client-user');
+      expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(
+        expect.stringContaining('access_token=freshly-refreshed-token')
+      );
+      expect(fetchWithRetryAndPaging).not.toHaveBeenCalledWith(
+        expect.stringContaining('access_token=stale-token')
+      );
+      expect(getMetaAccessToken).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    });
+
+    it('uses the resolved account id for the thresholds lookup too (the third reuse site), not just the campaigns fetch', async () => {
+      mockAdmin();
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+        userId: 'client-user',
+        email: 'client@example.com',
+        displayName: 'Client User',
+        isAdmin: false,
+        adAccount: '666666', // legacy field — a differing id, must NOT be what thresholds are looked up under
+      });
+      (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+        {
+          platform: 'meta',
+          account_id: 'meta-888',
+          account_name: 'Client Meta Ads',
+          config: { account_type: 'ad_account', ad_account_id: '888888', access_token: 'clients-own-token' },
+          created_at: '2024-01-01',
+          updated_at: '2024-01-01',
+        },
+      ]);
+      // Need at least one ACTIVE ad with a creative for `activeAds.length > 0`, which is what
+      // gates the thresholds lookup — an empty-campaigns response never exercises this branch.
+      (fetchWithRetryAndPaging as jest.Mock)
+        .mockResolvedValueOnce({
+          data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        })
+        .mockResolvedValueOnce({
+          data: [
+            { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+          ],
+        });
+      const { getThresholdsForAccount } = require('../services/adsThresholdsDb');
+
+      await assessClientHealth('admin-user', 'client@example.com');
+
+      expect(getThresholdsForAccount).toHaveBeenCalledWith('meta', '888888');
+      expect(getThresholdsForAccount).not.toHaveBeenCalledWith('meta', '666666');
+    });
+  });
+
+  // Fatigue detection: frequency ceiling (default 3.5), CTR-drop / CPM-rise vs prior-period
+  // baseline (defaults 20% / 15%) — resolved from ENG-918's threshold store (mocked empty here,
+  // so registry defaults apply).
+  //
+  // The service fetches BOTH windows in one Graph API `insights.time_ranges(...)` call and
+  // distinguishes the two resulting rows by `date_start` — NOT via separate aliased sub-fields
+  // (an alias like `current:insights.date_preset(...)` is silently dropped by the real Graph
+  // API, confirmed live against a real ad account during ENG-885 live-testing 2026-09-04). Mocks
+  // here replicate that same `insights.data` shape with matching `date_start` values.
+  function currentWindowDateStart(): string {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - 13);
+    return d.toISOString().slice(0, 10);
+  }
+  function priorWindowDateStart(): string {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - 13 - 1 - 13);
+    return d.toISOString().slice(0, 10);
+  }
+
+  it('flags a creative fatigued by frequency alone (no prior-period data)', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Fatigued Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            // Only the current-window row — newly launched, no prior-period baseline yet.
+            insights: {
+              data: [
+                { spend: '50', frequency: '4.2', ctr: '1.0', cpm: '10', date_start: currentWindowDateStart() },
+              ],
+            },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(true);
+    expect(result.health.creative_variety.fatigued_creatives).toEqual([
+      { id: 'ad1', name: 'Fatigued Ad', reasons: ['frequency'] },
+    ]);
+  });
+
+  it('requests the ads creative and insights.time_ranges selectors URL-encoded (ENG-1742 follow-up)', async () => {
+    // Confirmed live 2026-09-04 against a real ad account: unencoded `creative{id,name}` on
+    // this `ads` edge silently drops the whole `creative` field (no error, just missing data —
+    // same as the sibling fix in meta.ts/agentModeService.ts). The `insights.time_ranges(...){...}`
+    // selector is worse: unencoded, it hard-errors on EVERY call ("Syntax error \"Expected end
+    // of string...\""), so this feature has never returned ad-level insights at all. Every
+    // existing test in this file mocks the ad objects directly (e.g. `creative: { id: 'cr1' }`)
+    // rather than a real fetch response keyed to a real URL, so none of them could have caught
+    // this — this is the first test that inspects the actual URL built.
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({ data: [] });
+
+    await assessClientHealth(adminUserId, 'client@example.com');
+
+    const adsCallUrl = (fetchWithRetryAndPaging as jest.Mock).mock.calls.find(
+      (call: any[]) => call[0].includes('/ads?')
+    )?.[0];
+    expect(adsCallUrl).toBeDefined();
+    expect(adsCallUrl).toContain('creative%7Bid%2Cname%7D');
+    expect(adsCallUrl).not.toContain('creative{id,name}');
+    expect(adsCallUrl).toContain(encodeURIComponent('insights.time_ranges('));
+    expect(adsCallUrl).not.toContain('insights.time_ranges([');
+    expect(adsCallUrl).not.toContain('{spend,frequency,ctr,cpm,date_start}');
+  });
+
+  it('flags a creative fatigued by CTR drop and CPM rise vs the prior period, not by frequency', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Drifting Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            insights: {
+              data: [
+                // frequency under the 3.5 default ceiling — should not trigger that reason.
+                { spend: '50', frequency: '2.0', ctr: '0.5', cpm: '15', date_start: currentWindowDateStart() },
+                // CTR dropped 50% (> 20% default), CPM rose 50% (> 15% default) vs this baseline.
+                { spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10', date_start: priorWindowDateStart() },
+              ],
+            },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(true);
+    const flagged = result.health.creative_variety.fatigued_creatives[0];
+    expect(flagged.id).toBe('ad1');
+    expect(flagged.reasons).toContain('ctr_drop');
+    expect(flagged.reasons).toContain('cpm_rise');
+    expect(flagged.reasons).not.toContain('frequency');
+  });
+
+  it('does not flag a healthy creative within all thresholds', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Healthy Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            insights: {
+              data: [
+                { spend: '50', frequency: '2.0', ctr: '0.95', cpm: '10.5', date_start: currentWindowDateStart() },
+                { spend: '50', frequency: '2.0', ctr: '1.0', cpm: '10', date_start: priorWindowDateStart() },
+              ],
+            },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(false);
+    expect(result.health.creative_variety.fatigued_creatives).toEqual([]);
+  });
+
+  it('matches current vs prior window by RELATIVE ORDER, not exact date_start equality — an account-timezone offset must not silently drop both rows', async () => {
+    // Meta buckets insights `date_start` in the AD ACCOUNT's own timezone, not UTC. Shift both
+    // real dates forward by one day, as a non-UTC account plausibly would relative to our
+    // UTC-computed window boundaries. Neither string equals currentWindowDateStart()/
+    // priorWindowDateStart() exactly, but the current row is still the later of the two.
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: adminUserId, isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+
+    const shiftedCurrent = new Date(currentWindowDateStart());
+    shiftedCurrent.setUTCDate(shiftedCurrent.getUTCDate() + 1);
+    const shiftedPrior = new Date(priorWindowDateStart());
+    shiftedPrior.setUTCDate(shiftedPrior.getUTCDate() + 1);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 'ad1',
+            name: 'Timezone-Shifted Ad',
+            creative: { id: 'cr1' },
+            status: 'ACTIVE',
+            insights: {
+              data: [
+                // frequency 5.0 exceeds the 3.5 default ceiling — should trigger 'frequency'
+                // ONLY if this row is correctly identified as the CURRENT window, not the prior.
+                { spend: '50', frequency: '5.0', ctr: '1.0', cpm: '10', date_start: shiftedCurrent.toISOString().slice(0, 10) },
+                { spend: '50', frequency: '1.0', ctr: '1.0', cpm: '10', date_start: shiftedPrior.toISOString().slice(0, 10) },
+              ],
+            },
+          },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(true);
+    expect(result.health.creative_variety.fatigued_creatives[0].reasons).toContain('frequency');
+  });
+
+  /*
+   * ENG-1584 sibling: fetchWithRetryAndPaging is bounded and reports `pagingTruncated` when a
+   * read stops short of the account's full campaign list. active_campaigns is a bare count with
+   * no other signal that it might be an undercount — this pins that the truncation flag survives
+   * into ads_layer instead of being silently dropped, the gap this whole PR started from.
+   */
+  it('flags active_campaigns as incomplete when the campaigns read was truncated', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        pagingTruncated: true,
+      })
+      .mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(1);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+  });
+
+  /*
+   * Fail-open regression: campaigns_complete used to default to `true` and only flip to `false`
+   * on a TRUNCATED success — a fetch that THREW (network error, expired token) fell straight to
+   * the catch block below (log-only), leaving active_campaigns at 0 and campaigns_complete still
+   * true. That reads as "confirmed zero campaigns, complete" when nothing was actually read.
+   */
+  it('does not report campaigns_complete:true when the campaigns fetch itself throws', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockRejectedValueOnce(new Error('Meta access token expired'));
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(0);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+  });
+
+  /*
+   * ENG-1767 follow-up: `fetchWithRetryAndPaging` does not throw on a Graph API error — per its
+   * own documented contract it RESOLVES with the parsed `{ error: {...} }` body, no `data` array,
+   * no `pagingTruncated` flag. The truncation-only check above missed this case entirely: a real
+   * permission error came back as `active_campaigns: 0, campaigns_complete: true` — confirmed live
+   * against a real account whose stored token had lost Graph access. Same silent-wrong-zero shape
+   * this whole ticket exists to eliminate, via a different trigger than the original bug.
+   */
+  it('does not report campaigns_complete:true when the campaigns fetch resolves with a Graph API error', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({
+      error: { message: 'Ad account owner has NOT grant ads_management or ads_read permission', code: 200 },
+    });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(0);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+  });
+
+  /*
+   * Sibling of the campaigns_complete gap above, found by the same review: the ad-level insights
+   * fetch (creative-fatigue/cannibalization source data) has the identical failure mode and, before
+   * this fix, NO completeness signal at all — not even a flawed one. A failed read after a
+   * successful campaigns fetch silently reported zero warnings with full confidence, which can make
+   * a client's health look BETTER than it is, not just incomplete.
+   */
+  it('does not report creative_data_complete:true when the ad-level insights fetch resolves with a Graph API error', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      .mockResolvedValueOnce({
+        error: { message: 'Ad account owner has NOT grant ads_management or ads_read permission', code: 200 },
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    // The campaigns read itself succeeded cleanly — this must NOT be conflated with the
+    // ad-level failure below.
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.fatigue_warning).toBe(false);
+    expect(result.health.creative_variety.cannibalization_warning).toBe(false);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
+  });
+
+  it('reports creative_data_complete:true for a genuinely clean, successful ad-level read', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      .mockResolvedValueOnce({
+        data: [
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.creative_data_complete).toBe(true);
+  });
+
+  /*
+   * Review finding on the fix above: fetchWithRetryAndPaging keeps whatever partial `data` it
+   * already fetched when it truncates (it does not discard the page it did read) — so a truncated
+   * campaigns read can still return real ACTIVE campaigns and feed a genuinely clean, successful
+   * ad-level fetch. Before this, creative_data_complete reported its own isolated success (true)
+   * with no reflection of the incomplete campaign list it was built from. Now ANDed with
+   * campaigns_complete so incompleteness upstream propagates downstream too.
+   */
+  it('reports creative_data_complete:false when built from a truncated (but non-empty) campaigns read, even if the ad-level fetch itself is clean', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+        pagingTruncated: true,
+      })
+      .mockResolvedValueOnce({
+        data: [
+          { id: 'ad1', name: 'Ad 1', creative: { id: 'cr1' }, status: 'ACTIVE', insights: { data: [{ spend: '10' }] } },
+        ],
+      });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.health.ads_layer.active_campaigns).toBe(1);
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
+  });
+
+  /*
+   * Review finding: adLevelDataComplete used to be assigned BEFORE the ad-level transform ran, so
+   * a throw during that transform (malformed data from Graph) left the flag at whatever it was
+   * already set to, misreporting a crashed read as complete. Now assigned pessimistic (false) the
+   * moment the fetch is attempted, only flipping true after fetch AND transform both succeed — a
+   * throw here should leave it false, caught by the outer catch, not silently true.
+   */
+  it('does not report creative_data_complete:true when the ad-level transform itself throws on malformed data', async () => {
+    const adminUserId = 'admin-user';
+    const clientUserId = 'client-user';
+
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: clientUserId,
+      email: 'client@example.com',
+      displayName: 'Client User',
+      isAdmin: false,
+      adAccount: '123456',
+    });
+
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        account_id: 'meta-123',
+        account_name: 'Meta Ads',
+        config: { account_type: 'ad_account', ad_account_id: '123456', access_token: 'tok' },
+        created_at: '2024-01-01',
+        updated_at: '2024-01-01',
+      },
+    ]);
+
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock)
+      .mockResolvedValueOnce({
+        data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+      })
+      // A malformed `null` entry — `ad.insights?.data` throws on `null.insights` inside the
+      // transform, since the optional chaining only guards insights -> data, not `ad` itself.
+      .mockResolvedValueOnce({ data: [null] });
+
+    const result = await assessClientHealth(adminUserId, 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.ads_layer.campaigns_complete).toBe(true);
+    expect(result.health.creative_variety.creative_data_complete).toBe(false);
   });
 
   it('should detect a deployed landing page owned by another member of the client org', async () => {
@@ -441,6 +1258,28 @@ describe('Client Health - listAllClients', () => {
     expect(result.success).toBe(true);
     expect(result.clients).toHaveLength(1);
     expect(result.clients[0].email).toBe('admin@example.com');
+  });
+
+  // ENG-1907: a sandbox take-home account looks like a Pro customer with a Meta
+  // connection; it must not appear in the admin client roster or its health sweep.
+  it('never lists a sandbox (eval_) principal as a client', async () => {
+    const adminUserId = 'admin-user';
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: adminUserId,
+      email: 'admin@example.com',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      { userId: 'customer-1', email: 'customer@example.com', isAdmin: false },
+      { userId: 'eval_5d5d5d5d-0000-4000-8000-000000000000', email: 'candidate@example.invalid', isAdmin: false },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValue([]);
+
+    const result = await listAllClients(adminUserId);
+
+    expect(result.success).toBe(true);
+    expect(result.clients.map((c: any) => c.email)).toEqual(['customer@example.com']);
+    expect(getAccountsByUserId).not.toHaveBeenCalledWith(expect.stringMatching(/^eval_/));
   });
 
   // FAIL test 3: Error handling when DB fails

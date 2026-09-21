@@ -5,10 +5,13 @@
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 
-const mockGetAccountById = jest.fn();
+// Resolution reads every account the caller can reach (own + org-shared), not
+// just their own record — see ENG-943 and emailProviderService.orgShared.test.ts.
+const mockGetAccountsWithOwnerIncludingOrgShared = jest.fn();
 
 jest.mock('../services/connectedAccountsDb', () => ({
-  getAccountById: (...args: any[]) => mockGetAccountById(...args),
+  getAccountsWithOwnerIncludingOrgShared: (...args: any[]) =>
+    mockGetAccountsWithOwnerIncludingOrgShared(...args),
 }));
 
 // Prevent gmailService from importing googleapis at module load
@@ -19,6 +22,17 @@ jest.mock('../services/gmailService', () => ({
     getEmails: jest.fn(),
     sendEmail: jest.fn(),
   },
+  // ENG-1300: real typed error classes — plain classes, no side effects to
+  // import — needed to test emailProviderErrorStatus() against the real thing.
+  ...(() => {
+    const actual = jest.requireActual('../services/gmailService');
+    return {
+      GmailNotConnectedError: actual.GmailNotConnectedError,
+      GmailTokenRevokedError: actual.GmailTokenRevokedError,
+      GmailQuotaError: actual.GmailQuotaError,
+      GmailSendNotAuthorizedError: actual.GmailSendNotAuthorizedError,
+    };
+  })(),
 }));
 
 import {
@@ -26,10 +40,17 @@ import {
   getEmailProvider,
   resolveEmailAccount,
   bootstrapEmailProviders,
+  emailProviderErrorStatus,
   EMAIL_PLATFORMS,
   type IEmailService,
   type EmailPlatform,
 } from '../services/emailProviderService';
+import {
+  GmailNotConnectedError,
+  GmailTokenRevokedError,
+  GmailQuotaError,
+  GmailSendNotAuthorizedError,
+} from '../services/gmailService';
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -95,7 +116,7 @@ describe('emailProviderService', () => {
     });
 
     it('resolves a valid gmail account', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('gmail', 'user@gmail.com'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('gmail', 'user@gmail.com')]);
 
       const result = await resolveEmailAccount('user-123', 'user@gmail.com');
       expect(result.platform).toBe('gmail');
@@ -103,7 +124,7 @@ describe('emailProviderService', () => {
     });
 
     it('throws when account is not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
 
       await expect(resolveEmailAccount('user-123', 'missing-acc')).rejects.toThrow(
         /not found/
@@ -111,7 +132,7 @@ describe('emailProviderService', () => {
     });
 
     it('throws when account platform is not an email platform', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('linkedin', 'li-acc'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('linkedin', 'li-acc')]);
 
       await expect(resolveEmailAccount('user-123', 'li-acc')).rejects.toThrow(
         /not an email account/
@@ -119,7 +140,7 @@ describe('emailProviderService', () => {
     });
 
     it('error for non-email platform mentions the platform name', async () => {
-      mockGetAccountById.mockResolvedValue(makeAccount('meta', 'meta-acc'));
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([makeAccount('meta', 'meta-acc')]);
 
       await expect(resolveEmailAccount('user-123', 'meta-acc')).rejects.toThrow(/meta/);
     });
@@ -138,6 +159,38 @@ describe('emailProviderService', () => {
         bootstrapEmailProviders(),
         bootstrapEmailProviders(),
       ])).resolves.not.toThrow();
+    });
+  });
+
+  // ── emailProviderErrorStatus (ENG-1300) ───────────────────────────────────
+  // Gmail/Outlook throw fully-typed EmailProviderError subclasses that
+  // deliberately carry no HTTP status of their own — this maps by constructor
+  // name to a representative HTTP-equivalent status instead of falling
+  // through to the generic Error/bug classification.
+  describe('emailProviderErrorStatus', () => {
+    it('maps GmailNotConnectedError to 401', () => {
+      expect(emailProviderErrorStatus(new GmailNotConnectedError())).toBe(401);
+    });
+
+    it('maps GmailTokenRevokedError to 401', () => {
+      expect(emailProviderErrorStatus(new GmailTokenRevokedError())).toBe(401);
+    });
+
+    it('maps GmailSendNotAuthorizedError to 403', () => {
+      expect(emailProviderErrorStatus(new GmailSendNotAuthorizedError())).toBe(403);
+    });
+
+    it('leaves GmailQuotaError unmapped (its message already classifies via classFromMessage\'s "quota exceeded" pattern)', () => {
+      expect(emailProviderErrorStatus(new GmailQuotaError())).toBeUndefined();
+    });
+
+    it('returns undefined for a plain Error (e.g. Resend failures, which carry no typed class here)', () => {
+      expect(emailProviderErrorStatus(new Error('Resend API error'))).toBeUndefined();
+    });
+
+    it('returns undefined for a non-Error value', () => {
+      expect(emailProviderErrorStatus('not an error')).toBeUndefined();
+      expect(emailProviderErrorStatus(undefined)).toBeUndefined();
     });
   });
 });

@@ -17,8 +17,8 @@ import { extractJson } from './util/extractJson';
  * - The judge returns a 1-based INDEX into the shown list (not a free-form id) so it cannot
  *   hallucinate an identifier; we map the index back to the candidate.
  * - Model is sourced from settings via agentModeService.getDedupJudgeModel() — NOT a
- *   hardcoded literal. TODO(ENG-9): route this LLM call through OpenRouter so model choice
- *   is gateway/routing config.
+ *   hardcoded literal. ENG-9: setting that config value to an `openrouter/<provider>/<model>`
+ *   id already routes this call through OpenRouter — no code change needed here.
  * - Best-effort: any error returns null so a filing is never blocked.
  */
 
@@ -75,7 +75,17 @@ function buildPrompt(input: DedupInput, candidates: DedupCandidate[]): { system:
  * Returns the candidate to group onto, or null to create a fresh canonical. The caller
  * supplies the open candidates (features: FB posts; bugs: Linear bug canonicals).
  */
-export async function findDuplicate(input: DedupInput, candidates: DedupCandidate[]): Promise<DedupCandidate | null> {
+export async function findDuplicate(
+  input: DedupInput,
+  candidates: DedupCandidate[],
+  /**
+   * Who triggered this filing, for metering (ENG-1961). The judge used to run
+   * with no usage context at all, so its spend booked to the `system`
+   * placeholder — recorded, but never charged to anyone. Omitted, the call is
+   * metered feature-only rather than against an invented user.
+   */
+  usage?: { userId?: string; sessionId?: string },
+): Promise<DedupCandidate | null> {
   try {
     if (candidates.length === 0) return null;
 
@@ -88,7 +98,17 @@ export async function findDuplicate(input: DedupInput, candidates: DedupCandidat
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0, max_completion_tokens: 120, response_format: { type: 'json_object' } },
+      {
+        temperature: 0,
+        max_completion_tokens: 120,
+        response_format: { type: 'json_object' },
+        taskClass: 'nonstandard_consumer',
+        usageContext: {
+          ...(usage?.userId ? { userId: usage.userId } : {}),
+          ...(usage?.sessionId ? { sessionId: usage.sessionId } : {}),
+          feature: 'intake_dedup',
+        },
+      },
     );
     let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {

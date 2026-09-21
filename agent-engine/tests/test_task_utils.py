@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 
 # Add parent directory to path to import task_utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from task_utils import run_python_code_in_sandbox
+from task_utils import run_python_code_in_sandbox, get_llm
 from browser_use.agent.views import ActionResult
 
 class TestRunPythonCodeInSandbox(unittest.TestCase):
@@ -45,6 +45,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test"
         )
         
@@ -59,6 +60,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test"
         )
         
@@ -67,18 +69,25 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         self.assertIn("ZeroDivisionError", result.error)
         
     def test_timeout_handling(self):
-        """Test that the function handles code that exceeds the timeout."""
-        python_code = "import time\ntime.sleep(60)"  # This should timeout (30s limit)
-        
-        result = run_python_code_in_sandbox(
-            python_code=python_code,
-            execution_id=self.execution_id,
-            script_type="test"
-        )
-        
+        """Test that the function handles code that exceeds the timeout.
+
+        The sandbox timeout is read from SANDBOX_TIMEOUT_SECONDS (default
+        300s in prod - see agent-engine.service) rather than a hardcoded
+        30s, so this overrides it to 2s and sleeps 5s to keep the test fast
+        and deterministic regardless of the real default."""
+        python_code = "import time\ntime.sleep(5)"
+
+        with patch.dict(os.environ, {'SANDBOX_TIMEOUT_SECONDS': '2'}):
+            result = run_python_code_in_sandbox(
+                python_code=python_code,
+                execution_id=self.execution_id,
+                user_id="test_user",
+                script_type="test"
+            )
+
         self.assertIsInstance(result, ActionResult)
         self.assertIsNotNone(result.error)
-        self.assertEqual(result.error, "Execution timed out after 30 seconds")
+        self.assertEqual(result.error, "Execution timed out after 2 seconds")
         
     def test_header_comment(self):
         """Test that the function correctly adds a header comment."""
@@ -102,6 +111,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
             result = run_python_code_in_sandbox(
                 python_code=python_code,
                 execution_id=self.execution_id,
+                user_id="test_user",
                 script_type="test",
                 header_comment=header_comment
             )
@@ -116,6 +126,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test",
             additional_env_vars={"TEST_VAR": "TEST_VALUE"}
         )
@@ -130,6 +141,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test"
         )
         
@@ -146,6 +158,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test"
         )
         
@@ -162,6 +175,7 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         result = run_python_code_in_sandbox(
             python_code=python_code,
             execution_id=self.execution_id,
+            user_id="test_user",
             script_type="test"
         )
         
@@ -169,5 +183,26 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         self.assertIsNotNone(result.error)
         self.assertIn("SyntaxError", result.error)
 
+class TestOpenRouterDoesNotExportEnvVar(unittest.TestCase):
+    """Gateway construction must not replace credentials for sibling callers."""
+
+    def setUp(self):
+        self.original_env = os.environ.pop('OPENAI_API_KEY', None)
+
+    def tearDown(self):
+        if self.original_env is not None:
+            os.environ['OPENAI_API_KEY'] = self.original_env
+        else:
+            os.environ.pop('OPENAI_API_KEY', None)
+
+    @patch('openrouter_gateway.ChatOpenAI')
+    @patch('openrouter_gateway.secrets_manager.get_openrouter_api_key', return_value='or-test-key-123')
+    def test_get_llm_does_not_export_browser_use_compatibility_key(self, mock_get_key, mock_client):
+        self.assertNotIn('OPENAI_API_KEY', os.environ)
+        get_llm('openai->openai->gpt-4o')
+        self.assertNotIn('OPENAI_API_KEY', os.environ)
+        mock_client.assert_called_once()
+
+
 if __name__ == '__main__':
-    unittest.main() 
+    unittest.main()

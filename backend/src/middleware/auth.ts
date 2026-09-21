@@ -1,3 +1,4 @@
+import { isEvaluationUser, requireActiveEvaluation } from '../services/evaluationPolicy';
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
@@ -33,11 +34,19 @@ export interface UserPayload {
   _svc?: boolean;
   // Delegation fields
   delegateAccess?: {
+    scope?: 'evaluation';
     adminUserId: string;
     adminEmail: string;
     targetUserId: string;
     targetEmail: string;
   };
+  /**
+   * Delegate-token epoch (ENG-1506). Stamped from the TARGET user's
+   * `delegateTokenEpoch` at mint time and compared against the stored value on
+   * every request, so an admin can cut off outstanding support access without
+   * waiting for the token to expire. Absent = 0.
+   */
+  dte?: number;
 }
 
 // Common function to extract user from request token (returns null if no token or invalid)
@@ -60,6 +69,29 @@ export async function getUserFromToken(req: Request): Promise<{
       getJwtSecret()
     ) as UserPayload;
 
+    // Evaluation Access Portal delegation stays a candidate principal; generic delegation remains denied.
+    if (isEvaluationUser(decoded.userId) || isEvaluationUser(decoded.delegateAccess?.targetUserId) || isEvaluationUser(decoded.delegateAccess?.adminUserId)) {
+      if (decoded._svc || decoded.isAdmin || !isEvaluationUser(decoded.userId)) return { user: null };
+      const delegate = decoded.delegateAccess;
+      if (delegate && (delegate.scope !== 'evaluation' || delegate.targetUserId !== decoded.userId ||
+          delegate.targetEmail !== decoded.email || isEvaluationUser(delegate.adminUserId))) return { user: null };
+      const evaluation = await requireActiveEvaluation(decoded.userId);
+      if (decoded.email !== evaluation.email) return { user: null };
+      const account = await userDb.getUserByEmailConsistent(evaluation.email);
+      if (!account || account.userId !== decoded.userId || account.isActive !== true || account.isAdmin || account.orgId ||
+          (decoded.sv ?? 0) < (account.sessionVersion ?? 0)) return { user: null };
+      let adminUser;
+      if (delegate) {
+        if (!Number.isSafeInteger(decoded.dte) || !Number.isSafeInteger(decoded.sv) ||
+            decoded.dte !== (account.delegateTokenEpoch ?? 0) || decoded.sv !== (account.sessionVersion ?? 0)) return { user: null };
+        adminUser = await userDb.getUserByIdConsistent(delegate.adminUserId);
+        if (!adminUser || adminUser.userId !== delegate.adminUserId || adminUser.email !== delegate.adminEmail ||
+            adminUser.isAdmin !== true || adminUser.isActive !== true) return { user: null };
+      }
+      return { user: { userId: account.userId, email: account.email, isAdmin: false, roles: ['customer'] }, decoded,
+        ...(adminUser ? { adminUser: { userId: adminUser.userId, email: adminUser.email } } : {}) };
+    }
+
     // Handle delegate access tokens
     if (decoded.delegateAccess) {
       // This is a delegate token - admin or contractor accessing as another user
@@ -80,6 +112,29 @@ export async function getUserFromToken(req: Request): Promise<{
           return { user: null };
         }
       } else if (!isAdmin && !isContractor) {
+        return { user: null };
+      }
+
+      // ENG-1506. Two independent kill switches for a delegate token, because
+      // until now there were none: the only thing standing between a leaked
+      // support token and the customer's account was the clock.
+      //
+      // Same `<` (token behind server) comparison as the sessionVersion check
+      // below, and for the same eventual-consistency reason: getUserById reads
+      // an eventually-consistent GSI, so a freshly-minted token can legitimately
+      // carry a value the read has not caught up to yet. A strict `!==` would
+      // reject the token the admin just created.
+      //
+      // 1. delegateTokenEpoch — revokes support access on demand, without
+      //    logging the customer out of their own devices.
+      if ((decoded.dte ?? 0) < (targetUser.delegateTokenEpoch ?? 0)) {
+        return { user: null };
+      }
+      // 2. the TARGET user's sessionVersion — a customer changing their password
+      //    should end delegate sessions too. This branch used to return before
+      //    reaching the sessionVersion check further down, so a delegate token
+      //    outlived the password change that was supposed to kill every session.
+      if ((decoded.sv ?? 0) < (targetUser.sessionVersion ?? 0)) {
         return { user: null };
       }
 
@@ -229,4 +284,4 @@ export async function isAdmin(req: Request, res: Response, next: NextFunction) {
   }
 
   next();
-} 
+}

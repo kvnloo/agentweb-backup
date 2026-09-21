@@ -23,15 +23,15 @@ import { getSecret } from '../utils/secretsManager';
  *   or redeploy, and deleting the SM secret rolls enforcement back to fail-open
  *   within one TTL window (~5 min) — a no-redeploy rollback lever.
  *
- * Rollout safety (ENG-347): enforcement is gated on a secret being resolvable.
- * If NEITHER the env var NOR the SM secret resolves, requests pass through
- * unauthenticated (pre-ENG-347 behavior) and a warning is logged once per
- * process. This keeps the deploy additive: the backend auto-deploys daily at
- * 02:00 UTC while the agent-engine is manually deployed on a GCP VM — a hard
- * requirement would break every customer's scheduled chats at the next backend
- * deploy until someone touched the VM. On any SM read error we also fail open
- * (never hard-fail the endpoint) so a transient Secrets Manager blip cannot
- * 401 the entire scheduled-chats system.
+ * Fail-closed (ENG-1754): if NEITHER the env var NOR the SM secret resolves —
+ * including on any SM read error — the endpoint returns 503 and logs a loud
+ * error, once per process. This replaced an earlier fail-open rollout mode
+ * (pre-ENG-1754: unauthenticated pass-through) once ENG-347/ENG-359 confirmed
+ * the secret is active in staging/prod; a misconfigured deploy, an SM outage,
+ * or a self-hoster who forgot the variable can no longer silently open the
+ * scheduled-run trigger to the internet. 503 (not 500) signals "service
+ * temporarily unavailable, retry" rather than an application bug, and is
+ * distinguishable in logs/alerts from a real 401 auth failure.
  */
 
 export const SERVICE_SECRET_HEADER = 'x-service-secret';
@@ -68,19 +68,19 @@ function safeSecretEquals(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-// The agent-engine polls run-scheduled-chats continuously; warn once per
-// process, not once per request, so the rollout mode doesn't flood logs.
+// The agent-engine polls run-scheduled-chats continuously; log once per
+// process, not once per request, so the fail-closed state doesn't flood logs.
 let warnedSecretUnset = false;
 
 function warnScheduledChatsSecretUnset() {
   if (warnedSecretUnset) return;
-  console.warn(
+  console.error(
     `[serviceAuth] No shared secret resolved for run-scheduled-chats — neither ` +
       `the ${SCHEDULED_CHATS_SERVICE_SECRET_ENV} env var nor Secrets Manager ` +
-      `(${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}) provided one. The endpoint is ` +
-      `accepting unauthenticated requests (pre-ENG-347 rollout mode). Create the ` +
-      `SM secret (JSON key ${SCHEDULED_CHATS_SERVICE_SECRET_SM_KEY}) after the ` +
-      `agent-engine has the same value to enforce.`
+      `(${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}) provided one. Failing CLOSED ` +
+      `(ENG-1754): the endpoint is returning 503 to every caller until the ` +
+      `SM secret (JSON key ${SCHEDULED_CHATS_SERVICE_SECRET_SM_KEY}) or the env ` +
+      `override is set to the same value the agent-engine sends.`
   );
   warnedSecretUnset = true;
 }
@@ -175,7 +175,7 @@ async function resolveFromSecretsManagerThenEnforce(
 
   if (!expected) {
     warnScheduledChatsSecretUnset();
-    return next();
+    return res.status(503).json({ error: 'Service temporarily unavailable' });
   }
   return enforceServiceSecret(req, res, next, expected);
 }
@@ -187,7 +187,7 @@ export function requireScheduledChatsServiceSecret(
 ) {
   // (a) Env override wins and resolves synchronously — preserves the original
   //     behavior exactly (tests / local set the env var).
-  const fromEnv = process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV];
+  const fromEnv = process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV]?.trim();
   if (fromEnv) {
     return enforceServiceSecret(req, res, next, fromEnv);
   }
@@ -209,4 +209,31 @@ export function __resetScheduledChatsSecretCacheForTests() {
   smCache = null;
   smInFlight = null;
   warnedSecretUnset = false;
+}
+
+/**
+ * Boot-time visibility (ENG-1754 AC3): log which service secrets are resolvable at
+ * startup — names only, never values — so a missing secret shows up in the deploy
+ * log instead of only manifesting as a wall of runtime 503s later. Does not block
+ * boot: the Secrets-Manager check is a best-effort async read with the same
+ * fail-open-to-"unresolved" semantics as the middleware itself, so a slow or
+ * failing SM call can never delay server startup.
+ */
+export async function logServiceSecretResolutionAtBoot(): Promise<void> {
+  const results: string[] = [];
+
+  const scheduledChatsResolved =
+    Boolean(process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV]?.trim()) ||
+    Boolean(await resolveSecretFromSecretsManager().catch(() => undefined));
+  results.push(
+    `${SCHEDULED_CHATS_SERVICE_SECRET_ENV}: ${scheduledChatsResolved ? 'resolved' : 'UNRESOLVED (endpoint will 503)'}`
+  );
+
+  const linearWebhookResolved = Boolean(process.env.LINEAR_WEBHOOK_SECRET?.trim());
+  results.push(
+    `LINEAR_WEBHOOK_SECRET: ${linearWebhookResolved ? 'resolved' : 'UNRESOLVED (endpoint will 503)'}`
+  );
+
+  const log = scheduledChatsResolved && linearWebhookResolved ? console.log : console.error;
+  log(`[serviceAuth] Boot-time service secret resolution — ${results.join(', ')}`);
 }

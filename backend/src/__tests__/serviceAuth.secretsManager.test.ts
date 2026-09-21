@@ -7,9 +7,9 @@
  *   1. Env override unset + SM returns a secret → enforcement is ON: a request
  *      with no / wrong x-service-secret header is 401'd and next() is not
  *      called; the correct header calls next().
- *   2. Env override unset + SM returns nothing (no key), a non-JSON blob, or
- *      throws → fail-open: next() is called (never a 500) and a once-per-process
- *      warning is emitted.
+ *   2. Env unset + SM returns nothing (no key), a non-JSON blob, or
+ *      throws → fail-closed (ENG-1754): 503 is returned (next() never called)
+ *      and a once-per-process error is logged.
  *   3. The SM read is cached: N requests within the TTL window trigger exactly
  *      one getSecret call; a read past the TTL re-reads; deleting the SM secret
  *      flips enforcement back to fail-open after the TTL (the rollback lever).
@@ -111,86 +111,90 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
     });
   });
 
-  describe('env unset + SM has no usable secret → fail-open', () => {
-    it('SM returns an object without the key → next() + warns once', async () => {
+  describe('env unset + SM has no usable secret → fail-closed (ENG-1754)', () => {
+    it('SM returns an object without the key → 503 + errors once', async () => {
       mockGetSecret.mockResolvedValue('{}');
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       const next1 = jest.fn();
-      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), mockRes(), next1);
-      expect(next1).toHaveBeenCalledTimes(1);
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(warnSpy.mock.calls[0][0]).toContain(SCHEDULED_CHATS_SERVICE_SECRET_SM_ID);
+      const res1 = mockRes();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res1, next1);
+      expect(next1).not.toHaveBeenCalled();
+      expect(res1.status).toHaveBeenCalledWith(503);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toContain(SCHEDULED_CHATS_SERVICE_SECRET_SM_ID);
 
-      // Second request within the TTL: still fails open, no repeat warning.
+      // Second request within the TTL: still fails closed, no repeat log.
       const next2 = jest.fn();
-      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), mockRes(), next2);
-      expect(next2).toHaveBeenCalledTimes(1);
-      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const res2 = mockRes();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res2, next2);
+      expect(next2).not.toHaveBeenCalled();
+      expect(res2.status).toHaveBeenCalledWith(503);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
     });
 
-    it('SM read throws (as the real getSecret wraps it) → fail-open + warn once, never 500', async () => {
+    it('SM read throws (as the real getSecret wraps it) → 503 + error once, never 500', async () => {
       // The real getSecret catches AWS errors and re-throws
       // `new Error('Failed to fetch secret: ...')` (dropping the AWS code), and
-      // logs the underlying cause itself — so serviceAuth just fails open and
-      // records the impact via its once-per-process warn.
+      // logs the underlying cause itself — so serviceAuth fails closed and
+      // records the impact via its once-per-process error log.
       mockGetSecret.mockRejectedValue(
         new Error(`Failed to fetch secret: ${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}`)
       );
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res, next);
 
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
-      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
     });
 
-    it('SM returns a non-JSON blob → fail-open (no crash)', async () => {
+    it('SM returns a non-JSON blob → fail-closed (no crash)', async () => {
       mockGetSecret.mockResolvedValue('not-json-at-all');
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader('whatever'), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    it('SM returns a blank value for the key → fail-open', async () => {
+    it('SM returns a blank value for the key → fail-closed', async () => {
       mockGetSecret.mockResolvedValue(smPayload('   '));
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader('   '), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    it('SM returns an empty string → fail-open', async () => {
+    it('SM returns an empty string → fail-closed', async () => {
       mockGetSecret.mockResolvedValue('');
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    it('SM returns a JSON scalar (not an object) → fail-open', async () => {
+    it('SM returns a JSON scalar (not an object) → fail-closed', async () => {
       mockGetSecret.mockResolvedValue('"just-a-string"');
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    it('SM returns JSON null → fail-open', async () => {
+    it('SM returns JSON null → fail-closed', async () => {
       mockGetSecret.mockResolvedValue('null');
       const res = mockRes();
       const next = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(503);
     });
   });
 
@@ -244,9 +248,9 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
       expect(mockGetSecret).toHaveBeenCalledTimes(2);
     });
 
-    it('deleting the SM secret flips enforcement back to fail-open after the TTL', async () => {
+    it('deleting the SM secret flips enforcement to fail-closed after the TTL (ENG-1754)', async () => {
       const nowSpy = jest.spyOn(Date, 'now');
-      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
 
       // t=0: SM has the secret → enforcing (missing header → 401).
       nowSpy.mockReturnValue(0);
@@ -263,13 +267,14 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
         new Error(`Failed to fetch secret: ${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}`)
       );
 
-      // Past the TTL → re-read → now fails open (rollback lever, no redeploy).
+      // Past the TTL → re-read → now fails CLOSED (ENG-1754: an unresolved
+      // secret 503s rather than opening the endpoint back up).
       nowSpy.mockReturnValue(301_000);
       const res2 = mockRes();
       const next2 = jest.fn();
       await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res2, next2);
-      expect(next2).toHaveBeenCalledTimes(1);
-      expect(res2.status).not.toHaveBeenCalled();
+      expect(next2).not.toHaveBeenCalled();
+      expect(res2.status).toHaveBeenCalledWith(503);
     });
   });
 

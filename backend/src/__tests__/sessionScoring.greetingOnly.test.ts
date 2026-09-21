@@ -1,7 +1,7 @@
 import {
   scoreSessionIfNeeded,
   scoreSessionWithJudgeIfNeeded,
-  isGreetingOnlySession,
+  isNoTaskSession,
   ScoringJudge,
 } from '../services/sessionScoringService';
 import { ChatMessage } from '../services/chatbotService';
@@ -81,10 +81,10 @@ function realGoalSession(overrides: Record<string, any> = {}) {
   } as any;
 }
 
-describe('isGreetingOnlySession', () => {
+describe('isNoTaskSession', () => {
   it('returns true for a single "Hi" user message', () => {
     expect(
-      isGreetingOnlySession([
+      isNoTaskSession([
         { role: 'user', content: 'Hi' },
         { role: 'assistant', content: 'Hello! How can I help?' },
       ] as ChatMessage[])
@@ -94,14 +94,14 @@ describe('isGreetingOnlySession', () => {
   it('returns true for common greeting variants (punctuation / casing / emoji tolerant)', () => {
     for (const g of ['hello', 'Hey there', 'HELLO!', 'Good morning', 'yo', 'howdy', 'Hi 👋', 'hey Emma']) {
       expect(
-        isGreetingOnlySession([{ role: 'user', content: g }] as ChatMessage[])
+        isNoTaskSession([{ role: 'user', content: g }] as ChatMessage[])
       ).toBe(true);
     }
   });
 
   it('returns true when every user turn is a greeting (e.g. "Hi" then "hello")', () => {
     expect(
-      isGreetingOnlySession([
+      isNoTaskSession([
         { role: 'user', content: 'Hi' },
         { role: 'assistant', content: 'Hello! How can I help?' },
         { role: 'user', content: 'hello' },
@@ -111,7 +111,7 @@ describe('isGreetingOnlySession', () => {
 
   it('returns false when the user states an actual goal', () => {
     expect(
-      isGreetingOnlySession([
+      isNoTaskSession([
         { role: 'user', content: 'Write me a LinkedIn post about AI.' },
         { role: 'assistant', content: 'Sure, here you go...' },
       ] as ChatMessage[])
@@ -120,7 +120,7 @@ describe('isGreetingOnlySession', () => {
 
   it('returns false for a greeting followed by a real request (goal WAS stated)', () => {
     expect(
-      isGreetingOnlySession([
+      isNoTaskSession([
         { role: 'user', content: 'Hi' },
         { role: 'assistant', content: 'Hello! How can I help?' },
         { role: 'user', content: 'Can you draft an email to my investor?' },
@@ -130,14 +130,14 @@ describe('isGreetingOnlySession', () => {
 
   it('returns false when there are no user messages at all', () => {
     expect(
-      isGreetingOnlySession([{ role: 'assistant', content: 'Hello!' }] as ChatMessage[])
+      isNoTaskSession([{ role: 'assistant', content: 'Hello!' }] as ChatMessage[])
     ).toBe(false);
-    expect(isGreetingOnlySession([])).toBe(false);
+    expect(isNoTaskSession([])).toBe(false);
   });
 
   it('returns false for a greeting that also carries a question ("hi, can you help?")', () => {
     expect(
-      isGreetingOnlySession([
+      isNoTaskSession([
         { role: 'user', content: 'hi, can you help me with something?' },
       ] as ChatMessage[])
     ).toBe(false);

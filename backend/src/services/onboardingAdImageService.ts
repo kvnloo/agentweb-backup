@@ -55,9 +55,11 @@ import {
   IcpBrandContext,
 } from "./onboardingIcpService";
 import {
+  classifyBrandLogoUrl,
   getPersistedBrandLogoUrl,
   resolveBrandGuidelinesForLoadedUser,
 } from "./agentMode/brandLogo";
+import type { BrandLogoProbeDeps } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import {
@@ -695,6 +697,204 @@ export async function generateAdImagesForUser(
 }
 
 /**
+ * Preflight a resolved brand logo URL (ENG-792): does it actually serve usable
+ * image bytes right now?
+ *
+ * A persisted `logoUrl` can be structurally present yet unfetchable — a deleted
+ * S3 object, a hotlink-protected asset, or (the reported case) a Google
+ * favicon-service URL `https://www.google.com/s2/favicons?domain=…` that
+ * 301→404s when the domain has no crawlable favicon. Passing such a URL to
+ * `generate_image` makes `processInputImage`'s axios GET throw on EVERY
+ * variant, so all three creatives come back as placeholders while the run is
+ * still marked "ready" — the customer sees broken onboarding creatives.
+ *
+ * We catch that here so the orchestrator can treat an unfetchable logo the same
+ * as a missing one: fail the run with the actionable brand-config message
+ * instead of shipping broken placeholders (consistent with the ENG-326 gate —
+ * ad images are never generated with a broken/invented/approximate logo).
+ *
+ * Thin fail-CLOSED wrapper over `classifyBrandLogoUrl` (the shared probe in
+ * agentMode/brandLogo, which also backs the brand-build rediscovery gate).
+ * Only an outright `'usable'` verdict lets the run proceed: an inconclusive
+ * probe (timeout / DNS / 5xx) blocks too, because the alternative is burning
+ * three Gemini calls to produce three placeholders. The user gets an
+ * actionable error and a Retry button instead. Never throws.
+ */
+export async function isBrandLogoFetchable(
+  logoUrl: string,
+  deps: BrandLogoProbeDeps = {}
+): Promise<boolean> {
+  return (await classifyBrandLogoUrl(logoUrl, deps)) === "usable";
+}
+
+/**
+ * Who a run is, for the purposes of owning the ad-image axis.
+ *
+ * `runId` is the authority — a per-run nonce minted by `adImageStartPatch`.
+ * `startedAt` is the legacy fallback, used only when the axis carries no
+ * nonce: records written before the nonce shipped, and eager-DAG invocations
+ * that never went through the start patch. It cannot be the authority because
+ * it is a millisecond timestamp — two runs that start inside the same
+ * millisecond get byte-identical stamps, and every comparison below
+ * (including the DynamoDB equality condition) would then authorise each to
+ * write off the other (Greptile).
+ */
+interface AdImageRunIdentity {
+  runId?: unknown;
+  startedAt?: unknown;
+}
+
+function readAxisIdentity(record: unknown): AdImageRunIdentity {
+  return {
+    runId: (record as any)?.adImageRunId,
+    startedAt: (record as any)?.adImageStartedAt,
+  };
+}
+
+/**
+ * True when the axis provably belongs to someone else, so this run must not
+ * publish a terminal state over it.
+ */
+function axisIsNotOurs(axis: AdImageRunIdentity, ours: AdImageRunIdentity): boolean {
+  if (typeof axis.runId === "string") {
+    // The axis names its owner outright. An invocation carrying no nonce of
+    // its own cannot outrank one that does.
+    return axis.runId !== ours.runId;
+  }
+  // No nonce on the axis — fall back to timestamp ordering. Drop only when a
+  // newer run demonstrably exists; anything inconclusive (either timestamp
+  // missing or unparseable) still writes, because swallowing a real failure
+  // is what produced this ticket. Same conservative rule as `throwIfStepFailed`
+  // in onboardingOrchestratorWiring.
+  const ourStart =
+    typeof ours.startedAt === "string" ? Date.parse(ours.startedAt) : NaN;
+  const axisStart =
+    typeof axis.startedAt === "string" ? Date.parse(axis.startedAt) : NaN;
+  return (
+    Number.isFinite(axisStart) &&
+    (!Number.isFinite(ourStart) || axisStart > ourStart)
+  );
+}
+
+/**
+ * Restate "the axis still looks exactly as it did when I read it" as a
+ * DynamoDB condition, so an ownership check made from a read and the terminal
+ * write it authorises land as ONE decision. Both identity attributes are only
+ * ever written by `adImageStartPatch`, i.e. by a newer run, so an unmet
+ * condition means precisely one thing: someone else now owns the axis.
+ *
+ * Conditions on whichever attribute `axisIsNotOurs` just judged on. The
+ * fallback branch also asserts the nonce is still ABSENT: a run that starts in
+ * the window mints one, and without that clause the ms-resolution timestamp
+ * could still match and let this write through.
+ */
+function axisOwnershipCondition(axis: AdImageRunIdentity) {
+  if (typeof axis.runId === "string") {
+    return {
+      expression: "#axisRun = :axisRun",
+      names: { "#axisRun": "adImageRunId" },
+      values: { ":axisRun": axis.runId },
+    };
+  }
+  const names = { "#axisRun": "adImageRunId", "#axisStart": "adImageStartedAt" };
+  return typeof axis.startedAt === "string"
+    ? {
+        expression: "attribute_not_exists(#axisRun) AND #axisStart = :axisStart",
+        names,
+        values: { ":axisStart": axis.startedAt },
+      }
+    : {
+        expression:
+          "attribute_not_exists(#axisRun) AND attribute_not_exists(#axisStart)",
+        names,
+      };
+}
+
+function isConditionalCheckFailure(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "ConditionalCheckFailedException";
+}
+
+/**
+ * Terminally fail the ad-image axis on behalf of ONE specific run.
+ *
+ * Every gate in `triggerAdImageGenerationForUser` used to patch
+ * `adImageFailedPatch` unconditionally. That let a run which had already lost
+ * the race — say a slow logo preflight finally resolving — stomp a NEWER run
+ * that had since reset the axis to `running`, or clobber a `ready` the newer
+ * run had already published. `adImageReadyPatch` has always refused to write
+ * off a run it does not own; the failure paths simply never got the same
+ * treatment.
+ *
+ * Identity is `adImageRunId`, the nonce `adImageStartPatch` mints at the top of
+ * every run, with `adImageStartedAt` ordering as the legacy fallback — see
+ * `axisIsNotOurs` for the full rule and why the timestamp alone will not do.
+ * An inconclusive axis still writes: that keeps the eager DAG working (it
+ * invokes the trigger without going through `startAdImageGenerationForUser`,
+ * so it carries no identity at all) along with the plain "never started" case,
+ * and a swallowed real failure is the more costly error — it reproduces this
+ * very ticket.
+ *
+ * Deliberately not a `status === "running"` check: that would silently drop
+ * every legitimate failure on the eager path.
+ *
+ * The ownership decision comes from a read, so the write restates it as a
+ * DynamoDB condition (`axisOwnershipCondition`) — otherwise a run that starts
+ * in the window between the two is still stomped by the very write this guard
+ * exists to prevent.
+ *
+ * Returns true when the failure was written, false when dropped as stale.
+ */
+async function failAdImageRunIfOwned(
+  userId: string,
+  ours: AdImageRunIdentity,
+  reason: string,
+  operation: string,
+  logMessage: string,
+  logContext: Record<string, unknown> = {}
+): Promise<boolean> {
+  const current = await userDb.getUserById(userId);
+  const axis = readAxisIdentity(current);
+  if (axisIsNotOurs(axis, ours)) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale failure — a newer run owns the axis",
+      { userId, reason, ours, axis },
+    );
+    return false;
+  }
+  try {
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any,
+      { condition: axisOwnershipCondition(axis) }
+    );
+  } catch (err) {
+    if (!isConditionalCheckFailure(err)) throw err;
+    // A run started between the read above and this write, so the axis is no
+    // longer ours after all. Same outcome as the stale branch, decided
+    // atomically by DynamoDB instead of by a stale snapshot.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale failure — the axis was restarted mid-write",
+      { userId, reason, ours, axis },
+    );
+    return false;
+  }
+  // eslint-disable-next-line no-console
+  console.error(logMessage, { userId, ...logContext, reason });
+  void reportUIError({
+    operation,
+    errorMessage: reason,
+    userId,
+    context: {
+      Source: "backend",
+      Step: "adImage",
+    },
+  });
+  return true;
+}
+
+/**
  * Fire-and-forget orchestrator. Reads the User record, gates on
  * `creativeDirStatus === 'ready'`, runs the parallel image-generation loop,
  * and patches the User with the result.
@@ -704,36 +904,59 @@ export async function generateAdImagesForUser(
  */
 export async function triggerAdImageGenerationForUser(
   userId: string,
-  deps: { imageGen?: AdImageGeneratorDep; timeoutMs?: number } = {}
+  deps: {
+    imageGen?: AdImageGeneratorDep;
+    timeoutMs?: number;
+    /**
+     * Logo-fetchability preflight (ENG-792). Injected in tests; defaults to a
+     * real one-shot HTTP fetch. Returning false routes the run through the
+     * same actionable "upload your logo" failure path as a missing logo.
+     */
+    verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
+    /**
+     * The identity minted for THIS run by `startAdImageGenerationForUser`.
+     * Passed in hand-to-hand rather than re-read from the User record,
+     * because the record is shared state: if two starts overlap so that both
+     * start patches land before either worker reads, both workers would read
+     * — and adopt — the second run's nonce, and each would then be authorised
+     * to overwrite the other's creatives (Greptile).
+     *
+     * Absent for eager-DAG invocations, which never go through the start
+     * patch; those fall back to whatever the record says, as before.
+     */
+    run?: AdImageRunIdentity;
+  } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
 
   const u = user as any;
+  // Run identity for every terminal write below — see failAdImageRunIfOwned.
+  const ourRun = deps.run ?? readAxisIdentity(u);
+  if (axisIsNotOurs(readAxisIdentity(u), ourRun)) {
+    // A newer run already owns the axis and this one has not generated
+    // anything yet — stop here rather than burn an image-generation cycle
+    // whose every terminal write is destined to be dropped. A no-op when the
+    // identity came from the record, since that compares it against itself.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] abandoning run — a newer run owns the axis",
+      { userId, ours: ourRun, axis: readAxisIdentity(u) },
+    );
+    return;
+  }
   const creativeDirStatus =
     typeof u.creativeDirStatus === "string" ? u.creativeDirStatus : "idle";
   if (creativeDirStatus !== "ready") {
     const reason = `creative direction not ready (status=${creativeDirStatus})`;
-    const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-    );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] gated by creative-dir step", {
-      userId,
+      ourRun,
       reason,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:gated-creative-dir",
-      errorMessage: reason,
-      userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-        creativeDirStatus,
-      },
-    });
+      "onboarding:ad-image:gated-creative-dir",
+      "[onboardingAdImageService] gated by creative-dir step",
+      { creativeDirStatus },
+    );
     return;
   }
 
@@ -763,25 +986,38 @@ export async function triggerAdImageGenerationForUser(
     const reason =
       "no brand logo is saved in Brand Guidelines — upload your logo in brand config, then regenerate. " +
       "Ad images are never generated with an invented or approximate logo (ENG-326).";
-    const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-    );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] gated on missing brand logo", {
-      userId,
+      ourRun,
       reason,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:missing-brand-logo",
-      errorMessage: reason,
+      "onboarding:ad-image:missing-brand-logo",
+      "[onboardingAdImageService] gated on missing brand logo",
+    );
+    return;
+  }
+
+  // ENG-792: a persisted logo URL can be structurally present yet unfetchable
+  // (deleted S3 object, hotlink protection, or a Google favicon-service URL
+  // that 301→404s for a domain with no crawlable favicon). Such a URL makes
+  // generate_image's input-image fetch throw on EVERY variant, so the run
+  // would ship three placeholders while reporting "ready" — the exact
+  // "onboarding creatives fail to generate" symptom. Preflight it once and
+  // treat an unfetchable logo like a missing one (never invent/approximate).
+  const verifyLogoUrl = deps.verifyLogoUrl ?? isBrandLogoFetchable;
+  const logoUsable = await verifyLogoUrl(brand.logoUrl);
+  if (!logoUsable) {
+    const reason =
+      "your saved brand logo could not be loaded — its URL is broken or " +
+      "unreachable (for example a favicon-service link that returns 404). " +
+      "Re-upload your logo in brand config, then regenerate. Ad images are " +
+      "never generated with a broken, invented, or approximate logo (ENG-326).";
+    await failAdImageRunIfOwned(
       userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-      },
-    });
+      ourRun,
+      reason,
+      "onboarding:ad-image:unfetchable-brand-logo",
+      "[onboardingAdImageService] gated on unfetchable brand logo",
+    );
     return;
   }
 
@@ -861,6 +1097,36 @@ export async function triggerAdImageGenerationForUser(
     });
   }
 
+  // ENG-792: every variant came back a placeholder, so the run produced ZERO
+  // usable creatives. Reporting "ready" here is what let the reported account
+  // finish onboarding believing it had three ad images: the cards fell back to
+  // gradients, and because the chat-session mirror below is gated on live
+  // variants, nothing was ever written — /images showed "No images found".
+  // Fail the run instead, so the UI renders the error + Retry it already has
+  // for the missing-/unfetchable-logo gates above.
+  //
+  // Scoped to TOTAL failure on purpose: a partial failure (liveCount >= 1)
+  // still ships as "ready" — degraded but genuinely usable, and blocking
+  // onboarding over one flaky variant would be worse than shipping two.
+  if (liveCount === 0 && variantCount > 0) {
+    const reason =
+      "ad image generation produced no usable images — all " +
+      `${variantCount} variants failed. This is usually a temporary problem ` +
+      "with the image model, or a brand logo that can no longer be loaded. " +
+      "Retry, and if it keeps failing re-upload your logo in brand config.";
+    await failAdImageRunIfOwned(
+      userId,
+      ourRun,
+      reason,
+      "onboarding:ad-image:all-variants-failed",
+      "[onboardingAdImageService] all variants failed",
+      { variantCount, durationMs },
+    );
+    return;
+  }
+
+  // Read only now: the failure path above does its own owning-run read, and
+  // hoisting this above it would cost every failed run a redundant fetch.
   const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
@@ -905,7 +1171,45 @@ export async function triggerAdImageGenerationForUser(
   const finalPatch: any = chatSessionId
     ? { ...patch, adImageChatSessionId: chatSessionId }
     : patch;
-  await userDb.updateUser(userId, finalPatch);
+  try {
+    // `adImageReadyPatch` decided this run may publish from `current`, and the
+    // mirror above can spend seconds on network I/O before we get here — the
+    // widest read-to-write window on the axis. Condition the publish on the
+    // identity we read, so a run started in between keeps its `running` state
+    // instead of being overwritten with this (older) run's results.
+    await userDb.updateUser(userId, finalPatch, {
+      condition: axisOwnershipCondition(readAxisIdentity(current)),
+    });
+  } catch (err) {
+    if (!isConditionalCheckFailure(err)) throw err;
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale completion — the axis was restarted mid-write",
+      { userId, axis: readAxisIdentity(current) },
+    );
+  }
+}
+
+/**
+ * Claim the ad-image axis for a NEW run: mint the run's identity, publish it,
+ * and hand it back so the caller can pass it to the worker it is about to
+ * launch.
+ *
+ * Every entry point that starts a run must go through here. A worker that
+ * instead re-reads its identity from the User record is not identifying
+ * ITSELF — it adopts whichever run the record names at read time, so two
+ * overlapping starts both adopt the later nonce, both pass the conditional
+ * terminal write, and each can overwrite the other's result (Greptile).
+ */
+export async function claimAdImageRun(
+  userId: string,
+): Promise<AdImageRunIdentity> {
+  const startPatch = adImageStartPatch();
+  await userDb.updateUser(userId, startPatch as any);
+  return {
+    runId: startPatch.adImageRunId,
+    startedAt: startPatch.adImageStartedAt,
+  };
 }
 
 /**
@@ -914,9 +1218,15 @@ export async function triggerAdImageGenerationForUser(
  */
 export async function startAdImageGenerationForUser(
   userId: string,
-  deps: { imageGen?: AdImageGeneratorDep; timeoutMs?: number } = {}
+  deps: {
+    imageGen?: AdImageGeneratorDep;
+    timeoutMs?: number;
+    // Forwarded verbatim to the worker below; `run` is not accepted here
+    // because this function is the thing that mints it.
+    verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
+  } = {}
 ): Promise<void> {
-  await userDb.updateUser(userId, adImageStartPatch() as any);
+  const run = await claimAdImageRun(userId);
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -931,5 +1241,5 @@ export async function startAdImageGenerationForUser(
     void reconcileForUser(userId);
     return;
   }
-  void triggerAdImageGenerationForUser(userId, deps);
+  void triggerAdImageGenerationForUser(userId, { ...deps, run });
 }

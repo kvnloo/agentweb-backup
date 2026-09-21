@@ -6,7 +6,7 @@
  *   2. Bedrock errors degrade gracefully — returns { topHypotheses: [proposal.hypothesis], rankedFixes: [], error }.
  *   3. JSON schema mismatch on the LLM response degrades gracefully (same error path).
  *   4. 25-second hard timeout — slow Bedrock returns the same graceful error envelope.
- *   5. Prompt caching cachePoint is set on the system block (stable rule + mutation surface caching).
+ *   5. The call uses the shared gateway with a bounded timeout and attributable task class.
  *   6. The system prompt mentions the mutation surface keys + rule context so the LLM can ground its analysis.
  *   7. claude-sonnet-4-6 is the model used.
  */
@@ -18,6 +18,7 @@ import type { AiEvalProposalPayload } from '../loops/instances/ai-eval-funnel/ru
 // --- Mock Bedrock --------------------------------------------------------
 const mockBedrockSend = jest.fn();
 let lastConverseInput: any = null;
+let lastCallOptions: any = null;
 
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: jest.fn().mockImplementation(() => ({
@@ -27,6 +28,27 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
     lastConverseInput = input;
     return { input };
   }),
+}));
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    callLLM: jest.fn(async (model: string, messages: any[], options: any) => {
+      lastCallOptions = options;
+      lastConverseInput = {
+        modelId: model,
+        system: messages.filter(message => message.role === 'system').map(message => ({ text: message.content })),
+        messages: messages.filter(message => message.role !== 'system').map(message => ({
+          role: message.role,
+          content: [{ text: message.content }],
+        })),
+      };
+      const response = await mockBedrockSend();
+      const content = response?.output?.message?.content
+        ?.map((block: any) => block?.text ?? '')
+        .join('') ?? '';
+      return { choices: [{ message: { content } }], usage: response?.usage };
+    }),
+  },
 }));
 
 // Import AFTER the mock so the module picks up the mocked client.
@@ -78,6 +100,7 @@ describe('enrichWithRCA', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     lastConverseInput = null;
+    lastCallOptions = null;
     process.env.AWS_REGION = 'us-west-2';
     process.env.AWS_ACCESS_KEY_ID = 'test-key';
     process.env.AWS_SECRET_ACCESS_KEY = 'test-secret';
@@ -133,7 +156,7 @@ describe('enrichWithRCA', () => {
     expect(result.rankedFixes[0].title).toMatch(/Scope rule denominator/);
   });
 
-  it('uses claude-sonnet-4-6 via the cross-region inference profile', async () => {
+  it('uses the claude-sonnet-4-6 logical model through the shared gateway', async () => {
     mockBedrockSend.mockResolvedValueOnce(
       bedrockResponseWithJson({
         topHypotheses: ['a', 'b', 'c'],
@@ -148,12 +171,10 @@ describe('enrichWithRCA', () => {
     await enrichWithRCA(makeProposal(), SAMPLE_MUTATION_SURFACE);
 
     expect(lastConverseInput).not.toBeNull();
-    expect(lastConverseInput.modelId).toBe(
-      'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-    );
+    expect(lastConverseInput.modelId).toBe('anthropic.claude-sonnet-4-6');
   });
 
-  it('applies a cachePoint after the system prompt for prompt caching', async () => {
+  it('uses the bounded shared-gateway contract for RCA work', async () => {
     mockBedrockSend.mockResolvedValueOnce(
       bedrockResponseWithJson({
         topHypotheses: ['a', 'b', 'c'],
@@ -168,10 +189,12 @@ describe('enrichWithRCA', () => {
     await enrichWithRCA(makeProposal(), SAMPLE_MUTATION_SURFACE);
 
     expect(lastConverseInput).not.toBeNull();
-    const system = lastConverseInput.system as Array<Record<string, unknown>>;
-    // First block holds the system text, last block is the cachePoint marker.
-    expect(system.length).toBeGreaterThanOrEqual(2);
-    expect(system[system.length - 1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(lastCallOptions).toEqual(expect.objectContaining({
+      max_completion_tokens: 2048,
+      timeoutMs: RCA_TIMEOUT_MS,
+      usageContext: { feature: 'platform:eval_rca' }, // ENG-1858: platform-funded, no userId
+      taskClass: 'nonstandard_consumer',
+    }));
   });
 
   it('puts the rule context + mutation surface in the system prompt (so caching pays off)', async () => {

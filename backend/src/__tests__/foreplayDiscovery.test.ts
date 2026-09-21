@@ -14,6 +14,22 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// ENG-973 put a token-quota gate in front of this router. This suite covers
+// discovery-search behaviour, not the gate, so the meter is stubbed as "under
+// allowance". Gate behaviour itself is covered by emmaApiTokenBudget.test.ts.
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({
+    allowed: true,
+    warning: false,
+    used: 0,
+    allowance: null,
+    bonus: 0,
+    effectiveAllowance: null,
+    percentUsed: 0,
+    month: '2026-08',
+  }),
+}));
+
 const mockSearchForeplayDiscovery = jest.fn();
 const mockSearchForeplayAds = jest.fn();
 jest.mock('../services/agentModeService', () => ({

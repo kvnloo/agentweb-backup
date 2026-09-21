@@ -1,36 +1,50 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { crmDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import {
+  canAccessCrmList,
+  canDestructiveCrmList,
+  CRM_EDITOR_REQUIRED_MESSAGE,
+  CRM_SHARING_DISABLED_MESSAGE,
+} from '../services/crmAccessControl';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
 import { ensureWebhookSubscriptions } from '../utils/hubspotWebhookSubscriptions';
+import { ensureAttioWebhook } from '../utils/attioWebhookSubscription';
 
 const router = express.Router();
 router.use(authenticateToken);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Grants access when the user owns the list OR belongs to the same org as the
-// list owner. Mirrors `canAccessCrmList` in crm.ts so org members share lead
-// lists (and their CRM sync configs) consistently across every CRM surface.
+// Grants access to a list's CRM sync surface. Delegates to the shared ENG-686
+// guards (crmAccessControl.ts) so external-CRM sync/push/pull/delete honours
+// the same owner/org-owner/crm.editors rule as every other CRM write surface.
+// `destructive: false` (read-only endpoints) uses the weaker read guard, which
+// still honours the `crm.enabled` toggle; everything else requires being the
+// list owner, the org owner, or a listed crm.editor.
 async function verifyListOwnership(
   userId: string,
-  listId: string
+  listId: string,
+  opts: { destructive?: boolean } = {}
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { ok: false, status: 404, error: 'Lead list not found' };
 
-  const ownerId = (list as any).userId;
-  if (ownerId === userId) return { ok: true };
+  const destructive = opts.destructive !== false;
+  const allowed = destructive
+    ? await canDestructiveCrmList(userId, list as any)
+    : await canAccessCrmList(userId, list as any);
+  if (!allowed) {
+    return {
+      ok: false,
+      status: 403,
+      error: destructive ? CRM_EDITOR_REQUIRED_MESSAGE : CRM_SHARING_DISABLED_MESSAGE,
+    };
+  }
 
-  const [user, owner] = await Promise.all([
-    userDb.getUserById(userId),
-    userDb.getUserById(ownerId),
-  ]);
-  if (user?.orgId && owner?.orgId && user.orgId === owner.orgId) return { ok: true };
-
-  return { ok: false, status: 403, error: 'Access denied' };
+  return { ok: true };
 }
 
 // ─── Default field mappings ───────────────────────────────────────────────────
@@ -59,7 +73,7 @@ router.get('/custom-fields/:listId', async (req: any, res) => {
     const { listId } = req.params;
     const provider = req.query.provider as string;
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const [keys, defaults] = await Promise.all([
@@ -85,15 +99,30 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const config = await externalCrmSyncService.getConfig(userId, listId, provider);
     if (!config) return res.json({ configured: false });
 
+    // Editor-level check, reused below for both the backfill-write gate and
+    // the webhookUrl visibility gate. This route itself is read-authorized
+    // (any same-org member when crm.enabled, per verifyListOwnership's
+    // destructive:false above) — but webhookUrl embeds the plaintext
+    // webhookSecret, which is the sole auth for this list's public webhook
+    // endpoint. A same-org member with mere read access must not receive a
+    // credential that lets them forge sync-triggering requests into a list
+    // they can't edit.
+    const list = await crmDb.getLeadListById(listId);
+    const canEdit = !!list && (await canDestructiveCrmList(userId, list as any));
+
     // Lazily backfill webhookSecret for configs created before this feature was added.
     // Non-fatal: if the write fails the config is still returned without a webhookUrl.
-    if (!config.webhookSecret) {
+    // Gated on canEdit — the backfill itself is a write, so it must independently
+    // require owner/org-owner/crm.editor, or a plain reader could cause another
+    // member's sync config to be mutated just by viewing it (Greptile P1, ENG-1049
+    // follow-up).
+    if (!config.webhookSecret && canEdit) {
       try {
         await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
       } catch (backfillErr: any) {
@@ -119,6 +148,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping: config.contactFieldMapping,
       dealFieldMapping: config.dealFieldMapping,
       customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
@@ -126,6 +156,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
       lastPushSyncAt: config.lastPushSyncAt,
       lastPullSyncAt: config.lastPullSyncAt,
       lastSyncStatus: config.lastSyncStatus,
@@ -134,8 +165,11 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
       lastSyncErrorCount: config.lastSyncErrorCount,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
-      // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
-      webhookUrl: config.webhookSecret
+      // Webhook URL — secret embedded as query param so HubSpot/Attio can call
+      // it with no custom headers. Only ever returned to an editor (canEdit,
+      // computed above) — a read-only same-org viewer must not receive a
+      // credential that authenticates writes into this list's leads.
+      webhookUrl: (canEdit && config.webhookSecret)
         ? `${backendUrl}/api/crm/${provider}/${listId}/webhook?secret=${config.webhookSecret}`
         : undefined,
     });
@@ -160,9 +194,9 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
 
     const {
       accountId, apiKey, autoSyncEnabled,
-      contactFieldMapping, dealFieldMapping, customFieldMapping,
+      contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
-      externalPipelineId, listName,
+      externalPipelineId, attioDealListId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     } = req.body;
 
@@ -191,9 +225,9 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
 
     const config = await externalCrmSyncService.saveConfig(userId, listId, provider, {
       accountId, apiKey, autoSyncEnabled,
-      contactFieldMapping, dealFieldMapping, customFieldMapping,
+      contactFieldMapping, dealFieldMapping, customFieldMapping, companyFieldMapping,
       deleteOnPush, deleteOnPull, webhookEnabled,
-      externalPipelineId, listName,
+      externalPipelineId, attioDealListId, listName,
       hubspotLifecycleStage, hubspotMarkAsNonMarketing,
     });
 
@@ -207,6 +241,15 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       );
     }
 
+    // Fire-and-forget: register a real-time webhook subscription for this
+    // Attio workspace (per-workspace registration, unlike HubSpot's app-wide
+    // list above). Idempotent — ensureAttioWebhook no-ops if already
+    // registered. Only for OAuth connections; manual token users use
+    // per-list webhooks (crmWebhook.ts) instead.
+    if (provider === 'attio' && (accountId || config.accountId)) {
+      void ensureAttioWebhook(userId, accountId ?? config.accountId!);
+    }
+
     res.json({
       configured: true,
       provider: config.provider,
@@ -216,6 +259,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       contactFieldMapping: config.contactFieldMapping,
       dealFieldMapping: config.dealFieldMapping,
       customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
       deleteOnPush: config.deleteOnPush ?? false,
       deleteOnPull: config.deleteOnPull ?? false,
       webhookEnabled: config.webhookEnabled ?? true,
@@ -223,6 +267,7 @@ router.put('/config/:listId/:provider', async (req: any, res) => {
       hubspotLifecycleStage: config.hubspotLifecycleStage,
       hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
       externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
       // Webhook URL — secret embedded as query param so HubSpot/Attio can call it with no custom headers
@@ -276,8 +321,9 @@ router.delete('/config/:listId/:provider', async (req: any, res) => {
 
 // ─── External property discovery ─────────────────────────────────────────────
 
-// GET /api/crm-sync/external-properties/:listId/:provider?objectType=contact|deal
+// GET /api/crm-sync/external-properties/:listId/:provider?objectType=contact|deal|company
 // Returns CRM properties/attributes for use in the mapping dropdowns.
+// objectType=company is Attio-only (see companyFieldMapping's doc comment).
 router.get('/external-properties/:listId/:provider', async (req: any, res) => {
   try {
     const userId = req.user?.userId;
@@ -288,11 +334,11 @@ router.get('/external-properties/:listId/:provider', async (req: any, res) => {
       return res.status(400).json({ error: 'Unsupported provider. Use hubspot or attio.' });
     }
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { objectType, accountId, apiKey } = req.query as {
-      objectType?: 'contact' | 'deal';
+      objectType?: 'contact' | 'deal' | 'company';
       accountId?: string;
       apiKey?: string;
     };
@@ -348,7 +394,7 @@ router.get('/lifecycle-stages/:listId/:provider', async (req: any, res) => {
       return res.status(400).json({ error: 'Lifecycle stages are only supported for HubSpot.' });
     }
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
@@ -366,7 +412,7 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
@@ -384,17 +430,18 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
 });
 
 // PUT /api/crm-sync/config/:listId/:provider/pipeline
-// Re-points a HubSpot list to a different deal pipeline AFTER the first sync
-// (the normal config save locks the pipeline once synced). The client then
-// triggers a push (POST /push/...) to migrate existing deals into the new pipeline.
+// Re-points a list to a different deal pipeline (HubSpot) or deal list
+// (Attio) AFTER the first sync (the normal config save locks it once
+// synced). The client then triggers a push (POST /push/...) to migrate
+// existing deals into the new pipeline/list.
 router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    if (provider !== 'hubspot') {
-      return res.status(400).json({ error: 'Changing the deal pipeline is only supported for HubSpot.' });
+    if (!['hubspot', 'attio'].includes(provider)) {
+      return res.status(400).json({ error: 'Changing the deal pipeline/list is only supported for HubSpot and Attio.' });
     }
 
     const ownership = await verifyListOwnership(userId, listId);
@@ -406,7 +453,37 @@ router.put('/config/:listId/:provider/pipeline', async (req: any, res) => {
     }
 
     const config = await externalCrmSyncService.changePipeline(userId, listId, provider, externalPipelineId);
-    res.json({ config });
+    // Allowlisted response, not the raw persisted config — same fields as
+    // PUT /config/:listId/:provider. changePipeline() builds its return value
+    // via a full `...config` spread, so returning it verbatim here leaked
+    // apiKeyEncrypted (manual-token configs) and the plaintext webhookSecret
+    // to any same-org CRM editor with destructive access to this list, not
+    // just the config's own creator (CodeRabbit finding).
+    res.json({
+      configured: true,
+      provider: config.provider,
+      accountId: config.accountId,
+      hasManualToken: !!config.apiKeyEncrypted,
+      autoSyncEnabled: config.autoSyncEnabled,
+      contactFieldMapping: config.contactFieldMapping,
+      dealFieldMapping: config.dealFieldMapping,
+      customFieldMapping: config.customFieldMapping,
+      companyFieldMapping: config.companyFieldMapping ?? [],
+      deleteOnPush: config.deleteOnPush ?? false,
+      deleteOnPull: config.deleteOnPull ?? false,
+      webhookEnabled: config.webhookEnabled ?? true,
+      listName: config.listName,
+      hubspotLifecycleStage: config.hubspotLifecycleStage,
+      hubspotMarkAsNonMarketing: config.hubspotMarkAsNonMarketing ?? false,
+      externalPipelineId: config.externalPipelineId,
+      attioDealListId: config.attioDealListId,
+      createdAt: config.createdAt,
+      updatedAt: config.updatedAt,
+      // No webhookUrl here (unlike GET/PUT /config) — the frontend's
+      // handleChangePipeline never reads this response at all, it calls
+      // fetchConfig() separately to refresh state, so including a
+      // secret-bearing URL nobody consumes was pure unnecessary exposure.
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to change pipeline' });
   }
@@ -494,7 +571,7 @@ router.get('/push/:listId/:provider/status', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const job = await externalCrmSyncService.getPushJob(userId, listId, provider);
@@ -515,7 +592,7 @@ router.get('/push/:listId/status', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const running = await externalCrmSyncService.getRunningPushJobForList(userId, listId);

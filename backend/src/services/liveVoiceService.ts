@@ -27,11 +27,13 @@ import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 import { meterUserUsage } from './usageRecorderService';
+import type { LLMUsageContext } from '../utils/llmService';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
   recordOnboardingFailure,
 } from './onboardingTelemetry';
+import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -91,6 +93,7 @@ function stableToolExecutionKey(toolName: string, args: unknown): string {
  * are interpreted by Gemini 3.1 Flash's voice director layer.
  */
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
+When the user is stuck on a product or integration setup step, call search_user_guide with the exact blocked step before asking them for manual input. It searches the canonical docs at docs.agentweb.pro — give the one relevant action and its source link, not a library.
 Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
 Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.
@@ -342,15 +345,25 @@ async function openGeminiSession(
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      // Harsha speaks in long, pause-heavy thoughts. Require sustained speech
-      // before barge-in and a full 1.2s pause before committing the turn.
+      // ENG-525: previously tuned LOW/LOW/1200ms for one heavy dogfooder's
+      // pause-heavy speech, which made ordinary turn-taking and barge-in feel
+      // sluggish next to ChatGPT's voice mode. Tightened to HIGH sensitivity
+      // and a sub-second silence window for snappier turn-taking. 800ms
+      // (rather than a more aggressive ~600ms) is a deliberate hedge: this
+      // tuning hasn't been validated against real speech, and the ORIGINAL
+      // 1200ms value existed specifically to stop Emma cutting off
+      // pause-heavy speakers mid-thought — going too aggressive risks
+      // reintroducing that exact failure mode for a different set of users.
+      // Watch the voiceInterrupted / voiceTurnCompleted / responseLatencyMs
+      // telemetry (onboardingTelemetry.ts) after shipping before tightening
+      // further.
       realtimeInputConfig: {
         automaticActivityDetection: {
           disabled: false,
-          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
           prefixPaddingMs: 200,
-          silenceDurationMs: 1_200,
+          silenceDurationMs: 800,
         },
         activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       },
@@ -771,6 +784,7 @@ async function summarizeToolResult(
   toolResult: Record<string, unknown>,
   seen: Set<string>,
   out: LiveArtifact[],
+  usageContext?: LLMUsageContext,
 ): Promise<string | undefined> {
   const resultJson = JSON.stringify(toolResult).slice(0, 3000);
   const argsJson = JSON.stringify(toolArgs).slice(0, 500);
@@ -798,7 +812,13 @@ Tool result: ${resultJson}`;
       agentModeService.callLLM(
         ARTIFACT_EXTRACT_MODEL,
         [{ role: 'user', content: prompt }],
-        { max_completion_tokens: 600, temperature: 0 },
+        {
+          max_completion_tokens: 600,
+          temperature: 0,
+          taskClass: 'interactive_chat',
+          // ENG-1858: part of the live session user's turn, not "system".
+          usageContext: usageContext ?? { feature: 'live_voice_tool_summary' },
+        },
       ),
       LIVE_TOOL_SUMMARY_TIMEOUT_MS,
       `Live tool summary for ${toolName}`,
@@ -847,6 +867,49 @@ export function closeLiveSession(sessionId: string, socketId?: string): void {
  */
 export function hasLiveSession(sessionId: string): boolean {
   return activeSessions.has(sessionId);
+}
+
+/**
+ * ENG-1189: waits for every in-flight Gemini Live tool execution, across all
+ * active live-voice sessions, to finish — up to the same drain ceiling used
+ * elsewhere in runDrain(). These tool calls (e.g. manage_scheduled_chat) run
+ * agentModeService.executeTool() in-process and self-call back into this
+ * same process via mcpFetch's http://localhost:${PORT}, exactly like the
+ * REST /generate and Emma-chatbot turns already drained — closing the
+ * listener while one is in flight breaks it unrecoverably, not transiently.
+ *
+ * Deliberately checks in-flight TOOL CALLS (toolExecutions' settled flag),
+ * not whether a live-voice SESSION is still open: a session can sit
+ * connected but idle indefinitely (the user just isn't talking), and
+ * draining on session presence would routinely block shutdown for the full
+ * ceiling waiting on a call nobody is actively using.
+ *
+ * Tools in ONBOARDING_LIVE_TOOLS (read-mostly lookups — list_connected_accounts,
+ * search_knowledge_base, etc.) bypass toolExecutions tracking entirely and are
+ * NOT covered here; manage_scheduled_chat and the rest of the general Agent
+ * Mode tool set always go through the tracked path this drains.
+ */
+export async function drainLiveVoiceToolExecutions(
+  ceilingMs: number = DRAIN_CEILING_MS,
+  pollIntervalMs: number = DRAIN_POLL_INTERVAL_MS
+): Promise<{ drained: boolean; stuckCount: number }> {
+  const countInFlight = (): number => {
+    let count = 0;
+    for (const entry of activeSessions.values()) {
+      for (const execution of entry.toolExecutions.values()) {
+        if (!execution.settled) count++;
+      }
+    }
+    return count;
+  };
+
+  const deadline = Date.now() + ceilingMs;
+  let stuckCount = countInFlight();
+  while (stuckCount > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    stuckCount = countInFlight();
+  }
+  return stuckCount > 0 ? { drained: false, stuckCount } : { drained: true, stuckCount: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1145,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
           const resultObj = typeof result === 'object' && result !== null
             ? result as Record<string, unknown>
             : { result: text };
-          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts);
+          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts, {
+            userId: entry.userId,
+            sessionId,
+            feature: 'live_voice_tool_summary',
+          });
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
           entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, result, narrative });

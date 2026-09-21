@@ -1,4 +1,3 @@
-import { google } from 'googleapis';
 import { getAccountById, updateAccountTokens, GmailConfig } from './connectedAccountsDb';
 import { getGmailConfig } from '../config/integrations';
 import { EmailProviderError } from './emailProviderService';
@@ -109,6 +108,8 @@ export class GmailService implements IEmailService {
       throw new GmailTokenRevokedError('No refresh token available. Please reconnect your Gmail account.');
     }
 
+    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    const { google } = await import('googleapis');
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
       gmailConfig.clientId,
@@ -148,6 +149,8 @@ export class GmailService implements IEmailService {
   // ── Gmail client builder ──────────────────────────────────────────────────
 
   private async getGmailClient(userId: string, accountId: string) {
+    // ENG-1277: lazy load — see googleSearchProvider.ts for why.
+    const { google } = await import('googleapis');
     const token = await this.getValidAccessToken(userId, accountId);
     const gmailConfig = await getGmailConfig();
     const oauth2Client = new google.auth.OAuth2(
@@ -184,6 +187,16 @@ export class GmailService implements IEmailService {
   private encodeMimeHeader(value: string): string {
     if (/^[\x00-\x7F]*$/.test(value)) return value; // pure ASCII — no encoding needed
     return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+  }
+
+  /**
+   * Gmail's internalDate — when GOOGLE received the message, in ms since epoch.
+   * Unlike the Date header it is server-stamped, so a sender's wrong or skewed
+   * clock cannot move it. Freshness decisions must use this.
+   */
+  private receivedAtIso(internalDate: unknown): string | undefined {
+    const ms = Number(internalDate);
+    return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : undefined;
   }
 
   private getHeader(headers: Array<{ name?: string | null; value?: string | null }>, name: string): string {
@@ -285,6 +298,7 @@ export class GmailService implements IEmailService {
       from: this.getHeader(headers, 'From'),
       to: this.getHeader(headers, 'To'),
       date: this.getHeader(headers, 'Date'),
+      receivedAt: this.receivedAtIso(detail.data.internalDate),
       snippet: detail.data.snippet || '',
       body,
       hasAttachments: this.hasAttachmentParts(payload),
@@ -409,6 +423,7 @@ export class GmailService implements IEmailService {
         subject: this.getHeader(headers, 'Subject') || '(no subject)',
         from: this.getHeader(headers, 'From'),
         date: this.getHeader(headers, 'Date'),
+        receivedAt: this.receivedAtIso(part.body.internalDate),
         snippet: part.body.snippet || '',
       });
     }
@@ -458,6 +473,7 @@ export class GmailService implements IEmailService {
             from: this.getHeader(headers, 'From'),
             to: this.getHeader(headers, 'To'),
             date: this.getHeader(headers, 'Date'),
+            receivedAt: this.receivedAtIso(data.internalDate),
             snippet: data.snippet || '',
             body: emailBody,
             hasAttachments: this.hasAttachmentParts(payload),

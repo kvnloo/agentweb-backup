@@ -51,6 +51,9 @@ import {
   GOOGLE_CALENDAR_EVENTS_SCOPE,
   GOOGLE_CALENDAR_READONLY_SCOPE,
 } from '../services/connectedAccountsDb';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const CONTEXT = { userId: 'user-1' };
 
@@ -273,6 +276,20 @@ describe('google_calendar_create_event error mapping', () => {
     const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
     expect(res.success).toBe(false);
     expect(res.needs_reconnect).toBe(true);
+  });
+
+  // ENG-1300: the reconnect message text ("write access was denied by Google")
+  // doesn't match any of classifyToolErrorClass's message-based patterns, so
+  // without `status` riding along on the result this fell back to the generic
+  // Error/bug class in tool telemetry.
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    mockGetAccountByPlatform.mockResolvedValue(writeAccount());
+    mockInsert.mockRejectedValue({ response: { status: 403 }, message: 'forbidden' });
+
+    const res = await run({ summary: 's', start: '2026-06-30T10:00:00' });
+    const classified = toolResultError(res);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
   });
 
   it('maps a 400 to a date/time format hint', async () => {

@@ -1,0 +1,19 @@
+{
+  "model": "jev-latest",
+  "answers": {
+    "queue": {
+      "type": "choice",
+      "choice": "account_access",
+      "probabilities": {
+        "account_access": 0.82,
+        "billing": 0.1,
+        "sales": 0.08
+      },
+      "confidence": 0.74
+    }
+  },
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 8
+  }
+}

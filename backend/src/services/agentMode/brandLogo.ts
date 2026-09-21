@@ -72,6 +72,23 @@ export function getPersistedBrandLogoUrl(
 }
 
 /**
+ * The logo as a stored brand ASSET — attachments (or the legacy brandAssets
+ * array), never `brandData.logoUrl`.
+ *
+ * ENG-933: the Brand Guidelines "Logo & Assets" card renders `attachments`
+ * only, so an account whose logo lives solely on `brandData.logoUrl` shows
+ * "No logos uploaded" — the reported symptom. `ensureBrandLogoPersisted` uses
+ * this (not `getPersistedBrandLogoUrl`) to decide whether onboarding actually
+ * finished the job.
+ */
+export function getPersistedBrandLogoAssetUrl(
+  brand: BrandGuidelinesLike | null | undefined,
+): string | null {
+  if (!brand) return null;
+  return firstLogoAssetUrl(brand.attachments) ?? firstLogoAssetUrl(brand.brandAssets);
+}
+
+/**
  * Org-aware brandGuidelines read off an ALREADY-LOADED user record — same
  * resolution as `agentModeService.readBrandGuidelines` (org members read the
  * org record, because that is where updateBrandGuidelines and brand-config
@@ -80,7 +97,7 @@ export function getPersistedBrandLogoUrl(
  */
 export async function resolveBrandGuidelinesForLoadedUser(
   user:
-    | { orgId?: string; brandGuidelines?: BrandGuidelinesLike | null }
+    | { userId?: string; orgId?: string; brandGuidelines?: BrandGuidelinesLike | null }
     | null
     | undefined,
 ): Promise<BrandGuidelinesLike | null> {
@@ -89,7 +106,13 @@ export async function resolveBrandGuidelinesForLoadedUser(
   if (user.orgId) {
     const { orgDb } = await import('../db');
     const org: any = await orgDb.getOrgById(user.orgId);
-    if (org?.brandGuidelines) brand = org.brandGuidelines;
+    if (org) {
+      // Org record first, then the org OWNER's record for an org that was never
+      // populated — otherwise a member of such an org generates creatives with
+      // no logo while the settings page shows one (ENG-927).
+      const { resolveOrgProfileField } = await import('../orgProfileResolver');
+      brand = (await resolveOrgProfileField(user, org, 'brandGuidelines')) ?? null;
+    }
   }
   return brand;
 }
@@ -200,13 +223,145 @@ export type BrandLogoDownloadOutcome =
   | { status: 'download-failed'; detail?: string }
   | { status: 'upload-failed'; detail?: string };
 
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+/** Directory entry of the largest frame in an ICO container, if it parses. */
+function largestIcoFrame(
+  buf: Buffer,
+): { offset: number; size: number; width: number; height: number } | null {
+  // ICONDIR: reserved(0) | type(1 = icon) | count
+  if (buf.length < 6) return null;
+  if (buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1) return null;
+  const count = buf.readUInt16LE(4);
+  if (count < 1 || buf.length < 6 + count * 16) return null;
+  let best: { offset: number; size: number; width: number; height: number } | null =
+    null;
+  for (let i = 0; i < count; i++) {
+    const e = 6 + i * 16;
+    // A dimension byte of 0 means 256 (it doesn't fit in a byte).
+    const width = buf[e] === 0 ? 256 : buf[e];
+    const height = buf[e + 1] === 0 ? 256 : buf[e + 1];
+    const size = buf.readUInt32LE(e + 8);
+    const offset = buf.readUInt32LE(e + 12);
+    if (size <= 0 || offset + size > buf.length) continue;
+    if (!best || width * height > best.width * best.height) {
+      best = { offset, size, width, height };
+    }
+  }
+  return best;
+}
+
+/**
+ * Convert an ICO container to PNG bytes, or null when it isn't an ICO we can
+ * decode. sharp/libvips has no ICO decoder, so the frame is unpacked here:
+ * modern icons embed a whole PNG per frame, older ones a headerless
+ * BITMAPINFOHEADER DIB (bottom-up BGRA/BGR rows).
+ */
+async function icoToPng(buf: Buffer): Promise<Buffer | null> {
+  const frame = largestIcoFrame(buf);
+  if (!frame) return null;
+  const bytes = buf.subarray(frame.offset, frame.offset + frame.size);
+  const sharp = (await import('sharp')).default;
+
+  if (bytes.subarray(0, 4).equals(PNG_MAGIC)) {
+    return sharp(bytes).png().toBuffer();
+  }
+
+  const headerSize = bytes.length >= 40 ? bytes.readUInt32LE(0) : 0;
+  if (headerSize < 40) return null;
+  const width = bytes.readInt32LE(4);
+  // An ICO's DIB height covers the XOR image plus the AND mask, so it is
+  // double the real height.
+  const height = Math.floor(Math.abs(bytes.readInt32LE(8)) / 2);
+  const bitCount = bytes.readUInt16LE(14);
+  const compression = bytes.readUInt32LE(16);
+  if (
+    width !== frame.width ||
+    height !== frame.height ||
+    compression !== 0 ||
+    (bitCount !== 32 && bitCount !== 24)
+  ) {
+    // Palettised or compressed frames need a full BMP decoder — leave them to
+    // the raw-upload fallback rather than guessing at pixels.
+    return null;
+  }
+
+  const stride = (((width * bitCount + 31) / 32) | 0) * 4;
+  const pixels = bytes.subarray(headerSize);
+  if (pixels.length < stride * height) return null;
+  const rgba = Buffer.alloc(width * height * 4);
+  const bytesPerPixel = bitCount / 8;
+  for (let y = 0; y < height; y++) {
+    // DIB rows are stored bottom-up.
+    const row = (height - 1 - y) * stride;
+    for (let x = 0; x < width; x++) {
+      const s = row + x * bytesPerPixel;
+      const d = (y * width + x) * 4;
+      rgba[d] = pixels[s + 2];
+      rgba[d + 1] = pixels[s + 1];
+      rgba[d + 2] = pixels[s];
+      rgba[d + 3] = bitCount === 32 ? pixels[s + 3] : 255;
+    }
+  }
+  return sharp(rgba, { raw: { width, height, channels: 4 } }).png().toBuffer();
+}
+
+/**
+ * ENG-933: normalise a downloaded logo to PNG when the site serves it in a
+ * format brand guidelines and the image models can't consume.
+ *
+ * Websites overwhelmingly embed their logo as an `.ico` (the reported Zetld
+ * case) or an `.svg` — neither is a raster asset the Brand Guidelines "Logo &
+ * Assets" card, the ad-image pipeline, or `generate_image` can use, so the
+ * logo either never got stored or got stored mislabelled. Rasterising here is
+ * the one place every persist path funnels through.
+ *
+ * `png` is null when the bytes are already a usable raster format or the
+ * conversion fails — the caller then uploads them as-is, using the sniffed
+ * `isIco`/`isSvg` classification (which sees the ICO magic bytes a generic or
+ * absent Content-Type hides) to label the upload correctly.
+ */
+async function normalizeLogoToPng(
+  buf: Buffer,
+  contentType: string,
+): Promise<{ png: Buffer | null; isIco: boolean; isSvg: boolean }> {
+  const isIco =
+    contentType.includes('icon') ||
+    contentType.includes('/ico') ||
+    (buf.length >= 4 &&
+      buf[0] === 0 &&
+      buf[1] === 0 &&
+      buf[2] === 1 &&
+      buf[3] === 0);
+  const isSvg = contentType.includes('svg');
+  if (!isIco && !isSvg) return { png: null, isIco, isSvg };
+  try {
+    if (isIco) return { png: await icoToPng(buf), isIco, isSvg };
+    const sharp = (await import('sharp')).default;
+    // SVGs often declare no pixel size; render at a high density so the
+    // rasterised logo is usable rather than a 16px thumbnail.
+    return {
+      png: await sharp(buf, { density: 384 }).png().toBuffer(),
+      isIco,
+      isSvg,
+    };
+  } catch (err: any) {
+    console.warn(
+      `Failed to convert ${isIco ? 'ICO' : 'SVG'} logo to PNG:`,
+      err?.message ?? String(err),
+    );
+    return { png: null, isIco, isSvg };
+  }
+}
+
 /**
  * Download a discovered logo and pin it to S3 under
  * `users/{userId}/brand/logo`. The download + upload mechanics are the block
- * extracted from `agentModeService.extractCSSFromURL` (ENG-326): SVGs are
- * skipped by CONTENT-TYPE (brand guidelines reject them; extensions lie),
- * failures log a warning. Never throws — every branch resolves to a
- * `BrandLogoDownloadOutcome`.
+ * extracted from `agentModeService.extractCSSFromURL` (ENG-326), plus the
+ * ENG-933 PNG normalisation: ICO/SVG logos are rasterised so they can be
+ * stored as a real brand asset, and only an SVG we could NOT rasterise still
+ * reports `svg` (brand guidelines reject raw SVG). Failures log a warning.
+ * Never throws — every branch resolves to a `BrandLogoDownloadOutcome`.
  */
 export async function downloadBrandLogoToS3(
   logoUrl: string,
@@ -225,24 +380,44 @@ export async function downloadBrandLogoToS3(
     console.warn('Failed to download logo:', detail);
     return { status: 'download-failed', detail };
   }
-  const contentType = logoResponse.headers['content-type'] || '';
-  // Skip SVG since brand guidelines doesn't accept it
-  if (contentType.includes('svg')) {
+  let contentType = logoResponse.headers['content-type'] || '';
+  let body = Buffer.from(logoResponse.data as ArrayBuffer);
+  const normalized = await normalizeLogoToPng(body, contentType);
+  if (normalized.png) {
+    console.log(`Converted logo to PNG (was ${contentType || 'unknown type'})`);
+    body = normalized.png;
+    contentType = 'image/png';
+  } else if (normalized.isSvg) {
+    // Un-rasterisable SVG: brand guidelines reject it outright.
     console.log('Skipping SVG logo (not supported by brand guidelines)');
     return { status: 'svg' };
   }
   try {
+    // The sniffed classification, not just Content-Type: a site serving an
+    // undecodable .ico as application/octet-stream (or with no Content-Type at
+    // all) must still be stored as logo.ico, never as logo.jpg holding icon
+    // bytes — that mislabelling is what this fix exists to remove.
+    const isIco =
+      normalized.isIco || contentType.includes('icon') || contentType.includes('/ico');
     const ext = contentType.includes('png')
       ? 'png'
       : contentType.includes('gif')
         ? 'gif'
-        : 'jpg';
+        : contentType.includes('webp')
+          ? 'webp'
+          : isIco
+            ? 'ico'
+            : 'jpg';
+    const uploadContentType =
+      ext === 'ico' && !(contentType.includes('icon') || contentType.includes('/ico'))
+        ? 'image/x-icon'
+        : contentType;
     const filename = `logo.${ext}`;
     const { uploadFileToS3WithPath } = await import('../../utils/s3Utils');
     const uploadResult = await uploadFileToS3WithPath(
-      Buffer.from(logoResponse.data as ArrayBuffer),
+      body,
       filename,
-      contentType,
+      uploadContentType,
       `users/${userId}/brand/logo`,
     );
     if (uploadResult.success && uploadResult.url) {
@@ -257,9 +432,116 @@ export async function downloadBrandLogoToS3(
   }
 }
 
+/**
+ * How usable a persisted logo URL is *right now* (ENG-792).
+ *
+ * Deliberately tri-state rather than boolean, because the two callers need
+ * OPPOSITE failure semantics for an inconclusive probe:
+ *
+ *  - the ad-image preflight fails CLOSED (`'unknown'` blocks the run) — a
+ *    doubtful logo would otherwise burn three Gemini calls and ship
+ *    placeholders;
+ *  - `ensureBrandLogoPersisted` fails OPEN (`'unknown'` keeps the existing
+ *    logo) — a transient blip must never cause us to replace an account's
+ *    real, manually-uploaded logo.
+ *
+ * Only a DEFINITIVE negative is `'broken'`: a 4xx (the resource genuinely
+ * isn't there — e.g. the reported `google.com/s2/favicons` URL that
+ * 301→404s for a domain with no crawlable favicon), or a 2xx whose body is
+ * empty or clearly textual (an HTML/JSON error page is not a logo).
+ * Timeouts, DNS errors and 5xx are `'unknown'` — the URL may be perfectly
+ * fine and merely unreachable this second.
+ */
+export type BrandLogoUsability = 'usable' | 'broken' | 'unknown';
+
+/** Timeout for the one-shot logo usability probe (ENG-792). */
+const LOGO_PROBE_TIMEOUT_MS = 15_000;
+
+export interface BrandLogoProbeDeps {
+  /**
+   * One-shot fetch. Defaults to a real axios GET. May either reject (real
+   * axios rejects non-2xx) or resolve with a non-2xx `status`; both shapes
+   * are classified.
+   */
+  httpGet?: (url: string) => Promise<{
+    status?: number;
+    headers?: Record<string, unknown>;
+    data?: unknown;
+  }>;
+}
+
+/**
+ * Probe a logo URL once and classify whether it currently serves usable
+ * image bytes. Never throws.
+ *
+ * A 2xx with a generic or absent content-type counts as `'usable'`: the
+ * downstream consumer (`imageGeneration.processInputImage` →
+ * `getImageMimeType`) tolerates those by sniffing the URL extension and
+ * defaulting to image/png, so rejecting them here would break logos that
+ * work fine today (e.g. S3 objects with no ContentType metadata).
+ */
+export async function classifyBrandLogoUrl(
+  logoUrl: string,
+  deps: BrandLogoProbeDeps = {},
+): Promise<BrandLogoUsability> {
+  if (typeof logoUrl !== 'string' || logoUrl.trim() === '') return 'broken';
+  const httpGet =
+    deps.httpGet ??
+    (async (url: string) => {
+      const axios = (await import('axios')).default;
+      return axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: LOGO_PROBE_TIMEOUT_MS,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)' },
+      });
+    });
+  try {
+    const resp = await httpGet(logoUrl);
+    const status = resp?.status;
+    if (typeof status === 'number' && (status < 200 || status >= 300)) {
+      // An injected fetcher (or a custom validateStatus) can surface the
+      // non-2xx instead of rejecting. Same classification as the throw path.
+      return status >= 400 && status < 500 ? 'broken' : 'unknown';
+    }
+    const data: any = resp?.data;
+    const byteLength =
+      data == null
+        ? 0
+        : typeof data.byteLength === 'number'
+          ? data.byteLength
+          : typeof data.length === 'number'
+            ? data.length
+            : 0;
+    // A 2xx with no bytes is definitively not a logo.
+    if (byteLength <= 0) return 'broken';
+    const contentType = String(
+      (resp?.headers as any)?.['content-type'] || '',
+    ).toLowerCase();
+    const isTextual =
+      contentType.startsWith('text/') ||
+      contentType.startsWith('application/json');
+    return isTextual ? 'broken' : 'usable';
+  } catch (err: any) {
+    const status = err?.response?.status;
+    // Real axios rejects on non-2xx and carries the response. A 4xx is a
+    // definitive "not there"; everything else (timeout, DNS, 5xx, and any
+    // error with no response attached) is inconclusive.
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      return 'broken';
+    }
+    return 'unknown';
+  }
+}
+
 export interface EnsureBrandLogoDeps {
   /** Org-aware brandGuidelines read. Defaults to the real Dynamo read. */
   resolveBrand?: (userId: string) => Promise<BrandGuidelinesLike | null>;
+  /**
+   * Usability probe for an ALREADY-persisted logo (ENG-792). Defaults to
+   * `classifyBrandLogoUrl`. Only a `'broken'` verdict makes the step fall
+   * through to rediscovery — see the call site.
+   */
+  classifyExisting?: (logoUrl: string) => Promise<BrandLogoUsability>;
   /** Logo discovery. Defaults to the cssExtractor heuristics on the company URL. */
   discoverLogoUrl?: (companyUrl: string) => Promise<string | null>;
   /** Download + S3 pin. Defaults to `downloadBrandLogoToS3`. */
@@ -346,13 +628,54 @@ export async function ensureBrandLogoPersisted(
 ): Promise<EnsureBrandLogoOutcome> {
   try {
     const resolveBrand = deps.resolveBrand ?? resolveBrandGuidelinesForUser;
-    const existing = getPersistedBrandLogoUrl(await resolveBrand(userId));
-    if (existing) {
-      return { persisted: false, logoUrl: existing, reason: 'already-present' };
+    const brand = await resolveBrand(userId);
+    const classifyExisting = deps.classifyExisting ?? classifyBrandLogoUrl;
+    // ENG-792: "already present" used to be a purely STRUCTURAL check — any
+    // non-empty string short-circuited this step. Emma's brand-build session
+    // writes `logoUrl` voluntarily and, when a site renders its logo as inline
+    // SVG (nothing to link to), has been observed substituting a
+    // `google.com/s2/favicons?domain=…` URL that 404s. That junk value counted
+    // as "present", so the deterministic discover-and-pin below never ran and
+    // every downstream ad-image generation failed on the unfetchable logo.
+    //
+    // Verify before trusting it, and fall through to rediscovery only on a
+    // DEFINITIVE negative. `'unknown'` (timeout / DNS / 5xx) keeps the existing
+    // URL: replacing an account's real logo because of a transient blip would
+    // be far worse than leaving a possibly-stale one in place.
+    //
+    // ENG-933: "present" now means a stored brand ASSET. Emma routinely writes
+    // `brandData.logoUrl` and nothing else, which left Brand Guidelines showing
+    // "No logos uploaded" (the card renders `attachments`) even though the step
+    // considered itself done. When only `brandData.logoUrl` exists we pin THAT
+    // URL instead of re-scraping the site — it is the logo Emma already found.
+    const existingAsset = getPersistedBrandLogoAssetUrl(brand);
+    let sourceUrl: string | null = null;
+    if (existingAsset) {
+      const usability = await classifyExisting(existingAsset);
+      if (usability !== 'broken') {
+        return { persisted: false, logoUrl: existingAsset, reason: 'already-present' };
+      }
+      console.warn(
+        '[brandLogo] persisted logo is unfetchable — rediscovering (ENG-792)',
+        { userId, existing: existingAsset },
+      );
+    } else {
+      const brandDataUrl = getPersistedBrandLogoUrl(brand);
+      if (brandDataUrl) {
+        const usability = await classifyExisting(brandDataUrl);
+        if (usability !== 'broken') {
+          sourceUrl = brandDataUrl;
+        } else {
+          console.warn(
+            '[brandLogo] persisted logo is unfetchable — rediscovering (ENG-792)',
+            { userId, existing: brandDataUrl },
+          );
+        }
+      }
     }
 
     const discoverLogoUrl = deps.discoverLogoUrl ?? defaultDiscoverLogoUrl;
-    const discovered = await discoverLogoUrl(companyUrl);
+    const discovered = sourceUrl ?? (await discoverLogoUrl(companyUrl));
     if (!discovered) {
       return { persisted: false, logoUrl: null, reason: 'no-logo-found' };
     }

@@ -22,6 +22,8 @@ const sendEmail = jest.fn();
 jest.mock('../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn(async () => undefined),
   getEmailProvider: jest.fn(() => ({ sendEmail })),
+  // ENG-1300: real impl — pure/deterministic, safe to keep real under this mock.
+  emailProviderErrorStatus: jest.requireActual('../services/emailProviderService').emailProviderErrorStatus,
 }));
 
 jest.mock('../services/settingsService', () => ({
@@ -40,8 +42,17 @@ jest.mock('../services/db', () => ({
     updateLead: jest.fn(async () => undefined),
     addEngagement: jest.fn(async () => undefined),
   },
-  userDb: { getUserById: jest.fn(async () => ({ userId: OWNER })) },
-  orgDb: { getOrgMembers: jest.fn(async () => []) },
+  userDb: {
+    getUserById: jest.fn(async (id: string) => ({ userId: id, orgId: 'org-A' })),
+  },
+  orgDb: {
+    getOrgMembers: jest.fn(async () => []),
+    getOrgById: jest.fn(async () => ({
+      orgId: 'org-A',
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [ACTOR] } },
+    })),
+  },
 }));
 
 const { settingsService } = require('../services/settingsService');

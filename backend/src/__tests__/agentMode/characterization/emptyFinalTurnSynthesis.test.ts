@@ -1,0 +1,217 @@
+/**
+ * ENG-946 — live-loop proof that a scheduled run cannot end on a turn that said
+ * nothing just because an earlier turn narrated something.
+ *
+ * Prod signature (scheduled "X Reply Guy" / "Reply Ideas" runs): the model narrates
+ * one line alongside its tool calls ("I'll scan his roster…"), the run falls back
+ * mid-flight from Bedrock Claude to native Gemini on a transient error, and the
+ * follow-up turn comes back with either NO text at all or nothing but the
+ * `[Previously called ...]` placeholder that the cross-provider history degradation
+ * emits. Both are non-answers, but the loop's `content` accumulator is
+ * replace-on-nonempty, so it still held the stale narration — the empty-synthesis
+ * nudge never fired and the run shipped the narration as if it were the report.
+ *
+ * The placeholder half is now blanked upstream by ENG-1054's `isUnusableSynthesis`
+ * (whose HISTORY_ECHO_PREFIX covers this exact string), so this file keeps it as a
+ * COMPOSED regression: blanked turn -> nudge -> real answer. The plain-empty half is
+ * covered by nothing else, and is what `currentTurnText` exists for.
+ *
+ * Only `callLLM` / leaf `executeTool` are scripted; the real loop drives the real
+ * termination ladder.
+ */
+
+import { AgentModeService } from '../../../services/agentModeService';
+import { buildLLMResponse, installStandardMockDeps } from './harness';
+
+// Standard agentMode mock block (module-hoisted — must live in the test file).
+jest.mock('openai');
+jest.mock('../../../services/settingsService');
+jest.mock('../../../services/db');
+jest.mock('../../../services/chatbotService');
+jest.mock('../../../utils/secretsManager');
+jest.mock('../../../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([]),
+  },
+}));
+jest.mock('../../../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
+  filterFunctionCalls: jest.fn().mockImplementation((tools: any) => tools),
+}));
+
+const NARRATION = "I'll scan his roster and check what he's already engaged with today.";
+const REPORT = 'Top reply targets today:\n1. @chamath — bottoms-up CAC thread\n2. @gregisenberg — distribution thread';
+const DEGRADED_ECHO =
+  '[Previously called twitter_outreach({"action":"search_tweets","query":"from:chamath","max_results":30})]';
+
+describe('ENG-946 — the terminating turn, not the accumulator, decides whether the run answered', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    installStandardMockDeps();
+  });
+
+  async function runScriptedLoop(turns: any[]) {
+    const seen: any[] = [];
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      seen.push(args[1]);
+      return buildLLMResponse(turns[Math.min(call++, turns.length - 1)]);
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
+      const toolName: string = args[1];
+      return JSON.stringify({ success: true, data: `mock:${toolName}` });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      "You are Harsha's X reply guy. Surface and rank today's best reply targets.",
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+    return { result, messagesPerCall: seen, llmCalls: call };
+  }
+
+  it('nudges for a synthesis when the FINAL turn is empty, instead of shipping the stale narration', async () => {
+    const { result, messagesPerCall, llmCalls } = await runScriptedLoop([
+      // 1: narration + tool call — this is the text that used to survive as "the answer"
+      {
+        content: NARRATION,
+        tool_calls: [{ id: 'c1', name: 'you_search_web', arguments: '{"query":"harshmoney123 mentions"}' }],
+      },
+      // 2: the terminating turn comes back with nothing
+      { content: '' },
+      // 3: after the nudge the model produces the real report
+      { content: REPORT },
+    ]);
+
+    expect(llmCalls).toBe(3);
+    expect(result.content).toBe(REPORT);
+    expect(result.content).not.toBe(NARRATION);
+
+    // The nudge really was injected before the third call.
+    const lastRequest = messagesPerCall[2] as any[];
+    expect(
+      lastRequest.some(
+        (m: any) => m?.role === 'user' && typeof m.content === 'string' && m.content.includes('synthesize the information'),
+      ),
+    ).toBe(true);
+  });
+
+  it('treats a turn that is only the degraded cross-provider history placeholder as no answer', async () => {
+    const { result } = await runScriptedLoop([
+      {
+        content: NARRATION,
+        tool_calls: [{ id: 'c1', name: 'you_search_web', arguments: '{"query":"harshmoney123 mentions"}' }],
+      },
+      // The parroted `[Previously called ...]` placeholder — non-empty, but not an answer.
+      { content: DEGRADED_ECHO },
+      { content: REPORT },
+    ]);
+
+    // `toContain`, not `toBe`: a run that recovers after a discarded synthesis also
+    // gets ENG-1054's executed-action ledger appended. What matters here is that the
+    // real report is delivered and the placeholder never reaches the user.
+    expect(result.content).toContain(REPORT);
+    expect(result.content).not.toContain('Previously called');
+  });
+
+  it('keeps the nudge bounded — a second empty turn ends the run rather than looping', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: NARRATION,
+        tool_calls: [{ id: 'c1', name: 'you_search_web', arguments: '{"query":"harshmoney123 mentions"}' }],
+      },
+      { content: '' },
+      { content: '' },
+    ]);
+
+    // One nudge only (MAX_EMPTY_SYNTHESIS_RETRIES = 1), then terminate — this
+    // invariant (bounded, no infinite loop) is unchanged.
+    expect(llmCalls).toBe(3);
+    // ENG-1331 follow-up (CodeRabbit, PR #2620): this used to assert
+    // result.content === NARRATION — that pinned an incidental side effect (the
+    // sticky `content` accumulator still held turn 1's narration), not a real
+    // invariant. The terminating turn produced no text of its own, so shipping
+    // the stale narration as if it answered is exactly the "turn did real work
+    // but the response doesn't reflect it" failure this whole file characterizes.
+    // The fallback below now correctly replaces it with the truthful ledger.
+    // not.toContain (not not.toBe, CodeRabbit): the fallback must REPLACE the
+    // narration, not merely produce a content string that happens not to equal
+    // it verbatim (e.g. narration + ledger concatenated would pass not.toBe but
+    // still leak the stale text).
+    expect(result.content).not.toContain(NARRATION);
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('you_search_web');
+  });
+
+  it('does not disturb a healthy run that answers on its final turn', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: NARRATION,
+        tool_calls: [{ id: 'c1', name: 'you_search_web', arguments: '{"query":"harshmoney123 mentions"}' }],
+      },
+      { content: REPORT },
+    ]);
+
+    expect(llmCalls).toBe(2);
+    expect(result.content).toBe(REPORT);
+  });
+
+  // Production case (found live-testing ENG-1331 on gemini-3.1-pro-preview): a
+  // work-plan run that never narrates ANYTHING, in any iteration — every turn is
+  // tool-only. The 'keeps the nudge bounded' case above still has NARRATION sitting
+  // in the accumulator from turn 1 to fall back on; this scenario has nothing, so it
+  // is the one case the residue guard's own comment (synthesisResidue.ts) says is NOT
+  // its job ("Empty/whitespace content returns FALSE on purpose: that case already
+  // has its own bounded handling in the termination ladder") — except the ladder's
+  // "own bounded handling" was just the one nudge, with no fallback once it's
+  // exhausted. Left unfixed this ships a blank, fully-timestamped assistant message
+  // after real tool calls ran, with zero explanation.
+  it('falls back to the executed-action ledger when EVERY turn is empty, not just the last one', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: '',
+        tool_calls: [{ id: 'c1', name: 'playwright_browser_take_screenshot', arguments: '{}' }],
+      },
+      { content: '' }, // the one nudge retry also comes back empty
+    ]);
+
+    expect(llmCalls).toBe(3);
+    expect(result.content).not.toBe('');
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('playwright_browser_take_screenshot');
+  });
+
+  // CodeRabbit (PR #2620): the fallback above must key off THIS iteration's own
+  // text (turnHadUsableText), not the sticky `content` accumulator. An earlier
+  // iteration that narrated something ("I'll start rendering now") alongside its
+  // tool calls leaves `content` non-empty for the rest of the turn — even after a
+  // LATER iteration performs more tool calls and terminates with genuinely nothing
+  // of its own. Gating on `!content` would see the stale narration as "not empty"
+  // and skip the fallback, shipping that stale text as if it answered the empty
+  // terminating turn instead of the truthful ledger recap.
+  it('falls back to the ledger on a genuinely empty terminating turn even when an earlier turn narrated', async () => {
+    const { result, llmCalls } = await runScriptedLoop([
+      {
+        content: "I'll start rendering now.",
+        tool_calls: [{ id: 'c1', name: 'playwright_browser_take_screenshot', arguments: '{}' }],
+      },
+      { content: '' }, // the terminating iteration has nothing of its own
+      { content: '' }, // the one nudge retry also comes back empty
+    ]);
+
+    expect(llmCalls).toBe(3);
+    // not.toContain (not not.toBe, CodeRabbit): must actually be replaced, not
+    // just fail to be byte-identical to the stale narration.
+    expect(result.content).not.toContain("I'll start rendering now.");
+    expect(result.content).toContain('built directly from the actions I actually ran');
+    expect(result.content).toContain('playwright_browser_take_screenshot');
+  });
+});

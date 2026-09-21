@@ -4,7 +4,12 @@
  * Contract under test:
  *   - HMAC-SHA256 signature (`linear-signature` over the raw payload bytes) is enforced for every
  *     event type when LINEAR_WEBHOOK_SECRET is set
- *   - customer comms fire only on an Issue update that transitions into the configured Done state
+ *   - customer comms fire on ANY Issue update that transitions into the configured Done state —
+ *     customer-reported or not. The pre-flight verification gate (ENG-1268: require a structured
+ *     customer-symptom-check comment before the bridge could fire) is deliberately removed
+ *     (Harsha, 2026-08-25: "i don't give a shit about closure risk anymore its annoying, torch
+ *     it"). A customer-reported bug transitioning to Done behaves exactly like any other issue —
+ *     no comment lookup, no block, no reopen.
  *   - completed-type states that are not Done, already-Done edits, and Issue create events fire no
  *     resolve bridge
  *   - missing LINEAR_DONE_STATE_ID fails loud for Issue updates and never fires customer comms
@@ -48,6 +53,7 @@ function transitionIntoDone(overrides: Record<string, any> = {}): any {
     data: {
       id: 'issue-1',
       title: 'A customer bug',
+      labels: [{ name: 'Bug' }, { name: 'Customer Reported' }],
       state: { id: DONE_STATE_ID, name: 'Done', type: 'completed' },
     },
     updatedFrom: { stateId: MERGED_STATE_ID },
@@ -180,6 +186,41 @@ describe('POST /api/integrations/linear/webhook — Done-only transition gating'
   });
 });
 
+describe('POST /api/integrations/linear/webhook — no customer-verification gate (ENG-1268 removed 2026-08-25)', () => {
+  it('a customer-reported bug transitions straight through, no comment lookup, no block', async () => {
+    // transitionIntoDone()'s default payload already carries Bug + Customer Reported — this is
+    // the exact shape that used to require a structured verification comment before the bridge
+    // would fire. It no longer does.
+    const res = await post(transitionIntoDone());
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledWith('issue-1', 'A customer bug');
+  });
+
+  it('a customer-reported bug with a reporter-ticket comment but no verification record still fires', async () => {
+    // Previously "Fixed in PR #123." alone (or nothing at all) would have blocked this. Now the
+    // resolve bridge doesn't inspect comments for this decision at all.
+    const res = await post(transitionIntoDone());
+    expect(res.body.ok).toBe(true);
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+  });
+
+  it('an explicitly non-customer bug behaves identically to a customer-reported one', async () => {
+    const res = await post(transitionIntoDone({
+      data: {
+        id: 'issue-1',
+        title: 'An internal bug',
+        labels: [{ name: 'Bug' }],
+        state: { id: DONE_STATE_ID, name: 'Done', type: 'completed' },
+      },
+    }));
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('POST /api/integrations/linear/webhook — config guard (AC5)', () => {
   it('missing LINEAR_DONE_STATE_ID fails loud for Issue updates and never fires', async () => {
     delete process.env.LINEAR_DONE_STATE_ID;
@@ -303,5 +344,18 @@ describe('POST /api/integrations/linear/webhook — signature and error handling
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(false);
     expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/integrations/linear/webhook — fail-closed when LINEAR_WEBHOOK_SECRET unset (ENG-1754)', () => {
+  it('returns 503 and never processes the payload, even with a well-formed signature header', async () => {
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await post(transitionIntoDone());
+
+    expect(res.status).toBe(503);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    errSpy.mockRestore();
   });
 });

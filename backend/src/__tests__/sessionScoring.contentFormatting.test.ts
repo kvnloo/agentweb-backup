@@ -1,4 +1,4 @@
-import { scoreSession } from '../services/sessionScoringService';
+import { scoreSession, SCORING_MAX_COMPLETION_TOKENS } from '../services/sessionScoringService';
 import { ChatMessage } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 
@@ -75,7 +75,7 @@ Three key trends to watch:
       ]),
       expect.objectContaining({
         temperature: 0,
-        max_completion_tokens: 2000,
+        max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
         response_format: { type: 'json_object' },
       })
     );

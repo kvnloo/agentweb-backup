@@ -1,25 +1,30 @@
+import { requireActiveEvaluation } from './services/evaluationPolicy';
+import { evaluationSocketDecision } from './utils/socketEvaluationAuth';
+import { installSandboxMetaInterceptorAtBoot } from './services/sandbox/bootstrap';
 import app from './app';
-import { isCronEnabled, disableCron } from './utils/instanceState';
+import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
 import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
 import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
+import { logServiceSecretResolutionAtBoot } from './middleware/serviceAuth';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import { generateChatResponse, chatbotDb } from './services/chatbotService';
-import { checkTokenUsage } from './services/tokenUsageService';
+import { chatbotDb } from './services/chatbotService';
 import { userDb } from './services/db';
 import { registerIo } from './services/sessionSockets';
+import { handleSocketChatMessage } from './services/chatSocketHandler';
 import {
   sendAudioChunk,
   sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
+  drainLiveVoiceToolExecutions,
 } from './services/liveVoiceService';
 import {
   getEffectiveLiveUserId,
@@ -30,12 +35,24 @@ import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
 } from './services/onboardingTelemetry';
+import { createFathomLinearPort } from './services/fathomLinearProductionPort';
+import { registerFathomLinearPort } from './services/fathomLinearPortRegistry';
 
 dotenv.config();
+
+// Production composition root for the Fathom → Linear router. The adapter is
+// inert until a signed recording.ready webhook reaches the router; credentials
+// are resolved lazily through linearService on the first Linear operation.
+registerFathomLinearPort(createFathomLinearPort());
 
 // Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
 // letting tokens be signed/verified with a fallback secret or erroring on first request.
 assertJwtSecretAtBoot();
+
+// Best-effort visibility only (ENG-1754 AC3) — never blocks/delays binding the port.
+logServiceSecretResolutionAtBoot().catch((err) =>
+  console.error('[serviceAuth] boot-time secret resolution check failed:', err)
+);
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
@@ -51,9 +68,23 @@ const io = new Server(server, {
         'http://localhost:5174',
         process.env.FRONTEND_URL || 'http://localhost:5173',
         process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174',
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
       ];
+
+      // Same fail-closed production gate as the HTTP CORS config in app.ts
+      // (ENG-1751): ngrok tunnels are a local-dev convenience and must not be
+      // a credentialed origin in production. `NODE_ENV !== 'production'` was
+      // fail-open (no tracked EB config sets NODE_ENV=production explicitly);
+      // require an explicit NODE_ENV=development or the CORS_ALLOW_NGROK=1
+      // opt-in instead.
+      if (
+        process.env.NODE_ENV === 'development' ||
+        process.env.CORS_ALLOW_NGROK === '1'
+      ) {
+        allowedOrigins.push(
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+        );
+      }
 
       if (!origin) return callback(null, true);
 
@@ -93,10 +124,24 @@ io.use(async (socket, next) => {
     try {
       const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
+        email?: string;
         sv?: number;
+        dte?: number;
         delegateAccess?: unknown;
         _svc?: boolean;
+        isAdmin?: boolean;
       };
+
+      // Sandbox principals stream Emma over this socket like any customer, on the
+      // same policy check as the HTTP layer; the primary record is read by email
+      // because a just-provisioned account may not be in the userId GSI yet.
+      const evaluationDecision = await evaluationSocketDecision(decoded, requireActiveEvaluation,
+        async claims => (typeof claims.email === 'string' ? userDb.getUserByEmailConsistent(claims.email) : null));
+      if (evaluationDecision === 'deny') return next(new Error('Authentication error'));
+      if (evaluationDecision === 'allow') {
+        socket.data.user = decoded;
+        return next();
+      }
 
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are
@@ -253,56 +298,21 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: {
+  //
+  // ENG-1189: this Emma-chatbot turn runs in-process (no fork) and can
+  // dispatch MCP tools (including manage_scheduled_chat) via
+  // agentModeService.executeTool, but — unlike the Agent Mode /generate
+  // family — it was never tracked as in-flight work, so runDrain()'s wait
+  // below wouldn't hold the listener open for it. cronJobRegistry.track() is
+  // a drop-in wrap (untouched resolution/rejection), so this is a pure
+  // addition, not a behavior change.
+  socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => {
-    try {
-      // Get user ID from socket auth
-      const token = socket.handshake.auth.token;
-      if (!token) {
-        throw new Error('No authentication token provided');
-      }
-
-      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
-      const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
-      const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
-
-      // Check token usage limits
-      const usageStatus = await checkTokenUsage(userId);
-      if (!usageStatus.allowed) {
-        socket.emit('error', {
-          message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          code: 'TOKEN_LIMIT_EXCEEDED',
-          tokenUsage: usageStatus,
-        });
-        return;
-      }
-
-      const portalType = data.portal || 'partner';
-      const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
-      const response = await generateChatResponse(
-        data.sessionId,
-        data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
-      );
-
-      // Send response back to the client
-      const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';
-      socket.emit('message', {
-        sessionId: data.sessionId,
-        content: responseContent
-      });
-    } catch (error) {
-      console.error('Error processing message:', error);
-      socket.emit('error', {
-        message: 'Failed to process message'
-      });
-    }
-  });
+  }) => cronJobRegistry.track('chatbotTurn', handleSocketChatMessage(socket, data)));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {
@@ -360,9 +370,22 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// Graceful shutdown handler
-const gracefulShutdown = async (signal: string) => {
-  console.log(`\n${signal} received. Shutting down gracefully...`);
+// Drain every in-flight unit of work, WITHOUT exiting.
+//
+// Split out of gracefulShutdown for ENG-764: the ASG termination guard needs to
+// drain and then still be alive to answer its lifecycle hook (an exit here would
+// strand the instance in Terminating:Wait until the hook timed out). Memoized on
+// the promise, so the SIGTERM that follows an ASG-initiated drain joins the
+// in-progress drain instead of starting a second one.
+let drainPromise: Promise<void> | null = null;
+
+const drainForShutdown = (reason: string): Promise<void> => {
+  drainPromise ??= runDrain(reason);
+  return drainPromise;
+};
+
+const runDrain = async (reason: string): Promise<void> => {
+  console.log(`\n${reason}: draining in-flight work...`);
 
   // Register force-exit FIRST so it's always set, even if an await below hangs.
   // Force-exit buffer = drain ceiling + 3 min.
@@ -385,7 +408,49 @@ const gracefulShutdown = async (signal: string) => {
     // ignore — scheduler may not have started
   }
 
-  // 3. Stop accepting new HTTP connections
+  // 3. Drain the LLM worker (scheduled chats / EMMA runs), every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry), in-flight interactive Agent Mode turns,
+  //    AND in-flight Gemini Live Voice tool calls, concurrently, up to the
+  //    same ceiling, so the total wait is the max of the four rather than
+  //    their sum.
+  //
+  //    This MUST run BEFORE the HTTP listener closes below (ENG-1189): every
+  //    one of these self-calls back into THIS process via mcpFetch's
+  //    http://localhost:${PORT} — the marketing-response worker is a forked
+  //    child process that inherits the same PORT, and an interactive turn's
+  //    (or a live-voice tool call's) tool calls run right here. Closing the
+  //    listener first (as this used to do) meant any of that in-flight
+  //    work's self-calls failed with an unrecoverable "fetch failed" for the
+  //    rest of the process's life — not a transient blip, since
+  //    server.close() refuses every new loopback connection a retry would
+  //    need, no matter how long the retry waits.
+  const { drainActiveSessionGenerations } = await import('./controllers/agentModeController');
+  const [, cronDrain, sessionDrain, liveVoiceDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+    drainActiveSessionGenerations(),
+    drainLiveVoiceToolExecutions(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
+  if (!sessionDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Interactive session drain ceiling reached — ${sessionDrain.stuckCount} turn(s) still in-flight`
+    );
+  }
+  if (!liveVoiceDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Live voice tool-call drain ceiling reached — ${liveVoiceDrain.stuckCount} call(s) still in-flight`
+    );
+  }
+
+  // 4. Stop accepting new HTTP connections — safe now that in-flight
+  //    self-calls above have had their chance to complete.
   server.close((err) => {
     if (err) {
       console.error('Error closing HTTP server:', err);
@@ -394,7 +459,7 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // 4. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
+  // 5. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
   io.close((err) => {
     if (err) {
       console.error('Error closing Socket.IO:', err);
@@ -403,29 +468,20 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
-  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
-  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
-  //    the total wait is the max of the two rather than their sum.
-  const [, cronDrain] = await Promise.all([
-    generateMarketingResponseWorkerService.shutdown(),
-    cronJobRegistry.drain(),
-  ]);
-  if (!cronDrain.drained) {
-    console.warn(
-      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
-      cronDrain.stuckJobs
-    );
-  }
-
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
 
   // 6.5. Flush OTel spans (ENG-141) — best-effort, never rejects, no-op when
   //      tracing is off. Deploy-killed runs are exactly the traces we need.
   await (await import('./observability/tracing')).flushTelemetry();
+};
 
-  // 7. Clean exit
+// Graceful shutdown handler
+const gracefulShutdown = async (signal: string) => {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+  await drainForShutdown(signal);
+
+  // Clean exit
   process.exit(0);
 };
 
@@ -463,6 +519,17 @@ createTestAccount().then(async () => {
     console.log('Apollo service initialized');
   } catch (err) {
     console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
+  }
+
+  // Initialize Enigma card-revenue lookups (ENG-1388). Defensive like Apollo —
+  // without the Secrets Manager key getEnigmaService() stays null and nothing
+  // calls Enigma.
+  try {
+    const { initEnigmaServiceFromEnv } = await import('./services/enigmaServiceFactory');
+    await initEnigmaServiceFromEnv();
+    console.log('Enigma service initialized');
+  } catch (err) {
+    console.warn('Enigma service not initialized — card-revenue lookups disabled:', (err as Error).message);
   }
 
   // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
@@ -509,6 +576,43 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
+    // ENG-1286: everything below this line either schedules a timer or awaits a
+    // dynamic import, and under Jest both outlive the test that triggered them.
+    // Nothing asks for this — `app.ts` registers `routes/crm.ts`, which imports
+    // `../server`, so merely touching `app` boots the real server. The 30-second
+    // cron bootstrap then fires long after that file's environment is torn down,
+    // resolves every `await import(...)` against a dead module registry, and
+    // throws `TypeError: <fn> is not a function` inside an unrelated suite.
+    // Returning here — rather than guarding each cron — is deliberate: a guard
+    // per job is a list that the next background job will be added without.
+    if (!shouldBootstrapBackgroundJobs()) {
+      console.log('[server] Test runtime — background jobs not started (ENG-1286)');
+      return;
+    }
+
+    // ENG-1908: install the sandbox Meta interceptor once, here, in every real runtime
+    // (dev/staging/prod) but never under the Jest test-boot path above — same reasoning as
+    // the ENG-1286 guard: metaInterceptor.test.ts manages its own install/uninstall lifecycle
+    // against the same module-level singleton, and this call is synchronous with no timer or
+    // dynamic import, so it carries none of the risk that guard exists for; it just needs to
+    // stay on this side of the same line so it doesn't fire during an incidental test boot.
+    try {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[server] Sandbox Meta interceptor installed');
+    } catch (error) {
+      console.error('[server] Failed to install sandbox Meta interceptor:', (error as Error).message);
+    }
+
+    // ENG-764: an EB deploy terminates this instance without waiting for the
+    // drain, killing any in-flight scheduled run. Watch for the ASG's termination
+    // signal, drain first, then release the instance. Self-disables off-ASG (local
+    // dev, the test box) where the IMDS lifecycle path 404s.
+    import('./services/asgLifecycleGuard')
+      .then(({ startAsgTerminationGuard }) =>
+        startAsgTerminationGuard(() => drainForShutdown('ASG termination'))
+      )
+      .catch((error) => console.error('Failed to start the ASG termination guard:', error));
+
     // Self-heal the telemetry/loop tables if missing — fire-and-forget, non-fatal.
     // Prevents the silent-no-op class of bug where a writer swallows
     // ResourceNotFound and a whole loop subsystem runs against a table that
@@ -527,7 +631,18 @@ createTestAccount().then(async () => {
     console.log('Initializing Agent Mode Tools (non-blocking)...');
     agentModeService.initialize()
       .then(() => {
-        console.log('Agent Mode Tools initialized successfully');
+        // initialize() resolves even when a step failed — every step swallows its own
+        // errors — so this must report the actual outcome. Logging unconditional success
+        // directly beneath the latch's own failure line is how a degraded boot reads as a
+        // healthy one, which cost real debugging time on ENG-1852.
+        if (agentModeService.isInitialized) {
+          console.log('Agent Mode Tools initialized successfully');
+        } else {
+          console.error(
+            'Agent Mode Tools initialization DEGRADED — a later request will retry. ' +
+            'See the AgentMode latch error above for which step failed.',
+          );
+        }
         // Pre-start the worker process so MCP servers are ready before the first chat message
         console.log('Pre-starting worker process...');
         generateMarketingResponseWorkerService.ensureWorkerReady()
@@ -603,6 +718,93 @@ createTestAccount().then(async () => {
         console.error('[ActivationCron] Failed to initialize:', error);
       }
 
+      // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
+      // Three landing pages sat unreachable while every record read healthy, one of them
+      // unreported for months, because nothing ever asked whether the site loads.
+      try {
+        const { runDomainReachabilitySweep, REACHABILITY_INTERVAL_MS } =
+          await import('./cron/domainReachabilityCron');
+
+        /*
+         * DAILY at a fixed UTC time, not hourly-from-boot.
+         *
+         * Hourly meant we made an unsolicited HTTPS request to every customer's domain 24
+         * times a day. That is traffic they did not ask for, against their origin, and a WAF
+         * or bot-protection layer is entitled to start refusing it — at which point we would
+         * confidently report a working site as unreachable. Daily is enough: these are static
+         * landing pages, and the failure this watches for (a certificate that can never be
+         * issued) does not come and go.
+         *
+         * Fixed clock time rather than boot+offset, matching every other cron here. Under
+         * boot-relative scheduling the schedule reshuffles on every deploy, so "hourly" really
+         * meant "whenever this instance happened to start, then every hour after that" — which
+         * is neither predictable nor reproducible when reading the timestamps back.
+         */
+        const nowForReach = new Date();
+        const nextReachRun = new Date(nowForReach);
+        nextReachRun.setUTCHours(6, 15, 0, 0);
+        if (nextReachRun <= nowForReach) {
+          nextReachRun.setUTCDate(nextReachRun.getUTCDate() + 1);
+        }
+        const msUntilReach = nextReachRun.getTime() - nowForReach.getTime();
+
+        console.log(
+          `[DomainReachability] Initialized — first sweep at 06:15 UTC (in ${Math.round(msUntilReach / 60000)} min), then daily`,
+        );
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+            .catch(e => console.error('[DomainReachability] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+              .catch(e => console.error('[DomainReachability] Error:', e));
+          }, REACHABILITY_INTERVAL_MS);
+        }, msUntilReach);
+      } catch (error) {
+        console.error('[DomainReachability] Failed to initialize:', error);
+      }
+
+
+      // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
+      const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
+      setInterval(() => {
+        if (!isCronEnabled()) return;
+        cronJobRegistry.track('AdsLearningEvaluation', runAdsLearningEvaluation())
+          .catch(e => console.error('[AdsLearning] due evaluation failed:', e));
+      }, 15 * 60 * 1000).unref();
+      console.info('[AdsLearning] evaluation scheduled every 15 minutes');
+
+      // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
+      // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
+      // final refresh occurs after reporting-day end plus 28 elapsed days.
+      try {
+        const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
+
+        const nowForMetricsCron = new Date();
+        const nextMetricsRunUTC = new Date(nowForMetricsCron);
+        nextMetricsRunUTC.setUTCHours(9, 0, 0, 0);
+        if (nextMetricsRunUTC <= nowForMetricsCron) {
+          nextMetricsRunUTC.setUTCDate(nextMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextMetricsRun = nextMetricsRunUTC.getTime() - nowForMetricsCron.getTime();
+
+        console.log(`[MetaMetricsSnapshotCron] Initialized — first run at 09:00 UTC (in ${Math.round(msUntilNextMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+            .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+              .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          }, METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextMetricsRun);
+      } catch (error) {
+        console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
+      }
+
 
       // Drip Sequence Worker — runs every 5 minutes
       try {
@@ -618,6 +820,33 @@ createTestAccount().then(async () => {
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
         console.error('[dripWorker] Failed to initialize:', error);
+      }
+
+      // Async job queue poller (ENG-524 fast-follow) — crash-safety net for any
+      // webhook receiver's fire-and-forget processing (Calendly, HubSpot). Enqueueing
+      // fails open, so this poller finding nothing to do (table not provisioned yet,
+      // or simply empty) is completely normal, not an error.
+      try {
+        const { pollAndProcessOnce } = await import('./services/asyncJobQueue');
+        // Verify the binding BEFORE scheduling the timer. The import is captured
+        // once, and calling an undefined binding throws SYNCHRONOUSLY inside the
+        // interval callback — past this try/catch and past the `.catch()` below,
+        // which only sees rejected promises. That error then surfaces 30s later
+        // against whichever unrelated suite happens to be running, which is how
+        // `settings.replaySessions` and `securityHeaders` failed on a PR that
+        // touches neither. Failing here instead keeps it to one init-time log.
+        if (typeof pollAndProcessOnce !== 'function') {
+          throw new Error('asyncJobQueue.pollAndProcessOnce is unavailable — poller not started');
+        }
+        const QUEUE_POLL_INTERVAL_MS = 30 * 1000;
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('AsyncJobQueuePoller', pollAndProcessOnce())
+            .catch(e => console.error('[AsyncJobQueuePoller] Error:', e));
+        }, QUEUE_POLL_INTERVAL_MS);
+        console.log('[AsyncJobQueuePoller] Initialized — polling every 30 seconds');
+      } catch (error) {
+        console.error('[AsyncJobQueuePoller] Failed to initialize:', error);
       }
 
       // ENG-324: Scheduled-run reconciler — crash-safe backstop for the drain.
@@ -702,6 +931,118 @@ createTestAccount().then(async () => {
         console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
       } catch (error) {
         console.error('[metaTokenRefreshCron] Failed to initialize:', error);
+      }
+
+      // Meta Tracking Integrity Monitor (ENG-926 §F) — runs daily.
+      // Watches every connected Meta ad account for an account that is spending while
+      // Meta attributes it no conversions at all, and for stored credentials Meta has
+      // stopped accepting. Both failures are SILENT by nature — nothing errors, leads
+      // simply stop arriving — so only a clock can notice them. RankAI's tracking was
+      // reported fixed three times without an end-to-end check and nobody caught it.
+      // Anchored to 09:00 UTC rather than a 24h interval, and with NO run on boot.
+      //
+      // A 24h setInterval never elapses here: PRs merge every 1-2 hours, each merge
+      // restarts the process, and the interval resets — so an interval-based daily cron is
+      // really "runs on every boot". This one did exactly that, re-alerting on every
+      // deploy because its in-memory dedupe reset too (observed 2026-08-16: three sweeps
+      // in eleven hours). Anchoring to a wall-clock hour makes restarts free — every boot
+      // re-arms the SAME target, so it fires once a day however often we deploy.
+      // Same shape as the activation cron above; the arithmetic lives in dailySchedule.
+      try {
+        const { runMetaTrackingMonitor } = await import('./cron/metaTrackingMonitorCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const TRACKING_MONITOR_HOUR_UTC = 9;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstRun = msUntilNextUtcHour(TRACKING_MONITOR_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
+            .catch(e => console.error('[metaTrackingMonitorCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
+              .catch(e => console.error('[metaTrackingMonitorCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstRun);
+        console.log(
+          `[metaTrackingMonitorCron] Initialized — first run at ${TRACKING_MONITOR_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
+      }
+
+      // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
+      // Charging a customer while their ad platform connection is silently dead
+      // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
+      // manually). Flags active-subscription users renewing within the lookahead
+      // window whose ad integration is missing/expired via a deduped oncall alert.
+      try {
+        const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
+        const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+          .catch(e => console.error('[renewalIntegrationHealthCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+            .catch(e => console.error('[renewalIntegrationHealthCron] Error:', e));
+        }, RENEWAL_HEALTH_INTERVAL_MS);
+        console.log('[renewalIntegrationHealthCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
+      // Ray's manual campaign-monitoring routine included clicking "renew"
+      // (the enrich-v3 engine) on managed-campaign lead lists by hand a
+      // couple of times. With Ray leaving, this keeps it happening without
+      // a human clicking anything — but ONLY for a list whose saved
+      // enrichmentConfig has explicitly opted in (`autoEnrich: true`, set
+      // via the existing PUT /lists/:listId/enrichment-config). Every
+      // other list's behavior is unchanged; nothing runs until a human
+      // flips that flag for a specific list.
+      try {
+        const { runCrmAutoEnrichmentCheck } = await import('./cron/crmAutoEnrichmentCron');
+        const CRM_AUTO_ENRICHMENT_INTERVAL_MS = 15 * 60 * 1000;
+        // Guard the initial run too, matching the interval callback below —
+        // a disabled-cron environment must not enrich real leads once on
+        // startup just because the guard was only on the recurring path.
+        if (isCronEnabled()) {
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('crmAutoEnrichmentCron', runCrmAutoEnrichmentCheck())
+            .catch(e => console.error('[crmAutoEnrichmentCron] Error:', e));
+        }, CRM_AUTO_ENRICHMENT_INTERVAL_MS);
+        console.log('[crmAutoEnrichmentCron] Initialized — running every 15 minutes (opt-in per list, default off)');
+      } catch (error) {
+        console.error('[crmAutoEnrichmentCron] Failed to initialize:', error);
+      }
+
+      // Skill Review Queue Digest (ENG-932) — runs daily.
+      // "Submit for Review" fires no notification at all (ENG-149 correctly
+      // killed the old per-submission oncall page as noise, but that left the
+      // queue with no reader). This alerts once a skill has sat in
+      // pending_review past the stale window, deduped to at most one message
+      // per day regardless of queue size — submitting a single skill still
+      // pages nobody.
+      try {
+        const { runSkillReviewQueueDigest } = await import('./cron/skillReviewQueueDigestCron');
+        const SKILL_REVIEW_DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        if (isCronEnabled()) {
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error:', e));
+        }, SKILL_REVIEW_DIGEST_INTERVAL_MS);
+        console.log('[skillReviewQueueDigestCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
       }
 
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15

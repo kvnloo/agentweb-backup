@@ -40,6 +40,11 @@ jest.mock('../middleware/auth', () => ({
 // in-memory map so /finalize -> /connect works across the request boundary.
 jest.mock('../services/settingsService', () => {
   const store = new Map<string, string>();
+  const conditionalCheckFailed = () => {
+    const err: any = new Error('The conditional request failed');
+    err.code = 'ConditionalCheckFailedException';
+    return err;
+  };
   return {
     settingsService: {
       setSetting: jest.fn(async (name: string, value: string) => { store.set(name, value); }),
@@ -48,6 +53,17 @@ jest.mock('../services/settingsService', () => {
         return settingValue ? { settingName: name, settingValue } : null;
       }),
       deleteSetting: jest.fn(async (name: string) => { store.delete(name); }),
+      // Conditional (compare-and-swap) primitives the store's one-time-use consume path
+      // uses (ENG-965) — real DynamoDB semantics: the write only applies if the row's
+      // current raw value still equals what the caller read.
+      setSettingIfValueMatches: jest.fn(async (name: string, value: string, expectedValue: string) => {
+        if (store.get(name) !== expectedValue) throw conditionalCheckFailed();
+        store.set(name, value);
+      }),
+      deleteSettingIfValueMatches: jest.fn(async (name: string, expectedValue: string) => {
+        if (store.get(name) !== expectedValue) throw conditionalCheckFailed();
+        store.delete(name);
+      }),
     },
   };
 });
@@ -265,6 +281,37 @@ describe('POST /connect', () => {
   it('rejects an unknown tokenSessionId', async () => {
     const res = await request(app).post('/api/oauth/outlook/connect').send({ tokenSessionId: 'nope' });
     expect(res.status).toBe(401);
+  });
+
+  // ENG-965: a genuine store failure while consuming the one-time-use session must
+  // surface as the route's own deliberate JSON error, not an unhandled rejection /
+  // generic 500 — and must never leak the tokens it failed to safely consume.
+  it('returns a deliberate error (not a generic 500) when the one-time-use delete fails, and never leaks tokens', async () => {
+    const { settingsService } = require('../services/settingsService');
+    // Drain any stray session an earlier /finalize-only test in this file left behind
+    // under the same fixed userId+provider key — otherwise this test's session would land
+    // as a SIBLING (not the last one), taking the setSettingIfValueMatches branch instead
+    // of the deleteSettingIfValueMatches branch this test targets.
+    await settingsService.deleteSetting('oauth_token_session_outlook_user-123');
+
+    const fin = await finalize();
+    const { tokenSessionId } = fin.body;
+    expect(tokenSessionId).toBeDefined();
+
+    (settingsService.deleteSettingIfValueMatches as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('ProvisionedThroughputExceededException'), {
+        code: 'ProvisionedThroughputExceededException',
+      }),
+    );
+
+    const res = await request(app).post('/api/oauth/outlook/connect').send({ tokenSessionId });
+
+    // Exact status, not a range (CodeRabbit, PR #2500 review): a >=400 range also passes
+    // for 401, which is the "invalid/expired session" response — a regression that
+    // misclassified this as an ordinary invalid session would slip through a range check.
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBeDefined();
+    expect(JSON.stringify(res.body)).not.toMatch(/refresh-1|access-1/);
   });
 
   it('persists the account, with the refresh token and BOTH scope fields', async () => {

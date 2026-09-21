@@ -21,9 +21,13 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 
 const mockSendAsSender = jest.fn();
-jest.mock('../services/sendAsSender', () => ({
-  sendAsSender: (...args: any[]) => mockSendAsSender(...args),
-}));
+jest.mock('../services/sendAsSender', () => {
+  const actual = jest.requireActual('../services/senderUsageTracker');
+  return {
+    sendAsSender: (...args: any[]) => mockSendAsSender(...args),
+    SenderDailyLimitExceededError: actual.SenderDailyLimitExceededError,
+  };
+});
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {

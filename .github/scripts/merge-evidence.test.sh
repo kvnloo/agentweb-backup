@@ -11,7 +11,7 @@
 # repo on 2026-07-31:
 #   - the draft-run fixture is agentweb#2231 at 4b933aee (six of seven jobs
 #     `skipped`, `Detect changed projects` the only one that ran)
-#   - the healthy fixture is agentweb#2235 at 573238f1 (`Require Greptile
+#   - the healthy fixture is agentweb#2235 at 573238f1 (`Detect changed
 #     Review` success, `CI script tests` skipped by path filter)
 #
 # The final case is a regression proof: it runs the *previous* procedure
@@ -83,6 +83,32 @@ if [ "$sub" = "api" ]; then
     *actions/runs*)
       emit_file workflowruns.json workflowruns_exit '{"total_count":0,"workflow_runs":[]}'
       ;;
+    *pulls/*/files*)
+      # ENG-915: the diff decides whether the backend suite was required here.
+      # `--jq '.[].filename'` is applied by real gh, so the mock emits the
+      # already-projected filename list the script consumes.
+      #
+      # The default is deliberately a NON-backend path. Every case written
+      # before ENG-915 asserts on the draft/path-filter/supersession logic and
+      # says nothing about the backend suite; defaulting to a backend file
+      # would silently add "and the backend jobs must be green" to all of them,
+      # so those fixtures would start failing for a reason they do not test.
+      # Cases that mean to exercise the new rule set files.txt explicitly.
+      emit_file files.txt files_exit 'partner-portal/src/App.tsx'
+      ;;
+    *compare/*)
+      # ENG-1003: what the base branch gained since this PR diverged. Emitted
+      # as raw JSON, not a projected list, because the gate reads two things
+      # from it — the file list AND `ahead_by` — and a single `--jq` could only
+      # project one of them.
+      #
+      # The default is an EMPTY file list, which the gate reads as "the base
+      # moved but changed nothing this PR touches". Cases that mean to exercise
+      # the overlap rule set compare.json explicitly. This default is only ever
+      # consulted when mergeStateStatus is BEHIND, and every fixture written
+      # before ENG-1003 is CLEAN, so it cannot alter their verdicts.
+      emit_file compare.json compare_exit '{"ahead_by":0,"files":[]}'
+      ;;
     *)
       emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
       ;;
@@ -106,13 +132,28 @@ new_fixture_dir() {
   mktemp -d "${WORKDIR}/fixture.XXXXXX"
 }
 
-# pr_view <dir> <mergeable> [isDraft] [state] [headSha]
+# pr_view <dir> <mergeable> [isDraft] [state] [headSha] [mergeStateStatus] [baseRefName]
+#
+# The two trailing parameters are ENG-1003's and default to today's behaviour
+# (CLEAN against main), so every fixture written before it keeps its verdict.
 pr_view() {
   local dir="$1" mergeable="$2" draft="${3:-false}" state="${4:-OPEN}" sha="${5:-${HEAD}}"
+  local merge_state="${6:-CLEAN}" base_ref="${7:-main}"
   cat >"${dir}/pr_view.json" <<EOF
 {"number":2231,"state":"${state}","isDraft":${draft},"mergeable":"${mergeable}",
- "mergeStateStatus":"CLEAN","headRefOid":"${sha}"}
+ "mergeStateStatus":"${merge_state}","headRefOid":"${sha}","baseRefName":"${base_ref}"}
 EOF
+}
+
+# base_compare <dir> <ahead_by> <newline-separated paths the base gained>
+# The `repos/{repo}/compare/{head}...{base}` body: `.files` is the diff from the
+# merge base to the base branch head, i.e. exactly what landed on main while
+# this PR was open (ENG-1003).
+base_compare() {
+  local dir="$1" ahead="$2" files="$3" json
+  json="$(printf '%s\n' "${files}" | jq -R '{filename: .}' | jq -s \
+    --argjson ahead "${ahead}" '{ahead_by: $ahead, files: [.[] | select(.filename != "")]}')"
+  printf '%s\n' "${json}" >"${dir}/compare.json"
 }
 
 # checkruns <dir> <json array of {name,status,conclusion}>
@@ -120,6 +161,15 @@ checkruns() {
   local dir="$1" runs="$2" total
   total="$(printf '%s' "${runs}" | jq 'length')"
   printf '{"total_count":%s,"check_runs":%s}\n' "${total}" "${runs}" >"${dir}/checkruns.json"
+}
+
+# changed_files <dir> <newline-separated paths>
+# The projection real `gh api --jq '.[].filename'` would emit for
+# `pulls/{n}/files`. ENG-915 reads it to decide whether the backend suite was
+# required at this head.
+changed_files() {
+  local dir="$1" files="$2"
+  printf '%s\n' "${files}" >"${dir}/files.txt"
 }
 
 # workflowruns <dir> <json array of {id,workflow_id,run_number,conclusion,check_suite_id}>
@@ -133,24 +183,24 @@ workflowruns() {
 # The real agentweb#2231 draft run: everything draft-gated skipped, the two
 # path-gated jobs skipped too, only Detect changed projects executed.
 DRAFT_RUN_RUNS='[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"skipped"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"skipped"},
   {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
   {"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"skipped"},
   {"name":"CI script tests","status":"completed","conclusion":"skipped"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
   {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 
 # The real agentweb#2235 ready run, with the in-progress jobs landed green.
 HEALTHY_RUNS='[
   {"name":"CI script tests","status":"completed","conclusion":"skipped"},
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
   {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
-  {"name":"Greptile Review","status":"completed","conclusion":"success"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"CodeRabbit","status":"completed","conclusion":"success"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 
 # ---------------------------------------------------------------------------
@@ -166,6 +216,7 @@ run_gate() {
     REPO='AgentWebPro/agentweb' \
     PR_NUMBER='2231' \
     GH_TOKEN='mock' \
+    MERGE_EVIDENCE_BACKEND_JOBS=$'Backend tests (agentMode)\nBackend tests (all other + coverage)' \
     bash "${GATE_SCRIPT}" 2>&1)"
   LAST_EXIT=$?
 }
@@ -179,7 +230,9 @@ check() {
       "${desc}" "${expected_exit}" "${LAST_EXIT}" "${LAST_OUTPUT}"
     return
   fi
-  if [ -n "${expected_substr}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${expected_substr}"; then
+  # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+  # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+  if [ -n "${expected_substr}" ] && ! grep -qF "${expected_substr}" <<<"${LAST_OUTPUT}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf 'FAIL  %s\n      expected output to contain: %s\n      output: %s\n' \
       "${desc}" "${expected_substr}" "${LAST_OUTPUT}"
@@ -231,7 +284,7 @@ d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${DRAFT_RUN_RUNS}"
 run_gate "${d}"
-check 'AC3: the reason names the draft-gated discriminator' 3 'Require Greptile Review'
+check 'AC3: the reason names the draft-gated discriminator' 3 'Detect changed projects'
 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' 'true'
@@ -247,9 +300,9 @@ check 'AC3: an actually-draft PR is NO_EVIDENCE' 3 'draft'
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"skipped"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"skipped"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
-  {"name":"Detect changed projects","status":"in_progress","conclusion":null}
+  {"name":"EB resource/instance config conflict","status":"in_progress","conclusion":null}
 ]'
 run_gate "${d}"
 check 'ready-flip window: a real run executing makes it PENDING, not NO_EVIDENCE' 2 'PENDING'
@@ -263,7 +316,7 @@ check 'ready-flip window: with nothing executing it is still NO_EVIDENCE' 3 'NO_
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Detect changed projects","status":"in_progress","conclusion":null}
+  {"name":"EB resource/instance config conflict","status":"in_progress","conclusion":null}
 ]'
 run_gate "${d}"
 check 'discriminator absent but a run executing is PENDING, not NO_EVIDENCE' 2 'PENDING'
@@ -289,8 +342,8 @@ check 'AC4: a real green run prints PASS, a distinct verdict token' 0 'VERDICT: 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
-  {"name":"Greptile Review","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"CodeRabbit","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'AC4: discriminator job absent is NO_EVIDENCE (fails closed on rename)' 3 'NO_EVIDENCE'
@@ -340,9 +393,9 @@ check 'AC2: after — conflict resolved and a real run landed, no intervention' 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Backend tests (agentMode)","status":"in_progress","conclusion":null},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'a run still in flight is PENDING' 2 'PENDING'
@@ -350,22 +403,188 @@ check 'a run still in flight is PENDING' 2 'PENDING'
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'a genuinely failing check is FAIL' 1 'VERDICT: FAIL'
 
+# ---------------------------------------------------------------------------
+# ENG-1381 — a cancellation is an ABSENT verdict, not a negative one
+# ---------------------------------------------------------------------------
+#
+# This block replaces a test that asserted `a cancelled check is FAIL, not a
+# pass`. That assertion was the defect, not the guarantee: `Backend deploy to
+# staging` sits in a single GLOBAL concurrency lane where a newer waiting
+# request evicts the older, so 37% of its executions were cancelled over the
+# 20h sampled — and every one of those PRs got FAIL from the gate CLAUDE.md
+# mandates. agentweb#2491 had to be merged by overriding it.
+#
+# What replaces it is not "tolerate cancellations". It is the distinction the
+# script already drew everywhere else: jobs whose evidence is REQUIRED must
+# carry a positive success (asserted below), and a job no evidence was required
+# from cannot block by failing to produce any.
+
+# The real agentweb#2491 payload at head 9c07bb78d3, captured 2026-08-20.
+# Every job green; the staging deploy evicted from its lane. This exact shape
+# forced the override, and is the ENG-1381 AC6 regression.
+PR2491_RUNS='[
+  {"id":96166573894,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"cancelled","check_suite":{"id":87513641148}},
+  {"id":96162760452,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760309,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760196,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162634066,"app":{"id":15368},"name":"Dependabot Integrity Check","status":"completed","conclusion":"skipped","check_suite":{"id":87513634173}},
+  {"id":96162640489,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760245,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162761465,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":87513641148}}
+]'
+
+# AC1 + AC6. #2491 changed .github/workflows/tests.yml, which BACKEND_PATHS
+# counts as a backend change, so this also proves the backend requirement is
+# still evaluated (and satisfied) rather than skipped past.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '9c07bb78d38af550af0f2f3bec78d741d7a3a24a'
+checkruns "${d}" "${PR2491_RUNS}"
+changed_files "${d}" '.github/workflows/tests.yml
+.github/scripts/merge-evidence.sh'
+run_gate "${d}"
+check 'ENG-1381 AC1/AC6: the real #2491 shape (only the evicted deploy cancelled) is PASS' 0 'VERDICT: PASS'
+
+# AC2. Tolerating it silently is how a gate stops working unnoticed, so the
+# cancellation must be NAMED on the pass path. Assert the job name and the
+# non-blocking label together — either alone could pass for the wrong reason.
+run_gate "${d}"
+check 'ENG-1381 AC2: the tolerated cancellation is named in the PASS output' 0 'cancelled, NOT blocking'
+run_gate "${d}"
+check 'ENG-1381 AC2: and names the job itself' 0 'Backend deploy to staging (after tests pass)'
+
+# AC3a. The same conclusion on a job the gate DOES require evidence from is not
+# tolerated — it is the absence of the measurement, which is NO_EVIDENCE (3),
+# not FAIL (1). The remedy differs: re-run, do not debug.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381 AC3: a cancelled BACKEND_JOBS member is NO_EVIDENCE, never a pass' 3 'Backend tests (agentMode) (cancelled)'
+
+# AC3b. The discriminator is the job every other conclusion is read against, so
+# a cancelled one makes the whole payload uninterpretable. Fails closed.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"cancelled"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
-check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
+check 'ENG-1381 AC3: a cancelled draft discriminator is NO_EVIDENCE, never a pass' 3 'was CANCELLED'
+
+# AC4. The tolerance is for cancellations ONLY. A staging deploy that actually
+# RAN and FAILED is a real negative verdict and still hard-fails — ENG-734/743
+# exist to make that failure honest, and this change must not soften it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"failure"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381 AC4: a FAILED staging deploy still blocks (ENG-734/743 intact)' 1 'Backend deploy to staging (after tests pass) (failure)'
+
+# AC4, the other conclusions in `bad`. None of them moved.
+for conc in neutral timed_out action_required stale; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  checkruns "${d}" '[
+    {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+    {"name":"Some optional check","status":"completed","conclusion":"'"${conc}"'"},
+    {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+  ]'
+  run_gate "${d}"
+  check "ENG-1381 AC4: '${conc}' is still a negative verdict and blocks" 1 "VERDICT: FAIL"
+done
+
+# A wholly cancelled run has no success to report, so the positive-execution
+# requirement catches it even though nothing is in `bad` any more.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"cancelled"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a run cancelled after the discriminator cannot pass a backend PR' 3 'VERDICT: NO_EVIDENCE'
+
+# ENG-1381, raised by CodeRabbit on #2523 and confirmed as a real defect before
+# being acted on.
+#
+# Section 7 accepts a required backend job on "did it EVER pass at this head",
+# so a job with a cancelled attempt in one suite and a success in another
+# passes — correctly, because the head SHA is immutable and a green suite at it
+# tested exactly this code. But that job then ALSO appears in the cancelled
+# list, and the first version of the PASS line claimed every name in that list
+# was "outside the evidence set". For this job that is simply false.
+#
+# The verdict was right and only the explanation was wrong, which is exactly
+# the failure this line exists to prevent: AC2 makes the gate trustworthy by
+# saying out loud what it tolerated, and a message that misdescribes what it
+# tolerated is worse than no message at all.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled","check_suite":{"id":10}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":5,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"cancelled","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a required job with a cancelled attempt AND a success still PASSes' 0 'VERDICT: PASS'
+
+# The cancelled ATTEMPT of a required job is reported as separately accounted
+# for — never as something no evidence was required from.
+run_gate "${d}"
+check 'ENG-1381: a required job cancelled-attempt is not called outside the evidence set' 0 'not a tolerated gap: Backend tests (agentMode) (cancelled)'
+
+# ...while a genuinely unrelated cancellation in the SAME payload is still
+# named as outside it. Both lines have to be able to appear at once, which is
+# why this is one fixture rather than two.
+run_gate "${d}"
+check 'ENG-1381: an unrelated cancellation is still named as outside the evidence set' 0 'none was required from these: Backend deploy to staging (after tests pass) (cancelled)'
+
+# Evidence-set membership is EXACT. Written after the first implementation used
+# jq's `inside`, which for strings matches on substring — so a job named
+# "Backend tests" was classified as a member of the set purely because
+# "Backend tests (agentMode)" contains it. Everywhere else in the gate a name
+# is matched exactly so a rename fails closed instead of being absorbed by a
+# partial match; this asserts the cancelled split obeys the same rule.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests","status":"completed","conclusion":"cancelled","check_suite":{"id":20}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a name that is only a SUBSTRING of a required job is outside the set' 0 'none was required from these: Backend tests (cancelled)'
+
+
 
 # A ready flip and a synchronize event can race and schedule two workflow runs
 # for the same head. GitHub's commit check-runs endpoint returns both suites,
@@ -373,10 +592,10 @@ check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
 # the newer run completes successfully. Only the latest check context is live;
 # flattening both suites makes the superseded cancellation poison the verdict.
 SUPERSEDED_CANCELLED_RUN='[
-  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
-  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"success"},
-  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Require Greptile Review","status":"completed","conclusion":"skipped"},
-  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"cancelled"}
+  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"skipped"},
+  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"EB resource/instance config conflict","status":"completed","conclusion":"cancelled"}
 ]'
 
 # The workflow runs that PROVE suite 10 is superseded: same workflow, run 1
@@ -400,36 +619,36 @@ pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
 workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
-check 'the stale skipped discriminator is ignored in favour of the latest suite' 0 'Require Greptile Review'
+check 'the stale skipped discriminator is ignored in favour of the latest suite' 0 'Detect changed projects'
 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
 workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
-check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded check-run(s)'
+check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded and/or retired-allowlisted check-run(s)'
 
 # The inverse guards against a cosmetic dedupe that simply prefers success:
 # the latest suite still owns the context when it is the failing one.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
-  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"failure"},
-  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
-  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"EB resource/instance config conflict","status":"completed","conclusion":"failure"},
+  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'a latest failure still blocks even when a superseded suite passed' 1 'VERDICT: FAIL'
 
-# Greptile's finding on this PR: a `neutral` check sitting beside a success was
+# A review finding on this PR: a `neutral` check sitting beside a success was
 # excluded from every count, so the gate emitted PASS and silently dropped it.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"neutral"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'a neutral check beside a success does NOT pass' 1 'VERDICT: FAIL'
@@ -439,9 +658,9 @@ check 'a neutral check beside a success does NOT pass' 1 'VERDICT: FAIL'
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Some Future Check","status":"completed","conclusion":"quarantined"},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'an unrecognised conclusion beside a success does NOT pass' 1 'does not recognise'
@@ -449,9 +668,9 @@ check 'an unrecognised conclusion beside a success does NOT pass' 1 'does not re
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
-  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Odd Check","status":"completed","conclusion":null},
-  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
 check 'a completed check with a null conclusion does NOT pass' 1 'does not recognise'
@@ -505,18 +724,18 @@ SUPERSEDED_2231='[
   {"id":1,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
   {"id":2,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144461834}},
   {"id":3,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144461834}},
-  {"id":4,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":4,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
   {"id":5,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
   {"id":6,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
   {"id":7,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
   {"id":8,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
   {"id":9,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
   {"id":10,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
-  {"id":11,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":11,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
   {"id":12,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
-  {"id":13,"app":{"id":57789},"name":"Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":83144408061}},
-  {"id":14,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
-  {"id":15,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"cancelled","check_suite":{"id":83144420933}}
+  {"id":13,"app":{"id":57789},"name":"CodeRabbit","status":"completed","conclusion":"success","check_suite":{"id":83144408061}},
+  {"id":14,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":15,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"cancelled","check_suite":{"id":83144420933}}
 ]'
 SUPERSEDED_2231_WFRUNS='[
   {"id":30658029710,"workflow_id":191827888,"run_number":4936,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":83144420933},
@@ -530,14 +749,14 @@ workflowruns "${d}" "${SUPERSEDED_2231_WFRUNS}"
 run_gate "${d}"
 check 'the verbatim agentweb#2231 payload passes, as the PR really was' 0 'VERDICT: PASS'
 
-# Greptile's suite (83144408061) has no workflow run at all, so it can never be
+# The third-party suite (83144408061) has no workflow run at all, so it can never be
 # in the superseded set. Its success must survive the narrowing.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" "${SUPERSEDED_2231}"
 workflowruns "${d}" "${SUPERSEDED_2231_WFRUNS}"
 run_gate "${d}"
-check 'a third-party suite with no workflow run is never treated as superseded' 0 'Greptile Review'
+check 'a third-party suite with no workflow run is never treated as superseded' 0 'CodeRabbit'
 
 # THE FALSE GREEN THIS MECHANISM EXISTS TO PREVENT.
 #
@@ -549,7 +768,7 @@ check 'a third-party suite with no workflow run is never treated as superseded' 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" '[
-  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100}},
   {"id":2,"app":{"id":15368},"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":100}},
   {"id":3,"app":{"id":15368},"name":"test","status":"completed","conclusion":"success","check_suite":{"id":200}}
 ]'
@@ -565,7 +784,7 @@ check 'a live failure sharing a job name with a newer workflow still blocks' 1 '
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" '[
-  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100}},
   {"id":2,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure","check_suite":{"id":100}},
   {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100}}
 ]'
@@ -579,8 +798,8 @@ check 'a re-run within one suite supersedes its earlier failure' 0 'VERDICT: PAS
 # the same head is already green, looking only at check-runs false-passes during
 # that window even though GitHub still has a relevant run queued/in progress.
 COMPLETED_GREEN_RUN='[
-  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
-  {"id":2,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100}}
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":2,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":100}}
 ]'
 
 d="$(new_fixture_dir)"
@@ -629,23 +848,33 @@ pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" "${SUPERSEDED_2231}"
 workflowruns "${d}" '[]'
 run_gate "${d}"
-# Nothing is proven superseded, so the cancelled row survives and blocks. Exit 1
-# rather than 3, but the guarantee that matters holds: never green.
-check 'with no workflow-run data nothing is dropped and the cancelled row blocks' 1 'Detect changed projects (cancelled)'
+# Nothing is proven superseded, so the cancelled row SURVIVES narrowing — which
+# is the property under test, and it is unchanged. ENG-1381 changed only what a
+# surviving cancellation means: it is named on the pass path rather than
+# counted as a failure. The assertion still proves survival, because this name
+# is carried by two rows at this head (id 14 success, id 15 cancelled) and only
+# the cancelled one renders with the conclusion suffix. Were the row wrongly
+# dropped, the suffix would be absent.
+check 'with no workflow-run data nothing is dropped and the cancelled row survives' 0 'EB resource/instance config conflict (cancelled)'
 
 # A cancelled run with no newer run of the same workflow is the only evidence
 # there is, and it is bad evidence. It is not superseded.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" '[
-  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":10}},
-  {"id":2,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"cancelled","check_suite":{"id":10}}
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":10}},
+  {"id":2,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"cancelled","check_suite":{"id":10}}
 ]'
 workflowruns "${d}" '[
   {"id":901,"workflow_id":191827888,"run_number":1,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":10}
 ]'
 run_gate "${d}"
-check 'a lone cancelled run is not superseded and still blocks' 1 'cancelled)'
+# Still not superseded — nothing newer exists — so the row survives to be
+# reported. This fixture is the agentweb#2491 shape in miniature (discriminator
+# green, one evicted job, run conclusion `cancelled`), and 21 of 21 sampled
+# evictions produced exactly it, so it MUST NOT block: treating it as bad is
+# precisely what forced the override.
+check 'a lone cancelled run is not superseded, and is reported rather than dropped' 0 'EB resource/instance config conflict (cancelled)'
 
 # The workflow-run API being unreadable is blindness, not a pass.
 d="$(new_fixture_dir)"
@@ -666,6 +895,108 @@ run_gate "${d}"
 check 'a truncated workflow-run page fails loud, never passes' 4 'truncated'
 
 # ---------------------------------------------------------------------------
+# ENG-1453 — a retired check-run left on GitHub cannot block forever
+# ---------------------------------------------------------------------------
+#
+# ENG-1371 deleted the `Require Greptile Review` job. GitHub's
+# commits/{sha}/check-runs endpoint keeps its last row forever — a new run
+# cannot overwrite a job that no longer exists to schedule one. Live-verified
+# 2026-08-24: agentweb#2417 and #2334 are otherwise green, unchanged PRs that
+# still hard-fail this gate on nothing but that leftover `failure`.
+
+# The real #2417 shape, trimmed: otherwise-healthy run, one retired failure.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an otherwise-green run with only the retired check failing is PASS' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: the ignored retired check is named in the log, not silently dropped' 0 'ignored check-run(s) named on MERGE_EVIDENCE_RETIRED_CHECKS'
+
+# A retired check with a SUCCESS conclusion is ignored too ("any conclusion") —
+# it must not be counted toward the positive-success requirement either, since
+# a leftover success from a deleted job describes nothing about this head.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check "ENG-1453: a retired check's success alone is still NO_EVIDENCE, not a pass" 3 'NO_EVIDENCE'
+
+# The allowlist matches by exact name. A DIFFERENT, still-active failing check
+# must keep blocking — this is not a general "ignore anything Greptile-shaped"
+# rule, and CI-script/backend jobs must never be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: an active, currently-defined check still blocks alongside a retired one' 1 'CI script tests (failure)'
+
+# Exact-name matching, not substring: a job whose name merely CONTAINS the
+# allowlisted string must not be swallowed by it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review (extended)","status":"completed","conclusion":"failure"}
+]'
+run_gate "${d}"
+check 'ENG-1453: a similarly-named but distinct check is NOT swallowed by the allowlist' 1 'Require Greptile Review (extended) (failure)'
+
+# ENG-502: the retired integration still emits pending check-runs on ready PRs.
+for conclusion in pending failure success; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  if [ "${conclusion}" = pending ]; then
+    review='"status":"in_progress","conclusion":null'
+  else
+    review="\"status\":\"completed\",\"conclusion\":\"${conclusion}\""
+  fi
+  checkruns "${d}" '[
+    {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+    {"name":"Greptile Review",'"${review}"'}
+  ]'
+  run_gate "${d}"
+  check "retired Greptile integration ${conclusion} is excluded" 0 'VERDICT: PASS'
+done
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"CI script tests","status":"completed","conclusion":"failure"},
+  {"name":"Greptile Review","status":"in_progress","conclusion":null}
+]'
+run_gate "${d}"
+check 'active failure still blocks beside retired integration' 1 'CI script tests (failure)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[{"name":"Greptile Review","status":"completed","conclusion":"success"}]'
+run_gate "${d}"
+check 'retired integration success is not execution evidence' 3 'NO_EVIDENCE'
+
+# ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
 # ---------------------------------------------------------------------------
 #
@@ -681,7 +1012,7 @@ Backend tests (agentMode)	skipping	0	https://github.com/...
 Backend tests (all other + coverage)	skipping	0	https://github.com/...
 CI script tests	skipping	0	https://github.com/...
 Partner portal tests	skipping	0	https://github.com/...
-Require Greptile Review	skipping	0	https://github.com/...
+Detect changed projects	skipping	0	https://github.com/...
 Detect changed projects	pass	26s	https://github.com/...
 EOF
 printf '0' >"${d}/pr_checks_exit"
@@ -708,32 +1039,550 @@ run_gate "${d2}"
 check 'regression proof: the new gate refuses that same state' 3 'NO_EVIDENCE'
 
 # ---------------------------------------------------------------------------
+# ENG-915 AC4 — a gate may reorder work, it must not reduce evidence
+# ---------------------------------------------------------------------------
+#
+# Gating the backend suite on another job gives its `skipped` a third
+# meaning: "the gate did not pass". Every case below is a state that reads as a
+# clean PASS to the pre-ENG-915 gate, because the discriminator executed and
+# nothing failed. The suite simply never ran.
+
+# The state that makes this urgent rather than theoretical. `re-run failed jobs`
+# appends to the SAME check suite, so re-running only the gate turns it green
+# and leaves the earlier skips beside it — a payload in which every visible
+# signal is success and the tests were never executed at this head.
+GATED_RERUN_RUNS='[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"},
+  {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"}
+]'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GATED_RERUN_RUNS}"
+changed_files "${d}" 'backend/src/services/db.ts'
+run_gate "${d}"
+check 'a backend diff whose suite was gate-skipped is NO_EVIDENCE, not PASS' 3 'Backend tests (agentMode) (skipped)'
+
+# The same payload with a diff the path filter really does exclude. The skip is
+# then legitimate and the verdict must stay PASS — the new rule has to fire on
+# the diff, not on the mere presence of a skipped backend job, or it would
+# block every frontend-only PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GATED_RERUN_RUNS}"
+changed_files "${d}" 'partner-portal/src/App.tsx
+customer-portal/src/main.tsx'
+run_gate "${d}"
+check 'a frontend-only diff still passes with the backend suite skipped' 0 'PASS'
+
+# ENG-743: tests.yml and eb-deploy.sh are classified as backend changes by the
+# workflow's own paths filter, so they carry the same requirement. Mirrored
+# here, because a PR editing this very gate is exactly the one that must not be
+# able to exempt itself from it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GATED_RERUN_RUNS}"
+changed_files "${d}" '.github/workflows/tests.yml'
+run_gate "${d}"
+check 'editing tests.yml counts as a backend change and needs the suite' 3 'NO_EVIDENCE'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GATED_RERUN_RUNS}"
+changed_files "${d}" '.github/scripts/eb-deploy.sh'
+run_gate "${d}"
+check 'editing eb-deploy.sh counts as a backend change and needs the suite' 3 'NO_EVIDENCE'
+
+# The prefixes are anchored at the start of the path. A regex over these
+# strings would match `backend/` anywhere in the path and quietly demand the
+# backend suite of a portal-only PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GATED_RERUN_RUNS}"
+changed_files "${d}" 'partner-portal/src/backend/client.ts'
+run_gate "${d}"
+check 'a nested path merely containing "backend/" is not a backend change' 0 'PASS'
+
+# A backend diff with the suite genuinely green is the case the whole gate
+# exists to let through.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend diff with a green suite passes' 0 'PASS'
+
+# Absent is not the same as skipped, and must not be the same as passed either:
+# a payload that simply never mentions the job is the ENG-757 shape again.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend diff with the suite absent entirely is NO_EVIDENCE' 3 '(ABSENT)'
+
+# A re-run at a head whose suite already went green must not lose that result.
+# Suite 100 ran the tests to success; suite 200 is a re-run whose discriminator
+# came back below 5/5, so the tests skipped. The head is unchanged, so the
+# green in suite 100 tested exactly this code. Reporting NO_EVIDENCE here would
+# be wrong on the facts AND unfixable by the author, since pushing anything to
+# clear it changes the head this evidence belongs to.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":100},"id":1},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100},"id":2},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":3},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":4},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":200},"id":5},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped","check_suite":{"id":200},"id":6},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped","check_suite":{"id":200},"id":7}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a re-run that skipped the suite does not discard an earlier green at the same head' 0 'PASS'
+
+# The safety half of the same rule: "ever passed" must not become "ignore a
+# later failure". A failing re-run is caught by the classification pass long
+# before the backend requirement is consulted, so the earlier success cannot
+# rescue it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":100},"id":1},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100},"id":2},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":3},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":4},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure","check_suite":{"id":200},"id":6}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'an earlier green never masks a later failure at the same head' 1 'FAIL'
+
+# The backend requirement must never be the reason a PR is blocked when some
+# OTHER, accurate reason applies — and it must never fire on a PR the path
+# filter legitimately excluded. Both depend on section 7 staying LAST, after
+# the draft, failure and pending verdicts. That ordering is load-bearing and
+# otherwise undefended: hoisting section 7 above the pending check would block
+# every backend PR while its suite is still running, and nothing else here
+# would notice. These cases pin the ordering by its observable effect.
+
+# Draft: the draft verdict, not the backend block. The discriminator is skipped on a
+# draft, which is exactly the "a check was skipped, is that a problem?" shape.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' 'true'
+checkruns "${d}" "${DRAFT_RUN_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a draft backend PR reports DRAFT, not the backend-suite block' 3 'is a draft'
+
+# Discriminator failed: the failure is the reason, and it is named. Reporting
+# NO_EVIDENCE here would send the reader looking for a missing run when the
+# actual problem is a review that said no.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"failure"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a failed-discriminator backend PR reports FAIL, not the backend-suite block' 1 'FAIL'
+
+# Mid-suite: PENDING. This is the one that would bite hardest if the ordering
+# regressed, because it is the normal state of every backend PR for ~15 min.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"in_progress","conclusion":null},
+  {"name":"Backend tests (all other + coverage)","status":"in_progress","conclusion":null}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend PR mid-suite reports PENDING, not the backend-suite block' 2 'PENDING'
+
+# And the whole class of diffs the backend filter legitimately excludes. Each
+# skips the suite for a good reason and must still pass — including the two
+# CI-path files that are deliberately NOT backend paths, which is the easiest
+# place to over-reach when widening BACKEND_PATHS later.
+NON_BACKEND_RUNS='[
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"},
+  {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"}
+]'
+for non_backend in \
+  'partner-portal/src/App.tsx' \
+  '.github/workflows/deploy.yml' \
+  '.github/scripts/merge-evidence.sh' \
+  'docs/readme.md' \
+  'agent-engine/web_agent.py'; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  checkruns "${d}" "${NON_BACKEND_RUNS}"
+  changed_files "${d}" "${non_backend}"
+  run_gate "${d}"
+  check "a PR touching only ${non_backend} passes with the suite skipped" 0 'PASS'
+done
+
+# Renames and the backend classifier (review P1 on ENG-1003). The workflow's
+# path filter classifies on the POST-rename path, so the gate must too:
+#
+# 1. A file renamed OUT of the backend does not schedule the backend jobs.
+#    Gating on its old name would demand evidence the workflow never produced —
+#    a NO_EVIDENCE the author cannot fix by re-running anything.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'docs/service-notes.md\tbackend/src/serviceNotes.ts')"
+run_gate "${d}"
+check 'a rename OUT of backend/ passes with the suite skipped (classified on current path)' 0 'PASS'
+
+# 2. A file renamed INTO the backend is a backend change under its current
+#    name, and the requirement still bites when the suite did not run.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'backend/src/serviceNotes.ts\tdocs/service-notes.md')"
+run_gate "${d}"
+check 'a rename INTO backend/ still requires the backend suite' 3 'changes backend paths'
+
+# Renaming a job must fail closed rather than delete the requirement. With the
+# override pointing at a name nothing reports, the gate blocks.
+TESTS_RUN=$((TESTS_RUN + 1))
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+LAST_OUTPUT="$(MERGE_EVIDENCE_MOCK_DIR="${d}" REPO='AgentWebPro/agentweb' PR_NUMBER='2231' \
+  GH_TOKEN='mock' MERGE_EVIDENCE_BACKEND_JOBS='Backend tests (renamed)' \
+  bash "${GATE_SCRIPT}" 2>&1)"
+LAST_EXIT=$?
+check 'MERGE_EVIDENCE_BACKEND_JOBS is honoured and an unknown name fails closed' 3 'Backend tests (renamed) (ABSENT)'
+
+# An unreadable diff is an ERROR, not a verdict: the gate cannot tell whether
+# the requirement applies, which is a statement about the API, not the PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+printf '1' >"${d}/files_exit"
+run_gate "${d}"
+check 'an unreadable changed-files API is ERROR, never a pass' 4 'ERROR'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" ''
+run_gate "${d}"
+check 'an empty changed-files list is ERROR, never a pass' 4 'ERROR'
+
+# ---------------------------------------------------------------------------
+# ENG-1003: the evidence must describe the merge that would actually happen
+# ---------------------------------------------------------------------------
+#
+# Everything above establishes that a real run executed at this head and nothing
+# failed. That is a statement about the PR's own code. It is NOT a statement
+# about the merge, because `refs/pull/N/merge` — what the suite actually checks
+# out on a `pull_request` event — was built against whatever `main` was when the
+# run started. Commits that land on `main` afterwards are outside the evidence.
+#
+# Today nothing in this gate notices that. The freshness property is enforced
+# only by GitHub's `strict` branch-protection flag, which pays for it by forcing
+# a full ~34-runner-minute revalidation of EVERY open PR after EVERY merge —
+# 25 of agentweb's 35 open PRs were BEHIND with 0 CLEAN when ENG-1003 was filed.
+#
+# So the property moves here, where it can be checked precisely and for free:
+# a base that moved only matters if it moved a file this PR also touches.
+# Overlap is the thing that can invalidate a green suite; everything else is
+# GitHub being conservative because it cannot read a diff.
+#
+# This is strictly a TIGHTENING. Before this block the gate passed a PR whose
+# tested merge base was hundreds of commits stale without comment.
+
+GREEN_HEAD='321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+GREEN_WF='[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100}
+]'
+
+# A PR that is green at its head, touching one non-backend file, in the given
+# mergeStateStatus. Section 7 is not exercised (the file is not a backend path),
+# so every verdict below is attributable to the staleness rule alone.
+green_pr() {
+  local dir="$1" merge_state="$2"
+  pr_view "${dir}" 'MERGEABLE' false OPEN "${GREEN_HEAD}" "${merge_state}" 'main'
+  checkruns "${dir}" "${COMPLETED_GREEN_RUN}"
+  workflowruns "${dir}" "${GREEN_WF}"
+  changed_files "${dir}" 'partner-portal/src/App.tsx'
+}
+
+# 1. The case the rule exists for: main moved a file this PR also edits, so the
+#    green suite was run against a merge result that no longer exists.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'partner-portal/src/App.tsx
+backend/src/services/db.ts'
+run_gate "${d}"
+check 'ENG-1003: a stale base that moved a file this PR touches is NO_EVIDENCE' 3 'partner-portal/src/App.tsx'
+
+# 2. The saving. The base moved, but nowhere near this PR's diff, so the tested
+#    merge result is still the one that would land. This is the verdict that
+#    makes turning `strict` off safe rather than reckless.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md
+customer-portal/src/Other.tsx'
+run_gate "${d}"
+check 'ENG-1003: a stale base with no overlapping file still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md'
+run_gate "${d}"
+check 'ENG-1003: the non-overlapping pass says the base moved and why it is safe' 0 'base has moved 12 commit'
+
+# 3. Fail closed when the comparison itself cannot be read. A gate that cannot
+#    see the base must not certify freshness.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '7\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable base comparison is ERROR, never a pass' 4 'ERROR'
+
+# 4. GitHub's compare endpoint caps `files` at 300. A truncated list cannot
+#    prove the ABSENCE of an overlap, and this PR's files are deliberately
+#    absent from it — so without the cap check this fixture would false-PASS.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 400 "$(seq 1 300 | sed 's|^|unrelated/f|; s|$|.ts|')"
+run_gate "${d}"
+check 'ENG-1003: a truncated base file list cannot prove no overlap, so NO_EVIDENCE' 3 'truncat'
+
+# 5. The freshness check keys on `ahead_by`, never on the displayed merge
+#    state: mergeStateStatus reports one dominant state, so a PR that is behind
+#    AND awaiting a required review reads BLOCKED, not BEHIND. A gate that
+#    trusted the label would false-PASS exactly this fixture.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BLOCKED'
+base_compare "${d}" 12 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a behind base hidden under BLOCKED still fails freshness' 3 'partner-portal/src/App.tsx'
+
+# 5b. A genuinely current PR (compare says the base has not moved) passes, and
+#     an unreadable comparison is now an ERROR for every PR, not only BEHIND
+#     ones — the comparison is the evidence, so its absence fails closed.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+base_compare "${d}" 0 ''
+run_gate "${d}"
+check 'ENG-1003: a current base (ahead_by 0) still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+printf '9\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable comparison fails closed even when the state reads CLEAN' 4 'ERROR'
+
+# 6. Renames participate under both paths: the base renamed the file this PR
+#    edits, so the overlap only exists via `previous_filename`. Filename-only
+#    projection would false-PASS this.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '%s\n' '{"ahead_by":3,"files":[{"filename":"partner-portal/src/AppRenamed.tsx","previous_filename":"partner-portal/src/App.tsx"}]}' >"${d}/compare.json"
+run_gate "${d}"
+check 'ENG-1003: a base rename of a file this PR edits is caught via previous_filename' 3 'partner-portal/src/App.tsx'
+
+# 6b. The PR side of the same coin: this PR renamed the file, the base edited
+#     it under the old name. The overlap only exists via the PR's
+#     previous_filename, which the current-path-only backend classifier must
+#     not have stripped from the overlap list.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+changed_files "${d}" "$(printf 'partner-portal/src/AppRenamed.tsx\tpartner-portal/src/App.tsx')"
+base_compare "${d}" 3 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a PR rename of a file the base edits is caught via the PR previous_filename' 3 'partner-portal/src/App.tsx'
+
+# ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY
 # ---------------------------------------------------------------------------
 #
 # The gate's ability to tell a draft skip from a path-filter skip rests entirely
-# on `Require Greptile Review` being conditioned on draft state and nothing else.
-# Add a path filter to that job and every assertion above still passes while the
-# real gate quietly stops working, because a path-skipped discriminator is
-# indistinguishable from a draft-skipped one. Assert the workflow here so the
-# invariant breaks loudly, in CI, in the PR that breaks it.
+# on the discriminator job being conditioned on draft state and nothing else
+# that can vary independently of draft state. Add a path filter to that job and
+# every assertion above still passes while the real gate quietly stops working,
+# because a path-skipped discriminator is indistinguishable from a
+# draft-skipped one. Assert the workflow here so the invariant breaks loudly,
+# in CI, in the PR that breaks it.
+#
+# ENG-1371: the discriminator moved from `Require Greptile Review` to
+# `detect-changes` when Greptile was dropped as a vendor and its job deleted.
+# The new one is a BETTER fit for this invariant, not merely an available one.
+# `greptile-review` needed `always() &&` in front of its draft check because it
+# declared `needs: [detect-changes, backend-tests-a, backend-tests-b]`, and
+# GitHub implicitly ANDs an `if:` with `success()` whenever the expression names
+# no status-check function — so a path-filtered skip of backend-tests-a/b on a
+# non-backend PR would have silently skipped the discriminator too, which is
+# precisely the ambiguity this invariant exists to prevent. `detect-changes` is
+# the ROOT of the job graph with no `needs:` at all, so no upstream skip can
+# reach it and the bare draft check is exactly right.
+#
+# Both halves are asserted below. If `detect-changes` ever gains a `needs:`,
+# this has to grow the `always() &&` guard back, or the gate silently reverts to
+# reading a propagated skip as "this was a draft run".
 
 WORKFLOW="$(cd "${SCRIPT_DIR}/../.." && pwd)/.github/workflows/tests.yml"
 DISCRIMINATOR_IF="$(awk '
-  /^  greptile-review:/ { in_job = 1; next }
-  in_job && /^  [a-z]/  { exit }
-  in_job && /^    if:/  { sub(/^    if: */, ""); print; exit }
+  /^  detect-changes:/ { in_job = 1; next }
+  in_job && /^  [a-z]/ { exit }
+  in_job && /^    if:/ { sub(/^    if: */, ""); print; exit }
+' "${WORKFLOW}")"
+DISCRIMINATOR_NEEDS="$(awk '
+  /^  detect-changes:/ { in_job = 1; next }
+  in_job && /^  [a-z]/    { exit }
+  in_job && /^    needs:/ { print; exit }
 ' "${WORKFLOW}")"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ "${DISCRIMINATOR_IF}" = "github.event.pull_request.draft == false" ]; then
-  printf "ok    invariant: the 'Require Greptile Review' job is gated on draft state alone\n"
+if [ "${DISCRIMINATOR_IF}" = "github.event.pull_request.draft == false" ] && [ -z "${DISCRIMINATOR_NEEDS}" ]; then
+  printf "ok    invariant: the 'Detect changed projects' job is gated on draft state alone, with no needs:\n"
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf "FAIL  invariant: 'Require Greptile Review' must be gated on draft state ALONE for the\n"
-  printf "      draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
-  printf "      If this job legitimately gained a path filter, merge-evidence.sh needs a new\n"
-  printf "      discriminator — it can no longer tell a draft run from a path-skipped one.\n"
+  printf "FAIL  invariant: 'Detect changed projects' must be gated on 'draft == false' with no needs:.\n"
+  printf "      Found if: '%s'  needs: '%s'\n" "${DISCRIMINATOR_IF}" "${DISCRIMINATOR_NEEDS}"
+  printf "      merge-evidence.sh uses this job to tell a draft-time run from a path-filtered\n"
+  printf "      skip. A path filter here, or an upstream job that can skip into it, destroys that.\n"
+fi
+
+# ---------------------------------------------------------------------------
+# Invariant guard — nothing may be serialized in front of the backend suites
+# ---------------------------------------------------------------------------
+#
+# ENG-1039 reversed ENG-915's ordering: the reviewer check failed 61% of the
+# time over 2026-08-01..10 and every failure skipped the backend suite (303
+# skipped executions), destroying the run's test evidence and forcing a full
+# ~31-min re-run. ENG-1371 removed that reviewer entirely, but the invariant is
+# about the SHAPE, not the vendor: test evidence must be produced independently
+# of anything that can fail for a non-test reason.
+#
+# So this no longer greps for a vendor name — that check went vacuous the moment
+# the job was deleted, which is exactly how an invariant quietly stops working.
+# It asserts the positive property instead: these jobs depend on `detect-changes`
+# and NOTHING else. Any new dependency — a reviewer, a lint gate, an approval
+# job — fails here, in the PR that adds it.
+
+GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
+
+for job_key in backend-build partner-build; do
+  # Collect the job's whole header (needs + the `>-` if block scalar) so a
+  # dependency reintroduced in either field is caught.
+  # Comment lines are dropped: they legitimately narrate the ENG-1039 history
+  # and would otherwise trip the substring check below.
+  JOB_HEADER="$(awk -v job="  ${job_key}:" '
+    $0 == job            { in_job = 1; next }
+    in_job && /^  [a-z]/ { exit }
+    in_job && /^    steps:/ { exit }
+    in_job && /^ *#/     { next }
+    in_job               { print }
+  ' "${WORKFLOW}" | tr '\n' ' ')"
+
+  JOB_NEEDS="$(awk -v job="  ${job_key}:" '
+    $0 == job               { in_job = 1; next }
+    in_job && /^  [a-z]/    { exit }
+    in_job && /^    needs:/ { sub(/^    needs: */, ""); print; exit }
+  ' "${WORKFLOW}")"
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  # ENG-1277: here-string, not a pipe — see the check() fix above for why.
+  if [ "${JOB_NEEDS}" = "detect-changes" ]; then
+    printf "ok    invariant: %s depends on detect-changes and nothing else\n" "${job_key}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: %s must declare exactly 'needs: [detect-changes]'.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_NEEDS}"
+    printf "      Build evidence must not be serialized behind an unrelated gate.\n"
+  fi
+
+  surface='backend'
+  [ "${job_key}" = 'partner-build' ] && surface='partner'
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
+     && grep -qF "needs.detect-changes.outputs.${surface} == 'true'" <<<"${JOB_HEADER}"; then
+    printf "ok    invariant: %s keeps the draft and %s-path gates\n" "${job_key}" "${surface}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: %s must keep the draft gate and backend path filter.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_HEADER}"
+  fi
+done
+
+for job_name in 'Backend build' 'Partner portal build'; do
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if grep -qF "name: ${job_name}" "${WORKFLOW}"; then
+    printf "ok    invariant: required build job '%s' exists in tests.yml\n" "${job_name}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: required build job '%s' is missing from tests.yml.\n" "${job_name}"
+  fi
+done
+
+# BACKEND_PATHS hand-mirrors the `backend` filter in tests.yml, and the two
+# drift in one direction silently: adding a path to the workflow filter widens
+# what the suite runs on, while the requirement here keeps applying to the old,
+# narrower set. The result is a file that triggers the backend suite but is not
+# required to have run it — the exact hole this section closes, reopened. Only
+# the reverse (a path here that the filter dropped) is loud, because it demands
+# a suite that never runs.
+TESTS_RUN=$((TESTS_RUN + 1))
+# `backend/**` in the filter is the prefix `backend/` here; quotes and the glob
+# suffix are normalised away so the two are compared as the same kind of thing.
+filter_paths="$(awk '
+  /^            backend:$/ { in_filter = 1; next }
+  in_filter && /^            [a-z]+:$/ { exit }
+  in_filter && /^              - / {
+    sub(/^              - /, ""); gsub(/'"'"'/, ""); sub(/\*\*$/, ""); print
+  }
+' "${WORKFLOW}" | sort)"
+gate_paths="$(sed -n "/^BACKEND_PATHS='/,/'$/p" "${GATE_SH}" \
+  | sed -e "s/^BACKEND_PATHS='//" -e "s/'$//" | sort)"
+
+if [ "${filter_paths}" = "${gate_paths}" ]; then
+  printf "ok    invariant: BACKEND_PATHS mirrors the workflow's backend paths filter\n"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "FAIL  invariant: BACKEND_PATHS has drifted from the backend filter in tests.yml.\n"
+  printf "      tests.yml: %s\n" "$(printf '%s' "${filter_paths}" | tr '\n' ' ')"
+  printf "      this gate: %s\n" "$(printf '%s' "${gate_paths}" | tr '\n' ' ')"
+  printf "      A path the filter has and this gate does not is a file that triggers the\n"
+  printf "      backend suite without being required to have run it.\n"
+fi
+
+# Two jobs sharing a per-PR concurrency group cancel each other, which is the
+# problem ENG-915 design wrinkle 4 warns must not come back: the reorder means
+# the reviewer gate then decided whether the suite ran at all, so a group
+# collision involving it would silently cancel the tests rather than merely
+# delay them. Distinct groups are what let these jobs run in the same workflow
+# without racing, so assert every group is unique.
+TESTS_RUN=$((TESTS_RUN + 1))
+dupe_group="$(grep '^      group:' "${WORKFLOW}" | sort | uniq -d)"
+if [ -z "${dupe_group}" ]; then
+  printf "ok    invariant: every job's concurrency group is unique (ENG-915 AC5)\n"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "FAIL  invariant: two jobs share a concurrency group, so they will cancel each other:\n"
+  printf "      %s\n" "${dupe_group}"
 fi
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
