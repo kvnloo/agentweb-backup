@@ -9260,6 +9260,7 @@ export const crmDb = {
       webSearch: { live: number; cached: number };
       sibling:   { live: number; cached: number };
       llm:       { live: number; cached: number };
+      enigma?:   { live: number; cached: number };
     };
   }): Promise<void> {
     try {

@@ -8,7 +8,7 @@ import type {
   EnrichmentConfig,
   EnrichmentFieldConfig,
 } from './crmEnrichmentServiceV3';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 
 // Set of every canonical field name across all FIELD_GROUPS — for aliasFor validation
 const CANONICAL_FIELD_NAMES = new Set<string>(
@@ -345,7 +345,10 @@ function buildDefaultField(name: string): EnrichmentFieldConfig {
     name,
     type: 'string',
     instruction: '',
-    include: true,                      // opt-out: pre-select all (UX choice)
+    // opt-out: pre-select all (UX choice) — except paid Enigma card-revenue
+    // columns (ENG-1388): a column existing on the list (e.g. after one run or
+    // a CSV import) must never re-enable buying it on every later run.
+    include: !isCardRevenueField(name),
     overwritePolicy: 'fill_if_empty',
     ...(aliasFor ? { aliasFor } : {}),
   };
@@ -451,6 +454,30 @@ export async function getEnrichmentConfig(
  * restore + classify smart fields, validate, and stamp audit fields.
  * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
  */
+/**
+ * ENG-1388: Enigma card revenue is bought per value, so it is only ever routed
+ * when the user names the field exactly. Drops any heuristic, LLM or client
+ * alias onto a card field ("Revenue" -> card_revenue_12m) and any smart-field
+ * dependency that would trigger a purchase implicitly.
+ *
+ * Every path that can reach the card-revenue tier must run this, including
+ * preview runs that take an inline config straight from the client.
+ */
+export function stripImplicitCardRevenueRouting<T extends { fields: any[] }>(config: T): T {
+  return {
+    ...config,
+    fields: config.fields.map((f: any) => {
+      const aliasToCard = isCardRevenueField(f.aliasFor) && f.aliasFor !== f.name;
+      const cardDeps = (f.smartDependencies ?? []).filter(isCardRevenueField);
+      if (!aliasToCard && cardDeps.length === 0) return f;
+      const out = { ...f };
+      if (aliasToCard) delete out.aliasFor;
+      if (cardDeps.length > 0) out.smartDependencies = (f.smartDependencies ?? []).filter((d: any) => !isCardRevenueField(d));
+      return out;
+    }),
+  };
+}
+
 export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigProcessingDeps,
@@ -597,6 +624,8 @@ export async function processEnrichmentConfig(
       console.warn('[enrichmentConfigService] smart field classification failed:', err);
     }
   }
+
+  enriched = stripImplicitCardRevenueRouting(enriched);
 
   const { warnings } = validateConfig(enriched);
 

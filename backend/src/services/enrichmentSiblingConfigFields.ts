@@ -14,7 +14,7 @@ import type { LeadRecord } from './crmEnrichmentService';
 import type { EnrichmentFieldConfig } from './crmEnrichmentServiceV3';
 import type { SiblingLeadResult } from './enrichmentIdentityResolver';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 import { createLLMService, LLMUsageContext } from '../utils/llmService';
 
 const IDENTITY_FIELDS = new Set([
@@ -166,6 +166,9 @@ export function copySiblingConfigFields(
 
   for (const configField of configFields) {
     if (IDENTITY_FIELDS.has(configField.name)) continue;
+    // ENG-1388: Enigma card revenue is licensed per AgentWeb account, not for
+    // reuse on another customer's lead; each run buys (or caches) its own.
+    if (isCardRevenueField(configField.aliasFor ?? configField.name)) continue;
 
     // Skip if lead already has this field
     const topVal = (lead as any)[configField.name];
@@ -211,6 +214,9 @@ export function copySiblingConfigFields(
         // lineage. Non-web sibling values (Apollo, manual, etc.) keep the
         // plain crm-history shape and remain trusted.
         const sibMeta = sib.enrichmentMetadata?.[key];
+        // Never carry an Enigma-sourced value across leads, whatever field the
+        // LLM mapping matched it to (ENG-1388).
+        if (sibMeta?.provider === 'enigma') continue;
         const copiedFromWeb = sibMeta?.source === 'web_search';
         const meta: EnrichedFieldMeta = copiedFromWeb
           ? {

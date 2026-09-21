@@ -10,6 +10,12 @@
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
 import { getEnrichSoService } from './enrichSoService';
+import { getEnigmaService } from './enigmaService';
+import {
+  createEnigmaCardRevenueFetcher,
+  isEnigmaEnrichmentEnabledForUser,
+  type EnigmaCardRevenueFetcher,
+} from './enigmaCardRevenueEnrichment';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
@@ -1160,8 +1166,28 @@ export async function pickCandidateByContextLLM(
 // so existing importers are unchanged.
 export { unipileNameMatches };
 
-export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
+/**
+ * ENG-1388: Enigma card revenue is attached only when the caller opts in (the
+ * enrich-v3 route and Emma do; the auto-enrichment cron never does), the flag
+ * and allowlist permit this user, and the service is initialised. One fetcher
+ * per run carries the per-run cap and the 402/401 circuit breaker.
+ */
+function buildEnigmaFetcherForRun(userId: string): EnigmaCardRevenueFetcher | null {
+  if (!isEnigmaEnrichmentEnabledForUser(userId)) return null;
+  const service = getEnigmaService();
+  if (!service) {
+    console.warn(`[v3 deps] Enigma enabled for user ${userId} but the service is not initialised (missing key?)`);
+    return null;
+  }
+  return createEnigmaCardRevenueFetcher({ service, userId });
+}
+
+export function buildOrchestratorDeps(
+  userId: string,
+  opts: { enigma?: boolean } = {},
+): OrchestratorDeps {
   const identityDeps = buildIdentityDeps(userId);
+  const enigmaFetcher = opts.enigma ? buildEnigmaFetcherForRun(userId) : null;
 
   return {
     loadLeads: async ({ listId, leadIds }) => {
@@ -1506,6 +1532,19 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           return null;
         }
       },
+
+      ...(enigmaFetcher ? {
+        fetchEnigmaCardRevenue: (lead: LeadRecord, { industryLabels, forceRefresh }: { industryLabels: Array<string | undefined>; forceRefresh: boolean }) => {
+          const domain = resolveApolloMatchDomain(lead);
+          return enigmaFetcher.fetch({
+            // A free-mail or institutional domain is never the company's site.
+            domain: domain && !CrmEnrichmentService.isPersonalDomain(domain) ? domain : null,
+            companyName: lead.company,
+            industryLabels,
+            forceRefresh,
+          });
+        },
+      } : {}),
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"
@@ -1619,6 +1658,8 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     },
 
     runCriticOverWebFills: (input) => runCriticReal(input, userId),
+
+    ...(enigmaFetcher ? { enigmaSummary: () => enigmaFetcher.summary() } : {}),
 
     setLeadFields: async ({ listId, leadId, topLevel, customFields, enrichmentMetadata, ifNotExists }) => {
       // When writing to topLevel, also clear stale customFields[name] entries

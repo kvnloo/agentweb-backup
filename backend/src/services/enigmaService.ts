@@ -75,6 +75,13 @@ export interface EnigmaCallOptions {
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 export class EnigmaApiError extends Error {
+  /**
+   * Credits Enigma billed for values that came back on a response we then
+   * treated as failed (a GraphQL `errors` array alongside data). The quota
+   * settles with this rather than releasing the whole reservation.
+   */
+  billedCredits?: number;
+
   constructor(message: string, readonly status?: number) {
     super(message);
     this.name = 'EnigmaApiError';
@@ -105,7 +112,65 @@ export class EnigmaRateLimitedError extends EnigmaApiError {
   }
 }
 
+/** Platform-wide monthly Enigma credit budget spent - raised before any HTTP call. */
+export class EnigmaBudgetExhaustedError extends Error {
+  constructor(readonly budgetCredits: number) {
+    super(`Enigma monthly credit budget spent (${budgetCredits} credits)`);
+    this.name = 'EnigmaBudgetExhaustedError';
+  }
+}
+
+/** Per-user daily Enigma lookup cap reached — raised before any HTTP call. */
+export class EnigmaQuotaExceededError extends Error {
+  constructor(readonly limit: number) {
+    super(`Enigma daily lookup limit reached (${limit}/day)`);
+    this.name = 'EnigmaQuotaExceededError';
+  }
+}
+
 // ─── Injected dependencies ───────────────────────────────────────────────────
+
+/**
+ * What one billed call may cost, reserved BEFORE the call. Enigma bills per
+ * value returned: `cardTransactions(first: 4)` = 4 x 10, name 2, `websites(first:
+ * 5)` = 5 x 2, so 52 credits at worst (see enigmaGraphql.ts).
+ */
+export const ENIGMA_MAX_CREDITS_PER_CALL = 52;
+
+/** Handle for capacity reserved before a call; pass it back to `settle`. */
+export interface EnigmaQuotaReservation {
+  userId?: string;
+  /** Credits held against the monthly budget (0 when no budget applies). */
+  credits: number;
+  /** Month the credits were reserved in, e.g. "2026-09". */
+  month?: string;
+  /** Day the user call was counted in, e.g. "2026-09-21". */
+  day?: string;
+}
+
+/**
+ * Spend limits, enforced by RESERVING capacity before the billed call rather
+ * than checking and recording around it: concurrent leads (a run fans out)
+ * would otherwise all pass the same read-only check and overshoot. Cache hits
+ * never reserve.
+ */
+export interface EnigmaQuotaTracker {
+  /**
+   * Atomically reserves one call against the user's daily limit and up to
+   * ENIGMA_MAX_CREDITS_PER_CALL against the platform's monthly credit budget.
+   * Throws EnigmaBudgetExhaustedError / EnigmaQuotaExceededError, reserving
+   * nothing, when either is spent. ENG-1933 measured ~19 credits per call on a
+   * 2,100-credit monthly plan, so a call cap alone cannot bound spend.
+   */
+  reserve(userId?: string): Promise<EnigmaQuotaReservation>;
+  /**
+   * Reconciles a reservation once the call is over. `actualCredits` is what
+   * Enigma billed (also for a response that carried values and errors);
+   * `null` means the call failed before anything was billed, so the whole
+   * reservation (credits and the user's call) is released.
+   */
+  settle(reservation: EnigmaQuotaReservation, actualCredits: number | null): Promise<void>;
+}
 
 export interface EnigmaSearchRequest {
   website: string;
@@ -154,6 +219,8 @@ export interface EnigmaServiceDeps {
    * import the enrichment service graph.
    */
   isPersonalDomain?: (host: string) => boolean;
+  /** Enforced only for calls that carry a userId. */
+  quota?: EnigmaQuotaTracker;
   now?: () => Date;
 }
 
@@ -210,6 +277,12 @@ function isBlockedHost(host: string): boolean {
   return SITE_BUILDER_HOSTS.some((base) => host.endsWith(`.${base}`));
 }
 
+/** True when a lead's website can never be looked up (profile page, site-builder subdomain, our own host). */
+export function isEnigmaBlockedWebsite(website: string | null | undefined): boolean {
+  const host = normalizeEnigmaHost(website);
+  return !host || isBlockedHost(host);
+}
+
 /** Registrable domains a Brand's websites resolve to (e.g. "acme.com"). */
 function brandWebsiteRoots(brand: any): string[] {
   const roots: string[] = [];
@@ -263,6 +336,25 @@ function pickCardRevenue(brand: any): EnigmaCardRevenue | null {
 }
 
 export type EnigmaBilledFillKey = 'card_revenue_12m' | 'card_revenue_yoy_growth_12m' | 'brand_attribute';
+
+/**
+ * Enigma credits per billed value (rate card effective 2026-08-10; 1 credit =
+ * $0.01), in the units Enigma sells its plan in so the budget can be compared
+ * with the plan directly. `vendorRateCard.ts` holds the dollar prices; a test
+ * pins the two together.
+ */
+export const ENIGMA_CREDITS_PER_FILL: Record<EnigmaBilledFillKey, number> = {
+  card_revenue_12m: 10,
+  card_revenue_yoy_growth_12m: 10,
+  brand_attribute: 2,
+};
+
+/** Credits Enigma billed for one response. */
+export function countEnigmaBilledCredits(brands: any[] | null | undefined): number {
+  const fills = countEnigmaBilledFills(brands);
+  return (Object.keys(fills) as EnigmaBilledFillKey[])
+    .reduce((total, key) => total + fills[key] * ENIGMA_CREDITS_PER_FILL[key], 0);
+}
 
 /**
  * Values Enigma bills for in a search response. Enigma charges per value
@@ -358,8 +450,24 @@ export class EnigmaService {
       }
     }
 
+    const { quota } = this.deps;
+    const reservation = quota ? await quota.reserve(opts.userId) : undefined;
+
     const name = input.companyName?.trim();
-    const brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
+    let brands: any[];
+    try {
+      brands = await this.deps.http.searchBrand({ website: host, ...(name ? { name } : {}) }, opts.userId);
+    } catch (err) {
+      // Most failures are unbilled, so the reservation goes back. A response
+      // that carried values AND errors was billed for those values: settle with
+      // that, so the budget never under-counts what the ledger recorded.
+      const billed = err instanceof EnigmaApiError ? err.billedCredits : undefined;
+      if (quota && reservation) await this.settleQuietly(quota, reservation, typeof billed === 'number' ? billed : null);
+      throw err;
+    }
+    // Credits come from what Enigma actually returned - the same values the
+    // ledger meters - so the budget and the spend ledger cannot drift.
+    if (quota && reservation) await this.settleQuietly(quota, reservation, countEnigmaBilledCredits(brands));
     const result = evaluateSearch(brands, host);
 
     await this.writeCache({
@@ -373,6 +481,20 @@ export class EnigmaService {
     }, key, !!opts.forceRefresh);
 
     return { ...result, fromCache: false, checkedAt };
+  }
+
+  private async settleQuietly(
+    quota: EnigmaQuotaTracker,
+    reservation: EnigmaQuotaReservation,
+    actualCredits: number | null,
+  ): Promise<void> {
+    try {
+      await quota.settle(reservation, actualCredits);
+    } catch (err) {
+      // The reservation already counts against the limits, so a failed
+      // reconcile only errs on the safe (over-counted) side.
+      console.warn(`[enigma] quota settle failed: ${(err as Error).message}`);
+    }
   }
 
   // A cache outage degrades to a fresh lookup rather than failing enrichment.

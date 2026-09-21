@@ -45,6 +45,28 @@ import { getProjection } from "./spendProjectionDb";
 export const SPEND_LEDGER_ENFORCEMENT_ENV = "AW_SPEND_LEDGER_ENFORCEMENT";
 export const SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV = "AW_SPEND_LEDGER_ENFORCEMENT_ACCOUNTS";
 
+/**
+ * Max age of a projection snapshot before enforcement stops trusting it and
+ * fails open to legacy. Minutes; unset or <= 0 disables the guard.
+ *
+ * Deliberately OFF by default. The event-driven writer restamps `computedAt` on
+ * every settled event, so an ACTIVE account's snapshot is always fresh — but an
+ * over-cap account that has been paused makes no new settled charges, so its
+ * `computedAt` would age naturally, and a default-on guard would let it back in
+ * on a timer (oscillation). The guard exists for the operational case it is
+ * actually needed in: a lagging periodic materializer or a stopped writer, where
+ * an operator sets a threshold and would rather under-enforce visibly on stale
+ * data than enforce on a figure the pipeline can no longer vouch for.
+ */
+export const SPEND_PROJECTION_MAX_STALENESS_MIN_ENV = "AW_SPEND_PROJECTION_MAX_STALENESS_MIN";
+
+/** Parsed staleness threshold in ms, or null when the guard is disabled. */
+export function projectionStalenessThresholdMs(): number | null {
+  const raw = Number(process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV]);
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  return raw * 60_000;
+}
+
 export type EnforcementBasis = "legacy" | "spend_ledger";
 
 /**
@@ -72,6 +94,8 @@ export interface EnforcementCostBasis {
   basis: EnforcementBasis;
   /** True when the ledger basis was requested but no snapshot existed (fell back). */
   projectionMissing: boolean;
+  /** True when a snapshot existed but was too stale to trust, so it fell back. */
+  stale: boolean;
 }
 
 /**
@@ -88,7 +112,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
   legacyRawCostUsedMicroUsd: number;
 }): Promise<EnforcementCostBasis> {
   if (!isSpendLedgerEnforcementEnabled(input.billingUserId)) {
-    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false };
+    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false, stale: false };
   }
 
   let projection = null;
@@ -102,11 +126,37 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
         `falling back to legacy basis:`,
       err,
     );
-    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true };
+    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true, stale: false };
   }
 
   if (!projection) {
-    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true };
+    // Enabled but nothing to read: the writer/backfill has not covered this
+    // subject yet. Log it (previously silent) so an allowlist canary can tell a
+    // real ledger read from a fall-through — the exact gap that hid the missing
+    // production writer for two weeks.
+    console.log(
+      `[spendEnforcementBasis] projection MISSING for ${input.billingUserId} ${input.billingMonth}; ` +
+        `falling back to legacy basis (writer/backfill has not covered this subject).`,
+    );
+    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true, stale: false };
+  }
+
+  // Freshness guard: a snapshot older than the configured threshold is not
+  // trusted for enforcement — fail open to legacy and say so, rather than
+  // enforce on a figure a lagging writer can no longer vouch for. Disabled by
+  // default (see the env doc above).
+  const thresholdMs = projectionStalenessThresholdMs();
+  if (thresholdMs !== null) {
+    const computedAtMs = Date.parse(projection.computedAt ?? "");
+    const ageMs = Number.isNaN(computedAtMs) ? Infinity : Date.now() - computedAtMs;
+    if (ageMs > thresholdMs) {
+      console.warn(
+        `[spendEnforcementBasis] projection STALE for ${input.billingUserId} ${input.billingMonth}: ` +
+          `computedAt=${projection.computedAt ?? "(missing)"} age=${Number.isFinite(ageMs) ? Math.round(ageMs / 1000) + "s" : "unknown"} ` +
+          `> threshold=${Math.round(thresholdMs / 1000)}s; falling back to legacy basis.`,
+      );
+      return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false, stale: true };
+    }
   }
 
   // The ledger's settled all-vendor total, and nothing else from the projection.
@@ -121,5 +171,5 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
       `legacy=${input.legacyRawCostUsedMicroUsd}µ ledger=${rawCostUsedMicroUsd}µ delta=${deltaMicroUsd}µ`,
   );
 
-  return { rawCostUsedMicroUsd, basis: "spend_ledger", projectionMissing: false };
+  return { rawCostUsedMicroUsd, basis: "spend_ledger", projectionMissing: false, stale: false };
 }
