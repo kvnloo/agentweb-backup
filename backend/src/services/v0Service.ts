@@ -588,6 +588,17 @@ export interface GeneratedLandingPage {
     checkedAt: string;
     error?: string;
   };
+  /**
+   * ENG-1238: externally-deployed/imported page marker. Records registered via
+   * the admin external-import route carry sourceType 'external' + canonicalUrl
+   * + repo/project ref + leadListId and are otherwise plain AW-LandingPages rows,
+   * so the owner-scoped list route already surfaces them; build/deploy/poller/
+   * janitor paths never match them (no siteId/v0/vercel fields set).
+   */
+  sourceType?: "external";
+  canonicalUrl?: string;
+  repoRef?: string;
+  projectRef?: string;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge

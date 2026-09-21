@@ -90,7 +90,14 @@ describe.each([
   ['revoked', () => { root.status = 'revoked'; }],
   ['missing root', () => { root = undefined; }],
   ['null lifecycle marker', () => { root.lifecycleState = null; }],
-  ['expired root', () => { root.expiresAt = Date.now(); }],
+  // Must be unambiguously in the PAST, not "expires exactly now". The guard this case
+  // simulates is `expiresAt > :now`, and :now is captured when the request is built —
+  // strictly before this transition runs at commit time. Date.now() here equals that
+  // :now only while under a millisecond elapses between the two. On a loaded machine it
+  // does not: the root then reads as still-valid, the write is allowed, and
+  // "cannot persist" fails. That made this suite fail under full-suite CPU contention
+  // while passing in isolation — which reads as cross-suite pollution and is not.
+  ['expired root', () => { root.expiresAt = Date.now() - 3600000; }],
   ['foreign root owner', () => { root.userId = 'eval_someone-else'; }],
 ] as const)('%s between read and commit', (_name, transition) => {
   it.each(paths)('%s cannot persist', async (_path, write) => {

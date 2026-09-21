@@ -42,7 +42,17 @@ export function hasUnsafeEmailStyles(html: string): boolean {
  *
  * Returns the inlined HTML, or the original HTML if the LLM call fails.
  */
-export async function inlineEmailStyles(html: string): Promise<{ html: string; wasFixed: boolean }> {
+export async function inlineEmailStyles(
+  html: string,
+  /**
+   * Who triggered the import, for metering (ENG-1961). This used to book to the
+   * `system` placeholder because the utility had no identity in scope — but its
+   * caller is an authenticated route, so the user was always one argument away.
+   * Omitted (or absent), the call is metered feature-only rather than against an
+   * invented user.
+   */
+  usage?: { userId?: string },
+): Promise<{ html: string; wasFixed: boolean }> {
   if (!hasUnsafeEmailStyles(html)) {
     return { html, wasFixed: false };
   }
@@ -67,9 +77,10 @@ Return ONLY the complete fixed HTML wrapped in <actual_html_content>...</actual_
 
     const userPrompt = `Convert this email HTML to use inline styles instead of CSS classes:\n\n${html}`;
 
-    // Shadow metering: no userId reachable in this utility (callers don't pass
-    // identity) — recorder attributes to 'system'.
-    const inlined = await llm.generateHTML(systemPrompt, userPrompt, undefined, { feature: 'content_gen' });
+    const inlined = await llm.generateHTML(systemPrompt, userPrompt, undefined, {
+      ...(usage?.userId ? { userId: usage.userId } : {}),
+      feature: 'content_gen',
+    });
     if (inlined && inlined.length > html.length * 0.5) {
       return { html: inlined, wasFixed: true };
     }

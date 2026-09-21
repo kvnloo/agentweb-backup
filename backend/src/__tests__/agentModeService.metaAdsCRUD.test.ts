@@ -1,3 +1,4 @@
+jest.mock('../services/agentMode/adsLearning', () => ({ recordCreativeLearningReceipt: jest.fn().mockResolvedValue(undefined) }));
 // Mock MCP client service first
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({
@@ -45,6 +46,11 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+jest.mock('../services/landerUtmStore', () => ({
+  getCustomerUtmDefault: jest.fn(),
+  getLanderUtmOverride: jest.fn(),
+}));
+
 jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
 }));
@@ -52,6 +58,7 @@ jest.mock('../utils/secretsManager', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { getCustomerUtmDefault, getLanderUtmOverride } from '../services/landerUtmStore';
 
 describe('AgentModeService - Meta Ads Complete CRUD', () => {
   let agentModeService: AgentModeService;
@@ -328,6 +335,83 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
     });
 
     describe('createMetaAdsAdCreative', () => {
+      const utmParams = {
+        name: 'UTM Creative',
+        page_id: 'page_123',
+        image_hash: 'hash_123',
+        body: 'Body',
+        title: 'Title',
+        link_url: 'https://example.com/lander',
+        lander_id: 'lander_123',
+      };
+
+      it('emits customer defaults through the shared lander resolver', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_source: 'customer', utm_medium: 'paid' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            url_tags: 'utm_source=customer&utm_medium=paid&aw_lander=1',
+          }),
+        );
+      });
+
+      it('keeps Meta macros unencoded in configured UTM values', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_campaign: '{{campaign.id}}' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({ url_tags: 'utm_campaign={{campaign.id}}&aw_lander=1' }),
+        );
+      });
+
+      it('lets a per-lander override win and preserves click ids', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue({ utm_source: 'customer', utm_campaign: 'default' });
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue({ utm_source: 'lander', utm_campaign: 'override' });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', {
+          ...utmParams,
+          url_tags: 'gclid=google-click&fbclid=meta-click',
+        });
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            url_tags: 'utm_source=lander&utm_campaign=override&gclid=google-click&fbclid=meta-click&aw_lander=1',
+          }),
+        );
+      });
+
+      it('keeps url_tags absent when no default or override exists', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (getCustomerUtmDefault as jest.Mock).mockResolvedValue(null);
+        (getLanderUtmOverride as jest.Mock).mockResolvedValue(null);
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_utm', name: 'UTM Creative' });
+
+        await agentModeService.createMetaAdsAdCreative('user123', utmParams);
+
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.not.objectContaining({ url_tags: expect.anything() }),
+        );
+      });
+
       it('should successfully create an ad creative', async () => {
         const mockCreativeData = { id: 'creative_123', name: 'New Creative' };
         const params = {

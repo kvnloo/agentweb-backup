@@ -140,6 +140,7 @@ import {
   exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
+import { healthPayload } from "./utils/buildInfo";
 
 const app = express();
 
@@ -315,6 +316,7 @@ app.use((req, res, next) => {
 });
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
+app.use("/api/slack/events", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 // Stripe Connect webhook needs its own raw-body handler — also before express.json().
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
@@ -546,7 +548,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  res.status(200).json(healthPayload());
 });
 
 // Global error handler — catches unhandled errors from all routes and reports them to Notion

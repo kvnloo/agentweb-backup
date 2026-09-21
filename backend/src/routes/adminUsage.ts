@@ -26,8 +26,8 @@ import {
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 import { buildUnitEconomicsReport } from "../services/llmUnitEconomicsService";
-import { listSpendEvents } from "../services/spendEventDb";
-import { buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
+import { listSpendEventsBounded } from "../services/spendEventDb";
+import { boundBreakdownRows, buildSpendBreakdown, explainPause, resolveAllowanceInputs } from "../services/spendReadModel";
 import { projectMonth } from "../services/spendProjection";
 import { LLM_SPEND_LEDGER_STARTED_ON } from "../services/spendLedgerDualWrite";
 import { measureLlmLedgerCoverage } from "../services/spendReconciliation";
@@ -39,6 +39,17 @@ import { checkTokenUsage, resolveBillingUserId } from "../services/tokenUsageSer
 import { describeEnforcement } from "../services/enforcementStateView";
 
 const router = express.Router();
+
+/**
+ * ENG-1841 bounds on the interactive spend breakdown.
+ *
+ * MAX_EVENTS caps the read. The largest subject-month on production was 542
+ * events on 2026-09-15 (2,450 across every subject for the whole of September),
+ * so this leaves ~90x headroom while making the work bounded by construction.
+ * ROWS_PER_CUT caps each detail list in the response; the portal renders 25.
+ */
+export const SPEND_BREAKDOWN_MAX_EVENTS = 50_000;
+export const SPEND_BREAKDOWN_ROWS_PER_CUT = 100;
 
 /**
  * Every aggregate row billed to `billingUserId` in `month`, by keyed query.
@@ -135,7 +146,24 @@ router.get(
       // The GSI is keyed on occurredAt, so the range is the calendar month.
       // `-31` is safe for every month: it is an upper bound on a string
       // comparison, not a date that has to exist.
-      const events = await listSpendEvents(billingUserId, `${month}-01`, `${month}-31`);
+      // ENG-1841: bounded read. Past the ceiling the events are incomplete and
+      // every total built from them would be understated, so the endpoint says
+      // so instead of answering with a confident wrong number.
+      const { events, exceeded } = await listSpendEventsBounded(
+        billingUserId,
+        `${month}-01`,
+        `${month}-31`,
+        SPEND_BREAKDOWN_MAX_EVENTS,
+      );
+      if (exceeded) {
+        return res.status(422).json({
+          error:
+            `This billing subject has more than ${SPEND_BREAKDOWN_MAX_EVENTS.toLocaleString()} spend events in ${month} — ` +
+            "too many to summarise exactly here. Use the reconciliation report for this month.",
+          code: "spend_breakdown_too_large",
+          eventLimit: SPEND_BREAKDOWN_MAX_EVENTS,
+        });
+      }
       const breakdown = buildSpendBreakdown(billingUserId, month, events);
 
       const allowance = await resolveAllowanceInputs(billingUserId, month, {
@@ -163,7 +191,9 @@ router.get(
           : null;
 
       return res.json({
-        ...breakdown,
+        // Totals are over the whole month; only the detail row lists are
+        // bounded, with what was left out counted in `omitted` (ENG-1841).
+        ...boundBreakdownRows(breakdown, SPEND_BREAKDOWN_ROWS_PER_CUT),
         // Echoed so the UI can say WHOSE ledger this is when the two differ —
         // an admin who opened a member must see they are reading the org's
         // spend, not that member's.

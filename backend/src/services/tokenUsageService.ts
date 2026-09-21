@@ -6,6 +6,7 @@ import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
   type ResolvedAlertThresholds,
 } from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
@@ -351,7 +352,15 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
   const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
 
-  const rawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  const legacyRawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
+  // onto the vendor-inclusive spend ledger; the credit/threshold/predicate path
+  // below is reused unchanged so the only divergence is vendor inclusion.
+  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+    billingUserId,
+    billingMonth: usage.month,
+    legacyRawCostUsedMicroUsd,
+  });
   const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
   const adjustedUsage = llmUsagePolicy
     ? applyLlmUsageCredits({

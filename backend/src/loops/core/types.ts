@@ -381,6 +381,8 @@ export interface LoopRunResult {
    * mentioned that 8 was a ceiling.
    */
   proposalsTruncated?: number;
+  /** Full post-cooldown set when capped, for accurate distinct-subject digest counts. */
+  uncappedProposals?: readonly MutationProposal<unknown>[];
   /** Mutations the tools layer materialized. May be fewer than proposals if
    * business rules filtered some out. */
   mutations: readonly Mutation[];

@@ -214,6 +214,36 @@ describe('runHumanEvalFeedbackAction', () => {
     );
   });
 
+  // ENG-1854: slackChannel/slackMessageTs became optional once candidate persistence was
+  // decoupled from a successful Slack post — this candidate shape (no Slack fields at all)
+  // is now a real, reachable state via the queue API, not just a type-system technicality.
+  it('skips the session-busy notice without throwing when the candidate was never posted to Slack', async () => {
+    (runVerifiedChat as jest.Mock).mockRejectedValueOnce(
+      Object.assign(new Error('busy'), { code: 'SESSION_BUSY' }),
+    );
+
+    await expect(runHumanEvalFeedbackAction(
+      candidate({
+        reviewType: 'creative_image',
+        userId: 'user-1',
+        sessionId: 'session-1',
+        artifactUrl: 'https://example.com/image.png',
+        slackChannel: undefined,
+        slackMessageTs: undefined,
+        action: {
+          type: 'agent_mode_image_revision',
+          userId: 'user-1',
+          sessionId: 'session-1',
+          artifactUrl: 'https://example.com/image.png',
+          filename: 'image.png',
+        },
+      }),
+      feedback,
+    )).resolves.toBeUndefined();
+
+    expect(mockPostSlackMessage).not.toHaveBeenCalled();
+  });
+
   it('still propagates a genuine (non-busy) failure', async () => {
     (runVerifiedChat as jest.Mock).mockRejectedValueOnce(new Error('LLM provider exploded'));
 

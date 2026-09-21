@@ -1,0 +1,4 @@
+Production TypeScript no-emit: exit 0
+Command: node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit -p tsconfig.build.json
+git diff --check: exit 0
+No production writes, deploy, or merge.

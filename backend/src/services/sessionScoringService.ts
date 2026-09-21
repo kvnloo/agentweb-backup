@@ -1039,6 +1039,228 @@ function isPublishGateWithheldSession(session: ChatSession): boolean {
 }
 
 /**
+ * ENG-1165 — a session blocked by something outside the agent's control must
+ * not be scored as an agent failure. The general satisfaction judge charges
+ * the block to goalCompletion while the specialist judges correctly score the
+ * agent's HANDLING as excellent, so the headline metric reports platform gaps
+ * as agent failures (2-point judge spreads on identical behavior).
+ *
+ * Deterministic transcript classifier, same exclusion treatment as a no-task
+ * session (ENG-168) or a publish-gate-withheld run (ENG-995): the assistant's
+ * LAST substantive turn must affirmatively state an external block AND show
+ * correct handling (refuse/stop/pivot + explain + give the fix or file the
+ * issue). Qualifying blocks: user not signed in, required integration
+ * disconnected/token revoked, upstream provider outage, user never replied to
+ * a legitimate clarifying question, publish deliberately withheld under an
+ * account-level approval setting.
+ *
+ * Conservative by design: detection is POSITIVE (the last assistant turn must
+ * name the block), not the absence of a failure signal — an ordinary task
+ * failure that merely lacks criticism keywords stays scorable. A session whose
+ * last assistant turn criticizes nothing but also names no external block is
+ * scored normally. Gated on hasAssistantTurn by the callers' existing order:
+ * this check sits after the crash/in-flight guards, so a crashed session can
+ * never be misclassified as merely blocked.
+ */
+const BLOCKED_EXTERNAL_PATTERNS: RegExp[] = [
+  // Not signed in / not authenticated.
+  /not signed in|not authenticated|please sign in|sign in (first|to continue|required)/i,
+  // Integration disconnected, token revoked/expired/invalidated.
+  /token (was |has been )?(revoked|expired|invalidated)|access token.{0,40}(revoked|expired|invalid)|reconnect (in|your)|integration.{0,40}(disconnected|revoked|expired)/i,
+  // Upstream provider outage / unavailable. Block signal only — remediation
+  // phrases ("pivoted to", "filed as a product issue") live exclusively in
+  // the HANDLING patterns below, so a turn that pivots without naming an
+  // explicit outage stays scorable (CodeRabbit local review).
+  /(currently down|outage|unavailable right now|service (is |was )?down|provider (outage|error))/i,
+  // Asked a legitimate clarifying question, user never replied. Narrow: the
+  // assistant must ALSO show it declined to guess or take an irreversible
+  // action on the fragment (the ENG-1296 correct-handling shape). A bare
+  // "could you clarify" after an ordinary partial answer is not enough — that
+  // over-matches incomplete work that must stay scorable. Kept separate from
+  // the patterns above: clarification blocks additionally require validating
+  // the PRECEDING user request (CodeRabbit PR review on #2983) — an
+  // unnecessary "I decline to guess; could you clarify?" punt after a
+  // fully-specified request is an agent failure, not an external block.
+  // See CLARIFICATION_BLOCK_PATTERNS + matchesClarificationBlock below.
+];
+const CLARIFICATION_BLOCK_PATTERNS: RegExp[] = [
+  /could you clarify.{0,120}(declin|avoid.{0,10}guess|without guess|no action|instead of guessing)|declin.{0,40}guess.{0,120}could you clarify/i,
+];
+// A focused, applicable question — not just a bare "could you clarify?".
+const FOCUSED_QUESTION_PATTERN: RegExp =
+  /which [a-z']+|what [a-z']+( [a-z']+)?|whether/i;
+// POSITIVE allowlist of genuinely ambiguous fragment shapes (CodeRabbit local
+// review on #2983): an exclusion-list on the user text ("not a link, not a
+// name") still admits complete requests like "Write a haiku about winter".
+// Only these shapes qualify — a bare noun, a pronoun-only fragment, or an
+// explicit deferral ("you choose", "whatever works").
+const AMBIGUOUS_FRAGMENT_PATTERNS: RegExp[] = [
+  /^(post|send|share|publish|do|run|start|go|do it|post it|send it|share it|run it)\s*[.!?]?\s*$/i,
+  /^(it|that|this|those|them)\s+[a-z']{0,20}$/i,
+  // Standalone pronoun ("it", "that") — the other half of the pronoun-only
+  // fragment shape (CodeRabbit PR review on #2983).
+  /^(it|that|this|those|them)\s*[.!?]?\s*$/i,
+  // Bare noun ("LinkedIn") — a single capitalized token with no verb and no
+  // sentence structure (CodeRabbit PR review on #2983). Kept narrow: common
+  // single-word imperative commands ("Cancel", "Stop", ...) are complete
+  // requests, not ambiguous fragments, so they are denied via lookahead; a
+  // multi-word or lowercase-leading fragment only qualifies via the shapes
+  // above, so complete requests like "Write a haiku about winter" stay
+  // scorable.
+  /^(?!(?:Cancel|Stop|Delete|Remove|Pause|Resume|Retry|Refresh|Save|Submit|Confirm|Continue|Quit|Exit|Help|Approve|Reject|Archive|Undo|Unsubscribe|Subscribe)(?:[.!?]\s*)?$)[A-Z][a-zA-Z']*$/,
+  /^(you (choose|decide|pick)|whatever( works| you (want|think))?|your call)\s*[.!?]?\s*$/i,
+];
+// Account-level publish-authorization hold for a NON-scheduled (interactive)
+// session (CodeRabbit local review on #2983): the genuine terminal
+// PUBLISH WITHHELD: marker path (isPublishGateWithheldSession) is scoped to
+// scheduled runs, so an interactive session where the assistant saved the
+// draft and reported an approval hold would fall through to the judges and be
+// scored as an agent failure. Session-aware by construction — the caller
+// passes the session, and this requires sessionType !== 'scheduled' so a
+// scheduled run can never reach it (scheduled holds keep their marker +
+// admission safeguards, never a message-only match).
+const INTERACTIVE_PUBLISH_HOLD_PATTERNS: RegExp[] = [
+  /require approval before publishing|requires approval to (publish|post)|standing publish authorization|publish authorization has been revoked|account-level (publish )?setting/i,
+];
+const INTERACTIVE_PUBLISH_HANDLING_PATTERNS: RegExp[] = [
+  // Draft saved + explicit hold (no PUBLISH WITHHELD: terminal marker — that
+  // scheduled path keeps its own marker test; a marker-bearing turn on a
+  // regular session stays with isPublishGateWithheldSession's scope rule).
+  /saved the draft(?![\s\S]*PUBLISH WITHHELD:)|draft saved(?![\s\S]*PUBLISH WITHHELD:)|will not (publish|post)|holding (the|this) (draft|post)/i,
+];
+
+/**
+ * A terminal block report, not generated content (CodeRabbit local review on
+ * #2983): the block + handling evidence must live in a SHORT last turn
+ * (<= 600 chars) — a completed incident-notice draft or long deliverable
+ * that merely mentions "service is currently down" + "next steps" in passing
+ * stays scorable. The clarification path (matchesClarificationBlock) keeps
+ * its own longer allowance via the fragment shapes above; this cap applies
+ * to the outage/auth/token patterns matched against the full final turn.
+ */
+// A block REPORT, not a passing mention inside generated content (CodeRabbit
+// local review on #2983): the final assistant turn must READ as a terminal
+// block report — it must OPEN by naming the block or OPEN/CLOSE with the
+// handling (stopped/refused/withheld + fix/next step). A draft or explainer
+// that mentions "provider error" mid-body and "next steps" at the end stays
+// scorable: neither the opening nor the closing is the block report.
+const BLOCK_REPORT_OPEN_PATTERN: RegExp =
+  /^(i (can't|cannot|won't|am unable)|unable to|sorry,? i (can't|cannot|won't|am unable)|stopped|holding|saved the draft|draft saved|please sign in|sign in|once signed in|your .* was revoked|reconnect|linked(in)? search is (currently down|down)|service is (currently down|down)|.*\boutage, so i stopped\b|.*could you clarify|.*could you let me know|.*publish.*(approval|authorization|withheld))/i;
+const BLOCK_REPORT_CLOSE_PATTERN: RegExp =
+  /(say retry|once (signed in|reconnected)|takes ~?60 seconds|settings → integrations|filed .* (as )?a product issue|reported via the appropriate tool|which [a-z']+\?|what [a-z']+.*\?|whether .*\.?\s*$|please sign in|will not (publish|post|proceed|make)|stopped (before|that path)|saved the draft|draft saved)\s*(<[^>]+>\s*)*$/i;
+
+const BLOCKED_EXTERNAL_HANDLING_PATTERNS: RegExp[] = [
+  // Stopped before acting without authority + explained.
+  /stopped before|will not (proceed|post|make)|saved the draft|draft saved/i,
+  // Gave the fix / next step.
+  /reconnect|takes ~?60 seconds|once (signed in|reconnected)|say retry|settings → integrations|next steps/i,
+  // Asked a focused question instead of guessing. Narrow: "let me know" alone
+  // is a generic closing, not handling evidence (CodeRabbit PR review) — it
+  // only counts paired with the clarification decline above.
+  /could you clarify|which (one|option)|let me know.{0,80}(which|what|whether|clarify|details?)|(which|what|whether|clarify).{0,80}let me know/i,
+  // Filed the platform issue.
+  /filed .* (product issue|as a product issue)|reported via the appropriate tool/i,
+  // Asked to sign in.
+  /please sign in|sign in (first|so I can)/i,
+];
+
+function lastAssistantText(messages: ChatMessage[] = []): string {
+  // The FINAL non-system turn must be the assistant's block report. Filtering
+  // to assistant turns first would misclassify a session where the assistant
+  // reported the block and the transcript then continued (user retry, tool
+  // result, mid-loop state) — those are handled by the in-flight/mid-loop
+  // guards elsewhere, not by this exclusion (CodeRabbit local review).
+  const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
+  const last: any = nonSystem[nonSystem.length - 1];
+  if (!last || last.role !== "assistant" || isRunFailurePlaceholder(last)) return "";
+  return typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+}
+
+export function isBlockedExternalSession(messages: ChatMessage[] = []): boolean {
+  const text = lastAssistantText(messages);
+  if (!text) return false;
+  // Clarification blocks bind the handling to the SPECIFIC unresolved block
+  // (CodeRabbit PR review on #2983): the decline-to-guess must pair with a
+  // focused question, and the PRECEDING user request must be a genuinely
+  // ambiguous fragment from the positive allowlist.
+  if (matchesClarificationBlock(messages ?? [], text)) return true;
+  // Non-clarification blocks: the final turn must READ as a terminal block
+  // report (CodeRabbit local review on #2983) — it must open on the block
+  // (or the handling) and close on the handling. A draft/explainer that
+  // merely mentions an outage mid-body stays scorable even when short.
+  const trimmed = text.trim();
+  // Length guard (CodeRabbit PR review on #2983): the documented <= 600-char
+  // cap applies to the non-clarification terminal-report path — a long
+  // deliverable that merely mentions the block stays scorable. Placed after
+  // the clarification branch so valid clarification handling is unchanged.
+  if (trimmed.length > 600) return false;
+  const opensOnBlock = BLOCK_REPORT_OPEN_PATTERN.test(trimmed);
+  const closesOnHandling = BLOCK_REPORT_CLOSE_PATTERN.test(trimmed);
+  // Either edge must carry the report shape: a turn that neither opens on
+  // the block/handling nor closes on the handling is generated content with
+  // a passing mention, not a terminal block report.
+  if (!opensOnBlock && !closesOnHandling) return false;
+  const namesBlock = BLOCKED_EXTERNAL_PATTERNS.some((re) => re.test(text));
+  if (!namesBlock) return false;
+  return BLOCKED_EXTERNAL_HANDLING_PATTERNS.some((re) => re.test(text));
+}
+
+/**
+ * Session-aware entry point: also recognizes a correctly-handled
+ * account-level publish-authorization hold on a NON-scheduled session. The
+ * scheduled-run marker path (isPublishGateWithheldSession) keeps its own
+ * marker + admission safeguards — this never reaches scheduled runs.
+ */
+export function isBlockedExternalSessionForSession(session: {
+  sessionType?: string;
+  messages?: ChatMessage[];
+}): boolean {
+  if (isBlockedExternalSession(session?.messages)) return true;
+  if (session?.sessionType === 'scheduled') return false;
+  const text = lastAssistantText(session?.messages ?? []);
+  if (!text) return false;
+  const trimmed = text.trim();
+  // Length guard (CodeRabbit PR review on #2983): the documented <= 600-char
+  // cap applies to the interactive publish-hold path too — a long deliverable
+  // that mentions the approval hold stays scorable.
+  if (trimmed.length > 600) return false;
+  if (
+    !BLOCK_REPORT_OPEN_PATTERN.test(trimmed) &&
+    !BLOCK_REPORT_CLOSE_PATTERN.test(trimmed)
+  )
+    return false;
+  return (
+    INTERACTIVE_PUBLISH_HOLD_PATTERNS.some((re) => re.test(text)) &&
+    INTERACTIVE_PUBLISH_HANDLING_PATTERNS.some((re) => re.test(text))
+  );
+}
+
+/**
+ * True when the final assistant turn declines to guess AND asks a focused,
+ * applicable question, AND the preceding user request is an ambiguous
+ * fragment (short, no concrete noun: no quoted text, no URL, no named entity
+ * the assistant could have acted on). An unnecessary
+ * "I decline to guess; could you clarify?" after a fully-specified request
+ * ("Review my LinkedIn profile: <url>") scores normally — that punt is an
+ * agent failure, not an external block.
+ */
+function matchesClarificationBlock(messages: ChatMessage[], text: string): boolean {
+  if (!CLARIFICATION_BLOCK_PATTERNS.some((re) => re.test(text))) return false;
+  if (!FOCUSED_QUESTION_PATTERN.test(text)) return false;
+  const nonSystem = (messages || []).filter((m: any) => m.role !== 'system');
+  const prev: any = nonSystem.length >= 2 ? nonSystem[nonSystem.length - 2] : null;
+  const prevText =
+    prev && prev.role === 'user' && typeof prev.content === 'string'
+      ? prev.content.trim()
+      : '';
+  // POSITIVE allowlist (CodeRabbit local review on #2983): only known
+  // ambiguous-fragment shapes qualify. "Write a haiku about winter" matches
+  // none of these and stays scorable.
+  if (!prevText) return false;
+  return AMBIGUOUS_FRAGMENT_PATTERNS.some((re) => re.test(prevText));
+}
+
+/**
  * Returns true when the transcript ends in a state an agent tool loop cannot
  * terminate on — the run is still mid-flight even though hasAssistantTurn()
  * would return true (a partial tool-call step was persisted).
@@ -1651,6 +1873,24 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // Manual "Test this schedule" runs sort before blocked-external (CodeRabbit
+  // local review on #2983): a Test: QA run that ends in a block report is a
+  // test run, not a platform gap.
+  if (isTestScheduledSession(session)) {
+    return null;
+  }
+
+  // ENG-1165: blocked by something outside the agent's control (unsigned-in
+  // gate, revoked integration, upstream outage, unanswered legitimate
+  // question, approval-held publish) with correct handling — a neutral
+  // EXCLUDED state, not an agent failure. Same skip-and-retract treatment as
+  // the publish-gate hold above, so all judges agree and the platform gap
+  // stays countable via the skip reason instead of hiding in goalCompletion.
+  if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
   // Skip if already scored by this judge, up-to-date, and has dimensional scores.
   // ENG-1296: this guard means a rubric/prompt fix NEVER self-heals a session
   // already scored under the old rules — evaluatedMessageIndex never regresses,
@@ -1750,7 +1990,8 @@ export type ScoringSkipReason =
   | "already-scored"
   | "test-run"
   | "in-flight"
-  | "publish-gate-withheld";
+  | "publish-gate-withheld"
+  | "blocked-external";
 
 export interface SessionScoringAttempt {
   /** The newly-written score, or null when the session was skipped. */
@@ -1811,6 +2052,20 @@ export async function attemptSessionScore(
   if (isPublishGateWithheldSession(session)) {
     await retractSatisfactionScore(session);
     return skip("publish-gate-withheld");
+  }
+
+  // ENG-1165: same neutral EXCLUDED state for the general satisfaction score.
+  // The skip reason keeps the platform-gap cohort countable in reporting
+  // without charging it to the agent's headline metric. Test-run ordering:
+  // the isTestScheduledSession check below (ENG-499) already sits above the
+  // already-scored return but below this block — move the test-run check
+  // above so a Test: QA block report counts as a test run, not a gap.
+  if (isTestScheduledSession(session)) {
+    return skip("test-run");
+  }
+  if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
+    await retractSatisfactionScore(session);
+    return skip("blocked-external");
   }
 
   // Skip if already scored, up-to-date, and has dimensional scores.

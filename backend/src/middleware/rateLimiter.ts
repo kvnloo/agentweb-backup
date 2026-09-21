@@ -21,6 +21,49 @@ export class RateLimiter {
   // source IPs hitting a public endpoint). Cap chosen generously above any
   // realistic legitimate per-minute unique-caller count for this process.
   private maxEntries: number;
+  // Incremental eviction state (ENG-1768): the full-map scan in
+  // findEvictionCandidate filtered every entry's timestamps on each
+  // over-capacity request — O(n) timestamp checks per call, ~250k at the
+  // 50k default cap under an all-blocked flood. Instead, check() maintains
+  // an insertion-ordered queue of non-blocked keys; the head is always a
+  // safe eviction candidate, so the all-blocked case only needs a cheap
+  // head-validity walk instead of a full timestamp filter.
+  // Invariant: every key in evictQueue is present in entries (stale heads
+  // are skipped lazily at eviction time).
+  private evictQueue: string[] = [];
+  private evictQueueHeads: Set<string> = new Set();
+  // Head offset into evictQueue (ENG-1768 follow-up): heads are removed by
+  // advancing this index instead of Array.shift(), which would reindex the
+  // whole array per removal — O(N^2) to drain N heads under flood. The
+  // consumed prefix is compacted away once it grows large (amortized O(1)).
+  private evictQueueHead = 0;
+  // Block-expiry records (ENG-1768 CodeRabbit follow-up): when check()
+  // rejects a key as blocked, its window-expiry (oldest in-window timestamp
+  // + windowMs) is recorded here. findEvictionCandidate promotes only keys
+  // whose recorded expiry has passed instead of scanning every entry's
+  // timestamps per eviction — a full-map sweep here restored O(n) work per
+  // request under a sustained distinct-key flood at capacity. A watermark
+  // (nextUnblockAt) skips the promotion scan entirely until some recorded
+  // key can actually have expired, so the common case stays O(1).
+  private blockedUntil: Map<string, number> = new Map();
+  private nextUnblockAt = Infinity;
+
+  // Removes the current queue head, compacting the consumed prefix when it
+  // grows large enough that slicing pays for itself. Callers must also
+  // evictQueueHeads.delete(key) for the removed head.
+  private shiftEvictQueue(): void {
+    this.evictQueueHead++;
+    if (this.evictQueueHead >= this.evictQueue.length) {
+      this.evictQueue = [];
+      this.evictQueueHead = 0;
+    } else if (
+      this.evictQueueHead >= 1024 &&
+      this.evictQueueHead * 2 >= this.evictQueue.length
+    ) {
+      this.evictQueue = this.evictQueue.slice(this.evictQueueHead);
+      this.evictQueueHead = 0;
+    }
+  }
 
   constructor(cleanupIntervalMs: number = 60000, maxEntries: number = 50000) {
     this.cleanupInterval = setInterval(() => this.cleanup(), cleanupIntervalMs);
@@ -33,40 +76,74 @@ export class RateLimiter {
 
   /**
    * Picks a key safe to evict at capacity, in priority order:
-   *   1. A key with no timestamps left in the window (fully idle) — freeing
-   *      it changes nothing observable.
-   *   2. A key that is tracked but NOT currently at/over its own limit
-   *      (i.e. not blocked) — evicting it just means its next request looks
-   *      "fresh", which is the same relaxation the old oldest-insertion
-   *      eviction already accepted for non-blocked keys.
-   *   3. Only if every single tracked key is currently blocked, fall back to
-   *      the oldest insertion — still bounds memory, and this case requires
-   *      >= maxEntries simultaneously-blocked distinct keys, an extreme
-   *      flood scenario where evicting one blocked key slightly early is an
-   *      acceptable trade against unbounded growth.
+   *   1. The head of the incremental non-blocked queue (a key that was
+   *      idle or under-limit when last checked) — O(1) amortized, with a
+   *      cheap lazy skip over stale/already-evicted heads.
+   *   2. Blocked keys whose recorded window-expiry has passed are promoted
+   *      back into the queue first (no timestamp filtering — expiry was
+   *      recorded when the key was last rejected). Only keys in
+   *      `blockedUntil` are ever examined, and only once the `nextUnblockAt`
+   *      watermark says at least one can have expired.
+   *   3. Only if no unblocked key is known (every tracked key currently
+   *      blocked) fall back to the oldest insertion — still bounds memory,
+   *      and this case requires >= maxEntries simultaneously-blocked
+   *      distinct keys, an extreme flood scenario where evicting one
+   *      blocked key slightly early is an acceptable trade against
+   *      unbounded growth.
+   * The caller re-queues keys that transition back to non-blocked, so the
+   * queue never goes permanently stale while non-blocked keys exist.
    */
   private findEvictionCandidate(now: number): string | undefined {
-    const windowStart = now - this.windowMs;
-    let blockedFallback: string | undefined;
-
-    for (const [key, entry] of this.entries.entries()) {
-      const activeCount = entry.timestamps.filter((t) => t > windowStart).length;
-
-      if (activeCount === 0) {
-        return key; // fully idle — safe to evict immediately
+    // Cheap promotion: only recorded-blocked keys can re-qualify, and only
+    // once the watermark says at least one expiry may have passed. No
+    // full-map scan of entries — under a sustained distinct-key flood this
+    // path runs per request at capacity.
+    if (now >= this.nextUnblockAt && this.blockedUntil.size > 0) {
+      let next = Infinity;
+      for (const [key, unblockAt] of this.blockedUntil) {
+        if (now < unblockAt) {
+          if (unblockAt < next) next = unblockAt;
+          continue;
+        }
+        this.blockedUntil.delete(key);
+        if (!this.evictQueueHeads.has(key) && this.entries.has(key)) {
+          this.evictQueue.push(key);
+          this.evictQueueHeads.add(key);
+        }
       }
-
-      const isBlocked = activeCount >= entry.lastMax;
-      if (!isBlocked) {
-        return key; // active but under its own limit — safe to evict
-      }
-
-      if (blockedFallback === undefined) {
-        blockedFallback = key;
-      }
+      this.nextUnblockAt = next;
     }
+    while (this.evictQueueHead < this.evictQueue.length) {
+      const key = this.evictQueue[this.evictQueueHead];
+      const entry = this.entries.get(key);
+      if (!entry) {
+        // Stale head: key already evicted — drop and continue.
+        this.shiftEvictQueue();
+        this.evictQueueHeads.delete(key);
+        continue;
+      }
+      const windowStart = now - this.windowMs;
+      const activeCount = entry.timestamps.filter((t) => t > windowStart).length;
+      if (activeCount === 0 || activeCount < entry.lastMax) {
+        return key; // idle or under-limit — safe to evict immediately
+      }
+      // Head is currently blocked; drop it from the queue (promotion above
+      // re-queues it once its recorded expiry passes) and keep walking —
+      // this walk only visits keys once per state change, never the full
+      // timestamp volume per call.
+      this.shiftEvictQueue();
+      this.evictQueueHeads.delete(key);
+    }
+    // Every tracked key is currently blocked: fall back to oldest insertion.
+    const oldest = this.entries.keys().next();
+    return oldest.done ? undefined : oldest.value;
+  }
 
-    return blockedFallback;
+  private trackEvictable(key: string): void {
+    if (!this.evictQueueHeads.has(key)) {
+      this.evictQueue.push(key);
+      this.evictQueueHeads.add(key);
+    }
   }
 
   check(key: string, maxPerMinute: number): RateLimitResult {
@@ -81,6 +158,7 @@ export class RateLimiter {
         const evictKey = this.findEvictionCandidate(now);
         if (evictKey !== undefined) {
           this.entries.delete(evictKey);
+          this.evictQueueHeads.delete(evictKey);
         }
       }
       entry = { timestamps: [], lastMax: maxPerMinute };
@@ -95,6 +173,13 @@ export class RateLimiter {
     if (entry.timestamps.length >= maxPerMinute) {
       const oldestInWindow = entry.timestamps[0];
       const resetInMs = oldestInWindow + this.windowMs - now;
+      // Record when this key's current window expires so eviction can
+      // promote it back as a candidate without scanning all entries'
+      // timestamps on each at-capacity request. Only recorded keys are
+      // ever scanned, gated by the nextUnblockAt watermark.
+      const unblockAt = oldestInWindow + this.windowMs;
+      this.blockedUntil.set(key, unblockAt);
+      if (unblockAt < this.nextUnblockAt) this.nextUnblockAt = unblockAt;
       return {
         allowed: false,
         remaining: 0,
@@ -103,6 +188,12 @@ export class RateLimiter {
     }
 
     entry.timestamps.push(now);
+    // Key just proved itself non-blocked — keep it available as a future
+    // eviction candidate so the queue never drains while such keys exist.
+    // Any stale block-expiry record for it is now wrong; drop it so the
+    // promotion pass never re-queues a key that just changed state.
+    this.blockedUntil.delete(key);
+    this.trackEvictable(key);
     const remaining = maxPerMinute - entry.timestamps.length;
     const resetInMs = entry.timestamps[0] + this.windowMs - now;
 
@@ -121,6 +212,7 @@ export class RateLimiter {
       entry.timestamps = entry.timestamps.filter((t) => t > windowStart);
       if (entry.timestamps.length === 0) {
         this.entries.delete(key);
+        this.blockedUntil.delete(key);
       }
     }
   }
@@ -131,6 +223,11 @@ export class RateLimiter {
       this.cleanupInterval = null;
     }
     this.entries.clear();
+    this.evictQueue = [];
+    this.evictQueueHead = 0;
+    this.evictQueueHeads.clear();
+    this.blockedUntil.clear();
+    this.nextUnblockAt = Infinity;
   }
 }
 

@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
+import { OpeningAction, validateOpeningAction } from "../utils/openingActionValidation";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -51,6 +52,7 @@ export interface Skill {
   triggerMode?: SkillTriggerMode;
   schedule?: SkillSchedule;
   welcomeMessage?: string;
+  openingAction?: OpeningAction;
   llmModel?: string;
   maxIterations?: number;
   isBuiltIn?: boolean;
@@ -294,6 +296,8 @@ export class SkillService {
   async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<string> {
     const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
     if (welcomeMessageError) throw new Error(welcomeMessageError);
+    const openingActionError = validateOpeningAction(skill.openingAction, skill.toolNames || []);
+    if (openingActionError) throw new Error(openingActionError);
     const updatedAt = new Date().toISOString();
     const skillItem: any = {
       ...skill,

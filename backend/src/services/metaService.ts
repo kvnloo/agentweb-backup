@@ -1716,57 +1716,14 @@ export class MetaService {
   }
 
   /**
-   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   * Return caller-resolved creative `url_tags` verbatim.
    *
-   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
-   * this both honours a caller who hand-authored tracking and preserves the
-   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
-   *
-   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
-   * utm_campaign / utm_content as Meta click-time macros).
-   *
-   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
-   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
-   * param on the click URL. We therefore omit any UTM key the reference URL already
-   * carries; if it carries them all, `utmQueryString` returns "" and we return
-   * undefined so the caller writes no `url_tags` field at all.
-   *
-   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
-   * on the creative, but there is only one tag string. We reference `params.link_url`
-   * (the single-image/video link, and the carousel fallback link at :989). Carousels
-   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
-   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
-   * reference URL exists at all, we omit nothing and emit the full set.
+   * Customer defaults and per-lander overrides are resolved in AgentMode, where
+   * both the authenticated customer and optional lander id are available. This
+   * Meta boundary deliberately does not implement a second precedence system.
    */
   private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
-    if (params.url_tags) {
-      return params.url_tags;
-    }
-
-    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
-    // creative (the top-level link and every carousel card). So a key must be omitted
-    // if ANY of those links already carries it — emitting it would give that link the
-    // param twice, and a duplicated utm_source corrupts the very attribution this
-    // feature exists to produce. The cost is that a card the user tagged only
-    // partially may stay under-tagged; that is strictly better than a duplicate.
-    const linkUrls = [
-      params.link_url,
-      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
-    ].filter((u): u is string => Boolean(u));
-
-    const omit = new Set<string>();
-    for (const url of linkUrls) {
-      const keys = readUtmKeys(url);
-      // Unreadable link → we cannot know what it already carries, so we do not tag at
-      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
-      // (precise) error; tagging must never be the thing that breaks an ad build.
-      if (!keys) return undefined;
-      for (const k of keys) omit.add(k);
-    }
-
-    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
-    const tags = utmQueryString(spec, omit);
-    return tags || undefined;
+    return params.url_tags || undefined;
   }
 
   /**
@@ -2709,6 +2666,37 @@ export class MetaService {
       return result._data;
     } catch (error) {
       return this.handleError(error, 'getAdCreative');
+    }
+  }
+
+  /** Render one existing ad or creative in a Meta placement. */
+  public async generateAdPreview(accessToken: string, nodeId: string, adFormat: string) {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    try {
+      const response = await axios.get(
+        `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(nodeId)}/previews`,
+        {
+          params: { ad_format: adFormat, access_token: accessToken },
+          timeout: META_READ_CALL_TIMEOUT_MS,
+          maxContentLength: 1_000_000,
+        },
+      );
+      const rows = response?.data?.data;
+      if (
+        !Array.isArray(rows)
+        || rows.length === 0
+        || rows.some((row: any) => !row || typeof row.body !== 'string' || row.body.trim().length === 0)
+      ) {
+        throw new Error('Meta returned an invalid ad preview response.');
+      }
+      return rows.map((row: any) => ({ body: row.body }));
+    } catch (error) {
+      const responseData = (error as any)?.response?.data;
+      const safeError = new Error((error as any)?.message || 'Meta ad preview request failed.');
+      if (responseData) {
+        (safeError as any).response = { data: responseData };
+      }
+      return this.handleError(safeError, 'generateAdPreview');
     }
   }
 

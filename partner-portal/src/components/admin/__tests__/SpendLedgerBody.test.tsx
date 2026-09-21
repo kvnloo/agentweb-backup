@@ -584,3 +584,75 @@ describe("SpendLedgerBody enforcement state (ENG-1886)", () => {
     expect(screen.queryByTestId("spend-ledger-enforcement")).not.toBeInTheDocument();
   });
 });
+
+// ── ENG-1841: rows the server left out are still stated ─────────────────────
+
+describe("SpendLedgerBody with server-bounded rows (ENG-1841)", () => {
+  const rows = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      key: `s${i}`,
+      settledMicroUsd: 1_000,
+      reservedMicroUsd: 0,
+      eventCount: 1,
+      percentOfSettled: 1,
+    }));
+
+  it("counts rows the server omitted in 'of N' and 'more not shown'", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          bySession: rows(100),
+          omitted: { bySession: { rows: 407, eventCount: 407, settledMicroUsd: 407_000, reservedMicroUsd: 0 } },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-slice-bySession-more")).toHaveTextContent(
+      `Showing the ${MAX_ROWS_PER_CUT} largest of 507 — ${507 - MAX_ROWS_PER_CUT} more not shown, but included in every total above.`,
+    );
+  });
+
+  it("states a remainder even when the server list alone fits on screen", () => {
+    render(
+      <SpendLedgerBody
+        data={payload({
+          bySession: rows(3),
+          omitted: { bySession: { rows: 2, eventCount: 2, settledMicroUsd: 2_000, reservedMicroUsd: 0 } },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-slice-bySession-more")).toHaveTextContent("Showing the 3 largest of 5 — 2 more not shown");
+  });
+
+  it("counts omitted open reservations too", () => {
+    const inFlight = Array.from({ length: 30 }, (_, i) => ({
+      eventId: `r${i}`,
+      occurredAt: "2026-09-04T10:00:00.000Z",
+      provider: "v0",
+      operation: "generate",
+      costMicroUsd: 1_000,
+      actingUserId: "member-1",
+    }));
+    render(
+      <SpendLedgerBody
+        data={payload({
+          inFlight,
+          inFlightMicroUsd: 40_000,
+          omitted: { inFlight: { rows: 10, eventCount: 10, settledMicroUsd: 0, reservedMicroUsd: 10_000 } },
+          projection: projection({ reservedMicroUsd: 40_000, reservedEventCount: 40 }),
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("spend-ledger-inflight-more")).toHaveTextContent(
+      `Showing the ${MAX_ROWS_PER_CUT} most recent of 40 open reservations — ${40 - MAX_ROWS_PER_CUT} more not shown`,
+    );
+  });
+
+  it("AC4: without omitted rows the screen is exactly as before", () => {
+    render(<SpendLedgerBody data={payload({ bySession: rows(3) })} />);
+
+    expect(screen.queryByTestId("spend-slice-bySession-more")).not.toBeInTheDocument();
+  });
+});

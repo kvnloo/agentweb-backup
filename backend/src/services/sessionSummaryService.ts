@@ -1,5 +1,8 @@
 import { chatbotDb, ChatSession } from "./chatbotService";
 import { detectFalseCompletionClaim, ExecutedToolCall } from "./agentMode/core/synthesisResidue";
+import { meteringFeature } from "./llmUsageAttributionService";
+import { extractScheduleId } from "../utils/schedulePublishApproval";
+import type { LLMUsageContext } from "../utils/llmService";
 
 const SUMMARY_MODEL = "gemini-3.1-flash-lite";
 const MAX_MESSAGES_FOR_SUMMARY = 50;
@@ -22,7 +25,8 @@ Respond with ONLY valid JSON: {"summary": "<1-2 sentence summary>"}`;
 
 export async function summarizeSession(
   messages: Array<{ role: string; content: string }>,
-  currentMessageCount: number
+  currentMessageCount: number,
+  usageContext?: LLMUsageContext
 ): Promise<{ summary: string; evaluatedMessageIndex: number }> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SUMMARY);
   const conversationText = recentMessages
@@ -42,6 +46,8 @@ export async function summarizeSession(
       max_completion_tokens: 200,
       response_format: { type: "json_object" },
       taskClass: 'nonstandard_consumer',
+      // ENG-1858: summarizing the user's own session — attribute it to them.
+      usageContext: usageContext ?? { feature: "session_summary" },
     }
   );
 
@@ -109,7 +115,12 @@ export async function summarizeSessionIfNeeded(
       content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
     }));
 
-  const result = await summarizeSession(simplifiedMessages, messageCount);
+  // ENG-1858: bill the summary to the session owner instead of "system".
+  const result = await summarizeSession(simplifiedMessages, messageCount, {
+    userId: session.userId,
+    sessionId: session.sessionId,
+    feature: meteringFeature("session_summary", session.sessionType, extractScheduleId(session.pageIdentifier)),
+  });
 
   let summaryText = result.summary;
   const toolCallLedger = flattenSessionToolCalls(session.messages);
