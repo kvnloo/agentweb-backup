@@ -333,4 +333,82 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       });
     });
   });
+
+  // ENG-738: perform_deep_research previously fell through to the generic `{}`
+  // fallback, which drops success/partial/error — the exact fields the
+  // open-research-request tracker needs to tell a real success from a
+  // still-unresolved partial/timeout result using only this minimized entry.
+  describe('perform_deep_research result extraction (ENG-738)', () => {
+    it('preserves success and the research URL on a completed result', () => {
+      const result = {
+        success: true,
+        message: 'Deep research completed successfully. Generated 2200 words of content and saved to S3.',
+        data: {
+          research_url: 'https://s3.amazonaws.com/bucket/research.md',
+          title: 'AI in Marketing',
+          summary: 'Summary text',
+          word_count: 2200,
+          research_depth: 'detailed',
+          topic: 'AI in marketing'
+        }
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        research_url: 'https://s3.amazonaws.com/bucket/research.md',
+        research_depth: 'detailed',
+      });
+    });
+
+    it('preserves success:false, partial, and a truncated error on a partial/timeout result', () => {
+      const result = {
+        success: false,
+        partial: true,
+        message: 'Deep research on "Semiconductor architecture" didn\'t finish before the time budget ran out...',
+        error: 'Deep research timed out. Please try again with a more specific topic.',
+        data: {
+          research_url: 'https://s3.amazonaws.com/bucket/partial.md',
+          research_depth: 'comprehensive',
+          topic: 'Semiconductor architecture'
+        }
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        partial: true,
+        error: 'Deep research timed out. Please try again with a more specific topic.',
+        research_url: 'https://s3.amazonaws.com/bucket/partial.md',
+        research_depth: 'comprehensive',
+      });
+    });
+
+    it('preserves success:false without a partial flag on a plain failure', () => {
+      const result = {
+        success: false,
+        message: 'Deep Research service is not available. Please check API key configuration.',
+        error: 'Service unavailable'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        error: 'Service unavailable',
+      });
+    });
+
+    it('truncates a very long error to avoid bloating stored history', () => {
+      const longError = 'x'.repeat(500);
+      const result = { success: false, error: longError };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
+
+      expect(minimalResult.error.length).toBeLessThanOrEqual(200);
+      expect(longError.startsWith(minimalResult.error)).toBe(true);
+    });
+  });
 });

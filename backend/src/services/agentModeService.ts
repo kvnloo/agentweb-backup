@@ -5870,6 +5870,22 @@ export class AgentModeService {
       };
     }
 
+    // ENG-738: previously fell through to the generic `{}` fallback below, which
+    // dropped success/partial/error — the open-research-request tracker
+    // (detectOpenResearchRequestChanges) needs these on the MINIMIZED entry to
+    // tell a real success from a still-unresolved partial/timeout result,
+    // since only this minimized form (not the full result) reaches toolCalls.
+    if (toolName === 'perform_deep_research') {
+      const r = result || {};
+      return {
+        ...(r.success !== undefined ? { success: r.success } : {}),
+        ...(r.partial ? { partial: true } : {}),
+        ...(typeof r.error === 'string' && r.error ? { error: r.error.slice(0, 200) } : {}),
+        ...(r.data?.research_url ? { research_url: r.data.research_url } : {}),
+        ...(r.data?.research_depth ? { research_depth: r.data.research_depth } : {}),
+      };
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
