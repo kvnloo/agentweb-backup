@@ -153,6 +153,91 @@ export async function enqueueJob(
   }
 }
 
+/**
+ * Delete a job row ONLY if it is in the terminal `failed` state. Returns whether it did.
+ *
+ * A dedupe key is normally permanent on purpose — that is what makes an enqueue idempotent.
+ * But a key derived from durable business state (ENG-926 §C keys on list + lead + Meta event,
+ * so a repeat transition collapses onto the same job) turns "terminally failed" into
+ * "permanently unreachable": once attempts are exhausted, every later genuine attempt is
+ * rejected as a duplicate, even hours later when the external dependency has recovered
+ * (Greptile P1 on #2412).
+ *
+ * Deliberately conditional on `status = failed`, so a pending, processing or completed job
+ * is never disturbed — in particular this can never resurrect work that already succeeded,
+ * and can never race a live processor.
+ */
+/** `not-failed` means the row is genuinely live or completed — stand down, someone else owns
+ *  it. `error` means we could not tell: a caller that treats the two alike gives up on a
+ *  conversion for a transient DynamoDB blip exactly as if another worker had it, with no
+ *  retry, no fallback and no marker (Greptile P1 on #2412). */
+export type ClearFailedJobResult = 'cleared' | 'not-failed' | 'error';
+
+export async function clearFailedJob(
+  source: string,
+  dedupeKey: string,
+): Promise<ClearFailedJobResult> {
+  const id = jobId(source, dedupeKey);
+  try {
+    await dynamodb
+      .delete({
+        TableName: TABLE_NAME,
+        Key: { id },
+        ConditionExpression: '#status = :failed',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':failed': 'failed' },
+      })
+      .promise();
+    console.log(`[AsyncJobQueue] cleared terminally-failed job ${id} so it can be retried`);
+    return 'cleared';
+  } catch (error: any) {
+    // The condition failing is the normal case: the job is still pending/processing, or it
+    // completed. Not an error, and not something to retry.
+    if (error?.code === 'ConditionalCheckFailedException') return 'not-failed';
+    console.warn(`[AsyncJobQueue] clearFailedJob errored for ${id}:`, error?.message ?? error);
+    return 'error';
+  }
+}
+
+/**
+ * Remove a job row outright.
+ *
+ * For a source whose dedupe key is derived from durable business state, "completed" is not a
+ * harmless terminal state — the row keeps rejecting every later enqueue for that same key
+ * forever. That is correct only if the work can never legitimately need doing again. Where a
+ * job finished WITHOUT doing the work (skipped because a customer had not opted in yet, or
+ * no pixel was connected at the time), the row would permanently suppress the conversion the
+ * moment the customer fixed the very thing that caused the skip (Greptile on #2412).
+ *
+ * Callers that guarantee once-only semantics by their own means — ENG-926 §C records sends
+ * on the lead itself — should delete rather than complete, so the queue never becomes a
+ * second, weaker source of truth that outlives the real one.
+ */
+export async function deleteJob(source: string, dedupeKey: string): Promise<void> {
+  const id = jobId(source, dedupeKey);
+  const remove = () => dynamodb.delete({ TableName: TABLE_NAME, Key: { id } }).promise();
+
+  try {
+    await remove();
+  } catch (firstError: any) {
+    // One immediate retry before giving up, matching every sibling write here
+    // (markJobComplete, markJobFailed, updateJobPayload). Losing this one is worse than
+    // losing those: the row is left occupying a dedupe key derived from durable business
+    // state, so every later enqueue for that key is rejected as a duplicate and the
+    // conversion is suppressed permanently — including after the customer fixes whatever
+    // caused the skip (Greptile P1 on #2412).
+    try {
+      await remove();
+    } catch (secondError: any) {
+      console.error(
+        `[AsyncJobQueue] deleteJob failed twice for ${id} — the row may block later work ` +
+        `for this key until stale reclamation clears it:`,
+        secondError?.message ?? secondError,
+      );
+    }
+  }
+}
+
 export async function markJobComplete(source: string, dedupeKey: string): Promise<void> {
   const id = jobId(source, dedupeKey);
   const writeCompleted = () =>
@@ -355,6 +440,12 @@ export function startHeartbeat(source: string, dedupeKey: string): () => void {
 
 type JobProcessor = (payload: any) => Promise<void>;
 const processors = new Map<string, JobProcessor>();
+/** Sources whose dedupe key is derived from durable business state. For these a finished job
+ *  must be REMOVED, not marked 'completed': the key is reused by design, and a lingering
+ *  terminal row rejects every later enqueue for it. The inline dispatch path already deletes;
+ *  without this the poller path would quietly re-introduce the blocking row it avoids
+ *  (Greptile P1 on #2412). */
+const deleteOnCompleteSources = new Set<string>();
 const maxAttemptsBySource = new Map<string, number>();
 
 /** Populated once per process at module-load time by each integration — mirrors how
@@ -371,10 +462,17 @@ const maxAttemptsBySource = new Map<string, number>();
  *  failure mode is "the outage/expired-token will eventually clear" rather than
  *  "a human needs to intervene" — it just keeps retrying instead of ever going
  *  terminally inert. */
-export function registerProcessor(source: string, handler: JobProcessor, options?: { maxAttempts?: number }): void {
+export function registerProcessor(
+  source: string,
+  handler: JobProcessor,
+  options?: { maxAttempts?: number; deleteOnComplete?: boolean },
+): void {
   processors.set(source, handler);
   if (options?.maxAttempts !== undefined) {
     maxAttemptsBySource.set(source, options.maxAttempts);
+  }
+  if (options?.deleteOnComplete) {
+    deleteOnCompleteSources.add(source);
   }
 }
 
@@ -422,15 +520,39 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
   try {
     const payload = JSON.parse(job.payload);
     await processor(payload);
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id: job.id },
-        UpdateExpression: 'SET #status = :completed, updatedAt = :now',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
-      })
-      .promise();
+
+    // Bookkeeping, NOT processing. It sits outside the failure path deliberately: the work
+    // is already done by this point, so letting a failed status write count as a processing
+    // failure would increment attempts and rewrite completed work as pending or failed —
+    // eventually exhausting the attempt budget and re-running side effects that already
+    // happened (Greptile P1 on #2412). One retry, then log; a stuck row is recovered by
+    // stale reclamation, whereas a mis-counted attempt is not recoverable at all.
+    const writeTerminalState = () =>
+      deleteOnCompleteSources.has(job.source)
+        ? dynamodb.delete({ TableName: TABLE_NAME, Key: { id: job.id } }).promise()
+        : dynamodb
+            .update({
+              TableName: TABLE_NAME,
+              Key: { id: job.id },
+              UpdateExpression: 'SET #status = :completed, updatedAt = :now',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
+            })
+            .promise();
+    try {
+      await writeTerminalState();
+    } catch (firstError: any) {
+      try {
+        await writeTerminalState();
+      } catch (secondError: any) {
+        console.error(
+          `[AsyncJobQueue] job ${job.id} PROCESSED successfully but its terminal write failed ` +
+          `twice — the row stays claimed until stale reclamation; it must NOT be counted as a ` +
+          `processing failure:`,
+          secondError?.message ?? secondError,
+        );
+      }
+    }
   } catch (error: any) {
     const attempts = (job.attempts ?? 0) + 1;
     const maxAttempts = maxAttemptsBySource.get(job.source) ?? MAX_ATTEMPTS;

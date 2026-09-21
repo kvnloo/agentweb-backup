@@ -39,7 +39,13 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getSupportedModels: jest.fn(),
     getDefaultModel: jest.fn()
-  }
+  },
+  // ENG-1802: the controller now imports the real title-normalization helper
+  // directly (not through the agentModeService object above), so this module
+  // mock must still provide it -- pull in the real implementation rather than
+  // stubbing it, since it's a pure string helper the title-matching tests
+  // below rely on behaving correctly.
+  normalizeWorkPlanTitleForMatch: jest.requireActual('../services/agentModeService').normalizeWorkPlanTitleForMatch,
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -388,6 +394,68 @@ describe('AgentModeController - createSessionWithPlan', () => {
       });
     });
 
+    // ENG-1331: this route was the only predefined-plan session-creation path that
+    // dropped expectedAssetCount on the floor — its sibling instantiation path
+    // (agentModeService.ts applyPredefinedWorkPlan) already carried it through. A
+    // template step declaring expectedAssetCount had nothing to enforce once a
+    // session was created via this route, which is confirmed (by pageIdentifier
+    // pattern) to be the exact route the production incident session used.
+    it('carries expectedAssetCount and expectedAssetCountTools from the template step into the session work plan (ENG-1331)', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) =>
+        Promise.resolve(
+          visibility === 'system'
+            ? [
+                {
+                  ...mockWorkPlans[0],
+                  steps: [
+                    { stepCount: 1, title: 'Step 1', description: 'First step', requiredFunctionCalls: ['function1'] },
+                    {
+                      stepCount: 2,
+                      title: 'Render Sizes',
+                      description: 'Render the matrix',
+                      expectedAssetCount: 12,
+                      expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+                    },
+                  ],
+                },
+              ]
+            : []
+        )
+      );
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.objectContaining({
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              stepCount: 2,
+              title: 'Render Sizes',
+              expectedAssetCount: 12,
+              expectedAssetCountTools: ['playwright_browser_take_screenshot'],
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('omits expectedAssetCount and expectedAssetCountTools when the template step does not declare them', async () => {
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      const call = mockChatbotDb.updateSessionWorkPlan.mock.calls.find((c) => c[0] === 'test-session-123');
+      const steps = (call?.[1] as any)?.steps ?? [];
+      for (const step of steps) {
+        expect(step).not.toHaveProperty('expectedAssetCount');
+        expect(step).not.toHaveProperty('expectedAssetCountTools');
+      }
+    });
+
     // ENG-508/ENG-867: the Founder LinkedIn audit plan carries the "LinkedIn Profile
     // Reader" skill on its profile-extraction step. Creating a session from the plan
     // must auto-install that skill, because tool filtering is computed at the start of
@@ -471,6 +539,42 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
       expect(res.json).toHaveBeenCalled();
+    });
+
+    // ENG-1802: the URL param match used to be `.toLowerCase()` only, so a
+    // template stored with an underscore-joined title (the common shape) never
+    // resolved from a naturally-typed, spaced :planTitle URL param. Switched to
+    // normalizeWorkPlanTitleForMatch, the same separator/case normalization
+    // applyPredefinedWorkPlan already uses (ENG-1794).
+    it('resolves a stored underscore-joined title against a spaced, mixed-case :planTitle param (ENG-1802)', async () => {
+      const underscoredPlans = [
+        {
+          planId: 'plan-underscored',
+          title: 'Founder_Linkedin_Sales_Readiness_Audit',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          welcomeMessage: 'Welcome!',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z',
+        },
+      ];
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') return Promise.resolve(underscoredPlans);
+        return Promise.resolve([]);
+      });
+      mockChatbotDb.createChatSession.mockResolvedValue({
+        ...mockSession,
+        pageIdentifier: 'plan-Founder Linkedin Sales Readiness Audit',
+      } as any);
+
+      const req = mockRequest('Founder LinkedIn Sales Readiness Audit');
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(404);
+      expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
     });
 
     it('should handle errors gracefully', async () => {
@@ -1005,7 +1109,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
         sessionId: 'test-session-123'
       }));
 
-      // Wait for the fire-and-forget to execute, fail, restart worker, wait 3s, and retry
+      // Wait for the fire-and-forget to execute, fail, pass the health check (mocked
+      // healthy by default), wait the short retry backoff, and retry.
       await new Promise(resolve => setTimeout(resolve, 4000));
 
       // First failure should be logged as warning
@@ -1020,6 +1125,57 @@ describe('AgentModeController - createSessionWithPlan', () => {
 
       warnSpy.mockRestore();
       errorSpy.mockRestore();
+    }, 10000);
+
+    // The blast-radius bug: restartWorker() SIGKILLs a worker process SHARED by every
+    // concurrent session, and its exit handler rejects every OTHER session's in-flight
+    // turn too — not just this one. Restarting unconditionally on any single session's
+    // transient failure (a rate limit, a bad tool call, anything unrelated to the worker
+    // process itself) took down every concurrent user for one unrelated hiccup. Fixed:
+    // ping the worker first: only restart when it's genuinely unresponsive.
+    it('does NOT restart the worker when it responds healthy — a single session\'s transient failure must not affect concurrent sessions', async () => {
+      mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const { generateMarketingResponseWorkerService } = jest.requireMock('../services/generateMarketingResponseWorkerService');
+      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValue(true);
+
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // No restart (and no 3s restart-path wait) to wait out — just the shorter
+      // healthy-path retry backoff.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      expect(generateMarketingResponseWorkerService.isWorkerHealthy).toHaveBeenCalled();
+      expect(generateMarketingResponseWorkerService.restartWorker).not.toHaveBeenCalled();
+
+      (console.warn as jest.Mock).mockRestore();
+      (console.error as jest.Mock).mockRestore();
+    });
+
+    it('DOES restart the worker when it fails to respond — the genuinely-unresponsive case is unchanged', async () => {
+      mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const { generateMarketingResponseWorkerService } = jest.requireMock('../services/generateMarketingResponseWorkerService');
+      // Once, not a standing override: clearMocks (jest.config.js) only resets call
+      // history between tests, not implementations — a plain mockResolvedValue(false)
+      // here would leak "unhealthy" into every later test in this file.
+      generateMarketingResponseWorkerService.isWorkerHealthy.mockResolvedValueOnce(false);
+
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
+      const res = mockResponse();
+      await agentModeController.createSessionWithPlan(req, res);
+
+      await new Promise(resolve => setTimeout(resolve, 4000));
+
+      expect(generateMarketingResponseWorkerService.isWorkerHealthy).toHaveBeenCalled();
+      expect(generateMarketingResponseWorkerService.restartWorker).toHaveBeenCalled();
+
+      (console.warn as jest.Mock).mockRestore();
+      (console.error as jest.Mock).mockRestore();
     }, 10000);
 
     it('should handle missing req.body gracefully', async () => {

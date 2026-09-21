@@ -8,23 +8,33 @@ import { getReleases } from "../controllers/release";
 import { fetchMintlifyDocsContent, chunkDocsContent } from "./docsKnowledgeSource";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
-import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
-import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
+// ENG-1277: type-only. `SearchServiceClient` (the value) is required lazily
+// inside searchPlatformKnowledgeBase() below — that function is the only
+// caller, and `@google-cloud/discoveryengine` pulls in ~379 transitive
+// modules that every jest worker previously paid on `require()` of this file
+// regardless of whether a test ever calls it. `EngineServiceClient` was
+// imported but never referenced anywhere in this file or its tests'
+// production paths (only in mock factories, which don't need the real
+// export to exist) — dropped rather than carried into the lazy form.
+import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
+import { isEvaluationUser } from './evaluationPolicy';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { AgentModeService } from './agentModeService';
+import { AgentModeService, agentModeService as agentModeServiceSingleton } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
-import { isTransientLLMError } from '../utils/agentModeErrors';
+import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
+import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import { WorkflowRunState } from './agentMode/core/workflow';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -49,15 +59,6 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
-
-// Metered Azure OpenAI client for Emma chat. Same standard deployment the
-// module singleton used; usage is recorded per user/session via the factory.
-function chatClient(userId?: string, sessionId?: string) {
-  return getAzureClient(
-    { userId, feature: "chat", sessionId },
-    process.env.AZURE_OPENAI_DEPLOYMENT
-  );
-}
 
 // Metered client for embeddings (knowledge-base semantic search). Uses the
 // separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
@@ -93,11 +94,14 @@ export interface ChatMessage {
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls
   messageIndex?: number; // Index of message in the database (included when loading from DB)
+  clientId?: string; // ENG-1495: client-generated id, present only on messages the frontend created optimistically before a server round-trip (echoed back so it can key the same message stably across the refresh that resolves messageIndex)
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
     estimated_cost: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
   metadata?: {
     currentUrl?: string;
@@ -142,6 +146,7 @@ export interface ChatMessage {
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
 
@@ -193,6 +198,14 @@ export interface ChatSession {
       description?: string;
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
+      // ENG-1188 (Greptile): set alongside completedAt for 'completed' AND ALSO for
+      // 'skipped' -- unlike completedAt, this exists purely so setWorkPlanStatus's
+      // asset-count gate has a real "this step left pending" marker for a skipped
+      // step to scope a later step's asset count against, instead of silently
+      // falling through to counting the whole session. Internal bookkeeping only;
+      // never rendered (PlanProgress/HorizontalPlanProgress key off completedAt +
+      // status === 'completed', which reusing completedAt here would have broken).
+      resolvedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
@@ -202,11 +215,45 @@ export interface ChatSession {
       // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
       // only a fraction generated (the xCures incident). Unset = no asset-count gate.
       expectedAssetCount?: number;
+      // ENG-1331: which tool name(s) count toward expectedAssetCount, when a step's
+      // deliverable spans multiple asset-producing tools that aren't interchangeable
+      // (see synthesisResidue.ts's countProducedAssets for the full rationale). Unset
+      // = the gate falls back to the max succeeded count across every known
+      // asset-producing tool.
+      expectedAssetCountTools?: string[];
+      inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
+    // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
+    // session's work plan was instantiated from, when it was launched from a
+    // template (launch_predefined_work_plan, the public plan-session route, or
+    // the recommend-then-accept flow). Absent for plans created ad hoc via
+    // create_work_plan. Used for accept-endpoint idempotency and to chain into
+    // a completed template's author-approved "next plan" suggestions.
+    templatePlanId?: string;
+    // ENG-1811: a session-lifetime, stepCount-agnostic ledger of required
+    // function names that were removed from some step via modify_work_plan's
+    // removeStepCounts while genuinely unresolved (never succeeded). Populated
+    // by modifyWorkPlan whenever it removes a step; enforced by
+    // setWorkPlanStatusAttempt, which refuses to let a batch resolve the LAST
+    // remaining pending step(s) (finish the plan) while any entry here still
+    // hasn't succeeded -- regardless of whether the removed step's number, or
+    // any step at all, ever mentions that function again. This closes a real,
+    // live-observed gap: the per-step requiredFunctionCalls protection
+    // (mergeRequiredFunctionCalls) only guards a step whose OWN declared list
+    // is being edited; removing the step entirely (optionally re-adding a
+    // differently-scoped replacement, in the same modify_work_plan call or a
+    // later, separate one) bypassed it completely, since neither the merge
+    // logic nor any later "add new step" branch has a way to know the
+    // function was ever required at all once its owning step is gone. Cleared
+    // entries are removed once their function succeeds; the whole field is
+    // naturally reset on a genuinely new plan (createWorkPlan/
+    // applyPredefinedWorkPlan replace workPlan wholesale, never carrying this
+    // field forward from the prior plan).
+    pendingRequiredFunctionCalls?: string[];
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   // ENG-396: the single structured question Emma is currently blocked on (if any).
@@ -219,7 +266,38 @@ export interface ChatSession {
   // write gate (checkQuestionGate) still find an earlier human answer even
   // after Emma has moved on to asking something else in the same session.
   answeredQuestions?: Record<string, PendingUserQuestion>;
+  // One channel-neutral information request emitted by the current work-plan
+  // step. It is intentionally separate from pendingUserQuestion because it
+  // carries typed values rather than an option selection; the write guard
+  // still makes the two mutually exclusive while either is awaiting.
+  pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-1642: canonical digests (computeMetaWriteManifestDigest) of manifest-
+  // approved Meta writes already executed confirmation-free in this session.
+  // A digest present here has been consumed — the SAME write may not execute
+  // again without a fresh confirmation. Map value is the consumption
+  // timestamp (kept, not just a boolean, purely for audit/debugging).
+  consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-1974: workplan recommendations the user explicitly declined via "Keep
+  // chatting" this session, keyed by recommendationId (the deterministic
+  // sha256(sessionId:planId) hash recommendPredefinedWorkPlan already
+  // computes — see agentModeService.ts). A map, not a single slot like
+  // pendingUserQuestion, because a decline isn't blocking the way an
+  // unanswered question is, and a single slot would let declining a SECOND
+  // plan silently erase protection for the first. Consulted by
+  // applyPredefinedWorkPlan's decline gate and by the dynamic work-plan
+  // context builder so Emma sees the real fact before her own read of the
+  // conversation forms, instead of self-launching a plan the user already
+  // passed on.
+  declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>;
+  // ENG-397: the structured, typed workflow run in flight for this session
+  // (if any). Each mutating step's checkpoint (entity IDs + verified
+  // end-state) is persisted here so a killed-and-restarted session resumes
+  // from the last VERIFIED step instead of re-deriving state from chat prose
+  // / re-creating entities. Distinct from `workPlan` (a narrative to-do
+  // list) — see agentMode/core/workflow.ts file header.
+  workflowRun?: WorkflowRunState;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
+  calledFunctionsVersion?: number; // Optimistic-lock counter guarding calledFunctions read-modify-write races
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   // ENG-738: RESEARCH_LOOKUP_TOOLS calls that timed out and were never retried
   // to success — kept so a later turn doesn't silently drop (or misremember)
@@ -232,6 +310,18 @@ export interface ChatSession {
   feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake"; // Type of session based on how it was created
+  // ENG-827: the publish authorization this scheduled run was ADMITTED under, stamped
+  // before the first turn. A run keeps the permissions it started with: the dispatch
+  // guard intersects this with live schedule state, so consent granted after a run
+  // began cannot reach into it. Written only for runs admitted as authorized —
+  // absent means "not authorized to publish", the fail-closed default.
+  publishAdmission?: {
+    authorized: boolean;
+    tools: string[];
+    recordedAt: string;
+  };
+  /** H-VOICE: session-scoped Voice Card from draft → approved edit observations. */
+  sessionVoiceProfile?: import('./voiceProfileService').SessionVoiceProfile;
   emailMetadata?: {
     senderEmail?: string;
     lastInboundEmailId?: string;
@@ -262,6 +352,17 @@ export interface ChatSession {
     threadTs: string;
   }; // Slack thread association for in-thread Q&A
   llmModel?: string; // Selected LLM model for this session
+  llmUsagePolicyDecision?: {
+    requestedModel: string | null;
+    effectiveModel: string | null;
+    backupModel: string | null;
+    backupSource: 'user' | 'system' | null;
+    modelSelection: 'honored' | 'corrected' | 'defaulted' | 'blocked';
+    modelSelectionReason: string;
+    usageMode: 'full_choice' | 'optimized' | 'paused';
+    usagePolicyVersion: string | null;
+    recordedAt: string;
+  };
   delegateInfo?: {
     adminUserId: string;
     adminEmail: string;
@@ -286,7 +387,17 @@ export interface ChatSession {
       goalCompletion: number;   // 1-5: did the assistant accomplish what was asked?
       dataAccuracy: number;     // 1-5: plausible/consistent data, no hallucinations?
       outputQuality: number;    // 1-5: well-structured, specific, actionable output?
+      // ENG-1312: optional — a session scored before this shipped, or by a
+      // stale custom judge prompt, simply omits these.
+      concision?: number;               // 0-5: did reply length match the question/instruction?
+      instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
+      unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
+    // ENG-929: the judge saw a shortened transcript (a very long run exceeded the
+    // scoring context budget). The score is real but formed on partial context —
+    // labelled rather than withheld, since withholding is what silently dropped
+    // the longest sessions from satisfaction reporting.
+    transcriptTruncated?: boolean;
   };
   judgeScores?: Record<string, {  // keyed by judge ID
     score: number;
@@ -298,6 +409,10 @@ export interface ChatSession {
       goalCompletion: number;
       dataAccuracy: number;
       outputQuality: number;
+      // ENG-1312: see satisfactionScore.dimensions above.
+      concision?: number;
+      instructionCompliance?: number;
+      unnecessaryPermissionRequest?: boolean;
     };
   }>;
   // Scores retracted because the session turned out to be outside the
@@ -537,12 +652,38 @@ function keywordBasedChunkRetrieval(
  * Persisted audit of a Google Ads pre-flight tracking check (ENG-335), stored on
  * the chat/run record so a launch's measurement status is durable and auditable.
  */
+/** ENG-941 — Meta counterpart of GoogleAdsMeasurementCheckRecord below. */
+export interface MetaMeasurementCheckRecord {
+  accountId: string;
+  campaignId?: string;
+  /**
+   * Kept in step with `metaLaunchGate.ts`'s declaration of the same name — structural typing
+   * means a field added there and not here still persists (DynamoDB is schemaless), so the
+   * compiler will NOT catch the drift. It went missing once already, when the gate started
+   * recording which ad a block was about.
+   */
+  adId?: string;
+  creativeId?: string;
+  action: string;
+  outcome: 'passed' | 'blocked' | 'overridden';
+  /** Per-destination check results (url + status + detected pixels). */
+  urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
+  checkedAt: string;
+}
+
 export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
   action: string;
-  /** Overall outcome of the gate for this launch attempt. */
-  outcome: 'passed' | 'blocked' | 'overridden';
+  /**
+   * Overall outcome of the gate for this launch attempt.
+   *
+   * `passed_with_warning` (ENG-1358) is deliberately distinct from `passed`: the launch
+   * was permitted, but the page carried only a GTM container or a GA4 property and no
+   * Google Ads conversion tag. Collapsing the two would make the audit trail claim the
+   * conversion path was verified when all we verified was that some Google tag exists.
+   */
+  outcome: 'passed' | 'passed_with_warning' | 'blocked' | 'overridden';
   /** Per-URL check results (url + status + detected mechanisms). */
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
   checkedAt: string;
@@ -654,9 +795,10 @@ export class ChatbotDB {
       throw error;
     }
 
-    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access.
+    // Update lastActiveAt on the user — only for real user sessions, not admin delegate access
+    // and not sandbox (eval_) principals, whose take-home sessions are not customer engagement (ENG-1907).
     // Fire-and-forget: don't fail session creation if this update fails.
-    if (!delegateInfo?.isDelegated) {
+    if (!delegateInfo?.isDelegated && !isEvaluationUser(userId)) {
       userDb.updateUser(userId, { lastActiveAt: timestamp }).catch((err) => {
         console.error(`Failed to update lastActiveAt for user ${userId}:`, err);
       });
@@ -687,6 +829,37 @@ export class ChatbotDB {
     return chatSession;
   }
 
+  /**
+   * Bound a message to the per-item persistence budget.
+   *
+   * Check serialized item size in UTF-8 BYTES — covers both string content and
+   * content-block arrays. DynamoDB's hard limit is 400KB per item; we use 350KB as a
+   * safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
+   * a CJK/emoji-heavy message is far bigger encoded than its character count.
+   *
+   * ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
+   * long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
+   * routinely 20x the answer — truncating `content` shed nothing, the item stayed
+   * over 400KB, batchWrite threw, and the report was lost from the transcript while
+   * the run still reported success. shrinkMessageForPersistence sheds the ledger
+   * first and the answer last, and guarantees the item fits.
+   *
+   * ENG-1048: this lives here, rather than inline in one writer, because EVERY path
+   * that writes a message item is subject to the same ceiling. ENG-946 guarded only
+   * the append path, so the session→table migration, the repair pass and the
+   * single-message update still wrote raw messages and still threw on an oversized one.
+   *
+   * Returns the ORIGINAL reference when the message already fits.
+   */
+  private fitMessageForPersistence(message: any, label: string): any {
+    const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
+    const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
+    if (safeMessage !== message) {
+      console.warn(`${label} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
+    }
+    return safeMessage;
+  }
+
   // Add messages to AW-ChatMessages table
   private async addMessagesToMessagesTable(sessionId: string, messages: ChatMessage[], startIndex: number): Promise<void> {
     if (messages.length === 0) {
@@ -699,28 +872,10 @@ export class ChatbotDB {
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
-          let safeMessage = message;
-          // Check serialized item size — covers both string content and content-block arrays.
-          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
-          const serializedLen = JSON.stringify(message).length;
-          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
-            if (typeof message.content === 'string') {
-              safeMessage = {
-                ...message,
-                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            } else {
-              // Content is an array of blocks — stringify it, truncate, store as plain string
-              const contentStr = JSON.stringify(message.content);
-              safeMessage = {
-                ...message,
-                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            }
-          }
+          const safeMessage = this.fitMessageForPersistence(
+            message,
+            `Message ${startIndex + i + index} for session ${sessionId}`,
+          );
           return {
             PutRequest: {
               Item: {
@@ -914,6 +1069,36 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Append a Meta pre-flight tracking check to the session's run record (ENG-941).
+   * Same audit contract as recordGoogleAdsMeasurementCheck above: a launch decision —
+   * passed, blocked, or explicitly overridden — and its per-destination measurement
+   * status must survive, so a later "0 conversions" report can say the campaign was
+   * never measurable instead of presenting a bare zero. Best-effort by design: a
+   * persistence failure must never break the launch flow.
+   */
+  async recordMetaMeasurementCheck(
+    sessionId: string,
+    record: MetaMeasurementCheckRecord
+  ): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression:
+          'SET metaMeasurementChecks = list_append(if_not_exists(metaMeasurementChecks, :empty), :rec), updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':rec': [record],
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error recording Meta measurement check for session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -945,19 +1130,25 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, [message]);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId && message.usage) {
-        await incrementUserTokenUsage(
-          currentSession.userId,
-          message.usage.total_tokens || 0,
-          message.usage.estimated_cost || 0
-        );
-      }
+      // ENG-1134: NO per-user quota charge here. Persisting a message is not a
+      // spend event — the LLM call that produced it already charged the counter
+      // and wrote the ledger row at its metering chokepoint. Charging again here
+      // double-billed every agent-mode turn (measured at exactly 2.000x cost).
+      //
+      // It also hid itself: `usage.total_tokens` is prompt+completion only, while
+      // the real charge includes cache tokens (~73% of traffic), so the token
+      // totals stayed plausible while the dollars silently doubled. And it wrote
+      // no ledger row, breaking ENG-200's rule that nothing is deducted without
+      // also being recorded. Charge where you record: at the call site.
 
-      // Return session with updated messages (no need to update session table)
+      // ENG-1495: stamp messageIndex onto the returned message rather than the raw
+      // reference -- this is the same id getMessagesFromMessagesTable would produce on
+      // a fresh read, just computed once here instead of thrown away and re-derived
+      // later. Lets callers (the /generate response, the session-message-appended
+      // socket event) echo a stable id synchronously instead of only after a refetch.
       return {
         ...currentSession,
-        messages: [...currentMessages, message],
+        messages: [...currentMessages, { ...message, messageIndex }],
       };
     });
   }
@@ -995,25 +1186,17 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, messages);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId) {
-        let batchTokens = 0;
-        let batchCost = 0;
-        for (const msg of messages) {
-          if (msg.usage) {
-            batchTokens += msg.usage.total_tokens || 0;
-            batchCost += msg.usage.estimated_cost || 0;
-          }
-        }
-        if (batchTokens > 0 || batchCost > 0) {
-          await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
-        }
-      }
+      // ENG-1134: no per-user quota charge here either — same reasoning as the
+      // single-message path above. The batch variant double-charged identically.
 
-      // Return session with updated messages (no need to update session table)
+      // ENG-1495: same reasoning as addMessageToSession above -- stamp messageIndex on
+      // each returned message instead of the raw reference.
       return {
         ...currentSession,
-        messages: [...currentMessages, ...messages],
+        messages: [
+          ...currentMessages,
+          ...messages.map((m, i) => ({ ...m, messageIndex: messageIndex + i })),
+        ],
       };
     });
   }
@@ -1063,7 +1246,11 @@ export class ChatbotDB {
           '#message': 'message',
         },
         ExpressionAttributeValues: {
-          ':message': updatedMessage,
+          // ENG-1048: adding feedback grows an item that may already sit at the ceiling.
+          ':message': this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} feedback for session ${sessionId}`,
+          ),
         },
         ReturnValues: 'ALL_NEW',
       };
@@ -1124,6 +1311,65 @@ export class ChatbotDB {
       const firstUser = (result.Items || []).find((item: any) => item.message?.role === 'user');
       return firstUser ? (firstUser.message.content as string) || null : null;
     } catch {
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1819: the most recent REAL (not server-injected) user message's content, via a
+   * bounded, reverse-sorted, paginated query — not a full `getChatSession` hydration. Used
+   * by the work-plan auto-continuation stop-check, which needs to know whether the user's
+   * last actual instruction asked to stop, without paying the cost of the full message-table
+   * read/migration `getChatSession` performs (same reasoning as `getSessionPreview` and
+   * `getChatSessionRecord` above). `sessionId`(HASH)+`messageIndex`(RANGE) makes
+   * `ScanIndexForward: false` a direct, correct reverse-index read, not a scan.
+   *
+   * Excludes two known server-authored `role: 'user'` kinds, both INDISTINGUISHABLE from a
+   * real user turn by role alone:
+   *   - `metadata.kind === 'auto-continuation'` — the injected continuation directive itself
+   *     (AUTO_WORK_PLAN_CONTINUATION_MESSAGE); without this, a stale "stop" verdict from an
+   *     earlier round would keep re-triggering forever.
+   *   - `metadata.autoDelegatedAnswer === true` — the runVerifiedChat auto-take breadcrumb
+   *     ("[Full autonomy] Proceed with..."), persisted with no `kind` field at all
+   *     (agentModeController.ts's resolveAwaitingUserQuestion). Missing this would let an
+   *     auto-answered question mask a real earlier "stop" behind it.
+   *
+   * Paginated rather than a single fixed `Limit`: one response turn persists ONE row PER
+   * TOOL CALL (agentModeController.ts's response-message persistence), so a single
+   * tool-call-heavy autocomplete round — exactly this feature's own primary case — can
+   * exhaust a small fixed limit before ever reaching the real user turn underneath it.
+   * Still bounded (MAX_PAGES caps total read cost) rather than the unbounded
+   * getMessagesFromMessagesTable paginate-everything approach.
+   */
+  async getMostRecentRealUserMessage(sessionId: string, consistentRead = false): Promise<{ content: string; timestamp?: string } | null> {
+    const PAGE_SIZE = 25;
+    const MAX_PAGES = 4;
+    try {
+      let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const result = await dynamodb.query({
+          TableName: this.messagesTableName,
+          KeyConditionExpression: 'sessionId = :sessionId',
+          ExpressionAttributeValues: { ':sessionId': sessionId },
+          ScanIndexForward: false,
+          Limit: PAGE_SIZE,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+          ...(consistentRead ? { ConsistentRead: true } : {}),
+        }).promise();
+        const realUser = (result.Items || []).find((item: any) =>
+          item.message?.role === 'user'
+          && item.message?.metadata?.kind !== 'auto-continuation'
+          && item.message?.metadata?.autoDelegatedAnswer !== true
+        );
+        if (realUser?.message?.content) {
+          return { content: realUser.message.content as string, timestamp: realUser.message?.metadata?.timestamp };
+        }
+        lastKey = result.LastEvaluatedKey as AWS.DynamoDB.DocumentClient.Key | undefined;
+        if (!lastKey) break;
+      }
+      return null;
+    } catch (error) {
+      console.error(`ChatbotDB: getMostRecentRealUserMessage failed for session ${sessionId}:`, error);
       return null;
     }
   }
@@ -1312,7 +1558,11 @@ export class ChatbotDB {
             Item: {
               sessionId,
               messageIndex: i + index,
-              message,
+              // ENG-1048: same 400KB ceiling as the append path.
+              message: this.fitMessageForPersistence(
+                message,
+                `Migrated message ${i + index} for session ${sessionId}`,
+              ),
             },
           },
         }));
@@ -1517,7 +1767,12 @@ export class ChatbotDB {
           Item: {
             sessionId,
             messageIndex,
-            message
+            // ENG-1048: a repaired message is subject to the same 400KB ceiling —
+            // without this the repair pass throws on exactly the messages it exists to fix.
+            message: this.fitMessageForPersistence(
+              message,
+              `Repaired message ${messageIndex} for session ${sessionId}`,
+            )
           }
         }
       }));
@@ -1628,12 +1883,13 @@ export class ChatbotDB {
    * absent for non-legacy sessions). Callers that need the real conversation
    * must use `getChatSession`.
    */
-  async getChatSessionRecord(sessionId: string): Promise<ChatSession | null> {
+  async getChatSessionRecord(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1646,7 +1902,7 @@ export class ChatbotDB {
   }
 
   async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
-    const session = await this.getChatSessionRecord(sessionId);
+    const session = await this.getChatSessionRecord(sessionId, consistentRead);
 
     if (!session) {
       return null;
@@ -2465,11 +2721,21 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1332: guarded by default against clobbering an admin override. The
+   * caller (scoreSessionIfNeeded) already skips adminOverride rows using the
+   * session it read, but that read happens once before scoring — a concurrent
+   * admin override written in between is a TOCTOU race the in-process check
+   * can't catch. Pass `allowOverride: true` only for an explicit human
+   * override write (the admin PUT route), which must be allowed to replace
+   * anything, including a prior override.
+   */
   async updateSessionSatisfactionScore(
     sessionId: string,
-    satisfactionScore: ChatSession["satisfactionScore"]
-  ): Promise<ChatSession> {
-    const params = {
+    satisfactionScore: ChatSession["satisfactionScore"],
+    options?: { allowOverride?: boolean }
+  ): Promise<ChatSession | null> {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -2481,10 +2747,18 @@ export class ChatbotDB {
       ReturnValues: "ALL_NEW",
     };
 
+    if (!options?.allowOverride) {
+      params.ConditionExpression = "attribute_not_exists(satisfactionScore.adminOverride)";
+    }
+
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      // Lost the race: an admin override landed on this row after it was read
+      // for scoring, so there is nothing to persist. Not an error — the row
+      // still holds the human's score.
+      if (!options?.allowOverride && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session satisfaction score:", error);
       throw error;
     }
@@ -3000,6 +3274,303 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1642: atomically claim a manifest-granted Meta write digest for
+   * confirmation-free execution, at most once. A digest already present in
+   * `consumedMetaWriteManifestDigests` means that exact write already ran
+   * under this manifest — the caller must fall back to a normal confirmation
+   * rather than executing again. Uses a single conditional DynamoDB update
+   * (attribute_not_exists on the specific map key) so two concurrent
+   * requests carrying the same digest cannot both win the claim — mirrors
+   * the claimPreviewToken conditional-put pattern in
+   * metaAudienceCampaignTokenStore.ts. Returns true only if THIS call
+   * claimed it.
+   */
+  async claimMetaWriteManifestDigest(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression:
+            'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          // attribute_exists(sessionId) is REQUIRED, not optional belt-and-
+          // braces (mirrors the identical guard on the workflowRun writer
+          // above): the attribute_not_exists(...) checks alone are satisfied
+          // identically whether the map/key is merely absent on an existing
+          // row or the whole session item doesn't exist at all — DynamoDB's
+          // conditional UpdateItem creates the item if missing. Without this,
+          // a session deleted before/during this claim would silently upsert
+          // a partial ChatSession row and let a retry return true, granting a
+          // confirmation-free Meta write on a session that no longer exists.
+          ConditionExpression:
+            'attribute_exists(sessionId) AND (attribute_not_exists(consumedMetaWriteManifestDigests) OR attribute_not_exists(consumedMetaWriteManifestDigests.#digest))',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      // A DynamoDB map SET against a session with no existing
+      // `consumedMetaWriteManifestDigests` attribute at all fails differently
+      // ("document path does not exist") rather than the map-key condition
+      // above — initialize the map on first use, then retry the claim once.
+      // Guarded the same way: only initialize on a session that still exists.
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression:
+                'SET consumedMetaWriteManifestDigests = if_not_exists(consumedMetaWriteManifestDigests, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return false;
+          throw initError;
+        }
+        return this.claimMetaWriteManifestDigestRetry(sessionId, digest);
+      }
+      console.error('Error claiming Meta write manifest digest:', error);
+      throw error;
+    }
+  }
+
+  /** Single retry after map initialization — never recurses further. */
+  private async claimMetaWriteManifestDigestRetry(sessionId: string, digest: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET consumedMetaWriteManifestDigests.#digest = :consumedAt',
+          ConditionExpression: 'attribute_not_exists(consumedMetaWriteManifestDigests.#digest)',
+          ExpressionAttributeNames: { '#digest': digest },
+          ExpressionAttributeValues: { ':consumedAt': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      console.error('Error claiming Meta write manifest digest (retry):', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1974: record that the user declined a workplan recommendation via
+   * "Keep chatting". Unlike claimMetaWriteManifestDigest, this is an
+   * UNCONDITIONAL overwrite — re-declining the same recommendationId (e.g. a
+   * retried request after a dropped response) is harmless and idempotent,
+   * not an exactly-once claim like a Meta write. Same "SET the map key, and
+   * on ValidationException init the map then retry once" shape as
+   * claimMetaWriteManifestDigest because a fresh session's
+   * declinedWorkPlanRecommendations attribute doesn't exist yet either.
+   */
+  async recordDeclinedWorkPlanRecommendation(
+    sessionId: string,
+    recommendationId: string,
+    entry: { planId: string; planTitle: string; declinedAt: string },
+  ): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET declinedWorkPlanRecommendations.#id = :entry',
+          ConditionExpression: 'attribute_exists(sessionId)',
+          ExpressionAttributeNames: { '#id': recommendationId },
+          ExpressionAttributeValues: { ':entry': entry },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression:
+                'SET declinedWorkPlanRecommendations = if_not_exists(declinedWorkPlanRecommendations, :empty)',
+              ConditionExpression: 'attribute_exists(sessionId)',
+              ExpressionAttributeValues: { ':empty': {} },
+            })
+            .promise();
+        } catch (initError: any) {
+          if (initError?.code === 'ConditionalCheckFailedException') return false;
+          throw initError;
+        }
+        return this.recordDeclinedWorkPlanRecommendationRetry(sessionId, recommendationId, entry);
+      }
+      console.error('Error recording declined work plan recommendation:', error);
+      throw error;
+    }
+  }
+
+  /** Single retry after map initialization — never recurses further. */
+  private async recordDeclinedWorkPlanRecommendationRetry(
+    sessionId: string,
+    recommendationId: string,
+    entry: { planId: string; planTitle: string; declinedAt: string },
+  ): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET declinedWorkPlanRecommendations.#id = :entry',
+          ConditionExpression: 'attribute_exists(sessionId)',
+          ExpressionAttributeNames: { '#id': recommendationId },
+          ExpressionAttributeValues: { ':entry': entry },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      console.error('Error recording declined work plan recommendation (retry):', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Persist the typed information a work-plan step is waiting for. The same
+   * request is rendered as a chat card in the portal or as MCP elicitation;
+   * persisting the channel-neutral form lets a reconnect resume safely.
+   *
+   * There is one human-input interruption at a time across both structured
+   * interaction types. A second request must wait instead of racing to steal
+   * the user's answer slot.
+   */
+  async updateSessionWorkPlanInputRequest(
+    sessionId: string,
+    pendingWorkPlanInput: WorkPlanInputRequest | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfAwaitingExists === true && pendingWorkPlanInput !== null;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+
+    const params: any = pendingWorkPlanInput
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingWorkPlanInput = :pendingWorkPlanInput, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingWorkPlanInput': pendingWorkPlanInput,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingWorkPlanInput',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status' };
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requestId': requireStillAwaiting,
+        ':awaitingStatus': 'awaiting',
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireStillAwaiting) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-397: persist (or clear) the session's workflow run. Two guard modes,
+   * mirroring updateSessionAskUserQuestion/updateSessionWorkPlanInputRequest:
+   *  - failIfActiveExists: used by startWorkflow — refuses to start a new run
+   *    while an existing one is still 'in_progress'/'blocked_on_parameter'
+   *    (one active workflow run per session, matching the one-question/
+   *    one-input-request invariants elsewhere on ChatSession).
+   *  - requireVersion: used by every step-transition write — optimistic lock
+   *    on WorkflowRunState.version. Caller passes the PRE-transition version;
+   *    the condition checks the STORED version still matches before the new
+   *    (already version+1'd) run overwrites it. Loses the race -> null, and
+   *    the caller must re-read + recompute rather than trust its local object.
+   */
+  async updateSessionWorkflowRun(
+    sessionId: string,
+    workflowRun: WorkflowRunState | null,
+    opts?: { failIfActiveExists?: boolean; requireVersion?: number },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfActiveExists === true && workflowRun !== null;
+    const requireVersion = typeof opts?.requireVersion === 'number' ? opts.requireVersion : undefined;
+
+    const params: any = workflowRun
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET workflowRun = :workflowRun, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: { ':workflowRun': workflowRun, ':adminListPartition': 'all' },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE workflowRun',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      // attribute_exists(sessionId) is REQUIRED here, not optional belt-and-
+      // braces: attribute_not_exists(workflowRun) is satisfied identically
+      // whether the field is merely absent on an existing row or the whole
+      // session item doesn't exist at all — DynamoDB's conditional UpdateItem
+      // creates the item if missing. Without this, a session deleted between
+      // the caller's existence check and this write (or a caller that never
+      // checked) would silently upsert a partial ChatSession row instead of
+      // failing the guard.
+      params.ConditionExpression =
+        'attribute_exists(sessionId) AND (attribute_not_exists(workflowRun) OR workflowRun.#wStatus IN (:completedStatus, :failedStatus))';
+      params.ExpressionAttributeNames = { '#wStatus': 'status' };
+      params.ExpressionAttributeValues[':completedStatus'] = 'completed';
+      params.ExpressionAttributeValues[':failedStatus'] = 'failed';
+    } else if (requireVersion !== undefined) {
+      params.ConditionExpression = 'workflowRun.runId = :requireRunId AND workflowRun.version = :requireVersion';
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requireRunId': workflowRun?.runId,
+        ':requireVersion': requireVersion,
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireVersion !== undefined) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session workflow run:', error);
+      throw error;
+    }
+  }
+
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -3014,15 +3585,24 @@ export class ChatbotDB {
         userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
+        /** ENG-1188: see the matching field on the read-side workPlan type above. */
+        resolvedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
         expectedAssetCount?: number;
+        /** ENG-1331: see the matching field on the read-side workPlan type above. */
+        expectedAssetCountTools?: string[];
+        inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-1472: see the matching field on the read-side workPlan type above. */
+      templatePlanId?: string;
+      /** ENG-1811: see the matching field on the read-side workPlan type above. */
+      pendingRequiredFunctionCalls?: string[];
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
@@ -3093,16 +3673,20 @@ export class ChatbotDB {
 
   async updateSessionLlmModel(
     sessionId: string,
-    llmModel: string
+    llmModel: string,
+    policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+      UpdateExpression: policyDecision
+        ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
+        ...(policyDecision ? { ":policyDecision": policyDecision } : {}),
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -3115,6 +3699,65 @@ export class ChatbotDB {
       console.error("Error updating session LLM model:", error);
       throw error;
     }
+  }
+
+  /**
+   * ENG-827: stamp the publish authorization a scheduled run was admitted under.
+   *
+   * The dispatch-time consent guard re-reads the SCHEDULE so a revocation bites
+   * immediately, but a re-read alone is only half an answer: it would also let a
+   * grant made while the run is in flight widen it, and publish content that was
+   * generated by a run explicitly admitted as draft-only. Persisting the admitted
+   * scope here gives the guard the other half to intersect against, so live state
+   * can only ever narrow this run's rights.
+   *
+   * Throws on failure — the caller must downgrade the run to draft-only rather
+   * than proceed with a permission it could not record.
+   */
+  async updateSessionPublishAdmission(
+    sessionId: string,
+    admission: { authorized: boolean; tools: string[] }
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET publishAdmission = :publishAdmission, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":publishAdmission": {
+          authorized: admission.authorized === true,
+          tools: Array.isArray(admission.tools) ? admission.tools : [],
+          recordedAt: new Date().toISOString(),
+        },
+        ":adminListPartition": "all",
+      },
+    };
+
+    await dynamodb.update(params).promise();
+  }
+
+  /**
+   * H-VOICE: persist session-scoped Voice Card metadata on AW-ChatSessions.
+   * Schema extension per RFC H-VOICE (Harsha P0 epic #4) — requires Harsha sign-off
+   * before upstream merge per CLAUDE.md persistent-data policy.
+   */
+  async updateSessionVoiceProfile(
+    sessionId: string,
+    profile: import('./voiceProfileService').SessionVoiceProfile,
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: 'SET sessionVoiceProfile = :sessionVoiceProfile, adminListPartition = :adminListPartition',
+      ExpressionAttributeValues: {
+        ':sessionVoiceProfile': profile,
+        ':adminListPartition': 'all',
+      },
+    };
+
+    await dynamodb.update(params).promise();
   }
 
   async updateSessionError(
@@ -3241,44 +3884,80 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1698 hardening: calledFunctions previously had multiple independent
+   * read-modify-write writers (increment per tool-dispatch batch, reset on new
+   * plan, decrement on step completion/skip) with no concurrency guard, so a
+   * writer computing its new value from a stale read could silently undo a
+   * concurrent writer's change (e.g. a reset landing between another request's
+   * read and write resurrects the exact stale credit the reset just cleared).
+   * This helper closes that gap with optimistic locking on `calledFunctionsVersion`:
+   * every writer re-reads fresh state and recomputes its mutation on conflict
+   * instead of blindly overwriting.
+   */
+  async mutateCalledFunctions(
+    sessionId: string,
+    mutate: (current: Record<string, number>) => Record<string, number>,
+    maxAttempts = 5
+  ): Promise<ChatSession> {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Record-only read: this loop only needs calledFunctions/calledFunctionsVersion,
+      // so avoid getChatSession's AW-ChatMessages query (and possible one-time
+      // migration write) on every retry attempt.
+      const session = await this.getChatSessionRecord(sessionId);
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
+      const currentVersion = session.calledFunctionsVersion || 0;
+      const nextCounts = mutate(session.calledFunctions || {});
+
+      const params = {
+        TableName: this.tableName,
+        Key: {
+          sessionId,
+        },
+        UpdateExpression:
+          "SET calledFunctions = :calledFunctions, calledFunctionsVersion = :nextVersion, adminListPartition = :adminListPartition",
+        ConditionExpression:
+          "attribute_not_exists(calledFunctionsVersion) OR calledFunctionsVersion = :currentVersion",
+        ExpressionAttributeValues: {
+          ":calledFunctions": nextCounts,
+          ":nextVersion": currentVersion + 1,
+          ":currentVersion": currentVersion,
+          ":adminListPartition": "all",
+        },
+        ReturnValues: "ALL_NEW",
+      };
+
+      try {
+        const result = await dynamodb.update(params).promise();
+        return result.Attributes as ChatSession;
+      } catch (error: any) {
+        if (error?.code === "ConditionalCheckFailedException" && attempt < maxAttempts - 1) {
+          // Jittered backoff so multiple writers that just conflicted don't
+          // immediately retry in lockstep and re-collide.
+          const backoffMs = 20 * Math.pow(2, attempt) + Math.random() * 20;
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+        console.error("Error mutating called functions:", error);
+        throw error;
+      }
+    }
+    throw new Error(`mutateCalledFunctions: exhausted retries for session ${sessionId}`);
+  }
+
   async incrementCalledFunctions(
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    // Get current session to retrieve existing calledFunctions
-    const session = await this.getChatSession(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
-
-    // Merge the new counts with existing counts
-    const currentCounts = session.calledFunctions || {};
-    const updatedCounts = { ...currentCounts };
-    
-    for (const [functionName, count] of Object.entries(functionCounts)) {
-      updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
-    }
-
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": updatedCounts,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error incrementing called functions:", error);
-      throw error;
-    }
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
+      }
+      return updatedCounts;
+    });
   }
 
   async incrementFailedFunctions(
@@ -3374,66 +4053,40 @@ export class ChatbotDB {
     sessionId: string,
     functionCounts: Record<string, number>
   ): Promise<ChatSession> {
-    // Get current session to retrieve existing calledFunctions
-    const session = await this.getChatSession(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        updatedCounts[functionName] = (updatedCounts[functionName] || 0) - count;
+      }
+      return updatedCounts;
+    });
+  }
 
-    // Decrement the counts
-    const currentCounts = session.calledFunctions || {};
-    const updatedCounts = { ...currentCounts };
-    
-    for (const [functionName, count] of Object.entries(functionCounts)) {
-      updatedCounts[functionName] = (updatedCounts[functionName] || 0) - count;
-    }
-
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": updatedCounts,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error decrementing called functions:", error);
-      throw error;
-    }
+  /**
+   * ENG-1698: clamped decrement used when a step's required-call credit is
+   * consumed (completed) or released (skipped without over-penalizing a later
+   * step). Applies against a fresh read via mutateCalledFunctions rather than
+   * a value the caller precomputed from a possibly-stale baseline.
+   */
+  async decrementCalledFunctionsClamped(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    return this.mutateCalledFunctions(sessionId, (current) => {
+      const updatedCounts = { ...current };
+      for (const [functionName, count] of Object.entries(functionCounts)) {
+        const currentCount = updatedCounts[functionName] || 0;
+        updatedCounts[functionName] = Math.max(0, currentCount - count);
+      }
+      return updatedCounts;
+    });
   }
 
   async updateCalledFunctions(
     sessionId: string,
     calledFunctions: Record<string, number>
   ): Promise<ChatSession> {
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":calledFunctions": calledFunctions,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error updating called functions:", error);
-      throw error;
-    }
+    return this.mutateCalledFunctions(sessionId, () => calledFunctions);
   }
 
   // Common function to create or reuse interactive share for a session
@@ -3551,7 +4204,15 @@ export class ChatbotDB {
     limit: number,
     lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key,
     timeRange?: { startTime: string; endTime: string }
-  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+  ): Promise<{
+    sessions: ChatSession[];
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key;
+    // ENG-1332 (Greptile): the gap query's page cap can stop before reaching a
+    // qualifying late-touched session, silently understating the requested
+    // range. This says so, rather than leaving the caller to trust an
+    // unqualified count.
+    gapQueryTruncated?: boolean;
+  }> {
     const expressionValues: Record<string, any> = {
       ":adminListPartition": "all",
     };
@@ -3589,9 +4250,114 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // ENG-1332 follow-up: the query above is keyed on updatedAt, so a session
+        // created inside the window but last touched AFTER timeRange.endTime (e.g.
+        // its final message landed a few seconds past the window boundary, or this
+        // window is being re-queried well after it closed) is invisible to it even
+        // though it belongs in the requested range. Close that gap with a second
+        // query over [endTime, now] — only sessions genuinely created in range are
+        // kept from it, so it can't pull in unrelated later activity. DynamoDB
+        // KeyConditionExpression allows only one condition per key, so BETWEEN
+        // (inclusive both ends) is the only compound-range operator available;
+        // BETWEEN is inclusive on both ends, so a session with updatedAt exactly
+        // at endTime legitimately matches both this query and the primary one —
+        // dedupe by sessionId against what the primary query already returned
+        // (comparing the updatedAt strings directly is not reliable: DynamoDB
+        // always stores full-millisecond ISO timestamps, but a caller-supplied
+        // endTime without milliseconds, e.g. "...T14:00:00Z", would never
+        // string-equal the stored value even though they name the same instant).
+        // Skipped entirely when endTime is already at/after "now" (the common
+        // daily-report case, where nothing can have updatedAt in the future), so
+        // this adds no cost to the case the fix already handles.
+        //
+        // [endTime, now] is unbounded in principle (a stale/old window re-queried
+        // much later can span months of unrelated activity), so this loop stops
+        // once enough in-range sessions have been found to fill `limit` — the
+        // final slice below never returns more than `limit` in-range sessions
+        // anyway, so scanning further pages can't change the response, only add
+        // cost.
+        //
+        // The `inRangeCount < limit` stop condition alone isn't enough: a
+        // sparse stale range (few or no sessions actually created in it) can
+        // never reach `limit` no matter how many pages are scanned, so it would
+        // still walk every page through "now" one at a time. A hard page cap
+        // bounds that case too — past this many pages, further scanning trades
+        // an unbounded amount of latency for a small chance of catching one
+        // more late-touched session, so this stops and logs instead.
+        const nowIso = new Date().toISOString();
+        let gapQueryTruncated = false;
+        if (timeRange.endTime < nowIso) {
+          const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
+          let inRangeCount = accumulated.filter(
+            (s) => s.createdAt && s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime
+          ).length;
+          const lateExpressionValues: Record<string, any> = {
+            ":adminListPartition": "all",
+            ":end": timeRange.endTime,
+            ":now": nowIso,
+          };
+          const lateKeyCondition =
+            "adminListPartition = :adminListPartition AND updatedAt BETWEEN :end AND :now";
+          const MAX_GAP_QUERY_PAGES = 20;
+          let lateKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+          let pageCount = 0;
+          do {
+            const lateParams: AWS.DynamoDB.DocumentClient.QueryInput = {
+              TableName: this.tableName,
+              IndexName: "AdminUpdatedAtIndex",
+              KeyConditionExpression: lateKeyCondition,
+              ExpressionAttributeValues: lateExpressionValues,
+              ScanIndexForward: false,
+            };
+            if (lateKey) {
+              lateParams.ExclusiveStartKey = lateKey;
+            }
+
+            const lateResult = await dynamodb.query(lateParams).promise();
+            pageCount++;
+            for (const session of (lateResult.Items as ChatSession[]) || []) {
+              if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
+              const createdAt = session.createdAt;
+              if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+                accumulated.push(session);
+                inRangeCount++;
+              }
+            }
+            lateKey = lateResult.LastEvaluatedKey;
+          } while (lateKey && inRangeCount < limit && pageCount < MAX_GAP_QUERY_PAGES);
+
+          if (lateKey && pageCount >= MAX_GAP_QUERY_PAGES) {
+            gapQueryTruncated = true;
+            console.warn(
+              `[chatbotService] getRecentSessionsPage: gap query hit its ${MAX_GAP_QUERY_PAGES}-page cap scanning [${timeRange.endTime}, ${nowIso}] for a sparse range — some late-touched in-range sessions past this point may be missing from this page`
+            );
+          }
+        }
+
+        // ENG-1332: the query above orders by updatedAt, not createdAt — a
+        // historical session touched (but not created) during this window sorts
+        // by that touch, and can outrank a session genuinely created in the
+        // window if the touch is more recent. Re-prioritize before truncating:
+        // sessions actually created within the requested range come first
+        // (newest first), so the `limit` slice and any budget-bound consumer
+        // (e.g. the sync scoring backfill) exhaust in-range coverage before
+        // spending anything on out-of-range history.
+        const inRange: ChatSession[] = [];
+        const outOfRange: ChatSession[] = [];
+        for (const session of accumulated) {
+          const createdAt = session.createdAt;
+          if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+            inRange.push(session);
+          } else {
+            outOfRange.push(session);
+          }
+        }
+        inRange.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
         return {
-          sessions: accumulated.slice(0, limit),
+          sessions: [...inRange, ...outOfRange].slice(0, limit),
           lastEvaluatedKey: undefined,
+          gapQueryTruncated,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);
@@ -3658,7 +4424,11 @@ export class ChatbotDB {
         },
         UpdateExpression: "SET message = :message",
         ExpressionAttributeValues: {
-          ":message": updatedMessage,
+          // ENG-1048: same 400KB ceiling as every other message write.
+          ":message": this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} for session ${sessionId}`,
+          ),
         },
       };
 
@@ -4006,32 +4776,59 @@ Be helpful, concise, and accurate. Focus on actionable growth marketing advice. 
 export function calculateCost(
   promptTokens: number,
   completionTokens: number,
-  model: string
+  model: string,
+  // ENG-1134: cache tokens were omitted entirely, so this under-reported Emma's
+  // cost by the cache share — the bulk of a cached conversation. It no longer
+  // drives billing (that moved to the call-site meter), but it still drives the
+  // per-session cost the admin UI shows, and a display that disagrees with the
+  // ledger is how the last three metering tickets started.
+  cacheReadTokens: number = 0,
+  cacheWriteTokens: number = 0,
+  // ENG-893 splits cache writes by the TTL Bedrock actually applied: 1.25x input
+  // at 5 minutes, 2x at one hour. Dropping it prices every write at the 5-minute
+  // rate, so an Emma-on-Claude session with 1h writes shows a cost materially
+  // below the ledger figure for the same call — the display/ledger disagreement
+  // this whole ticket exists to eliminate.
+  cacheWriteByTtl?: CacheWriteByTtl
 ): number {
   // Price from the single source of truth (llmPricing via computeCostMicroUsd)
   // so chatbot cost stays consistent with the shadow usage book and ENG-207
   // normalization. This replaced a stale hardcoded per-1K table whose gpt-4o
   // prompt rate was 10x the published list price ($25/1M vs $2.50/1M), which
   // silently overcharged Emma chatbot usage. Unknown models → 0 (unchanged).
-  return computeCostMicroUsd(model, promptTokens, completionTokens) / 1_000_000;
+  return (
+    computeCostMicroUsd(
+      model,
+      promptTokens,
+      completionTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      cacheWriteByTtl
+    ) / 1_000_000
+  );
 }
 
 // Helper function to log token usage
 function logTokenUsage(
   response: OpenAI.Chat.ChatCompletion,
-  context: string = ""
+  context: string = "",
+  pricingModel: string = response.model
 ) {
   const usage = response.usage;
   if (!usage) return;
 
+  const u: any = usage;
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model
+    pricingModel,
+    u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    u.cache_creation_input_tokens || 0,
+    u.cache_creation_by_ttl
   );
 
   console.log(
-    `[Token Usage] Model: ${response.model} | Prompt: ${
+    `[Token Usage] Model: ${pricingModel} | Prompt: ${
       usage.prompt_tokens
     } | Completion: ${usage.completion_tokens} | Total: ${
       usage.total_tokens
@@ -4045,6 +4842,12 @@ function logTokenUsage(
     completion_tokens: usage.completion_tokens,
     total_tokens: usage.total_tokens,
     estimated_cost: cost,
+    // ENG-1222: without these, a session's spend has no per-model attribution
+    // basis (apiTools.ts reads msg.usage.cache_*_input_tokens) and reports as
+    // 'selection-only' with cacheTokens/costByModel null even though real spend
+    // happened — the exact telemetry fingerprint that hid the P0 fabrication bug.
+    cache_read_input_tokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
   };
 }
 
@@ -4060,6 +4863,31 @@ export async function searchKnowledgeBase(query: string, maxResults: number = 5)
   }
 }
 
+// ENG-1222 follow-up: the Vertex AI Discovery Engine calls below have no
+// timeout of their own and can hang indefinitely — observed directly in a
+// live environment, where a single call blocked an entire chat turn for
+// several minutes. Every chatbotService.ts turn goes through this function
+// (not just skill sessions), so an unbounded hang here stalls the whole
+// generateChatResponse call. Mirrors the same pattern already used
+// independently in v0Service.ts / linkedInOutreachService.ts / etc. — a
+// shared utility would be a separate, larger cleanup, not bundled in here.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = 'KNOWLEDGE_BASE_SEARCH_TIMEOUT';
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+const KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS = 10_000;
+
 // Function to search platform-wide knowledge base using Vertex AI Search
 export async function searchPlatformKnowledgeBase(query: string, maxResults: number = 10, userId?: string): Promise<ContextChunk[]> {
   try {
@@ -4069,6 +4897,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     }
 
     // Initialize the Search Service clients
+    // ENG-1277: lazy load — see the import comment above for why.
+    const { SearchServiceClient, protos } = await import('@google-cloud/discoveryengine');
     const privateKey = await getGCSPPrivateKey();
 
     const publicClient = new SearchServiceClient({
@@ -4114,11 +4944,18 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       }
     };
 
-    // Search both knowledge bases in parallel
-    const [publicResults, privateResults] = await Promise.all([
-      publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }),
-      privateClient.search({ ...searchRequest, servingConfig: privateServingConfig })
-    ]);
+    // Search both knowledge bases in parallel. The outer withTimeout guard only
+    // abandons the *promise* on the caller's side — without also passing
+    // CallOptions.timeout, the underlying RPCs stay in flight past the 10s
+    // deadline, holding the socket and retry budget open.
+    const [publicResults, privateResults] = await withTimeout(
+      Promise.all([
+        publicClient.search({ ...searchRequest, servingConfig: publicServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS }),
+        privateClient.search({ ...searchRequest, servingConfig: privateServingConfig }, { timeout: KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS })
+      ]),
+      KNOWLEDGE_BASE_SEARCH_TIMEOUT_MS,
+      'searchPlatformKnowledgeBase',
+    );
 
     const results: ContextChunk[] = [];
 
@@ -4314,17 +5151,100 @@ export async function generateChatResponse(
       throw new Error("Chat session not found");
     }
 
+    // ENG-1222: resolve skill/admin tool access ONCE, through agent-mode's own
+    // buildSkillContext, shared below by both the system prompt (skill
+    // systemPrompt injection) and tool binding — this is the single source of
+    // truth for "which tools + skill-context text does this session get",
+    // replacing two independently hand-rolled, silently-drifting copies of the
+    // same policy. Also picks up subscription-tier skill gating and
+    // __other_skills__ support that this path never had.
+    const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
+    const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
+    const skillToolGateOpen = portalType === 'customer' || (portalType as string) === 'emma-sidebar' || !!isDelegatedAdmin || sessionHasInstalledSkills;
+    // ENG-1852 follow-up: use the module's own exported singleton, not a fresh
+    // instance. A `new AgentModeService()` here ran a full initialize()
+    // (registerTools over ~264 tools + initializeMcp + ensureBuiltInSkills +
+    // downstream singleton bootstrap) on EVERY message this gate is open for,
+    // purely to throw the instance away at end of turn — and, because
+    // startFileCacheCleanup() sets an un-unref'd interval whose closure retains
+    // `this`, each discarded instance stayed reachable for the process lifetime.
+    // It was also the last remaining second construction site in backend/src,
+    // which is the exact shape that made ENG-1852 (two live instances, one with an
+    // empty registry, either able to answer a call) possible in the worker.
+    //
+    // Imported at top level, not lazily. An earlier version of this change used
+    // `await import('./agentModeService')` on the claim that it avoided
+    // constructing the singleton as a side effect of loading this module. That
+    // claim was false: line 25's `AgentModeService` class import is a VALUE import
+    // of the same module, so the module body — including its
+    // `export const agentModeService = new AgentModeService()` — already runs at
+    // load. The compiled output confirms it (`require("./agentModeService")` at
+    // top level). The lazy form bought nothing and cost a dynamic require per
+    // message. The existing circular edge with agentModeService.ts is unchanged
+    // and safe: compiled CJS resolves the binding at USE time, long after both
+    // modules finish loading.
+    //
+    // initialize() is idempotent for the expensive registration pass and still
+    // re-reads foundation tools on every call — see agentModeService.ts.
+    const agentModeService = agentModeServiceSingleton;
+    let skillContext: { allowedToolNames: Set<string>; installedSkillContextMsg: string } = { allowedToolNames: new Set<string>(), installedSkillContextMsg: '' };
+    // Exposed for the ENG-1222 hard gate below, so it can tell "subscription
+    // correctly doesn't include this skill" apart from "tool resolution failed".
+    let userAllowedSkillIdsForGate: string[] = [];
+    // getSkillsByIds/getPublishedSkills/getAllowedSkills can all reject (e.g. a
+    // transient DynamoDB error) — without tracking that separately from "resolved
+    // to an empty allowlist", the hard gate below would misreport a backend
+    // failure as "this skill isn't in your plan" to a paying customer whose
+    // subscription was never actually checked.
+    let skillAllowlistResolved = false;
+    if (skillToolGateOpen) {
+      try {
+        await agentModeService.initialize();
+        const { skillService } = await import('./skillService');
+        // buildSkillContext only ever consults publishedSkills/userAllowedSkillIds
+        // when the session itself has skill IDs to resolve or gate (regular skills,
+        // or the __other_skills__ virtual ID) — a plain skill-less customer/admin
+        // turn never uses either. Skipping them here avoids a subscription-tier
+        // lookup plus a full Dev-AW-Skills table scan on every single Emma message,
+        // not just the ones that actually have a skill installed.
+        if (sessionSkillIds.length > 0) {
+          const { getAllowedSkills, getPublicAllowedSkills } = await import('./subscriptionService');
+          const [associatedSkills, publishedSkills, userAllowedSkillIds] = await Promise.all([
+            skillService.getSkillsByIds(sessionSkillIds),
+            skillService.getPublishedSkills(),
+            // ENG-1222: userId is optional on this function (anonymous/public
+            // callers exist) — route those through the same public-allowlist path
+            // subscriptionService already defines, instead of letting getAllowedSkills
+            // throw on an undefined id and silently falling back to zero tools below.
+            userId ? getAllowedSkills(userId) : getPublicAllowedSkills(),
+          ]);
+          userAllowedSkillIdsForGate = userAllowedSkillIds;
+          // Set only after buildSkillContext itself succeeds — if it throws, the
+          // catch block below must still see skillAllowlistResolved === false, or
+          // the hard gate would misreport a context-construction bug as "your
+          // subscription doesn't include this skill".
+          skillContext = agentModeService.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionSkillIds, !!isDelegatedAdmin);
+          skillAllowlistResolved = true;
+        } else {
+          skillContext = agentModeService.buildSkillContext([], [], [], [], !!isDelegatedAdmin);
+        }
+      } catch (skillContextErr) {
+        console.error('[generateChatResponse] Error resolving skill/tool context:', skillContextErr);
+      }
+    }
+
     // Get messages for OpenAI
     // Always inject the current system prompt fresh (ignoring the stale stored version)
     // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
     const freshSystemPrompt = portalType === "customer" ? getEmmaSystemContext(session.sessionType, orgRole) : null;
+    const combinedSystemPrompt = [freshSystemPrompt, skillContext.installedSkillContextMsg || null].filter(Boolean).join('\n\n') || null;
     const messages = [...session.messages];
-    if (freshSystemPrompt) {
+    if (combinedSystemPrompt) {
       const firstSystemIdx = messages.findIndex((m) => m.role === "system");
       if (firstSystemIdx >= 0) {
-        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: freshSystemPrompt };
+        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: combinedSystemPrompt };
       } else {
-        messages.unshift({ role: "system", content: freshSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
+        messages.unshift({ role: "system", content: combinedSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
       }
     }
 
@@ -4447,7 +5367,7 @@ export async function generateChatResponse(
       // none of the agent-mode image-resume hardening (progression / multi-intent /
       // completion guard / asset-awareness / hands-off autocomplete wording) is emitted.
       // The reported bug was agent-mode-only, so Emma needs no change here.
-      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, undefined, false);
+      const workPlanMessages = AgentModeService.buildWorkPlanContextMessages(session.workPlan, undefined, false, session.calledFunctions);
       if (workPlanMessages.length > 0) {
         const lastUserMsgIndex = messages.map((m) => m.role).lastIndexOf("user");
         const insertAt = lastUserMsgIndex >= 0 ? lastUserMsgIndex : messages.length;
@@ -4459,28 +5379,26 @@ export async function generateChatResponse(
     }
 
     // Initialize tool support for Emma (customer portal, or admin users on any portal)
-    let agentModeService: AgentModeService | null = null;
     let toolDefinitions: any[] = [];
 
-    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin) {
+    if (skillToolGateOpen) {
       try {
-        // Initialize AgentModeService to access tool registry and executeTool
-        agentModeService = new AgentModeService();
-        await agentModeService.initialize();
-
-        // Base tools: foundation tools (always available in agent mode) + Emma-specific extras
+        // Base tools: agent-mode's resolved skill/admin/foundation tool names
+        // (computed once above, shared with the system prompt) + Emma-specific extras.
         // Only include customer-specific tools when on the customer portal or emma-sidebar
         const isCustomerContext = (portalType as string) === 'customer' || (portalType as string) === 'emma-sidebar';
-        const toolsToInclude = new Set<string>(isCustomerContext ? [
-          ...AgentModeService.FOUNDATION_TOOLS,
-          'read_page_source',
-          'enrich_leads_preview', 'enrich_leads_execute',
-          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
-          'search_user_guide',
-          'report_product_issues',
-          'get_temp_email', 'check_temp_inbox',
-          'get_test_account', 'save_test_account', 'list_test_accounts',
-        ] : []);
+        const toolsToInclude = new Set<string>(skillContext.allowedToolNames);
+        if (isCustomerContext) {
+          [
+            'read_page_source',
+            'enrich_leads_preview', 'enrich_leads_execute',
+            'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
+            'search_user_guide',
+            'report_product_issues',
+            'get_temp_email', 'check_temp_inbox',
+            'get_test_account', 'save_test_account', 'list_test_accounts',
+          ].forEach((t) => toolsToInclude.add(t));
+        }
 
         if (isCustomerContext) {
           // Page-aware tool injection based on the current page URL
@@ -4513,12 +5431,6 @@ export async function generateChatResponse(
           }
         }
 
-        // Add admin tools when user is admin (direct or delegated)
-        if (isDelegatedAdmin) {
-          const adminToolNames = agentModeService.getAdminToolNames();
-          adminToolNames.forEach(t => toolsToInclude.add(t));
-        }
-
         if (!emmaToolsLoaded) {
           await import('../emma/tools');
           await import('../emma/tempEmailTools');
@@ -4528,29 +5440,6 @@ export async function generateChatResponse(
         }
         const { mcpToolRegistry } = await import('../mcp/server/registry');
         const { emmaToolRegistry } = await import('../emma/registry');
-
-        // Expand the tool set with any skills installed on this session
-        // (session.associatedSkills). Without this, skills installed via Emma's
-        // install_skills tool — or auto-installed when a work plan template is
-        // launched (launch_predefined_work_plan) — would have no effect on Emma's tool list,
-        // so the plan's required tools would never become available. This mirrors
-        // Agent Mode, which resolves a session's installed skills into tool names.
-        const sessionSkillIds = Array.isArray(session.associatedSkills) ? session.associatedSkills : [];
-        if (sessionSkillIds.length > 0) {
-          try {
-            const { resolveSkillsToToolNames } = await import('./subscriptionService');
-            const skillToolNames = await resolveSkillsToToolNames(sessionSkillIds);
-            if (skillToolNames.includes('*')) {
-              // Wildcard: every registered Emma/MCP tool becomes available.
-              emmaToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-              mcpToolRegistry.getToolNames().forEach(t => toolsToInclude.add(t));
-            } else {
-              skillToolNames.forEach(t => toolsToInclude.add(t));
-            }
-          } catch (skillErr) {
-            console.error('[generateChatResponse] Error resolving session skills to tools:', skillErr);
-          }
-        }
 
         // Expand the tool set with the active work plan's required function calls.
         // Predefined templates declare the tools each step needs via
@@ -4592,6 +5481,77 @@ export async function generateChatResponse(
       }
     }
 
+    // ENG-1222 hard gate: a skill session (session.associatedSkills non-empty)
+    // expects its skill's tools to be available, so resolving to zero tools here
+    // is a binding/configuration failure (e.g. an unregistered tool name, or a
+    // skill with no toolNames declared), not a legitimate "no tools needed" turn.
+    // Fail explicitly instead of letting the model free-text an answer it has no
+    // real capability to back up — this is the failure mode that produced the P0
+    // ("I don't have the capability to..." for a session that actually did).
+    // toolDefinitions also carries customer/page/work-plan tools unrelated to the
+    // installed skill (e.g. a CRM-page turn on a customer session), so a nonzero
+    // toolDefinitions.length doesn't prove the skill's own tools bound. Gate on
+    // the subset that actually came from the skill (+ virtual-skill) resolution
+    // instead — excluding FOUNDATION_TOOLS and the delegated-admin tool set,
+    // since buildSkillContext unions both into allowedToolNames unconditionally
+    // (foundation tools for every session, admin tools for any delegated admin),
+    // so a single registered tool from either would otherwise mask the exact
+    // "this skill's own tools failed to bind" failure the gate exists to catch.
+    const adminToolNames = new Set(agentModeService.getAdminToolNames());
+    const skillOnlyToolNames = new Set(
+      [...skillContext.allowedToolNames].filter((name) => !AgentModeService.FOUNDATION_TOOLS.has(name) && !adminToolNames.has(name)),
+    );
+    const skillToolDefinitions = toolDefinitions.filter((t: any) => skillOnlyToolNames.has(t.function.name));
+    if (sessionHasInstalledSkills && skillToolDefinitions.length === 0) {
+      // ENG-1222: subscription-tier gating (now enforced here via buildSkillContext,
+      // where before this path ignored it) correctly excludes a skill's tools when
+      // the caller's plan doesn't include it — that isn't a bug to apologize for or
+      // ask the user to retry. Tell them the real reason instead of the generic
+      // "configuration issue" message, which would be actively misleading here.
+      const isWildcardAllowed = userAllowedSkillIdsForGate.includes('*');
+      // skillAllowlistResolved guards this: an unresolved allowlist (the
+      // Promise.all above rejected) must never be classified as "subscription
+      // doesn't include this skill" — that's only a real conclusion once the
+      // allowlist was actually fetched.
+      const isSubscriptionGated = skillAllowlistResolved && !isWildcardAllowed && sessionSkillIds.length > 0
+        && sessionSkillIds.every((id) => !userAllowedSkillIdsForGate.includes(id));
+      console.error('[generateChatResponse] ENG-1222 hard gate: skill session resolved to zero tools', {
+        sessionId,
+        associatedSkills: session.associatedSkills,
+        isSubscriptionGated,
+      });
+      const hardGateMessage = isSubscriptionGated
+        ? "This skill isn't included in your current plan, so I don't have access to its tools right now. You may need to upgrade your subscription, or contact support if you believe this is a mistake."
+        : "I wasn't able to load the tools this task needs right now — that looks like a configuration issue on our side rather than something you did wrong. Please try again in a moment, and let us know if it keeps happening.";
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: "assistant",
+        content: hardGateMessage,
+        metadata: { timestamp, portalType },
+      });
+      return hardGateMessage;
+    }
+
+    // ENG-1222 runtime assertion: if the user's message names one of the tools
+    // that IS available this turn (e.g. "call list_connected_accounts") and the
+    // model's first response makes zero tool calls, don't accept that as final —
+    // nudge once and give it a real chance to actually call the tool before
+    // falling back to whatever it says (still subject to the fabrication guard
+    // below either way).
+    const availableToolNames = toolDefinitions.map((t: any) => t.function.name);
+    const userNamedAvailableTool = availableToolNames.some((name: string) => {
+      if (!userMessage.includes(name)) return false;
+      // Exclude meta-questions ABOUT the tool ("what does X do?", "how does X
+      // work?", "explain X") from counting as a request to invoke it — a naive
+      // substring match would otherwise retry a question the model already
+      // answered correctly without calling anything.
+      const isMetaQuestionAboutTool = new RegExp(
+        `\\b(?:what (?:does|is)|how does|explain|describe|tell me about)\\b[^.!?]*${name}`,
+        'i',
+      ).test(userMessage);
+      return !isMetaQuestionAboutTool;
+    });
+    let retriedForMissingToolCall = false;
+
     // Iterative tool execution loop (follows Agent Mode pattern)
     const startMemory = process.memoryUsage();
     const startTime = Date.now();
@@ -4605,41 +5565,11 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
-    const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
-    // Match 'claude' or 'anthropic.' prefixed Bedrock IDs (e.g. anthropic.claude-3-5-sonnet-20241022)
-    // Deliberately excludes generic 'sonnet' to avoid false positives on unrelated model names.
-    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.startsWith('anthropic.')) : false;
-
-    // Select the active client:
-    // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
-    //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
-    // - Gemini: use agentModeService.getGeminiClient() which returns an
-    //   OpenAI-compatible wrapper that supports tool calling.
-    // - Azure OpenAI (default): use the standard OpenAI SDK client.
-    const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
-    let activeClient: any;
-
-    if (isClaudeModel || isGeminiModel) {
-      if (!agentModeService) {
-        throw new Error('AgentModeService not initialized');
-      }
-    }
-
-    if (isClaudeModel) {
-      activeClient = await agentModeService!.getBedrockClient(model!);
-    } else if (isGeminiModel) {
-      activeClient = await agentModeService!.getGeminiClient();
-    } else {
-      // model specified → that Azure deployment; otherwise the default
-      // deployment (what the module singleton used). Metered via the factory.
-      activeClient = getAzureClient(
-        { userId, feature: "chat", sessionId },
-        model || process.env.AZURE_OPENAI_DEPLOYMENT
-      );
-    }
-
-    // Helper: Sleep function for exponential backoff
-    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    // One logical model and one shared execution boundary for every Emma portal.
+    // callLLM owns provider transport, retries/fallback, and exactly-once metering;
+    // the sidebar owns only conversation/tool behavior.
+    const activeModel = model || session.llmModel || await agentModeService.getDefaultModel();
+    const isEmmaInteractive = portalType === 'customer';
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
@@ -4647,16 +5577,11 @@ export async function generateChatResponse(
       // Trim large old tool results to prevent context window overflow
       const trimmedMessages = trimToolMessagesForContext(messages);
 
-      // Generate response using OpenAI (with tools if available)
+      // Generate through the shared runtime gateway (with tools if available).
       const llmStartMs = Date.now();
-      let response: any;
-      const maxAttempts = 3;
-      const baseDelayMs = 2000;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          response = await activeClient.chat.completions.create({
-            model: activeDeployment,
-            messages: trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
+      const response = await agentModeService.callLLM(
+        activeModel,
+        trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
@@ -4669,21 +5594,13 @@ export async function generateChatResponse(
           }
           return message;
         }),
-        // Add tools only for customer portal with tools loaded
-        ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
-          });
-          break; // Success, break the retry loop
-        } catch (error) {
-          const isLastAttempt = attempt >= maxAttempts;
-          if (!isTransientLLMError(error) || isLastAttempt) {
-            throw error;
-          }
-          const jitterMs = Math.floor(Math.random() * 500);
-          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
-          console.warn(`[generateChatResponse] Rate limit/transient error for model "${activeDeployment}", attempt ${attempt}/${maxAttempts}. Waiting ${delayMs}ms before retry...`);
-          await sleep(delayMs);
-        }
-      }
+        {
+          ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' as const } : {}),
+          ...(isEmmaInteractive ? { taskClass: 'interactive_chat' as const } : {}),
+          humanPaced: true,
+          usageContext: { userId, sessionId, feature: 'chat' },
+        },
+      );
 
       const llmDurationMs = Date.now() - llmStartMs;
       const responseMessage = response.choices[0]?.message;
@@ -4694,7 +5611,8 @@ export async function generateChatResponse(
       // Log token usage for this iteration
       logTokenUsage(
         response,
-        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`,
+        activeModel,
       );
 
       // Add assistant message to messages array (for next iteration)
@@ -4709,10 +5627,28 @@ export async function generateChatResponse(
 
       // Check if LLM wants to call tools
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+        // toolCalls.length === 0 restricts the retry to "nothing real has executed
+        // yet this turn" — once a tool has actually run, a later toolless response
+        // is the model synthesizing its final answer from real results, not denying
+        // or fabricating, and must not be treated as another missed tool call.
+        if (userNamedAvailableTool && !retriedForMissingToolCall && toolCalls.length === 0) {
+          retriedForMissingToolCall = true;
+          console.warn('[generateChatResponse] ENG-1222 retry: user named an available tool but the model made zero tool calls this turn', {
+            sessionId,
+            availableToolNames,
+          });
+          iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
+          messages.push({
+            role: 'user',
+            content: `Reminder: you have real tools available (${availableToolNames.join(', ')}) for this request — call the tool now instead of describing or simulating what it would return.`,
+          });
+          iteration++;
+          continue;
+        }
         // No tool calls - we're done
         iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
-        finalUsageData = logTokenUsage(response, "Final response");
+        finalUsageData = logTokenUsage(response, "Final response", activeModel);
         break;
       }
 
@@ -4724,12 +5660,11 @@ export async function generateChatResponse(
           functionArgs = JSON.parse(toolCall.function.arguments);
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
-          if (!agentModeService) throw new Error("AgentModeService not initialized");
           const extraContext: Record<string, any> = {};
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
-          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
+          const result = await agentModeService.executeTool(activeModel, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           // ENG-351: harvest web-search sources into the citation registry.
           let citationBatch: Citation[] = [];
@@ -4760,6 +5695,50 @@ export async function generateChatResponse(
     if (iteration >= MAX_ITERATIONS && !finalAssistantMessage) {
       finalAssistantMessage = "I apologize, but I reached the maximum number of iterations. Please try again with a simpler request.";
       console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
+    }
+
+    // ENG-1222: a turn that made zero real tool calls must never present its own
+    // prose as if it were actual/real tool-derived data — this is exactly the P0
+    // fabrication pattern (an invented Google Ads account presented as "the
+    // ACTUAL returned rows"). toolCalls.length === 0 is ground truth for whether
+    // anything really executed. The phrase match alone over-fires on innocent
+    // text like "based on your actual account settings" (no tool-result claim at
+    // all) — genuine fabrication also presents something ID/list-shaped to look
+    // authentic, so require both signals together to cut that false-positive rate
+    // without weakening the check against the actual incident pattern.
+    const CLAIMS_REAL_TOOL_OUTPUT = /\bactual(?:ly)?\s+(?:returned|return|results?|rows?|data|account\s+(?:names?|ids?))\b|\breal\s+(?:api|account|customer)\s+data\b/i;
+    const LOOKS_LIKE_TOOL_SHAPED_DATA = /\d{3,}|(?:^|\n)\s*[-*•]\s|(?:^|\n)\s*\d+[.)]\s/;
+    // An honest refusal ("I can't reach your actual data, but here's how to
+    // check it yourself:" followed by a bulleted list) satisfies both patterns
+    // above on a zero-tool turn. Scoped to a denial word immediately followed by
+    // an access verb, not any negation within reach of "actual" — "I don't know
+    // why, but here are the actual returned rows" is genuine fabrication and
+    // must still be caught, so a bare "don't"/"can't" elsewhere in the sentence
+    // doesn't exempt it.
+    const DENIES_REAL_TOOL_ACCESS = /\b(?:can(?:'|’)?t|cannot|don(?:'|’)?t|unable to|without)\s+(?:access(?:ing)?|reach(?:ing)?|retriev(?:e|ing)|get(?:ting)?|provid(?:e|ing)|check(?:ing)?|pull(?:ing)?|fetch(?:ing)?|see(?:ing)?)\b[^.!?]{0,30}\bactual\b/i;
+    // A turn where every tool call threw still pushes those failures into
+    // toolCalls (see the catch block above), so toolCalls.length alone isn't
+    // "something really executed" — it must have at least one call that didn't
+    // error and didn't report an explicit { success: false } result.
+    const isFailedToolResult = (result: any): boolean => {
+      // Tool results aren't always objects — some handlers return a JSON string
+      // (see toolContent above). A string result with success:false must count
+      // as a failure too, or a serialized error slips past the `.success`
+      // property check (undefined on a string, so `!== false` is trivially true).
+      const parsed = typeof result === 'string'
+        ? (() => { try { return JSON.parse(result); } catch { return undefined; } })()
+        : result;
+      return parsed?.success === false;
+    };
+    const hasSuccessfulToolCall = toolCalls.some((tc) => !tc.error && !isFailedToolResult(tc.result));
+    if (
+      !hasSuccessfulToolCall
+      && CLAIMS_REAL_TOOL_OUTPUT.test(finalAssistantMessage)
+      && LOOKS_LIKE_TOOL_SHAPED_DATA.test(finalAssistantMessage)
+      && !DENIES_REAL_TOOL_ACCESS.test(finalAssistantMessage)
+    ) {
+      console.error('[generateChatResponse] Blocked a zero-tool-call response claiming real tool-derived data', { sessionId, portalType });
+      finalAssistantMessage = "I wasn't able to actually run the tools needed to get real data for this, so I don't have genuine results to share. Please try again, and let us know if this keeps happening.";
     }
 
     // Calculate memory usage delta and current state
@@ -4794,6 +5773,12 @@ export async function generateChatResponse(
     await chatbotDb.addMessageToSession(sessionId, {
       role: "assistant",
       content: finalAssistantMessage,
+      // ENG-1222: stamp the model that actually generated this turn so
+      // apiTools.ts's per-session attribution (attributionBasis/generationModels/
+      // costByModel) reads 'transcript' instead of falling back to
+      // 'selection-only' — without this, spend/model telemetry for every Emma
+      // turn is invisible to the tool-binding-failure fingerprint the P0 relied on.
+      llm: activeModel,
       usage: finalUsageData,
       metadata: assistantMessageMetadata,
     });

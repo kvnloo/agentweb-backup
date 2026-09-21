@@ -172,6 +172,356 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
 
       expect(result.success).toBe(true);
       expect(agentModeService.callLLM).toHaveBeenCalled();
+
+      // ENG-1877 regression guard: an earlier version of the escaping fix ran every
+      // value through String(value), which collapses an object array item to the
+      // literal text "[object Object]" instead of preserving its real fields — a
+      // silent full data-loss regression a bare success-flag check would not catch.
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+      expect(promptContent).not.toContain('[object Object]');
+      expect(promptContent).toContain('Item 1');
+      expect(promptContent).toContain('Item 2');
+    });
+
+    // ENG-1877 follow-up (round 2 review): escaping must preserve structure (objects,
+    // arrays, null) while still escaping every STRING leaf, however deeply nested —
+    // not flatten everything through String(value).
+    it('should escape string leaves nested inside object array items without losing structure', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items'],
+        html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [{ item: '<script>alert(1)</script>' }, { item: 'Safe Item', note: null }] },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('[object Object]');
+      expect(promptContent).not.toContain('<script>alert(1)</script>');
+      expect(promptContent).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(promptContent).toContain('Safe Item');
+      // null is a real JSON value, not the literal text "null" a String(value) coercion
+      // would have produced.
+      expect(promptContent).toContain('"note": null');
+      expect(promptContent).not.toContain('"note": "null"');
+    });
+
+    // ENG-1877: variable values (campaign names, CRM data) are not trusted HTML, but the
+    // LLM is instructed to copy them through verbatim — so an unescaped value reaches the
+    // rendered report unchanged. Asserts on the actual PROMPT sent to callLLM, since that's
+    // where escaping has to happen (post-hoc sanitizing the LLM's output can't tell a
+    // value's markup apart from the template's own static markup).
+    it('should HTML-escape scalar variable values before building the substitution prompt', async () => {
+      const maliciousTitle = '<script>alert(1)</script> & "Sale" <b>Bold</b>';
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('<script>alert(1)</script>');
+      expect(promptContent).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(promptContent).toContain('&amp;');
+      expect(promptContent).toContain('&quot;Sale&quot;');
+      expect(promptContent).toContain('&lt;b&gt;Bold&lt;/b&gt;');
+    });
+
+    // A single-quoted HTML attribute (e.g. <img src='{{url}}'>) is valid HTML the template
+    // author could write, and nothing forbids it. Escaping only &, <, >, " (not ') leaves this
+    // vector wide open: a value of `' onerror='alert(1)` breaks out of the attribute without
+    // ever containing any of the 4 escaped characters, so the earlier assertions above (which
+    // only test double-quote/no-quote contexts) would not have caught this gap.
+    it('should HTML-escape single quotes, closing the single-quoted-attribute breakout vector', async () => {
+      const breakoutValue = "' onerror='alert(1)";
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: breakoutValue, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain("' onerror='alert(1)");
+      expect(promptContent).toContain('&#39; onerror=&#39;alert(1)');
+    });
+
+    // Escaping the PROMPT only proves the request was safe — it says nothing about
+    // whether the LLM actually reproduced the escaped form rather than "cleaning up"
+    // what looked like a stray HTML entity. This simulates exactly that failure: the
+    // model is asked to escape but the mocked response leaks the raw value anyway.
+    // Auto-CORRECTS rather than rejecting outright — this function is shared by ~35
+    // other real templates never tested against this change, and a reject-on-detect
+    // design would turn any of their models' occasional imperfect escaping into a
+    // customer-visible outage unrelated to security. See round-3 review discussion.
+    it('should auto-correct a raw, unescaped value the LLM reproduced in its output', async () => {
+      const maliciousTitle = '<script>alert(1)</script>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // Simulates a misbehaving model that decoded the escaped entity back
+              // to raw HTML instead of reproducing it as sent.
+              final_html: `<html><body><h1>${maliciousTitle}</h1><p>Test Content</p></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<script>alert(1)</script>');
+      expect(uploadedHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    });
+
+    // Round-3 review finding: an exact, case-sensitive match let a model evade the
+    // output-verification check via trivial reformatting — `<SCRIPT>` is just as
+    // browser-executable as `<script>`, so a case-sensitive check missing it entirely
+    // would defeat the correction for zero real difficulty on the model's part.
+    it('should auto-correct even if the LLM reproduces the raw value with different casing', async () => {
+      const maliciousTitle = '<script>alert(1)</script>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1><SCRIPT>alert(1)</SCRIPT></h1><p>Test Content</p></body></html>',
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml.toLowerCase()).not.toContain('<script>alert(1)</script>');
+      expect(uploadedHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    });
+
+    // Round-4 review finding: `subject` (docs/html-templates.md) is a real email subject
+    // line, never HTML-rendered — escaping it doesn't protect anything, it just shows
+    // literal "&amp;"/"&#39;" text in a real customer's inbox. The subject must come back
+    // as plain, decoded text even when the LLM faithfully echoes the escaped values it
+    // was given.
+    it('should decode HTML entities in final_subject — it is plain text, never rendered', async () => {
+      const clientName = 'O\'Brien & Sons "Premium"';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: '<html><body><h1>Report</h1></body></html>',
+              // Simulates the LLM faithfully copying the escaped value into the subject,
+              // exactly as it's instructed to do for the HTML body.
+              final_subject: 'Report for O&#39;Brien &amp; Sons &quot;Premium&quot;'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: clientName, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.final_subject).toBe('Report for O\'Brien & Sons "Premium"');
+      expect(result.final_subject).not.toContain('&amp;');
+      expect(result.final_subject).not.toContain('&#39;');
+      expect(result.final_subject).not.toContain('&quot;');
+    });
+
+    // Round-4 review finding, verified by direct execution in the review itself: passing
+    // the escaped value as a plain string (not a function) to String.replace lets a `$`
+    // adjacent to certain characters trigger JS's special replacement-pattern syntax
+    // (e.g. `$&` re-inserts the matched text), silently RE-introducing the raw value the
+    // correction was supposed to remove — the "fix" reopening the exact injection it exists
+    // to close.
+    it('should not reinject raw content via $-pattern replacement-string interpretation', async () => {
+      const maliciousTitle = '<b>Price$&Info</b>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              final_html: `<html><body><h1>${maliciousTitle}</h1></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: maliciousTitle, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<b>Price');
+      expect(uploadedHtml).not.toContain('</b>');
+      expect(uploadedHtml).toContain('&lt;b&gt;Price$&amp;Info&lt;/b&gt;');
+    });
+
+    // Round-4 review finding, verified by direct execution: when one flagged raw value is
+    // a literal substring of another (plausible with real HTML-snippet-shaped data),
+    // correcting the shorter one first destroys the exact string the longer one's pattern
+    // needs to match, silently no-oping the longer one's own correction.
+    it('should correct both values when one raw value is a substring of another', async () => {
+      const shortValue = '<b>Alpha</b>';
+      const longValue = '<div><b>Alpha</b></div>';
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // The model leaked both raw forms — the short one standalone (title) and
+              // the long one containing it (content).
+              final_html: `<html><body><h1>${shortValue}</h1><p>${longValue}</p></body></html>`,
+              final_subject: 'Test Subject: has a title'
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: shortValue, content: longValue },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const { uploadFileToS3 } = require('../utils/s3Utils');
+      const uploadedHtml = (uploadFileToS3 as jest.Mock).mock.calls[0][0];
+      expect(uploadedHtml).not.toContain('<b>Alpha</b>');
+      expect(uploadedHtml).not.toContain('<div>');
+      expect(uploadedHtml).toContain('&lt;b&gt;Alpha&lt;/b&gt;');
+      expect(uploadedHtml).toContain('&lt;div&gt;&lt;b&gt;Alpha&lt;/b&gt;&lt;/div&gt;');
+    });
+
+    // Round-3 review finding: including '/&/" in the output-verification check made an
+    // ordinary apostrophe in a real name ("O'Brien's Q3") a false-positive trigger if that
+    // short substring coincidentally reappeared anywhere else in the LLM's output — failing
+    // a legitimate report for no real security benefit, since an apostrophe alone (without
+    // a `<`/`>`) cannot construct a new HTML element regardless of where it lands.
+    it('should NOT fail closed on an ordinary apostrophe reappearing elsewhere in the output', async () => {
+      const clientName = "O'Brien's Q3";
+
+      (agentModeService.callLLM as jest.Mock).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              // The client name legitimately appears twice — once as the real
+              // substitution, once incidentally repeated by the model elsewhere.
+              final_html: `<html><body><h1>${clientName}</h1><p>Report for ${clientName}</p></body></html>`,
+              final_subject: `Report: ${clientName}`
+            })
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: clientName, content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should HTML-escape array variable values before building the substitution prompt', async () => {
+      const templateWithArrays = {
+        ...mockTemplate,
+        arrayVariables: ['items'],
+        html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>'
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([templateWithArrays])
+      });
+
+      const maliciousItem = '<img src=x onerror=alert(1)>';
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        { items: [maliciousItem] },
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+      const promptContent = messages[0].content;
+
+      expect(promptContent).not.toContain('<img src=x onerror=alert(1)>');
+      expect(promptContent).toContain('&lt;img src=x onerror=alert(1)&gt;');
     });
 
     it('should validate that all required variables are provided', async () => {

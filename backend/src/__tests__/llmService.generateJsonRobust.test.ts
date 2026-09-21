@@ -68,13 +68,23 @@ describe('LLMService.generateJsonRobust', () => {
         content: '{"ok":true}',
       });
     const svc = makeService(invoke);
-    const out = await svc.generateJsonRobust<{ ok: boolean }>('sys', 'user');
-    expect(out).toEqual({ ok: true });
-    expect(invoke).toHaveBeenCalledTimes(2);
-    // Retry should have been called with a stricter system prompt
-    const secondCall = invoke.mock.calls[1][0];
-    const systemContent = String(secondCall[0]?.content || '');
-    expect(systemContent).toContain('valid JSON');
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await svc.generateJsonRobust<{ ok: boolean }>('sys', 'user');
+      expect(out).toEqual({ ok: true });
+      expect(invoke).toHaveBeenCalledTimes(2);
+      // Retry should have been called with a stricter system prompt
+      const secondCall = invoke.mock.calls[1][0];
+      const systemContent = String(secondCall[0]?.content || '');
+      expect(systemContent).toContain('valid JSON');
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('first extraction failed'),
+        expect.objectContaining({ rawLength: 40, model: 'gpt-4' }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('I cannot generate JSON');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('throws JsonExtractError with raw snippet when both attempts fail', async () => {
@@ -109,6 +119,20 @@ describe('LLMService.generateJsonRobust', () => {
       svc.generateJsonRobust('sys', 'user'),
     ).rejects.toThrow('ECONNREFUSED');
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('wraps a strict-retry transport failure without leaking the first raw response', async () => {
+    const invoke = jest.fn()
+      .mockResolvedValueOnce({ content: 'not json' })
+      .mockRejectedValueOnce(new Error('strict retry unavailable'));
+    const svc = makeService(invoke);
+
+    await expect(svc.generateJsonRobust('sys', 'user')).rejects.toMatchObject({
+      name: 'JsonExtractError',
+      message: expect.stringContaining('strict retry unavailable'),
+      rawSnippet: expect.stringContaining('not json'),
+    });
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it('invokes the usage callback on every call', async () => {

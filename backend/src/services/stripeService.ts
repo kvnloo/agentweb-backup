@@ -1,10 +1,11 @@
 import Stripe from 'stripe';
 import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
-import { userDb } from './db';
+import { userDb, User } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
+import { waitlistDb, WaitlistEntry } from './waitlistDb';
 
 dotenv.config();
 
@@ -38,6 +39,152 @@ export function getSubscriptionPeriodEndIso(sub: any): string | undefined {
     sub?.items?.data?.[0]?.current_period_end ?? sub?.current_period_end;
   if (raw == null) return undefined;
   return new Date(typeof raw === 'number' ? raw * 1000 : raw).toISOString();
+}
+
+/**
+ * Extract the two custom checkout fields ("companyname" and
+ * "howdoyouplantousethisproduct") from a Stripe Checkout Session's
+ * `custom_fields` array. Shared by the authenticated webhook handler
+ * (source of truth) so the profile-enrichment side effects that used to
+ * live in the public, unauthenticated `GET /api/stripe/session/:sessionId`
+ * route (ENG-1756) still happen — just from a signature-verified event.
+ */
+export function extractCheckoutCustomFields(session: any): {
+  companyName?: string;
+  productUsageLabel?: string;
+} {
+  let companyName: string | undefined;
+  let productUsageLabel: string | undefined;
+
+  if (session?.custom_fields && Array.isArray(session.custom_fields)) {
+    for (const field of session.custom_fields) {
+      if (
+        field.key === 'companyname' &&
+        field.text &&
+        typeof field.text.value === 'string'
+      ) {
+        companyName = field.text.value;
+      }
+      if (
+        field.key === 'howdoyouplantousethisproduct' &&
+        field.dropdown &&
+        typeof field.dropdown.value === 'string'
+      ) {
+        const selectedValue = field.dropdown.value;
+        const selectedOption = field.dropdown.options?.find(
+          (opt: any) => opt.value === selectedValue
+        );
+        productUsageLabel =
+          selectedOption && typeof selectedOption.label === 'string'
+            ? selectedOption.label
+            : selectedValue;
+      }
+    }
+  }
+
+  return { companyName, productUsageLabel };
+}
+
+/**
+ * Sync companyName / useCaseCategories from a Checkout Session's custom
+ * fields onto the matching user (or waitlist entry) record. Only ever
+ * called from the signature-verified webhook handler — this is the write
+ * path formerly reachable from the public GET session-lookup route
+ * (ENG-1756).
+ */
+async function syncCheckoutProfileFields(session: any): Promise<void> {
+  const { companyName, productUsageLabel } = extractCheckoutCustomFields(session);
+  if (!companyName && !productUsageLabel) return;
+
+  let email: string | undefined;
+  if (
+    session.customer &&
+    typeof session.customer === 'object' &&
+    !session.customer.deleted &&
+    session.customer.email
+  ) {
+    email = session.customer.email;
+  } else if (session.customer_details?.email) {
+    email = session.customer_details.email;
+  }
+  if (!email) return;
+  email = email.toLowerCase();
+
+  let stripeCustomerId: string | undefined;
+  if (session.customer) {
+    if (typeof session.customer === 'string') {
+      stripeCustomerId = session.customer;
+    } else if (session.customer.id && !session.customer.deleted) {
+      stripeCustomerId = session.customer.id;
+    }
+  }
+
+  try {
+    const existingUser = await userDb.getUserByEmail(email);
+
+    if (existingUser && existingUser.userId) {
+      const userUpdates: Partial<User> = {};
+      if (stripeCustomerId && existingUser.stripe_customer_id !== stripeCustomerId) {
+        userUpdates.stripe_customer_id = stripeCustomerId;
+      }
+      if (companyName && existingUser.companyName !== companyName) {
+        userUpdates.companyName = companyName;
+      }
+      if (
+        productUsageLabel &&
+        (!existingUser.useCaseCategories ||
+          existingUser.useCaseCategories.length !== 1 ||
+          existingUser.useCaseCategories[0] !== productUsageLabel)
+      ) {
+        userUpdates.useCaseCategories = [productUsageLabel];
+      }
+      if (Object.keys(userUpdates).length > 0) {
+        await userDb.updateUser(existingUser.userId, userUpdates);
+      }
+
+      const waitlistUpdates: Partial<WaitlistEntry> = {};
+      if (stripeCustomerId) waitlistUpdates.stripe_customer_id = stripeCustomerId;
+      if (companyName) waitlistUpdates.companyName = companyName;
+      if (productUsageLabel) waitlistUpdates.useCaseCategories = [productUsageLabel];
+      if (Object.keys(waitlistUpdates).length > 0) {
+        const waitlistEntry = await waitlistDb.getByEmail(email);
+        if (waitlistEntry) {
+          const changesExist = Object.keys(waitlistUpdates).some(
+            (key) =>
+              waitlistUpdates[key as keyof typeof waitlistUpdates] !==
+              waitlistEntry[key as keyof typeof waitlistEntry]
+          );
+          if (changesExist) {
+            await waitlistDb.updateDetails(email, waitlistUpdates);
+          }
+        }
+      }
+    } else {
+      const existingWaitlistEntry = await waitlistDb.getByEmail(email);
+      const waitlistData: Partial<WaitlistEntry> & { email: string } = {
+        email,
+        companyName: companyName || existingWaitlistEntry?.companyName || 'Freelancer',
+        useCaseCategories: productUsageLabel
+          ? [productUsageLabel]
+          : existingWaitlistEntry?.useCaseCategories || [],
+        stripe_customer_id: stripeCustomerId,
+        supportNote: existingWaitlistEntry?.supportNote || 'Joined/Updated from Stripe',
+        joinedAt: existingWaitlistEntry?.joinedAt || new Date().toISOString(),
+        status: 'invited',
+        invitedAt: new Date().toISOString(),
+      };
+      if (existingWaitlistEntry) {
+        await waitlistDb.updateDetails(email, waitlistData);
+      } else {
+        await waitlistDb.add(waitlistData as WaitlistEntry);
+      }
+    }
+  } catch (err: any) {
+    console.error(
+      `[STRIPE] Failed to sync checkout profile fields for session ${session?.id}:`,
+      err.message
+    );
+  }
 }
 
 /**
@@ -408,6 +555,35 @@ export async function syncSubscriptionFromStripe(
 
 // ─── Webhook Event Handlers ────────────────────────────────────────────
 
+export async function handleLlmUsageTopUpCheckoutCompleted(session: any): Promise<void> {
+  const metadata = session?.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') throw new Error('Invalid usage top-up checkout metadata');
+  if (session.payment_status !== 'paid') {
+    // Async payment methods are granted by checkout.session.async_payment_succeeded.
+    return;
+  }
+  const billingUserId = String(metadata.billingUserId || '');
+  const amountMicroUsd = Number(metadata.usageCreditMicroUsd);
+  const minimumMarkupBps = Number(metadata.minimumMarkupBps);
+  const paidCents = Number(session.amount_total);
+  const topUpGrantId = String(metadata.topUpGrantId || session.id || '');
+  if (!billingUserId) throw new Error('billingUserId is required');
+  if (!topUpGrantId) throw new Error('topUpGrantId is required');
+  if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) throw new Error('Invalid usage credit amount');
+  if (!Number.isInteger(minimumMarkupBps) || minimumMarkupBps < 10_000) throw new Error('Invalid usage top-up markup');
+  if (!Number.isInteger(paidCents) || paidCents <= 0) throw new Error('Invalid usage top-up payment amount');
+  if (paidCents * 10_000 * 10_000 < amountMicroUsd * minimumMarkupBps) {
+    throw new Error('Usage top-up payment is below the configured minimum markup');
+  }
+  const { grantMonthlyLlmUsageCredit } = await import('./llmUsageCreditService');
+  await grantMonthlyLlmUsageCredit({
+    billingUserId,
+    grantId: `stripe:${topUpGrantId}`,
+    source: 'purchase',
+    amountMicroUsd,
+  });
+}
+
 /**
  * Handle checkout.session.completed — link Stripe customer/subscription to user.
  */
@@ -489,6 +665,14 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     subscription_status: updateData.subscription_status,
     stripe_customer_id: updateData.stripe_customer_id,
   });
+
+  // Sync companyName/useCaseCategories from custom checkout fields — this
+  // used to happen from the public, unauthenticated GET session-lookup
+  // route (ENG-1756); moved here since this handler is signature-verified.
+  // Awaited (not fire-and-forget): this function already catches its own
+  // errors internally, so awaiting only ensures the work completes before
+  // the webhook handler returns — it cannot make this handler throw.
+  await syncCheckoutProfileFields(session);
 
   // Cancel any duplicate subscriptions for this customer (keep only the latest)
   if (stripeCustomerId && stripeSubscriptionId) {
@@ -865,6 +1049,7 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
+  const metadata = charge.metadata || {};
   const customerId = typeof charge.customer === 'string'
     ? charge.customer
     : charge.customer?.id;
@@ -874,10 +1059,42 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
     return;
   }
 
-  const user = await findUserByStripeCustomerId(customerId);
+  const metadataBillingUserId = String(metadata.billingUserId || '');
+  const user = metadata.purchaseType === 'llm_usage_top_up' && metadataBillingUserId
+    ? await userDb.getUserById(metadataBillingUserId)
+    : await findUserByStripeCustomerId(customerId);
   if (!user) {
     console.warn(`[STRIPE] No user found for charge.refunded. customer=${customerId}`);
     return;
+  }
+
+  if (metadata.purchaseType === 'llm_usage_top_up') {
+    const amountPaidCents = Number(charge.amount);
+    const amountRefundedCents = Number(charge.amount_refunded);
+    const purchasedMicroUsd = Number(metadata.usageCreditMicroUsd);
+    const topUpGrantId = String(metadata.topUpGrantId || '');
+    const billingUserId = user.userId;
+    if (
+      !topUpGrantId ||
+      !Number.isInteger(amountPaidCents) || amountPaidCents <= 0 ||
+      !Number.isInteger(amountRefundedCents) || amountRefundedCents < 0 ||
+      !Number.isInteger(purchasedMicroUsd) || purchasedMicroUsd <= 0
+    ) {
+      throw new Error(`Invalid usage top-up refund metadata for charge ${charge.id}`);
+    }
+    const targetReversedMicroUsd = charge.refunded
+      ? purchasedMicroUsd
+      : Math.min(
+          purchasedMicroUsd,
+          Math.round((purchasedMicroUsd * amountRefundedCents) / amountPaidCents),
+        );
+    const { reverseMonthlyPurchasedLlmUsageCredit } = await import('./llmUsageCreditService');
+    await reverseMonthlyPurchasedLlmUsageCredit({
+      billingUserId,
+      grantId: `stripe:${topUpGrantId}`,
+      reversalId: `charge:${charge.id}:refunded:${amountRefundedCents}`,
+      targetReversedMicroUsd,
+    });
   }
 
   // Record in payment history
@@ -897,6 +1114,179 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
 
   console.log(
     `[STRIPE] Charge refunded: user ${user.userId}, charge=${charge.id}, amount_refunded=${charge.amount_refunded}`
+  );
+}
+
+/**
+ * Resolve the charge behind a dispute. Stripe's dispute payloads carry only the
+ * charge *id*, while the credit-purchase metadata we need (billing user, grant
+ * id, purchased capacity) lives on the charge itself, so it has to be fetched.
+ */
+async function retrieveDisputedCharge(dispute: any): Promise<any | null> {
+  const chargeId = typeof dispute.charge === 'string'
+    ? dispute.charge
+    : dispute.charge?.id;
+  if (!chargeId) {
+    console.warn(`[STRIPE] dispute ${dispute.id} carries no charge reference`);
+    return null;
+  }
+  return getStripeOrThrow().charges.retrieve(chargeId);
+}
+
+/**
+ * Handle charge.dispute.created — revoke purchased AgentWeb Credits capacity.
+ *
+ * The revocation happens when the dispute *opens*, not when it resolves: the
+ * funds are already at risk, and a dispute that runs its course would otherwise
+ * leave the customer spending against capacity they have reclaimed the money
+ * for. `reverseMonthlyPurchasedLlmUsageCredit` targets a cumulative reversal
+ * total, so redelivery of this webhook — or a refund that lands on the same
+ * grant — settles at the same figure instead of stacking.
+ */
+export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
+  const charge = await retrieveDisputedCharge(dispute);
+  if (!charge) return;
+
+  const metadata = charge.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    console.log(
+      `[STRIPE] Dispute ${dispute.id} is not an AgentWeb Credits purchase; no capacity to revoke`
+    );
+    return;
+  }
+
+  const billingUserId = String(metadata.billingUserId || '');
+  const user = billingUserId ? await userDb.getUserById(billingUserId) : null;
+  if (!user) {
+    console.warn(
+      `[STRIPE] No user found for disputed credit purchase. dispute=${dispute.id} billingUserId=${billingUserId}`
+    );
+    return;
+  }
+
+  const amountPaidCents = Number(charge.amount);
+  const amountDisputedCents = Number(dispute.amount);
+  const purchasedMicroUsd = Number(metadata.usageCreditMicroUsd);
+  const topUpGrantId = String(metadata.topUpGrantId || '');
+  if (
+    !topUpGrantId ||
+    !Number.isInteger(amountPaidCents) || amountPaidCents <= 0 ||
+    !Number.isInteger(amountDisputedCents) || amountDisputedCents <= 0 ||
+    !Number.isInteger(purchasedMicroUsd) || purchasedMicroUsd <= 0
+  ) {
+    throw new Error(`Invalid usage top-up dispute metadata for dispute ${dispute.id}`);
+  }
+
+  const targetReversedMicroUsd = Math.min(
+    purchasedMicroUsd,
+    Math.round((purchasedMicroUsd * amountDisputedCents) / amountPaidCents),
+  );
+  const { reverseMonthlyPurchasedLlmUsageCredit } = await import('./llmUsageCreditService');
+  const reversalResult = await reverseMonthlyPurchasedLlmUsageCredit({
+    billingUserId: user.userId,
+    grantId: `stripe:${topUpGrantId}`,
+    reversalId: `dispute:${dispute.id}:${amountDisputedCents}`,
+    targetReversedMicroUsd,
+  });
+
+  // Reversal can no-op when the original grant is not on the current-month
+  // ledger (credits are month-scoped and expire at reset, so a past-month
+  // grant has nothing left to revoke). Retrying does not help — the semantic
+  // condition will persist — so record the *true* outcome in the audit trail
+  // and return success. A later run of the reaper picks these up if we ever
+  // want to compensate customers whose disputed spend crossed months.
+  const revokedMicroUsd = reversalResult.reversed ? targetReversedMicroUsd : 0;
+  const reversalOutcome = reversalResult.reversed
+    ? 'revoked'
+    : 'no_current_month_grant';
+
+  // Atomic idempotency via dedupKey: paymentHistoryDb writes the main row +
+  // a marker on the sentinel dedup partition in a single TransactWriteItems.
+  // A concurrent redelivery races on ConditionalCheckFailed on the marker
+  // and no-ops — no bounded lookback window to slip past. Reversal is
+  // already idempotent via its own reversalId key.
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_opened',
+      amount: amountDisputedCents,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: reversalOutcome === 'revoked' ? 'disputed' : 'disputed_no_action',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeReason: dispute.reason,
+        revokedMicroUsd,
+        reversalOutcome,
+      },
+    },
+    { dedupKey: `dispute:opened:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_opened for ${dispute.id} already recorded — skipped duplicate history`);
+    return;
+  }
+
+  console.log(
+    `[STRIPE] Credit purchase disputed: user ${user.userId}, dispute=${dispute.id}, revoked=${revokedMicroUsd} microUSD (${reversalOutcome})`
+  );
+}
+
+/**
+ * Handle charge.dispute.closed — record the outcome only.
+ *
+ * Winning a dispute deliberately does NOT auto-restore the revoked capacity.
+ * Credits are scoped to a usage month and expire at reset, while disputes
+ * routinely resolve in a later month; re-granting then would deposit a second
+ * month of capacity for a single payment, and there is no way to tell from the
+ * ledger whether the original capacity was already spent. Restoring a won
+ * dispute is therefore an admin one-time-credit decision, made against the
+ * audit trail this record leaves behind.
+ */
+export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
+  const charge = await retrieveDisputedCharge(dispute);
+  if (!charge) return;
+
+  const metadata = charge.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') return;
+
+  const billingUserId = String(metadata.billingUserId || '');
+  const user = billingUserId ? await userDb.getUserById(billingUserId) : null;
+  if (!user) {
+    console.warn(
+      `[STRIPE] No user found for closed credit dispute. dispute=${dispute.id} billingUserId=${billingUserId}`
+    );
+    return;
+  }
+
+  // Atomic idempotency via dedupKey (see handleChargeDisputeCreated for the
+  // same rationale — TransactWriteItems marker on the sentinel dedup
+  // partition, no bounded lookback to slip past).
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_closed',
+      amount: Number(dispute.amount) || 0,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: dispute.status || 'closed',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeStatus: dispute.status,
+      },
+    },
+    { dedupKey: `dispute:closed:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_closed for ${dispute.id} already recorded — skipped duplicate history`);
+    return;
+  }
+
+  console.log(
+    `[STRIPE] Credit dispute closed as "${dispute.status}": user ${user.userId}, dispute=${dispute.id}. ` +
+      'Revoked capacity is not auto-restored; issue an admin one-time credit if the customer should be made whole.'
   );
 }
 

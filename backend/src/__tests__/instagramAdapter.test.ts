@@ -90,7 +90,7 @@ describe('InstagramAdapter', () => {
 
             const result = await adapter.createPost(mockValidAccount, 'Test Caption', ['https://example.com/image.jpg']);
 
-            expect(mockInstagramService.createInstagramPost).toHaveBeenCalledWith('1234567890', 'valid_token', 'https://example.com/image.jpg', 'Test Caption');
+            expect(mockInstagramService.createInstagramPost).toHaveBeenCalledWith('1234567890', 'valid_token', 'https://example.com/image.jpg', 'Test Caption', undefined);
             expect(mockInstagramService.getInstagramMediaObject).toHaveBeenCalledWith('mocked_media_id', 'valid_token');
 
             expect(result).toEqual({
@@ -117,7 +117,7 @@ describe('InstagramAdapter', () => {
 
             const result = await adapter.createPost(mockValidAccount, 'Reel Caption', ['https://example.com/video.mp4']);
 
-            expect(mockInstagramService.createInstagramReelPost).toHaveBeenCalledWith('1234567890', 'valid_token', 'https://example.com/video.mp4', 'Reel Caption');
+            expect(mockInstagramService.createInstagramReelPost).toHaveBeenCalledWith('1234567890', 'valid_token', 'https://example.com/video.mp4', 'Reel Caption', undefined);
             expect(result.postId).toBe('reel_id');
             expect(result.postUrl).toBe('https://instagram.com/reel/REEL123');
         });
@@ -150,7 +150,7 @@ describe('InstagramAdapter', () => {
                     { url: 'https://img.com/b.png', mediaType: 'IMAGE' },
                 ],
                 'Carousel caption'
-            );
+            , undefined);
             expect(result.postId).toBe('carousel_id');
         });
 
@@ -173,7 +173,7 @@ describe('InstagramAdapter', () => {
                     { url: 'https://img.com/c.png', mediaType: 'IMAGE' },
                 ],
                 'Mixed'
-            );
+            , undefined);
         });
 
         it('should surface partial failure warnings from carousel', async () => {
@@ -216,8 +216,8 @@ describe('InstagramAdapter', () => {
 
             // Assertions
             expect(mockInstagramService.createInstagramPost).toHaveBeenCalledTimes(2);
-            expect(mockInstagramService.createInstagramPost).toHaveBeenNthCalledWith(1, '1234567890', 'valid_token', 'https://example.com/image.jpg', 'Test Caption');
-            expect(mockInstagramService.createInstagramPost).toHaveBeenNthCalledWith(2, '1234567890', 'new_valid_token', 'https://example.com/image.jpg', 'Test Caption');
+            expect(mockInstagramService.createInstagramPost).toHaveBeenNthCalledWith(1, '1234567890', 'valid_token', 'https://example.com/image.jpg', 'Test Caption', undefined);
+            expect(mockInstagramService.createInstagramPost).toHaveBeenNthCalledWith(2, '1234567890', 'new_valid_token', 'https://example.com/image.jpg', 'Test Caption', undefined);
             
             expect(mockInstagramService.refreshLongLivedToken).toHaveBeenCalledWith('valid_token');
             expect(updateAccountTokens).toHaveBeenCalledWith('user_123', 'meta', {

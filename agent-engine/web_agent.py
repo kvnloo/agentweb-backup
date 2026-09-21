@@ -12,9 +12,7 @@ import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import SecretStr, BaseModel
+from pydantic import BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
@@ -22,7 +20,7 @@ import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
-from aws_utils import get_dynamodb_resource, get_bedrock_client, get_s3_client
+from aws_utils import get_dynamodb_resource, get_s3_client
 import time
 import asyncio
 import random
@@ -31,8 +29,11 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
+from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
+from task_completion_status import determine_task_completion_status
+from strict_action_controller import StrictActionController
 from datetime import datetime, timezone
 import PyPDF2
 import docx
@@ -53,8 +54,8 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 # Azure AI Services credentials used for image generation/editing (gpt-image-*, FLUX.*).
 # Sourced from the environment so the resource can be rotated without a code change.
 #
-# These are deliberately SEPARATE from the AZURE_OPENAI_*2 pair used by the chat client in
-# task_utils.get_azure_openai_llm2(). Image generation and chat historically shared
+# These are deliberately SEPARATE from the retired AZURE_OPENAI_*2 chat pair.
+# Image generation and chat historically shared
 # AZURE_OPENAI_API_KEY2 while pointing at different resources, so repointing the image
 # endpoint alone would authenticate the new endpoint with the old resource's key (401).
 # Endpoint and key move together as a pair.
@@ -88,7 +89,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 global_use_vision = True
-global_tool_calling_method_for_azure: Optional[str] = "function_calling"
 
 controller = Controller()
 
@@ -271,7 +271,10 @@ class WebAgent:
         self.is_interactive = False  # Initialize interactive mode flag
         self.current_execution_id = None
         self.current_task_id = None
-        self.controller = Controller()
+        # ENG-1828: reject a malformed multi-action response instead of
+        # silently executing whichever one browser-use happens to find
+        # first (always `done`) -- see strict_action_controller.py.
+        self.controller = StrictActionController()
         self.question_count = 0  # Track number of questions asked
         self.s3_client = get_s3_client()
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
@@ -432,10 +435,15 @@ class WebAgent:
             logger.info(f"Running agent with max_steps={max_steps} (Complex Task: {is_complex_task})")
             result = await self.agent.run(max_steps=max_steps)
             
-            task_is_done = False  # Initialize task_is_done
+            # ENG-1823: task_is_done ("did the agent call `done` at all") and
+            # task_succeeded ("did that `done` call's own success field say
+            # True") are deliberately separate -- see task_completion_status.py.
+            # task_is_done stays the gate for the ENG-859 salvage path below
+            # (that logic only cares whether the run finished); task_succeeded
+            # is the one that belongs in the customer-facing/persisted result.
+            task_is_done, task_succeeded = determine_task_completion_status(result)
             agent_message = None
-            if result.is_done():
-                task_is_done = True
+            if task_is_done:
                 agent_message = result.history[-1].result[-1].extracted_content
 
             # ENG-859: a run that reached its step/time limit before the agent
@@ -529,8 +537,8 @@ class WebAgent:
                 result_files = upload_task_result_files(downloads_path, self.current_execution_id)
             
             return {
-                "success": task_is_done,
-                "summary" if task_is_done else "error": agent_message,
+                "success": task_succeeded,
+                "summary" if task_succeeded else "error": agent_message,
                 "partial": bool(partial_extraction) and not task_is_done,
                 "llmName": self.llm_name,
                 "result_files": result_files if result_files else None
@@ -2708,7 +2716,8 @@ class WebAgent:
                 # Combine all results
                 analysis_result = "\n\n".join(result_parts)
                 
-                return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
+                no_code_execution_note = "\n\nNo code execution was performed." if not code_executed else ""
+                return ActionResult(extracted_content=f"{analysis_result}{no_code_execution_note}")
 
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
@@ -4109,15 +4118,30 @@ class WebAgent:
             "max_failures": 5,
             "retry_delay": 60,
             "generate_gif": self.generate_gif,
-            "validate_output": validate_output
+            "validate_output": validate_output,
+            "tool_calling_method": browser_tool_calling_method(
+                getattr(self.llm, "model_name", "")
+            ),
+            # ENG-1818: every model here is actually langchain_openai.ChatOpenAI
+            # under the hood (openrouter_gateway.py routes every provider through
+            # OpenRouter's OpenAI-compatible API), so self.llm.__class__.__name__
+            # is always "ChatOpenAI" regardless of the real provider. browser-use's
+            # Agent defaults enable_memory=True and, when unset, infers the memory
+            # embedder from that class name -- so it always defaults to mem0's
+            # OpenAI embedder, which requires a real OPENAI_API_KEY that doesn't
+            # exist anywhere in this codebase (everything routes through
+            # OPENROUTER_API_KEY by design). That mem0 embedder construction is
+            # not wrapped in the surrounding except ImportError, so it raises
+            # straight through Agent.__init__ and aborts every single task before
+            # any real work starts -- confirmed via a direct repro against the
+            # real production environment, root-caused to
+            # mem0/embeddings/openai.py's OpenAI(api_key=...) call. Memory was
+            # never an intentionally used feature here; disable it explicitly
+            # rather than relying on a library default that silently assumes a
+            # real OpenAI account exists.
+            "enable_memory": False,
         }
 
-        # Conditionally add tool_calling_method for Azure OpenAI LLMs
-        # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
-        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
-            agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
-            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
-        
         self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
 

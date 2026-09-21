@@ -10,7 +10,7 @@ import { userDb } from '../services/db';
 import { canViewItem, canEditItem, isFeatureEffectivelyEnabled } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
-import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
+import { agentModeService } from '../services/agentModeService';
 import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
@@ -1390,19 +1390,15 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     
     Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content.`;
 
-    // Call OpenAI to get the updated content
-    // Un-metered client + explicit meter below: a real userId means this spend
-    // must be charged to that user's cap (tokens + cost), not just recorded (ENG-200).
-    const openai = getAzureClient({ userId, feature: 'task_kb_update' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
-    const completion = await openai.chat.completions.create({
-      messages: [{ role: "user", content: prompt }],
-      model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+    const completion = await agentModeService.callLLM(
+      process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+      [{ role: 'user', content: prompt }],
+      {
       temperature: 0.4,
-      max_tokens: 32768,
-    });
-    meterUsageFromResponse(
-      { userId, model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4', provider: 'azure-openai', feature: 'task_kb_update' },
-      completion
+        max_completion_tokens: 32768,
+        usageContext: { userId, feature: 'task_kb_update' },
+        taskClass: 'scheduled_background',
+      },
     );
 
     const updatedContent = completion.choices[0].message.content || '';
@@ -2316,7 +2312,7 @@ export async function getExecutionsWithAssets(
   if (assetType === 'html-reports') {
     // Run searchableText enrichment first (populates content used by classifier), then classify.
     enrichHtmlReportsWithSearchableText(result, chatbotDbForEnrich)
-      .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich))
+      .then(() => classifyUnlabeledReports(result, chatbotDbForEnrich, userId))
       .catch(() => {/* non-fatal */});
   }
 
@@ -2412,7 +2408,7 @@ async function enrichHtmlReportsWithSearchableText(result: Record<string, any>, 
  * Uses the filename + cached searchableText as context for the LLM call.
  * Persists results back to DynamoDB (same lazy-backfill pattern as searchableText).
  */
-async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: ChatbotDB): Promise<void> {
+async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: ChatbotDB, userId: string): Promise<void> {
   const CONCURRENCY = 5;
 
   const filesToClassify: Array<{ file: any; executionId: string; sessionId?: string }> = [];
@@ -2430,9 +2426,14 @@ async function classifyUnlabeledReports(result: Record<string, any>, chatbotDb: 
 
   for (let i = 0; i < filesToClassify.length; i += CONCURRENCY) {
     const batch = filesToClassify.slice(i, i + CONCURRENCY);
-    await Promise.all(batch.map(async ({ file }) => {
+    await Promise.all(batch.map(async ({ file, sessionId }) => {
       try {
-        file.reportType = await classifyReport(file.filename || '', file.searchableText || '');
+        // ENG-1858: these are the requesting user's reports — attribute them to that user.
+        file.reportType = await classifyReport(file.filename || '', file.searchableText || '', {
+          userId,
+          sessionId,
+          feature: 'report_classification',
+        });
       } catch {
         // Non-fatal
       }

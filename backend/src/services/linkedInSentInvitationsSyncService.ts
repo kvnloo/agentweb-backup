@@ -11,7 +11,9 @@ const TAG = '[linkedInConnectionSync]';
 
 /**
  * True when a freshly-read invitation differs from its cached row in any way a
- * consumer can observe. Volatile timestamps are deliberately excluded.
+ * consumer can observe. `syncedAt` is excluded, and `sentAt` counts only when it
+ * moved EARLIER: `resolveLedgerSentAt` never moves it later, so the per-request
+ * drift of `parsed_datetime` (ENG-875) still produces no write.
  */
 export function sentInvitationChanged(
   cached: UnipileSentInvitation,
@@ -21,8 +23,88 @@ export function sentInvitationChanged(
     cached.publicProfileUrl !== candidate.publicProfileUrl ||
     cached.invitationId !== candidate.invitationId ||
     cached.invitedUserName !== candidate.invitedUserName ||
-    cached.invitationText !== candidate.invitationText
+    cached.invitationText !== candidate.invitationText ||
+    isEarlierTimestamp(candidate.sentAt, cached.sentAt)
   );
+}
+
+/** Tolerated clock skew before a provider timestamp counts as "in the future". */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+/** Epoch ms of an ISO timestamp, or null when it is missing, unparseable, or in the future. */
+function validPastMs(value: unknown, nowMs: number): number | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) || ms > nowMs + FUTURE_SKEW_MS ? null : ms;
+}
+
+/** True when `candidate` parses and is strictly earlier than `cached` (or `cached` does not parse). */
+function isEarlierTimestamp(candidate: string | undefined, cached: string | undefined): boolean {
+  const candidateMs = typeof candidate === 'string' ? Date.parse(candidate) : NaN;
+  const cachedMs = typeof cached === 'string' ? Date.parse(cached) : NaN;
+  if (Number.isNaN(candidateMs)) return false;
+  return Number.isNaN(cachedMs) || candidateMs < cachedMs;
+}
+
+/**
+ * ENG-1938: the `sentAt` to store for a pending invitation — the EARLIEST
+ * estimate ever observed for this invitation, not the first one.
+ *
+ * LinkedIn exposes only a relative age ("Sent 3 months ago") and Unipile resolves
+ * it to an absolute `parsed_datetime` at request time. That label is a floor on
+ * the real age, so every resolution lands at or after the real send, and the
+ * earliest one seen is the tightest estimate. Keeping the FIRST value instead
+ * (the pre-ENG-1938 rule) froze two kinds of wrong row forever:
+ *   - a row first seen while Unipile omitted `parsed_datetime`, stamped with the
+ *     sync time — on large production backlogs most rows looked this way, so
+ *     months-old invitations looked days old to the stale-invitation drain;
+ *   - a row first seen at a coarse bucket ("1 week ago") that later rolled over
+ *     to an earlier one ("1 month ago").
+ *
+ * Properties the callers rely on:
+ *   - Never moves later, so request-time drift causes no rewrite (ENG-875) and a
+ *     send-path row keeps the exact instant it was stamped with.
+ *   - The earliest-wins rule applies only when BOTH ids are present and equal. A
+ *     cached date must never make a DIFFERENT invitation look older than it is —
+ *     that is the direction that gets a fresh re-invite withdrawn prematurely
+ *     (CodeRabbit on PR #2916). So:
+ *       · different ids → a new invitation: provider value, else now;
+ *       · either id missing → identity unknown: the provider value when there is
+ *         one (never older than this invitation's real send), otherwise the cached
+ *         value carried forward so sentAt does not re-stamp every sync (ENG-787).
+ *   - An unparseable or future provider value is ignored rather than trusted.
+ */
+export function resolveLedgerSentAt(
+  cached: Pick<UnipileSentInvitation, 'sentAt' | 'invitationId'> | undefined,
+  item: { parsed_datetime?: unknown; id?: unknown },
+  now: string,
+): string {
+  const nowMs = Date.parse(now);
+  const parsedMs = validPastMs(item.parsed_datetime, nowMs);
+  const parsed = parsedMs !== null ? (item.parsed_datetime as string) : null;
+  const cachedId = typeof cached?.invitationId === 'string' ? cached.invitationId : '';
+  const itemId = typeof item.id === 'string' ? item.id : '';
+
+  if (cachedId && itemId && cachedId !== itemId) return parsed ?? now;
+
+  const cachedMs = validPastMs(cached?.sentAt, nowMs);
+  if (cachedId && itemId) {
+    if (parsedMs !== null && (cachedMs === null || parsedMs < cachedMs)) return parsed as string;
+    return cachedMs !== null ? (cached!.sentAt as string) : now;
+  }
+  if (parsed !== null) return parsed;
+  return cachedMs !== null ? (cached!.sentAt as string) : now;
+}
+
+export interface SyncSentInvitationsOptions {
+  /**
+   * 'full' walks the entire pending feed and prunes; 'incremental' stops at the
+   * first page that is entirely known-and-unchanged and does NOT prune.
+   *
+   * Defaults to 'full' so every existing caller — the backfill script especially —
+   * keeps its exact previous semantics, and only the cron opts into the cheap walk.
+   */
+  mode?: 'full' | 'incremental';
 }
 
 /**
@@ -30,16 +112,38 @@ export function sentInvitationChanged(
  *
  * This service intentionally has no cron or agent-mode imports. Operator scripts
  * can refresh the cache without loading the server's LLM dependency graph.
+ *
+ * Cost note (ENG-1197): this walked the WHOLE pending feed every ten minutes, on
+ * every instance, with no early exit even when the previous cycle had already
+ * proved nothing changed. At ~100 invitations per page that is 7 pages for an
+ * account with 685 pending and 16 for one with 1,540 — repeated 144 times a day
+ * each, against LinkedIn, whether or not anyone was using the product. Since load
+ * scaled with backlog size, the accounts we hit hardest were exactly the ones whose
+ * sessions kept being revoked.
+ *
+ * The incremental mode fixes that. The feed is newest-first, so a page in which
+ * every invitation is already cached and unchanged means everything behind it is
+ * too, and the walk can stop. What it cannot do is prune: dropping stale rows
+ * requires having seen the COMPLETE pending set, so an early exit would delete
+ * invitations it simply never reached. Pruning therefore stays with the full walk,
+ * which the cron still runs — just far less often.
  */
-export async function syncSentInvitationsForAccount(accountId: string): Promise<number> {
+export async function syncSentInvitationsForAccount(
+  accountId: string,
+  options: SyncSentInvitationsOptions = {},
+): Promise<number> {
+  const mode = options.mode ?? 'full';
   const toUpsert: UnipileSentInvitation[] = [];
   const stillPendingPublicIds = new Set<string>();
   const now = new Date().toISOString();
   let unchanged = 0;
+  let stoppedEarly = false;
+  let loggedMissingParsedDatetime = false;
+  let consecutiveKnownPages = 0;
 
-  // Unipile occasionally omits parsed_datetime. Carry the first-observed value
-  // forward instead of moving sentAt on every sync. Keep the whole cached row so
-  // unchanged invitations can skip their DynamoDB write (ENG-875).
+  // sentAt keeps the EARLIEST estimate observed (resolveLedgerSentAt, ENG-1938),
+  // so request-time drift never moves it. Keep the whole cached row so unchanged
+  // invitations can skip their DynamoDB write (ENG-875).
   const cachedByPublicId = new Map<string, UnipileSentInvitation>();
   let cachePreloaded = false;
   try {
@@ -61,6 +165,7 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
     const items: any[] = result?.items ?? [];
     if (items.length === 0) break;
 
+    let pageWasEntirelyKnown = true;
     for (const item of items) {
       const publicId: string =
         item.invited_user_public_id ||
@@ -72,6 +177,17 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
       // even when its unchanged row does not need another write.
       stillPendingPublicIds.add(publicId);
 
+      // ENG-1938 diagnostic: rows Unipile gives no `parsed_datetime` for keep the
+      // sync time as their sentAt and never heal, which is the drain's remaining
+      // blind spot on large backlogs. The SDK schema always carries a raw `date`;
+      // sample ONE per account per walk to learn its shape before deciding whether
+      // it can be parsed. Logs the value's shape only — no invitee identity.
+      if (item.parsed_datetime == null && !loggedMissingParsedDatetime) {
+        loggedMissingParsedDatetime = true;
+        const raw = (item as any).date;
+        console.warn(`${TAG} account=${accountId} parsed_datetime missing (ENG-1938 probe): date=${JSON.stringify(raw)} type=${typeof raw} parsable=${typeof raw === 'string' && !Number.isNaN(Date.parse(raw))}`);
+      }
+
       const cached = cachedByPublicId.get(publicId);
       const candidate: UnipileSentInvitation = {
         accountId,
@@ -80,7 +196,7 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
         invitationId: item.id ?? '',
         invitedUserName: item.invited_user ?? '',
         invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? cached?.sentAt ?? now,
+        sentAt: resolveLedgerSentAt(cached, item, now),
         syncedAt: now,
       };
 
@@ -89,14 +205,55 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
         continue;
       }
 
+      pageWasEntirelyKnown = false;
       toUpsert.push(candidate);
     }
 
     cursor = (result as any)?.cursor ?? undefined;
     page++;
+
+    // Newest-first ordering means a page we already knew in full implies every page
+    // behind it is known too. Requires a trustworthy cache: if the preload failed we
+    // have no basis for "unchanged" and must keep walking.
+    //
+    // Two CONSECUTIVE known pages, not one. The early exit rests on Unipile ordering
+    // the feed newest-first, which is observed behaviour rather than a documented
+    // contract — and the cost of that assumption being wrong is not a slow sync, it
+    // is a pending invitation missing from the cache, which reads as "never invited"
+    // and can re-invite someone. One extra page is cheap insurance against a single
+    // out-of-order page ending the walk early.
+    consecutiveKnownPages = pageWasEntirelyKnown ? consecutiveKnownPages + 1 : 0;
+    if (mode === 'incremental' && cachePreloaded && consecutiveKnownPages >= 2) {
+      stoppedEarly = true;
+      break;
+    }
   } while (cursor && page < MAX_PAGES);
 
+  // Truncation is an incomplete walk too. Hitting MAX_PAGES with a cursor still in
+  // hand means there are pages we never read, so `stillPendingPublicIds` is partial —
+  // and pruning against a partial set deletes real pending invitations. The
+  // two-known-pages exit already sets this; the page cap has exactly the same
+  // consequence and was not covered.
+  if (cursor && page >= MAX_PAGES) {
+    stoppedEarly = true;
+    console.warn(
+      `${TAG} account=${accountId} stopped at the ${MAX_PAGES}-page cap with more feed remaining — ` +
+      `prune skipped (an incomplete set cannot say what is stale)`,
+    );
+  }
+
   await upsertSentInvitations(toUpsert);
+
+  if (stoppedEarly) {
+    // No prune: `stillPendingPublicIds` holds only the pages actually read, so
+    // pruning against it would delete every invitation beyond the early exit.
+    console.log(
+      `${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ` +
+      `${unchanged} unchanged (skipped), prune deferred to the next full walk (pages=${page}, incremental)`,
+    );
+    return toUpsert.length;
+  }
+
   const pruned = await pruneStaleSentInvitations(
     accountId,
     stillPendingPublicIds,

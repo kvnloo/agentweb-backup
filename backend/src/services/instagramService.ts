@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { MetaInstagramAccount } from '../types/meta';
+import { PublishConsentWithdrawn, isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 
 export interface CarouselItem {
     url: string;
@@ -20,6 +21,12 @@ export class InstagramService {
     }
 
     private handleError(error: any, context?: string): never {
+        // ENG-827: a deliberate stop is not a platform failure. Rethrow the sentinel
+        // untouched — rewrapping it as an Instagram API error would turn "we chose not
+        // to publish" into "Instagram rejected the post" for the caller that has to
+        // decide whether to retry.
+        if (isPublishConsentWithdrawn(error)) throw error;
+
         console.error(`[InstagramServiceError] Context: ${context || 'Unknown'}`);
         console.error(error?.response?.data || error?.message || error);
 
@@ -44,7 +51,18 @@ export class InstagramService {
     /**
      * Publish a media container with retry logic for readiness (error code 9007).
      */
-    private async publishMediaWithRetry(igUserId: string, creationId: string, userToken: string): Promise<{ id: string }> {
+    private async publishMediaWithRetry(
+        igUserId: string,
+        creationId: string,
+        userToken: string,
+        // ENG-827 (Greptile, security): this is the single point where an Instagram
+        // post becomes public — every variant funnels through it. Everything before
+        // it built a container nobody can see: uploads, transcoding waits, and the
+        // 9007 not-ready backoff below, which alone can burn 45s. The caller's
+        // consent check happened before all of that, so re-check here, and again on
+        // every retry — the wait between attempts is exactly when a revocation lands.
+        assertStillAuthorized?: () => Promise<{ error: string } | null>
+    ): Promise<{ id: string }> {
         const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
         const publishUrl = `${instagramApiBaseUrl}/${igUserId}/media_publish`;
         const publishPayload = {
@@ -57,6 +75,11 @@ export class InstagramService {
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
+                const withdrawn = await assertStillAuthorized?.();
+                if (withdrawn) {
+                    console.warn('[publishMediaWithRetry] ENG-827: abandoning publish — consent was withdrawn while the media container was being prepared.');
+                    throw new PublishConsentWithdrawn(withdrawn.error);
+                }
                 console.log(`[publishMediaWithRetry] Publishing media (Attempt ${attempt}/${maxRetries})...`);
                 const publishResponse = await axios.post<any>(publishUrl, publishPayload);
                 return { id: publishResponse.data?.id };
@@ -226,7 +249,7 @@ export class InstagramService {
     /**
      * Create a single image post on Instagram Business Account
      */
-    public async createInstagramPost(igUserId: string, userToken: string, imageUrl: string, caption: string): Promise<{ id: string }> {
+    public async createInstagramPost(igUserId: string, userToken: string, imageUrl: string, caption: string, assertStillAuthorized?: () => Promise<{ error: string } | null>): Promise<{ id: string }> {
         try {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
             // 1. Create Media Container
@@ -246,7 +269,7 @@ export class InstagramService {
             }
 
             // 2. Publish Media (with retry for readiness)
-            return await this.publishMediaWithRetry(igUserId, creationId, userToken);
+            return await this.publishMediaWithRetry(igUserId, creationId, userToken, assertStillAuthorized);
         } catch (error) {
             this.handleError(error, 'createInstagramPost');
         }
@@ -256,7 +279,7 @@ export class InstagramService {
      * Create a Reel (video) post on Instagram Business Account.
      * Video containers require polling checkContainerStatus before publishing.
      */
-    public async createInstagramReelPost(igUserId: string, userToken: string, videoUrl: string, caption: string): Promise<{ id: string }> {
+    public async createInstagramReelPost(igUserId: string, userToken: string, videoUrl: string, caption: string, assertStillAuthorized?: () => Promise<{ error: string } | null>): Promise<{ id: string }> {
         try {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
 
@@ -282,7 +305,7 @@ export class InstagramService {
             await this.checkContainerStatus(creationId, userToken);
 
             // 3. Publish
-            return await this.publishMediaWithRetry(igUserId, creationId, userToken);
+            return await this.publishMediaWithRetry(igUserId, creationId, userToken, assertStillAuthorized);
         } catch (error) {
             this.handleError(error, 'createInstagramReelPost');
         }
@@ -297,7 +320,8 @@ export class InstagramService {
         igUserId: string,
         userToken: string,
         items: CarouselItem[],
-        caption: string
+        caption: string,
+        assertStillAuthorized?: () => Promise<{ error: string } | null>
     ): Promise<{ id: string; failedItems?: { url: string; error: string }[] }> {
         try {
             if (items.length < 2 || items.length > 10) {
@@ -372,7 +396,7 @@ export class InstagramService {
             }
 
             // 4. Publish
-            const result = await this.publishMediaWithRetry(igUserId, carouselId, userToken);
+            const result = await this.publishMediaWithRetry(igUserId, carouselId, userToken, assertStillAuthorized);
 
             return {
                 id: result.id,

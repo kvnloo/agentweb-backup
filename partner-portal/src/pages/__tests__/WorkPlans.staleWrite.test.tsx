@@ -122,4 +122,23 @@ describe("WorkPlans editor stakes the plan it loaded", () => {
     await waitFor(() => expect(mockedAxios.put).toHaveBeenCalled());
     expect(screen.queryByText(/work plan updated/i)).not.toBeInTheDocument();
   });
+
+  // ENG-1469: editing customer-facing display metadata must never touch the
+  // real steps array — a save triggered purely by a display-field edit should
+  // still send every existing step, unchanged, alongside the display block.
+  it("does not touch or drop existing steps when only display metadata changes", async () => {
+    await renderPage();
+    await openEditor();
+    mockedAxios.put.mockResolvedValue({ data: {} });
+
+    fireEvent.change(screen.getByLabelText(/Display title \(optional\)/i), {
+      target: { value: "Meta Launch, Fast" },
+    });
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(mockedAxios.put).toHaveBeenCalled());
+    const body = mockedAxios.put.mock.calls[0][1] as any;
+    expect(body.steps).toEqual(plan.steps);
+    expect(body.display).toEqual(expect.objectContaining({ title: "Meta Launch, Fast" }));
+  });
 });

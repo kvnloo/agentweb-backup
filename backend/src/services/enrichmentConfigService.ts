@@ -8,7 +8,7 @@ import type {
   EnrichmentConfig,
   EnrichmentFieldConfig,
 } from './crmEnrichmentServiceV3';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 
 // Set of every canonical field name across all FIELD_GROUPS — for aliasFor validation
 const CANONICAL_FIELD_NAMES = new Set<string>(
@@ -194,6 +194,8 @@ export interface ConfigServiceDeps {
    *  (return {} on error) so heuristic results still apply. */
   llmInferAliases(
     input: Array<{ name: string; instruction: string }>,
+    /** ENG-1858: the saving user, so the call is metered to them, not "system". */
+    userId?: string,
   ): Promise<Record<string, string | null>>;
   /** Called once per save to classify fields as smart (computed/derived) or
    *  normal (directly fetchable). For smart fields also extracts canonical
@@ -201,6 +203,8 @@ export interface ConfigServiceDeps {
    *  error) so the rest of the save still proceeds. */
   llmClassifySmartFields(
     input: Array<{ name: string; instruction: string }>,
+    /** ENG-1858: see llmInferAliases. */
+    userId?: string,
   ): Promise<Record<string, SmartFieldClassification>>;
 }
 
@@ -225,6 +229,15 @@ function validateConfig(config: EnrichmentConfig): { warnings: string[] } {
   if (config.schemaVersion !== 1) {
     throw new ConfigValidationError(
       `schemaVersion must be 1; received ${config.schemaVersion}`,
+    );
+  }
+
+  // autoEnrich (ENG-88) opts a list into the unattended enrichment cron —
+  // reject a malformed value outright rather than silently coercing it,
+  // since a truthy-but-wrong type here would be a silent behavior change.
+  if (config.autoEnrich !== undefined && typeof config.autoEnrich !== 'boolean') {
+    throw new ConfigValidationError(
+      `autoEnrich must be a boolean when present; received ${typeof config.autoEnrich}`,
     );
   }
 
@@ -332,7 +345,10 @@ function buildDefaultField(name: string): EnrichmentFieldConfig {
     name,
     type: 'string',
     instruction: '',
-    include: true,                      // opt-out: pre-select all (UX choice)
+    // opt-out: pre-select all (UX choice) — except paid Enigma card-revenue
+    // columns (ENG-1388): a column existing on the list (e.g. after one run or
+    // a CSV import) must never re-enable buying it on every later run.
+    include: !isCardRevenueField(name),
     overwritePolicy: 'fill_if_empty',
     ...(aliasFor ? { aliasFor } : {}),
   };
@@ -438,6 +454,30 @@ export async function getEnrichmentConfig(
  * restore + classify smart fields, validate, and stamp audit fields.
  * Does NOT persist. setEnrichmentConfig = processEnrichmentConfig + write.
  */
+/**
+ * ENG-1388: Enigma card revenue is bought per value, so it is only ever routed
+ * when the user names the field exactly. Drops any heuristic, LLM or client
+ * alias onto a card field ("Revenue" -> card_revenue_12m) and any smart-field
+ * dependency that would trigger a purchase implicitly.
+ *
+ * Every path that can reach the card-revenue tier must run this, including
+ * preview runs that take an inline config straight from the client.
+ */
+export function stripImplicitCardRevenueRouting<T extends { fields: any[] }>(config: T): T {
+  return {
+    ...config,
+    fields: config.fields.map((f: any) => {
+      const aliasToCard = isCardRevenueField(f.aliasFor) && f.aliasFor !== f.name;
+      const cardDeps = (f.smartDependencies ?? []).filter(isCardRevenueField);
+      if (!aliasToCard && cardDeps.length === 0) return f;
+      const out = { ...f };
+      if (aliasToCard) delete out.aliasFor;
+      if (cardDeps.length > 0) out.smartDependencies = (f.smartDependencies ?? []).filter((d: any) => !isCardRevenueField(d));
+      return out;
+    }),
+  };
+}
+
 export async function processEnrichmentConfig(
   input: { listId: string; userId: string; config: EnrichmentConfig },
   deps: ConfigProcessingDeps,
@@ -473,6 +513,7 @@ export async function processEnrichmentConfig(
     try {
       const llmAliases = await deps.llmInferAliases(
         llmCandidates.map(f => ({ name: f.name, instruction: f.instruction || '' })),
+        input.userId,
       );
       enriched = {
         ...enriched,
@@ -531,6 +572,7 @@ export async function processEnrichmentConfig(
     try {
       const classifications = await deps.llmClassifySmartFields(
         classificationCandidates.map(f => ({ name: f.name, instruction: f.instruction })),
+        input.userId,
       );
       enriched = {
         ...enriched,
@@ -582,6 +624,8 @@ export async function processEnrichmentConfig(
       console.warn('[enrichmentConfigService] smart field classification failed:', err);
     }
   }
+
+  enriched = stripImplicitCardRevenueRouting(enriched);
 
   const { warnings } = validateConfig(enriched);
 

@@ -3,8 +3,10 @@ import path from 'path';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
+import { getCachedPixels, setCachedPixels } from '../services/metaPixelsCache';
+import { sandboxManagementUrl } from '../services/sandboxManagementUrl';
+import { isEvaluationUser } from '../services/evaluationPolicy';
 import {
-  cleanAccountId,
   getConnectedMetaAccountsList,
   getMetaAccountCredentials,
 } from '../services/metaAccountCredentials';
@@ -148,7 +150,7 @@ router.get('/campaigns-and-adsets', async (req, res) => {
 
     const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, accountId);
 
-    const [campaigns, adSets, pages] = await Promise.all([
+    const [{ campaigns }, { adSets }, pages] = await Promise.all([
       metaService.listCampaigns(resolvedAccountId, accessToken),
       metaService.listAdSets(resolvedAccountId, accessToken),
       metaService.getPages(accessToken),
@@ -175,6 +177,51 @@ router.get('/campaigns-and-adsets', async (req, res) => {
     console.error('[MetaV2] /campaigns-and-adsets error:', error);
     const status = error.message?.includes('not connected') || error.message?.includes('not found') ? 400 : 500;
     res.status(status).json({ message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/meta/v2/pixels
+// ENG-1141: lists every pixel across every one of the caller's connected Meta
+// accounts, so the frontend can offer one flat picker instead of a two-step
+// "pick account, then pick pixel" flow. No new Graph integration — aggregates
+// the same listPixels() resolveMetaPixelForUser already calls per-account.
+// A single account's lookup failing (e.g. an expired token) is skipped, not
+// fatal to the whole request — same "never let one bad account break
+// everything" philosophy as resolveMetaPixelForUser itself.
+//
+// Cached per user — see services/metaPixelsCache.ts for why the TTL alone is not
+// enough and connect/disconnect invalidate it explicitly.
+// ---------------------------------------------------------------------------
+router.get('/pixels', async (req, res) => {
+  const userId = (req as any).user.userId;
+  try {
+    const cached = getCachedPixels(userId);
+    if (cached) return res.json({ pixels: cached, cached: true });
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const accounts = getConnectedMetaAccountsList(user);
+    const perAccountPixels = await Promise.all(
+      accounts.map(async (acc: any) => {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, acc.accountId);
+          const { pixels } = await metaService.listPixels(accountId, accessToken);
+          return (pixels || []).map((p: any) => ({ pixelId: p.id, accountId, accountName: acc.accountName }));
+        } catch (err) {
+          console.error(`[MetaV2] /pixels: skipping account ${acc.accountId} (lookup failed):`, err);
+          return [];
+        }
+      })
+    );
+
+    const pixels = perAccountPixels.flat();
+    setCachedPixels(userId, pixels);
+    res.json({ pixels });
+  } catch (error: any) {
+    console.error('[MetaV2] /pixels error:', error);
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -224,7 +271,11 @@ router.post('/create-image-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     const adInfo = {
       adId: ad.id,
@@ -318,7 +369,11 @@ router.post('/create-carousel-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     if (session_id) await appendSessionMessage(session_id, ad_name.trim(), managementUrl);
 
@@ -390,7 +445,11 @@ router.post('/create-video-ad', async (req, res) => {
       status: 'PAUSED',
     });
 
-    const managementUrl = `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
+    // A sandbox account's ad account is fictional, so it gets a portal-internal link
+    // instead of a dead Meta URL (ENG-1909).
+    const managementUrl = isEvaluationUser(userId)
+      ? sandboxManagementUrl(campaign_id)
+      : `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${accountId}`;
 
     const adInfo = {
       adId: ad.id,

@@ -19,7 +19,7 @@
  */
 
 import { agentModeService } from '../services/agentModeService';
-import { metaService } from '../services/metaService';
+import { metaService, META_ACCOUNT_SCOPE_REFUSAL_MARKER, isMetaAccountScopeRefusal } from '../services/metaService';
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools';
 
@@ -65,6 +65,35 @@ afterEach(() => {
 });
 
 describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
+  it('exposes url_tags as a string at the call_meta_marketing_api boundary', () => {
+    const paramsSchema = emmaToolRegistry.getTool('call_meta_marketing_api')!
+      .definition.inputSchema.properties.params;
+
+    expect(paramsSchema.properties.url_tags).toEqual(expect.objectContaining({ type: 'string' }));
+  });
+
+  describe('ENG-1641 — confirmation batching instruction', () => {
+    const metaToolDescription = () =>
+      emmaToolRegistry.getTool('call_meta_marketing_api')!.definition.description;
+
+    it('tells the model to batch independent gated writes from one directive', () => {
+      expect(metaToolDescription()).toContain(
+        'When one user directive covers multiple gated writes with no data dependency between them',
+      );
+    });
+
+    it('requires independent gated writes to be emitted in one model message', () => {
+      expect(metaToolDescription()).toContain('emit ALL of those calls in ONE message');
+      expect(metaToolDescription()).toContain('as a single round');
+    });
+
+    it('allows separate messages only for real data dependencies', () => {
+      expect(metaToolDescription()).toContain(
+        'Split only on a real data dependency',
+      );
+    });
+  });
+
   it('declares GET in the tool action enum', () => {
     const schema = emmaToolRegistry.getTool('call_meta_marketing_api')!
       .definition.inputSchema.properties.action;
@@ -138,14 +167,35 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
       account_id: '111111111111111', // a different account the token can also reach
     } as never);
 
-    await expect(
-      agentModeService.manageMetaAdsAdCreatives(
+    /*
+     * The message must refuse WITHOUT naming the owning account.
+     *
+     * The earlier assertion pinned `belongs to ad account 111111111111111`, i.e. it required
+     * the guard to disclose which other ad account owns the creative — turning a block into an
+     * oracle any id-guesser could query. The refusal now carries one generic sentence and the
+     * owning account goes to the server log only.
+     *
+     * Read the MESSAGE, never assert on the Error object: `rejects.toThrow(
+     * expect.not.stringContaining(x))` is unconditionally true, because jest hands the matcher
+     * the Error, not its text.
+     */
+    let message = '';
+    try {
+      await agentModeService.manageMetaAdsAdCreatives(
         'user-1',
         'GET',
         'act_922903076601160',
         { creative_id: '120210000000000000' },
-      ),
-    ).rejects.toThrow(/belongs to ad account 111111111111111.*not the selected account/i);
+      );
+      throw new Error('expected the cross-account creative read to be refused, but it resolved');
+    } catch (err: any) {
+      message = String(err?.message ?? err);
+    }
+
+    expect(message).toContain(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
+    expect(message).not.toContain('111111111111111');
+    // Recognisable as a scope refusal, so callers can tell it apart from a transient Graph blip.
+    expect(isMetaAccountScopeRefusal(new Error(message))).toBe(true);
   });
 
   it('accepts the creative when the account matches, with or without the act_ prefix', async () => {
@@ -175,14 +225,26 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
       name: 'no owner field',
     } as never);
 
-    await expect(
-      agentModeService.manageMetaAdsAdCreatives(
-        'user-1',
-        'GET',
-        'act_922903076601160',
-        { creative_id: '120210000000000000' },
-      ),
-    ).rejects.toThrow(/could not verify which ad account/i);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(
+        agentModeService.manageMetaAdsAdCreatives(
+          'user-1',
+          'GET',
+          'act_922903076601160',
+          { creative_id: '120210000000000000' },
+        ),
+      ).rejects.toThrow(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
+
+      // All three refusal branches deliberately share ONE model/user-visible sentence, so the
+      // branch that fired is only distinguishable in the server log. Asserting the log is what
+      // keeps that discrimination covered now that the message no longer encodes it.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('no account_id on Ad creative 120210000000000000'),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('fails closed when the SELECTED account cannot be determined', async () => {
@@ -193,14 +255,23 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
     // must be known for the comparison to mean anything.
     credentialsSpy.mockResolvedValue({ accountId: '', accessToken: 'test-token' } as never);
 
-    await expect(
-      agentModeService.manageMetaAdsAdCreatives(
-        'user-1',
-        'GET',
-        'act_922903076601160',
-        { creative_id: '120210000000000000' },
-      ),
-    ).rejects.toThrow(/could not determine which ad account was selected/i);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(
+        agentModeService.manageMetaAdsAdCreatives(
+          'user-1',
+          'GET',
+          'act_922903076601160',
+          { creative_id: '120210000000000000' },
+        ),
+      ).rejects.toThrow(META_ACCOUNT_SCOPE_REFUSAL_MARKER);
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('no selected account resolved for Ad creative 120210000000000000'),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('leaves LIST behaviour untouched', async () => {

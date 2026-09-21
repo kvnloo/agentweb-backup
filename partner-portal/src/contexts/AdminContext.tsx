@@ -46,7 +46,6 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply monitoring for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -70,6 +69,12 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  llmUsageCredits?: {
+    month: string;
+    totalPurchasedMicroUsd?: number;
+    totalAdminGrantedMicroUsd?: number;
+    totalMigrationOffsetMicroUsd?: number;
+  };
   extraCostUsage?: {
     month: string;
     totalCost: number;

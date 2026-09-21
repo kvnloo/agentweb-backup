@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
+import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
 
 const router = Router();
 
@@ -37,7 +38,7 @@ function userId(req: Request): string {
 router.post('/you-search-web', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.youSearchWeb(req.body.query, req.body.max_results || 10);
+    const result = await svc.youSearchWeb(req.body.query, req.body.max_results || 10, undefined, undefined, userId(req));
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -47,7 +48,7 @@ router.post('/you-search-web', async (req: Request, res: Response) => {
 router.post('/you-search-news', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.youSearchNews(req.body.query, req.body.max_results || 10, req.body.freshness);
+    const result = await svc.youSearchNews(req.body.query, req.body.max_results || 10, req.body.freshness, userId(req));
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -57,7 +58,7 @@ router.post('/you-search-news', async (req: Request, res: Response) => {
 router.post('/google-search-web', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.googleSearchWeb(req.body.query, req.body.max_results || 10);
+    const result = await svc.googleSearchWeb(req.body.query, req.body.max_results || 10, userId(req));
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -199,12 +200,21 @@ router.post('/generate-video', async (req: Request, res: Response) => {
 router.post('/describe-media', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time } = req.body;
+    const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time, session_id } = req.body;
     let result;
     if (type === 'video') {
-      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time, userId: userId(req) });
+      // ENG-1961: carry the session too, so analysis run through this API is
+      // traceable to its chat the same way the tool path is (the sibling
+      // /generate-video route already takes session_id).
+      result = await svc.describeVideo(url, prompt, {
+        return_transcript, return_scenes, start_time, end_time,
+        userId: userId(req), sessionId: session_id,
+      });
     } else {
-      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
+      // ENG-1858: meter to the API caller instead of "system".
+      result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt, {
+        userId: userId(req), sessionId: session_id, feature: 'describe_image',
+      });
     }
     res.json(result);
   } catch (err: any) {
@@ -226,33 +236,42 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 router.post('/email', async (req: Request, res: Response) => {
   try {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
     await bootstrapEmailProviders();
-    const { provider } = await resolveEmailAccount(userId(req), req.body.account_id);
+    // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
+    // record, and that is where the provider reads (and refreshes) its tokens.
+    // A send is resolved as a write, so it is refused on a teammate's mailbox.
+    const operation = req.body.action === 'send' ? 'send' : 'read';
+    const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
+    const { provider, ownerUserId } = resolved;
+    // Every provider call runs inside withAccessGuard: a teammate's shared
+    // mailbox is re-checked immediately before the call AND before the result is
+    // returned, so a share revoked mid-read discloses nothing.
+    const guarded = <T,>(read: () => Promise<T>) => withAccessGuard(userId(req), resolved, operation, read);
 
     const { action } = req.body;
     let result;
     switch (action) {
       case 'search': {
         const maxResults = Math.min(req.body.max_results || 10, 50);
-        const emails = await provider.searchEmails(userId(req), req.body.account_id, req.body.query, maxResults);
+        const emails = await guarded(() => provider.searchEmails(ownerUserId, req.body.account_id, req.body.query, maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'list': {
         const maxResults = Math.min(req.body.max_results || 20, 50);
-        const emails = await provider.listEmails(userId(req), req.body.account_id, req.body.folder || 'INBOX', maxResults);
+        const emails = await guarded(() => provider.listEmails(ownerUserId, req.body.account_id, req.body.folder || 'INBOX', maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
-        const emails = await provider.getEmails(userId(req), req.body.account_id, ids);
+        const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;
       }
       case 'send': {
-        const sendResult = await provider.sendEmail(userId(req), req.body.account_id, {
+        const sendResult = await provider.sendEmail(ownerUserId, req.body.account_id, {
           to: req.body.to,
           subject: req.body.subject,
           body: req.body.body,
@@ -295,10 +314,32 @@ router.post('/linkedin-outreach', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * ENG-827: rebuild the scheduled run's publish re-check on the far side of a self-call.
+ *
+ * The hook is a closure, so it cannot cross an HTTP boundary — only the session id it
+ * is keyed on can. `attachPublishRevalidation` remakes the identical hook here, which
+ * means the adapters re-read live consent immediately before the write no matter which
+ * side of the boundary the tool call started on.
+ */
+function buildScheduledPublishContext(req: Request): any {
+  return publishRevalidationForForwardedRun(req, 'post_on_connected_account');
+}
+
 router.post('/post-on-account', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.postOnConnectedAccount(userId(req), req.body.account_id, req.body.content, req.body.media_urls || []);
+    // ENG-827 (Greptile, security): the caller checked consent before making this
+    // self-call, but the irreversible work — media upload, Instagram's container,
+    // YouTube's transfer — happens here, minutes later. Rebuild the run's re-check
+    // hook from the session it forwarded so the adapters bind the write to consent
+    // as it stands at the write. No session header means an ordinary interactive
+    // call, which is not gated and gets no hook.
+    const toolContext = buildScheduledPublishContext(req);
+    const result = await svc.postOnConnectedAccount(
+      userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
+      undefined, toolContext
+    );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -370,7 +411,20 @@ router.get('/meta-ads/campaigns', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
   try {
-    const { entity_type, action, account_id, parent_id, entity_id, fields, params, session_id } = req.body;
+    /*
+     * ENG-1725: this used to destructure parent_id/entity_id/fields and pass them positionally
+     * into callMetaMarketingApi's (campaign_id, ad_set_id, ad_id) slots — none of those names
+     * exist anywhere in this tool's own published schema (emma/tools.ts's call_meta_marketing_api
+     * definition), which documents campaign_id/ad_set_id/ad_id as the actual field names, and
+     * whose `execute()` handler (the path every LLM/agent tool call actually takes) already
+     * passes args.campaign_id/args.ad_set_id/args.ad_id straight through correctly. Only this
+     * raw REST route was out of sync with its own spec — `fields` in particular was never an id
+     * at all, so it could end up silently occupying the ad_id slot. Reading the documented names
+     * here instead makes this route consistent with the one path (agent tool-calling) that was
+     * already correct, and with anyone who followed the published schema rather than the
+     * previously-undocumented parent_id/entity_id/fields shape.
+     */
+    const { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id } = req.body;
     // Greptile P1/security ("Session does not bind authorization"): session_id
     // feeds the objective gate's confirmation check (a prior answer, or the
     // transcript for an explicit-statement quote) — an authenticated caller
@@ -383,7 +437,7 @@ router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
       }
     }
     const svc = await getAgentModeService();
-    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params, session_id);
+    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, session_id);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

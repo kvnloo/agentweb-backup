@@ -1,3 +1,4 @@
+import { sanitizeGeneratedHtml } from '../utils/htmlSanitizer';
 import { AgentModeService, agentModeService as singletonAgentService } from '../services/agentModeService';
 
 // Mock AWS SDK
@@ -240,6 +241,33 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('Failed to create HTML file');
       expect(result.error).toContain('S3 upload failed');
+    });
+
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createHtmlFile's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     // ENG-873: a render failure must no longer discard the draft. The draft is
@@ -691,16 +719,51 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
+      // ENG-1997: the rendered HTML is sanitized before upload. This fixture has
+      // nothing dangerous in it, so sanitization only normalizes it (e.g. void
+      // elements gain a self-closing slash) — assert against the real
+      // sanitizer's output rather than the raw LLM mock response.
       expect(mockUploadFileToS3).toHaveBeenCalledWith(
-        mockHtmlContent,
+        sanitizeGeneratedHtml(mockHtmlContent),
         expect.stringMatching(/^html_\d+_Test_Title\.html$/),
         'user123',
         'text/html'
       );
     });
 
-    it('should truncate long titles in filename', async () => {
-      const longTitle = 'A'.repeat(100);
+    // ENG-1997 — this tool has no {{variable}} boundary to escape values into
+    // (unlike createHtmlFromTemplate/ENG-1877), since the render step is told
+    // to copy names/quotes/numbers from the draft verbatim. Prove the RENDER
+    // path specifically (not just the complete-HTML passthrough) neutralizes
+    // markup the model faithfully reproduced from untrusted quoted content.
+    it('neutralizes a script tag and an event-handler payload the render LLM reproduced verbatim', async () => {
+      // No <img> tag here on purpose — this file's real (unmocked)
+      // inlinePrivateS3Images would try to resolve any <img src> against S3
+      // and this file's s3Utils mock doesn't stub extractS3KeyFromUrl, which
+      // is an unrelated, pre-existing gap in this test file, not something
+      // this sanitizer fix should paper over. <div onclick> proves the same
+      // on*-attribute stripping without touching that path.
+      mockGenerateHTML.mockResolvedValue(
+        '<html><body><p>Feedback: <script>alert(1)</script> and <div onclick="alert(1)">click</div></p></body></html>',
+      );
+
+      const result = await (agentModeService as any).createHtmlFile(
+        'Client Feedback',
+        'Quote the client feedback verbatim.',
+        '',
+        'user123',
+        'session123',
+      );
+
+      expect(result.success).toBe(true);
+      const [uploaded] = mockUploadFileToS3.mock.calls[0];
+      expect(uploaded).not.toContain('<script');
+      expect(uploaded).not.toMatch(/onclick/i);
+      expect(uploaded).toContain('Feedback:');
+    });
+
+    it('caps very long titles at 150 chars, still bounded (ENG-1686: was 50, too aggressive)', async () => {
+      const longTitle = 'A'.repeat(300);
       const result = await (agentModeService as any).createHtmlFile(
         longTitle,
         'Test content',
@@ -709,9 +772,11 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      // Filename should be truncated to 50 characters (plus extension)
-      expect(result.filename.length).toBeLessThan(100);
-      expect(result.filename).toMatch(/^html_\d+_A{1,50}\.html$/);
+      // Filename should be truncated to 150 sanitized chars (plus prefix/extension).
+      // ENG-1686 raised this from 50 -- the old cap cut real report titles
+      // mid-word (Kraftersland: "...Weekly_Performance_Report" -> "...Repor").
+      expect(result.filename.length).toBeLessThan(200);
+      expect(result.filename).toMatch(/^html_\d+_A{1,150}\.html$/);
     });
 
     it('should default to document mode and report an HTML file', async () => {

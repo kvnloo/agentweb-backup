@@ -57,7 +57,7 @@ jest.mock('../services/db', () => ({
     deleteTemplate: jest.fn(),
     incrementUsageCount: jest.fn(),
   },
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByEmail: jest.fn() },
   taskDb: { getTaskExecutionById: jest.fn(), createTaskExecution: jest.fn(), updateTaskExecution: jest.fn() },
 }));
 
@@ -88,6 +88,7 @@ jest.mock('../utils/sseProgress', () => ({
 
 import { agentModeController } from '../controllers/agentModeController';
 import { scheduleDb, scheduleTemplateDb } from '../services/db';
+import { agentModeService } from '../services/agentModeService';
 
 const mockUser = { userId: 'user-1', email: 'test@example.com', isAdmin: true };
 const mockOtherUser = { userId: 'user-2', email: 'other@example.com', isAdmin: false };
@@ -112,6 +113,8 @@ function mockRes() {
 describe('Schedule Templates', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    (agentModeService.getDefaultModel as jest.Mock).mockResolvedValue('gpt-5-chat-2');
+    (agentModeService.getScheduledChatsDefaultModel as jest.Mock).mockResolvedValue('gpt-5-chat-2');
   });
 
   // ─── CREATE ───────────────────────────────────────────────────────────────
@@ -275,11 +278,189 @@ describe('Schedule Templates', () => {
       const res = mockRes();
       await agentModeController.updateScheduleTemplate(req as any, res);
       expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('updated') }));
-      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ name: 'Updated', category: 'SEO' }));
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.objectContaining({ name: 'Updated', category: 'SEO' }), {});
     });
   });
 
   // ─── DELETE ───────────────────────────────────────────────────────────────
+
+  // ENG-1716: the update route wrote whatever `visibility` was sent behind an
+  // ownership check alone, so any authenticated user could publish their own
+  // template platform-wide and skip the review workflow.
+  describe('updateScheduleTemplate — visibility authorization (ENG-1716)', () => {
+    const owned = { templateId: 't1', createdBy: 'user-1', visibility: 'private', name: 'Mine' };
+    // The suite's default mockUser is an ADMIN, so an authorization test must name
+    // its caller explicitly or it silently exercises the privileged path.
+    const ownerNonAdmin = { userId: 'user-1', email: 'owner@example.com', isAdmin: false };
+
+    beforeEach(() => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(owned);
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockResolvedValue({});
+    });
+
+    it('THE BUG: refuses a non-admin promoting their own template to system/public', async () => {
+      for (const visibility of ['system', 'public']) {
+        (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+        const req = mockReq({ params: { templateId: 't1' }, body: { visibility }, user: ownerNonAdmin });
+        const res = mockRes();
+        await agentModeController.updateScheduleTemplate(req as any, res);
+
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(res.json).toHaveBeenCalledWith(
+          expect.objectContaining({ error: expect.stringContaining('administrator') }),
+        );
+        // Refused, not partially applied.
+        expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+      }
+    });
+
+    it('refuses the legacy "platform" alias too, which reads back as system', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'platform' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown visibility instead of persisting it', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'nonsense' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+    });
+
+    it('AC #2: still lets the owner submit for review and withdraw', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'pending_review' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'pending_review' }), { expectedVisibility: 'private' },
+      );
+
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+      const req2 = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req2 as any, mockRes());
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'private' }), { expectedVisibility: 'pending_review' },
+      );
+    });
+
+    // Production verification of ENG-1716 surfaced this: `authenticateToken`
+    // rebuilds `req.user` for a delegate session from the TARGET user's DB row
+    // (`isAdmin: targetUser.isAdmin || false`), so a session delegated into an
+    // account that happens to be an admin carries `isAdmin: true`. Reading that
+    // flag raw would let anyone able to mint a delegate token for an admin —
+    // including a contractor with that admin in their assigned list — publish a
+    // template to every customer's picker. `isRealAdmin` is the codebase's
+    // existing answer and withholds the bit from any delegated session.
+    it('refuses a DELEGATED session into an admin account (no borrowed admin bit)', async () => {
+      for (const visibility of ['system', 'public', 'platform']) {
+        (scheduleTemplateDb.updateTemplate as jest.Mock).mockClear();
+        const req = mockReq({
+          params: { templateId: 't1' },
+          body: { visibility },
+          user: { userId: 'user-1', email: 'admin-target@example.com', isAdmin: true },
+          delegateInfo: { adminUserId: 'sup-1', adminEmail: 'support@example.com', isDelegated: true },
+        });
+        const res = mockRes();
+        await agentModeController.updateScheduleTemplate(req as any, res);
+
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(scheduleTemplateDb.updateTemplate).not.toHaveBeenCalled();
+      }
+    });
+
+    // The same delegated session keeps every non-privileged power it had, so the
+    // fix withholds admin reach without breaking support workflows.
+    it('a delegated session may still edit and submit the template for review', async () => {
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { name: 'Renamed by support', visibility: 'pending_review' },
+        user: { userId: 'user-1', email: 'admin-target@example.com', isAdmin: true },
+        delegateInfo: { adminUserId: 'sup-1', adminEmail: 'support@example.com', isDelegated: true },
+      });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1',
+        expect.objectContaining({ name: 'Renamed by support', visibility: 'pending_review' }),
+        { expectedVisibility: 'private' },
+      );
+    });
+
+    it('AC #3: an admin may still publish through this route', async () => {
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { visibility: 'system' },
+        user: { userId: 'user-1', email: 'a@b.c', isAdmin: true },
+      });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'system' }), { expectedVisibility: 'private' },
+      );
+    });
+
+    // CodeRabbit on PR #2810: the authorization decision is made against a
+    // SNAPSHOT. The owner route authorizes pending_review -> private from the row
+    // it just read, while admin approval reads pending_review and writes public —
+    // so an in-flight owner write could silently overwrite the approval.
+    it('binds a visibility CHANGE to the snapshot it was authorized against', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith(
+        't1', expect.objectContaining({ visibility: 'private' }), { expectedVisibility: 'pending_review' },
+      );
+    });
+
+    it('reports a lost race as a conflict instead of pretending the write landed', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({ ...owned, visibility: 'pending_review' });
+      const lost: any = new Error('changed'); lost.preconditionFailed = true;
+      (scheduleTemplateDb.updateTemplate as jest.Mock).mockRejectedValue(lost);
+
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('changed while you were editing') }),
+      );
+    });
+
+    it('does NOT condition an edit that leaves visibility alone', async () => {
+      // Conditioning those would make ordinary renames fail whenever an admin
+      // happened to be reviewing the template.
+      const req = mockReq({ params: { templateId: 't1' }, body: { name: 'Renamed' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.any(Object), {});
+    });
+
+    it('does NOT condition a no-op restatement of the same visibility', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { visibility: 'private' }, user: ownerNonAdmin });
+      await agentModeController.updateScheduleTemplate(req as any, mockRes());
+
+      expect(scheduleTemplateDb.updateTemplate).toHaveBeenCalledWith('t1', expect.any(Object), {});
+    });
+
+    it('leaves every non-visibility edit working for the owner', async () => {
+      const req = mockReq({ params: { templateId: 't1' }, body: { name: 'Renamed', category: 'SEO' }, user: ownerNonAdmin });
+      const res = mockRes();
+      await agentModeController.updateScheduleTemplate(req as any, res);
+
+      const updates = (scheduleTemplateDb.updateTemplate as jest.Mock).mock.calls[0][1];
+      expect(updates).toEqual(expect.objectContaining({ name: 'Renamed', category: 'SEO' }));
+      expect(updates.visibility).toBeUndefined();
+    });
+  });
 
   describe('deleteScheduleTemplate', () => {
     it('should reject delete by non-owner', async () => {
@@ -324,6 +505,38 @@ describe('Schedule Templates', () => {
       llmModel: '',
     };
 
+    // ENG-1552: a template-created schedule goes live immediately, so it gets the same
+    // authorized-recipient gate as createScheduledChat — enforced only with the flag on.
+    describe('authorized-recipient gate (ENG-1552)', () => {
+      const crossAccount = { ...baseTemplate, variables: [], startingMessage: 'Summarize all clients',
+        requiredFunctionCalls: ['list_all_clients'], emailNotifications: ['analyst@customer.example'] };
+      const nonAdminOwner = { userId: 'user-2', email: 'owner@customer.example', isAdmin: false };
+      beforeEach(() => {
+        (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(crossAccount);
+        (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+        (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+        const { userDb } = jest.requireMock('../services/db');
+        (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+      });
+      afterEach(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+      it('refuses with the remediation when enforcement is on — nothing is written', async () => {
+        process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true';
+        const res = mockRes();
+        await agentModeController.createScheduleFromTemplate(mockReq({ user: nonAdminOwner, params: { templateId: 't1' }, body: {} }) as any, res);
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect((res.json as jest.Mock).mock.calls[0][0].remediation.code).toBe('no_authorized_recipients');
+        expect(scheduleDb.createSchedule).not.toHaveBeenCalled();
+      });
+
+      it('creates it unchanged in shadow mode (flag unset)', async () => {
+        const res = mockRes();
+        await agentModeController.createScheduleFromTemplate(mockReq({ user: nonAdminOwner, params: { templateId: 't1' }, body: {} }) as any, res);
+        expect(res.status).toHaveBeenCalledWith(201);
+        expect(scheduleDb.createSchedule).toHaveBeenCalled();
+      });
+    });
+
     it('should return 404 for non-existent template', async () => {
       (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(null);
       const req = mockReq({ params: { templateId: 'no-exist' }, body: {} });
@@ -340,6 +553,30 @@ describe('Schedule Templates', () => {
       const res = mockRes();
       await agentModeController.createScheduleFromTemplate(req as any, res);
       expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    // Found in production 2026-09-09: a schedule created here with every variable
+    // supplied still never ran. `runScheduledChats` accepts prefilled values only via
+    // `prefilledWithoutRequest` = `!variableRequestSentAt && variableValuesUpdatedAt`,
+    // so omitting the timestamp fails the gate even with `variableRequestStatus:
+    // 'provided'`. The schedule emails its owner for the values it already holds and
+    // pushes nextRunTime out one interval, every interval.
+    it('stamps variableValuesUpdatedAt, without which the schedule never runs', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(baseTemplate);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { variableValues: { website: 'https://example.com' } },
+      });
+      await agentModeController.createScheduleFromTemplate(req as any, mockRes());
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.variableRequestStatus).toBe('provided');
+      expect(typeof created.variableValuesUpdatedAt).toBe('string');
+      expect(Number.isNaN(Date.parse(created.variableValuesUpdatedAt))).toBe(false);
+      expect(created.variableRequestSentAt).toBeUndefined();
     });
 
     it('should create scheduled chat from template with variable values', async () => {
@@ -370,7 +607,80 @@ describe('Schedule Templates', () => {
       expect(created.type).toBe('scheduled_chat');
 
       // Verify usage count was incremented
-      expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1');
+      expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1', mockUser.userId);
+    });
+
+    // ENG-1722 (ENG-1609 AC #2): variables alone must be sufficient — no freehand
+    // conversation. Run against the REAL seeded template, not a fixture, so a
+    // change to the shipped prompt or variable list is caught here.
+    it('ENG-1722: builds a working daily schedule from the real LinkedIn outreach template with variables alone', async () => {
+      const { buildLinkedInOutreachTemplate } = require('../scripts/seed-eng1609-linkedin-outreach-template');
+      const template = buildLinkedInOutreachTemplate();
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(template);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: template.templateId },
+        body: {
+          variableValues: {
+            icp_description: 'Heads of Clinical Operations at US biotechs, 50-500 staff',
+            daily_connection_target: '10',
+            message_template: 'default',
+            lead_list_id: 'create new',
+          },
+        },
+      });
+      const res = mockRes();
+      await agentModeController.createScheduleFromTemplate(req as any, res);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+
+      // Ready to run: nothing is pending a human, so the first fire is not parked.
+      expect(created.variableRequestStatus).toBe('provided');
+      expect(created.status).toBe('active');
+      expect(created.frequency).toBe('daily');
+
+      // The validation wiring survives the copy — this is the field ENG-1132's
+      // whole block-detection chain is gated on.
+      expect(created.requiredFunctionCalls).toEqual(['linkedin_outreach']);
+      expect(created.functionCallMinCalls).toEqual({ linkedin_outreach: 1 });
+
+      // Every placeholder has a value, so none reaches the model unsubstituted and
+      // the pre-run missing-variable gate cannot fire.
+      const stillUnfilled = (created.startingMessage.match(/\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g) || [])
+        .filter((ph: string) => {
+          const name = ph.replace(/[{}\s]/g, '');
+          return !created.variableValues[name];
+        });
+      expect(stillUnfilled).toEqual([]);
+    });
+
+    it('ENG-1722: parks the run when a variable is left blank — there are no optional variables', async () => {
+      const { buildLinkedInOutreachTemplate } = require('../scripts/seed-eng1609-linkedin-outreach-template');
+      const template = buildLinkedInOutreachTemplate();
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue(template);
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: template.templateId },
+        body: {
+          variableValues: {
+            icp_description: 'Heads of Clinical Operations',
+            daily_connection_target: '10',
+            // message_template and lead_list_id omitted — the two the parent
+            // ticket calls "optional". They are not, which is why each carries a
+            // documented literal default instead.
+          },
+        },
+      });
+      const res = mockRes();
+      await agentModeController.createScheduleFromTemplate(req as any, res);
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.variableRequestStatus).toBe('pending');
     });
 
     it('should allow overriding frequency and model', async () => {

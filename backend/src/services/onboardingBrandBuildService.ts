@@ -59,6 +59,10 @@ interface ICPPersonaLite {
   desire: string;
   objection: string;
   meta_targeting_brief: string;
+  // Passed through from the source marketStrategy.icp entry when present —
+  // lets routes/crm.ts's icp/filters cache-hit check work the same way for
+  // marketStrategy-derived personas as it does for icpResult ones (ENG-1955).
+  extractedFilters?: any;
 }
 
 interface CompetitorEntry {
@@ -194,6 +198,7 @@ export function mapMarketIcpToResult(
         desire: stringOr(p.valueProposition, ""),
         objection: "",
         meta_targeting_brief: stringOr(firstPersona, ""),
+        ...(p.extractedFilters ? { extractedFilters: p.extractedFilters } : {}),
       };
     })
     .slice(0, 5);
@@ -269,6 +274,8 @@ function defaultDeps(): {
   const { chatbotDb } = require("./chatbotService");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { generateSessionResponse } = require("../controllers/agentModeController");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { cronJobRegistry } = require("../utils/cronJobRegistry");
   return {
     createChatSession: async (userId: string) => {
       const session = await chatbotDb.createChatSession(
@@ -284,8 +291,13 @@ function defaultDeps(): {
       );
       return { sessionId: session.sessionId };
     },
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener. Only the real (default)
+    // implementation is tracked — tests inject their own fake via
+    // BrandBuildDeps and never go through this function.
     generateSessionResponse: (sessionId, userMessage, userId, llmModel) =>
-      generateSessionResponse(sessionId, userMessage, userId, llmModel),
+      cronJobRegistry.track('onboardingBrandBuildAgentTurn', generateSessionResponse(sessionId, userMessage, userId, llmModel)),
   };
 }
 

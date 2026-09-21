@@ -10,6 +10,18 @@
  * not saved. Please try again." All three judges scored it 2/5 for dataAccuracy.
  * Worst-case consequence: the user re-runs a production deploy that already landed.
  *
+ * ENG-1224 (Variant A / session 1e9a4fe4): the same inversion, one seam further —
+ * `update_html_file` had already returned a live preview URL when a trailing
+ * exception threw the turn into this catch block, and the diagnosis path had no
+ * notice for it: `update_html_file` is neither a publish (no email/campaign goes
+ * out) nor a duplicate-unsafe data write (re-running an edit overwrites the same
+ * file rather than duplicating it), so it was in neither confirmed set and the
+ * user was left with the bare "please try again" fallback and no way back to the
+ * page they had just finished editing. `CONFIRMED_ARTIFACT_TOOLS` /
+ * `collectConfirmedArtifactUrls` / `appendConfirmedArtifactNotice` close that gap:
+ * a distinct notice (never "do not re-run" — re-running IS safe here) that
+ * surfaces the produced artifact's URL instead.
+ *
  * Two independent defects produced that sentence, and this module backs the fix for
  * both:
  *   1. The model-visible tool error for a bookkeeping tool carried no criticality
@@ -36,6 +48,8 @@
  * and the diagnosis path (`ledgerFromSucceededFunctions` supplies the ledger there,
  * since `toolCalls[]` does not survive the throw).
  */
+
+import { extractToolResponseHeader } from './toolResponseS3Ref';
 
 /** A tool-ledger entry (agentMode toolCalls[]): { name, result, error }. */
 export interface FalseFailureLedgerEntry {
@@ -98,6 +112,69 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
  * excluded rather than guessed.
  */
 
+/**
+ * ENG-1173: data writes that are duplicate-unsafe but are NOT publishes.
+ *
+ * Kept in its own set, and consumed ONLY by `reconcileFalseDataWriteFailure`, because
+ * `CONFIRMED_PUBLISH_TOOLS` decides more than wording. Through
+ * `collectConfirmedPublishActions` it drives `mayHavePublished` in agentModeController,
+ * which decides whether a failed SCHEDULED run may be requeued at all. Adding CRM
+ * writes there would silently disable a schedule's auto-recovery for any task that
+ * touches the CRM — exactly the over-reach the note above about
+ * `generate_landing_page` describes. This set changes a MESSAGE and nothing else.
+ *
+ * Narrow on purpose. `import_leads_from_search` is deliberately absent: ENG-1002 and
+ * ENG-1068 both record its written-vs-reported counts disagreeing, so "it wrote
+ * something" is not yet a claim this module can stand behind by name alone.
+ */
+const CONFIRMED_DATA_WRITE_TOOLS: ReadonlySet<string> = new Set<string>([
+  'add_leads_to_list',
+  'create_lead_list',
+  'add_lead_engagement',
+  // Enrichment spends paid Apollo / LinkedIn credits and writes back to the CRM, so a
+  // needless re-run costs real money on top of duplicating work.
+  'enrich_leads_execute',
+  'enrich_lead_custom',
+  // Created in the user's OWN Drive — a re-run leaves them with two of the file.
+  'create_google_doc',
+  'create_google_sheet',
+  'create_knowledge_base',
+]);
+
+/** Plain-language labels for the data-write set. Deliberately carry no quantities. */
+const DATA_WRITE_ACTION_LABELS: Record<string, string> = {
+  add_leads_to_list: 'added leads to your list',
+  create_lead_list: 'created your lead list',
+  add_lead_engagement: 'recorded a lead engagement event',
+  enrich_leads_execute: 'ran enrichment on your lead list',
+  enrich_lead_custom: 'enriched a lead',
+  create_google_doc: 'created a Google Doc in your Drive',
+  create_google_sheet: 'created a Google Sheet in your Drive',
+  create_knowledge_base: 'created a knowledge base',
+};
+
+/**
+ * Deliberately EXCLUDED, and the reasons follow the same rule as the publish set —
+ * a name has to confirm the outcome on its own, because on the diagnosis path the
+ * name is all that survives the throw:
+ *
+ *   `import_leads_from_search` — ENG-1002 and ENG-1068 both record its
+ *   written-vs-reported counts disagreeing, so "it wrote something" is not yet a
+ *   claim this module can stand behind.
+ *
+ *   `create_blog_article`, `create_book`, `create_social_media_posts` — these produce
+ *   DRAFTS, not published artifacts, exactly like the `generate_landing_page` case
+ *   above. Re-running a draft is cheap; telling the user not to is simply false.
+ *
+ *   `create_task_from_prompt` / `create_task_from_template` /
+ *   `create_image_task_from_prompt` — all three are marked [DEPRECATED] in the tool
+ *   registry and are being phased out.
+ *
+ *   Every `update_*` and `delete_*` tool — these overwrite or remove a known target,
+ *   so a repeat converges on the same state instead of duplicating it. Re-running is
+ *   the safe advice there, which is the opposite of what this notice says.
+ */
+
 /** Plain-language label per tool, so the correction reads as prose, not tool names. */
 const PUBLISH_ACTION_LABELS: Record<string, string> = {
   publish_landing_page_changes: 'published your landing-page changes',
@@ -127,6 +204,10 @@ const INTERRUPTION_CLAIM_RE = new RegExp([
   String.raw`\bended\s+unexpectedly\b`,
   String.raw`\bpartway\s+through\b`,
   String.raw`\bdid\s*n[o']?t\s+finish\b`,
+  // ENG-1173: the diagnosis agent's OWN phrasing for the same claim. Production
+  // session 98b90503 closed with "the process took longer than expected" and matched
+  // none of the patterns above, so the guard never even reached the ledger check.
+  String.raw`\btook\s+longer\s+than\s+expected\b`,
   String.raw`\b(?:session|connection|request|run)\b[^.!?\n]{0,40}\b(?:was )?(?:interrupted|dropped|lost)\b`,
 ].join('|'), 'i');
 
@@ -155,6 +236,20 @@ const DENIED_SUCCESS_RE = new RegExp([
   // Scoped to the WORK, so a truthful "I could not complete the competitor
   // comparison" or "…could not complete the memory note" stays silent.
   String.raw`\bcould\s*n[o']?t\s+(?:complete|finish)\s+(?:the\s+|your\s+)?(?:deployment|deploy|publish\w*|update|changes?|fix(?:es)?|edits?|post|send)\b`,
+  // ENG-1173: "Emma was unable to finish adding your prospects to the … list" — the
+  // production denial in session 98b90503, where five add_leads_to_list batches had
+  // all returned success.
+  //
+  // SCOPED TO THE WRITE, and the scoping is the whole point. These patterns are shared
+  // with reconcileFalseFailureReport, which runs at the loop edge on the MAIN AGENT's
+  // own closing prose — always-on, every provider, every turn. An unscoped
+  // "unable to finish|complete" also matched truthful copy like "I published your page,
+  // but I was unable to complete the competitor analysis", stamping a red correction
+  // banner on a message that was entirely accurate. Matching the GERUND of a write verb
+  // keeps the production denial and drops the false positives.
+  String.raw`\bunable\s+to\s+(?:finish|complete)\s+(?:the\s+|your\s+)?(?:adding|importing|creating|saving|publishing|sending|posting|uploading|deploying|writing|updating)\b`,
+  // Same reasoning: anchored to the noun that names the write, never bare.
+  String.raw`\b(?:import|upload|sync|deployment|publish)\b[^.!?\n]{0,20}\bcould\s+not\s+be\s+completed\b`,
   String.raw`\bmay\s+n[o']?t\s+have\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|sent|gone\s+through)\b`,
   String.raw`\bnothing\s+(?:was\s+)?(?:saved|persisted|applied|published|deployed|posted|sent)\b`,
   String.raw`\bnone\s+of\s+(?:the|your|these|those)\s+[^.!?\n]{0,30}?\b(?:made\s+it|went\s+through|(?:was|were)\s+(?:saved|applied|published|deployed|sent|posted))\b`,
@@ -346,6 +441,122 @@ export function collectPublishActionsSince(
   return out;
 }
 
+/**
+ * HTML-editor tools whose SUCCESS produces a user-visible preview artifact (an S3
+ * URL) but that belong in neither existing set: not a publish (no email/campaign
+ * goes out) and not duplicate-unsafe (an update overwrites the same file, so a
+ * repeat converges rather than duplicates it — same reasoning as the "every
+ * update and delete tool" exclusion from `CONFIRMED_DATA_WRITE_TOOLS` above).
+ * What a false failure after one of these costs the user is not a re-run risk,
+ * it is losing the link to work that already exists.
+ */
+const CONFIRMED_ARTIFACT_TOOLS: ReadonlySet<string> = new Set<string>([
+  'create_html_file',
+  'update_html_file',
+  'create_html_from_template',
+]);
+
+/** Parse a tool result body into JSON, stripping the leading recovery/notice header first if present. */
+function parseToolResultBody(content: unknown): any {
+  if (typeof content !== 'string' || !content) return null;
+  const header = extractToolResponseHeader(content);
+  const body = header ? content.slice(header.length) : content;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+/** A confirmed HTML-artifact URL plus the tool that produced it, so wording can tell create from update. */
+export interface ConfirmedArtifactRef {
+  url: string;
+  name: string;
+}
+
+/** create_html_file / create_html_from_template make a NEW file; update_html_file edits an existing one. */
+const CREATE_ARTIFACT_TOOLS: ReadonlySet<string> = new Set<string>([
+  'create_html_file',
+  'create_html_from_template',
+]);
+
+/**
+ * Preview/artifact URLs a confirmed HTML tool call produced THIS turn, read from
+ * the transcript. Same reasoning and scoping as `collectPublishActionsSince`: the
+ * diagnosis path only has the persisted session, never the in-loop ledger with
+ * tool results, so this reads the timestamped tool messages directly. Accepts
+ * epoch ms (rather than `collectPublishActionsSince`'s ISO string) because both
+ * call sites already hold `turnStartMs` as a number.
+ */
+export function collectConfirmedArtifactUrls(
+  messages: TranscriptToolMessage[] | null | undefined,
+  sinceMs: number | null | undefined,
+): ConfirmedArtifactRef[] {
+  if (!Array.isArray(messages) || !Number.isFinite(sinceMs as number)) return [];
+
+  const refs: ConfirmedArtifactRef[] = [];
+  const seen = new Set<string>();
+  for (const m of messages) {
+    if (!m || m.role !== 'tool' || !m.name || !CONFIRMED_ARTIFACT_TOOLS.has(m.name)) continue;
+    const stamp = m.timestamp || m.metadata?.timestamp;
+    const at = stamp ? new Date(stamp).getTime() : NaN;
+    if (!Number.isFinite(at) || at < (sinceMs as number)) continue;
+    const parsed = parseToolResultBody(m.content);
+    if (!parsed || parsed.success !== true) continue;
+    const url = parsed.s3_url;
+    if (typeof url !== 'string' || !url || seen.has(url)) continue;
+    seen.add(url);
+    refs.push({ url, name: m.name });
+  }
+  return refs;
+}
+
+/** "created"/"updated"/"created and updated", pluralized to match how many artifacts are named. */
+function describeArtifactAction(refs: ConfirmedArtifactRef[]): string {
+  const anyCreated = refs.some((r) => CREATE_ARTIFACT_TOOLS.has(r.name));
+  const anyUpdated = refs.some((r) => !CREATE_ARTIFACT_TOOLS.has(r.name));
+  const noun = refs.length > 1 ? 'HTML files' : 'HTML file';
+  const verb = anyCreated && anyUpdated ? 'created and updated' : anyCreated ? 'created' : 'updated';
+  return `${verb} your ${noun}`;
+}
+
+/** The visible notice appended after a confirmed HTML edit whose URL would otherwise be lost. */
+function buildArtifactNotice(refs: ConfirmedArtifactRef[]): string {
+  const urls = refs.map((r) => r.url);
+  const links = urls.length === 1 ? urls[0] : urls.map((u, i) => `${i + 1}. ${u}`).join('\n');
+  const pronoun = urls.length > 1 ? 'them' : 'it';
+  return (
+    `${CORRECTION_MARKER}, successfully: ${describeArtifactAction(refs)}. `
+    + `You can view ${pronoun} here — the error above did not affect this work:\n${links}`
+  );
+}
+
+/**
+ * ENG-1224 (Variant A): the artifact twin of `appendConfirmedDataWriteNotice`, for
+ * text the CALLER already knows is generic. Never says "do not re-run" — unlike a
+ * publish or a CRM write, re-running an HTML edit is safe (it overwrites the same
+ * file) — it exists purely to hand back the link a thrown turn would otherwise
+ * lose. Composes with the publish/data-write notices via the shared
+ * CORRECTION_MARKER exactly like `extendExistingCorrection`.
+ */
+export function appendConfirmedArtifactNotice(
+  content: string,
+  refs: ConfirmedArtifactRef[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!Array.isArray(refs) || refs.length === 0) return content;
+
+  if (content.includes(CORRECTION_MARKER)) {
+    const missing = refs.filter((r) => !content.includes(r.url));
+    if (missing.length === 0) return content;
+    const links = missing.length === 1 ? missing[0].url : missing.map((r, i) => `${i + 1}. ${r.url}`).join('\n');
+    const pronoun = missing.length > 1 ? 'them' : 'it';
+    return `${content.replace(/\s+$/, '')} It also ${describeArtifactAction(missing)} — you can view ${pronoun} here:\n${links}`;
+  }
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildArtifactNotice(refs)}`;
+}
+
 /** Plain-language labels of every publish/deploy confirmed this run, de-duplicated. */
 export function collectConfirmedPublishActions(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
@@ -410,6 +621,233 @@ export function appendConfirmedPublishNotice(
   if (actions.length === 0) return content;
 
   return `${content.replace(/\s+$/, '')}\n\n${buildConfirmedWorkNotice(actions)}`;
+}
+
+/**
+ * ENG-1173: entity nouns whose QUANTITY the diagnosis agent can never know.
+ *
+ * The agent is handed `calledFunctions` — a histogram of tool-call counts — and
+ * nothing else numeric. It has no `successCount`, no row count, no record count. So
+ * every quantity of a record-like thing in its output is unfounded by construction,
+ * whatever number it happens to be.
+ */
+const UNFOUNDED_COUNT_NOUNS = [
+  'leads?', 'contacts?', 'prospects?', 'subscribers?',
+  'records?', 'rows?', 'entries', 'items?',
+  'posts?', 'emails?', 'messages?', 'campaigns?',
+  'lists?', 'articles?', 'pages?', 'images?', 'files?',
+].join('|');
+
+const UNFOUNDED_COUNT_RE = new RegExp(
+  String.raw`\b(?:(the|your|all|these|those)\s+)?\d[\d,]*\s+(${UNFOUNDED_COUNT_NOUNS})\b`,
+  'gi',
+);
+
+/**
+ * ENG-1174: the nouns a founded count may legitimately attach to.
+ *
+ * Every founded figure this module is given comes from a lead import, so it is a count
+ * of ROWS. Allowing it on any noun at all would let "I sent 75 emails" stand because 75
+ * happened to be the row total — a number that is true about one thing asserted about
+ * another. If a second source of founded counts is ever added, it must arrive with its
+ * own noun set rather than widening this one.
+ */
+const FOUNDED_COUNT_NOUNS_RE = /^(?:leads?|rows?|records?|contacts?|prospects?)$/i;
+
+/**
+ * ENG-1173 kill switch — ON by default; set AGENT_DIAGNOSIS_COUNT_GUARD=false to stand
+ * the count strip and the data-write notices down.
+ *
+ * Same reasoning as AGENT_SYNTHESIS_RESIDUE_GUARD (ENG-1054): these guards alter
+ * user-visible text and fail SILENTLY — a false positive costs the user information
+ * and surfaces only as a log line, never as an error. A merge here deploys straight to
+ * production, so there has to be a way to disable it from config rather than waiting on
+ * a revert. Read per call, not at module load, so it can be flipped without a restart.
+ * Off restores the exact pre-ENG-1173 behaviour.
+ */
+function countGuardEnabled(): boolean {
+  return process.env.AGENT_DIAGNOSIS_COUNT_GUARD !== 'false';
+}
+
+/**
+ * Remove entity quantities from diagnosis-agent prose.
+ *
+ * Production session 39eb5663 wrote 75 leads across three `add_leads_to_list` batches
+ * and closed with "I have successfully added the 3 leads to your CRM list". The `3` is
+ * `calledFunctions["add_leads_to_list"]` — the call count — and reading it as a lead
+ * count is the only reasonable reading of what the prompt actually sent.
+ *
+ * This STRIPS rather than corrects, and that is the whole design: there is no
+ * authoritative record count on this path to reconcile against, so the only honest
+ * options are "no number" and "a number that might be wrong". A user told "added the
+ * leads" goes and looks; a user told "added the 3 leads" believes it.
+ *
+ * Digits only. Spelled-out quantities ("three leads") are left alone deliberately —
+ * the observed failure is numeric because the ledger is JSON, and word-matching would
+ * mangle ordinary prose for no measured benefit.
+ *
+ * Point this ONLY at diagnosis-agent output. The main agent composes its closing from
+ * real tool results and its counts ARE founded; stripping them there would destroy
+ * true information.
+ */
+export function stripUnfoundedEntityCounts(content: string, foundedCounts?: number[] | null): string {
+  if (typeof content !== 'string' || content.length === 0) return content;
+  if (!countGuardEnabled()) return content;
+
+  // ENG-1174: figures this run can actually prove — read off its own tool results
+  // (see collectLeadImportTotals). A quantity matching one of them is FOUNDED and may
+  // stand; everything else is still removed. Empty/absent keeps the ENG-1173 behaviour
+  // of stripping every count, which is the correct default whenever nothing is provable.
+  const founded = new Set<number>(
+    Array.isArray(foundedCounts) ? foundedCounts.filter((n) => typeof n === 'number' && Number.isFinite(n)) : [],
+  );
+
+  return content.replace(
+    UNFOUNDED_COUNT_RE,
+    (match: string, determiner: string | undefined, noun: string, offset: number, whole: string) => {
+      // "2 of 5 files" must stay intact. Rewriting only the "5 files" half yields
+      // "2 of the files" — the denominator is gone and the numerator now reads as a
+      // claim about the whole set, which is worse than the number this guard exists
+      // to remove. An N-of-M construction is left alone entirely.
+      if (/\bof\s+$/i.test(whole.slice(0, offset))) return match;
+
+      // A founded figure is founded FOR A PARTICULAR THING. The only source of these
+      // today is a lead import (collectLeadImportTotals), so 75 is 75 rows — it says
+      // nothing about emails, posts or campaigns. Without this check the guard let
+      // "I sent 75 emails" through purely because 75 happened to be the row total,
+      // which is the same confident-wrong-number defect this module exists to remove.
+      if (founded.size > 0 && FOUNDED_COUNT_NOUNS_RE.test(noun)) {
+        const digits = match.match(/\d[\d,]*/);
+        const value = digits ? Number(digits[0].replace(/,/g, '')) : NaN;
+        if (Number.isFinite(value) && founded.has(value)) return match;
+      }
+      return `${determiner || 'the'} ${noun}`;
+    },
+  );
+}
+
+/** Plain-language labels of every duplicate-unsafe data write confirmed this run. */
+export function collectConfirmedDataWriteActions(
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string[] {
+  if (!Array.isArray(toolCalls)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of toolCalls) {
+    // A name in this ledger is itself the confirmation that the call succeeded
+    // (see ledgerFromSucceededFunctions); an entry carrying an error never counts.
+    if (!entry || entry.error !== undefined) continue;
+    if (!entry.name || !CONFIRMED_DATA_WRITE_TOOLS.has(entry.name)) continue;
+    const label = DATA_WRITE_ACTION_LABELS[entry.name];
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out;
+}
+
+/**
+ * A run can both publish AND write data. The publish reconciler runs first and stamps
+ * CORRECTION_MARKER, and a bare `includes(CORRECTION_MARKER)` bail-out would then drop
+ * the data-write warning entirely — the user is told not to re-run the deploy, and
+ * nothing warns them off re-running the import that would duplicate records.
+ *
+ * So instead of yielding, extend the banner that is already there with the actions it
+ * does not already name. Idempotent by construction: an action whose label is already
+ * present is never re-added, so a second pass changes nothing.
+ */
+function extendExistingCorrection(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  const missing = collectConfirmedDataWriteActions(toolCalls)
+    .filter((action) => !content.includes(action));
+  if (missing.length === 0) return content;
+
+  return (
+    `${content.replace(/\s+$/, '')} It also ${missing.join('; ')} — that data is written `
+    + 'and saved, so please do NOT re-run that either; a repeat can create duplicate records.'
+  );
+}
+
+/** The visible correction appended after a confirmed, duplicate-unsafe data write. */
+function buildDataWriteNotice(actions: string[]): string {
+  return (
+    `${CORRECTION_MARKER}, successfully: ${actions.join('; ')}. `
+    + 'That data is written and saved, so please do NOT re-run it — a repeat import can '
+    + 'create duplicate records. Check the list before retrying.'
+  );
+}
+
+/**
+ * ENG-1173: the data-write twin of `appendConfirmedPublishNotice`, for text the CALLER
+ * already knows is generic.
+ *
+ * The fixed fallbacks ("I encountered an error … Please try sending your message
+ * again", "The server restarted … Please send your message again") carry no outcome to
+ * judge, just blanket retry advice — and that advice after a landed CRM import is the
+ * same duplicate-record instruction this ticket is about. These strings are reached
+ * whenever the diagnosis agent is unavailable, including its own 10s timeout, so the
+ * path is not rare. Never point this at model-written prose: truthful text would
+ * collect a "Correction" banner it does not deserve.
+ */
+export function appendConfirmedDataWriteNotice(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!countGuardEnabled()) return content;
+  if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
+
+  const actions = collectConfirmedDataWriteActions(toolCalls);
+  if (actions.length === 0) return content;
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildDataWriteNotice(actions)}`;
+}
+
+/**
+ * ENG-1173: the ENG-971 inversion, one seam over — a message denying work that a
+ * confirmed CRM write actually completed.
+ *
+ * Same contract as `reconcileFalseFailureReport`: fires only when the text asserts
+ * BOTH an interruption AND that the work was not saved, appends only what the ledger
+ * confirms, and never rewrites the model's own words. Run this AFTER the publish
+ * reconciler — the shared `CORRECTION_MARKER` makes whichever fires first win, and a
+ * landed publish is the more expensive thing to re-run.
+ */
+export function reconcileFalseDataWriteFailure(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!countGuardEnabled()) return content;
+  // A publish correction is already here — extend it rather than drop the warning.
+  if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
+  if (!assertsUnsavedInterruption(content)) return content;
+
+  const actions = collectConfirmedDataWriteActions(toolCalls);
+  if (actions.length === 0) return content;
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildDataWriteNotice(actions)}`;
+}
+
+/**
+ * ENG-1224 (Variant A): the artifact twin of `reconcileFalseDataWriteFailure`, for
+ * the DIAGNOSIS AGENT's own prose rather than a fixed fallback string. Same
+ * contract — fires only when the text asserts an unsaved interruption, appends
+ * only a URL a confirmed tool call actually produced, and never rewrites the
+ * model's own words. Run LAST: the shared `CORRECTION_MARKER` makes whichever
+ * reconciler runs first win the banner, and a landed publish or data write is
+ * more consequential to have re-run than losing a preview link.
+ */
+export function reconcileFalseArtifactFailure(
+  content: string,
+  artifactRefs: ConfirmedArtifactRef[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(CORRECTION_MARKER)) return appendConfirmedArtifactNotice(content, artifactRefs);
+  if (!assertsUnsavedInterruption(content)) return content;
+  return appendConfirmedArtifactNotice(content, artifactRefs);
 }
 
 /**

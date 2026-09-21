@@ -877,6 +877,22 @@ export async function getEnrichSoApiKey(): Promise<string> {
   return key.trim();
 }
 
+/**
+ * Get the Enigma (company card-revenue data) API key from AWS Secrets Manager.
+ * Stored as a plain string at dev/AgentWeb/Enigma or prod/AgentWeb/Enigma.
+ */
+export async function getEnigmaApiKey(): Promise<string> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Enigma'
+    : 'dev/AgentWeb/Enigma';
+  const key = await getSecret(secretName);
+  if (!key || key.trim() === '') {
+    throw new Error(`Enigma API key is empty. Store it in Secrets Manager at ${secretName}.`);
+  }
+  return key.trim();
+}
+
 export interface ApolloCredentials {
   apiKey: string;
   webhookSecret?: string;
@@ -993,6 +1009,94 @@ export async function getElevenLabsApiKey(): Promise<string> {
     ? 'prod/AgentWeb/ElevenLabs'
     : 'dev/AgentWeb/ElevenLabs';
   return (await getSecret(secretName)).trim();
+}
+
+/**
+ * How long a resolved Placid token is reused before Secrets Manager is asked
+ * again. The token is a long-lived API credential, not a session token, so
+ * freshness is measured in rotations, not seconds; five minutes bounds how long
+ * a rotated secret takes to be picked up.
+ */
+export const PLACID_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+let placidTokenCache: { value: string | null; expiresAt: number } | null = null;
+let placidTokenInFlight: Promise<string | null> | null = null;
+
+/** Test hook: forget any cached or in-flight Placid token lookup. */
+export function __resetPlacidTokenCache(): void {
+  placidTokenCache = null;
+  placidTokenInFlight = null;
+}
+
+/**
+ * Resolve the Placid private API token (ENG-698).
+ *
+ * Reads `prod/AgentWeb/Placid` (or `dev/…`) first. Harsha created the prod
+ * secret on 2026-09-11 (ENG-1598) by migrating the token that had lived in the
+ * Elastic Beanstalk environment, and described it as holding "a non-empty
+ * `PLACID_PRIVATE_TOKEN` value". That phrasing fits both a JSON object keyed by
+ * that name and a bare token string, and the secret itself is not readable from
+ * here, so BOTH shapes are accepted rather than guessing one and breaking
+ * production on the other.
+ *
+ * Falls back to `process.env.PLACID_PRIVATE_TOKEN` when the secret is absent or
+ * unusable — which is the normal case in development, where no
+ * `dev/AgentWeb/Placid` exists. The fallback is logged, not silent: the point of
+ * ENG-698's migration is that production stops depending on the environment
+ * variable, and a quiet fallback would let it keep doing so unnoticed.
+ *
+ * Returns null when neither source yields a token.
+ */
+async function resolvePlacidPrivateToken(): Promise<string | null> {
+  const secretName = process.env.NODE_ENV === 'production'
+    ? 'prod/AgentWeb/Placid'
+    : 'dev/AgentWeb/Placid';
+
+  try {
+    const raw = (await getSecret(secretName)).trim();
+    let token = raw;
+    if (raw.startsWith('{')) {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const value = parsed.PLACID_PRIVATE_TOKEN ?? parsed.privateToken ?? parsed.token;
+      token = typeof value === 'string' ? value.trim() : '';
+    }
+    if (token) return token;
+    console.warn(`[Placid] ${secretName} exists but holds no usable token; falling back to environment`);
+  } catch (err: any) {
+    console.warn(`[Placid] ${secretName} unavailable (${err?.message || err}); falling back to environment`);
+  }
+
+  const fromEnv = process.env.PLACID_PRIVATE_TOKEN?.trim();
+  return fromEnv || null;
+}
+
+export async function getPlacidPrivateToken(): Promise<string | null> {
+  // Cached, because this sits on interactive request paths — every editor-token
+  // mint and every template-list load. The environment read it replaced was
+  // free; an uncached Secrets Manager call on each is a network round trip and
+  // a per-call AWS charge on every page view (CodeRabbit, PR #2901).
+  //
+  // Misses are cached too, deliberately. In development no dev/AgentWeb/Placid
+  // exists, and caching only successes would re-attempt — and re-log — that
+  // failed lookup on every single request.
+  const now = Date.now();
+  if (placidTokenCache && placidTokenCache.expiresAt > now) {
+    return placidTokenCache.value;
+  }
+
+  // Concurrent callers share one lookup. Without this a cold cache under load
+  // fans out into as many Secrets Manager reads as there are waiting requests.
+  if (!placidTokenInFlight) {
+    placidTokenInFlight = resolvePlacidPrivateToken()
+      .then((value) => {
+        placidTokenCache = { value, expiresAt: Date.now() + PLACID_TOKEN_TTL_MS };
+        return value;
+      })
+      .finally(() => {
+        placidTokenInFlight = null;
+      });
+  }
+  return placidTokenInFlight;
 }
 
 /**

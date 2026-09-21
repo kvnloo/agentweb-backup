@@ -461,6 +461,48 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.error).toBe('S3 upload failed');
     });
 
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createBlogArticle's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should handle exceptions during blog creation', async () => {
       mockGenerateBlogContent.mockRejectedValue(new Error('Network error'));
 
@@ -690,61 +732,15 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.data.deepResearchUsed).toBe(false);
     });
 
-    // ENG-738: a timed-out deep research call that still gathered real
-    // partial findings must not sink the whole article request — continue
-    // building from what was actually gathered instead of failing a request
-    // that would otherwise get nothing at all.
-    it('continues building the article from partial content when deep research times out with partial findings', async () => {
+    // ENG-738: deepResearchService.performDeepResearch already retries once at
+    // a cheaper depth internally when its own call times out. A failure
+    // reaching createBlogArticle means that already happened and still didn't
+    // produce content, so the whole article request fails with the real
+    // reason rather than shipping a restyled draft built from nothing.
+    it('fails with the underlying reason when deep research fails', async () => {
       mockDeepResearchService.performDeepResearch.mockResolvedValue({
         success: false,
-        error: 'Deep research timed out. Please try again with a more specific topic.',
-        partial: true,
-        partialContent: '# Partial Research\n\nSome findings gathered before the cutoff.',
-      });
-      mockRestyleContent.mockResolvedValue({
-        title: 'Partial Article',
-        description: 'Description',
-        content: 'Restyled partial content',
-        imagePrompt: 'prompt'
-      });
-      mockGenerateBlogImage.mockResolvedValue({
-        imageUrl: 'https://example.com/image.png',
-        filename: 'image.png'
-      });
-      mockGenerateBlogHtml.mockReturnValue('<html>Partial</html>');
-      mockUploadFileToS3.mockResolvedValue({
-        success: true,
-        url: 'https://s3.example.com/blog.html'
-      });
-
-      const result = await (agentModeService as any).createBlogArticle(
-        'Test Title Draft',
-        '# Test Content Draft',
-        'medium',
-        '',
-        '',
-        'user123',
-        'session123',
-        'default',
-        true // deep_research = true
-      );
-
-      expect(result.success).toBe(true);
-      expect(result.data.deepResearchPartial).toBe(true);
-      expect(result.message).toContain('partial findings');
-      expect(mockRestyleContent).toHaveBeenCalledWith(
-        '# Partial Research\n\nSome findings gathered before the cutoff.',
-        'Test Title Draft',
-        'professional',
-        'default',
-        true
-      );
-    });
-
-    it('still fails when deep research fails with no usable partial content', async () => {
-      mockDeepResearchService.performDeepResearch.mockResolvedValue({
-        success: false,
-        error: 'Deep research timed out. Please try again with a more specific topic.',
+        error: 'Deep research failed: Request timed out',
       });
 
       const result = await (agentModeService as any).createBlogArticle(
@@ -762,46 +758,6 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('timed out');
       expect(mockRestyleContent).not.toHaveBeenCalled();
-    });
-
-    it('reports deepResearchPartial as false and omits the partial note on a normal deep-research success', async () => {
-      mockDeepResearchService.performDeepResearch.mockResolvedValue({
-        success: true,
-        markdownContent: '# Full Research\n\nComplete findings.',
-        title: 'Full Research',
-        researchSummary: 'Summary',
-      });
-      mockRestyleContent.mockResolvedValue({
-        title: 'Full Article',
-        description: 'Description',
-        content: 'Restyled full content',
-        imagePrompt: 'prompt'
-      });
-      mockGenerateBlogImage.mockResolvedValue({
-        imageUrl: 'https://example.com/image.png',
-        filename: 'image.png'
-      });
-      mockGenerateBlogHtml.mockReturnValue('<html>Full</html>');
-      mockUploadFileToS3.mockResolvedValue({
-        success: true,
-        url: 'https://s3.example.com/blog.html'
-      });
-
-      const result = await (agentModeService as any).createBlogArticle(
-        'Test Title Draft',
-        '# Test Content Draft',
-        'medium',
-        '',
-        '',
-        'user123',
-        'session123',
-        'default',
-        true
-      );
-
-      expect(result.success).toBe(true);
-      expect(result.data.deepResearchPartial).toBe(false);
-      expect(result.message).not.toContain('partial findings');
     });
   });
 });

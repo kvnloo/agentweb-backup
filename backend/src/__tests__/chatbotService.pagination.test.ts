@@ -208,9 +208,9 @@ describe('DynamoDB pagination in chatbotService', () => {
         title: 'Daily Task',
       };
 
-      queryPromiseMock.mockResolvedValueOnce({
-        Items: [newSession, oldSession],
-      });
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [newSession, oldSession] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
 
       const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
@@ -234,9 +234,9 @@ describe('DynamoDB pagination in chatbotService', () => {
         title: 'Session 2',
       };
 
-      queryPromiseMock.mockResolvedValueOnce({
-        Items: [session2, session1],
-      });
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [session2, session1] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
 
       const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
@@ -252,9 +252,9 @@ describe('DynamoDB pagination in chatbotService', () => {
         title: 'Legacy Session',
       };
 
-      queryPromiseMock.mockResolvedValueOnce({
-        Items: [sessionNoDate],
-      });
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [sessionNoDate] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
 
       const timeRange = { startTime: '2026-04-05T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
@@ -273,15 +273,245 @@ describe('DynamoDB pagination in chatbotService', () => {
         title: 'Late Night Start',
       };
 
-      queryPromiseMock.mockResolvedValueOnce({
-        Items: [spanningSession],
-      });
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [spanningSession] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
 
       const timeRange = { startTime: '2026-04-04T00:00:00Z', endTime: '2026-04-05T23:59:59Z' };
       const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
 
       expect(result.sessions).toHaveLength(1);
       expect(result.sessions[0].sessionId).toBe('spanning-midnight');
+    });
+
+    // ENG-1332: the DynamoDB query above orders by updatedAt, not createdAt. A
+    // historical session that was merely touched (not created) during the
+    // window can have a more recent updatedAt than a session genuinely
+    // created in the window, so a naive updatedAt-DESC pass-through inverts
+    // priority — the historical session gets scored first and the real
+    // current-window session gets starved out.
+    it('prioritizes sessions created within the requested window over historical sessions merely touched within it', async () => {
+      const historicalTouched = {
+        sessionId: 'historical-touched',
+        adminListPartition: 'all',
+        createdAt: '2026-02-21T10:30:00.000Z',
+        updatedAt: '2026-08-18T13:59:00.000Z',
+        title: 'Old session touched recently',
+      };
+      const currentWindowSession = {
+        sessionId: 'current-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-17T15:00:00.000Z',
+        updatedAt: '2026-08-17T15:05:00.000Z',
+        title: 'Created in the requested window',
+      };
+
+      // DynamoDB returns updatedAt-DESC order: the historical one sorts first.
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [historicalTouched, currentWindowSession] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual([
+        'current-window',
+        'historical-touched',
+      ]);
+    });
+
+    it('sorts multiple in-window sessions by createdAt descending', async () => {
+      const older = {
+        sessionId: 'older-in-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-17T15:00:00.000Z',
+        updatedAt: '2026-08-17T15:05:00.000Z',
+      };
+      const newer = {
+        sessionId: 'newer-in-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T08:00:00.000Z',
+        updatedAt: '2026-08-18T08:01:00.000Z',
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [older, newer] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual([
+        'newer-in-window',
+        'older-in-window',
+      ]);
+    });
+
+    it('keeps in-window sessions ahead of historical ones when limit truncates the result', async () => {
+      const historical1 = {
+        sessionId: 'h1',
+        adminListPartition: 'all',
+        createdAt: '2026-02-01T00:00:00.000Z',
+        updatedAt: '2026-08-18T13:59:00.000Z',
+      };
+      const historical2 = {
+        sessionId: 'h2',
+        adminListPartition: 'all',
+        createdAt: '2026-03-01T00:00:00.000Z',
+        updatedAt: '2026-08-18T13:58:00.000Z',
+      };
+      const current = {
+        sessionId: 'c1',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T08:00:00.000Z',
+        updatedAt: '2026-08-18T08:05:00.000Z',
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [historical1, historical2, current] })
+        .mockResolvedValueOnce({ Items: [] }); // (endTime, now] gap query — ENG-1332 follow-up
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(2, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['c1', 'h1']);
+    });
+
+    // ENG-1332 follow-up: the primary query is keyed on updatedAt, so a session
+    // created in-window but not touched again until after the window closed
+    // (e.g. its final message landed a few seconds past endTime, or the window
+    // is being re-queried well after it closed) never matches the `updatedAt
+    // BETWEEN start AND end` condition at all — no amount of in-memory
+    // reordering can recover a session the primary query never fetched. A
+    // second, disjoint query over (endTime, now] closes that gap without a
+    // schema change, keeping only sessions whose createdAt genuinely falls in
+    // the requested range.
+    it('recovers a session created in-window but last updated after endTime via the gap query', async () => {
+      const lateTouch = {
+        sessionId: 'late-touch',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T13:50:00.000Z',
+        updatedAt: '2026-08-18T14:00:05.000Z', // 5s after endTime
+        title: 'Finished just past the window boundary',
+      };
+      // A session touched after endTime but created OUTSIDE the requested
+      // range must not be pulled in by the gap query.
+      const unrelatedLateTouch = {
+        sessionId: 'unrelated-late-touch',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T14:30:00.000Z',
+        updatedAt: '2026-08-18T14:35:00.000Z',
+        title: 'Created after the window closed',
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [] }) // primary [start, end] query: nothing
+        .mockResolvedValueOnce({ Items: [lateTouch, unrelatedLateTouch] }); // (end, now] gap query
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['late-touch']);
+      expect(queryPromiseMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not double-count a session at the exact endTime boundary returned by both the primary and gap query', async () => {
+      // DynamoDB's inclusive BETWEEN means a session with updatedAt === endTime
+      // legitimately matches both the primary [start, end] query and the gap
+      // query's [end, now] query — it must only appear once in the result.
+      const boundarySession = {
+        sessionId: 'boundary',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T13:00:00.000Z',
+        updatedAt: '2026-08-18T14:00:00.000Z', // exactly endTime
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [boundarySession] }) // primary query
+        .mockResolvedValueOnce({ Items: [boundarySession] }); // gap query (inclusive lower bound)
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['boundary']);
+    });
+
+    it('skips the gap query when endTime is already at or after now', async () => {
+      const currentWindowSession = {
+        sessionId: 'current-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T08:00:00.000Z',
+        updatedAt: '2026-08-18T08:05:00.000Z',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({ Items: [currentWindowSession] });
+
+      // endTime far in the future relative to "now" at test execution.
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2099-01-01T00:00:00.000Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['current-window']);
+      expect(queryPromiseMock).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-1332 (Greptile): [endTime, now] is unbounded — a stale window
+    // re-queried long after it closed could otherwise force the gap query to
+    // page through months of unrelated activity before filtering. Once enough
+    // in-range sessions have been found to fill `limit`, further gap pages
+    // can't change the final (truncated) result, so the loop must stop early.
+    it('stops paging the gap query once enough in-range sessions have been found to fill the limit', async () => {
+      const firstLateTouch = {
+        sessionId: 'late-touch-1',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T13:50:00.000Z',
+        updatedAt: '2026-08-18T14:00:05.000Z',
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [] }) // primary [start, end] query: nothing
+        .mockResolvedValueOnce({
+          Items: [firstLateTouch],
+          LastEvaluatedKey: { sessionId: 'late-touch-1' }, // more pages exist...
+        });
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(1, undefined, timeRange);
+
+      // ...but limit=1 is already satisfied, so the second gap page is never fetched.
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['late-touch-1']);
+      expect(queryPromiseMock).toHaveBeenCalledTimes(2);
+    });
+
+    // ENG-1332 (Greptile): a SPARSE stale range — few or no sessions actually
+    // created in it — never reaches `limit` no matter how many gap-query pages
+    // are scanned, so the inRangeCount<limit condition alone never stops the
+    // loop. A hard page cap must bound it independently.
+    it('stops paging the gap query at its page cap when a sparse range never fills the limit', async () => {
+      queryPromiseMock.mockResolvedValueOnce({ Items: [] }); // primary [start, end] query: nothing
+
+      const PAGE_CAP = 20;
+      for (let i = 0; i < PAGE_CAP; i++) {
+        queryPromiseMock.mockResolvedValueOnce({
+          // Out-of-range noise on every page: never satisfies inRangeCount.
+          Items: [
+            {
+              sessionId: `noise-${i}`,
+              adminListPartition: 'all',
+              createdAt: '2026-08-19T00:00:00.000Z', // after the requested window
+              updatedAt: '2026-08-18T15:00:00.000Z',
+            },
+          ],
+          LastEvaluatedKey: { sessionId: `noise-${i}` }, // always more pages available
+        });
+      }
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      // 1 primary page + PAGE_CAP gap pages, then stops even though the last
+      // gap page still reported a LastEvaluatedKey.
+      expect(queryPromiseMock).toHaveBeenCalledTimes(1 + PAGE_CAP);
+      expect(result.sessions).toEqual([]);
     });
 
   });

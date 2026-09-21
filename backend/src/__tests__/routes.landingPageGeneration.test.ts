@@ -51,8 +51,18 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLeadListsForUser = jest.fn();
 const mockCreateLeadList = jest.fn();
 const mockCanOrgMemberAccessList = jest.fn();
+// ENG-827: the publish route's last-moment consent re-check reads these two for real.
+const mockGetScheduleById = jest.fn();
+const mockGetChatSession = jest.fn();
+
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+}));
 
 jest.mock("../services/db", () => ({
+  scheduleDb: {
+    getScheduleById: (...args: any[]) => mockGetScheduleById(...args),
+  },
   userDb: {
     getUserById: mockGetUserById,
     setLandingSiteMode: jest.fn(async (_id: string, m: string) => m),
@@ -127,6 +137,9 @@ jest.mock("../services/v0Service", () => ({
   updateLandingPageMetaPixel: (...args: any[]) => mockUpdateLandingPageMetaPixel(...args),
   updateLandingPageMetaTrackingInstalled: (...args: any[]) => mockUpdateLandingPageMetaTrackingInstalled(...args),
   syncLeadCaptureFilesToRepo: (...args: any[]) => mockSyncLeadCaptureFilesToRepo(...args),
+  // Re-export the real constant: the route compares against it, and an object-literal mock
+  // would leave it undefined so the comparison could never match.
+  NO_CAPTURE_LAYER: "no-capture-layer",
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -174,6 +187,11 @@ jest.mock("../services/settingsService", () => ({
 const mockVerifyLanderLiveMapping = jest.fn();
 jest.mock("../services/landerLiveMappingCheck", () => ({
   verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
+}));
+
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock("../services/metaAccountCredentials", () => ({
+  assertOwnedMetaPixel: (...args: any[]) => mockAssertOwnedMetaPixel(...args),
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -492,6 +510,23 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 
+  it("FAIL CASE (ENG-967): a failed enabling write is reported, not returned as a clean 201", async () => {
+    // The write stays best-effort — a DB hiccup must not block generation — but handing back
+    // an unqualified success for a page whose form cannot save a lead is the silent drop again.
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValue({ id: "list-123", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-123" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("page-1");
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
+  });
+
   it("SUCCESS (ENG-449 capture-or-fail): lead_list_id omitted → auto-resolves the existing default list, generation proceeds bound to it", async () => {
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
@@ -723,6 +758,96 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
   });
 
+  describe("ENG-1141: meta_pixel_override", () => {
+    it("FAIL: meta_pixel_override missing pixelId → 400, generateLandingPage never called", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: meta_pixel_override missing accountId → 400", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: the pixel/account pair is not owned by the caller → 400, generateLandingPage never called", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      // assertOwnedMetaPixel tags genuine ownership rejections; anything untagged means
+      // "couldn't reach Meta to check", which must NOT block generation (test below).
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(
+        Object.assign(
+          new Error('Meta ad account "acc-1" is not one of your connected accounts.'),
+          { ownershipViolation: true },
+        )
+      );
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/not one of your connected accounts/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    // Verification needs a live Graph call, so Meta being down would otherwise turn "I picked
+    // a pixel" into "I can't create a landing page at all" — a far worse outcome than the
+    // pre-feature behavior, which shipped the page and resolved tracking normally.
+    it("SUCCESS: an unverifiable override (Meta unreachable) still generates, just without the override", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(new Error("ETIMEDOUT graph.facebook.com"));
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage).toHaveBeenCalled();
+      expect(mockGenerateLandingPage.mock.calls[0][6]?.metaPixelOverride).toBeUndefined();
+    });
+
+    it("SUCCESS: a valid, owned override is threaded through to generateLandingPage's opts.metaPixelOverride", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockResolvedValueOnce({ accountId: "resolved-acc-1" });
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockAssertOwnedMetaPixel).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "test-user-id" }), "test-user-id", "px-1", "acc-1"
+      );
+      expect(mockGenerateLandingPage.mock.calls[0][6]).toMatchObject({
+        metaPixelOverride: { pixelId: "px-1", accountId: "resolved-acc-1" },
+      });
+    });
+
+    it("SUCCESS: meta_pixel_override omitted → generateLandingPage's opts.metaPixelOverride is undefined, assertOwnedMetaPixel never called", async () => {
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage.mock.calls[0][6].metaPixelOverride).toBeUndefined();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
+  });
+
   it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
     mockedExtractOutline.mockReturnValue("");
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
@@ -880,10 +1005,35 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
   };
 
+  // jest's `clearMocks` only calls mockClear(), which does NOT drain queued
+  // `mockResolvedValueOnce` values. The refusal cases below deliberately stop before
+  // consuming theirs, so without an explicit reset those leftovers surface in a later
+  // test as a GitHub call that mysteriously returns the wrong thing. Reset on both
+  // sides so this block neither inherits nor exports axios state.
+  const resetGitHubStubs = () => {
+    mockAxios.get.mockReset();
+    mockAxios.post.mockReset();
+    mockAxios.patch.mockReset();
+    mockAxios.delete.mockReset();
+  };
+  beforeEach(resetGitHubStubs);
+  afterEach(resetGitHubStubs);
+
   const stubGitHubMergeFlow = () => {
-    // GET pre-merge main ref → POST /merges → DELETE branch ref
-    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
-    mockAxios.post.mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    // GET main ref → consent → GET draft ref → find/create PR → inspect Tests
+    // → re-read draft tip → consent → POST /merges → re-read before DELETE branch ref
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
     mockAxios.delete.mockResolvedValueOnce({ data: {} });
   };
 
@@ -924,6 +1074,561 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockResolveLandingPageLiveUrl).toHaveBeenCalledWith(
       expect.objectContaining({ vercelProjectId: "vercel-proj-123", userId: "test-user-id" })
     );
+  });
+
+  // ===========================================================================
+  // ENG-827 — consent is re-checked at the MERGE, not at the tool that asks for it.
+  //
+  // `publish_landing_page_changes` is gated at dispatch, but the merge that makes
+  // the page public happens here, on the far side of a self-call, after a secrets
+  // fetch and a GitHub read that is allowed 30s. These drive the REAL guard (only
+  // its two storage reads are mocked) so the scope binding and the fail-closed
+  // branches are exercised, not just the wiring.
+  //
+  // The assertion that matters in every case is the SIDE EFFECT — was main
+  // advanced? — because that is the part that cannot be undone.
+  // ===========================================================================
+  const SESSION_HEADER = "X-AgentWeb-Session";
+  const TOOL = "publish_landing_page_changes";
+
+  /** An unattended run admitted with consent for the landing publish tool. */
+  const authorizedRun = () => ({
+    sessionType: "scheduled",
+    pageIdentifier: `Weekly site refresh|scheduleId:3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21`,
+    publishAdmission: { authorized: true, tools: [TOOL] },
+  });
+
+  const expectNothingPublished = () => {
+    expect(mockAxios.post).not.toHaveBeenCalled();
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+  };
+
+  it("FAIL: consent revoked after the tool was admitted → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // The owner switched it off while the route was fetching the token and the SHA.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: false,
+      autopublishAuthorizedTools: [],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/not authorized to publish/i);
+    expectNothingPublished();
+    // Proves the check sits at the LAST moment rather than at the top of the route:
+    // the read work ahead of the merge still ran.
+    expect(mockAxios.get).toHaveBeenCalled();
+  });
+
+  it("FAIL: consent stands but not for THIS tool → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Granted for social posting only. A landing deploy is not what the owner approved.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ["post_on_connected_account"],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("FAIL: the run's session cannot be read → fails closed, main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    // Both the call and its one retry fail. An unconfirmed permission is withheld.
+    mockGetChatSession.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("SUCCESS: consent still held at the merge → the page publishes", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    // The gate must not become a blanket block on authorized runs.
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    // It really did consult live schedule state rather than trusting the admission.
+    expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21");
+  });
+
+  // The 409 fallback force-advances main instead of merging. It reaches that write
+  // through a FAILED merge and a second branch-tip read, each allowed 30s, so it
+  // needs its own re-check — the one before the standard merge is by then ~a minute
+  // stale. Same public outcome, so the same rule applies.
+  const stub409Fallback = () => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // initial draft ref
+      .mockResolvedValueOnce({ data: [] }) // no existing PR
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }) // branch tip after Tests
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip before delete
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockRejectedValueOnce({ response: { status: 409 } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+  };
+
+  const stubDraftCheck = (check: { status: string; conclusion: string | null }) => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [{ name: "Tests", ...check }] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+  };
+
+  it("FAIL: missing Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(res.body.message).toMatch(/Tests.*not started/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: pending Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "in_progress", conclusion: null });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: cancelled Tests result is retryable and preserves the draft", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "cancelled" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: failed Tests result preserves the draft and never advances main", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubDraftCheck({ status: "completed", conclusion: "failure" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_failed");
+    expect(res.body.message).toMatch(/Tests.*failed/i);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: passing Tests for the exact draft SHA permits the existing merge flow", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/commits/draft-tip-sha/check-runs"), expect.anything()
+    );
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL: a draft updated after Tests ran is neither merged nor deleted", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "tested-draft-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "newer-draft-sha" } } });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("draft_changed_after_tests");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockAxios.delete).not.toHaveBeenCalled();
+  });
+
+  // ENG-1839 follow-up. The required-Tests gate is correct for a repo that runs tests and
+  // UNSATISFIABLE for one that does not. Generated landing-page repos contain no
+  // .github/workflows, so no check named "Tests" could ever appear and publish returned 409
+  // required_tests_pending forever — its own message said "retry after GitHub starts it",
+  // which GitHub never would. That is one of the reasons a customer's rebuilt page could not
+  // be published at all.
+  it("publishes a repo that defines no workflows — no Tests check can ever exist", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported at all
+      .mockResolvedValueOnce({ data: { total_count: 0 } })   // ...and no workflows exist
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://x.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    // Both signals must have been consulted before skipping the gate.
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/check-runs"), expect.anything()
+    );
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("FAIL-CLOSED: an unreadable workflow list keeps the gate rather than skipping it", async () => {
+    // "Could not determine whether this repo has CI" must never be treated as "it has none".
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported
+      .mockRejectedValueOnce(new Error("GitHub 502"));       // workflow list unreadable
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL-CLOSED: a 200 with no total_count keeps the gate", async () => {
+    // The `?? 1` default IS the fail-closed guarantee, and mutation testing showed nothing
+    // pinned it — changing it to `?? 0` left the whole suite green. A proxy or a changed API
+    // shape returning 200 with an unexpected body must not be read as "this repo has no CI".
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })
+      .mockResolvedValueOnce({ data: {} }); // 200, but no total_count
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  // ENG-1856. The `checkRuns.length === 0` requirement this test used to pin was itself the
+  // bug: Vercel's own GitHub integration auto-deploys and posts a check run for ANY PR on a
+  // connected project, unconditionally, and this route always opens a PR as its first step —
+  // so `checkRuns.length` was never actually 0 on a real publish attempt, the workflow-count
+  // check never ran, and the gate blocked every single publish forever. Confirmed live: zero
+  // of a random sample of generated repos ever had a merged publish PR since this gate shipped.
+  it("skips the gate when a non-Tests check exists but the repo genuinely has zero workflows", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        // Vercel's bot check — present on every real publish attempt, unrelated to test execution.
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 0 } }) // no Actions workflow can ever run
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://x.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // The workflow count is now consulted whenever no "Tests" check reported, regardless of
+    // what ELSE has reported — that's the whole fix.
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("still blocks a repo that genuinely has an Actions workflow but no Tests check yet", async () => {
+    // The workflow-count check itself must still fail closed for a repo that DOES have real
+    // CI configured — this is what keeps the gate meaningful, not merely satisfiable.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 1 } }); // a real Actions workflow exists
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("keeps the gate for a check from an app that is NOT the known-benign allowlist", async () => {
+    // This is the narrower protection ENG-1856 preserves: only a check identified as Vercel's
+    // own app is filtered out. Any OTHER app's check — a real CI tool, or anything unexpected —
+    // still counts toward checkRuns.length and keeps the gate, never even asking about
+    // workflows. Filtering everything unconditionally was the wrong fix; this pins the boundary.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success", app: { slug: "buildkite" } }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(mockAxios.get).not.toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("still blocks a repo WITH CI whose Tests check has not completed", async () => {
+    // The gate must keep working where it was always meaningful.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "in_progress", conclusion: null }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: a duplicate PR creation response reuses the concurrently created PR", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ number: 456 }] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "completed", conclusion: "success" }] },
+      })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockRejectedValueOnce({ response: { status: 422, data: { message: "A pull request already exists" } } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.objectContaining({ head: "draft-tip-sha" }), expect.anything()
+    );
+  });
+
+  it("FAIL: an unrelated pull-request validation error is not retried as a duplicate", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] });
+    mockAxios.post.mockRejectedValueOnce({
+      response: { status: 422, data: { message: "Validation Failed: head repository is unavailable" } },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(500);
+    expect(mockAxios.get).toHaveBeenCalledTimes(3);
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Authorized when the merge was attempted; revoked by the time the fallback
+    // has looked up the branch tip.
+    mockGetScheduleById
+      .mockResolvedValueOnce({ autopublishAuthorized: true, autopublishAuthorizedTools: [TOOL] })
+      .mockResolvedValue({ autopublishAuthorized: false, autopublishAuthorizedTools: [] });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    // The force-update is the write that would have made the page public here.
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+    // It really did re-read rather than reusing the pre-merge decision.
+    expect(mockGetScheduleById).toHaveBeenCalledTimes(2);
+  });
+
+  it("SUCCESS: consent holds through the 409 fallback → main is force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+    mockAxios.patch.mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.merge_commit_sha).toBe("draft-tip-sha");
+    expect(mockAxios.patch).toHaveBeenCalled();
+  });
+
+  it("BOUNDARY: an interactive publish carries no session header → not gated, no consent read", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // A human clicking Publish must not pay for a session read, let alone be refused.
+    expect(mockGetChatSession).not.toHaveBeenCalled();
+    expect(mockGetScheduleById).not.toHaveBeenCalled();
   });
 });
 
@@ -1031,6 +1736,75 @@ describe("GET /api/landing-pages/v0/generated", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.pages[0].customDomainUrl).toBe("https://hireemma.ai");
+  });
+
+  it("FAIL: a half-configured custom domain must not hide a broken subdomain's warning", async () => {
+    // ENG-1839. The reachability sweep deliberately does not probe an unverified domain — a
+    // pending custom domain has no DNS yet, so failing it would be an expected failure
+    // reported as a fault. But `rank` preferred `type: "custom"` regardless of status, so a
+    // pending custom domain won, and the winning row could never carry a verdict. Result: a
+    // managed subdomain CONFIRMED unreachable went unreported for as long as a custom domain
+    // sat half-configured on the same project — the ticket's own "stops watching the broken
+    // thing" failure, moved from the write path to the read path. It also rewrote the page's
+    // URL from the working subdomain to a host with no DNS.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-sub", domain: "acme.agentwebforms.com", vercelProjectId: "proj-1",
+        type: "subdomain", status: "active", updatedAt: "2026-02-01T00:00:00Z",
+        reachabilityStatus: "unreachable",
+        reachabilityError: "The connection closed during the SSL handshake.",
+      },
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    // The warning must still reach the customer.
+    expect(page.domainStatus).toBe("error");
+    expect(page.domainErrorMessage).toMatch(/SSL handshake/i);
+    // ...and the reported URL must stay on the host that actually resolves.
+    expect(page.domainHost).toBe("acme.agentwebforms.com");
+    expect(page.customDomainUrl).toBe("https://acme.agentwebforms.com");
+  });
+
+  it("an unverified custom domain alone must not become the page's reported host", async () => {
+    /*
+     * ENG-1839. `rank` is a COMPARATOR, not a filter, and the winner is seeded
+     * unconditionally — so rank 0 means "loses a comparison", never "is rejected". With a
+     * pending custom domain as the project's only attached row there is nothing to lose to,
+     * so it was adopted anyway and the page reported a host with no DNS. Exactly the failure
+     * the three tiers exist to prevent, surviving in the one shape where ranking never runs.
+     *
+     * Production reaches this shape via `DELETE /api/domains/:id`, the page-subdomain cascade
+     * cleanup, and the detach/re-add window in this PR's own repair script.
+     */
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      {
+        id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1",
+        status: "deployed", deployedUrl: "https://lp-acme.vercel.app",
+      },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    expect(page.domainHost).toBeUndefined();
+    expect(page.customDomainUrl).toBeUndefined();
   });
 
   it("FAIL: org member viewing a shared page → enriched from the page OWNER's domains", async () => {
@@ -1192,6 +1966,24 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 // Rate Limiting
 // =============================================================================
 describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
+  it("FAIL (ENG-1238): an externally-imported record is rejected before any generation", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Imported",
+      status: "deployed",
+      sourceType: "external",
+      canonicalUrl: "https://example.com/page",
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(409);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: re-generates with org-aware brand context passed through", async () => {
     const orgBrand = {
       brandData: { brandName: "OrgBrand" },
@@ -1266,6 +2058,96 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     expect(res.status).toBe(201);
     expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  // ENG-967: /generate enables public access on the list it binds; duplicate bound one
+  // and stopped there, so the copy's form 403'd on every submission at forward-lead.
+  it("FAIL CASE (ENG-967): a carried-over private list is made publicly submittable before the copy is generated", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).toHaveBeenCalledWith("list-original", { publicAccessEnabled: true });
+  });
+
+  it("FAIL CASE (ENG-967): a carried-over list that no longer exists is reported, never treated as fine", async () => {
+    // Three such binds existed in production on 2026-08-21 — a page POSTing into a 404 at
+    // forward-lead. Nothing here can repair it (repointing is a judgement call), so it is said.
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-deleted",
+    });
+    mockGetLeadListById.mockResolvedValue(null);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+    expect(res.body.warnings).toEqual([expect.stringContaining("list-deleted")]);
+  });
+
+  it("FAIL CASE (ENG-967): a failed enabling write on the copy is reported, not a clean 201", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
+  });
+
+  it("SUCCESS (ENG-967): an already-public carried-over list is not re-written", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: true });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
   });
 });
 
@@ -1821,6 +2703,64 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
     expect(mockUpdateLandingPageMetaTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
     expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledTimes(2);
+  });
+
+  it("BESPOKE REPO: reports that server-side tracking was NOT configured instead of a clean success", async () => {
+    // The base pixel snippet still goes into the layout, but the CAPI half lives in the
+    // capture route — which the install floor refuses to write on a repo we do not own.
+    // Answering "Meta Pixel injected" here would claim tracking that does not exist.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toEqual([expect.stringContaining("server-side conversion tracking was not configured")]);
+    // ⚠ Not transient — it must not promise a retry or a redeploy.
+    expect(res.body.warnings[0]).not.toMatch(/retry|redeploy/i);
+  });
+
+  it("REMOVAL wording: says the pixel was 'removed', not 'updated'", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: false, reason: "no-capture-layer" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/browser pixel was removed/);
+  });
+
+  it("committed:true is NOT enough — a skipped capture route is still reported", async () => {
+    // The silent-partial `committed` alone cannot see: the commit landed, but the capture
+    // route was deliberately excluded because its deployed map could not be parsed.
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValueOnce({ committed: true, captureRouteSkipped: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings[0]).toMatch(/could not be read/);
   });
 
   it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {

@@ -40,11 +40,17 @@ async function metaAccessToken(): Promise<string> {
 export const metaAdReadPort: AdReadPort = {
   async listCampaigns(_userId: string, accountId: string) {
     const token = await metaAccessToken();
-    const campaigns = await metaService.listCampaigns(accountId, token);
-    return (campaigns ?? []).map((c: any) => ({
-      id: String(c.id),
-      name: c.name ?? "",
-    }));
+    // `truncated` is carried through rather than dropped: a bounded read means campaigns the
+    // audit never saw, so "all clean" would be a claim about an account it did not finish
+    // reading — the ENG-1584 sentence shape.
+    const { campaigns, truncated } = await metaService.listCampaigns(accountId, token);
+    return {
+      items: (campaigns ?? []).map((c: any) => ({
+        id: String(c.id),
+        name: c.name ?? "",
+      })),
+      truncated,
+    };
   },
 
   async listAdDestinations(_userId: string, accountId: string, campaignId: string) {
@@ -52,14 +58,18 @@ export const metaAdReadPort: AdReadPort = {
     // The campaignId is pushed down to Meta's `filtering` param so we do not refetch the whole
     // account's ads once per campaign. We ALSO filter here: if Meta ever ignores the filter, an
     // unfiltered response must not attribute another campaign's ads to this one.
-    const ads = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
-    return ads
-      .filter((ad) => ad.campaignId === campaignId)
-      .map((ad) => ({
-        adId: ad.adId,
-        destinationUrls: ad.destinationUrls,
-        appendField: ad.urlTags, // Meta `url_tags`, appended to every link at delivery.
-      }));
+    const { items: ads, truncated } = await metaService.listAdsForUtmAudit(accountId, token, campaignId);
+    return {
+      items: ads
+        .filter((ad) => ad.campaignId === campaignId)
+        .map((ad) => ({
+          adId: ad.adId,
+          destinationUrls: ad.destinationUrls,
+          appendField: ad.urlTags, // Meta `url_tags`, appended to every link at delivery.
+        })),
+      // A campaign whose ad list stopped at a bound cannot be reported as fully tagged.
+      truncated,
+    };
   },
 };
 
@@ -69,20 +79,34 @@ export const googleAdReadPort: AdReadPort = {
   async listCampaigns(userId: string, customerId: string) {
     // The campaign resource is authoritative: it includes campaigns with zero ads, which the
     // ad_group_ad query cannot see.
-    const campaigns = await googleAdsService.listCampaigns(userId, customerId);
-    return campaigns.map((c) => ({ id: String(c.id), name: c.name ?? "" }));
+    //
+    // `truncated` is reported for the same reason the Meta port reports it: googleAdsService's
+    // `search` stops at a 50-page cap and used to drop the remainder with no signal, so a
+    // capped read came back as a bare array indistinguishable from a complete one and the audit
+    // printed "✅ All N campaign(s) on google carry UTM tracking" about campaigns it never saw.
+    const completeness: { truncated?: boolean } = {};
+    const campaigns = await googleAdsService.listCampaigns(userId, customerId, completeness);
+    return {
+      items: campaigns.map((c) => ({ id: String(c.id), name: c.name ?? "" })),
+      truncated: completeness.truncated,
+    };
   },
 
   async listAdDestinations(userId: string, customerId: string, campaignId: string) {
-    const ads = await googleAdsService.listAdsForUtmAudit(userId, customerId, campaignId);
-    return ads
-      .filter((ad) => ad.campaignId === campaignId)
-      .map((ad) => ({
-        adId: ad.adId,
-        destinationUrls: ad.destinationUrls,
-        // Already resolved most-specific-wins (ad suffix REPLACES campaign suffix) by the service.
-        appendField: ad.appendField,
-      }));
+    const completeness: { truncated?: boolean } = {};
+    const ads = await googleAdsService.listAdsForUtmAudit(userId, customerId, campaignId, completeness);
+    return {
+      items: ads
+        .filter((ad) => ad.campaignId === campaignId)
+        .map((ad) => ({
+          adId: ad.adId,
+          destinationUrls: ad.destinationUrls,
+          // Already resolved most-specific-wins (ad suffix REPLACES campaign suffix) by the service.
+          appendField: ad.appendField,
+        })),
+      // A campaign whose ad read stopped at the page cap cannot be reported as fully tagged.
+      truncated: completeness.truncated,
+    };
   },
 };
 
@@ -152,6 +176,16 @@ async function linkedInAccessToken(userId: string, accountId: string): Promise<s
   return tokens.access_token;
 }
 
+/*
+ * The one port that returns bare arrays on purpose.
+ *
+ * Meta and Google both bound their reads (a page/max-page cap) and must therefore say when a
+ * result is partial. LinkedIn's `fetchAllPages` has NO cap — it follows `nextPageToken` until
+ * there is none — and a failed page aborts with an error instead of returning what it had. So
+ * a LinkedIn result that arrives here is complete by construction, and `readPortResult` reads
+ * a bare array as exactly that. Verified against `linkedInAdsService.fetchAllPages`; if a cap
+ * is ever added there, this port has to start reporting `truncated` with the others.
+ */
 export const linkedInAdReadPort: AdReadPort = {
   async listCampaigns(userId: string, accountId: string) {
     const token = await linkedInAccessToken(userId, accountId);

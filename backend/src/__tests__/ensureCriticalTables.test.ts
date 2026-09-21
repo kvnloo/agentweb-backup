@@ -35,6 +35,65 @@ describe('ensureCriticalTables', () => {
     expect(created.sort()).toEqual(CRITICAL_TABLE_SPECS.map((s) => s.TableName).sort());
   });
 
+  describe('deletion-protection reconcile on the money ledger', () => {
+    // A mock that models an EXISTING table (createTable -> ResourceInUseException)
+    // plus describe/update, so the already-exists reconcile path is exercised.
+    function existingLedgerDynamo(opts: { protected: boolean; canUpdate?: boolean }) {
+      const updated: string[] = [];
+      const client = {
+        createTable: jest.fn(() => ({
+          promise: async () => {
+            const err: any = new Error('exists');
+            err.code = 'ResourceInUseException';
+            throw err;
+          },
+        })),
+        describeTable: jest.fn((p: any) => ({
+          promise: async () => ({ Table: { TableName: p.TableName, DeletionProtectionEnabled: opts.protected } }),
+        })),
+        updateTable: jest.fn((p: any) => ({
+          promise: async () => {
+            if (opts.canUpdate === false) {
+              const err: any = new Error('denied');
+              err.code = 'AccessDeniedException';
+              throw err;
+            }
+            updated.push(p.TableName);
+            return {};
+          },
+        })),
+      };
+      return { client, updated };
+    }
+
+    it('enables protection on an existing unprotected ledger', async () => {
+      const { client, updated } = existingLedgerDynamo({ protected: false });
+      await ensureCriticalTables(client as any);
+      expect(updated).toContain('AW-SpendEvents');
+      const call = client.updateTable.mock.calls.find((c: any) => c[0].TableName === 'AW-SpendEvents');
+      expect(call).toBeDefined();
+      expect(call![0].DeletionProtectionEnabled).toBe(true);
+    });
+
+    it('does NOT write when protection is already on — describe-first, no churn', async () => {
+      const { client } = existingLedgerDynamo({ protected: true });
+      await ensureCriticalTables(client as any);
+      expect(client.updateTable).not.toHaveBeenCalled();
+    });
+
+    it('never throws when the role lacks UpdateTable — the flag is additive, startup must survive', async () => {
+      const { client } = existingLedgerDynamo({ protected: false, canUpdate: false });
+      await expect(ensureCriticalTables(client as any)).resolves.toBeUndefined();
+    });
+
+    it('only reconciles tables whose spec requests protection', async () => {
+      // The two money tables carry DeletionProtectionEnabled: the event ledger
+      // and the §3b projection. Both are authoritative and hard to rebuild.
+      const guarded = CRITICAL_TABLE_SPECS.filter((s) => (s as any).DeletionProtectionEnabled);
+      expect(guarded.map((s) => s.TableName).sort()).toEqual(['AW-SpendEvents', 'AW-SpendProjection']);
+    });
+  });
+
   it('is idempotent — swallows ResourceInUseException for existing tables', async () => {
     const allNames = CRITICAL_TABLE_SPECS.map((s) => s.TableName);
     const { client, created } = fakeDynamo(allNames);
@@ -68,6 +127,45 @@ describe('ensureCriticalTables', () => {
       'Dev-AW-LoopDispatches',
     ]));
     expect(names.some((n) => n.endsWith('AW-OnboardingMetrics'))).toBe(true);
+    expect(names.some((n) => n.endsWith('AW-LlmChargeEvents'))).toBe(true);
+  });
+
+  it('provisions AW-SpendEvents with the approved key shape, GSI, and no TTL', () => {
+    // ENG-1250: Harsha approved these exact parameters on 2026-09-03. A drift
+    // here is a data-plane change that never went back through the gate.
+    const se = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-SpendEvents'));
+    expect(se).toBeDefined();
+    expect(se!.KeySchema).toEqual([
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ]);
+    expect(se!.GlobalSecondaryIndexes).toEqual([
+      expect.objectContaining({
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+      }),
+    ]);
+    // No TTL was approved, and CreateTable cannot express one anyway — this
+    // asserts nobody later adds a TimeToLiveSpecification believing it does.
+    expect(Object.keys(se!)).not.toContain('TimeToLiveSpecification');
+    // The money ledger must be delete-protected (spec, and enabled live).
+    expect((se as any).DeletionProtectionEnabled).toBe(true);
+  });
+
+  it('provisions AW-SpendProjection keyed billingUserId+billingMonth, delete-protected, no TTL', () => {
+    const sp = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-SpendProjection'));
+    expect(sp).toBeDefined();
+    expect(sp!.KeySchema).toEqual([
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'billingMonth', KeyType: 'RANGE' },
+    ]);
+    expect((sp as any).DeletionProtectionEnabled).toBe(true);
+    expect(Object.keys(sp!)).not.toContain('TimeToLiveSpecification');
+    // Admission reads by exact key — no GSI needed, and none should creep in.
+    expect(sp!.GlobalSecondaryIndexes).toBeUndefined();
   });
 
   it('onboarding metrics spec carries the StepStartedAtIndex GSI', () => {

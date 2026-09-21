@@ -27,6 +27,19 @@ jest.mock('../utils/secretsManager', () => ({
 // compare against the last-synced snapshot. Mocked here so CSV-source tests
 // that don't care about stale-member sync don't hit the network.
 jest.mock('axios');
+
+/*
+ * ENG-941: activating an ad set now runs the launch tracking gate, which reaches Meta for
+ * the campaign's destinations and the account's pixels. This suite covers ENG-600 audience
+ * workflows, not the gate, and mocks neither — so without this the gate correctly fails
+ * closed ("could not verify") and blocks these launches. Gate behaviour has its own
+ * coverage in metaLaunchGate.test.ts, and the fact that it is reached from here is proven
+ * in metaLaunchGateWiring.test.ts.
+ */
+jest.mock('../services/metaLaunchGate', () => ({
+  ...jest.requireActual('../services/metaLaunchGate'),
+  runMetaTrackingGate: jest.fn().mockResolvedValue({ proceed: true }),
+}));
 jest.mock('../services/metaAudienceSnapshotStore', () => ({
   getAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(null),
   saveAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(undefined),
@@ -45,6 +58,22 @@ jest.mock('../utils/ssrfGuard', () => ({
 
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+
+/*
+ * ENG-941: the launch tracking gate resolves Meta credentials before it runs, and this
+ * suite (ENG-600 audience workflows) mocks neither that lookup nor the Graph reads behind
+ * it. Stub the credential resolution so these tests exercise the workflows they are about;
+ * the gate itself is covered in metaLaunchGate.test.ts and its wiring in
+ * metaLaunchGateWiring.test.ts.
+ */
+beforeEach(() => {
+  jest
+    .spyOn(AgentModeService.prototype as any, 'getMetaCredentials')
+    .mockResolvedValue({ accountId: 'act-test', accessToken: 'tok-test' });
+});
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from '../services/metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../services/metaAudienceCampaignTokenStore';
 import { assertPublicHostname, resolvePinnedPublicAddress } from '../utils/ssrfGuard';
@@ -885,6 +914,32 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // failed-release retries also made a genuinely completed launch's
       // token replayable after the staleness window.
       expect(markPreviewTokenSucceeded).toHaveBeenCalledWith(USER_ID, expect.any(String));
+    });
+
+    // ENG-1300: createMetaAdsAdSet already returns `code` on failure (fixed
+    // separately), but executeAudienceCampaignLaunch rethrows a plain Error when
+    // it sees success:false — proving that code survives THIS extra rethrow to
+    // launchAudienceCampaign's own catch, not just createMetaAdsAdSet's own.
+    it('ENG-1300: a coded ad-set-creation failure classifies as auth/config end-to-end', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create',
+        audience: { id: 'aud_seed_1', name: 'RankAI Warm List' },
+        created: true,
+        sourceSummary: 'CSV upload (https://s3.example.com/audience.csv)',
+        failures: [],
+      });
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: false, message: 'Insufficient permission to create ad set', code: 403,
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     // Greptile finding: releasing the confirm token on a downstream failure

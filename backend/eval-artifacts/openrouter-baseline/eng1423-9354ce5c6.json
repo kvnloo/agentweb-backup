@@ -1,0 +1,297 @@
+{
+  "schemaVersion": 1,
+  "revision": "9354ce5c6",
+  "generatedAt": "2026-08-20T22:43:39.506Z",
+  "source": "executable synthetic fixtures + explicit logical model + OpenRouter generation detail",
+  "artifacts": [
+    {
+      "fixtureId": "eng1423-interactive-chat-v1",
+      "taskClass": "interactive_chat",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic interactive chat request: reply exactly BASELINE_OK.",
+      "behavioralContract": "The assistant returns exactly BASELINE_OK and performs no external action.",
+      "requirements": {
+        "tools": false,
+        "streaming": false,
+        "structuredOutput": false
+      },
+      "usage": {
+        "inputTokens": 24,
+        "outputTokens": 5,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 7,
+      "recordedCostUsd": 0.0000068,
+      "costSource": "provider_reported",
+      "latencyMs": 1425,
+      "requestLatencyMs": 3295,
+      "providerName": "Phala",
+      "finishReason": "stop",
+      "output": "BASELINE_OK",
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Provider/auth/rate-limit/timeout failures surface as errors; the fixture does not substitute a provider.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-interactive-chat-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:42:23.165Z",
+      "generationId": "gen-1787265740-hTs11fn1plARv0KOXUki",
+      "generationTimeMs": 2088,
+      "nativeFinishReason": "stop"
+    },
+    {
+      "fixtureId": "eng1423-scheduled-background-v1",
+      "taskClass": "scheduled_background",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic scheduled/background request: reply exactly BASELINE_OK.",
+      "behavioralContract": "The assistant returns exactly BASELINE_OK and performs no external action.",
+      "requirements": {
+        "tools": false,
+        "streaming": false,
+        "structuredOutput": false
+      },
+      "usage": {
+        "inputTokens": 24,
+        "outputTokens": 5,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 2,
+      "recordedCostUsd": 0.000002469,
+      "costSource": "provider_reported",
+      "latencyMs": 710,
+      "requestLatencyMs": 2138,
+      "providerName": "DigitalOcean",
+      "finishReason": "stop",
+      "output": "BASELINE_OK",
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Provider/auth/rate-limit/timeout failures surface as errors; the fixture does not substitute a provider.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-scheduled-background-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:42:34.105Z",
+      "generationId": "gen-1787265752-lKgZdsnEfkdi9E483KlS",
+      "generationTimeMs": 1228,
+      "nativeFinishReason": "stop"
+    },
+    {
+      "fixtureId": "eng1423-content-generation-v1",
+      "taskClass": "content_generation",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic content generation request for a deterministic JSON status object.",
+      "behavioralContract": "The assistant returns JSON with status=BASELINE_OK and fixtureId=eng1423-content-generation-v1.",
+      "requirements": {
+        "tools": false,
+        "streaming": false,
+        "structuredOutput": true
+      },
+      "usage": {
+        "inputTokens": 39,
+        "outputTokens": 21,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 6,
+      "recordedCostUsd": 0.000006176,
+      "costSource": "provider_reported",
+      "latencyMs": 601,
+      "requestLatencyMs": 2541,
+      "providerName": "DigitalOcean",
+      "finishReason": "stop",
+      "output": "{\"status\":\"BASELINE_OK\",\"fixtureId\":\"eng1423-content-generation-v1\"}",
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Malformed JSON or missing/wrong typed fields fail closed; no silent text fallback is accepted.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-content-generation-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:42:44.253Z",
+      "generationId": "gen-1787265762-uvCPVN82vc82aAYECvFl",
+      "generationTimeMs": 1498,
+      "nativeFinishReason": "stop"
+    },
+    {
+      "fixtureId": "eng1423-mcp-api-v1",
+      "taskClass": "mcp_api",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic MCP/API request requiring the inert baseline_echo tool.",
+      "behavioralContract": "The assistant calls baseline_echo once with fixtureId=eng1423-mcp-api-v1; the tool is never executed.",
+      "requirements": {
+        "tools": true,
+        "streaming": false,
+        "structuredOutput": false
+      },
+      "usage": {
+        "inputTokens": 338,
+        "outputTokens": 55,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 40,
+      "recordedCostUsd": 0.00004032,
+      "costSource": "provider_reported",
+      "latencyMs": 1096,
+      "requestLatencyMs": 2245,
+      "providerName": "DeepInfra",
+      "finishReason": "tool_calls",
+      "output": [
+        {
+          "type": "function",
+          "index": 0,
+          "id": "chatcmpl-tool-96042c5d67993d69",
+          "function": {
+            "name": "baseline_echo",
+            "arguments": "{\"fixtureId\": \"eng1423-mcp-api-v1\"}"
+          }
+        }
+      ],
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Missing/malformed tool calls fail the fixture; no tool or provider fallback is performed.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-mcp-api-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:42:57.281Z",
+      "generationId": "gen-1787265775-MuNSlwEKl4WoA4Zcoi1v",
+      "generationTimeMs": 1403,
+      "nativeFinishReason": "tool_calls"
+    },
+    {
+      "fixtureId": "eng1423-agent-engine-v1",
+      "taskClass": "agent_engine",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic agent-engine request requiring the inert baseline_echo tool.",
+      "behavioralContract": "The assistant calls baseline_echo once with fixtureId=eng1423-agent-engine-v1; the tool is never executed.",
+      "requirements": {
+        "tools": true,
+        "streaming": false,
+        "structuredOutput": false
+      },
+      "usage": {
+        "inputTokens": 336,
+        "outputTokens": 54,
+        "cacheReadTokens": 256,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 22,
+      "recordedCostUsd": 0.000021528,
+      "costSource": "provider_reported",
+      "latencyMs": 714,
+      "requestLatencyMs": 1886,
+      "providerName": "DeepInfra",
+      "finishReason": "tool_calls",
+      "output": [
+        {
+          "type": "function",
+          "index": 0,
+          "id": "chatcmpl-tool-95cd435cbcfab781",
+          "function": {
+            "name": "baseline_echo",
+            "arguments": "{\"fixtureId\": \"eng1423-agent-engine-v1\"}"
+          }
+        }
+      ],
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Missing/malformed tool calls fail the fixture; no tool or provider fallback is performed.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-agent-engine-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:43:09.679Z",
+      "generationId": "gen-1787265788-I54SAqSzpxuuOmzoBfEd",
+      "generationTimeMs": 1125,
+      "nativeFinishReason": "tool_calls"
+    },
+    {
+      "fixtureId": "eng1423-coding-agent-v1",
+      "taskClass": "coding_agent",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic coding-agent request requiring the inert baseline_echo tool.",
+      "behavioralContract": "The assistant calls baseline_echo once with fixtureId=eng1423-coding-agent-v1; the tool is never executed.",
+      "requirements": {
+        "tools": true,
+        "streaming": false,
+        "structuredOutput": false
+      },
+      "usage": {
+        "inputTokens": 336,
+        "outputTokens": 54,
+        "cacheReadTokens": 256,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 22,
+      "recordedCostUsd": 0.000021528,
+      "costSource": "provider_reported",
+      "latencyMs": 640,
+      "requestLatencyMs": 1716,
+      "providerName": "DeepInfra",
+      "finishReason": "tool_calls",
+      "output": [
+        {
+          "type": "function",
+          "index": 0,
+          "id": "chatcmpl-tool-bb8320bce7faacca",
+          "function": {
+            "name": "baseline_echo",
+            "arguments": "{\"fixtureId\": \"eng1423-coding-agent-v1\"}"
+          }
+        }
+      ],
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Missing/malformed tool calls fail the fixture; no tool or provider fallback is performed.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-coding-agent-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:43:18.546Z",
+      "generationId": "gen-1787265796-LSlon5fgIfYd0BirvRU6",
+      "generationTimeMs": 959,
+      "nativeFinishReason": "tool_calls"
+    },
+    {
+      "fixtureId": "eng1423-nonstandard-consumer-v1",
+      "taskClass": "nonstandard_consumer",
+      "incumbentLogicalModel": "openrouter/deepseek/deepseek-v4-flash",
+      "upstreamModelId": "deepseek/deepseek-v4-flash-20260423",
+      "representativeInput": "Synthetic judge/dedup consumer request for a deterministic JSON status object.",
+      "behavioralContract": "The assistant returns JSON with status=BASELINE_OK and fixtureId=eng1423-nonstandard-consumer-v1.",
+      "requirements": {
+        "tools": false,
+        "streaming": false,
+        "structuredOutput": true
+      },
+      "usage": {
+        "inputTokens": 65,
+        "outputTokens": 85,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "recordedCostMicroUsd": 33,
+      "recordedCostUsd": 0.0000329,
+      "costSource": "provider_reported",
+      "latencyMs": 794,
+      "requestLatencyMs": 1952,
+      "providerName": "Novita",
+      "finishReason": "stop",
+      "output": "{\"status\":\"BASELINE_OK\",\"fixtureId\":\"eng1423-nonstandard-consumer-v1\"}",
+      "behavioralVerdict": "passed",
+      "failureSemantics": "Malformed JSON or missing/wrong typed fields fail closed; no silent text fallback is accepted.",
+      "okareo": {
+        "status": "executable_fixture_ready",
+        "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-nonstandard-consumer-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
+      },
+      "observedAt": "2026-08-20T22:43:29.587Z",
+      "generationId": "gen-1787265807-Z5ksvfbvIjNLduhoOZak",
+      "generationTimeMs": 1485,
+      "nativeFinishReason": "stop"
+    }
+  ]
+}

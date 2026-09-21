@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { getWebflowConfig, getWordPressConfig } from '../controllers/blog';
 import { getSecret } from '../utils/secretsManager';
+import { PublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 
 export type BlogPublishStatus = 'draft' | 'published';
 
@@ -19,7 +20,25 @@ export type BlogPublishInput = {
 export type BlogPublishContext = {
   userId: string;
   sessionId: string;
+  /**
+   * ENG-827 (Greptile, security): re-read live publish consent immediately before the
+   * CMS write. Everything above this layer — the article fetch, the Payload probe, the
+   * user lookup, each publisher's own secrets fetch — is network work that runs on a
+   * decision taken before it started. The HTTP write below is where the article becomes
+   * public, and there is no layer under it, so this is where the check belongs and
+   * where threading it stops.
+   */
+  assertStillAuthorized?: () => Promise<{ error: string } | null>;
 };
+
+/** Throws if consent was withdrawn while the layers above were doing their work. */
+async function assertConsentAtCmsWrite(ctx: BlogPublishContext | undefined, publisherId: string): Promise<void> {
+  const withdrawn = await ctx?.assertStillAuthorized?.();
+  if (withdrawn) {
+    console.warn(`[${publisherId}] ENG-827: abandoning CMS publish — consent was withdrawn before the write.`);
+    throw new PublishConsentWithdrawn(withdrawn.error);
+  }
+}
 
 export interface BlogPublisher {
   id: 'payload' | 'webflow' | 'wordpress' | 'basehub';
@@ -82,7 +101,7 @@ export class PayloadBlogPublisher implements BlogPublisher {
     return Boolean(await getPayloadConfig());
   }
 
-  async publish(input: BlogPublishInput): Promise<any> {
+  async publish(input: BlogPublishInput, ctx?: BlogPublishContext): Promise<any> {
     const config = await getPayloadConfig();
     if (!config) {
       return {
@@ -91,6 +110,8 @@ export class PayloadBlogPublisher implements BlogPublisher {
         error: 'Payload CMS not configured',
       };
     }
+
+    await assertConsentAtCmsWrite(ctx, 'PayloadBlogPublisher');
 
     const payloadResponse = await axios.post(
       config.endpoint,
@@ -271,6 +292,8 @@ export class WebflowBlogPublisher implements BlogPublisher {
     console.log(`AgentMode: Publishing to Webflow ${input.status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
     try {
+      await assertConsentAtCmsWrite(ctx, 'WebflowBlogPublisher');
+
       const response = await axios.post(
         endpoint,
         cmsItemData,
@@ -355,6 +378,10 @@ export class WebflowBlogPublisher implements BlogPublisher {
         error: 'Webflow API validation error',
         availableCategories: errorInfo.availableCategories || [],
         repairSuggested: errorInfo.repairSuggested || false,
+        // ENG-1300: errorInfo.status (webflowError.response?.status) was already
+        // computed above but never surfaced — return it so a 401/403 classifies
+        // as auth/config instead of the generic bug fallback.
+        code: errorInfo.status,
       };
     }
   }
@@ -383,6 +410,8 @@ export class WordPressBlogPublisher implements BlogPublisher {
         const contentType = imgResponse.headers['content-type'] || 'image/png';
         const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
         const filename = `blog-hero-${Date.now()}.${ext}`;
+
+        await assertConsentAtCmsWrite(ctx, 'WordPressBlogPublisher');
 
         const mediaResponse = await axios.post(
           `${wpConfig.siteUrl}/wp-json/wp/v2/media`,
@@ -435,6 +464,8 @@ export class WordPressBlogPublisher implements BlogPublisher {
     console.log(`AgentMode: Publishing to WordPress as ${wpStatus}...`);
 
     try {
+      await assertConsentAtCmsWrite(ctx, 'WordPressBlogPublisher');
+
       const response = await axios.post(
         `${wpConfig.siteUrl}/wp-json/wp/v2/posts`,
         postData,
@@ -484,6 +515,10 @@ export class WordPressBlogPublisher implements BlogPublisher {
         message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
         error: 'WordPress API error',
         availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : [],
+        // ENG-1300: errorInfo.status (wpError.response?.status) was already computed
+        // above but never surfaced. Deliberately NOT errorInfo.code — that's
+        // WordPress's own error slug (e.g. "rest_post_invalid_id"), not an HTTP status.
+        code: errorInfo.status,
       };
     }
   }
@@ -511,7 +546,7 @@ export async function publishWithResolvedBlogPublisher(
 ): Promise<any> {
   const payloadPublisher = new PayloadBlogPublisher();
   if (await payloadPublisher.canPublish()) {
-    return payloadPublisher.publish(input);
+    return payloadPublisher.publish(input, ctx);
   }
 
   const { userDb } = await import('./db');

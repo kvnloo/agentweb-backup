@@ -1,11 +1,24 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
+import { invalidateCachedPixels } from './metaPixelsCache';
+import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
 // Type Definitions
 // ============================================
 
 export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
+
+/**
+ * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
+ * social-posting-capable. Single source of truth for that allowlist: it used to be
+ * duplicated between `agentModeService.postOnConnectedAccount` and the scheduled
+ * publish consent guard's `resolveAccountPlatform`, both narrowing an account_id
+ * lookup to these platforms before matching — a drift between the two copies would
+ * silently break account resolution for the missing platform on one side, with no
+ * test or runtime signal to catch it.
+ */
+export const SOCIAL_POSTING_PLATFORMS: readonly PlatformType[] = ['twitter', 'linkedin', 'instagram', 'youtube'];
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -63,6 +76,42 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Self-reported daily LinkedIn connection-request ceiling (linkedInWritePacer.ts).
+   * Set directly by the user in Settings, or by Emma via the linkedin_outreach
+   * `set-daily-invite-cap` action after asking whether the account has LinkedIn
+   * Premium. Deliberately NOT auto-detected — see the pacer's module doc comment.
+   * Unset defaults to the conservative free-tier number; the pacer clamps any
+   * value to its own absolute system-wide ceiling regardless of what's stored here.
+   */
+  daily_invite_cap?: number;
+  /**
+   * Durable daily-volume counters (linkedInWritePacer.ts). Persisted here —
+   * not in process memory — specifically so a backend restart (which happens
+   * on every merge to `main`) can't reset an account's daily send count to
+   * zero mid-day. Written by the pacer's caller, never read/written directly
+   * anywhere else.
+   */
+  daily_volume?: DailyVolumeState;
+  /**
+   * Persisted session health (ENG-1197).
+   *
+   * Unipile owns this session's lifecycle, so `token_expires_at` is a sentinel and
+   * says nothing about liveness — only a live probe does. That probe's result used
+   * to live exclusively in an in-process 10-minute Map, which meant the moment a
+   * session died was observed and then thrown away: no stored state, therefore no
+   * connected→disconnected TRANSITION, therefore nothing an alert could key on. A
+   * daily scheduled run rediscovered it hours later and silently no-opped.
+   *
+   * Storing it turns a level ("is dead right now", true on every one of the 288
+   * daily poll cycles) into an edge ("just died"), which is the only thing safe to
+   * notify a customer about. `disconnect_notified_at` then paces the reminder for a
+   * session that stays dead for weeks.
+   */
+  needs_reconnect?: boolean;     // set when a probe proves the session dead; cleared on reconnect
+  disconnected_at?: string;      // ISO — when the disconnect was first observed
+  last_verified_at?: string;     // ISO — last time a probe proved the session live
+  disconnect_notified_at?: string; // ISO — last owner notification, for reminder pacing
 }
 
 /**
@@ -252,12 +301,35 @@ export interface AttioConfig extends BaseOAuthConfig {
   account_type: 'oauth';
   workspace_id: string;
   workspace_name: string;
+  // Set after a real-time webhook subscription is registered against this
+  // workspace (POST /v2/webhooks — Attio's model is per-workspace, unlike
+  // HubSpot's single app-wide subscription list). `webhook_signing_key` is
+  // the secret Attio returns at creation time — it's shown only once and
+  // must be persisted immediately for HMAC verification of inbound events.
+  webhook_id?: string;
+  webhook_signing_key?: string;
+  // Set when webhook registration fails with 403 (missing webhook:read-write
+  // scope on this token — e.g. connected before the scope was added to the
+  // app). Cleared on reconnect, same pattern as TwitterXConfig/CalendlyConfig.
+  needs_reconnect?: boolean;
 }
 
 export interface GoogleAdsConfig extends BaseOAuthConfig {
   account_type: 'google_ads';
   customer_id: string;
   currency: string;
+  /**
+   * ENG-1362. Google's `test_account` flag, captured at connect time.
+   *
+   * `true` is Google's guarantee that the account cannot serve ads and cannot spend.
+   * `false` means real money. **Absent** means the account was connected before this was
+   * recorded — which must be read as billable, never as safe, and is resolved live by
+   * `googleAdsService.isTestAccount`.
+   *
+   * Stored because the account NAME carries no such guarantee: a real, billable, ENABLED
+   * account descriptively named "Test" is exactly the case this field disambiguates.
+   */
+  test_account?: boolean;
   /**
    * The manager (MCC) account id to send as `login-customer-id` on every Google Ads
    * API call for this account. Set when the account is a leaf reached through a manager
@@ -312,6 +384,20 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // persisted here so every later delivery reuses it directly — see
   // resolveOrCreateBookingList in calendlyWebhook.ts.
   booking_lead_list_id?: string;
+  // ENG-1141: which Meta pixel/ad account CAPI attribution uses for this connection's
+  // bookings. Unlike landing pages (per-generation choice, no stored default — a human
+  // is present at creation time), a booking webhook is unattended, so this has to be
+  // settable once and reused — see resolveMetaPixelWithDefault in metaService.ts, which
+  // falls back to the caller's first connected account/first pixel when unset.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  // ENG-1141: an explicit "don't wire Meta up at all" choice. Distinct from simply leaving
+  // the pair unset, which means "auto-resolve to my first account/pixel" — a customer who
+  // connected Calendly purely for scheduling has no way to express "no Meta attribution"
+  // otherwise, and would silently get CAPI Schedule events fired against whichever ad
+  // account happened to be first. When true, the booking is still created and CRM-forwarded
+  // exactly as before; only the CAPI leg is skipped.
+  attributionDisabled?: boolean;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
@@ -414,6 +500,12 @@ export const createAccount = async (
     connected_accounts: updatedAccounts,
   } as Partial<User>);
 
+  // ENG-1141: which pixels exist for this user just changed. Without this, connecting a
+  // Meta account and immediately opening the create dialog would read a cached "no pixels"
+  // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
+  // page. See services/metaPixelsCache.ts.
+  invalidateCachedPixels(userId);
+
   return accountConfig;
 };
 
@@ -440,7 +532,19 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
  *
  * Own accounts are always returned (ownerUserId === callerUserId). Other
  * members' accounts are included only when sharedWithOrg === true.
- * Deduplication is by account_id — the caller's own account wins on conflict.
+ * Deduplication is by platform + account_id — the caller's own account wins on
+ * conflict.
+ *
+ * Platform is part of the key because account_id alone does not identify an
+ * account: one Google account connected for both Gmail and Drive carries the
+ * same address on both rows. Keying on the id alone dropped whichever of the
+ * two came second, and dropped a teammate's shared account entirely if the
+ * caller happened to hold any account at the same id on any platform. For a
+ * mailbox that is not cosmetic — losing the Gmail row makes it unresolvable
+ * again, which is ENG-943's symptom reached by another route, and one the
+ * resolver's own "prefer the email platform" guard cannot catch because the row
+ * never arrives. Own accounts were never deduped at all, so consumers already
+ * handle one address appearing on two platforms.
  */
 export const getAccountsWithOwnerIncludingOrgShared = async (
   callerUserId: string
@@ -461,15 +565,21 @@ export const getAccountsWithOwnerIncludingOrgShared = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  const seen = new Set(ownAccounts.map(a => a.account_id));
+  // platform + account_id, not account_id alone — see the note above. The
+  // separator is written as an escape and never as a literal control character:
+  // a raw NUL in the source makes git and grep treat this entire file as
+  // binary, which silently costs every diff and review of it.
+  const identity = (account: { platform: string; account_id: string }) =>
+    `${account.platform}\u0000${account.account_id}`;
+  const seen = new Set(ownAccounts.map(identity));
   const sharedAccounts: ConnectedAccountWithUser[] = [];
 
   for (const member of members) {
     if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
     for (const account of memberAccounts) {
-      if (account.sharedWithOrg && !seen.has(account.account_id)) {
-        seen.add(account.account_id);
+      if (account.sharedWithOrg && !seen.has(identity(account))) {
+        seen.add(identity(account));
         sharedAccounts.push({ ...account, userId: member.userId });
       }
     }
@@ -607,42 +717,162 @@ export const updateAccountTokens = async (
  * Update arbitrary config fields on a connected account.
  * Used to store webhook_id, webhook_url, etc. after initial creation.
  */
+/**
+ * Config keys to REMOVE outright, applied after the merge.
+ *
+ * A plain merge can only ever add or overwrite, so a field that records a
+ * past observation — `ads_scope_revoked_at`, say — has no way to be retracted
+ * once it is wrong. Setting it to `undefined` is not equivalent: the key
+ * survives the spread and its removal would then depend on marshalling
+ * behaviour rather than on anything stated here. Deleting is explicit.
+ */
+export interface UpdateAccountConfigOptions {
+  unset?: string[];
+}
+
+/**
+ * Either a fixed set of fields to merge (the common case — the value doesn't
+ * depend on what's currently stored), or a function of the freshly-read
+ * config that returns the merge for THIS attempt (for a caller whose update is
+ * *derived* from current state — narrowing a scope list, defaulting a
+ * timestamp only if unset).
+ *
+ * The function form exists because the CAS retry below re-reads on conflict
+ * but, with a fixed object, would reapply the SAME pre-computed values against
+ * the fresh read — silently correct only when the update doesn't depend on
+ * what it's overwriting. For a derived update that's a real bug: two writers
+ * racing on one account's capability fields (a sweep's revocation and a
+ * concurrent recovery) could have the loser's stale-derived write clobber the
+ * winner's fresh state on retry, reversing whichever transition arrived
+ * second. The function form re-derives every attempt, closing that gap.
+ */
+export type AccountConfigMutation =
+  | Record<string, any>
+  | ((freshConfig: Record<string, any>) => {
+      updates: Record<string, any>;
+      unset?: string[];
+      /** Return without writing when the fresh state declines the mutation. */
+      skip?: boolean;
+    });
+
+/**
+ * How many times `updateAccountConfig` retries a write that collided with an
+ * in-flight DynamoDB transaction on the same user item, and how long it waits.
+ *
+ * ENG-1873. `TransactionConflictException` means another request holds a
+ * transaction on this item right now — on the users table that is, in practice,
+ * `applyMonthlyChargeAtomic`, which `tokenUsageService` runs for each LLM
+ * completion. A tool call executes the moment its completion returns, often
+ * while that completion's charge transaction is still committing, so the tool's
+ * config write lost the race and was treated as fatal. AWS documents the error
+ * as transient; `paymentHistoryDb` and `usageRecordDb` already classify it so.
+ *
+ * Kept separate from the CAS attempt budget below so it cannot change when a
+ * genuine concurrent overwrite gives up with `ConnectedAccountChanged`.
+ */
+export const TRANSACTION_CONFLICT_RETRIES = 4;
+export const transactionConflictBackoffMs = (retry: number): number =>
+  25 * 2 ** retry + Math.floor(Math.random() * 25);
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
   accountId: string,
-  configUpdates: Record<string, any>
+  configUpdates: AccountConfigMutation,
+  options?: UpdateAccountConfigOptions
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error('User not found');
-  }
+  // Compare-and-swap, mirroring updateAccountTokens. The User model forces a
+  // whole-list write, so a plain read-modify-write silently discards anything
+  // another writer changed in between — a token the refresh cron had just
+  // renewed, or a capability marker a concurrent sweep had just set. Conditioning
+  // the write on the list we actually read turns that clobber into a retry.
+  //
+  // Unlike the token path this re-applies the merge rather than failing closed:
+  // this function's contract is "merge these fields into whatever is current",
+  // so a fresh read followed by the same merge is exactly the right answer —
+  // provided the merge itself is recomputed from that fresh read when it needs
+  // to be (see AccountConfigMutation above).
+  let casAttempts = 0;
+  let transactionConflictRetries = 0;
+  for (;;) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
 
-  const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accounts.findIndex(
-    acc => acc.platform === platform && acc.account_id === accountId
-  );
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accounts.findIndex(
+      acc => acc.platform === platform && acc.account_id === accountId
+    );
 
-  if (accountIndex < 0) {
-    throw new Error(`No ${platform} account with id "${accountId}" connected`);
-  }
+    if (accountIndex < 0) {
+      throw new Error(`No ${platform} account with id "${accountId}" connected`);
+    }
 
-  const existingAccount = accounts[accountIndex];
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: {
+    const existingAccount = accounts[accountIndex];
+
+    const isDerived = typeof configUpdates === 'function';
+    const mutation = isDerived
+      ? configUpdates(existingAccount.config || {})
+      : { updates: configUpdates, unset: options?.unset };
+    if (mutation.skip) return;
+    const { updates, unset } = mutation;
+
+    const mergedConfig: Record<string, any> = {
       ...existingAccount.config,
-      ...configUpdates,
-    },
-    updated_at: new Date().toISOString(),
-  };
+      ...updates,
+    };
+    for (const key of unset || []) {
+      delete mergedConfig[key];
+    }
 
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: mergedConfig as ConnectedAccountConfig['config'],
+      updated_at: new Date().toISOString(),
+    };
 
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      // ENG-1873: an in-flight transaction on this item (see
+      // TRANSACTION_CONFLICT_RETRIES). Back off briefly, then re-read and
+      // re-apply exactly as the CAS path does — the merge is recomputed from the
+      // fresh read, so a retry can never write a stale snapshot.
+      if (
+        error?.code === 'TransactionConflictException'
+        && transactionConflictRetries < TRANSACTION_CONFLICT_RETRIES
+      ) {
+        transactionConflictRetries++;
+        await sleep(transactionConflictBackoffMs(transactionConflictRetries));
+        continue;
+      }
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      casAttempts++;
+      if (casAttempts >= 3) {
+        throw Object.assign(
+          new Error(`Connected account "${accountId}" changed while updating its config; retry`),
+          { code: 'ConnectedAccountChanged' },
+        );
+      }
+      // Loop: re-read and re-apply the merge onto whatever is now current.
+    }
+  }
 };
 
 /**
@@ -668,6 +898,9 @@ export const deleteAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: a disconnect must not leave that account's pixels listed in the picker.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -697,6 +930,10 @@ export const deleteAccountById = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: same as deleteAccount — a disconnected account's pixels must stop being
+  // offered immediately, not a TTL later.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -843,6 +1080,50 @@ export const getAccountsByCalendlyUserUri = async (
     return matches;
   } catch (error) {
     console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
+  }
+};
+
+/**
+ * Find the user (and the specific connected account) that owns a given Attio
+ * workspace_id. Used by the incoming Attio webhook to resolve which tenant(s)
+ * a delivery belongs to.
+ *
+ * Returns every match, not a single best-guess userId, following the same
+ * ENG-994 lesson `getAccountsByCalendlyUserUri` already documents above:
+ * two tenants could in principle connect the same underlying Attio workspace
+ * independently, each with their own webhook subscription and signing key —
+ * a single-match resolver would silently drop one tenant's deliveries on a
+ * collision. The caller verifies each candidate's own webhook_signing_key
+ * against the delivery's signature rather than committing to a guess.
+ */
+export const getAccountsByAttioWorkspaceId = async (
+  workspaceId: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    // Deliberately scanWithFilter, not getAllUsers(): this runs on every
+    // incoming Attio webhook, unauthenticated until a candidate's signing key
+    // verifies below — getAllUsers() additionally starts three count queries
+    // (tasks/workflows/chat sessions) per user for admin-dashboard display,
+    // irrelevant here and multiplying the cost of every delivery. A full
+    // table scan is still unavoidable without a dedicated workspace-to-account
+    // index (a schema change, gated separately), but skipping the per-user
+    // fan-out removes the dominant, easily-avoidable cost.
+    const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'attio' && (account.config as AttioConfig).workspace_id === workspaceId) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Attio workspace_id to accounts:', error);
     return [];
   }
 };

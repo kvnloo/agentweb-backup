@@ -110,6 +110,26 @@ describe('Meta Ads Emma Tools - list_meta_ads_campaigns', () => {
       'act_111222333444555',
     );
   });
+
+  it('forwards a client_id scope object when client_id is provided (ENG-1801)', async () => {
+    const tool = emmaToolRegistry.getTool(toolName);
+    if (!tool) throw new Error(`Tool ${toolName} not found`);
+
+    (agentModeService.listMetaAdsCampaignsNew as jest.Mock).mockResolvedValue({
+      success: true,
+      campaigns: [],
+      totalCount: 0,
+    });
+
+    await tool.execute({ account_id: 'act_111', client_id: 'client@example.com' }, { userId: 'admin-1' });
+
+    expect(agentModeService.listMetaAdsCampaignsNew).toHaveBeenCalledWith(
+      'admin-1',
+      'act_111',
+      {},
+      { clientId: 'client@example.com', toolName: 'list_meta_ads_campaigns' },
+    );
+  });
 });
 
 describe('Meta Ads Emma Tools - get_meta_ads_metrics', () => {
@@ -140,6 +160,30 @@ describe('Meta Ads Emma Tools - get_meta_ads_metrics', () => {
       'user-123',
       ['campaign-1'],
       '111222333444555',
+    );
+  });
+
+  it('forwards a client_id scope object when client_id is provided (ENG-1801)', async () => {
+    const tool = emmaToolRegistry.getTool('get_meta_ads_metrics');
+    if (!tool) throw new Error('Tool get_meta_ads_metrics not found');
+    (agentModeService.getMetaAdsMetrics as jest.Mock).mockResolvedValue({ success: true });
+
+    await tool.execute(
+      {
+        timeframe: '7d',
+        campaign_ids: ['campaign-1'],
+        account_id: '111222333444555',
+        client_id: 'client@example.com',
+      },
+      { userId: 'admin-1' },
+    );
+
+    expect(agentModeService.getMetaAdsMetrics).toHaveBeenCalledWith(
+      '7d',
+      'admin-1',
+      ['campaign-1'],
+      '111222333444555',
+      { clientId: 'client@example.com', toolName: 'get_meta_ads_metrics' },
     );
   });
 });

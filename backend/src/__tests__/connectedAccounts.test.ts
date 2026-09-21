@@ -67,6 +67,10 @@ jest.mock('../services/subscriptionService', () => ({
 jest.mock('../routes/calendlyAuth', () => ({
     refreshCalendlyAccessToken: jest.fn(),
 }));
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock('../services/metaAccountCredentials', () => ({
+    assertOwnedMetaPixel: (...a: any[]) => mockAssertOwnedMetaPixel(...a),
+}));
 const mockEnqueueJob = jest.fn();
 const mockUpdateJobPayload = jest.fn();
 jest.mock('../services/asyncJobQueue', () => ({
@@ -497,6 +501,35 @@ describe('Connected Accounts Routes', () => {
 
             expect(response.status).toBe(200);
             expect(response.body.accounts[0].booking_lead_list_id).toBe('list-1');
+        });
+
+        it('surfaces attribution_pixel_id/attribution_account_id for a Calendly account that has them set (ENG-1141)', async () => {
+            const calendlyWithAttribution = {
+                platform: 'calendly',
+                account_id: 'jane@customer.com',
+                account_name: 'Jane Customer',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: {
+                    account_type: 'calendly',
+                    email: 'jane@customer.com',
+                    access_token: 'tok',
+                    refresh_token: 'refresh',
+                    token_expires_at: 9999999999999,
+                    user_uri: 'https://api.calendly.com/users/AAAA',
+                    organization_uri: 'https://api.calendly.com/organizations/BBBB',
+                    booking_tracking_active: true,
+                    attributionPixelId: 'px-1',
+                    attributionAccountId: 'act-1',
+                }
+            };
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([calendlyWithAttribution]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].attribution_pixel_id).toBe('px-1');
+            expect(response.body.accounts[0].attribution_account_id).toBe('act-1');
         });
 
         it('does not set booking_lead_list_id for non-Calendly accounts', async () => {
@@ -1318,6 +1351,152 @@ describe('Connected Accounts Routes', () => {
             const response = await request(app)
                 .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
                 .send({ listId: 'list-1' });
+
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('PATCH /connected-accounts/calendly/:accountId/attribution (ENG-1141)', () => {
+        const mockUser = { userId: 'test_user_id', connected_accounts: [] };
+
+        it('returns 400 when pixelId is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ accountId: 'act-1' });
+
+            expect(response.status).toBe(400);
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 400 when accountId is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1' });
+
+            expect(response.status).toBe(400);
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+        });
+
+        it('returns 404 when the user record cannot be found', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(404);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 400 when the pixel/account pair is not owned by the caller', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockRejectedValue(
+                new Error('Meta ad account "act-1" is not one of your connected accounts.')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('persists attributionPixelId/attributionAccountId and returns success when owned', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({
+                success: true,
+                attributionPixelId: 'px-1',
+                attributionAccountId: 'act-1',
+            }));
+            // attributionDisabled: false rides along — choosing a real pair also clears any
+            // previous "don't track" opt-out, so the two controls can't disagree.
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: 'px-1', attributionAccountId: 'act-1', attributionDisabled: false }
+            );
+        });
+
+        // ENG-1141 opt-out: leaving the pair unset means "auto-resolve to my first
+        // account/pixel", so a customer who connected Calendly purely for scheduling had no
+        // way to say "no Meta attribution at all" — they'd silently get CAPI Schedule events
+        // fired against whichever ad account happened to come first.
+        it('accepts disabled:true as an explicit opt-out, clearing any stored pair', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ disabled: true });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({ success: true, attributionDisabled: true }));
+            // No ownership check to run — there is no pixel being claimed.
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: undefined, attributionAccountId: undefined, attributionDisabled: true }
+            );
+        });
+
+        it('clears the opt-out when a real pair is set afterwards', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(200);
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: 'px-1', attributionAccountId: 'act-1', attributionDisabled: false }
+            );
+        });
+
+        it('still rejects a request that is neither a valid pair nor an opt-out', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ disabled: false });
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 404 when the calendly account is not connected to the user', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(
+                new Error('No calendly account with id "cal-x" connected')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-x/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(404);
+        });
+
+        it('returns 500 when updateAccountConfig throws an unexpected error', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(new Error('DB down'));
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
 
             expect(response.status).toBe(500);
         });

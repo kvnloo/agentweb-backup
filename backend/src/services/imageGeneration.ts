@@ -3,7 +3,7 @@ import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage, meterUserUsage } from "./usageRecorderService";
-import { imageGenerationCostUsd } from "../utils/llmPricing";
+import { imageGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -60,9 +60,33 @@ interface ImageGenerationParams {
   quality?: string;
   inputImages?: string[];
   logoImage?: string; // Separate logo image URL - will be added with emphasis on preserving exact text, shape, and color
+  /**
+   * Owner of the generated file. Doubles as the S3 folder (`users/<userId>/...`),
+   * so it is NOT safe to repurpose for metering — see `meterUserId` (ENG-1961).
+   */
   userId: string;
+  /**
+   * Who to CHARGE, when that differs from the file's owner. Platform-funded
+   * generation (workplan thumbnails) passes `null` to book no user at all while
+   * keeping its S3 folder unchanged; omitted, the charge follows `userId` as it
+   * always has (ENG-1961).
+   */
+  meterUserId?: string | null;
+  /** Overrides the recorded feature, e.g. `platform:workplan_thumbnail` (ENG-1961). */
+  meterFeature?: string;
   imageModel?: string; // Optional model parameter - must be one of the supported models
   removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
+}
+
+/**
+ * Who a generation is charged to — the file's owner by default, or whoever
+ * `meterUserId` names. An explicit `null` books no user at all, for genuinely
+ * platform-funded generation; the recorder's own `system` fallback then applies,
+ * which is a placeholder for "AgentWeb paid", not a fake account (ENG-1961).
+ */
+function meteredUserId(params: ImageGenerationParams): string | undefined {
+  if (params.meterUserId === null) return undefined;
+  return params.meterUserId ?? params.userId;
 }
 
 export class ImageService {
@@ -549,17 +573,18 @@ export class ImageService {
           // This is the canonical charge point — provider sub-methods (e.g. generateWithOpenAI)
           // keep their token record burn-only so we never double-charge an image.
           void meterUserUsage({
-            userId: params.userId,
+            userId: meteredUserId(params),
             model: modelToUse,
             provider: modelToUse.startsWith("gpt-image")
               ? "openai"
               : modelToUse.startsWith("gemini-")
               ? "gemini"
               : "runway",
-            feature: "image_generation",
+            feature: params.meterFeature || "image_generation",
             inputTokens: 0,
             outputTokens: 0,
             costUsdOverride: imageGenerationCostUsd(modelToUse),
+            costProvenance: LLM_PRICE_BOOK_PROVENANCE,
           });
           // Check if it's a data URL (base64) and convert to buffer
           let imageBuffer: Buffer;
@@ -612,8 +637,21 @@ export class ImageService {
           fullError: apiError
         });
         
+        // Prefer the real provider error body over Axios's own .message, which
+        // is just the generic "Request failed with status code NNN" — the
+        // actual detail (e.g. "You exceeded your current quota..." for hard
+        // quota exhaustion vs. "...exceeded call rate limit..." for transient
+        // throttling, both surfaced as the same HTTP 429) lives on
+        // response.data.error.message and was never read here. Without it,
+        // both cases produce an IDENTICAL generic message and the gateway's
+        // tool-error classifier (ENG-1220's quota_exceeded class) can never
+        // tell them apart, so a permanently-exhausted account gets exempted
+        // from the session-wide retry budget the same as a transient 429.
+        const providerDetail = apiError?.response?.data?.error?.message;
+        const errorDetail = providerDetail || apiError.message || apiError.error || 'Unknown error';
+
         // Re-throw the error with more context
-        throw new Error(`${modelToUse} API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
+        throw new Error(`${modelToUse} API failed: ${errorDetail}`);
       }
     } catch (error: any) {
       console.error("Error generating image:", error);
@@ -837,7 +875,7 @@ export class ImageService {
       // family as generateWithGoogleGemini3Pro below; request/stream shapes are
       // unchanged, metering only observes the stream.
       const ai = await getGeminiClient(
-        { userId: params.userId, feature: "content_gen" },
+        { userId: meteredUserId(params), feature: params.meterFeature || "content_gen" },
         apiKey
       );
       
@@ -1175,7 +1213,7 @@ export class ImageService {
       // Metered Gemini client (shadow usage metering) — wraps the same
       // @google/genai GoogleGenAI client; the stream is passed through unchanged.
       const ai = await getGeminiClient(
-        { userId: params.userId, feature: 'content_gen' },
+        { userId: meteredUserId(params), feature: params.meterFeature || 'content_gen' },
         apiKey
       );
 
@@ -1439,7 +1477,7 @@ export class ImageService {
     // Note: the factory does not wrap images.generate, so the generation is
     // recorded explicitly below (fire-and-forget, fail-open).
     const client = getOpenAIClient(
-      { userId: params.userId, feature: 'content_gen' },
+      { userId: meteredUserId(params), feature: params.meterFeature || 'content_gen' },
       { apiKey }
     );
 
@@ -1455,10 +1493,10 @@ export class ImageService {
         try {
           const usage: any = (result as any)?.usage;
           void recordUsage({
-            userId: params.userId,
+            userId: meteredUserId(params),
             model: model,
             provider: 'openai',
-            feature: 'content_gen',
+            feature: params.meterFeature || 'content_gen',
             inputTokens: usage?.input_tokens || 0,
             outputTokens: usage?.output_tokens || 0,
           });

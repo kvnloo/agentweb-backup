@@ -101,6 +101,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         status: 'deployed',
         buildStatus: 'success',
         deployedUrl: 'https://example.agentwebforms.com/pilot',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -121,6 +122,7 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         deployedUrl: 'https://example.agentwebforms.com/pilot',
         name: 'Cold Outreach',
         leadListId: 'list-9',
+        launchReadiness: { ready: true, reasons: [] },
       });
     });
 
@@ -135,6 +137,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(minimalResult).toEqual({
         buildStatus: 'success',
         previewUrl: 'https://preview.example.com',
+        launchReadiness: { ready: true, reasons: [] },
+      });
+    });
+
+    // ENG-1868: a failed smoke test must survive minimization — this is the exact ledger
+    // evidence the truthful-reporting reconciler needs to append a launch-readiness caveat.
+    it('surfaces launchReadiness.ready = false when the smoke test failed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        smokeTestResult: { ok: false, leadCaptured: false, checkedAt: '2026-09-11T00:00:00Z' },
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['Post-deploy smoke test failed'],
+      });
+    });
+
+    it('surfaces launchReadiness.ready = false when tracking was not installed', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        trackingInstalled: false,
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult.launchReadiness).toEqual({
+        ready: false,
+        reasons: ['No conversion tracking (GTM) installed'],
       });
     });
   });
@@ -177,6 +210,37 @@ describe('AgentModeService - extractMinimalToolResult', () => {
         imageUrl: 'https://example.com/image.png',
         filename: 'image.png'
       });
+    });
+
+    // ENG-1027: this minimizer whitelists fields per tool — everything unnamed is
+    // dropped (ENG-736/ENG-1526 already hit this trap for other tools). Without this
+    // case, the post-generation data-fabrication warning would silently vanish before
+    // reaching Emma, exactly like the un-relayed approval tokens did.
+    it('preserves dataReliabilityWarning from a generate_image result', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png',
+        dataReliabilityWarning: 'DATA RELIABILITY CHECK: this image appears to contain specific numbers...'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBe(result.dataReliabilityWarning);
+    });
+
+    it('omits dataReliabilityWarning when the check did not fire', () => {
+      const result = {
+        success: true,
+        message: 'Image generated successfully',
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_image');
+
+      expect(minimalResult.dataReliabilityWarning).toBeUndefined();
     });
   });
 
@@ -335,9 +399,9 @@ describe('AgentModeService - extractMinimalToolResult', () => {
   });
 
   // ENG-738: perform_deep_research previously fell through to the generic `{}`
-  // fallback, which drops success/partial/error — the exact fields the
+  // fallback, which drops success/error — the exact fields the
   // open-research-request tracker needs to tell a real success from a
-  // still-unresolved partial/timeout result using only this minimized entry.
+  // still-unresolved timeout result using only this minimized entry.
   describe('perform_deep_research result extraction (ENG-738)', () => {
     it('preserves success and the research URL on a completed result', () => {
       const result = {
@@ -362,31 +426,22 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       });
     });
 
-    it('preserves success:false, partial, and a truncated error on a partial/timeout result', () => {
+    it('preserves success:false and a truncated error on a timeout result', () => {
       const result = {
         success: false,
-        partial: true,
-        message: 'Deep research on "Semiconductor architecture" didn\'t finish before the time budget ran out...',
-        error: 'Deep research timed out. Please try again with a more specific topic.',
-        data: {
-          research_url: 'https://s3.amazonaws.com/bucket/partial.md',
-          research_depth: 'comprehensive',
-          topic: 'Semiconductor architecture'
-        }
+        message: 'Deep research failed',
+        error: 'Deep research failed: Request timed out',
       };
 
       const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'perform_deep_research');
 
       expect(minimalResult).toEqual({
         success: false,
-        partial: true,
-        error: 'Deep research timed out. Please try again with a more specific topic.',
-        research_url: 'https://s3.amazonaws.com/bucket/partial.md',
-        research_depth: 'comprehensive',
+        error: 'Deep research failed: Request timed out',
       });
     });
 
-    it('preserves success:false without a partial flag on a plain failure', () => {
+    it('preserves success:false on a plain unavailable-service failure', () => {
       const result = {
         success: false,
         message: 'Deep Research service is not available. Please check API key configuration.',
@@ -411,4 +466,91 @@ describe('AgentModeService - extractMinimalToolResult', () => {
       expect(longError.startsWith(minimalResult.error)).toBe(true);
     });
   });
+
+  // ENG-1472: the workplan_recommendation result MUST survive minimization —
+  // it is the only thing that lets the customer portal render the recommendation
+  // card again after a reload (the ledger entry is all it has at that point).
+  describe('recommend_predefined_work_plan result extraction', () => {
+    const successResult = {
+      success: true,
+      type: 'workplan_recommendation',
+      version: 1,
+      recommendationId: 'abc123',
+      plan: {
+        id: 'plan-onboard',
+        title: 'Client Onboarding',
+        summary: 'Get a new client set up',
+        steps: [{ position: 1, label: 'Analyze website' }],
+      },
+      reason: 'The user wants to onboard a new client.',
+      formattedContent: 'Recommended work plan "Client Onboarding" — because reasons',
+    };
+
+    it('preserves the full structured payload for a successful proposal (reload survives)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(successResult, 'recommend_predefined_work_plan');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        type: 'workplan_recommendation',
+        version: 1,
+        recommendationId: 'abc123',
+        plan: successResult.plan,
+        reason: 'The user wants to onboard a new client.',
+      });
+      // formattedContent (model-visible only) is dropped from the persisted ledger entry.
+      expect(minimalResult.formattedContent).toBeUndefined();
+    });
+
+    it('preserves the source marker when present (completion-recommendation extension)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { ...successResult, source: 'completion_next' },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult.source).toBe('completion_next');
+    });
+
+    it('minimizes a rejected/failed proposal to success:false + message only (boundary/malformed case)', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { success: false, message: 'Work plan template "plan-x" is not available.' },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult).toEqual({ success: false, message: 'Work plan template "plan-x" is not available.' });
+      expect(minimalResult.type).toBeUndefined();
+    });
+
+    it('never treats a wrong-type/unversioned payload as a valid recommendation', () => {
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(
+        { success: true, type: 'workplan_recommendation', version: 2, plan: { id: 'x' } },
+        'recommend_predefined_work_plan',
+      );
+      expect(minimalResult).toEqual({ success: true, message: undefined });
+      expect(minimalResult.plan).toBeUndefined();
+    });
+  });
+
+  // ENG-1720: the de-dupe outcome must survive the minimizer, or the requirement
+  // verdict cannot tell a skipped send from a delivered one. linkedin_outreach has
+  // no general branch, so anything not named here becomes the `{}` default — and a
+  // `{}` result reads as SUCCESS to toolCallSucceeded (no error, no success:false).
+  // That is how a run which contacted nobody stored passed:true / { actual: 2 }.
+  describe('linkedin_outreach de-duplicated send (ENG-1720)', () => {
+    it('preserves alreadyInvited so a skipped send is not scored as a delivery', () => {
+      const result = {
+        success: true,
+        alreadyInvited: true,
+        message: 'A LinkedIn connection invitation is already pending for this profile. Skipped to avoid a duplicate — no invite quota was used.',
+        data: { alreadyInvited: true, sentAt: '2026-09-09T13:32:45.644Z' },
+      };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal.alreadyInvited).toBe(true);
+      expect(minimal.success).toBe(true);
+    });
+
+    it('a real delivery is NOT marked alreadyInvited', () => {
+      const result = { success: true, data: { invitationId: '7503444979126583297' } };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'linkedin_outreach');
+      expect(minimal?.alreadyInvited).toBeFalsy();
+    });
+  });
+
 });

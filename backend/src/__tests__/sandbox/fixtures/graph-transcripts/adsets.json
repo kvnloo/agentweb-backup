@@ -1,0 +1,360 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "act_120000000000001/adsets",
+    "query": {
+      "fields": "id,name,status,campaign_id,optimization_goal,billing_event,destination_type,promoted_object,bid_strategy,bid_amount,daily_budget,lifetime_budget,start_time,end_time,targeting",
+      "limit": "100"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "120000000000000010",
+        "name": "Object 10",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000004",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "WEBSITE",
+        "promoted_object": {
+          "pixel_id": "1200000000000011",
+          "custom_event_type": "LEAD",
+          "smart_pse_enabled": false
+        },
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "daily_budget": "3000",
+        "lifetime_budget": "0",
+        "start_time": "2026-08-09T15:32:59-0700",
+        "targeting": {
+          "age_max": 55,
+          "age_min": 25,
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "targeting_relaxation_types": {
+            "lookalike": 0,
+            "custom_audience": 0
+          },
+          "targeting_automation": {
+            "advantage_audience": 0
+          },
+          "publisher_platforms": [
+            "facebook",
+            "instagram"
+          ],
+          "facebook_positions": [
+            "feed",
+            "story"
+          ],
+          "instagram_positions": [
+            "stream",
+            "story"
+          ]
+        }
+      },
+      {
+        "id": "120000000000000012",
+        "name": "Object 11",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000005",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "WEBSITE",
+        "promoted_object": {
+          "pixel_id": "1200000000000011",
+          "custom_event_type": "LEAD",
+          "smart_pse_enabled": false
+        },
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "daily_budget": "3000",
+        "lifetime_budget": "0",
+        "start_time": "2026-08-09T15:31:50-0700",
+        "targeting": {
+          "age_max": 55,
+          "age_min": 25,
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "targeting_relaxation_types": {
+            "lookalike": 0,
+            "custom_audience": 0
+          },
+          "targeting_automation": {
+            "advantage_audience": 0
+          },
+          "publisher_platforms": [
+            "facebook",
+            "instagram"
+          ],
+          "facebook_positions": [
+            "feed",
+            "story"
+          ],
+          "instagram_positions": [
+            "stream",
+            "story"
+          ]
+        }
+      },
+      {
+        "id": "120000000000000013",
+        "name": "Object 12",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000006",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "WEBSITE",
+        "promoted_object": {
+          "pixel_id": "1200000000000011",
+          "custom_event_type": "LEAD",
+          "smart_pse_enabled": false
+        },
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "daily_budget": "3000",
+        "lifetime_budget": "0",
+        "start_time": "2026-07-22T03:17:05-0700",
+        "targeting": {
+          "age_max": 55,
+          "age_min": 25,
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "targeting_relaxation_types": {
+            "lookalike": 0,
+            "custom_audience": 0
+          },
+          "targeting_automation": {
+            "advantage_audience": 0
+          },
+          "publisher_platforms": [
+            "facebook",
+            "instagram"
+          ],
+          "facebook_positions": [
+            "feed",
+            "story"
+          ],
+          "instagram_positions": [
+            "stream",
+            "story"
+          ]
+        }
+      },
+      {
+        "id": "120000000000000014",
+        "name": "Object 13",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000007",
+        "optimization_goal": "LANDING_PAGE_VIEWS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "UNDEFINED",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "daily_budget": "6000",
+        "lifetime_budget": "0",
+        "start_time": "2026-07-10T23:04:14-0700",
+        "targeting": {
+          "age_max": 55,
+          "age_min": 25,
+          "flexible_spec": [
+            {
+              "interests": [
+                {
+                  "id": "1200000000015",
+                  "name": "Object 14"
+                },
+                {
+                  "id": "1200000000016",
+                  "name": "Object 15"
+                },
+                {
+                  "id": "1200000000017",
+                  "name": "Object 16"
+                }
+              ]
+            }
+          ],
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "targeting_automation": {
+            "advantage_audience": 0
+          },
+          "user_age_unknown": false
+        }
+      },
+      {
+        "id": "120000000000000018",
+        "name": "Object 17",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000008",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "UNDEFINED",
+        "promoted_object": {
+          "pixel_id": "1200000000000011",
+          "custom_event_type": "LEAD",
+          "smart_pse_enabled": false
+        },
+        "start_time": "2026-04-14T23:44:16-0700",
+        "targeting": {
+          "age_max": 65,
+          "age_min": 18,
+          "age_range": [
+            18,
+            65
+          ],
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "brand_safety_content_filter_levels": [
+            "FACEBOOK_RELAXED"
+          ],
+          "targeting_automation": {
+            "advantage_audience": 1,
+            "individual_setting": {
+              "age": 1,
+              "gender": 1
+            }
+          },
+          "publisher_platforms": [
+            "facebook",
+            "instagram"
+          ],
+          "facebook_positions": [
+            "feed",
+            "right_hand_column",
+            "instream_video",
+            "marketplace",
+            "story",
+            "biz_disco_feed",
+            "facebook_reels",
+            "facebook_reels_overlay",
+            "profile_feed",
+            "notification"
+          ],
+          "instagram_positions": [
+            "stream",
+            "story",
+            "reels",
+            "explore_home",
+            "profile_feed"
+          ],
+          "device_platforms": [
+            "mobile",
+            "desktop"
+          ]
+        }
+      },
+      {
+        "id": "120000000000000019",
+        "name": "Object 18",
+        "status": "PAUSED",
+        "campaign_id": "120000000000000009",
+        "optimization_goal": "OFFSITE_CONVERSIONS",
+        "billing_event": "IMPRESSIONS",
+        "destination_type": "UNDEFINED",
+        "promoted_object": {
+          "pixel_id": "1200000000000011",
+          "custom_event_type": "START_TRIAL",
+          "smart_pse_enabled": false
+        },
+        "start_time": "2026-04-08T10:30:17-0700",
+        "targeting": {
+          "age_max": 65,
+          "age_min": 18,
+          "age_range": [
+            18,
+            65
+          ],
+          "geo_locations": {
+            "countries": [
+              "US"
+            ],
+            "location_types": [
+              "home",
+              "recent"
+            ]
+          },
+          "brand_safety_content_filter_levels": [
+            "FACEBOOK_RELAXED"
+          ],
+          "targeting_automation": {
+            "advantage_audience": 1,
+            "individual_setting": {
+              "age": 1,
+              "gender": 1
+            }
+          },
+          "publisher_platforms": [
+            "facebook",
+            "instagram"
+          ],
+          "facebook_positions": [
+            "feed",
+            "right_hand_column",
+            "instream_video",
+            "marketplace",
+            "story",
+            "search",
+            "biz_disco_feed",
+            "facebook_reels",
+            "facebook_reels_overlay",
+            "profile_feed",
+            "notification"
+          ],
+          "instagram_positions": [
+            "stream",
+            "story",
+            "explore",
+            "reels",
+            "explore_home",
+            "profile_feed",
+            "ig_search"
+          ],
+          "device_platforms": [
+            "mobile",
+            "desktop"
+          ]
+        }
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci01",
+        "after": "c2FuaXRpemVkLWN1cnNvci02"
+      }
+    }
+  }
+}

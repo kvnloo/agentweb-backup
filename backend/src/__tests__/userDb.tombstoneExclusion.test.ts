@@ -78,6 +78,30 @@ describe('UserDB tombstone exclusion', () => {
       expect(results).toHaveLength(1);
       expect(results[0].userId).toBe('user-123');
     });
+
+    it('follows LastEvaluatedKey and aggregates every page (ENG-720 Greptile finding)', async () => {
+      mockScanPromise
+        .mockResolvedValueOnce({
+          Items: [{ userId: 'user-1' }],
+          LastEvaluatedKey: { userId: 'user-1' },
+        })
+        .mockResolvedValueOnce({
+          Items: [{ userId: 'user-2' }],
+          LastEvaluatedKey: { userId: 'user-2' },
+        })
+        .mockResolvedValueOnce({
+          Items: [{ userId: 'user-3' }],
+        });
+
+      const results = await (userDb as any).scanWithFilter('stripe_customer_id = :cid', { ':cid': 'cus_abc' });
+
+      expect(mockScan).toHaveBeenCalledTimes(3);
+      expect(results.map((r: any) => r.userId)).toEqual(['user-1', 'user-2', 'user-3']);
+
+      const calls = mockScan.mock.calls as unknown as Array<[Record<string, any>]>;
+      expect(calls[1][0].ExclusiveStartKey).toEqual({ userId: 'user-1' });
+      expect(calls[0][0].ExclusiveStartKey).toBeUndefined();
+    });
   });
 
   // ── getUserByStripeCustomerId ─────────────────────────────────────────────

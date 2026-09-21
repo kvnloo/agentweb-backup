@@ -10,11 +10,18 @@
 import { crmDb } from './db';
 import { getApolloService, isApolloServiceReady } from './apolloService';
 import { getEnrichSoService } from './enrichSoService';
+import { getEnigmaService } from './enigmaService';
+import {
+  createEnigmaCardRevenueFetcher,
+  isEnigmaEnrichmentEnabledForUser,
+  type EnigmaCardRevenueFetcher,
+} from './enigmaCardRevenueEnrichment';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
+import { usablePublicIdentifier } from '../utils/linkedInAnonymizedProfile';
 import { sanitizePhone } from '../utils/phoneValidation';
-import { nameTokensMatch, normalizeNameToken } from '../utils/nameMatch';
+import { nameTokensMatch, unipileNameMatches } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
 import { resolveIdentity as pureResolveIdentity } from './enrichmentIdentityResolver';
 import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFetchResult } from './enrichmentGroupWaterfall';
@@ -36,8 +43,8 @@ import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
 
-// Models — match what v2 enrichment uses (gpt-5-chat-2 via Azure OpenAI; see
-// `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
+// Logical model defaults preserve existing settings while callLLM normalizes
+// retired IDs and owns OpenRouter transport, fallback, and metering.
 const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
 const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
 // The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
@@ -51,9 +58,8 @@ const CRITIC_TEMPERATURE: number | null =
   process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
     ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
     : null;
-// Model used for Tier 4 web extraction — must support web search tool.
-// Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
-// or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
+// Model used for Tier 4 extraction. OpenRouter executes the provider-independent
+// web-search server tool, so no model-specific search adapter or secret is needed.
 const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
@@ -74,7 +80,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
         if (lastName) input.lastName = lastName;
         if (domain) input.domain = domain;
         else if (company) input.organizationName = company;
-        const result = await apollo.matchPerson(input);
+        const result = await apollo.matchPerson(input, { userId });
         const p = result?.match?.person;
         if (!p) return null;
         const org = result?.match?.organization;
@@ -146,7 +152,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
     enrichSoReverseLookup: async ({ email }) => {
       try {
         const enrichSo = getEnrichSoService();
-        const result = await enrichSo.reverseLookup(email);
+        const result = await enrichSo.reverseLookup(email, { userId });
         if (!result?.found) return null;
         return {
           firstName: result.firstName,
@@ -164,7 +170,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) return null;
       try {
         const enrichSo = getEnrichSoService();
-        const result = await enrichSo.findEmail({ firstName, lastName, domain });
+        const result = await enrichSo.findEmail({ firstName, lastName, domain }, { userId });
         if (!result?.found || !result.email) return null;
         return { email: result.email };
       } catch (err) {
@@ -390,6 +396,7 @@ async function fetchWebForGroupReal(
   lead: LeadRecord,
   groupName: string,
   listId?: string,
+  userId?: string,
 ): Promise<{ webContext: string } | null> {
   const groupCfg = FIELD_GROUPS[groupName];
   if (!groupCfg) return null;
@@ -424,7 +431,7 @@ async function fetchWebForGroupReal(
   // 3. Google CSE — for company_technographic also run a job-postings query
   let webResults: any[] = [];
   try {
-    const search = await agentModeService.youSearchWeb(query, 10);
+    const search = await agentModeService.youSearchWeb(query, 10, undefined, undefined, userId, 'crm_enrichment');
     if (search?.success && Array.isArray(search.results)) {
       webResults = search.results;
     }
@@ -439,7 +446,7 @@ async function fetchWebForGroupReal(
       lead,
     );
     try {
-      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5);
+      const jobsSearch = await agentModeService.youSearchWeb(jobsQuery, 5, undefined, undefined, userId, 'crm_enrichment');
       if (jobsSearch?.success && Array.isArray(jobsSearch.results)) {
         const existingUrls = new Set(webResults.map((r: any) => r.url || r.link).filter(Boolean));
         for (const r of jobsSearch.results) {
@@ -956,9 +963,12 @@ export async function findLinkedInUrlImpl(
       chosen = nameMatched[0];
     }
 
-    if (!chosen?.public_identifier) return null;
-    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosen.public_identifier}`);
-    return `https://www.linkedin.com/in/${chosen.public_identifier}`;
+    // The sentinel is truthy, so a bare presence check let an anonymized result
+    // resolve to /in/undefined and be returned as this lead's LinkedIn URL.
+    const chosenSlug = usablePublicIdentifier(chosen?.public_identifier);
+    if (!chosenSlug) return null;
+    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosenSlug}`);
+    return `https://www.linkedin.com/in/${chosenSlug}`;
   } catch (err) {
     // Any failure after accountId was resolved — purge both caches so next call
     // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
@@ -1151,41 +1161,33 @@ export async function pickCandidateByContextLLM(
  * fall back to splitting `name` on whitespace when those split fields are
  * absent.
  */
-export function unipileNameMatches(
-  item: any,
-  leadFirst: string | undefined,
-  leadLast: string | undefined,
-): boolean {
-  let itemFirst = typeof item.first_name === 'string' ? item.first_name.trim().toLowerCase() : null;
-  let itemLast  = typeof item.last_name  === 'string' ? item.last_name.trim().toLowerCase()  : null;
+// ENG-1026: the algorithm moved to ../utils/nameMatch so the pre-send identity
+// check can reuse it without importing this dep-heavy module. Re-exported here
+// so existing importers are unchanged.
+export { unipileNameMatches };
 
-  // Fallback: derive first/last from the combined `name` field. Split on
-  // whitespace — first token → first name, last token → last name. Handles
-  // middle names by ignoring everything between.
-  //
-  // Drop tokens that normalize to empty (emoji, symbols, decorative marks)
-  // BEFORE choosing first/last. Without this, a display name like
-  // "💡 Paul Graham" would take "💡" as the first name; normalization later
-  // turns it into "" → "no constraint" → a WRONG first name would slip
-  // through the gate (verified live). Filtering here keeps the first/last
-  // anchored on real name tokens.
-  if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
-    const tokens = item.name.trim().toLowerCase().split(/\s+/)
-      .filter(Boolean)
-      .filter((t: string) => normalizeNameToken(t) !== '');
-    if (tokens.length >= 1) itemFirst = tokens[0];
-    if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
+/**
+ * ENG-1388: Enigma card revenue is attached only when the caller opts in (the
+ * enrich-v3 route and Emma do; the auto-enrichment cron never does), the flag
+ * and allowlist permit this user, and the service is initialised. One fetcher
+ * per run carries the per-run cap and the 402/401 circuit breaker.
+ */
+function buildEnigmaFetcherForRun(userId: string): EnigmaCardRevenueFetcher | null {
+  if (!isEnigmaEnrichmentEnabledForUser(userId)) return null;
+  const service = getEnigmaService();
+  if (!service) {
+    console.warn(`[v3 deps] Enigma enabled for user ${userId} but the service is not initialised (missing key?)`);
+    return null;
   }
-
-  // Can't verify without at least one name field — reject for correctness.
-  if (itemFirst === null && itemLast === null) return false;
-
-  // Bidirectional-prefix token comparison shared with the Apollo identity gate.
-  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
+  return createEnigmaCardRevenueFetcher({ service, userId });
 }
 
-export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
+export function buildOrchestratorDeps(
+  userId: string,
+  opts: { enigma?: boolean } = {},
+): OrchestratorDeps {
   const identityDeps = buildIdentityDeps(userId);
+  const enigmaFetcher = opts.enigma ? buildEnigmaFetcherForRun(userId) : null;
 
   return {
     loadLeads: async ({ listId, leadIds }) => {
@@ -1231,7 +1233,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
         }
         console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] matchOrg domain=${domain}`);
         try {
-          const result = await getApolloService().matchOrg(domain);
+          const result = await getApolloService().matchOrg(domain, { userId });
           if (!result?.organization) {
             console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] MISS no organization`);
             return null;
@@ -1268,7 +1270,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             ? { email: lead.email, firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined }
             : { firstName: lead.firstName ?? undefined, lastName: lead.lastName ?? undefined, domain: domain! };
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] matchPerson input=${JSON.stringify(apolloInput)}`);
-          const result = await getApolloService().matchPerson(apolloInput);
+          const result = await getApolloService().matchPerson(apolloInput, { userId });
           if (!result?.match?.person) {
             console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:person] MISS no person`);
             return null;
@@ -1287,7 +1289,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       },
 
       extractFieldsViaLLM: (input) => extractFieldsViaLLMReal(input, userId),
-      fetchWebForGroup: fetchWebForGroupReal,
+      fetchWebForGroup: (lead, groupName, listId) => fetchWebForGroupReal(lead, groupName, listId, userId),
 
       // Tier 3.5b: person enrichment via Unipile.
       // Case A: lead.linkedin present → getProfile → extract name/title directly.
@@ -1339,7 +1341,10 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               const result = {
                 first_name:   profileFirst,
                 last_name:    profileLast,
-                linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
+                // Same sentinel guard as the search path above.
+                linkedin_url: usablePublicIdentifier(raw.public_identifier)
+                  ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                  : undefined,
                 title:        trimStr(current?.position),
                 fromCache:    profileResult.fromCache,
               };
@@ -1527,6 +1532,19 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
           return null;
         }
       },
+
+      ...(enigmaFetcher ? {
+        fetchEnigmaCardRevenue: (lead: LeadRecord, { industryLabels, forceRefresh }: { industryLabels: Array<string | undefined>; forceRefresh: boolean }) => {
+          const domain = resolveApolloMatchDomain(lead);
+          return enigmaFetcher.fetch({
+            // A free-mail or institutional domain is never the company's site.
+            domain: domain && !CrmEnrichmentService.isPersonalDomain(domain) ? domain : null,
+            companyName: lead.company,
+            industryLabels,
+            forceRefresh,
+          });
+        },
+      } : {}),
     }),
 
     // Ungrouped fields → synthetic web fetch using a generic "{{emailDomain}}"
@@ -1553,7 +1571,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
       const query = `${domain} ${queryParts.join(' ')}`;
       let webContext = '';
       try {
-        const search = await agentModeService.youSearchWeb(query, 5);
+        const search = await agentModeService.youSearchWeb(query, 5, undefined, undefined, userId, 'crm_enrichment');
         if (search?.success && Array.isArray(search.results)) {
           webContext = JSON.stringify(search.results.slice(0, 5), null, 2);
         }
@@ -1640,6 +1658,8 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     },
 
     runCriticOverWebFills: (input) => runCriticReal(input, userId),
+
+    ...(enigmaFetcher ? { enigmaSummary: () => enigmaFetcher.summary() } : {}),
 
     setLeadFields: async ({ listId, leadId, topLevel, customFields, enrichmentMetadata, ifNotExists }) => {
       // When writing to topLevel, also clear stale customFields[name] entries

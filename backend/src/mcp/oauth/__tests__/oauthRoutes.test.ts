@@ -23,7 +23,10 @@ const mockRecordMcpOAuthTokenIssued = jest.fn();
 jest.mock('../oauthService', () => ({
   mcpOAuthService: {
     registerClient: (...args: any[]) => mockRegisterClient(...args),
-    getClient: (...args: any[]) => mockGetClient(...args),
+    getClient: async (...args: any[]) => {
+      const client = await mockGetClient(...args);
+      return client && { tokenEndpointAuthMethod: 'none', ...client };
+    },
     createAuthorizationCode: (...args: any[]) => mockCreateAuthorizationCode(...args),
     consumeAuthorizationCode: (...args: any[]) => mockConsumeAuthorizationCode(...args),
     createTokenPair: (...args: any[]) => mockCreateTokenPair(...args),
@@ -465,6 +468,7 @@ describe('MCP OAuth Routes', () => {
     });
 
     it('should redirect with error=access_denied on denial', async () => {
+      mockGetClient.mockResolvedValue({ clientId: 'client-123', redirectUris: ['https://example.com/callback'] });
       const res = await request(app)
         .post('/oauth/authorize/decision')
         .send({
@@ -515,6 +519,7 @@ describe('MCP OAuth Routes', () => {
     });
 
     it('should reject form-urlencoded body with approved="false" (string, not boolean)', async () => {
+      mockGetClient.mockResolvedValue({ clientId: 'client-123', redirectUris: ['https://example.com/callback'] });
       // Regression guard: a naive `if (!approved)` would treat the
       // string "false" as truthy and mistakenly approve the request.
       const res = await request(app)
@@ -619,7 +624,7 @@ describe('MCP OAuth Routes', () => {
         clientId: 'client-123',
         tokenEndpointAuthMethod: 'none',
       });
-      mockValidatePkce.mockReturnValue(false);
+      mockConsumeAuthorizationCode.mockResolvedValue(null); // Service owns PKCE validation before consumption.
 
       const res = await request(app)
         .post('/oauth/token')
@@ -651,6 +656,7 @@ describe('MCP OAuth Routes', () => {
         .send({
           grant_type: 'refresh_token',
           refresh_token: 'old-refresh-token',
+          client_id: 'client-123',
         })
         .expect(200);
 
@@ -667,6 +673,7 @@ describe('MCP OAuth Routes', () => {
         .send({
           grant_type: 'refresh_token',
           refresh_token: 'bad-refresh',
+          client_id: 'client-123',
         })
         .expect(400);
 
@@ -684,5 +691,84 @@ describe('MCP OAuth Routes', () => {
 
       expect(res.body.error).toBe('unsupported_grant_type');
     });
+  });
+});
+
+describe('Hermes callback security boundaries (ENG-1869)', () => {
+  let app: express.Express;
+  const redirect = 'http://127.0.0.1:49152/callback';
+  const decision = { client_id: 'hermes', redirect_uri: redirect, state: 'state +/&=',
+    code_challenge: 'challenge', code_challenge_method: 'S256', approved: true };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetClient.mockResolvedValue({ clientId: 'hermes', clientName: 'Hermes Agent', redirectUris: [redirect] });
+    mockCreateAuthorizationCode.mockResolvedValue({ code: 'one-time-code' });
+    mockConsumeAuthorizationCode.mockResolvedValue({ clientId: 'hermes', redirectUri: redirect,
+      userId: 'user-456', codeChallenge: 'challenge', codeChallengeMethod: 'S256', scope: 'mcp:tools' });
+    mockValidatePkce.mockReturnValue(true);
+    mockCreateTokenPair.mockResolvedValue({ accessToken: 'secret-access', refreshToken: 'secret-refresh' });
+    mockRecordMcpOAuthStarted.mockResolvedValue(true);
+    mockRecordMcpOAuthAuthorized.mockResolvedValue(true);
+    mockRecordMcpOAuthTokenIssued.mockResolvedValue(true);
+    app = createTestApp();
+  });
+  it('preserves the exact state and loopback callback without tokens on browser form approval', async () => {
+    const res = await request(app).post('/oauth/authorize/decision').type('form').send(decision).expect(302);
+    const callback = new URL(res.headers.location);
+    expect(callback.origin + callback.pathname).toBe(redirect);
+    expect(callback.searchParams.get('state')).toBe(decision.state);
+    expect([...callback.searchParams.keys()]).toEqual(['code', 'state']);
+  });
+  it('validates a denied redirect before redirecting the browser', async () => {
+    await request(app).post('/oauth/authorize/decision').send({ ...decision, approved: false,
+      redirect_uri: 'https://attacker.example/callback' }).expect(400);
+    expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
+  });
+  it.each([undefined, '', ['challenge'], { value: 'challenge' }])('rejects missing or non-string consent PKCE: %p', async challenge => {
+    await request(app).post('/oauth/authorize/decision').send({ ...decision, code_challenge: challenge }).expect(400);
+    expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
+  });
+  it('rejects plain PKCE at the consent endpoint', async () => {
+    await request(app).post('/oauth/authorize/decision').send({ ...decision, code_challenge_method: 'plain' }).expect(400);
+    expect(mockCreateAuthorizationCode).not.toHaveBeenCalled();
+  });
+  it.each(['client_id'])('requires the original %s at token exchange', async field => {
+    const body: Record<string, string> = { grant_type: 'authorization_code', code: 'one-time-code',
+      client_id: 'hermes', redirect_uri: redirect, code_verifier: 'verifier' };
+    delete body[field];
+    await request(app).post('/oauth/token').type('form').send(body).expect(400);
+    expect(mockCreateTokenPair).not.toHaveBeenCalled();
+  });
+  it('preserves OAuth 2.1 exchange without a redundant redirect_uri', async () => {
+    await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
+      code: 'one-time-code', client_id: 'hermes', code_verifier: 'verifier' }).expect(200);
+    expect(mockConsumeAuthorizationCode).toHaveBeenCalledWith('one-time-code', 'hermes', undefined, 'verifier');
+    expect(mockCreateTokenPair).toHaveBeenCalledWith(expect.objectContaining({ clientId: 'hermes' }));
+  });
+  it.each([
+    { client_id: 'other-client' },
+    { redirect_uri: 'http://127.0.0.1:49153/callback' },
+    { redirect_uri: 'http://localhost:49152/callback' },
+    { redirect_uri: 'http://127.0.0.1:49152/other' },
+  ])('rejects changed callback bindings %p', async changed => {
+    mockConsumeAuthorizationCode.mockResolvedValue(null);
+    await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
+      code: 'one-time-code', client_id: 'hermes', redirect_uri: redirect, code_verifier: 'verifier', ...changed }).expect(400);
+    expect(mockCreateTokenPair).not.toHaveBeenCalled();
+  });
+  it('rejects a client that no longer exists before issuing tokens', async () => {
+    mockGetClient.mockResolvedValue(null);
+    await request(app).post('/oauth/token').type('form').send({ grant_type: 'authorization_code',
+      code: 'one-time-code', client_id: 'hermes', redirect_uri: redirect, code_verifier: 'verifier' }).expect(401);
+    expect(mockCreateTokenPair).not.toHaveBeenCalled();
+  });
+  it('rejects a wrong-type token verifier without invoking the service', async () => {
+    await request(app).post('/oauth/token').send({ grant_type: 'authorization_code',
+      code: 'one-time-code', client_id: 'hermes', redirect_uri: redirect, code_verifier: ['verifier'] }).expect(400);
+    expect(mockConsumeAuthorizationCode).not.toHaveBeenCalled();
+  });
+  it('rejects a duplicate query PKCE challenge at authorization', async () => {
+    await request(app).get('/oauth/authorize').query({ response_type: 'code', ...decision,
+      code_challenge: ['first', 'second'] }).expect(400);
   });
 });

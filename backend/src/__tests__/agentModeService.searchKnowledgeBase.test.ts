@@ -183,7 +183,11 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.message).toContain('Found 2 knowledge base results');
       expect(result.query).toBe('test query');
       expect(result.results).toHaveLength(2);
-      expect(result.totalResults).toBe(2);
+      // ENG-1207: renamed from `totalResults`. A field named "total" carrying a
+      // page count reads as authoritative; this one only ever held what was
+      // RETURNED, so it now says so, and `hasMore` carries the truncation signal.
+      expect(result.returnedResults).toBe(2);
+      expect(result.hasMore).toBe(false);
       expect(result.results[0].content).toBe('Public knowledge content');
       expect(result.results[0].source).toBe('public-knowledge-base');
       expect(result.results[0].fileName).toBe('public-guide.txt');
@@ -205,7 +209,8 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.message).toContain('No knowledge base results found');
       expect(result.query).toBe('test query');
       expect(result.results).toEqual([]);
-      expect(result.totalResults).toBe(0);
+      expect(result.returnedResults).toBe(0);
+      expect(result.hasMore).toBe(false);
     });
 
     it('should handle null/undefined search results', async () => {
@@ -220,7 +225,8 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.success).toBe(true);
       expect(result.message).toContain('No knowledge base results found');
       expect(result.results).toEqual([]);
-      expect(result.totalResults).toBe(0);
+      expect(result.returnedResults).toBe(0);
+      expect(result.hasMore).toBe(false);
     });
 
     it('should map results correctly without taskId', async () => {

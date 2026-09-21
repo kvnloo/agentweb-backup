@@ -39,6 +39,11 @@ function snap(
     medianIterations: 4,
     p90Iterations: 9,
     topClusters: [],
+    // ENG-1312: satisfaction-dimension fields — irrelevant to burn-in, zeroed.
+    concisionAvg: 0,
+    instructionComplianceAvg: 0,
+    unnecessaryPermissionRequestRate: 0,
+    satisfactionDimensionSampleCount: 0,
     computedAt: `${date}T17:45:00.000Z`,
     ...over,
   };

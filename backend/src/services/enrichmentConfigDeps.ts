@@ -3,6 +3,7 @@
 // enrichment tools build the deps the same way (DRY).
 
 import { crmDb } from './db';
+import type { LLMUsageContext } from '../utils/llmService';
 import type {
   ConfigServiceDeps,
   ConfigProcessingDeps,
@@ -28,19 +29,31 @@ function heuristicTypeSuggestion(
   });
 }
 
+/**
+ * ENG-1858: the config-save LLM calls used to meter to "system" because these
+ * deps are built without request context. The saving user is now threaded in per
+ * call (callLLM resolves the ENG-1217 billing subject at metering time).
+ */
+function enrichmentConfigUsageContext(userId?: string): LLMUsageContext {
+  return { userId, feature: 'crm_enrichment_config' };
+}
+
 async function llmInferAliases(
   fields: Array<{ name: string; instruction: string }>,
+  userId?: string,
 ): Promise<Record<string, string | null>> {
   if (fields.length === 0) return {};
   // Lazy import — avoids circular deps + keeps the LLM service out of the
   // hot path for callers that never hit alias inference.
-  const { FIELD_GROUPS } = await import('./enrichmentGroups');
+  const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
   const { createLLMService } = await import('../utils/llmService');
 
   // Build the canonical-field cheat sheet for the system prompt. Grouping
   // by FIELD_GROUPS gives the LLM more context (it understands "Series A"
-  // → funding_stage instead of guessing across groups).
+  // → funding_stage instead of guessing across groups). Enigma card revenue
+  // (ENG-1388) is left out: it is paid per value and only routed by exact name.
   const canonicalCheatsheet = Object.entries(FIELD_GROUPS)
+    .filter(([group]) => group !== CARD_REVENUE_GROUP)
     .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
     .join('\n');
 
@@ -68,16 +81,12 @@ async function llmInferAliases(
       process.env.CRM_ENRICH_V3_ALIAS_MODEL || 'gpt-5-chat-2',
       0.0,
     );
-    // Shadow usage metering (Ship 1): no user in scope here (deps are built
-    // without request context), so usage attributes to "system". Follow-up:
-    // thread userId through ConfigServiceDeps builders if per-user enrichment
-    // attribution is needed.
     const result = await llm.generateJSONContent<Record<string, string | null>>(
       systemPrompt,
       userPrompt,
       'json',
       undefined,
-      { feature: 'enrichment' },
+      enrichmentConfigUsageContext(userId),
     );
     return result ?? {};
   } catch (err) {
@@ -88,16 +97,19 @@ async function llmInferAliases(
 
 async function llmClassifySmartFields(
   fields: Array<{ name: string; instruction: string }>,
+  userId?: string,
 ): Promise<Record<string, SmartFieldClassification>> {
   if (fields.length === 0) return {};
-  const { FIELD_GROUPS } = await import('./enrichmentGroups');
+  const { FIELD_GROUPS, CARD_REVENUE_GROUP } = await import('./enrichmentGroups');
   const { createLLMService: mkLLM } = await import('../utils/llmService');
   const {
     buildSmartFieldClassificationSystemPrompt,
     buildSmartFieldClassificationUserPrompt,
   } = await import('./enrichmentPrompts');
 
+  // Enigma card revenue excluded for the same reason as in llmInferAliases.
   const canonicalFieldList = Object.entries(FIELD_GROUPS)
+    .filter(([group]) => group !== CARD_REVENUE_GROUP)
     .map(([group, cfg]) => `  ${group}: ${cfg.fields.join(', ')}`)
     .join('\n');
 
@@ -110,7 +122,7 @@ async function llmClassifySmartFields(
       buildSmartFieldClassificationUserPrompt(fields),
       'json',
       undefined,
-      { feature: 'enrichment' },
+      enrichmentConfigUsageContext(userId),
     );
     return result ?? {};
   } catch (err) {

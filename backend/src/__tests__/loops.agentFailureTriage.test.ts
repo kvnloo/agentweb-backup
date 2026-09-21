@@ -192,6 +192,9 @@ describe('ENG-820 — the digest states truncation', () => {
       proposals: Array.from({ length: shown }, (_, i) => ({
         payload: { toolName: `tool_${i}`, failures: shown - i },
       })),
+      uncappedProposals: Array.from({ length: shown + truncated }, (_, i) => ({
+        payload: { toolName: `tool_${i}` },
+      })),
       proposalsTruncated: truncated,
     });
   };
@@ -299,6 +302,7 @@ describe('ENG-820 — mixed classes and non-tool proposals', () => {
         { payload: { occurrences: 4, sessionIds: [], directive: 'x' } },
         ...Array.from({ length: 8 }, (_, i) => ({ payload: { toolName: `t${i}`, failures: 9 - i } })),
       ],
+      uncappedProposals: Array.from({ length: 13 }, (_, i) => ({ payload: { toolName: `t${i}` } })),
       proposalsTruncated: 5,
     });
 
@@ -428,124 +432,9 @@ describe('ENG-820 — a non-actionable majority never hides an actionable minori
   });
 });
 
-/**
- * Greptile round 5 — and the end of a sequence. Rounds 3, 4 and 5 were all the
- * same mistake at different depths: collapse a tool's failures to one "dominant"
- * class, then describe the whole cohort using that class's remedy.
- *
- * 10 config + 8 bug became an 18-failure CONFIG proposal asserting "not a
- * handler bug" — overstating the config impact and leaving 8 real bugs with no
- * remediation. The fix is structural rather than another patch: one proposal per
- * actionable class, so every number and every sentence describes exactly one
- * cohort.
- */
-/**
- * Mixed actionable cohorts (Greptile rounds 5 and 6).
- *
- * An earlier revision emitted one proposal PER actionable class, which described
- * each cohort exactly. It was reverted: `sourceRuleId` is the cooldown key —
- * `CooldownRuleSet` matches it exactly against persisted learning records — so
- * class-qualifying it orphans every historical record and re-dispatches tools
- * that are deliberately on cooldown. That is a persistence-semantics change,
- * not a digest change, and it is tracked as ENG-937.
- *
- * What is kept here: the dominant actionable class drives the remedy, and every
- * other actionable cohort is NAMED, so nothing is silently folded into another
- * class's count.
- */
-describe('ENG-820 — mixed actionable cohorts stay visible under one tool identity', () => {
-  const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
-
-  const mixed = (tool: string) => [
-    ...toolEvents(tool, 30, 10, 'config', 'auth', 'token expired — reconnect'),
-    ...toolEvents(tool, 0, 8, 'bug', 'TypeErrorClass', 'TypeError: boom'),
-  ];
-
-  it('emits exactly one proposal per tool, keyed at tool level', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults'), WINDOW);
-    const mine = proposals.filter((p: any) => p.payload?.toolName === 'two_faults');
-
-    expect(mine).toHaveLength(1);
-    // Tool-level identity — the cooldown key must keep matching history.
-    expect((mine[0] as any).sourceRuleId).toBe('tool-failure:two_faults');
-  });
-
-  it('gives the minority cohort its own ACTION, not just a mention', async () => {
-    // Round 7: naming a cohort is not dispatching it. Resolving the account for
-    // the 10 config failures must not close out 8 recurring handler bugs that
-    // were never assigned an action.
-    const proposals = await rules().evaluate(mixed('two_faults_act'), WINDOW);
-    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults_act');
-    expect(found).toBeDefined();
-    const p: any = found.payload;
-
-    expect(p.failureType).toBe('config');
-    expect(p.directive).toMatch(/8 bug failure\(s\)/);
-    expect(p.directive).toMatch(/investigate the "two_faults_act" handler/i);
-    expect(p.directive).toMatch(/do not close this out after the first remedy/i);
-  });
-
-  it('gives a secondary CONFIG cohort the account action, not a handler one', async () => {
-    // Mirror case: bug dominant, config minority. The secondary instruction has
-    // to match its own class or it misdirects exactly like the primary once did.
-    const events = [
-      ...toolEvents('bug_major', 30, 12, 'bug', 'TypeErrorClass', 'TypeError: boom'),
-      ...toolEvents('bug_major', 0, 7, 'config', 'auth', 'token expired'),
-    ];
-
-    const proposals = await rules().evaluate(events, WINDOW);
-    const found: any = proposals.find((x: any) => x.payload?.toolName === 'bug_major');
-    expect(found).toBeDefined();
-    const p: any = found.payload;
-
-    expect(p.failureType).toBe('bug');
-    expect(p.directive).toMatch(/7 configuration\/credential failure\(s\)/);
-    expect(p.directive).toMatch(/reconnect or re-authorise/i);
-  });
-
-  it('adds no secondary section when there is only one cohort', async () => {
-    const events = toolEvents('single_class', 30, 10, 'bug', 'TypeErrorClass', 'TypeError');
-
-    const proposals = await rules().evaluate(events, WINDOW);
-    const found: any = proposals.find((x: any) => x.payload?.toolName === 'single_class');
-    expect(found).toBeDefined();
-    const p: any = found.payload;
-
-    expect(p.directive).not.toMatch(/ALSO has other failure classes/i);
-  });
-
-  it('names the minority cohort instead of hiding it inside another class', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults2'), WINDOW);
-    const prop: any = proposals.find((p: any) => p.payload?.toolName === 'two_faults2');
-
-    expect(prop.payload.failureType).toBe('config');
-    expect(prop.hypothesis).toContain('8 bug');
-    expect(prop.payload.otherActionableClasses).toContain('8 bug');
-  });
-
-  it('keeps the remedy internally consistent with the class it names', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults3'), WINDOW);
-    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults3');
-    expect(found).toBeDefined();
-    const p: any = found.payload;
-
-    expect(p.topErrorClass).toBe('auth');
-    expect(p.directive).toContain('token expired');
-    expect(p.directive).not.toContain('TypeError');
-  });
-
-  it('sizes the config remedy on the config cohort, not the combined total', async () => {
-    // The round-5 defect: 10 config + 8 bug rendered as an 18-failure config
-    // fix. The directive must quantify the cohort it is advising on.
-    const proposals = await rules().evaluate(mixed('two_faults4'), WINDOW);
-    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults4');
-    expect(found).toBeDefined();
-    const p: any = found.payload;
-
-    expect(p.directive).toContain('10/30');
-    expect(p.directive).not.toContain('18/30');
-  });
-});
+// ENG-937 supersedes the old single-tool-proposal assertions. Per-class
+// evidence and historical cooldown compatibility are covered in
+// loops.agentFailureClasses.test.ts.
 
 /**
  * Ties must resolve on the data, not on arrival order.

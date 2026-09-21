@@ -179,7 +179,21 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = await retrieveTokenSession(tokenSessionId, userId, 'gmail');
+  let session;
+  try {
+    session = await retrieveTokenSession(tokenSessionId, userId, 'gmail');
+  } catch (error: any) {
+    // ENG-965: a genuine failure consuming the one-time-use session (not a "not found /
+    // already used" outcome — that returns null, handled below) must never surface as an
+    // unhandled rejection / generic 500, and must never happen to leak `error` details that
+    // could contain token material.
+    console.error('[Gmail OAuth /connect] failed to consume token session', error);
+    const details = IS_PRODUCTION ? undefined : error.message;
+    return res.status(503).json({
+      error: 'Temporarily unable to complete the Gmail connection. Please try again.',
+      ...(details && { details }),
+    });
+  }
   if (!session) {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }

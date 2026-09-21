@@ -108,6 +108,21 @@ describe('ActivationAnalysisCron', () => {
         expect(batchCreateArgs).toHaveLength(4);
     });
 
+    // ENG-1907: a sandbox account never finishes brand onboarding by design, so without
+    // this it would be synced into the internal CRM list as a "stuck" customer and nudged.
+    it('never syncs a sandbox (eval_) principal into the CRM lead list', async () => {
+        mockUserDb.getAllUsers.mockResolvedValue([
+            { userId: 'u1', email: 'user1@test.com', createdAt: RECENT_DATE, chatSessionCount: 0 } as any,
+            { userId: 'eval_4c4c4c4c-0000-4000-8000-000000000000', email: 'candidate@example.invalid', createdAt: RECENT_DATE, chatSessionCount: 0 } as any,
+        ]);
+
+        await runActivationAnalysis();
+
+        expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
+        const [, leads] = mockCrmDb.batchCreateLeads.mock.calls[0];
+        expect(leads.map((l: any) => l.email)).toEqual(['user1@test.com']);
+    });
+
     it('should use lastLoginTime for lastActiveDate when available', async () => {
         const loginTime = '2026-03-20T12:00:00Z';
         mockUserDb.getAllUsers.mockResolvedValue([

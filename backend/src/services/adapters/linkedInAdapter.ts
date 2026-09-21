@@ -1,7 +1,21 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
+import { isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 import { getLinkedInConfig } from '../../config/integrations';
+
+// ENG-1300: these rethrows replace LinkedIn's original axios error with a
+// friendlier message, which previously discarded the numeric HTTP status —
+// the classifier's message-text fallback catches some of these phrasings
+// ("permission to X", "rate limit exceeded") but not others ("access token
+// expired" matches no heuristic), silently misclassifying a well-understood
+// 401/403/429 as a generic bug. Attaching the code hardens all of them
+// against both today's gaps and future message wording changes.
+function rethrowWithCode(message: string, code?: number): never {
+  const err: any = new Error(message);
+  if (typeof code === 'number') err.code = code;
+  throw err;
+}
 
 /**
  * LinkedIn Adapter Implementation
@@ -82,7 +96,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
@@ -109,8 +123,25 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         }
       }
 
-      // Create post (with or without images)
-      const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
+      // ENG-827: the image uploads above are network round-trips that can take a
+      // while, and the dispatcher's consent check ran BEFORE this method was entered.
+      // Re-check here — the last point at which nothing is public yet. An owner who
+      // revoked during the upload stops the post; an already-uploaded image is an
+      // unreferenced asset, not a publication.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning post — publish consent was withdrawn during media upload.');
+        return { success: false, message: withdrawn.error };
+      }
+
+      // Create post (with or without images). The hook goes down with it: a post that
+      // carries a URL and no image builds a link preview first — OG discovery, possibly
+      // a headless browser, a thumbnail upload — so the check above is not the last
+      // moment for that shape. linkedInService re-runs it at the request itself.
+      const postUrn = await linkedInService.createPost(
+        token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined,
+        assertStillAuthorized
+      );
 
       // Store post in database for both personal and company page accounts
       if (userId && (config.account_type === 'personal' || config.account_type === 'company_page')) {
@@ -140,24 +171,39 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       
       return result;
     } catch (error: any) {
+      // A consent withdrawn while the preview was being built is a deliberate stop,
+      // not a platform fault — report it as the refusal the caller already handles
+      // rather than letting it surface as a LinkedIn error someone might retry.
+      if (isPublishConsentWithdrawn(error)) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning post — publish consent was withdrawn before the write.');
+        return { success: false, message: error.message };
+      }
       // Rate limit handling
       if (error.response?.status === 429) {
-        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+        rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       throw error;
     }
   }
 
-  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult> {
+  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const actorUrn = account.account_id; // The account creating the comment
 
     try {
       // Get valid token (refreshes if expired)
       const { token } = await this.getValidToken(account, userId);
+
+      // ENG-827: the token refresh above is a network round-trip taken on a consent
+      // decision read before it. This is the last moment before the comment is public.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning comment — publish consent was withdrawn during the token refresh.');
+        return { success: false, message: withdrawn.error };
+      }
 
       // Create comment
       const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn);
@@ -171,18 +217,18 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     } catch (error: any) {
       // Rate limit handling
       if (error.response?.status === 429) {
-        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+        rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account in Settings → Connected Accounts.');
+        rethrowWithCode('LinkedIn access token expired. Please reconnect your account in Settings → Connected Accounts.', 401);
       }
       if (error.response?.status === 403) {
         const linkedInMsg = error.response?.data?.message || '';
         const isCompanyPage = config.account_type === 'company_page';
         if (isCompanyPage) {
-          throw new Error(`Permission denied for company page "${account.account_name}". LinkedIn requires the organization to be enrolled in Community Management to comment as a company page. Please disconnect and reconnect the company page in Settings → Connected Accounts, or try commenting from a personal account instead. LinkedIn error: ${linkedInMsg}`);
+          rethrowWithCode(`Permission denied for company page "${account.account_name}". LinkedIn requires the organization to be enrolled in Community Management to comment as a company page. Please disconnect and reconnect the company page in Settings → Connected Accounts, or try commenting from a personal account instead. LinkedIn error: ${linkedInMsg}`, 403);
         }
-        throw new Error(`Permission denied. Make sure your account has permission to comment on this post. LinkedIn error: ${linkedInMsg}`);
+        rethrowWithCode(`Permission denied. Make sure your account has permission to comment on this post. LinkedIn error: ${linkedInMsg}`, 403);
       }
       throw error;
     }
@@ -194,17 +240,25 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       return await linkedInService.getComments(token, postUrn);
     } catch (error: any) {
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       throw error;
     }
   }
 
-  async createRepost(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult> {
+  async createRepost(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const authorUrn = account.account_id;
 
     try {
       const { token } = await this.getValidToken(account, userId);
+
+      // ENG-827: the token refresh above is a network round-trip taken on a consent
+      // decision read before it. This is the last moment before the repost is public.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning repost — publish consent was withdrawn during the token refresh.');
+        return { success: false, message: withdrawn.error };
+      }
 
       const repostUrn = await linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary);
 
@@ -216,13 +270,13 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       };
     } catch (error: any) {
       if (error.response?.status === 429) {
-        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+        rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       if (error.response?.status === 403) {
-        throw new Error('Permission denied. The original post may have sharing disabled, or your account lacks permission to repost it.');
+        rethrowWithCode('Permission denied. The original post may have sharing disabled, or your account lacks permission to repost it.', 403);
       }
       throw error;
     }
@@ -260,13 +314,13 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     } catch (error: any) {
       // Rate limit handling
       if (error.response?.status === 429) {
-        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+        rethrowWithCode('LinkedIn rate limit exceeded. Please try again later.', 429);
       }
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', 401);
       }
       if (error.response?.status === 403) {
-        throw new Error('Permission denied. Make sure your account has permission to react to this post.');
+        rethrowWithCode('Permission denied. Make sure your account has permission to react to this post.', 403);
       }
       throw error;
     }
@@ -456,7 +510,19 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         if (error?.message?.includes('deactivated')) {
           throw error;
         }
-        throw new Error('Failed to authenticate with LinkedIn. Please reconnect your account.');
+        // getValidToken can also propagate a ConnectedAccountChanged-coded
+        // error (a conditional-write race, not an auth failure) or a raw
+        // config-load failure (getLinkedInConfig() throws OUTSIDE its own
+        // try/catch, so that shape reaches here uncategorized) — neither is
+        // "please reconnect", so only relabel the specific messages
+        // getValidToken actually uses for a genuine token/auth failure
+        // (positive match, not "everything except deactivated").
+        const isTokenAuthFailure = typeof error?.message === 'string'
+          && error.message.includes('access token expired');
+        if (!isTokenAuthFailure) {
+          throw error;
+        }
+        rethrowWithCode('Failed to authenticate with LinkedIn. Please reconnect your account.', 401);
       }
 
       const fetchedMetrics = await Promise.all(
@@ -605,11 +671,16 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         
         const msgLower = msg.toLowerCase();
         if (status === 403 || msgLower.includes('permission denied') || msgLower.includes('scope') || msgLower.includes('access denied')) {
-          throw new Error(`Analytics permissions are missing. ${msg || 'Please reconnect your LinkedIn account to enable analytics.'}`);
+          // Only forward `status` when the API actually returned it — the
+          // message-heuristic branches (msgLower matches) can fire on a
+          // status LinkedIn never sent, and fabricating 403 here would be
+          // exactly the wrong-business-code trap this project has been
+          // careful to avoid elsewhere.
+          rethrowWithCode(`Analytics permissions are missing. ${msg || 'Please reconnect your LinkedIn account to enable analytics.'}`, status);
         }
-        
+
         if (status === 401 || msg.includes('expired')) {
-          throw new Error('LinkedIn access token expired. Please reconnect your account.');
+          rethrowWithCode('LinkedIn access token expired. Please reconnect your account.', status);
         }
 
         // For other errors, return empty metrics instead of failing hard
@@ -667,7 +738,15 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       if (error?.message?.includes('deactivated')) {
         throw error; // Re-throw deactivated app errors
       }
-      throw new Error('Failed to authenticate with LinkedIn. Please reconnect your account.');
+      // Only relabel a genuine token/auth failure — see the matching comment
+      // above in getPostMetrics for why this can't be "everything except
+      // deactivated" (ConnectedAccountChanged, config-load failures).
+      const isTokenAuthFailure = typeof error?.message === 'string'
+        && error.message.includes('access token expired');
+      if (!isTokenAuthFailure) {
+        throw error;
+      }
+      rethrowWithCode('Failed to authenticate with LinkedIn. Please reconnect your account.', 401);
     }
 
     const fetchedAt = new Date().toISOString();

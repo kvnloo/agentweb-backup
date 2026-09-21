@@ -51,6 +51,7 @@ describe('EmailEventsDb', () => {
           data: mockEvent.data,
           processedAt: expect.any(String),
         }),
+        ConditionExpression: 'attribute_not_exists(eventId)',
       });
 
       expect(result).toEqual(expect.objectContaining({
@@ -355,6 +356,38 @@ describe('EmailEventsDb', () => {
       await expect(
         emailEventsDb.addEmailEvent(mockEvent as any, 'example.com', 'event-123')
       ).rejects.toThrow('DynamoDB put error');
+    });
+
+    // ENG-720: two concurrent deliveries of the same webhook eventId can both
+    // pass the caller's getEventById existence check before either write
+    // lands. The conditional put makes the second writer lose atomically
+    // instead of silently overwriting the first writer's row (and its
+    // hardBounceFlagPending marker).
+    it('surfaces a ConditionalCheckFailedException as a distinguishable duplicate error', async () => {
+      const mockEvent = {
+        type: 'email.bounced',
+        created_at: '2025-01-01T00:00:00.000Z',
+        data: {
+          email_id: 'email-123',
+          from: 'sender@example.com',
+          to: ['test@example.com'],
+          subject: 'Test Email',
+        },
+      };
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+
+      mockDynamodb.put.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(conditionalError),
+      } as any);
+
+      await expect(
+        emailEventsDb.addEmailEvent(mockEvent as any, 'example.com', 'event-123', undefined, true)
+      ).rejects.toMatchObject({ isDuplicateEventId: true });
+
+      expect(mockDynamodb.put).toHaveBeenCalledWith(
+        expect.objectContaining({ ConditionExpression: 'attribute_not_exists(eventId)' }),
+      );
     });
   });
 

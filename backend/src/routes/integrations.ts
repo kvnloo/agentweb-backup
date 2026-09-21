@@ -30,15 +30,24 @@ const router = express.Router();
  *
  * Mounted with express.raw() in app.ts (BEFORE express.json) so req.body is the raw Buffer —
  * required to verify Linear's HMAC-SHA256 `linear-signature` over the exact payload bytes.
- * Set LINEAR_WEBHOOK_SECRET to enforce the signature (skipped only if unset, e.g. local);
- * verification runs before ANY event handling, both jobs included.
+ * Set LINEAR_WEBHOOK_SECRET to enforce the signature. Fail-closed (ENG-1754): if it is
+ * unset, the endpoint returns 503 rather than processing an unverified payload — a
+ * config regression or a self-hoster who forgot the variable can no longer silently
+ * open the webhook to forged Issue/state-transition events that trigger customer comms.
+ * Verification runs before ANY event handling, both jobs included.
  */
 router.post('/linear/webhook', async (req, res) => {
   try {
     const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
 
-    const secret = process.env.LINEAR_WEBHOOK_SECRET || '';
-    if (secret) {
+    const secret = (process.env.LINEAR_WEBHOOK_SECRET || '').trim();
+    if (!secret) {
+      console.error(
+        '[linear-webhook] LINEAR_WEBHOOK_SECRET is not set — refusing to process the payload (fail-closed, ENG-1754)',
+      );
+      return res.status(503).json({ error: 'Service temporarily unavailable' });
+    }
+    {
       const sig = req.header('linear-signature') || '';
       const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
       const ok =
@@ -73,6 +82,10 @@ router.post('/linear/webhook', async (req, res) => {
       payload?.data?.id;
 
     if (transitionedIntoDone) {
+      // ENG-1268's pre-flight verification gate (require a structured customer-symptom-check
+      // comment before the resolve bridge could fire) is deliberately removed (Harsha, 2026-08-25:
+      // "i don't give a shit about closure risk anymore its annoying, torch it"). Any transition
+      // into Done fires the resolve bridge, exactly like a non-customer-reported issue always did.
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });

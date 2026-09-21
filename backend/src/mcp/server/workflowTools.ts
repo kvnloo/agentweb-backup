@@ -34,6 +34,7 @@
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
+import { resolveClientScopedContext } from './adminClientScope';
 
 /**
  * Read one profile section.
@@ -167,6 +168,7 @@ mcpToolRegistry.register({
 
     return jsonResult({
       task_id: taskId,
+      ...(typeof data?.runId === 'string' && data.runId ? { run_id: data.runId } : {}),
       status,
       // Confirmed only when we actually verified it: a synchronous return IS
       // the completion signal, but only once the session read has ruled out a
@@ -177,7 +179,7 @@ mcpToolRegistry.register({
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
         : stillBuilding
-          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
+          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id and run_id if returned — an idle session or detached_still_building record does not confirm completion.'
           : confirmationFailed
             ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_session with session_id set to this task_id to check.'
             : undefined,
@@ -229,14 +231,29 @@ mcpToolRegistry.register({
     name: 'emma_get_account_status',
     description:
       "Get this account's plan, usage, and remaining quota. " +
-      'Call this when a tool returns a quota error, to see how much allowance is left.',
-    inputSchema: { type: 'object', properties: {} },
+      'Call this when a tool returns a quota error, to see how much allowance is left. ' +
+      "Admin-only: pass client_id to check a specific client's status instead of the caller's own.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_id: {
+          type: 'string',
+          description:
+            "Admin-only. Scope this call to a specific client's account instead of the caller's own — accepts the client's email or userId. Non-admin callers are rejected.",
+        },
+      },
+    },
   },
-  execute: async (_args: any, context: any) => {
-    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: ctx(context) });
+  /** Reports the caller's own account status, or (admin-only) `args.client_id`'s. */
+  execute: async (args: any, context: any) => {
+    const me: any = await mcpFetch({ method: 'GET', path: '/api/auth/me', context: await resolveClientScopedContext(context, args?.client_id, 'emma_get_account_status') });
     return jsonResult({
       email: me?.email,
       plan: me?.subscriptionType ?? me?.plan ?? null,
+      // Not also requiring hasDesignSystem — see ProtectedRoute.tsx's
+      // ENG-328 comment: every account onboarded before that step existed
+      // would otherwise report is_onboarded:false despite being fully
+      // onboarded under the rules that applied when they signed up.
       is_onboarded: me?.hasBrandGuidelines ?? null,
       usage: me?.tokenUsage ?? null,
     });

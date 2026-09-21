@@ -23,6 +23,42 @@ import {
 import type { EnrichSoEndpoint } from './enrichSoCacheKeys';
 import { crmDb } from './db';
 import { getEnrichSoApiKey } from '../utils/secretsManager';
+import { recordVendorUsage } from './usageRecorderService';
+
+// ─── Vendor $ ledger mirroring (ENG-696) ───────────────────────────────────
+//
+// Distinct from the DynamoDB quota tracker below (call-count only, no $).
+// Each HTTP wrapper method mirrors ITS successful call into the SAME ledger
+// recordUsage/recordVendorUsage writes to, at the exact point the call
+// reaches the vendor. A call with no resolvable userId still records,
+// attributed to the platform (recordVendorUsage defaults userId to "system").
+// `reverse` (lookup-by-email) is deliberately its own rate key — its
+// route-level daily cap (50/day) vs 1000/day for find/validate implies a
+// materially different unit cost (see enrichSoQuota.ts).
+const ENRICHSO_RATE_KEY: Record<EnrichSoEndpoint, string> = {
+  validate: 'email_validation',
+  find: 'email_lookup',
+  reverse: 'reverse_lookup',
+};
+const ENRICHSO_RATE_UNIT: Record<EnrichSoEndpoint, string> = {
+  validate: 'validation',
+  find: 'lookup',
+  reverse: 'lookup',
+};
+
+function recordEnrichSoLedger(endpoint: EnrichSoEndpoint, userId: string | undefined): void {
+  const rateKey = ENRICHSO_RATE_KEY[endpoint];
+  void recordVendorUsage({
+    userId,
+    provider: 'enrich.so',
+    operation: rateKey,
+    feature: 'crm_enrichment',
+    unit: ENRICHSO_RATE_UNIT[endpoint],
+    quantity: 1,
+    // ENG-1929: priced inside the recorder — never thrown into the enrich.so call.
+    rateKey,
+  });
+}
 
 const ENRICHSO_BASE_URL = 'https://dev.enrich.so/api/v3';
 const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
@@ -36,36 +72,47 @@ function buildHttpClient(apiKey: string): EnrichSoHttpClient {
   });
 
   return {
-    async validateEmail(email) {
+    async validateEmail(email, userId) {
       const r = await client.post('/email-validation', { email });
+      recordEnrichSoLedger('validate', userId);
       return r.data;
     },
-    async findEmail(input) {
+    async findEmail(input, userId) {
       try {
         const r = await client.post('/email-finder', input);
+        recordEnrichSoLedger('find', userId);
         return r.data;
       } catch (err: any) {
         // Translate 404 to the same shape the service's negative classifier
         // recognizes (`apiData.found === false`) so a confirmed not-found
         // goes into the 7d negative cache instead of the 1h error bucket.
         // Without this we'd re-hit the API every hour for every
-        // known-not-found name.
+        // known-not-found name. The call still reached the vendor and is
+        // billed, so it still records (AC1/AC5 distinguish endpoint, not
+        // found/not-found).
         const status = err?.response?.status;
-        if (status === 404) return { found: false };
+        if (status === 404) {
+          recordEnrichSoLedger('find', userId);
+          return { found: false };
+        }
         throw err;
       }
     },
-    async reverseLookup(email) {
+    async reverseLookup(email, userId) {
       try {
         const r = await client.post('/reverse-lookup/lookup', { email });
+        recordEnrichSoLedger('reverse', userId);
         return r.data;
       } catch (err: any) {
         // Translate 404 to a success:false envelope so the cache-first wrapper
         // routes it into the 7d not_found bucket instead of the 1h error bucket.
         // Without this, every miss costs 168x more cache slots and re-hits the
-        // API every hour for known-not-found emails.
+        // API every hour for known-not-found emails. Still a billed vendor hit.
         const status = err?.response?.status;
-        if (status === 404) return { success: false, error: { code: 'NOT_FOUND' } };
+        if (status === 404) {
+          recordEnrichSoLedger('reverse', userId);
+          return { success: false, error: { code: 'NOT_FOUND' } };
+        }
         throw err;
       }
     },

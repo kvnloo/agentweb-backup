@@ -35,6 +35,20 @@ export interface CustomDomainRecord {
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
+
+  /**
+   * Whether the domain actually SERVES, written by the hourly reachability sweep (ENG-1839).
+   *
+   * Deliberately separate from `status`. That field is the Vercel VERIFICATION state, owned by
+   * addCustomDomain / addSubdomain / verifyDomain, and `getProjectDomain` selects on it — so
+   * writing a reachability verdict there makes a live custom domain render as "not configured"
+   * in the portal after a few transient 5xx responses from the customer's own site.
+   */
+  reachabilityStatus?: "reachable" | "unreachable";
+  reachabilityError?: string;
+  lastReachabilityCheckAt?: string;
+  /** Consecutive non-reachable probes. A success resets it to 0. */
+  consecutiveFailures?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,8 +56,61 @@ export interface CustomDomainRecord {
 // ---------------------------------------------------------------------------
 
 /**
+ * Conservative FQDN ceiling for certificate issuance.
+ *
+ * MEASURED (ENG-1839): FQDNs of 28/34/57/59 characters serve fine; two separate 77-character
+ * FQDNs fail the TLS handshake outright while DNS resolves. No existing subdomain falls
+ * between 60 and 76, so the true boundary is somewhere in that gap and is NOT pinned.
+ *
+ * 64 is chosen because it is the X.509 Common Name upper bound (RFC 5280) and is consistent
+ * with every observation — but treat that as a working hypothesis, not an established cause.
+ * Let's Encrypt omits the CN for long names and relies on SAN, which would argue against it,
+ * so the real constraint may lie elsewhere in Vercel's issuance path.
+ *
+ * Erring low is deliberate. Rejecting a name that would have worked produces a clear,
+ * immediate, recoverable error; accepting one that does not produces a silently unreachable
+ * page whose record still reads `deployed` — the failure this ticket exists to stop, and one
+ * that went unnoticed on live customer sites for months.
+ *
+ * If the boundary is ever measured properly, raise this and keep the asymmetry.
+ */
+const MAX_CERT_CN_LENGTH = 64;
+const MAX_DNS_LABEL_LENGTH = 63;
+
+/**
+ * Longest label that still yields a certifiable FQDN under `base`.
+ *
+ * Parameterised because the base is NOT always SUBDOMAIN_BASE: setPageSubdomain issues certs
+ * under the customer's own domain. Validating that path against SUBDOMAIN_BASE would both
+ * miss over-length FQDNs on long customer domains and falsely reject legal ones on short
+ * domains, with an error naming a domain the user never mentioned.
+ *
+ * Math.max(1, …) matters: a base of 63+ characters drives the CN term to zero or negative,
+ * and a negative length would flow into String.slice, which treats it as an offset from the
+ * end rather than erroring — silently producing a leading-hyphen label.
+ */
+function maxLabelLengthFor(base: string): number {
+  return Math.max(
+    1,
+    Math.min(MAX_DNS_LABEL_LENGTH, MAX_CERT_CN_LENGTH - 1 - base.length)
+  );
+}
+
+/** The ceiling for MANAGED subdomains (SUBDOMAIN_BASE). Other bases: maxLabelLengthFor. */
+export const MAX_SUBDOMAIN_LABEL_LENGTH = maxLabelLengthFor(SUBDOMAIN_BASE);
+
+/**
+ * Truncate a label to `max`, dropping any trailing hyphen the cut leaves behind — a trailing
+ * hyphen is rejected by validateSubdomain's own pattern.
+ */
+function truncateLabel(label: string, max: number = MAX_SUBDOMAIN_LABEL_LENGTH): string {
+  return label.slice(0, Math.max(0, max)).replace(/-+$/, "");
+}
+
+/**
  * Generate a clean subdomain slug from a brand/page name.
- * Strips special characters, lowercases, and truncates to 63 chars (DNS limit).
+ * Strips special characters, lowercases, and truncates to a length whose FQDN can be
+ * certificated (see MAX_SUBDOMAIN_LABEL_LENGTH).
  */
 export function generateSubdomain(name: string): string {
   if (!name || !name.trim()) {
@@ -61,22 +128,34 @@ export function generateSubdomain(name: string): string {
     return `page-${uuidv4().slice(0, 8)}`;
   }
 
-  return slug.slice(0, 63);
+  return truncateLabel(slug) || `page-${uuidv4().slice(0, 8)}`;
 }
 
 /**
- * Validate a subdomain string (alphanumeric + hyphens, 1-63 chars).
+ * Validate a subdomain string (alphanumeric + hyphens, length bounded so the resulting
+ * FQDN can actually receive a certificate).
  */
-function validateSubdomain(subdomain: string): void {
+function validateSubdomain(subdomain: string, base: string = SUBDOMAIN_BASE): void {
   if (!subdomain || subdomain.length === 0) {
     throw new Error("Invalid subdomain: cannot be empty");
   }
-  if (subdomain.length > 63) {
-    throw new Error("Invalid subdomain: exceeds 63 character limit");
-  }
+  // Charset before length: a name typed with spaces or punctuation is the common mistake, and
+  // reporting it as a length problem sends the user to fix the wrong thing.
   if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(subdomain)) {
     throw new Error(
       "Invalid subdomain: must contain only lowercase letters, numbers, and hyphens"
+    );
+  }
+  const maxLabel = maxLabelLengthFor(base);
+  if (subdomain.length > maxLabel) {
+    const fqdnLength = subdomain.length + 1 + base.length;
+    // Bound the echo — this message is returned to the browser and logged, and the raw value
+    // is unbounded user input.
+    const shown = subdomain.length > 80 ? `${subdomain.slice(0, 80)}…` : subdomain;
+    throw new Error(
+      `Invalid subdomain: "${shown}.${base}" is ${fqdnLength} characters. ` +
+        `Names above ${MAX_CERT_CN_LENGTH} characters have failed SSL certificate issuance, ` +
+        `which leaves the site unreachable. Use at most ${maxLabel} characters.`
     );
   }
 }
@@ -175,8 +254,21 @@ export async function addSubdomain(
           // Domain is on a different project — retry with a suffix
         }
         if (attempt < MAX_RETRIES) {
-          const suffix = Math.random().toString(16).slice(2, 6);
-          finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
+          // Truncate the BASE to leave room for the suffix, rather than truncating the
+          // joined string — the latter can cut into the suffix and destroy the uniqueness
+          // it exists to provide, or leave a trailing hyphen that validateSubdomain rejects.
+          // padEnd: Math.random() can yield a short or empty fractional part ((0).toString(16)
+          // is "0", so .slice(2,6) is ""), which would otherwise emit a trailing hyphen.
+          const suffix = Math.random().toString(16).slice(2, 6).padEnd(4, "0");
+          const stem = truncateLabel(
+            cleanSubdomain,
+            MAX_SUBDOMAIN_LABEL_LENGTH - suffix.length - 1
+          );
+          finalSubdomain = stem ? `${stem}-${suffix}` : suffix;
+          // Assert the rebuilt label BEFORE the next iteration hands it to Vercel. Validating
+          // after the loop would run only once the POST had already succeeded, so a throw
+          // would leave the domain attached to the project with no record written for it.
+          validateSubdomain(finalSubdomain);
           continue;
         }
       }
@@ -186,15 +278,30 @@ export async function addSubdomain(
 
   const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
 
+  // Reuse an existing record for this user+domain rather than writing a second row, matching
+  // addCustomDomain. Without this, any re-add of the same host — a retried repair run, a
+  // re-assignment after a partial failure — silently created a duplicate, and duplicates
+  // perturb both `bestByOwnerProject` tie-breaking in the landing-pages list route and
+  // `getProjectSubdomain`'s `find`, so which row wins becomes arbitrary.
+  const existing = (await listDomains(userId, vercelProjectId)).find(
+    (d) => d.type === "subdomain" && d.domain === fullDomain
+  );
+
   const now = new Date().toISOString();
   const record: CustomDomainRecord = {
-    id: uuidv4(),
+    id: existing?.id ?? uuidv4(),
     userId,
     domain: fullDomain,
     type: "subdomain",
     status: "active", // Subdomains are active immediately (DNS is pre-configured)
     vercelProjectId,
-    createdAt: now,
+    // Carry reachability forward: it is owned by the sweep, and a re-add of the same host must
+    // not silently reset a known-unreachable domain to looking unmonitored.
+    reachabilityStatus: existing?.reachabilityStatus,
+    reachabilityError: existing?.reachabilityError,
+    lastReachabilityCheckAt: existing?.lastReachabilityCheckAt,
+    consecutiveFailures: existing?.consecutiveFailures,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
 
@@ -281,6 +388,14 @@ export async function addCustomDomain(
           domain: v.domain,
           value: v.value,
         })),
+    // Carry reachability forward, exactly as addSubdomain does. This is a full-item put, so
+    // omitting these ERASES them: a customer re-adding an already-confirmed-unreachable domain
+    // would clear the warning and reset the failure count to zero, hiding a known-bad state
+    // behind an ordinary user action.
+    reachabilityStatus: existing?.reachabilityStatus,
+    reachabilityError: existing?.reachabilityError,
+    lastReachabilityCheckAt: existing?.lastReachabilityCheckAt,
+    consecutiveFailures: existing?.consecutiveFailures,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -528,7 +643,9 @@ export async function setPageSubdomain(
   mainDomain: string
 ): Promise<{ fullDomain: string }> {
   const cleanPrefix = subdomainPrefix.toLowerCase().trim();
-  validateSubdomain(cleanPrefix);
+  // Validate against the domain the cert will actually cover, not SUBDOMAIN_BASE — this path
+  // issues under the customer's own `mainDomain`.
+  validateSubdomain(cleanPrefix, mainDomain);
 
   const fullDomain = `${cleanPrefix}.${mainDomain}`;
   const headers = await getVercelHeaders();

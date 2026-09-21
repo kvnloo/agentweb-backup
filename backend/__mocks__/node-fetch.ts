@@ -9,7 +9,9 @@
 // guard, so in-process/local calls behave exactly as before.
 import { assertLocalOrAllowed } from '../src/__tests__/networkEgressGuard';
 
-const realNodeFetch = jest.requireActual('node-fetch');
+// requireActual still applies moduleNameMapper. Use the installed v2 CJS entry
+// so '^node-fetch$' cannot resolve this wrapper again with partial exports.
+const realNodeFetch = jest.requireActual('node-fetch/lib/index.js');
 const realFetchFn: (url: unknown, init?: unknown) => unknown =
   typeof realNodeFetch === 'function' ? realNodeFetch : realNodeFetch.default;
 

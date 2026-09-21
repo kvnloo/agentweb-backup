@@ -29,6 +29,16 @@ jest.mock('../services/db', () => ({
 }));
 
 const mockGeminiCreate = jest.fn();
+const mockGetClientForModel = jest.fn().mockResolvedValue({
+  chat: { completions: { create: mockGeminiCreate } },
+});
+const mockCallLLM = jest.fn(async (model: string, messages: unknown[], options: Record<string, any> = {}) => {
+  const client = await mockGetClientForModel(model);
+  return client.chat.completions.create(
+    { model, messages, ...options },
+    { timeout: options.timeoutMs },
+  );
+});
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     youSearchWeb: jest.fn(),
@@ -40,18 +50,9 @@ jest.mock('../services/agentModeService', () => ({
         },
       },
     }),
-    getClientForModel: jest.fn().mockResolvedValue({
-      chat: {
-        completions: {
-          create: mockGeminiCreate,
-        },
-      },
-    }),
+    getClientForModel: mockGetClientForModel,
+    callLLM: mockCallLLM,
   },
-}));
-
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: jest.fn(),
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -93,7 +94,6 @@ import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
-import { meterUserUsage } from '../services/usageRecorderService';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 
@@ -191,7 +191,7 @@ describe('CrmEnrichmentService', () => {
   });
 
   describe('execute - per-user metering (ENG-200)', () => {
-    it('charges the extraction LLM turn to the caller (userId + token counts) via meterUserUsage', async () => {
+    it('charges the extraction LLM turn through the shared gateway usage context', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [createLead({ leadId: 'lead1' })],
@@ -220,12 +220,14 @@ describe('CrmEnrichmentService', () => {
 
       await service.execute(spec);
 
-      expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user1',
-        feature: 'crm_enrichment_extract',
-        inputTokens: 300,
-        outputTokens: 50,
-      }));
+      expect(mockCallLLM).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Array),
+        expect.objectContaining({
+          usageContext: { userId: 'user1', feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
+      );
     });
   });
 
@@ -653,6 +655,49 @@ describe('CrmEnrichmentService', () => {
       expect(allUserMsgs).toContain('LinkedIn');
     });
 
+    it('should not synthesize a fake /in/undefined URL when get-profile returns an anonymized profile (ENG-1198)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        linkedin: 'https://www.linkedin.com/in/existing-url',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: 'Acme',
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // Mirrors what agentModeService's get-profile now returns for an out-of-network
+      // profile viewed via a shared account: public_identifier is Unipile's literal
+      // 'undefined' sentinel, flagged anonymized:true, and public_profile_url dropped.
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({
+        success: true,
+        data: { public_identifier: 'undefined', anonymized: true, headline: 'CTO', usedSharedAccount: true, sharedAccountId: 'shared-1' },
+      });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/existing-url' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find the personal LinkedIn profile URL for {{firstName}} {{lastName}} at {{company}}',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      const allUserMsgs = mockGeminiCreate.mock.calls
+        .map(call => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+        .join('\n---\n');
+      expect(allUserMsgs).not.toContain('in/undefined');
+    });
+
     it('should re-process already-enriched leads when forceOverwrite=true', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [
@@ -1012,6 +1057,55 @@ describe('CrmEnrichmentService', () => {
 
     it('returns false for empty input', () => {
       expect(CrmEnrichmentService.isInstitutionalDomain('')).toBe(false);
+    });
+  });
+
+  describe('isPlaceholderDomain', () => {
+    it('identifies RFC 2606 / 6761 reserved domains and TLDs', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.org')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mail.example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.test')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.invalid')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.localhost')).toBe(true);
+    });
+
+    it('identifies canonical filler domains typed into test rows', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('company.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourcompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mycompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourdomain.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('test.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agenttest.com')).toBe(true);
+    });
+
+    it('is case- and trailing-dot-insensitive', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('  Example.COM. ')).toBe(true);
+    });
+
+    it('does not flag real company domains', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agentweb.pro')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('testflight.apple.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('examplecorp.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('')).toBe(false);
+    });
+
+    it('makes placeholder domains non-business everywhere (ENG-968)', () => {
+      // Folded into the personal/institutional guards so no firmographic path
+      // (Apollo org match, web-search templates, V3 identity) ever treats a
+      // reserved domain as the lead's employer.
+      expect(CrmEnrichmentService.isPersonalDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('queue-verify@example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('test2@company.com')).toBe(true);
+    });
+
+    it('drops the {{emailDomain}} token for placeholder-domain leads', () => {
+      const query = CrmEnrichmentService.applySearchTemplate(
+        '{{emailDomain}} company overview',
+        { leadId: 'l1', email: 'test2@company.com' } as any,
+      );
+      expect(query).toBe('company overview');
     });
   });
 
@@ -1716,6 +1810,18 @@ describe('CrmEnrichmentService template fallback chain', () => {
     });
 
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
+  });
+});
+
+describe('CrmEnrichmentService gateway boundary', () => {
+  it('propagates a timeout without issuing a second local model call', async () => {
+    const timeout = Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' });
+    const call = jest.fn().mockRejectedValue(timeout);
+
+    await expect((CrmEnrichmentService as any).llmCallWithTimeout(call, 'gpt-5-chat-2'))
+      .rejects.toBe(timeout);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(call).toHaveBeenCalledWith('gpt-5-chat-2');
   });
 });
 
@@ -3167,7 +3273,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalled();
     expect(mockGeminiCreate).toHaveBeenCalled();
     // First call is field-alias resolution; Apollo context appears in a later extraction call.
@@ -3194,7 +3300,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
@@ -3312,7 +3418,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('beta.com');
+    expect(matchOrg).toHaveBeenCalledWith('beta.com', { userId: 'user-1' });
   });
 
   it('falls back to web search when Apollo matchOrg rejects', async () => {
@@ -3330,7 +3436,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
@@ -3354,7 +3460,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 });

@@ -1,4 +1,5 @@
 import express, { Request, Response } from "express"; // slack-triggered-session v2
+import { createHmac, timingSafeEqual } from "crypto";
 import { authenticateToken } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getSecret } from "../utils/secretsManager";
@@ -11,13 +12,15 @@ import {
   openRejectModal,
   openTestEmailModal,
   postThreadResponse,
-  postThinkingMessage,
-  deleteSlackMessage,
+  setSlackAssistantStatus,
   getSlackUserDisplayName,
   getSlackUserEmail,
+  getSlackUserTeamId,
+  getOwnSlackTeamId,
   resolveSlackMentionsInText,
   downloadSlackFile,
-  resolveSlackFileUrl
+  resolveSlackFileUrl,
+  postSlackMessage
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -27,6 +30,7 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { renderCitationMarkers } from "../utils/citations";
+import { agentModeService } from '../services/agentModeService';
 
 // ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
 // rides on the response's last assistant message; render as markdown links, which postThreadResponse's
@@ -40,6 +44,101 @@ function citeForSlack(response: any): string {
 }
 
 const router = express.Router();
+
+const activeSlackTurns = new Map<string, number>();
+const SLACK_REQUEST_MAX_AGE_SECONDS = 60 * 5;
+const SLACK_ASSISTANT_STATUS_TIMEOUT_MS = 1_500;
+
+async function setSlackAssistantStatusWithDeadline(
+  channel: string,
+  threadTs: string,
+  status: string,
+): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      setSlackAssistantStatus(channel, threadTs, status),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Slack assistant status request timed out')),
+          SLACK_ASSISTANT_STATUS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function verifySlackRequest(req: Request): boolean {
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  // Existing route-level tests intentionally omit Slack credentials. Runtime
+  // deployments fail closed if the signing secret is absent.
+  if (!signingSecret) return process.env.NODE_ENV === 'test';
+
+  const timestampHeader = req.header('x-slack-request-timestamp');
+  const signature = req.header('x-slack-signature');
+  const timestamp = Number(timestampHeader);
+  if (!timestampHeader || !signature || !Number.isFinite(timestamp)
+    || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > SLACK_REQUEST_MAX_AGE_SECONDS) return false;
+
+  const rawBody = (req as any).rawBody instanceof Buffer
+    ? (req as any).rawBody
+    : Buffer.isBuffer(req.body) ? req.body : null;
+  if (!rawBody) return false;
+  const expected = `v0=${createHmac('sha256', signingSecret)
+    .update(`v0:${timestampHeader}:${rawBody.toString('utf8')}`)
+    .digest('hex')}`;
+  const suppliedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return suppliedBuffer.length === expectedBuffer.length && timingSafeEqual(suppliedBuffer, expectedBuffer);
+}
+
+async function claimSlackAssistantStatus(channel: string, threadTs: string): Promise<void> {
+  const key = `${channel}:${threadTs}`;
+  const activeTurns = activeSlackTurns.get(key) || 0;
+  // Claim synchronously before awaiting Slack so concurrent turns cannot both
+  // observe the thread as idle while the first status request is in flight.
+  activeSlackTurns.set(key, activeTurns + 1);
+  if (activeTurns === 0) {
+    try {
+      await setSlackAssistantStatusWithDeadline(channel, threadTs, 'is working...');
+    } catch (error) {
+      console.error('Non-blocking: failed to set Slack assistant thread status:', error);
+    }
+  }
+}
+
+async function releaseSlackAssistantStatus(channel: string, threadTs: string): Promise<void> {
+  const key = `${channel}:${threadTs}`;
+  const remainingTurns = Math.max((activeSlackTurns.get(key) || 1) - 1, 0);
+  if (remainingTurns > 0) {
+    activeSlackTurns.set(key, remainingTurns);
+    return;
+  }
+  activeSlackTurns.delete(key);
+  try {
+    await setSlackAssistantStatusWithDeadline(channel, threadTs, '');
+  } catch (error) {
+    console.error('Non-blocking: failed to clear Slack assistant thread status:', error);
+  }
+}
+
+// ENG-1294: Slack Connect guests (e.g. Argusoft engineers, who work directly in this codebase)
+// can never share our own workspace's team_id — that's what Slack Connect means — so neither the
+// email-domain check nor the own-team_id fallback below can ever authorize them, even though
+// they're legitimately trusted. Slack reliably includes the author's home team on Connect-shared
+// app_mention events via user_team/source_team, delivered directly on the event payload — no
+// extra API call, and no dependency on users.info resolving anything (confirmed empirically:
+// Manan's own test in #agentweb-argusoft on 2026-09-03 got the profile-email field silently
+// omitted exactly as it did for Harsha/Fangfang, but user_team/source_team carried his real home
+// team, T093CUE1WGP, without incident). Comma-separated env override; defaults to Argusoft's team.
+const TRUSTED_EXTERNAL_SLACK_TEAM_IDS = new Set(
+  (process.env.AGENTWEB_TRUSTED_EXTERNAL_SLACK_TEAM_IDS || 'T093CUE1WGP') // Argusoft
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
@@ -70,18 +169,6 @@ async function extractAdminMessageIntent(
   rawMessage: string
 ): Promise<{ targetEmail: string; taskMessage: string } | null> {
   try {
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const apiKey = process.env.GEMINI_API_KEY || (await getSecret(`${environment}/AgentWeb/GeminiAPIKey`));
-    if (!apiKey?.trim()) {
-      console.warn('⚠️ Gemini API key not available, falling back to regex for admin channel parsing');
-      return null;
-    }
-
-    // Metered factory client (shadow usage metering). System context — admin
-    // channel parsing has no single attributable user, so no userId is passed.
-    const { getGeminiClient } = await import('../utils/llmClients');
-    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
-
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
 Message: "${rawMessage}"
@@ -95,15 +182,17 @@ Respond with JSON only, no explanation:
 or if no email found:
 {"targetEmail": null, "taskMessage": null}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const response = await agentModeService.callLLM('gemini-3.1-flash-lite', [
+      { role: 'user', content: prompt },
+    ], {
+      response_format: { type: 'json_object' },
+      // ENG-1858: platform-funded admin-channel parsing — deliberately no userId
+      // (the target user is not known until this call returns).
+      usageContext: { feature: 'platform:slack_admin_intent' },
+      taskClass: 'mcp_api',
     });
 
-    const text = response.text?.trim();
+    const text = response.choices?.[0]?.message?.content?.trim();
     if (!text) return null;
 
     const parsed = JSON.parse(text);
@@ -116,156 +205,6 @@ or if no email found:
   } catch (err) {
     console.error('⚠️ Failed to extract admin message intent via LLM:', err);
     return null;
-  }
-}
-
-/**
- * Helper: handles the full slack triggered session flow for non-Emma messages.
- * Triages message, creates session, generates Emma response, emails founders.
- * Does NOT post to Slack — email only, so the team can decide how to respond.
- * @param ts For top-level messages: the message's own ts. For thread replies: the thread_ts (root).
- */
-async function handleSlackTriggeredSession(params: {
-  text: string;
-  slackUserId: string;
-  channel: string;
-  ts: string;
-}) {
-  const { text, slackUserId, channel, ts } = params;
-  try {
-    const { userDb } = await import('../services/db');
-    const { chatbotDb } = await import('../services/chatbotService');
-    const { agentModeService } = await import('../services/agentModeService');
-    const { settingsService } = await import('../services/settingsService');
-
-    // Normalize Slack formatting and resolve user mentions to display names
-    const rawMessage = (await resolveSlackMentionsInText(text))
-      .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
-      .replace(/<mailto:([^|>]+)>/g, '$1')
-      .trim();
-
-    if (!rawMessage) return;
-
-    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
-    const senderEmail = await getSlackUserEmail(slackUserId);
-    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
-      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
-      return;
-    }
-
-    // Look up user by slackChannel field (with cache)
-    const mappingKey = `slack_channel_mapping_${channel}`;
-    let user = null;
-
-    const cachedMapping = await settingsService.getSetting(mappingKey);
-    if (cachedMapping?.settingValue) {
-      const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
-      // Skip tombstoned (deleted) users — their userId starts with "deleted_"
-      if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
-        user = cachedUser;
-      }
-    }
-
-    if (!user) {
-      const allUsers = await userDb.getAllUsers();
-      user = allUsers.find((u: any) => userMatchesChannel(u, channel));
-      if (user) {
-        await settingsService.setSetting(
-          mappingKey,
-          user.userId,
-          `Slack channel to userId mapping for channel ${channel}`,
-          'system'
-        );
-      }
-    }
-
-    if (!user) {
-      console.log(`📨 [slack-triggered] channel ${channel} not connected to any user, ignoring`);
-      return;
-    }
-
-    // Respect the per-user opt-out: when suggested replies are disabled, skip the whole flow
-    // (no triage, no session, no email) so we don't generate suggestions for this customer.
-    if (user.slackSuggestedRepliesDisabled) {
-      console.log(`📨 [slack-triggered] suggested replies disabled for user ${user.userId}, skipping`);
-      return;
-    }
-
-    // Triage: does this message need handling?
-    console.log(`📨 [slack-triggered] user found (${user.email}), starting triage...`);
-    const needsHandling = await agentModeService.triageSlackMessage(rawMessage);
-    if (!needsHandling) {
-      console.log(`📨 [slack-triggered] triage: skipping message in channel ${channel}`);
-      return;
-    }
-
-    console.log(`📨 [slack-triggered] triage passed, creating session for user ${user.userId}`);
-
-    const displayName = await getSlackUserDisplayName(slackUserId);
-    const userMessage = `${displayName}: ${rawMessage}`;
-
-    const session = await chatbotDb.createChatSession(
-      user.userId,
-      undefined,
-      'agent',
-      'slack-triggered',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      'regular'
-    );
-
-    const sessionTitle = rawMessage.length > 50 ? rawMessage.substring(0, 47) + '...' : rawMessage;
-    await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
-
-    // Save thread-to-session mapping so thread replies continue the session
-    const threadMappingKey = `slack_thread_${channel}_${ts}`;
-    await settingsService.setSetting(
-      threadMappingKey,
-      JSON.stringify({ sessionId: session.sessionId, userId: user.userId, type: 'triggered' }),
-      `Slack thread to session mapping`,
-      'system'
-    );
-    await chatbotDb.updateSessionSlackThread(session.sessionId, { channel, threadTs: ts });
-
-    // Generate Emma's response
-    const { generateSessionResponse } = await import('../controllers/agentModeController');
-    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-    if (!session.llmModel) {
-      await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
-    }
-    let emmaResponse = '';
-    try {
-      const result = await generateSessionResponse(session.sessionId, userMessage, user.userId, llmModel);
-      emmaResponse = result.content;
-    } catch (genError) {
-      console.error('❌ Error generating Emma response for slack triggered session:', genError);
-      emmaResponse = '(Emma was unable to generate a response for this message.)';
-    }
-
-    // Resolve channel name
-    let channelName = channel;
-    try {
-      const { WebClient } = await import('@slack/web-api');
-      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-      const info = await slackClient.conversations.info({ channel });
-      channelName = (info.channel as any)?.name || channel;
-    } catch { /* non-blocking */ }
-
-    await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
-      sessionId: session.sessionId,
-      userEmail: user.email,
-      channelName,
-      originalMessage: rawMessage,
-      emmaResponse,
-      receivedAt: new Date().toISOString(),
-      senderDisplayName: displayName,
-    });
-
-    console.log(`✅ [slack-triggered] session handled: ${session.sessionId}`);
-  } catch (error) {
-    console.error('❌ Error in handleSlackTriggeredSession:', error);
   }
 }
 
@@ -283,8 +222,10 @@ async function handleSlackSessionResponse(params: {
   adminEmail?: string;
   isAdminChannel?: boolean;
   files?: any[];
+  threadTs?: string;
 }) {
-  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel, files } = params;
+  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel, files, threadTs } = params;
+  const responseThreadTs = threadTs || ts;
   const { chatbotDb } = await import('../services/chatbotService');
   const { settingsService } = await import('../services/settingsService');
   const { ensureGtmWorkItemForSlackSession } = await import('../services/gtmPlanService');
@@ -323,11 +264,11 @@ async function handleSlackSessionResponse(params: {
   }
 
   // Associate the session with this Slack thread
-  const slackThread = { channel, threadTs: ts };
+  const slackThread = { channel, threadTs: responseThreadTs };
   await chatbotDb.updateSessionSlackThread(session.sessionId, slackThread);
 
   // Save thread-to-session mapping for future thread replies
-  const threadMappingKey = `slack_thread_${channel}_${ts}`;
+  const threadMappingKey = `slack_thread_${channel}_${responseThreadTs}`;
   await settingsService.setSetting(
     threadMappingKey,
     JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
@@ -339,73 +280,67 @@ async function handleSlackSessionResponse(params: {
   const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
   console.log('🔗 iShare link created for Slack session:', ishareLink);
 
-  // Post a "thinking" message while we generate the response
-  const thinkingTs = await postThinkingMessage(channel, ts);
+  await claimSlackAssistantStatus(channel, responseThreadTs);
+  try {
+    // Every operation after the status claim belongs to this scope so imports,
+    // model setup, and attachment failures cannot leak an active turn.
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const { agentModeService } = await import('../services/agentModeService');
+    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
 
-  // Generate the response
-  const { generateSessionResponse } = await import('../controllers/agentModeController');
-  const { agentModeService } = await import('../services/agentModeService');
+    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+    if (!session.llmModel) await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
 
-  const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-  if (!session.llmModel) {
-    await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
-  }
-
-  // Download and upload any files attached to the initial Slack message
-  const attachments: any[] = [];
-  if (files && files.length > 0) {
-    for (const file of files) {
-      try {
-        // Slack Connect / ext-shared channels omit url_private and send a stub
-        // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
-        const fileUrl = await resolveSlackFileUrl(file);
-        const fileBuffer = await downloadSlackFile(fileUrl);
-        const { uploadFileToS3 } = await import('../utils/s3Utils');
-        const uploadResult = await uploadFileToS3(
-          fileBuffer,
-          file.name || 'attachment',
-          user.userId,
-          file.mimetype || 'application/octet-stream'
-        );
-        if (!uploadResult.success || !uploadResult.url) {
-          console.error('❌ Failed to upload Slack file to S3');
-          continue;
+    const attachments: any[] = [];
+    if (files && files.length > 0) {
+      for (const file of files) {
+        try {
+          // Slack Connect / ext-shared channels omit url_private and send a stub
+          // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+          const fileUrl = await resolveSlackFileUrl(file);
+          const fileBuffer = await downloadSlackFile(fileUrl);
+          const { uploadFileToS3 } = await import('../utils/s3Utils');
+          const uploadResult = await uploadFileToS3(
+            fileBuffer,
+            file.name || 'attachment',
+            user.userId,
+            file.mimetype || 'application/octet-stream'
+          );
+          if (!uploadResult.success || !uploadResult.url) {
+            console.error('❌ Failed to upload Slack file to S3');
+            continue;
+          }
+          attachments.push({
+            url: uploadResult.url,
+            filename: file.name || 'attachment',
+            size: file.size,
+            mimetype: file.mimetype || 'application/octet-stream',
+          });
+        } catch (fileError) {
+          console.error('❌ Error downloading Slack file:', fileError);
         }
-        attachments.push({
-          url: uploadResult.url,
-          filename: file.name || 'attachment',
-          size: file.size,
-          mimetype: file.mimetype || 'application/octet-stream',
-        });
-      } catch (fileError) {
-        console.error('❌ Error downloading Slack file:', fileError);
       }
     }
-  }
-
-  try {
-    const response = await generateSessionResponse(
+    // ENG-1189: this turn's tool calls self-call back into this process via
+    // mcpFetch — tracked so a deploy mid-run waits for it instead of
+    // abandoning it against a closed listener.
+    const response = await cronJobRegistry.track('slackAgentTurn', generateSessionResponse(
       session.sessionId,
       userMessage,
       user.userId,
       llmModel,
       attachments
-    );
-
-    // Remove the thinking message
-    if (thinkingTs) {
-      await deleteSlackMessage(channel, thinkingTs);
-    }
+    ));
 
     // Post Emma's response to the Slack thread
     if (response.content) {
-      await postThreadResponse(channel, ts, citeForSlack(response));
+      await postThreadResponse(channel, responseThreadTs, citeForSlack(response));
     } else {
       // Generation succeeded but produced no text content — log and post a fallback so the
       // user gets feedback instead of silence. This can happen when the LLM returns only tool
       // calls with no final summary text, or when the content variable was never populated.
       console.error(`❌ Slack session ${session.sessionId}: generateSessionResponse succeeded but response.content is empty`);
-      await postThreadResponse(channel, ts, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
+      await postThreadResponse(channel, responseThreadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
     }
 
     // Post iShare link and GTM Tracker link as a separate follow-up message
@@ -428,7 +363,7 @@ async function handleSlackSessionResponse(params: {
 
       await slackClient.chat.postMessage({
         channel,
-        thread_ts: ts,
+        thread_ts: responseThreadTs,
         text: `Continue chat by simply reply or click to chat in AgentWeb portal: ${ishareLink}`,
         blocks: [
           {
@@ -452,10 +387,7 @@ async function handleSlackSessionResponse(params: {
       }
     }
 
-    if (thinkingTs) {
-      await deleteSlackMessage(channel, thinkingTs);
-    }
-    await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
+    await postThreadResponse(channel, responseThreadTs, 'Sorry, I encountered an error while processing your request. Please try again.');
 
     // Save error message to session so ishare viewers see the failure rather than an orphaned user message
     try {
@@ -469,7 +401,76 @@ async function handleSlackSessionResponse(params: {
     } catch (saveError) {
       console.error('❌ Error saving error message to session:', saveError);
     }
+  } finally {
+    await releaseSlackAssistantStatus(channel, responseThreadTs);
   }
+}
+
+async function handleMappedSlackThreadResponse(params: {
+  channel: string;
+  threadTs: string;
+  slackUserId: string;
+  text: string;
+  files?: any[];
+  sessionId: string;
+  userId: string;
+}): Promise<boolean> {
+  const { channel, threadTs, slackUserId, text, files, sessionId, userId } = params;
+  const { chatbotDb } = await import('../services/chatbotService');
+  const { generateSessionResponse } = await import('../controllers/agentModeController');
+  const { agentModeService } = await import('../services/agentModeService');
+  const { cronJobRegistry } = await import('../utils/cronJobRegistry');
+  const session = await chatbotDb.getChatSession(sessionId);
+  if (!session || session.userId !== userId) {
+    console.warn('Slack mapped thread rejected: session owner mismatch', {
+      channel, threadTs, slackUserId, sessionId, mappedUserId: userId,
+      actualUserId: session?.userId,
+    });
+    return false;
+  }
+
+  const attachments: any[] = [];
+  for (const file of files || []) {
+    try {
+      const fileUrl = await resolveSlackFileUrl(file);
+      const fileBuffer = await downloadSlackFile(fileUrl);
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3(fileBuffer, file.name || 'attachment', userId, file.mimetype || 'application/octet-stream');
+      if (uploadResult.success && uploadResult.url) {
+        attachments.push({ url: uploadResult.url, filename: file.name || 'attachment', size: file.size, mimetype: file.mimetype || 'application/octet-stream' });
+      }
+    } catch (fileError) {
+      console.error('❌ Error downloading Slack file:', fileError);
+    }
+  }
+
+  let messageText = text;
+  if (!messageText && files?.length) messageText = attachments.length ? '[attached file]' : '[attachment could not be read]';
+  const displayName = await getSlackUserDisplayName(slackUserId);
+  const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
+  const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+  await claimSlackAssistantStatus(channel, threadTs);
+  try {
+    const response = await cronJobRegistry.track('slackThreadAgentTurn', generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments));
+    if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
+    else await postThreadResponse(channel, threadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
+  } catch (genError) {
+    console.error('❌ Error generating thread response:', genError);
+    await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+    try {
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: 'assistant',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        timestamp: new Date().toISOString(),
+        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
+      });
+    } catch (saveError) {
+      console.error('❌ Error saving error message to session:', saveError);
+    }
+  } finally {
+    await releaseSlackAssistantStatus(channel, threadTs);
+  }
+  return true;
 }
 
 /**
@@ -587,8 +588,10 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
  * @desc Handle Slack events (app mentions, etc.)
  * @access Public (Slack webhook)
  */
-router.post("/events", express.json(), async (req: Request, res: Response) => {
+router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), async (req: Request, res: Response) => {
   try {
+    if (!verifySlackRequest(req)) return res.status(401).json({ error: 'Unauthorized Slack request' });
+    if (Buffer.isBuffer(req.body)) req.body = JSON.parse(req.body.toString('utf8'));
     console.log('📥 Slack event received:', JSON.stringify(req.body, null, 2));
     console.log('📥 Request headers:', JSON.stringify(req.headers, null, 2));
     const { type, challenge, event } = req.body;
@@ -618,7 +621,20 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
       // Handle app mention events
       if (event.type === 'app_mention') {
-        const { text, user: slackUserId, channel, ts, files } = event;
+        const { text, user: slackUserId, channel, ts, thread_ts: threadTs, files, user_team: userTeam, source_team: sourceTeam } = event;
+        const responseThreadTs = threadTs ?? ts;
+
+        const emmaBotUserId = process.env.SLACK_BOT_USER_ID || await getEmmaBotUserId();
+        if (!emmaBotUserId) {
+          console.warn('Ignoring Slack app_mention because Emma bot identity is unavailable', {
+            channel, threadTs: responseThreadTs, slackUserId,
+          });
+          return;
+        }
+        if (slackUserId && slackUserId === emmaBotUserId) {
+          console.warn('Ignoring Slack app_mention emitted by Emma', { channel, threadTs: responseThreadTs, slackUserId });
+          return;
+        }
 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
@@ -634,18 +650,49 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           // Extract the message (remove bot mention, resolve other user mentions, normalize Slack formatting)
           const textWithoutBotMention = text.replace(/<@[A-Z0-9]+>/, ''); // strip the first mention (the bot)
-          const rawMessage = (await resolveSlackMentionsInText(textWithoutBotMention))
+          let rawMessage = (await resolveSlackMentionsInText(textWithoutBotMention))
             .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1') // <mailto:email|email> → email
             .replace(/<mailto:([^|>]+)>/g, '$1')         // <mailto:email> → email
             .trim();
 
+          if (!rawMessage && files?.length) rawMessage = '[attached file]';
           if (!rawMessage) {
             await slackClient.chat.postMessage({
               channel,
               text: '👋 Hi! Please include a message after mentioning me. For example: @Emma help me create a social media post',
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
             return;
+          }
+
+          // An explicit mention inside an existing Emma thread continues that
+          // thread's mapped session and always replies at the root thread.
+          if (threadTs) {
+            const mapping = await settingsService.getSetting(`slack_thread_${channel}_${threadTs}`);
+            if (mapping?.settingValue) {
+              let mappedSession: { sessionId: string; userId: string } | null = null;
+              try {
+                const parsed = JSON.parse(mapping.settingValue);
+                if (typeof parsed?.sessionId === 'string' && parsed.sessionId
+                  && typeof parsed?.userId === 'string' && parsed.userId) {
+                  mappedSession = parsed;
+                }
+              } catch {
+                // A malformed/stale mapping must not consume an explicit mention.
+              }
+              if (mappedSession) {
+                const handled = await handleMappedSlackThreadResponse({
+                  channel,
+                  threadTs,
+                  slackUserId,
+                  text: rawMessage,
+                  files,
+                  sessionId: mappedSession.sessionId,
+                  userId: mappedSession.userId,
+                });
+                if (handled) return;
+              }
+            }
           }
 
           // Check if this is an admin Slack channel (supports multiple channels via slack_admin_channels JSON array)
@@ -674,13 +721,47 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           if (channelLinkIntent) {
             const requesterEmail = (await getSlackUserEmail(slackUserId))?.toLowerCase();
             const targetEmail = channelLinkIntent.targetEmail;
-            const canLinkChannel = requesterEmail === targetEmail || requesterEmail?.endsWith('@agentweb.pro');
+            let canLinkChannel = requesterEmail === targetEmail
+              || requesterEmail?.endsWith('@agentweb.pro')
+              || requesterEmail?.endsWith('@argusoft.com');
+
+            // ENG-1294: requesterEmail depends on Slack's profile.email resolving, which needs the
+            // users:read.email bot scope and has empirically failed for verified AgentWeb admins
+            // (ENG-1263 — Fangfang's own email failed to resolve even though the rest of her
+            // profile did). Without this, nobody whose email fails to resolve can ever use the
+            // remedy this very handler tells them to run. Fall back to team_id: it rides the same
+            // users.info response but doesn't need that scope. It only proves "this Slack user
+            // belongs to our own workspace" — never enough to pick which AgentWeb account a
+            // mention resolves to, but that's not the question here: targetEmail is typed
+            // explicitly by the requester, so this only decides whether an AgentWeb workspace
+            // member is allowed to run the link command at all — the same authorization the
+            // trusted-domain checks above already grant to any internal admin, just via a
+            // signal that doesn't depend on the broken field.
+            if (!canLinkChannel) {
+              const [senderTeamId, ownTeamId] = await Promise.all([
+                getSlackUserTeamId(slackUserId),
+                getOwnSlackTeamId(),
+              ]);
+              canLinkChannel = !!senderTeamId && !!ownTeamId && senderTeamId === ownTeamId;
+            }
+
+            // ENG-1294: the own-team_id check above only ever proves "same workspace as us" — a
+            // real Slack Connect guest can never pass it, no matter who they are. Trust a small,
+            // explicit allowlist of partner teams via user_team/source_team instead, which Slack
+            // hands us directly rather than requiring a lookup that may silently omit data for an
+            // external profile. Same authorization question as every check above (may this Slack
+            // user run the link command at all), never used to pick which AgentWeb account a
+            // mention resolves to.
+            if (!canLinkChannel) {
+              const externalTeamId = userTeam || sourceTeam;
+              canLinkChannel = !!externalTeamId && TRUSTED_EXTERNAL_SLACK_TEAM_IDS.has(externalTeamId);
+            }
 
             if (!canLinkChannel) {
               await slackClient.chat.postMessage({
                 channel,
                 text: 'Only AgentWeb admins or the target account owner can link this channel.',
-                thread_ts: ts
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -690,7 +771,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               await slackClient.chat.postMessage({
                 channel,
                 text: `User not found: ${targetEmail}`,
-                thread_ts: ts
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -709,7 +790,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             await slackClient.chat.postMessage({
               channel,
               text: `✅ Linked this channel to ${targetEmail}.`,
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
             return;
           }
@@ -728,7 +809,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 await slackClient.chat.postMessage({
                   channel,
                   text: `User not found: ${targetEmail}`,
-                  thread_ts: ts
+                  thread_ts: responseThreadTs
                 });
                 return;
               }
@@ -751,7 +832,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               pageIdentifier = 'slack-bot-admin';
 
               // Post confirmation
-              await postThreadResponse(channel, ts, `Starting session for ${targetEmail}`);
+              await postThreadResponse(channel, responseThreadTs, `Starting session for ${targetEmail}`);
               console.log(`📝 Admin channel: creating delegated session for ${targetEmail} (admin: ${delegateInfo.adminEmail})`);
             } else {
               // No "for email" prefix — fall through to regular user lookup below
@@ -787,11 +868,40 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
             }
 
+            // ENG-1292: no channel binding — fall back to the mentioning Slack
+            // user's own verified identity instead of failing outright. Only
+            // an exact match on Slack's verified profile email resolves a
+            // user (never a fuzzy/partial match), so a Slack user with no
+            // matching AgentWeb account can never resolve to someone else's
+            // account (no cross-tenant leak). Deliberately NOT cached as a
+            // channel mapping: an internal channel can have several different
+            // AgentWeb users mention Emma, and caching the first one would
+            // silently misroute everyone else who mentions Emma there.
+            let requesterEmail: string | null = null;
             if (!user) {
+              requesterEmail = await getSlackUserEmail(slackUserId);
+              if (requesterEmail) {
+                const identityUser = await userDb.getUserByEmail(requesterEmail);
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                  user = identityUser;
+                  console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
+                }
+              }
+            }
+
+            if (!user) {
+              const remedy = 'An AgentWeb admin or the account owner can link it by posting ' +
+                '`@Emma for user <their-agentweb-email> link this channel` in this channel.';
+              const text = requesterEmail
+                ? `❌ Sorry, this channel isn't linked to an AgentWeb account, and there's no AgentWeb user with the email ${requesterEmail}. ${remedy}`
+                : `❌ Sorry, this channel isn't linked to an AgentWeb account, and I couldn't verify a Slack email for you to match one. ${remedy}`;
               await slackClient.chat.postMessage({
                 channel,
-                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
-                thread_ts: ts
+                text,
+                thread_ts: responseThreadTs
               });
               return;
             }
@@ -830,6 +940,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             adminEmail: delegateInfo?.adminEmail,
             isAdminChannel,
             files: event.files,
+            threadTs,
           });
 
           console.log('✅ Emma bot mention handled successfully');
@@ -841,7 +952,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             await slackClient.chat.postMessage({
               channel,
               text: '❌ Sorry, something went wrong while processing your request. Please try again or contact support.',
-              thread_ts: ts
+              thread_ts: responseThreadTs
             });
           } catch (slackError) {
             console.error('❌ Error sending error message to Slack:', slackError);
@@ -849,40 +960,136 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         }
       }
 
-      // Handle top-level message events in user-connected Slack channels (slack triggered session)
-      // Filter: plain message, NOT a thread reply, NOT a bot message, NOT a message_changed/deleted event
-      // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
-      // directly, so generating a "suggest" email would be redundant. Other @mentions (e.g.
-      // @john) should still go through the suggest flow.
-      if (event.type === 'message' && !event.thread_ts && !event.bot_id && !event.subtype) {
-        const { text, user: slackUserId, channel, ts } = event;
-        if (text) {
-          const botId = await getEmmaBotUserId();
-          const mentionsEmma = !!(botId && text.includes(`<@${botId}>`));
-          if (mentionsEmma) {
-            console.log('📨 Skipping slack suggest for Emma @mention (already handled by app_mention handler):', { channel, user: slackUserId });
-          } else {
-            console.log('📨 Top-level Slack message received:', { channel, user: slackUserId });
-            // Fire-and-forget: triage + session + email
-            handleSlackTriggeredSession({ text, slackUserId, channel, ts });
-          }
-        }
-      }
+      // ENG-1613: top-level untagged messages no longer trigger anything. The auto-listen pipeline
+      // (handleSlackTriggeredSession) was removed entirely — Emma's Slack behavior is exclusively
+      // tag-gated via the app_mention handler above. A customer never saw the auto-drafted reply
+      // (it only emailed founders@, never posted to Slack), so an account-level opt-in still left
+      // them with no visibility that their message had triggered an LLM session at all.
 
       // Handle message events in threads (follow-up messages to Emma sessions, or non-Emma threads)
       // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
       // Allow file_share subtype so that Slack file uploads are also processed
       // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
       // directly, so processing them here too would cause Emma to answer twice.
+      // Direct-message handling: a 1:1 DM to Emma (channel_type 'im', no
+      // thread) starts/continues a conversation without requiring an
+      // @mention — Slack never emits app_mention for DM text, so without
+      // this branch DMs were silently ignored. Threaded DM replies ride the
+      // thread handler below via the saved thread mapping.
+      if (event.type === 'message' && !event.thread_ts && !event.bot_id
+        && (!event.subtype || event.subtype === 'file_share')
+        && (event.channel_type === 'im' || String(event.channel || '').startsWith('D'))) {
+        const { text, user: slackUserId, channel, ts: messageTs, files } = event;
+        try {
+          const { userDb } = await import('../services/db');
+          const { chatbotDb } = await import('../services/chatbotService');
+          const { WebClient } = await import('@slack/web-api');
+          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+          const botId = await getEmmaBotUserId();
+          const textWithoutBotMention = botId
+            ? String(text || '').replace(new RegExp(`<@${botId}>`, 'g'), '')
+            : String(text || '');
+          const rawMessage = (await resolveSlackMentionsInText(textWithoutBotMention))
+            .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+            .replace(/<mailto:([^|>]+)>/g, '$1')
+            .trim();
+
+          if (!rawMessage && !(files && files.length > 0)) {
+            await slackClient.chat.postMessage({
+              channel,
+              text: '👋 Hi! Send me a message and I\'ll get started.',
+            });
+            return;
+          }
+
+          // DM identity: resolve the sender's verified Slack email to an
+          // AgentWeb user (exact email match only — never fuzzy, so a DM
+          // sender can never resolve to someone else's account). Cache the
+          // DM-channel mapping: a 1:1 DM channel has exactly one human side.
+          let user = null;
+          const mappingKey = `slack_channel_mapping_${channel}`;
+          const cachedMapping = await settingsService.getSetting(mappingKey);
+          if (cachedMapping?.settingValue) {
+            const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
+            if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
+              user = cachedUser;
+            }
+          }
+          let requesterEmail: string | null = null;
+          if (!user) {
+            requesterEmail = await getSlackUserEmail(slackUserId);
+            if (requesterEmail) {
+              const identityUser = await userDb.getUserByEmail(requesterEmail);
+              if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                user = identityUser;
+                await settingsService.setSetting(
+                  mappingKey,
+                  user.userId,
+                  `Slack DM channel to userId mapping for channel ${channel}`,
+                  'system'
+                );
+                console.log(`📝 [slack-dm] resolved via Slack identity (${requesterEmail})`);
+              }
+            }
+          }
+
+          if (!user) {
+            const text = requesterEmail
+              ? `❌ Sorry, there's no AgentWeb user with the email ${requesterEmail}. Ask an AgentWeb admin to create/link your account, then DM me again.`
+              : `❌ Sorry, I couldn't verify a Slack email for you to match an AgentWeb account. Ask an AgentWeb admin for help.`;
+            await slackClient.chat.postMessage({ channel, text });
+            return;
+          }
+
+          const displayName = await getSlackUserDisplayName(slackUserId);
+          const userMessage = `${displayName}: ${rawMessage}`;
+          console.log('📝 Creating Agent Mode session for DM user:', user.userId);
+          const session = await chatbotDb.createChatSession(
+            user.userId,
+            undefined, // pageContent
+            'agent', // portalType
+            'slack-dm', // pageIdentifier
+            undefined, // selectedStartupId
+            undefined, // workflowId
+            undefined, // executionId
+            undefined, // emailCampaignTaskId
+            'regular', // sessionType
+            undefined // delegateInfo
+          );
+          console.log('✅ Agent Mode DM session created:', session.sessionId);
+          await handleSlackSessionResponse({
+            session,
+            user,
+            channel,
+            ts: messageTs,
+            rawMessage,
+            userMessage,
+            files,
+          });
+          console.log('✅ Emma Slack DM handled successfully');
+        } catch (error) {
+          console.error('❌ Error handling Emma Slack DM:', error);
+          try {
+            const { WebClient } = await import('@slack/web-api');
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            await slackClient.chat.postMessage({
+              channel,
+              text: '❌ Sorry, something went wrong while processing your request. Please try again or contact support.',
+            });
+          } catch (slackError) {
+            console.error('❌ Error sending DM error message to Slack:', slackError);
+          }
+        }
+        return;
+      }
+
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
-        const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs, files } = event;
+        const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs } = event;
 
         if (text) {
           const botId = await getEmmaBotUserId();
-          if (botId && text.includes(`<@${botId}>`)) {
-            console.log('📨 Skipping thread message handler for Emma @mention (app_mention handler will process):', { channel, threadTs, user: slackUserId });
-            return;
-          }
+          if (botId && text.includes(`<@${botId}>`)) return;
         }
 
         if (text) {
@@ -900,166 +1107,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           }
         }
 
-        // Look up if this thread is associated with an Emma session
-        const threadMappingKey = `slack_thread_${channel}_${threadTs}`;
-        const mapping = await settingsService.getSetting(threadMappingKey);
-
-        if (mapping?.settingValue) {
-          try {
-            const parsed = JSON.parse(mapping.settingValue);
-            const { sessionId, userId } = parsed;
-            const isTriggered = parsed.type === 'triggered';
-
-            if (isTriggered) {
-              // Monitored (email-only) session — continue it and send email, do NOT post to Slack
-              if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
-                const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
-                  return;
-                }
-
-                console.log('📨 Thread reply in monitored session (email-only):', { channel, threadTs, slackUserId });
-                const { chatbotDb } = await import('../services/chatbotService');
-                const { generateSessionResponse } = await import('../controllers/agentModeController');
-                const { agentModeService } = await import('../services/agentModeService');
-                const { userDb } = await import('../services/db');
-
-                const session = await chatbotDb.getChatSession(sessionId);
-                if (!session) {
-                  console.log('❌ Session not found for monitored Slack thread:', sessionId);
-                  return;
-                }
-
-                // Respect the per-user opt-out before generating a response or sending email.
-                const user = await userDb.getUserById(userId);
-                if (user?.slackSuggestedRepliesDisabled) {
-                  console.log(`📨 [slack-triggered] suggested replies disabled for user ${userId}, skipping thread reply`);
-                  return;
-                }
-
-                const displayName = await getSlackUserDisplayName(slackUserId);
-                const formattedMessage = `${displayName}: ${text}`.trim();
-
-                const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-                let emmaResponse = '';
-                try {
-                  const result = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel);
-                  emmaResponse = result.content;
-                } catch (genError) {
-                  console.error('❌ Error generating response for monitored thread:', genError);
-                  emmaResponse = '(Emma was unable to generate a response for this message.)';
-                }
-
-                let channelName = channel;
-                try {
-                  const { WebClient } = await import('@slack/web-api');
-                  const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-                  const info = await slackClient.conversations.info({ channel });
-                  channelName = (info.channel as any)?.name || channel;
-                } catch { /* non-blocking */ }
-
-                await emailService.sendSlackTriggeredSessionEmail('founders@agentweb.pro', {
-                  sessionId,
-                  userEmail: user?.email || userId,
-                  channelName,
-                  originalMessage: text,
-                  emmaResponse,
-                  receivedAt: new Date().toISOString(),
-                });
-              }
-            } else {
-              // Emma @mention session — existing behavior: post response directly to Slack
-              console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
-              const { chatbotDb } = await import('../services/chatbotService');
-              const { generateSessionResponse } = await import('../controllers/agentModeController');
-              const { agentModeService } = await import('../services/agentModeService');
-
-              const session = await chatbotDb.getChatSession(sessionId);
-              if (!session) {
-                console.log('❌ Session not found for Slack thread:', sessionId);
-                return;
-              }
-
-              const displayName = await getSlackUserDisplayName(slackUserId);
-
-              const attachments: any[] = [];
-              if (files && files.length > 0) {
-                for (const file of files) {
-                  try {
-                    // Slack Connect / ext-shared channels omit url_private and send a stub
-                    // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
-                    const fileUrl = await resolveSlackFileUrl(file);
-                    const fileBuffer = await downloadSlackFile(fileUrl);
-                    const { uploadFileToS3 } = await import('../utils/s3Utils');
-                    const uploadResult = await uploadFileToS3(
-                      fileBuffer,
-                      file.name || 'attachment',
-                      userId,
-                      file.mimetype || 'application/octet-stream'
-                    );
-                    if (!uploadResult.success || !uploadResult.url) {
-                      console.error('❌ Failed to upload Slack file to S3');
-                      continue;
-                    }
-                    attachments.push({
-                      url: uploadResult.url,
-                      filename: file.name || 'attachment',
-                      size: file.size,
-                      mimetype: file.mimetype || 'application/octet-stream',
-                    });
-                  } catch (fileError) {
-                    console.error('❌ Error downloading Slack file:', fileError);
-                  }
-                }
-              }
-
-              // When the user sent only a file (no text), give Emma a placeholder so it knows
-              // a file was shared — but only claim '[attached file]' if an attachment actually
-              // reached the agent. If ingestion failed and attachments is empty, an honest
-              // marker keeps the model from calling read_file_content('[attached file]') on a
-              // non-URL and returning 'Invalid URL format' to the user (ENG-323).
-              let messageText = text;
-              if (!messageText && files && files.length > 0) {
-                messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
-              }
-              const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
-
-              const thinkingTs = await postThinkingMessage(channel, threadTs);
-              const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-
-              try {
-                const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
-                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
-              } catch (genError) {
-                console.error('❌ Error generating thread response:', genError);
-                if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
-                // Save error message to session so ishare viewers see the failure rather than an orphaned user message
-                try {
-                  const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
-                  await chatbotDbForError.addMessageToSession(sessionId, {
-                    role: 'assistant',
-                    content: 'Sorry, I encountered an error processing your request. Please try again.',
-                    timestamp: new Date().toISOString(),
-                    metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
-                  });
-                } catch (saveError) {
-                  console.error('❌ Error saving error message to session:', saveError);
-                }
-              }
-            }
-          } catch (parseError) {
-            console.error('❌ Error processing thread reply:', parseError);
-          }
-        } else if (text) {
-          // Thread not mapped to anything — treat as a new monitored conversation.
-          // Pass thread_ts as ts so subsequent replies in this thread continue the same session.
-          console.log('📨 Thread reply in untracked thread, triggering monitoring:', { channel, threadTs, slackUserId });
-          handleSlackTriggeredSession({ text, slackUserId, channel, ts: threadTs });
-        }
+        // Human-eval replies are captured silently above. All other message
+        // events are ignored; Emma turns are driven only by app_mention.
+        return;
       }
 
       return;
@@ -1366,31 +1416,19 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   throw new Error('Session not found');
                 }
                 
-                // Format revision message based on asset type (similar to Images/Reports pages)
-                let revisionMessage: string;
-                let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                
-                if (originalApproval.assetType === 'image') {
-                  // For images, use generate_image function
-                  revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'generate_image',
-                      minCount: 1
-                    }
-                  ];
-                } else if (originalApproval.assetType === 'html') {
-                  // For HTML reports, use update_html_file function
-                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'update_html_file',
-                      minCount: 1
-                    }
-                  ];
-                } else {
-                  throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                }
+                // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                  '../services/revisionService'
+                );
+                const revisionMessage = buildAgentModeRevisionMessage(
+                  originalApproval.assetType,
+                  originalApproval.assetUrl,
+                  feedbackValue
+                );
+                const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                  originalApproval.assetType === 'image'
+                    ? [{ functionName: 'generate_image', minCount: 1 }]
+                    : [{ functionName: 'update_html_file', minCount: 1 }];
                 
                 // Use runVerifiedChat function (same as verified-generate endpoint)
                 const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1404,7 +1442,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   requiredFunctions,
                   keywords: [],
                   attachments: [],
-                  maxAttempts: 5
+                  maxAttempts: 5,
+                  approvedRevisionImageSources:
+                    originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                 }).then(async (result) => {
                   console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1412,6 +1452,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   let newAssetUrl: string | null = null;
                   let newAssetFilename: string | null = null;
                   let toolCallFailed = false;
+                  let awaitingConfirmation = false;
                   let toolCallFailureMessage = '';
 
                   if (result.success && result.toolCalls.length > 0) {
@@ -1419,10 +1460,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     for (const toolCall of result.toolCalls) {
                       const toolResult = toolCall?.result || {};
 
+                      // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                      // asset and never will — no user is watching this auto-revision.
+                      if (toolResult.awaitingUserConfirmation === true) {
+                        awaitingConfirmation = true;
+                        continue;
+                      }
+
                       if (originalApproval.assetType === 'image') {
                         // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                         // Only extract if the tool call succeeded
                         if (toolResult.success) {
+                          if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                            toolCallFailed = true;
+                            toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                            continue;
+                          }
+
                           const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                           if (imageUrl) {
                             newAssetUrl = imageUrl;
@@ -1484,9 +1538,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                   } else {
                     // Determine the failure reason for better logging
-                    const failureReason = toolCallFailed
-                      ? `Tool call failed: ${toolCallFailureMessage}`
-                      : 'Could not extract new asset URL from toolCalls';
+                    const { describeRevisionFailure } = await import('../services/revisionService');
+                    const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                    const failureReason = failure.reason;
 
                     console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1506,12 +1560,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       }
 
                       await sendAgentModeOncallAlert({
-                        subject: toolCallFailed
-                          ? 'Agent Mode Revision: Tool Call Failed'
-                          : 'Agent Mode Revision: Failed to Extract Asset URL',
-                        message: toolCallFailed
-                          ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                          : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        subject: failure.subject,
+                        message: `${failure.reason}\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                         sessionId: agentSessionId,
                         context: {
                           'iShare Link': ishareLink,
@@ -1521,6 +1571,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           'Feedback': feedbackValue,
                           'Revision Success': result.success,
                           'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                           'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                           'Tool Calls Count': result.toolCalls.length,
                           'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
@@ -1532,8 +1583,39 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     } catch (alertError) {
                       console.error('❌ Error sending oncall alert:', alertError);
                     }
+                    // ENG-1741: the internal oncall alert above told nobody the reviewer is
+                    // actually waiting on — from their side, the revision just never came
+                    // back. Tell them directly, in addition to (not instead of) oncall.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
                   }
                 }).catch(async (error) => {
+                  // ENG-1719: expected, benign lock contention (a live chat turn or another
+                  // revision on the same session), not a real failure — paging on-call for
+                  // it was the exact false alarm this fix exists to stop.
+                  const { isSessionBusyError } = await import('../controllers/agentModeController');
+                  if (isSessionBusyError(error)) {
+                    console.warn(`⏳ Agent Mode revision for session ${agentSessionId} skipped — session was busy with another generation in progress.`);
+                    // ENG-1741: previously silent to the reviewer — only this log line existed.
+                    if (originalApproval.slackChannel) {
+                      await postSlackMessage(
+                        originalApproval.slackChannel,
+                        ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                        'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                        originalApproval.slackMessageTs || undefined,
+                      ).catch((slackErr: any) =>
+                        console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                      );
+                    }
+                    return;
+                  }
                   console.error('❌ Error in Agent Mode verified-generate:', error);
                   try {
                     const isSessionLimit = isSessionLimitError(error);
@@ -1559,8 +1641,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   } catch (alertError) {
                     console.error('❌ Error sending oncall alert:', alertError);
                   }
+                  // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                  if (originalApproval.slackChannel) {
+                    await postSlackMessage(
+                      originalApproval.slackChannel,
+                      ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                      originalApproval.slackMessageTs || undefined,
+                    ).catch((slackErr: any) =>
+                      console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                    );
+                  }
                 });
-                
+
                 console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${agentSessionId}`);
               } catch (agentModeError) {
                 console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);
@@ -1593,31 +1685,19 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       throw new Error('Session not found');
                     }
                     
-                    // Format revision message based on asset type (similar to Images/Reports pages)
-                    let revisionMessage: string;
-                    let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                    
-                    if (originalApproval.assetType === 'image') {
-                      // For images, use generate_image function
-                      revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'generate_image',
-                          minCount: 1
-                        }
-                      ];
-                    } else if (originalApproval.assetType === 'html') {
-                      // For HTML reports, use update_html_file function
-                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'update_html_file',
-                          minCount: 1
-                        }
-                      ];
-                    } else {
-                      throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                    }
+                    // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                    const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                      '../services/revisionService'
+                    );
+                    const revisionMessage = buildAgentModeRevisionMessage(
+                      originalApproval.assetType,
+                      originalApproval.assetUrl,
+                      feedbackValue
+                    );
+                    const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                      originalApproval.assetType === 'image'
+                        ? [{ functionName: 'generate_image', minCount: 1 }]
+                        : [{ functionName: 'update_html_file', minCount: 1 }];
                     
                     // Use runVerifiedChat function (same as verified-generate endpoint)
                     const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1631,7 +1711,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       requiredFunctions,
                       keywords: [],
                       attachments: [],
-                      maxAttempts: 5
+                      maxAttempts: 5,
+                      approvedRevisionImageSources:
+                        originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                     }).then(async (result) => {
                       console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1639,6 +1721,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       let newAssetUrl: string | null = null;
                       let newAssetFilename: string | null = null;
                       let toolCallFailed = false;
+                      let awaitingConfirmation = false;
                       let toolCallFailureMessage = '';
 
                       if (result.success && result.toolCalls.length > 0) {
@@ -1646,10 +1729,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         for (const toolCall of result.toolCalls) {
                           const toolResult = toolCall?.result || {};
 
+                          // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                          // asset and never will — no user is watching this auto-revision.
+                          if (toolResult.awaitingUserConfirmation === true) {
+                            awaitingConfirmation = true;
+                            continue;
+                          }
+
                           if (originalApproval.assetType === 'image') {
                             // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                             // Only extract if the tool call succeeded
                             if (toolResult.success) {
+                              if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                                toolCallFailed = true;
+                                toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                                continue;
+                              }
+
                               const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                               if (imageUrl) {
                                 newAssetUrl = imageUrl;
@@ -1711,9 +1807,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         }
                       } else {
                         // Determine the failure reason for better logging
-                        const failureReason = toolCallFailed
-                          ? `Tool call failed: ${toolCallFailureMessage}`
-                          : 'Could not extract new asset URL from toolCalls';
+                        const { describeRevisionFailure } = await import('../services/revisionService');
+                        const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                        const failureReason = failure.reason;
 
                         console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1733,12 +1829,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           }
 
                           await sendAgentModeOncallAlert({
-                            subject: toolCallFailed
-                              ? 'Agent Mode Revision: Tool Call Failed'
-                              : 'Agent Mode Revision: Failed to Extract Asset URL',
-                            message: toolCallFailed
-                              ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                              : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            subject: failure.subject,
+                            message: `${failure.reason}\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                             sessionId: task.sessionId,
                             context: {
                               'iShare Link': ishareLink,
@@ -1748,6 +1840,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               'Feedback': feedbackValue,
                               'Revision Success': result.success,
                               'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                               'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                               'Tool Calls Count': result.toolCalls.length,
                               'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
@@ -1760,8 +1853,37 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         } catch (alertError) {
                           console.error('❌ Error sending oncall alert:', alertError);
                         }
+                        // ENG-1741: notify the reviewer directly too, not just internal oncall.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
                       }
                     }).catch(async (error) => {
+                      // ENG-1719: expected, benign lock contention, not a real failure —
+                      // paging on-call for it was the exact false alarm this fix exists
+                      // to stop.
+                      const { isSessionBusyError } = await import('../controllers/agentModeController');
+                      if (isSessionBusyError(error)) {
+                        console.warn(`⏳ Agent Mode revision for session ${task.sessionId} skipped — session was busy with another generation in progress.`);
+                        // ENG-1741: previously silent to the reviewer — only this log line existed.
+                        if (originalApproval.slackChannel) {
+                          await postSlackMessage(
+                            originalApproval.slackChannel,
+                            ':hourglass_flowing_sand: This session was busy with another generation in progress, ' +
+                            'so the auto-revision couldn\'t run just now. Please retry the feedback in a moment.',
+                            originalApproval.slackMessageTs || undefined,
+                          ).catch((slackErr: any) =>
+                            console.warn('❌ Failed to post session-busy notice to Slack:', slackErr?.message || slackErr),
+                          );
+                        }
+                        return;
+                      }
                       console.error('❌ Error in Agent Mode verified-generate:', error);
                       try {
                         const isSessionLimit = isSessionLimitError(error);
@@ -1788,8 +1910,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       } catch (alertError) {
                         console.error('❌ Error sending oncall alert:', alertError);
                       }
+                      // ENG-1741: notify the reviewer directly too, in addition to oncall.
+                      if (originalApproval.slackChannel) {
+                        await postSlackMessage(
+                          originalApproval.slackChannel,
+                          ':warning: This revision didn\'t go through — please retry the feedback, or check the app for details.',
+                          originalApproval.slackMessageTs || undefined,
+                        ).catch((slackErr: any) =>
+                          console.warn('❌ Failed to post revision-failure notice to Slack:', slackErr?.message || slackErr),
+                        );
+                      }
                     });
-                    
+
                     console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${task.sessionId}`);
                   } catch (agentModeError) {
                     console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);

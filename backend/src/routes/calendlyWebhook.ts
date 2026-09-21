@@ -39,6 +39,7 @@ import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat, EnqueueResult } from '../services/asyncJobQueue';
+import { buildFbcFromFirstTouch } from '../services/metaConversionRelay';
 
 const router = express.Router();
 
@@ -153,6 +154,14 @@ interface CalendlyJobPayload {
   userId: string;
   accountId: string;
   bookingLeadListId?: string;
+  // ENG-1141: this connection's own Meta attribution choice, if the customer set one on
+  // the Calendly card — resolveMetaPixelWithDefault uses it directly when both are
+  // present, falling back to the caller's first connected account/pixel otherwise.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  /** ENG-1141: the customer explicitly turned Meta attribution off for this connection.
+   *  Distinct from "unset", which means auto-resolve — see CalendlyConfig's own comment. */
+  attributionDisabled?: boolean;
   email?: string;
   firstName?: string;
   lastName?: string;
@@ -204,6 +213,54 @@ function splitName(payload: CalendlyInviteePayload['payload']): { firstName?: st
  *  or later by the async job queue's poller if the process crashed before finishing.
  *  Re-fetches the owner and treats bookingLeadListId as a snapshot to verify, not
  *  trust — both cheap, and avoids ever acting on stale data on a delayed retry. */
+/**
+ * ENG-926 AC2 — recover the click identity (`fbc`/`fbp`) for a booking invitee.
+ *
+ * AC2's word is ATTRIBUTED, not merely received. Meta ties a conversion to an ad through
+ * `fbc` (the click id) or `fbp` — a hashed email alone rarely does it, and for an off-site
+ * booking our pixel never fires on the invitee at all, so the booking itself can supply
+ * neither. What CAN supply them is the lead this person already created on a landing page
+ * before booking: `firstTouch.clickIds.fbclid` and `metaFbp` are persisted there.
+ *
+ * §28 is the cautionary case — Every.io's server events reached Meta carrying only Meta's
+ * own browser cookies as match keys, so $557 of spend produced zero attributed conversions.
+ * Firing an event and attributing it are different problems.
+ *
+ * ⚠ OWNERSHIP IS SAFETY-CRITICAL. `findLeadsByEmail` queries a GLOBAL cross-tenant GSI with
+ * no userId filter, so an unfiltered read would send ANOTHER customer's click id to THIS
+ * customer's pixel. The owner check FAILS CLOSED: a lead whose `userId` is missing or does
+ * not match is skipped rather than trusted. `createLead` derives `userId` from the parent
+ * list so it never desyncs, but older rows may predate that and must not be assumed.
+ *
+ * Best-effort by construction: any failure returns `{}` and the Schedule event still sends
+ * exactly as it does today. Identity enrichment must never cost us the conversion — the
+ * same rule §F applies to alert enrichment.
+ */
+export async function resolveBookingMatchIdentity(
+  email: string | undefined,
+  userId: string | undefined,
+): Promise<{ fbc?: string; fbp?: string }> {
+  if (!email || !userId) return {};
+  try {
+    // Newest-first (the GSI query sets ScanIndexForward: false), so the most recent
+    // touch that carries an identity wins — the click that most likely drove this booking.
+    const leads = (await crmDb.findLeadsByEmail(email)) as any[];
+    for (const lead of leads || []) {
+      if (!lead || typeof lead.userId !== 'string' || lead.userId !== userId) continue;
+      const fbc = buildFbcFromFirstTouch(lead.firstTouch);
+      const fbp =
+        typeof lead.metaFbp === 'string' && lead.metaFbp.trim() ? lead.metaFbp.trim() : undefined;
+      if (fbc || fbp) return { ...(fbc ? { fbc } : {}), ...(fbp ? { fbp } : {}) };
+    }
+    return {};
+  } catch (err: any) {
+    console.warn(
+      `[Calendly Webhook] booking identity lookup failed for user ${userId}: ${err?.message ?? err} — Schedule event sent without fbc/fbp`,
+    );
+    return {};
+  }
+}
+
 export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Promise<void> {
   const owner = await userDb.getUserById(payload.userId);
   if (!owner) {
@@ -228,32 +285,51 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
   const failures: string[] = [];
 
   try {
-    const pixelResolution = await metaService.resolveMetaPixelForUser(owner, payload.userId);
-    if ('unresolved' in pixelResolution) {
-      console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
+    const storedAttribution = payload.attributionPixelId && payload.attributionAccountId
+      ? { pixelId: payload.attributionPixelId, accountId: payload.attributionAccountId }
+      : undefined;
+    // ENG-1141: an explicit opt-out short-circuits before resolution — not an error, and NOT
+    // a failure to record: the booking and its CRM-forward below proceed exactly as normal.
+    // Checked before the stored pair so a leftover selection can't resurrect attribution.
+    if (payload.attributionDisabled) {
+      console.log(`[Calendly Webhook] Meta attribution disabled for user ${payload.userId} — booking saved, CAPI skipped`);
     } else {
-      const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
-      const { accessToken } = await getMetaAccountCredentials(owner, payload.userId, pixelResolution.accountId);
-
-      const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
-        eventId: payload.uri,
-        email: payload.email,
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        eventTimeSeconds: payload.eventTimeSeconds,
-        // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
-        // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
-        eventName: 'Schedule',
-      });
-
-      if (result.success) {
-        console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${payload.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+      const pixelResolution = await metaService.resolveMetaPixelWithDefault(owner, payload.userId, storedAttribution);
+      if ('unresolved' in pixelResolution) {
+        console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
       } else {
-        console.error(`[Calendly Webhook] CAPI send failed for user ${payload.userId}: ${result.error}`);
-        // sendCapiLeadEvent returns { success: false }, it doesn't throw — a soft
-        // failure like this was silently swallowed here (Greptile P1 on #2291),
-        // recorded nowhere, so the job still completed and the poller never retried.
-        failures.push(`CAPI: ${result.error}`);
+        const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+        const { accessToken } = await getMetaAccountCredentials(owner, payload.userId, pixelResolution.accountId);
+
+        // ENG-926 AC2: recover the click identity so this booking can actually be
+        // ATTRIBUTED, not merely received. A Schedule event carrying only a hashed email
+        // is what Every.io's events looked like in §28 — Meta had nothing to tie them to
+        // an ad click, so real spend produced zero attributed conversions. `fbc`/`fbp` are
+        // the signals that make the difference, and the booking itself cannot supply them:
+        // the invitee is on the booking tool's domain, where our pixel never fires.
+        const bookingIdentity = await resolveBookingMatchIdentity(payload.email, payload.userId);
+
+        const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
+          eventId: payload.uri,
+          email: payload.email,
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          eventTimeSeconds: payload.eventTimeSeconds,
+          ...bookingIdentity,
+          // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
+          // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
+          eventName: 'Schedule',
+        });
+
+        if (result.success) {
+          console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${payload.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+        } else {
+          console.error(`[Calendly Webhook] CAPI send failed for user ${payload.userId}: ${result.error}`);
+          // sendCapiLeadEvent returns { success: false }, it doesn't throw — a soft
+          // failure like this was silently swallowed here (Greptile P1 on #2291),
+          // recorded nowhere, so the job still completed and the poller never retried.
+          failures.push(`CAPI: ${result.error}`);
+        }
       }
     }
   } catch (capiError: any) {
@@ -671,6 +747,9 @@ async function prepareCalendlyDelivery(req: express.Request): Promise<PreparedCa
     userId: resolved.userId,
     accountId: resolved.account.account_id,
     bookingLeadListId: resolved.account.config?.booking_lead_list_id,
+    attributionPixelId: resolved.account.config?.attributionPixelId,
+    attributionAccountId: resolved.account.config?.attributionAccountId,
+    attributionDisabled: resolved.account.config?.attributionDisabled === true,
     email: parsed.payload.email,
     firstName,
     lastName,

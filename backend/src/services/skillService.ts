@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
+import { OpeningAction, validateOpeningAction } from "../utils/openingActionValidation";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -51,6 +52,7 @@ export interface Skill {
   triggerMode?: SkillTriggerMode;
   schedule?: SkillSchedule;
   welcomeMessage?: string;
+  openingAction?: OpeningAction;
   llmModel?: string;
   maxIterations?: number;
   isBuiltIn?: boolean;
@@ -63,9 +65,30 @@ export interface Skill {
 
 export class SkillService {
   private tableName: string;
+  // ENG-1222: getPublishedSkills() is a full-table scan, called on every turn
+  // of every skill-having chat session (both agent-mode and chatbotService.ts)
+  // to resolve the __other_skills__ virtual skill and the "available skills"
+  // message — none of which needs sub-minute freshness. A short TTL cache
+  // removes that scan from the hot path; publish/edit/delete below explicitly
+  // invalidate it so an admin's change is visible on their very next request
+  // rather than waiting out the TTL.
+  private publishedSkillsCache: { data: Skill[]; expiresAt: number } | null = null;
+  private static readonly PUBLISHED_SKILLS_CACHE_TTL_MS = 30_000;
+  // CodeRabbit (ENG-1222 review): a scan in flight when create/update/delete
+  // invalidates the cache would otherwise finish afterward and unconditionally
+  // overwrite the null with its own now-stale result, silently reviving data
+  // from before the edit until the TTL expires. Bump this on every invalidation
+  // and only let a scan publish its result if the generation it started under
+  // is still current.
+  private publishedSkillsCacheGeneration = 0;
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-Skills`;
+  }
+
+  private invalidatePublishedSkillsCache(): void {
+    this.publishedSkillsCache = null;
+    this.publishedSkillsCacheGeneration++;
   }
 
   private normalizeSkill(item: any): Skill {
@@ -127,6 +150,7 @@ export class SkillService {
 
     try {
       await dynamodb.put(params).promise();
+      this.invalidatePublishedSkillsCache();
       return skill;
     } catch (error) {
       console.error("Error creating skill:", error);
@@ -169,6 +193,11 @@ export class SkillService {
   }
 
   async getPublishedSkills(): Promise<Skill[]> {
+    if (this.publishedSkillsCache && this.publishedSkillsCache.expiresAt > Date.now()) {
+      return this.publishedSkillsCache.data;
+    }
+
+    const generationAtScanStart = this.publishedSkillsCacheGeneration;
     const params = {
       TableName: this.tableName,
       FilterExpression: "isPublished = :isPublished",
@@ -179,8 +208,15 @@ export class SkillService {
 
     try {
       const items = await paginatedScan(dynamodb, params);
-      return ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
+      const result = ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
         .filter(skill => skill.visibility !== 'pending_review');
+      // Only publish this scan's result if nothing invalidated the cache while
+      // it was in flight — otherwise a deferred scan would resurrect stale data
+      // right after a create/update/delete/sync explicitly cleared it.
+      if (this.publishedSkillsCacheGeneration === generationAtScanStart) {
+        this.publishedSkillsCache = { data: result, expiresAt: Date.now() + SkillService.PUBLISHED_SKILLS_CACHE_TTL_MS };
+      }
+      return result;
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
         return [];
@@ -239,25 +275,55 @@ export class SkillService {
     }
   }
 
-  async updateSkill(skill: Skill): Promise<void> {
+  /**
+   * ENG-947: pass `expectedUpdatedAt` to make this a compare-and-swap. A bulk
+   * migration cannot make a read-then-write safe by re-reading first — the row can
+   * still change between the read and this put, and the loser of that race is
+   * overwritten silently with a backup that predates the lost edit. Guarding on the
+   * timestamp moves the check into the write itself, where it is atomic.
+   *
+   * Omitted (the default) leaves every existing caller's behaviour unchanged: an
+   * unconditional put. A conflict surfaces as DynamoDB's
+   * ConditionalCheckFailedException, which callers are expected to treat as "skip
+   * this row", not as a failure of the run.
+   */
+  /**
+   * Returns the `updatedAt` actually persisted. The caller's `skill` object is
+   * never mutated by this method — a caller that needs its own reference to
+   * stay in sync with what's now in the DB (e.g. to chain a further
+   * conditional write) must apply the returned value itself.
+   */
+  async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<string> {
     const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
     if (welcomeMessageError) throw new Error(welcomeMessageError);
+    const openingActionError = validateOpeningAction(skill.openingAction, skill.toolNames || []);
+    if (openingActionError) throw new Error(openingActionError);
+    const updatedAt = new Date().toISOString();
     const skillItem: any = {
       ...skill,
-      updatedAt: new Date().toISOString()
+      updatedAt,
     };
 
     if (skill.toolNames && skill.toolNames.length > 0) {
       skillItem.toolNames = dynamodb.createSet(skill.toolNames);
     }
 
-    const params = {
+    const params: any = {
       TableName: this.tableName,
       Item: skillItem,
     };
 
+    // Explicitly `!== undefined`: a row whose updatedAt is an empty string must
+    // still be guarded, not silently degraded to an unconditional write.
+    if (expectedUpdatedAt !== undefined) {
+      params.ConditionExpression = 'updatedAt = :expectedUpdatedAt';
+      params.ExpressionAttributeValues = { ':expectedUpdatedAt': expectedUpdatedAt };
+    }
+
     try {
       await dynamodb.put(params).promise();
+      this.invalidatePublishedSkillsCache();
+      return updatedAt;
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
       throw error;
@@ -293,6 +359,13 @@ export class SkillService {
         TableName: targetTable,
         Item: skillItem,
       }).promise();
+
+      // ENG-1222: only invalidate when the sync wrote to THIS environment's own
+      // table (this.tableName) — getPublishedSkills only ever reads that one, so
+      // a sync writing to the other environment's table has nothing to invalidate.
+      if (targetTable === this.tableName) {
+        this.invalidatePublishedSkillsCache();
+      }
 
       return skill;
     } catch (error) {
@@ -449,6 +522,35 @@ export class SkillService {
     return skill;
   }
 
+  /**
+   * ENG-932: the owner-side undo for an accidental submitForReview(). Unlike
+   * rejectSkill(), this never writes reviewFeedback — nothing was rejected,
+   * the owner just wants their skill back, so no "review feedback" banner.
+   */
+  async withdrawFromReview(skillId: string, ownerId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.ownerId !== ownerId) throw new Error('Not authorized');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    const expectedUpdatedAt = skill.updatedAt;
+    skill.visibility = 'private';
+    skill.isPublished = false;
+    skill.reviewFeedback = undefined;
+    try {
+      // Guard against a concurrent admin approve/reject landing between the
+      // read above and this write — an unconditional put would silently
+      // clobber whichever one lost the race.
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new Error('Skill was changed by someone else — refresh and try again');
+      }
+      throw error;
+    }
+    return skill;
+  }
+
   async deleteSkill(skillId: string): Promise<void> {
     const params = {
       TableName: this.tableName,
@@ -457,6 +559,7 @@ export class SkillService {
 
     try {
       await dynamodb.delete(params).promise();
+      this.invalidatePublishedSkillsCache();
     } catch (error) {
       console.error(`Error deleting skill ${skillId}:`, error);
       throw error;

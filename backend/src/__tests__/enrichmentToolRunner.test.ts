@@ -77,6 +77,33 @@ describe('runEmmaEnrichment', () => {
     expect(summary.samples).toBeUndefined();
   });
 
+  // ENG-1388 AC5: an Enigma halt must never reach the user as "no card revenue".
+  it.each([
+    ['credits_exhausted', 'credits are exhausted'],
+    ['auth', 'key was rejected'],
+    ['budget_reached', 'budget is spent'],
+  ])('warns Emma when the Enigma run halted (%s)', async (haltedBy, phrase) => {
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-1',
+      processed: 8,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 1234,
+      enigma: { lookups: 3, filled: 1, skipped: {}, failed: {}, haltedBy },
+    });
+
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'card_revenue_12m', instruction: 'card revenue' }],
+      mode: 'enrich',
+      leadIds: ['l1'],
+    });
+
+    expect(summary.warnings.join(' ')).toContain(phrase);
+    expect(summary.warnings.join(' ')).toMatch(/did not run, not that the company has none/);
+  });
+
   it('maps preview samples from result.preview', async () => {
     (runEnrichment as jest.Mock).mockResolvedValue({
       runId: 'run-2',
@@ -298,6 +325,32 @@ describe('pickPreviewLeadIds', () => {
     });
     const ids = await pickPreviewLeadIds('list-1', undefined);
     expect(ids).toEqual(['b', 'c']);
+  });
+
+  it('skips placeholder/test-domain rows when real leads are available (ENG-968)', async () => {
+    // A list ~40% seeded with test rows must still preview against real leads —
+    // sampling the junk rows makes the whole list look unenrichable.
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+      items: [
+        { leadId: 'junk1', email: 'queue-verify@example.com', linkedin: '' },
+        { leadId: 'junk2', email: 'test2@company.com', linkedin: '' },
+        { leadId: 'real1', email: 'jane@acme.com', linkedin: '' },
+        { leadId: 'real2', email: '', linkedin: 'https://linkedin.com/in/real2' },
+      ],
+    });
+    const ids = await pickPreviewLeadIds('list-1', undefined);
+    expect(ids).toEqual(['real1', 'real2']);
+  });
+
+  it('falls back to the pool when every lead is a placeholder row (ENG-968)', async () => {
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+      items: [
+        { leadId: 'junk1', email: 'queue-verify@example.com', linkedin: '' },
+        { leadId: 'junk2', email: 'test2@company.com', linkedin: '' },
+      ],
+    });
+    const ids = await pickPreviewLeadIds('list-1', undefined);
+    expect(ids).toEqual(['junk1', 'junk2']);
   });
 
   it('falls back to the first leads when fewer than 2 have identity data', async () => {

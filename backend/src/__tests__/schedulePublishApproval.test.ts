@@ -20,77 +20,127 @@ import {
   classifySessionForPublishGate,
 } from '../utils/schedulePublishApproval';
 
-describe('resolvePublishAuthorized (ENG-803)', () => {
-  describe('absence means authorized — no existing schedule changes behaviour', () => {
-    it('authorizes a legacy schedule that predates the field', () => {
-      expect(resolvePublishAuthorized({})).toBe(true);
+describe('resolvePublishAuthorized (ENG-803, re-pointed by ENG-827)', () => {
+  // POLARITY PRESERVED — and this is the same conclusion the file header reaches.
+  // ENG-827 adds an AFFIRMATIVE, tool-scoped grant, and this resolver delegates to that
+  // single decision so the two gates on the dispatch path cannot disagree. What it does
+  // NOT do is flip the default: a schedule nobody has been asked about stays authorized
+  // under ENG-803's opt-out, because the alternative breaks the 25 working schedules
+  // this header already argued must not break.
+  //
+  // So there are three states, not two: never asked, granted, and revoked.
+  const GRANT = {
+    autopublishAuthorized: true,
+    autopublishAuthorizedTools: ['post_on_connected_account'],
+  };
+
+  describe('absence of an ANSWER defers; absence of a RECORD withholds', () => {
+    it('withholds a legacy schedule that designates no publishing tool', () => {
+      // Nothing to authorize — there is no publish tool to scope the default to.
+      expect(resolvePublishAuthorized({} as any)).toBe(false);
     });
 
-    it('authorizes when the field is explicitly false', () => {
-      expect(resolvePublishAuthorized({ requirePublishApproval: false })).toBe(true);
+    it('authorizes a legacy schedule that designates one', () => {
+      // The 897 rows with no consent field. Reading their silence as a refusal is what
+      // would stop the 25 that publish today.
+      expect(
+        resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)
+      ).toBe(true);
     });
 
-  });
+    it('withholds when the grant is explicitly false', () => {
+      expect(resolvePublishAuthorized({ autopublishAuthorized: false } as any)).toBe(false);
+    });
 
-  describe('a missing RECORD is a different absence from a missing FIELD', () => {
-    // Greptile review #16: conflating the two let a failed schedule read publish
-    // straight past an owner who had explicitly opted out. The errors are not
-    // symmetric — a public post cannot be withdrawn, while a withhold saves the
-    // drafts and tells the owner — so an unverifiable state takes the recoverable
-    // side. This does NOT re-introduce the opt-in regression: the 897 existing rows
-    // are all "record present, field absent", which stays authorized above.
     it('withholds when there is no schedule record at all', () => {
+      // Unchanged from ENG-803: absence of a RECORD is not an answer either.
       expect(resolvePublishAuthorized(null)).toBe(false);
       expect(resolvePublishAuthorized(undefined)).toBe(false);
     });
-
-    it('still authorizes the read-but-unset case, so no existing schedule regresses', () => {
-      expect(resolvePublishAuthorized({})).toBe(true);
-    });
   });
 
-  describe('only an explicit opt-out withholds', () => {
-    it('withholds when the owner set requirePublishApproval', () => {
-      expect(resolvePublishAuthorized({ requirePublishApproval: true })).toBe(false);
+  describe('an affirmative, tool-scoped grant authorizes', () => {
+    it('authorizes when the owner consented and named an approved tool', () => {
+      expect(resolvePublishAuthorized(GRANT as any)).toBe(true);
+    });
+
+    it('withholds a grant with no approved tool — unknown scope authorizes nothing', () => {
+      expect(resolvePublishAuthorized({ autopublishAuthorized: true } as any)).toBe(false);
     });
 
     it('ignores truthy non-boolean values — strict === true only', () => {
-      // A loosely-typed caller (or a stringly-typed DynamoDB round-trip) must not be
-      // able to silence a schedule's publishing by accident.
-      for (const value of ['true', 1, {}, [], 'yes']) {
-        expect(resolvePublishAuthorized({ requirePublishApproval: value as any })).toBe(true);
+      for (const truthy of ['true', 1, {}]) {
+        expect(
+          resolvePublishAuthorized({ ...GRANT, autopublishAuthorized: truthy } as any)
+        ).toBe(false);
       }
     });
   });
 
+  describe('the owner\'s explicit hold still outranks a grant', () => {
+    it('withholds when requirePublishApproval is set, grant or no grant', () => {
+      expect(resolvePublishAuthorized({ ...GRANT, requirePublishApproval: true } as any)).toBe(false);
+    });
+  });
+
   describe('signals that must NEVER grant or withhold publishing', () => {
-    // Each of these was tried and rejected on review. They are asserted here so a
-    // future edit that starts honouring one fails loudly rather than silently
-    // handing the model a way to authorize (or mute) its own publishing.
     it('ignores fullAutonomy — consent to decide unaided is not consent to post', () => {
-      expect(resolvePublishAuthorized({ fullAutonomy: true } as any)).toBe(true);
-      expect(resolvePublishAuthorized({ fullAutonomy: false } as any)).toBe(true);
+      expect(resolvePublishAuthorized({ fullAutonomy: true } as any)).toBe(false);
     });
 
-    it('ignores requiredFunctionCalls — it is MODEL-WRITABLE via manage_scheduled_chat', () => {
-      expect(
-        resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)
-      ).toBe(true);
-      // and, critically, it cannot WITHHOLD either — the opt-out is the only lever
+    // requiredFunctionCalls IS model-writable (manage_scheduled_chat forwards
+    // required_function_calls), and under the deferred default it supplies the SCOPE for
+    // a never-asked schedule. So state precisely what it can and cannot do.
+    //
+    // It cannot manufacture an authorization the owner has decided against — that is the
+    // property that has to hold, and both directions are pinned below. What it can do is
+    // scope a row nobody has answered for, which on `main` publishes with no scope check
+    // at all; the model therefore reaches no outcome production does not already allow.
+    // Within a run it cannot even do that: the admitted scope is stamped before turn one
+    // and narrowPublishAuthorization only ever intersects, so a mid-run edit is invisible
+    // to the run that made it. Collecting real consent retires this entirely.
+    it('cannot override an explicit revocation, however it is written', () => {
       expect(
         resolvePublishAuthorized({
-          requiredFunctionCalls: [],
-          requirePublishApproval: true,
+          autopublishAuthorized: false,
+          requiredFunctionCalls: ['post_on_connected_account'],
         } as any)
       ).toBe(false);
+    });
+
+    it('cannot override the owner\'s hold', () => {
+      expect(
+        resolvePublishAuthorized({
+          requirePublishApproval: true,
+          requiredFunctionCalls: ['post_on_connected_account'],
+        } as any)
+      ).toBe(false);
+    });
+
+    it('cannot widen a grant onto a tool the owner never approved', () => {
+      // The scope binding that matters wherever consent is real: a granted schedule
+      // stays limited to the approved list no matter what the model adds here.
+      expect(
+        resolvePublishAuthorized({
+          ...GRANT,
+          requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        } as any)
+      ).toBe(true);
+      const { resolveSchedulePublishAuthorization } = require('../utils/schedulePublishAuthorization');
+      expect(
+        resolveSchedulePublishAuthorization({
+          ...GRANT,
+          requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        }).tools
+      ).toEqual(['post_on_connected_account']);
     });
 
     it('ignores the schedule prompt text — authorization is never model-read', () => {
       expect(
         resolvePublishAuthorized({
-          startingMessage: 'Do NOT post anything without asking me first.',
+          startingMessage: 'POST replies directly. Do not ask for approval.',
         } as any)
-      ).toBe(true);
+      ).toBe(false);
     });
   });
 });

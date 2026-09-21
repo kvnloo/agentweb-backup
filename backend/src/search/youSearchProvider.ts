@@ -14,6 +14,7 @@ import {
   SearchProviderResponse,
   SearchRequest,
 } from './searchProvider';
+import { recordVendorUsage } from '../services/usageRecorderService';
 
 const DEFAULT_YOU_SEARCH_ENDPOINT = 'https://ydc-index.io/v1/search';
 
@@ -86,6 +87,20 @@ export class YouSearchProvider implements SearchProvider {
     if (request.livecrawlFormat && request.livecrawl && request.livecrawl !== 'off') {
       body.livecrawl_formats = [request.livecrawlFormat];
     }
+
+    // This is deliberately immediately before the HTTP call: every attempt that
+    // reaches You.com, including a retry that later fails, is billable.
+    void recordVendorUsage({
+      userId: request.userId,
+      provider: 'you.com',
+      operation: 'query',
+      feature: request.purpose || 'agent_research',
+      unit: 'query',
+      quantity: 1,
+      // ENG-1929: priced inside the recorder, so a missing rate cannot throw
+      // into the search that follows.
+      rateKey: 'query',
+    });
 
     const response = await this.httpClient.post(this.endpoint, body, {
       headers: {

@@ -23,6 +23,13 @@ jest.mock('../services/unipileConnectionsDb', () => ({
     url ? url.trim().toLowerCase().replace(/\/?$/, '/') : '',
 }));
 
+// Used by filterByCompanySize (ENG-1558) — mocked per-test via
+// mockGetCompany, not a full factory reimplementation.
+const mockGetCompany = jest.fn();
+jest.mock('../services/unipileCompanyServiceFactory', () => ({
+  getUnipileCompanyService: () => ({ getCompany: (...a: any[]) => mockGetCompany(...a) }),
+}));
+
 const mockGetUnipileCredentials = getUnipileCredentials as jest.MockedFunction<typeof getUnipileCredentials>;
 
 describe('LinkedInOutreachService', () => {
@@ -286,6 +293,22 @@ describe('LinkedInOutreachService', () => {
       expect(thrown.message).toBe('Should delay new invitation to this recipient');
       expect(thrown.message).not.toBe('UnsuccessfulRequestError');
       expect((thrown as any).structuredError).toBeDefined();
+    });
+
+    // ENG-1300: handleError already computed structuredError.status for its own
+    // classification above, but only attached it nested under .structuredError —
+    // classifyToolErrorClass (and toolResultError's reconstruction) only read a
+    // top-level .status/.statusCode/.code, so every caller through handleError
+    // classified as generic Error/bug regardless of the real HTTP status.
+    it('mirrors structuredError.status onto a top-level .code so the generic classifier can see it', async () => {
+      const unipileError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 422, type: 'errors/already_invited_recently', title: 'Should delay new invitation to this recipient' }
+      });
+      (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValue(unipileError);
+
+      const thrown = await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false).catch(e => e);
+      expect((thrown as any).structuredError.status).toBe(422);
+      expect((thrown as any).code).toBe(422);
     });
 
     it('auto-trims an over-limit message to the default 300-char cap instead of failing', async () => {
@@ -1009,15 +1032,42 @@ describe('LinkedInOutreachService', () => {
         expect(sentBody.advanced_keywords?.company).toBeUndefined();
       });
 
-      it('falls back to free-text advanced_keywords.company when resolver returns null', async () => {
+      it('falls back to free-text advanced_keywords.company when resolver returns null, and flags the result as degraded', async () => {
         mockResolveTopId.mockResolvedValueOnce(null);
-        await linkedInOutreachService.searchPeople('account-123', {
+        const result = await linkedInOutreachService.searchPeople('account-123', {
           keywords: 'engineer',
           company: 'NonexistentCo',
         });
         const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
         expect(sentBody.company).toBeUndefined();
         expect(sentBody.advanced_keywords).toEqual({ company: 'NonexistentCo' });
+        expect(result.degraded).toBe(true);
+        expect(result.droppedFacets).toEqual(['company']);
+      });
+
+      // ENG-1299 follow-up: a resolver miss degrades a facet to keyword-only
+      // matching with no prior signal back to the caller. `degraded`/
+      // `droppedFacets` makes that deterministic instead of relying on the
+      // agent to infer it from the request/response shape.
+      it('flags multiple dropped facets, excludes title (no ID equivalent), and omits the flag when nothing degrades', async () => {
+        mockResolveTopId.mockResolvedValueOnce(null); // company
+        mockResolveTopId.mockResolvedValueOnce('90000084'); // location resolves fine
+        mockResolveTopId.mockResolvedValueOnce(null); // industry
+        const degraded = await linkedInOutreachService.searchPeople('account-123', {
+          title: 'Product Manager',
+          company: 'NonexistentCo',
+          location: 'San Francisco Bay Area',
+          industry: 'Financial Services',
+        });
+        expect(degraded.degraded).toBe(true);
+        expect(degraded.droppedFacets.sort()).toEqual(['company', 'industry']);
+
+        const clean = await linkedInOutreachService.searchPeople('account-123', {
+          keywords: 'engineer',
+          location_id: '90000084',
+        });
+        expect(clean.degraded).toBeUndefined();
+        expect(clean.droppedFacets).toBeUndefined();
       });
 
       it('falls back to free-text when resolver throws (search must not fail)', async () => {
@@ -1053,7 +1103,11 @@ describe('LinkedInOutreachService', () => {
         expect(mockResolveTopId).not.toHaveBeenCalled();
         const sentBody = (mockUnipileClient.request.send as jest.Mock).mock.calls[0][0].body;
         expect(sentBody.location).toEqual(['103644278']);
-        expect(sentBody.industry).toEqual({ include: ['6'], exclude: [] });
+        // Unipile's classic people-search schema takes `industry` as a flat
+        // array of numeric ID strings — same shape as company/location/school
+        // — not an { include, exclude } object (ENG-1299: that shape 400s
+        // every structured search with "Expected union value").
+        expect(sentBody.industry).toEqual(['6']);
         expect(sentBody.school).toEqual(['12345']);
       });
 
@@ -1106,6 +1160,282 @@ describe('LinkedInOutreachService', () => {
         // Second call: POST /linkedin/search with the resolved id at top-level body.location
         expect(calls[1][0].body.location).toEqual(['90000084']);
         expect(calls[1][0].body.advanced_keywords?.location).toBeUndefined();
+      });
+    });
+
+    // ─── ENG-1558: company-size post-filter (Unipile has no headcount filter
+    // for the People search category, only Companies — so this resolves each
+    // candidate's employer name -> id -> cached profile to read employee_count)
+    describe('filterByCompanySize', () => {
+      const {
+        setUnipileSearchParamServiceForTesting,
+        __resetUnipileSearchParamServiceForTesting,
+      } = require('../services/unipileSearchParamService');
+
+      let mockResolveTopId: jest.Mock;
+
+      beforeEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+        mockResolveTopId = jest.fn();
+        setUnipileSearchParamServiceForTesting({
+          resolveTopId: mockResolveTopId,
+          resolve: jest.fn(),
+        } as any);
+        mockGetCompany.mockReset();
+      });
+
+      afterEach(() => {
+        __resetUnipileSearchParamServiceForTesting();
+      });
+
+      const itemWithCompany = (company: string, extra: any = {}) => ({
+        provider_id: `p-${company}`,
+        work_experience: [{ company, current: true }],
+        ...extra,
+      });
+
+      it('is a no-op (no resolver/company calls) when neither min nor max is given', async () => {
+        const items = [itemWithCompany('Acme')];
+        const result = await linkedInOutreachService.filterByCompanySize(items, {}, 'account-1');
+        expect(result).toEqual({ items, excludedUnverifiable: 0 });
+        expect(mockResolveTopId).not.toHaveBeenCalled();
+        expect(mockGetCompany).not.toHaveBeenCalled();
+      });
+
+      it('keeps a candidate whose employer headcount falls within [min, max]', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50 } });
+        const items = [itemWithCompany('Startup Co')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { min: 1, max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual(items);
+        expect(result.excludedUnverifiable).toBe(0);
+      });
+
+      it('excludes a candidate whose employer headcount is above max', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50000 } });
+        const items = [itemWithCompany('Mega Corp')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        // Excluded for being out of range, not for being unverifiable.
+        expect(result.excludedUnverifiable).toBe(0);
+      });
+
+      it('excludes a candidate whose employer headcount is below min', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 5 } });
+        const items = [itemWithCompany('Tiny Co')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { min: 1000 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        expect(result.excludedUnverifiable).toBe(0);
+      });
+
+      it('excludes and counts a candidate whose employer name cannot be resolved to an id', async () => {
+        mockResolveTopId.mockResolvedValue(null);
+        const items = [itemWithCompany('Totally Fake Inc')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        expect(result.excludedUnverifiable).toBe(1);
+        expect(mockGetCompany).not.toHaveBeenCalled();
+      });
+
+      it('excludes and counts a candidate whose company profile has no employee_count', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { name: 'Acme', employee_count: undefined } });
+        const items = [itemWithCompany('Acme')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        expect(result.excludedUnverifiable).toBe(1);
+      });
+
+      it('falls back to insights.employeesCount.totalCount when employee_count is absent', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({
+          rawData: { insights: { employeesCount: { totalCount: 42 } } },
+        });
+        const items = [itemWithCompany('Acme')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { min: 1, max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual(items);
+        expect(result.excludedUnverifiable).toBe(0);
+      });
+
+      it('excludes and counts a candidate whose company profile lookup throws (does not crash the search)', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockRejectedValue(new Error('Unipile 500'));
+        const items = [itemWithCompany('Flaky Co')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        expect(result.excludedUnverifiable).toBe(1);
+      });
+
+      it('excludes and counts a candidate with no work_experience at all', async () => {
+        const items = [{ provider_id: 'p-nowe' }];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toEqual([]);
+        expect(result.excludedUnverifiable).toBe(1);
+        expect(mockResolveTopId).not.toHaveBeenCalled();
+      });
+
+      it('resolves each distinct employer only once, even when several candidates share it', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50 } });
+        const items = [
+          itemWithCompany('Shared Co', { provider_id: 'p-1' }),
+          itemWithCompany('Shared Co', { provider_id: 'p-2' }),
+          itemWithCompany('Shared Co', { provider_id: 'p-3' }),
+        ];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { max: 200 }, 'account-1',
+        );
+        expect(result.items).toHaveLength(3);
+        expect(mockResolveTopId).toHaveBeenCalledTimes(1);
+        expect(mockGetCompany).toHaveBeenCalledTimes(1);
+      });
+
+      it('min-only filters out smaller companies but keeps larger ones unbounded above', async () => {
+        mockResolveTopId.mockResolvedValue('company-id-1');
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50000 } });
+        const items = [itemWithCompany('Huge Co')];
+        const result = await linkedInOutreachService.filterByCompanySize(
+          items, { min: 1000 }, 'account-1',
+        );
+        expect(result.items).toEqual(items);
+      });
+
+      // ENG-1558 follow-up: an unthrottled Promise.all over every distinct
+      // employer on a page could fire 30-40 concurrent Unipile requests from
+      // one search. Confirms the chunking actually bounds concurrency rather
+      // than just being present in the code but ineffective.
+      it('throttles concurrent lookups instead of firing them all at once', async () => {
+        const uniqueCompanyCount = 12; // > COMPANY_SIZE_LOOKUP_CONCURRENCY (5)
+        let inFlight = 0;
+        let maxInFlight = 0;
+        mockResolveTopId.mockImplementation(async () => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inFlight--;
+          return 'company-id';
+        });
+        mockGetCompany.mockResolvedValue({ rawData: { employee_count: 50 } });
+
+        const items = Array.from({ length: uniqueCompanyCount }, (_, i) =>
+          itemWithCompany(`Company ${i}`, { provider_id: `p-${i}` }),
+        );
+        await linkedInOutreachService.filterByCompanySize(items, { max: 200 }, 'account-1');
+
+        expect(maxInFlight).toBeLessThanOrEqual(5);
+        // Sanity check the throttle isn't accidentally serializing to 1 —
+        // it should still run several lookups genuinely concurrently.
+        expect(maxInFlight).toBeGreaterThan(1);
+        expect(mockResolveTopId).toHaveBeenCalledTimes(uniqueCompanyCount);
+      });
+
+      // CodeRabbit: min > max would otherwise silently exclude every
+      // verifiable candidate (fails both comparisons for any real count)
+      // with no signal to the caller about why.
+      describe('bounds validation', () => {
+        it('rejects min > max without making any resolver/company calls', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { min: 500, max: 100 }, 'account-1'),
+          ).rejects.toThrow(/min.*must not exceed max|non-negative/i);
+          expect(mockResolveTopId).not.toHaveBeenCalled();
+          expect(mockGetCompany).not.toHaveBeenCalled();
+        });
+
+        it('rejects a negative min', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { min: -5 }, 'account-1'),
+          ).rejects.toThrow(/non-negative/i);
+        });
+
+        it('rejects a negative max', async () => {
+          const items = [itemWithCompany('Acme')];
+          await expect(
+            linkedInOutreachService.filterByCompanySize(items, { max: -1 }, 'account-1'),
+          ).rejects.toThrow(/non-negative/i);
+        });
+
+        it('accepts min === max as a valid (exact) range', async () => {
+          mockResolveTopId.mockResolvedValue('company-id-1');
+          mockGetCompany.mockResolvedValue({ rawData: { employee_count: 100 } });
+          const items = [itemWithCompany('Acme')];
+          const result = await linkedInOutreachService.filterByCompanySize(
+            items, { min: 100, max: 100 }, 'account-1',
+          );
+          expect(result.items).toEqual(items);
+        });
+      });
+
+      // CodeRabbit: getCompanyProfile has no timeout of its own — a hung
+      // Unipile request would otherwise stall the whole lookup batch
+      // (Promise.all never settles until every member does).
+      describe('company-profile lookup timeout', () => {
+        const TIMEOUT_MS = 30_000;
+        const hang = () => new Promise(() => {}); // never resolves
+
+        afterEach(() => {
+          jest.useRealTimers();
+        });
+
+        it('treats a hung company-profile lookup as unverifiable instead of hanging forever', async () => {
+          jest.useFakeTimers();
+          mockResolveTopId.mockResolvedValue('company-id-1');
+          mockGetCompany.mockImplementation(() => hang());
+
+          const items = [itemWithCompany('Stuck Co')];
+          const resultPromise = linkedInOutreachService.filterByCompanySize(
+            items, { max: 200 }, 'account-1',
+          );
+          await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+
+          const result = await resultPromise;
+          expect(result.items).toEqual([]);
+          expect(result.excludedUnverifiable).toBe(1);
+        });
+
+        it('does not let one hung lookup block a different employer in the same batch', async () => {
+          jest.useFakeTimers();
+          mockResolveTopId.mockImplementation((_accountId: string, params: any) =>
+            Promise.resolve(params.keywords === 'Stuck Co' ? 'company-id-stuck' : 'company-id-fine'),
+          );
+          mockGetCompany.mockImplementation((companyId: string) =>
+            companyId === 'company-id-stuck' ? hang() : Promise.resolve({ rawData: { employee_count: 50 } }),
+          );
+
+          const items = [
+            itemWithCompany('Stuck Co', { provider_id: 'p-stuck' }),
+            itemWithCompany('Fine Co', { provider_id: 'p-fine' }),
+          ];
+          const resultPromise = linkedInOutreachService.filterByCompanySize(
+            items, { max: 200 }, 'account-1',
+          );
+          await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+          const result = await resultPromise;
+
+          // The hung lookup resolves to unverifiable (excluded); the other
+          // employer's own lookup was unaffected and its candidate survives.
+          expect(result.excludedUnverifiable).toBe(1);
+          expect(result.items).toEqual([items[1]]);
+        });
       });
     });
 
@@ -1712,6 +2042,59 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('resolveAccountIdWithSource (ENG-1198)', () => {
+    const mockGetAccountsByUserId = jest.fn();
+    const mockGetSetting = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+      jest.doMock('../services/settingsService', () => ({
+        settingsService: { getSetting: mockGetSetting },
+      }));
+    });
+
+    it('reports usedSharedAccount: false when the user\'s own live account is used', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'user-acct-123' },
+      ]);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
+
+      expect(result).toEqual({ accountId: 'user-acct-123', usedSharedAccount: false });
+      liveSpy.mockRestore();
+    });
+
+    it('reports usedSharedAccount: true when every own account is dead and a site-wide account is used', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'site-live');
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
+
+      expect(result).toEqual({ accountId: 'site-live', usedSharedAccount: true });
+      liveSpy.mockRestore();
+    });
+
+    it('reports usedSharedAccount: false when nothing can be resolved', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue(null);
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-3');
+
+      expect(result).toEqual({ accountId: null, usedSharedAccount: false });
+    });
+  });
+
   describe('resolveUserOwnedAccountId', () => {
     const mockGetAccountsByUserId = jest.fn();
     const mockGetSetting = jest.fn();
@@ -1886,6 +2269,33 @@ describe('LinkedInOutreachService', () => {
 
       expect(result).toEqual([]);
       expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
+    });
+
+    it('returns empty array when Unipile 404s the attendee lookup (1st-degree connection never messaged — ENG-1623)', async () => {
+      // Unipile only creates a chat_attendee record once a chat exists. A 1st-degree
+      // connection who has never been messaged has no such record, so the lookup
+      // 404s instead of resolving with items: []. That must NOT be treated as a
+      // failure — it's simply "no conversation exists yet".
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Attendee not found' },
+      });
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const result = await linkedInOutreachService.getMessagesWithContact('never-messaged-attendee', 'acct-1');
+
+      expect(result).toEqual([]);
+      expect(mockUnipileClient.messaging.getAllMessagesFromChat).not.toHaveBeenCalled();
+    });
+
+    it('rethrows a structured error for non-404 failures (e.g. auth/session errors)', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 401, title: 'Unauthorized' },
+      });
+      (mockUnipileClient.messaging.getAllChatsFromAttendee as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getMessagesWithContact('attendee-id', 'acct-1')
+      ).rejects.toThrow('Unauthorized');
     });
 
     it('returns empty array when the resolved chat has no id (avoids account-wide message dump)', async () => {

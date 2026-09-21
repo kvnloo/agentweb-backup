@@ -12,6 +12,9 @@ jest.mock('../services/db', () => ({
     getLeadsByICPFlag: jest.fn(),
     getLeadsByEngagedFlag: jest.fn(),
     getLeadById: jest.fn(),
+    getLeadByIdAcrossLists: jest.fn(),
+    getLeadListsByUserId: jest.fn(),
+    getLeadListsForUser: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
@@ -39,13 +42,33 @@ jest.mock('../services/resendService', () => ({
 jest.mock('../services/gmailService', () => ({
   gmailService: {
     sendEmail: jest.fn(),
-  }
+  },
+  // ENG-1300: real typed error classes — plain classes, no side effects to
+  // import — needed so a test can construct one and prove
+  // emailProviderErrorStatus() maps it correctly.
+  GmailTokenRevokedError: jest.requireActual('../services/gmailService').GmailTokenRevokedError,
+}));
+
+// ENG-265: sendEmailToLead/sendEmailFromConfiguredSender now re-resolve the sender via
+// resolveSenderForSend (crmSenderService.ts) as the authoritative source, instead of trusting
+// the getCrmSenders() snapshot they already have — see the "fail closed" fix in
+// agentModeService.ts. This suite doesn't back real settingsService/DynamoDB data, so wire
+// resolveSenderForSend to mirror whatever getCrmSenders() is mocked to return per-test
+// (getCrmSenders is always called first in real production order, so its mock is already
+// configured by the time this runs) rather than repeating each test's sender fixture twice.
+jest.mock('../services/crmSenderService', () => ({
+  resolveSenderForSend: jest.fn(),
 }));
 
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
-import { gmailService } from '../services/gmailService';
+import { gmailService, GmailTokenRevokedError } from '../services/gmailService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+import { resolveSenderForSend } from '../services/crmSenderService';
+import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -117,6 +140,24 @@ describe('AgentModeService - CRM Tools', () => {
     // clearAllMocks() does not reset implementations, so set this deterministically
     // on every test; deny tests override to false explicitly.
     (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+
+    (resolveSenderForSend as jest.Mock).mockImplementation(async (uid: string, senderId?: string, senderEmail?: string) => {
+      const result = await (service as any).getCrmSenders(uid);
+      if (!result?.success) return null;
+      const needle = String(senderEmail || '').toLowerCase();
+      const found =
+        result.senders.find((s: any) => senderId && s.id === senderId) ??
+        result.senders.find((s: any) => s.email?.toLowerCase() === needle) ??
+        null;
+      if (!found) return null;
+      // Mirror crmSenderService.normalizeSender: the fixtures in this file use the legacy
+      // senderType/gmailAccountId keys the same way a real persisted sender might.
+      return {
+        ...found,
+        senderProvider: found.senderProvider || found.senderType || 'resend',
+        connectedAccountId: found.connectedAccountId || found.gmailAccountId,
+      };
+    });
   });
 
   // ─── getLeads ──────────────────────────────────────────────────────────
@@ -882,11 +923,150 @@ describe('AgentModeService - CRM Tools', () => {
     it('should return not found for missing lead', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      // No other accessible list holds this lead_id either — a genuine miss.
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
 
       const result = await service.getLeadDetails(listId, leadId, userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Lead not found');
+      // Both tiers ran, found nothing, and still landed on a clean not-found.
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
+    });
+
+    it('ENG-969: corrects a stale list_id when the lead is in one of the caller\'s OWN other lists (tier 1, no org fan-out)', async () => {
+      // The actual production case (session 6082779b-f9f1-4e38-a8eb-34abbc3da419) was
+      // always a same-user list mixup, so tier 1 (getLeadListsByUserId — one cheap
+      // query) should resolve it without ever calling the org-wide fan-out.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List', linkedInAccountId: 'acc-other' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(leadInOtherList as any);
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(result.note).toContain(listId);
+      expect(result.note).toContain(otherListId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([otherListId], leadId);
+      // Tier 2 (full org fan-out) must never run when tier 1 already found it.
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      // Engagement lookups must use the corrected list, not the one originally requested.
+      expect(mockCrmDb.getLeadEngagementCount).toHaveBeenCalledWith(otherListId, leadId, userId);
+    });
+
+    it('ENG-969: falls back to tier 2 (org-wide) when the lead is not in any of the caller\'s own lists', async () => {
+      const orgPeerListId = 'list-peer';
+      const orgPeerList = { ...mockList, listId: orgPeerListId, userId: 'peer-user', name: 'Peer List' };
+      const leadInPeerList = { ...mockLead, listId: orgPeerListId };
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList, orgPeerList] as any);
+      mockCrmDb.getLeadByIdAcrossLists
+        .mockResolvedValueOnce(null as any) // tier 1: own lists — miss
+        .mockResolvedValueOnce(leadInPeerList as any); // tier 2: org-wide — hit
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === orgPeerListId ? (orgPeerList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(orgPeerListId);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledWith(userId);
+      expect(mockCrmDb.getLeadListsForUser).toHaveBeenCalledWith(userId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenNthCalledWith(1, [], leadId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenNthCalledWith(2, [orgPeerListId], leadId);
+    });
+
+    it('ENG-969: does not leak a lead from a list the caller cannot access', async () => {
+      // getLeadByIdAcrossLists is only ever given getLeadListsByUserId's / getLeadListsForUser's
+      // own output, so a list the caller can't see is never a candidate in the first place.
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+    });
+
+    it('ENG-969: retries the whole recovery once after a throttle, and succeeds on the retry', async () => {
+      // The AWS SDK already retries an individual throttled DynamoDB call a few
+      // times internally, so a throw reaching our code means that already
+      // failed. One bounded retry (after a real pause) still gives a short,
+      // transient burst a second chance to resolve the correction.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValueOnce([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValueOnce(leadInOtherList as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-969: degrades to a plain not-found (not a new error) when the recovery lookup fails on both attempts', async () => {
+      // AW-LeadLists runs on fixed provisioned capacity in production — a sustained
+      // throttle here must never leave the caller worse off than before this fix existed.
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+      expect(result.error).toBe('The specified lead does not exist in this list');
+      // Must NOT surface as the generic catch-all 'Failed to get lead details'.
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      // Proves the retry actually happened, not just a single attempt.
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-969: degrades to a plain not-found when tier 2 throws on both attempts', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any); // tier 1 always misses
+      mockCrmDb.getLeadListsForUser.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadListsForUser).toHaveBeenCalledTimes(2);
     });
 
     it('should expose enrichmentMetadata provenance so the agent can cite data sources', async () => {
@@ -1153,7 +1333,7 @@ describe('AgentModeService - CRM Tools', () => {
           company: 'Acme',
           customFields: { dinnerSeat: 'confirmed' },
         },
-      ]);
+      ], expect.objectContaining({ dedupeByNameCompany: true }));
     });
 
     it('allows a listed crm.editor to add leads to another member\'s list (ENG-1049)', async () => {
@@ -1165,7 +1345,7 @@ describe('AgentModeService - CRM Tools', () => {
       const result = await service.addLeadsToList(listId, [newLead], orgMemberId);
 
       expect(result.success).toBe(true);
-      expect(result.newCount).toBe(1);
+      expect(result.reconciliation.created).toBe(1);
       expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
     });
 
@@ -1203,6 +1383,380 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.message).toBe('Lead list not found');
       expect(mockCrmDb.canOrgMemberAccessList).not.toHaveBeenCalled();
       expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
+    });
+
+    // ENG-1133: a 97-row CSV imported in three 25-row calls stopped at 75 when
+    // the whole-turn cap fired. Each call had reported only "25 new lead(s)
+    // created", so the next turn could not tell which 75 of the 97 had landed
+    // and told the user to retry the whole request instead of resuming.
+    describe('resumable import reporting (ENG-1133)', () => {
+      beforeEach(() => {
+        mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      });
+
+      it('names the rows it persisted so the next turn can resume from the remainder', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'merged'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'one@example.com', firstName: 'One' },
+            { linkedin: 'https://www.linkedin.com/in/two', firstName: 'Two', lastName: 'Person' },
+          ],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.attempted).toBe(2);
+        expect(result.importedIdentifiers).toEqual([
+          'one@example.com',
+          'https://www.linkedin.com/in/two',
+        ]);
+        expect(result.unimportedRows).toBeUndefined();
+      });
+
+      it('returns an explicit resumable partial naming the rows that did not land', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 2: b@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['created', 'failed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+          ],
+          userId,
+        );
+
+        // NOT success:false — the dispatch boundary turns a success:false result
+        // into a structured tool error, which strips `unimportedRows` before the
+        // model ever sees it and appends a "do NOT retry" verdict. Rows landed,
+        // so the call succeeded; `complete: false` carries the incompleteness.
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 2, identifier: 'b@example.com', reason: 'failed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/1 of 3/);
+        // The agent must be told to resume with the named rows, not to hand a
+        // whole-request retry back to the user.
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('still reports failure when the import landed nothing at all', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 2,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'failed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        // Nothing is in the list and every row was attempted, so this IS a tool
+        // failure — the dispatcher should downgrade it and the CRM page has
+        // nothing to refresh for. No resume is offered with it: the dispatcher
+        // strips the payload and appends "do NOT retry", so a `resumable: true`
+        // beside it would be an instruction the agent is simultaneously told to
+        // ignore, and resending rows that all failed on write repeats the
+        // failure anyway.
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/none of the 2 row\(s\) could be written/);
+      });
+
+      it('stays resumable when the budget expired before any row was reached', async () => {
+        // Zero rows landed, but two were never attempted — resending THOSE makes
+        // progress, so the call has to succeed or the dispatcher strips the
+        // resume list and stops the agent on an import that is merely unstarted.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'unprocessed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }, { email: 'c@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 1, identifier: 'a@example.com', reason: 'failed' },
+          { row: 2, identifier: 'b@example.com', reason: 'unprocessed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('clamps the write budget to the turn deadline it was handed', async () => {
+        // A full-length write budget started late in a turn outlives the turn,
+        // and the ledger it exists to produce never comes back.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {
+          turnDeadlineMs: Date.now() + 30_000,
+        });
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBeGreaterThan(0);
+        expect(options.deadlineMs).toBeLessThanOrEqual(25_000);
+      });
+
+      it('keeps the full write budget when the caller imposes no turn cap', async () => {
+        // Scheduled/Slack/email runs have no wall-clock cap, so there is no turn
+        // for the import to outlive — clamping them would truncate work that
+        // completes today.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {});
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+      });
+
+      // The resume list is capped so a huge partial cannot blow the tool result
+      // past the size at which the agent layer swaps it for a preview. Left
+      // unsaid, that cap is silent data loss: the agent imports the 100 rows it
+      // was named, gets a clean `complete: true`, and reports the import
+      // finished while the rest are still missing.
+      it('says so when the resume list is truncated, and that finishing it is not finishing the import', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.complete).toBe(false);
+        // 200 ledger entries are ~14KB — inside the budget, so the resume list
+        // names every missing row rather than a 100-row slice of them.
+        expect(result.unimportedRows).toHaveLength(200);
+        expect(result.unimportedRowsTruncated).toBeUndefined();
+        expect(result.unimportedRowRanges).toBe('51-250');
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
+      // The budget can still be exceeded by rows carrying long identifiers. A
+      // trimmed resume list that does not say it is trimmed is silent data
+      // loss: the agent imports the slice, reads `complete: true` and stops.
+      it('says so when the resume list does not fit, and points at the untrimmed ranges', async () => {
+        const rows = Array.from({ length: 400 }, (_, i) => ({
+          email: `row${i}.${'x'.repeat(120)}@example.com`,
+        }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 1 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.unimportedRowsTruncated).toBeDefined();
+        expect(result.unimportedRowsTruncated.total).toBe(399);
+        expect(result.unimportedRows.length).toBe(result.unimportedRowsTruncated.shown);
+        expect(result.unimportedRows.length).toBeLessThan(399);
+        // The backstop still accounts for every missing row.
+        expect(result.unimportedRowRanges).toBe('2-400');
+        expect(result.message).toMatch(/FIRST \d+ of 399 missing rows/);
+        expect(result.message).toMatch(/unimportedRowRanges \(2-400\) lists EVERY missing position/);
+        expect(result.message).toMatch(/not done until a result comes back with complete: true/);
+      });
+
+      // A resume that only ever sees a slice of the missing rows imports it,
+      // gets `complete: true` for that call, and stops — stranding the rest.
+      // The ranges are what make the resume deterministic regardless.
+      it('names every missing row position, including any past the detail budget', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        const missing = new Set<number>();
+        for (const part of (result.unimportedRowRanges as string).split(',')) {
+          const [start, end] = part.split('-').map(Number);
+          for (let row = start; row <= (end ?? start); row++) missing.add(row);
+        }
+        expect(missing.size).toBe(200);
+        expect(missing.has(51)).toBe(true);
+        expect(missing.has(250)).toBe(true);
+        expect(missing.has(50)).toBe(false);
+      });
+
+      it('does not claim truncation when the whole resume list fits', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.unimportedRowsTruncated).toBeUndefined();
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
+      // When the list could not be read at all, resending the same rows hits
+      // the same wall. This is the one incomplete import that must NOT be
+      // offered as a resume, or the agent loops on it for the rest of the turn.
+      it('reports an unreadable list as a blocker rather than a resume', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: ['Could not read the existing leads in this list within 120000ms, so no rows were imported.'],
+          rowOutcomes: ['unprocessed', 'unprocessed'],
+          dedupeIncomplete: true,
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/Import not attempted/);
+        expect(result.message).toMatch(/would duplicate rows already in the list/);
+        expect(result.message).toMatch(/Do NOT retry the same call/);
+        expect(result.message).not.toMatch(/RESUME by calling/);
+      });
+
+      it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          alreadyPresentCount: 1,
+          anonymizedSkipped: 1,
+          errorCount: 1,
+          errors: ['Row 4: Duplicate email "d@example.com" found in upload data'],
+          rowOutcomes: ['created', 'merged', 'already_present', 'duplicate_in_request', 'anonymized_skipped'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+            { email: 'c@example.com' },
+            { firstName: 'LinkedIn', lastName: 'Member' },
+          ],
+          userId,
+        );
+
+        expect(result.attempted).toBe(5);
+        const { created, merged, alreadyPresent, duplicateInRequest, anonymizedSkipped, failed, unprocessed } =
+          result.reconciliation;
+        // Pin each bucket to the row it came from — the sum alone is a
+        // tautology (every outcome tallies into exactly one bucket), so it
+        // would still hold if two buckets were mislabelled.
+        expect(created).toBe(1);
+        expect(merged).toBe(1);
+        expect(alreadyPresent).toBe(1);
+        expect(duplicateInRequest).toBe(1);
+        expect(anonymizedSkipped).toBe(1);
+        expect(failed).toBe(0);
+        expect(unprocessed).toBe(0);
+        expect(created + merged + alreadyPresent + duplicateInRequest + anonymizedSkipped + failed + unprocessed)
+          .toBe(result.attempted);
+        expect(result.complete).toBe(true);
+      });
+
+      // Re-sending the full CSV after a partial import is the retry the user
+      // was told to do. Every row already being present is a SUCCESSFUL
+      // reconciliation, not "No leads were processed".
+      it('reports success when every re-submitted row is already in the list', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          alreadyPresentCount: 2,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['already_present', 'already_present'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.message).toMatch(/already/i);
+      });
     });
   });
 
@@ -1678,7 +2232,7 @@ describe('AgentModeService - CRM Tools', () => {
       const result = await service.sendEmailToLead(listId, leadId, userId);
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Failed to send email');
     });
 
     it('should send via Gmail when senderType is gmail', async () => {
@@ -1764,6 +2318,37 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Token revoked');
+    });
+
+    // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+    // that carry no HTTP status of their own by design — "Gmail access was
+    // revoked" matches no classifyToolErrorClass message heuristic either, so
+    // this classified as generic Error/bug. emailProviderErrorStatus() maps
+    // the real typed error (not just its message) to a representative status.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      const gmailSender = {
+        id: 'sender-g2',
+        email: 'test@gmail.com',
+        fromName: 'Test',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'test@gmail.com',
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should deny access when user is not an org member', async () => {
@@ -1993,6 +2578,32 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockGmail.sendEmail).toHaveBeenCalled();
     });
 
+    // ENG-1300: same fix as sendEmailToLead above — a real typed provider error
+    // classifies via emailProviderErrorStatus() instead of falling through to
+    // the generic Error/bug class.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-g',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should include senderType in the availableSenders list on no match', async () => {
       jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
         success: true,
@@ -2166,7 +2777,7 @@ describe('AgentModeService - CRM Tools', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Custom domain send failed');
     });
 
     it('should return error when gmail-type sender is missing gmailAccountId', async () => {

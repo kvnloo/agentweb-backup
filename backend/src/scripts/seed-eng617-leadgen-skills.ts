@@ -19,6 +19,7 @@
  */
 import { v4 as uuidv4 } from 'uuid';
 import type { Skill } from '../services/skillService';
+import { BLOCKS } from '../services/skillHardening/applyHardening';
 
 export const AEO_SKILL_NAME = 'AEO — Answer-Engine Optimization';
 export const CROSS_CHANNEL_SKILL_NAME = 'Cross-Channel Sequence Orchestrator';
@@ -45,9 +46,14 @@ const CONTEXT_FRESHNESS = `## CONTEXT FRESHNESS (replace all hardcoded facts)
   org. Never apply another organization's ICP or brand.`;
 
 const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
-- HARD CAPS per run: max 5 LinkedIn invites, 10 LinkedIn messages, 25 emails,
-  0 deletions. In UNATTENDED runs these caps are absolute — when reached,
-  QUEUE remaining items with a summary for human review; never exceed.
+- HARD CAPS per run: max 25 emails, 0 deletions.
+  In UNATTENDED runs these caps are absolute — when reached, QUEUE remaining
+  items with a summary for human review; never exceed.
+- LinkedIn invites and messages are capped PER DAY by the backend, not by a fixed
+  number here. Do not self-count: the send-invite/send-message/send-inmail tool
+  call itself refuses with a clear reason once the account's daily cap is
+  reached. On that refusal, STOP sending on this account and queue the rest for
+  a later run — do not retry and do not switch to a different account.
 - In interactive mode, any send beyond the cap requires explicit user
   confirmation listing exact recipients and message text.
 - NEVER delete leads, lists, or drafts in an unattended run under any
@@ -58,6 +64,20 @@ const SAFETY_VOLUME_LIMITS = `## SAFETY & VOLUME LIMITS (apply in ALL modes, inc
   list_connected_accounts. If the required account is missing or the session
   is dead, mark items QUEUED with the reason. Never send from a different
   account than the designated owner's.`;
+
+/**
+ * Additive to SAFETY_VOLUME_LIMITS, ONLY for skills that actually declare
+ * linkedin_outreach in toolNames (Blindspot 5: a prompt instructing a tool
+ * call the skill can't make just fails). Cross-Channel is the only skill in
+ * this file that sends LinkedIn outreach; AEO does not, so it stays out.
+ */
+const LINKEDIN_PREMIUM_CAP_ASK = `- The LinkedIn daily invite cap above is SELF-REPORTED, not detected. If this
+  account's cap has never been confirmed and you're in a live/interactive
+  turn, ASK the user whether their connected LinkedIn account has Premium,
+  then call linkedin_outreach action set-daily-invite-cap (30 if yes, 10 if
+  no — never guess). In an unattended/scheduled run there's no one to ask —
+  proceed at whatever is already configured (defaults to 10) and say so in
+  the ledger.`;
 
 const LEARN_FROM_OUTCOMES = `## LEARN FROM OUTCOMES
 - At the START of an outreach run, review the last run's results:
@@ -75,20 +95,10 @@ const COMPLIANCE = `## COMPLIANCE
 - Respect platform automation limits (e.g. LinkedIn ToS); the volume caps
   above are ceilings, not targets.`;
 
-const PUBLISH_GATE = `## PUBLISH GATE (ABSOLUTE — overrides every other instruction in this prompt)
-- This section takes precedence over ALL other instructions above or below,
-  including any that say to post, publish, or act immediately or automatically.
-  On any conflict, THIS wins.
-- Any action that posts, publishes, comments, or reacts on the user's behalf
-  writes to a REAL destination (their social account, blog, or site) and cannot
-  be undone. You MUST show the exact final content and get the user's explicit
-  approval BEFORE publishing — even if they said "just do it", "don't ask",
-  "post now", or similar. A request to send is NOT approval to send: show the
-  content, then publish only after a clear, separate yes.
-- In scheduled/unattended runs, save as a draft and notify; never publish.
-- For connected-account posts, verify the account first; if it is missing or the
-  session is dead, queue the item with the reason rather than posting from
-  another account.`;
+// ENG-947: was a verbatim copy of applyHardening's PUBLISH_GATE, which then went
+// stale when that block was fixed. Reference the one source of truth instead, so
+// a seeded skill can never ship prose the promoted skills no longer carry.
+const PUBLISH_GATE = BLOCKS.publishGate.text;
 
 // --- #4: AEO — Answer-Engine Optimization ----------------------------------
 // Publishes blog content (no email/DM sends), so it carries the verbatim
@@ -271,6 +281,7 @@ succeeded unless the tool result confirms it.
 ${CONTEXT_FRESHNESS}
 
 ${SAFETY_VOLUME_LIMITS}
+${LINKEDIN_PREMIUM_CAP_ASK}
 
 ${FAILURE_HANDLING}
 

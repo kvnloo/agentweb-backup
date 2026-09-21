@@ -9,8 +9,28 @@ import { normalizeLinkedInUrl } from './enrichmentGroups';
  */
 const UNCONTACTED_STATUSES = new Set(['', 'new', 'not_contacted', 'uncontacted', 'to_contact', 'none']);
 
-/** Engagement event type written for every mirrored invitation. */
-const INVITE_SENT_EVENT = 'linkedin.invite.sent';
+/** Engagement event type written for a mirrored OUTBOUND invitation this account sent. */
+export const INVITE_SENT_EVENT = 'linkedin.invite.sent';
+/**
+ * Engagement event type written when this account accepted an INBOUND invitation
+ * (ENG-1595). Distinct from {@link INVITE_SENT_EVENT} because the two are opposite
+ * real-world events — who initiated contact matters for provenance — but they share
+ * every other mechanic below (dedup, idempotent append, status advance).
+ */
+export const INVITE_ACCEPTED_EVENT = 'linkedin.invite.accepted';
+
+/**
+ * ENG-1719: a stale invitation we withdrew ourselves.
+ *
+ * Logged so a lead's history reads truthfully — "we invited them, then withdrew
+ * it" — rather than ending at `linkedin.invite.sent` forever. Deliberately does
+ * NOT flip the lead back from 'contacted' and does NOT clear
+ * `linkedInInviteSentAt`: we really did contact that person, and rewriting that
+ * would be falsifying history rather than correcting it. What has to stop being
+ * true is the "invitation pending" indicator, and that is driven off the
+ * AW-UnipileSentInvitations row, which the withdrawal deletes.
+ */
+export const INVITE_WITHDRAWN_EVENT = 'linkedin.invite.withdrawn';
 
 /**
  * True when the lead already carries an invite-sent engagement for this invitee
@@ -44,12 +64,12 @@ const INVITE_SENT_EVENT = 'linkedin.invite.sent';
  */
 function hasInviteEngagement(
   lead: any,
-  opts: { linkedin: string; accountId: string; invitationId?: string },
+  opts: { linkedin: string; accountId: string; invitationId?: string; eventType: string },
 ): boolean {
   const engagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
   const candidates = engagements.filter(
     (e: any) =>
-      String(e?.eventType ?? '') === INVITE_SENT_EVENT &&
+      String(e?.eventType ?? '') === opts.eventType &&
       String(e?.eventData?.linkedin ?? '') === opts.linkedin &&
       String(e?.eventData?.accountId ?? '') === opts.accountId,
   );
@@ -89,6 +109,16 @@ export interface MirrorInviteParams {
   /** ISO timestamp of the send; defaults to now. */
   sentAt?: string;
   /**
+   * Which real-world event this mirror records — {@link INVITE_SENT_EVENT} (this
+   * account sent the invite) or {@link INVITE_ACCEPTED_EVENT} (this account accepted
+   * an inbound one). Defaults to `INVITE_SENT_EVENT` so every existing caller is
+   * unchanged. Dedup, status-advance, and the idempotent append below all key off
+   * this value, so a sent-invite mirror and an accepted-invite mirror for the SAME
+   * person never collide or mask each other — they are different events and both
+   * get their own engagement record.
+   */
+  eventType?: string;
+  /**
    * Other lists belonging to the same owner to check before creating in `listId`.
    * One LinkedIn account can drive outreach for several lists, so an invitee may
    * already be a lead somewhere other than the caller's default target; mirroring
@@ -120,6 +150,14 @@ export interface MirrorInviteResult {
 }
 
 /** Bound the cross-list search so a large account cannot turn one mirror into many reads. */
+/**
+ * CAS attempts before a contended engagement append is skipped rather than
+ * written blind. Shared by `mirrorLinkedInInviteToCrm` and
+ * `recordInviteWithdrawnInCrm` so the two cannot drift — an unguarded append is
+ * exactly the duplicate the guard exists to prevent.
+ */
+const MAX_ATTEMPTS = 3;
+
 const MAX_SEARCH_LISTS = 25;
 
 /**
@@ -158,18 +196,22 @@ export async function resolveListIdForAccount(
 }
 
 /**
- * Mirror a sent LinkedIn connection invitation back into the CRM lead list (ENG-787).
+ * Mirror a LinkedIn connection (sent or accepted) back into the CRM lead list
+ * (ENG-787, and ENG-1595 for the accepted/inbound direction).
  *
- * Attribution gap: invitations sent through the outreach tool (or the manual CRM
- * button) were never written back as a lead-level record, so the CRM under-reported
- * true contact volume and follow-up cadence could not fire for pending invitees. This
- * reconciles the invitee into the target list: creates the lead if absent, marks it
- * 'contacted', stamps `linkedInInviteSentAt`, and appends a `linkedin.invite.sent`
- * engagement carrying the note + sending account for provenance.
+ * Attribution gap: connections formed through the outreach tool — invitations this
+ * account SENT, or inbound ones this account ACCEPTED — were never written back as
+ * a lead-level record, so the CRM under-reported true contact volume, follow-up
+ * cadence could not fire, and (ENG-1595) a real accepted connection was invisible to
+ * name-based CRM search entirely. This reconciles the invitee into the target list:
+ * creates the lead if absent, marks it 'contacted', stamps `linkedInInviteSentAt`,
+ * and appends a `params.eventType` engagement (default `linkedin.invite.sent`; pass
+ * `INVITE_ACCEPTED_EVENT` for an inbound accept) carrying the note + account for
+ * provenance.
  *
  * Best-effort by contract: every call site wraps this so a CRM write can NEVER fail an
- * invite that Unipile already accepted. Returns null when there is no usable personal
- * LinkedIn identifier to key the lead on.
+ * invite/accept that Unipile already confirmed. Returns null when there is no usable
+ * personal LinkedIn identifier to key the lead on.
  */
 export async function mirrorLinkedInInviteToCrm(
   params: MirrorInviteParams,
@@ -180,6 +222,7 @@ export async function mirrorLinkedInInviteToCrm(
 
   const { crmDb } = await import('./db');
   const sentAt = params.sentAt || new Date().toISOString();
+  const eventType = params.eventType || INVITE_SENT_EVENT;
 
   // Resolve the target lead. A caller that already knows the lead (manual CRM button)
   // passes leadId. The outreach path resolves by normalized LinkedIn URL —
@@ -243,6 +286,7 @@ export async function mirrorLinkedInInviteToCrm(
       linkedin: normalized,
       accountId: params.accountId || '',
       invitationId,
+      eventType,
     });
     return { leadId: leadId ?? '', listId, created: !leadId, engagementLogged: !alreadyLogged };
   }
@@ -286,11 +330,15 @@ export async function mirrorLinkedInInviteToCrm(
   if (!leadId) return null;
 
   // Advance status to 'contacted' only when the lead has no meaningful status yet.
-  // Always stamp the invite timestamp so the UI reflects the send.
+  // Stamp the direction-appropriate timestamp so the UI reflects what actually
+  // happened — an ACCEPTED inbound connection must never be recorded under
+  // linkedInInviteSentAt (an outbound-send field), which would misrepresent who
+  // initiated contact and could overwrite a real prior outbound timestamp.
   const currentStatus = String(existing?.status ?? '').trim().toLowerCase();
-  const leadUpdate: { status?: string; linkedInInviteSentAt: string } = {
-    linkedInInviteSentAt: sentAt,
-  };
+  const leadUpdate: { status?: string; linkedInInviteSentAt?: string; linkedInInviteAcceptedAt?: string } =
+    eventType === INVITE_ACCEPTED_EVENT
+      ? { linkedInInviteAcceptedAt: sentAt }
+      : { linkedInInviteSentAt: sentAt };
   if (!created && UNCONTACTED_STATUSES.has(currentStatus)) {
     leadUpdate.status = 'contacted';
   }
@@ -306,7 +354,7 @@ export async function mirrorLinkedInInviteToCrm(
   // still-pending invite (or re-running the reconciliation) stays idempotent.
   const accountId = params.accountId || '';
   const engagement = {
-    eventType: INVITE_SENT_EVENT,
+    eventType,
     eventData: {
       note: params.note || '',
       accountId,
@@ -328,14 +376,13 @@ export async function mirrorLinkedInInviteToCrm(
   // say — can both read "not present" and both append. Guard the append on the lead
   // being unchanged since the read that decided it, and on a lost race re-read and
   // re-decide: the loser then sees the winner's engagement and skips.
-  const MAX_ATTEMPTS = 3;
   // Seed from the post-update item so the very first attempt CASes against the
   // updatedAt this mirror just stamped, not the pre-update snapshot (which a
   // legacy lead may carry without an updatedAt at all). Merge over `existing` so
   // a partial return still falls back to the loaded snapshot's fields.
   let snapshot: any = afterUpdate ? { ...existing, ...afterUpdate } : existing;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    if (hasInviteEngagement(snapshot, { linkedin: normalized, accountId, invitationId })) {
+    if (hasInviteEngagement(snapshot, { linkedin: normalized, accountId, invitationId, eventType })) {
       return { leadId, listId, created, engagementLogged: false };
     }
     // With updatedAt seeded from updateLead's ALL_NEW return this is effectively
@@ -367,7 +414,7 @@ export async function mirrorLinkedInInviteToCrm(
 }
 
 /** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
-function splitInvitedUserName(name?: string): { firstName?: string; lastName?: string } {
+export function splitInvitedUserName(name?: string): { firstName?: string; lastName?: string } {
   const trimmed = (name || '').trim().replace(/\s+/g, ' ');
   if (!trimmed) return {};
   const parts = trimmed.split(' ');
@@ -535,4 +582,102 @@ export async function reconcileSentInvitationsToCrm(
       : '',
   );
   return result;
+}
+
+
+/**
+ * ENG-1719: append a withdrawal engagement to an EXISTING lead, if there is one.
+ *
+ * Deliberately much narrower than `mirrorLinkedInInviteToCrm`: it never creates a
+ * lead and never changes a lead's status. A withdrawal is not an act of outreach,
+ * so inventing a CRM record for someone who has none would manufacture a contact
+ * from the act of undoing one. When the lead already exists, its history should
+ * say what happened.
+ *
+ * Best-effort by contract, like every other call into this module: the invitation
+ * is already withdrawn on LinkedIn's side by the time this runs, so a CRM write
+ * failing here must never be reported as a failed withdrawal.
+ */
+export async function recordInviteWithdrawnInCrm(params: {
+  userId: string;
+  accountId: string;
+  linkedinUrl: string;
+  invitationId: string;
+  sentAt?: string;
+  listId?: string;
+}): Promise<{ leadId: string; listId: string; engagementLogged: boolean } | null> {
+  const normalized = normalizeLinkedInUrl(params.linkedinUrl);
+  if (!normalized) return null;
+
+  const listId = params.listId || (await resolveListIdForAccount(params.userId, params.accountId));
+  if (!listId) return null;
+
+  const { crmDb } = await import('./db');
+  const existing = await crmDb.findLeadByLinkedinInList(listId, normalized);
+  if (!existing?.leadId) return null;
+
+  const leadId = String(existing.leadId);
+  const engagement = {
+    eventType: INVITE_WITHDRAWN_EVENT,
+    eventData: {
+      linkedin: normalized,
+      accountId: params.accountId,
+      invitationId: params.invitationId,
+      ...(params.sentAt ? { originallySentAt: params.sentAt } : {}),
+    },
+    createdAt: new Date().toISOString(),
+  };
+
+  // Same duplicate guard the sent/accepted paths use, keyed on this event type and
+  // this invitation id — a re-run of the drain must not append a second identical
+  // withdrawal to the same lead.
+  //
+  // CodeRabbit on PR #2801: the guard alone is not enough, and the first version
+  // of this function had only the guard. `addLeadEngagement` appends
+  // unconditionally unless `expectedUpdatedAt` is supplied, so the read and the
+  // append are two separate operations — two concurrent drains can BOTH observe
+  // "not present" and both append. That is the precise race the CAS-and-retry loop
+  // in `mirrorLinkedInInviteToCrm` above already solves; this reuses it rather
+  // than inventing a weaker variant, which is what it should have done from the
+  // start.
+  let snapshot: any = existing;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (hasInviteEngagement(snapshot, {
+      linkedin: normalized,
+      accountId: params.accountId,
+      invitationId: params.invitationId,
+      eventType: INVITE_WITHDRAWN_EVENT,
+    })) {
+      // Already recorded by an earlier run or a concurrent winner — the history
+      // entry exists, so this IS recorded from the caller's point of view.
+      return { leadId, listId, engagementLogged: true };
+    }
+    const expectedUpdatedAt = snapshot?.updatedAt ? String(snapshot.updatedAt) : undefined;
+    try {
+      await crmDb.addLeadEngagement(
+        listId, leadId, engagement,
+        expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt },
+      );
+      return { leadId, listId, engagementLogged: true };
+    } catch (err: any) {
+      if (!err?.preconditionFailed) throw err;
+      // Someone wrote to the lead in between — possibly this same withdrawal.
+      // Re-read and let the loop re-decide.
+      snapshot = await crmDb.getLeadById(listId, leadId);
+      // The lead vanished mid-retry — nothing was appended, and saying otherwise
+      // would let the drain report a missing history entry as written (CodeRabbit).
+      if (!snapshot) return { leadId, listId, engagementLogged: false };
+    }
+  }
+
+  // Contention outliving the retries: skip rather than append blind, because an
+  // unguarded append is exactly the duplicate this guard exists to prevent.
+  console.warn(
+    `[recordInviteWithdrawn] gave up appending the withdrawal engagement for lead ${listId}/${leadId} after ${MAX_ATTEMPTS} contended attempts`,
+  );
+  // Contention outlived the retries: nothing was appended. The caller must be able
+  // to tell this apart from a successful write, or the drain's own
+  // `crmRecordFailed` report — the whole point of which is that nothing re-runs
+  // this — silently under-reports.
+  return { leadId, listId, engagementLogged: false };
 }

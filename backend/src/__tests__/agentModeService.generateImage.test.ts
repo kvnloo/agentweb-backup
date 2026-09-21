@@ -1054,3 +1054,112 @@ describe('Category declaration at the enqueue boundary (ENG-343)', () => {
     );
   });
 });
+
+// ENG-1027 (round 3): a fresh-eyes independent review flagged that no existing test
+// exercised the real generateImage() → describeImage() wiring — only the pure
+// dataFabricationGuard helper functions and a hand-built extractMinimalToolResult
+// input were covered. That leaves the actual call site (argument order, the
+// metricsVerified parameter threading through 13 positional args, and the
+// Promise-race timeout behavior) unverified against a future refactor silently
+// reordering generateImage's parameters. This exercises the real method with a
+// mocked describeImage, the same way the suite above mocks imageService.
+describe('Data-fabrication backstop wiring (ENG-1027)', () => {
+  let agentModeService: AgentModeService;
+  let mockImageService: any;
+  let describeImageSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.spyOn(autoHumanEvalService, 'enqueueAutoHumanEval').mockResolvedValue(null as any);
+
+    mockImageService = {
+      generateImage: jest.fn().mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/dashboard.png',
+        filename: 'dashboard.png'
+      }),
+      isAvailable: jest.fn().mockResolvedValue(true)
+    };
+    (imageGeneration.imageService as any).isAvailable = mockImageService.isAvailable;
+    (imageGeneration.imageService as any).generateImage = mockImageService.generateImage;
+
+    agentModeService = new AgentModeService();
+    describeImageSpy = jest.spyOn(agentModeService, 'describeImage');
+  });
+
+  const DASHBOARD_PROMPT = 'A status tracker dashboard graphic with a metrics preview panel.';
+  const PLAIN_PROMPT = 'A candid phone snapshot of a laptop on a kitchen table at night.';
+
+  const call = (prompt: string, metricsVerified?: boolean) =>
+    (agentModeService as any).generateImage(
+      prompt, 'dashboard.png', '1024x1024', 'medium', [],
+      'user123', 'session123', undefined, undefined, undefined, 'ad', metricsVerified
+    );
+
+  it('calls describeImage with the correct arguments when the prompt is dashboard-shaped', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: NONE' });
+
+    await call(DASHBOARD_PROMPT);
+
+    expect(describeImageSpy).toHaveBeenCalledWith(
+      undefined,
+      'https://example.com/dashboard.png',
+      expect.stringContaining('NUMBERS_FOUND'),
+      // ENG-1858: the check is metered to the generating user, not "system".
+      { userId: 'user123', sessionId: 'session123', feature: 'describe_image' }
+    );
+  });
+
+  it('surfaces dataReliabilityWarning when the vision check reports fabricated numbers', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: 68%, $12,450' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toEqual(expect.stringContaining('ENG-1027'));
+  });
+
+  it('does not surface a warning when the vision check reports no numbers', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: NONE' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('does not call describeImage at all for a non-dashboard-shaped prompt', async () => {
+    const result = await call(PLAIN_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(describeImageSpy).not.toHaveBeenCalled();
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('skips the check when metricsVerified is explicitly true, even on a dashboard-shaped prompt', async () => {
+    const result = await call(DASHBOARD_PROMPT, true);
+
+    expect(result.success).toBe(true);
+    expect(describeImageSpy).not.toHaveBeenCalled();
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('degrades gracefully (no warning, generation still succeeds) when describeImage rejects/times out', async () => {
+    describeImageSpy.mockRejectedValue(new Error('generate_image data-fabrication check timed out after 20000ms'));
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.imageUrl).toBe('https://example.com/dashboard.png');
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('degrades gracefully when describeImage resolves but reports failure', async () => {
+    describeImageSpy.mockResolvedValue({ success: false, message: 'No image URL provided' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+});

@@ -11,6 +11,12 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { getAssetTypeFromFilename } from '../services/approvalDb';
 import { canViewItem, canEditItem } from '../services/orgShareService';
+import { getPlacidPrivateToken } from '../utils/secretsManager';
+import { parseAgentModeImageIds } from '../utils/agentModeAssetIds';
+import { retryTransientWrite } from '../services/usageWriteFailureMonitor';
+import { renderPlacidImage, describePlacidError } from '../services/placidRenderService';
+import { uploadFileToS3 } from '../utils/s3Utils';
+import { v4 as uuidv4 } from 'uuid';
 
 const s3 = new S3();
 
@@ -1186,13 +1192,16 @@ export const getPlacidEditorToken = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
+    // ENG-698: read from Secrets Manager (prod/AgentWeb/Placid), falling back to
+    // the environment only where the secret does not exist. Not metered: minting
+    // an editor access token is not a Placid render and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
     const templateUuid = (req.query?.template_uuid as string) || (req.body as any)?.template_uuid;
     if (!templateUuid) {
       return res.status(400).json({ message: 'template_uuid is required' });
     }
     if (!privateToken) {
-      return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+      return res.status(500).json({ message: 'Placid private token is not configured' });
     }
 
     // Allow optional overrides via query/body if needed later
@@ -1249,48 +1258,118 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       original_filename?: string;
     };
 
-    const task = await taskDb.getTaskById(taskId);
-    if (!task) return res.status(404).json({ message: 'Task not found' });
-    const user = await userDb.getUserById(userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    if (!user.isAdmin && task.userId !== userId) return res.status(403).json({ message: 'Access denied' });
+    // ENG-1957: an image generated inside an Emma chat reaches this endpoint under
+    // the synthetic ids the Images page groups it by (agent-mode-<sessionId> /
+    // <sessionId>-images). Nothing in AW-Tasks or AW-TaskExecutions matches those,
+    // so the task lookups below 404 every such render. Resolve them against the
+    // chat session instead — same owner-or-admin rule the other session-mutating
+    // endpoints use (favorite-image, uploadImageToSession).
+    const agentSessionId = parseAgentModeImageIds(taskId, executionId);
 
-    const execution = await taskDb.getTaskExecutionById(executionId);
-    if (!execution || execution.taskId !== taskId) return res.status(404).json({ message: 'Execution not found' });
+    // Who the render is billed to, and whose page it lands on: the task owner, or
+    // the session owner. Never the caller, who may be an admin acting for them.
+    let renderOwnerId: string;
+    // Only set on the task path; agent-mode renders have no execution row.
+    let execution: Awaited<ReturnType<typeof taskDb.getTaskExecutionById>> | undefined;
+
+    if (agentSessionId) {
+      const session = await chatbotDb.getChatSession(agentSessionId);
+      if (!session) return res.status(404).json({ message: 'Session not found' });
+      const user = await userDb.getUserById(userId);
+      if (!user) return res.status(401).json({ message: 'User not found' });
+      // CodeRabbit, PR #2935. getChatSession hands back whatever DynamoDB holds,
+      // and the legacy-shape migration never repairs `userId`. An owner-less row
+      // would sail past the comparison below for an admin caller and then become
+      // the billing subject and the S3 folder — `users/undefined/...` billed to
+      // "undefined". Refuse before either use; a session nobody owns is a data
+      // defect, not a render this endpoint can attribute.
+      const sessionOwnerId = typeof session.userId === 'string' ? session.userId.trim() : '';
+      if (!sessionOwnerId) {
+        console.error('[Placid] chat session has no owner; refusing to render:', agentSessionId);
+        return res.status(500).json({ message: 'Session owner is unknown' });
+      }
+      // Plain equality is delegation-safe: middleware/auth.ts already resolves
+      // req.user to the target user for a delegated token.
+      if (sessionOwnerId !== userId && !user.isAdmin) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+      renderOwnerId = sessionOwnerId;
+    } else {
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) return res.status(404).json({ message: 'Task not found' });
+      const user = await userDb.getUserById(userId);
+      if (!user) return res.status(401).json({ message: 'User not found' });
+      if (!user.isAdmin && task.userId !== userId) return res.status(403).json({ message: 'Access denied' });
+
+      execution = await taskDb.getTaskExecutionById(executionId);
+      if (!execution || execution.taskId !== taskId) return res.status(404).json({ message: 'Execution not found' });
+      renderOwnerId = task.userId;
+    }
 
     const tplUuid = template_uuid || process.env.PLACID_TEMPLATE_UUID_AD_IMAGE;
     if (!tplUuid) return res.status(400).json({ message: 'template_uuid is required' });
 
-    const base = process.env.PLACID_URL_API_BASE || 'https://api.placid.app/u';
-    const params = new URLSearchParams();
-    // Map provided layers -> URL API notation
-    // Note: The following properties will be sent to Placid API:
-    // - 'hide' (boolean): Set true to hide this layer; defaults to false
-    // - 'opacity' (number): Adjust layer opacity from 0 to 100
-    // - 'rotation' (number): Set layer rotation from 0 to 359 degrees
-    // - 'position_x_absolute' (string): Set absolute X position (e.g., "10px")
-    // - 'position_y_absolute' (string): Set absolute Y position (e.g., "10px")
-    // - 'position_x_relative' (string): Set relative X position (e.g., "+10px", "-10px")
-    // - 'position_y_relative' (string): Set relative Y position (e.g., "+10px", "-10px")
-    // - 'width' (string): Set width (e.g., "50%", "+10px", "100px")
-    // - 'height' (string): Set height (e.g., "50%", "+10px", "100px")
-    // Placid will handle all these properties to control layer appearance and positioning
+    // ENG-1972: rendered through the REST API, not the URL API
+    // (`api.placid.app/u/<uuid>`), which answers 403 for this project on every
+    // render — parameter-free requests included — so no ad image could be created
+    // at all. The REST API uses the private token this backend already holds and
+    // already uses for the editor token and template listing, so it does not
+    // depend on the project's URL-API settings.
+    const placidToken = await getPlacidPrivateToken();
+    if (!placidToken) {
+      console.error('[Placid] private token is not configured; cannot render');
+      return res.status(500).json({ message: 'Placid private token is not configured' });
+    }
+
+    // The REST body takes the same {layer: {prop: value}} shape the client already
+    // sends, so the layers pass straight through; values keep their own types
+    // rather than being stringified as the URL API's query notation required.
+    // Supported properties are unchanged: text, image, hide, opacity, rotation,
+    // position_x_absolute / position_y_absolute, position_x_relative /
+    // position_y_relative, width, height.
+    const restLayers: Record<string, Record<string, unknown>> = {};
     if (layers && typeof layers === 'object') {
       for (const [layerName, props] of Object.entries(layers)) {
         if (!props || typeof props !== 'object') continue;
+        const cleaned: Record<string, unknown> = {};
         for (const [propName, value] of Object.entries(props)) {
           if (value === undefined || value === null) continue;
-          params.set(`${layerName}[${propName}]`, String(value));
+          cleaned[propName] = value;
         }
+        if (Object.keys(cleaned).length > 0) restLayers[layerName] = cleaned;
       }
     }
-    // Optional convenience mapping for source image
-    if (source_image_url && !params.has('image[image]')) {
-      params.set('image[image]', source_image_url);
+    // Same convenience mapping the URL API expressed as `image[image]=`.
+    if (source_image_url && restLayers.image?.image === undefined) {
+      restLayers.image = { ...(restLayers.image || {}), image: source_image_url };
     }
-    const placidImageUrl = `${base}/${tplUuid}${params.toString() ? `?${params.toString()}` : ''}`;
 
-    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, { responseType: 'arraybuffer' as const });
+    // ENG-698: a render that produced an image is a billed render, and the
+    // recorder call lives with the egress in placidRenderService so the two
+    // cannot drift (ENG-701's coverage guard enforces that). Bills the owner --
+    // task owner, or session owner for a chat image -- while the acting caller,
+    // who may be an admin, is kept in onBehalfOf.
+    const placidOwner = renderOwnerId;
+    const { imageUrl: placidImageUrl } = await renderPlacidImage({
+      token: placidToken,
+      templateUuid: tplUuid,
+      layers: restLayers,
+      billing: {
+        userId,
+        billingUserId: placidOwner,
+        ...(userId && placidOwner && userId !== placidOwner ? { onBehalfOf: userId } : {}),
+        ...(agentSessionId ? { sessionId: agentSessionId } : {}),
+      },
+    });
+
+    // The REST API returns a URL rather than the bytes, so fetch it; everything
+    // downstream (S3 layout, result file, session message) is unchanged.
+    // Bounded: axios has no default timeout, so a stalled download would hold
+    // this request (and its resources) open indefinitely (CodeRabbit, #2943).
+    const imgResp = await axios.get<ArrayBuffer>(placidImageUrl, {
+      responseType: 'arraybuffer' as const,
+      timeout: 30_000,
+    });
     const contentType = (imgResp.headers['content-type'] as string) || 'image/png';
     const ext = contentType.includes('jpeg')
       ? 'jpg'
@@ -1316,28 +1395,45 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
     const shortTemplateId = tplUuid ? tplUuid.substring(0, 8) : 'unknown';
     
     const filenameBase = `${baseNameWithoutExt}-placid-${shortTemplateId}`;
-    const key = `tasks/${taskId}/executions/${executionId}/edits/${randomToken}/${filenameBase}.${ext}`;
+    const filename = `${filenameBase}.${ext}`;
     const imageBuffer = Buffer.from(new Uint8Array(imgResp.data));
 
-    await s3
-      .putObject({
-        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
-        Key: key,
-        Body: imageBuffer,
-        ContentType: contentType,
-      })
-      .promise();
+    let url: string;
+    if (agentSessionId) {
+      // Filed under the session owner, not the caller: the image belongs to their
+      // chat and shows on their Images page even when an admin rendered it for
+      // them. Same S3 layout as every other agent-mode image (uploadImageToSession).
+      const uploadResult = await uploadFileToS3(imageBuffer, filename, renderOwnerId, contentType);
+      if (!uploadResult.success || !uploadResult.url) {
+        console.error('[Placid] S3 upload failed for agent-mode render:', uploadResult.error);
+        return res.status(500).json({ message: 'Error generating image' });
+      }
+      url = uploadResult.url;
+    } else {
+      const key = `tasks/${taskId}/executions/${executionId}/edits/${randomToken}/${filenameBase}.${ext}`;
+      await s3
+        .putObject({
+          Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+          Key: key,
+          Body: imageBuffer,
+          ContentType: contentType,
+        })
+        .promise();
 
-    const url = `https://${
-      process.env.AWS_S3_BUCKET || 'agentweb-user-files'
-    }.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${key}`;
+      url = `https://${
+        process.env.AWS_S3_BUCKET || 'agentweb-user-files'
+      }.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${key}`;
+    }
 
     const newResultFile = {
       url,
-      filename: `${filenameBase}.${ext}`,
-      token: randomToken,
+      filename,
+      // Agent-mode files carry no execution token; the aggregator synthesizes
+      // them with an empty one (routes/tasks.ts addCachedAssetsToResult).
+      token: agentSessionId ? '' : randomToken,
       is_html: false,
       file_type: 'image',
+      ...(agentSessionId ? { source: 'agent-mode', sessionId: agentSessionId } : {}),
       placid_config: {
         template_uuid: tplUuid,
         layers: layers || {},
@@ -1346,13 +1442,91 @@ export const generateFromTemplateToExecution = async (req: AuthRequest, res: Res
       }
     };
 
-    const current = execution.result_files || [];
-    const updated = [...current, newResultFile];
-    await taskDb.updateTaskExecution(executionId, { result_files: updated });
+    if (agentSessionId) {
+      // The Images page derives agent-mode images by scanning session messages
+      // (scanMessagesForAssets), so the render is persisted as one, in the shape
+      // uploadImageToSession writes. addMessageToSession bumps messageCount, so
+      // the next read rescans and the image appears in assetCache.
+      const renderedAt = new Date().toISOString();
+      const attachMessage = () => chatbotDb.addMessageToSession(agentSessionId, {
+        role: 'system' as const,
+        content: `Image generated from Placid template: ${filename}`,
+        timestamp: renderedAt,
+        metadata: {
+          portalType: 'agent' as const,
+          timestamp: renderedAt,
+          toolCalls: [
+            {
+              id: uuidv4(),
+              name: 'upload_image',
+              arguments: {},
+              result: {
+                success: true,
+                imageUrl: url,
+                filename,
+                message: `✅ Image "${filename}" created from template!`,
+              },
+            },
+          ],
+        },
+      });
+
+      // Greptile, PR #2935. By this point Placid has rendered and the customer
+      // has been billed, and the image is in S3 — if this last write is lost the
+      // image exists but nothing references it, so it never reaches the Images
+      // page. Retry the transient shapes, and when it still fails say so and log
+      // the URL, rather than reporting a generic 500 that buries a paid render.
+      // (A retry by the user is a genuinely new Placid render and is billed as
+      // one; that is real vendor spend, not a double count.)
+      //
+      // addMessageToSession is not idempotent: it appends at the current count,
+      // so retrying a write whose RESPONSE was lost — rather than whose write was
+      // rejected — would append the same image a second time. The asset scanner
+      // de-dupes by URL only within one pass, and the incremental cache merge
+      // concatenates passes, so the second copy would surface as a duplicate
+      // image. Before every retry, check whether the previous attempt actually
+      // landed; the S3 URL is unique to this render, so it is the stable identity.
+      let attachAttempted = false;
+      const alreadyAttached = async (): Promise<boolean> => {
+        try {
+          const existing = await chatbotDb.getMessagesFromMessagesTable(agentSessionId);
+          return (existing || []).some((m: any) =>
+            (m?.metadata?.toolCalls || []).some((tc: any) => tc?.result?.imageUrl === url),
+          );
+        } catch {
+          // Unreadable: fall through and retry. A duplicate is recoverable by
+          // hand; a silently dropped paid render is not.
+          return false;
+        }
+      };
+
+      try {
+        await retryTransientWrite(async () => {
+          if (attachAttempted && (await alreadyAttached())) return;
+          attachAttempted = true;
+          await attachMessage();
+        });
+      } catch (attachErr) {
+        console.error(
+          `[Placid] billed render not attached to session ${agentSessionId}; image is orphaned at ${url}:`,
+          attachErr instanceof Error ? attachErr.message : attachErr,
+        );
+        return res.status(500).json({
+          message: 'Image was generated but could not be saved to this chat',
+          resultFile: newResultFile,
+        });
+      }
+    } else {
+      const current = execution?.result_files || [];
+      const updated = [...current, newResultFile];
+      await taskDb.updateTaskExecution(executionId, { result_files: updated });
+    }
 
     return res.status(200).json({ message: 'Generated image from template', resultFile: newResultFile });
   } catch (err: any) {
-    console.error('Error in generateFromTemplateToExecution:', err?.message || err);
+    // describePlacidError surfaces the vendor's own message (ENG-1972); for any
+    // other failure it falls back to the error's message unchanged.
+    console.error('Error in generateFromTemplateToExecution:', describePlacidError(err));
     return res.status(500).json({ message: 'Error generating image' });
   }
 };
@@ -1362,8 +1536,10 @@ export const listPlacidTemplates = async (req: AuthRequest, res: Response) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
-    const privateToken = process.env.PLACID_PRIVATE_TOKEN;
-    if (!privateToken) return res.status(500).json({ message: 'PLACID_PRIVATE_TOKEN must be set' });
+    // ENG-698: Secrets Manager first, environment fallback. Not metered: listing
+    // templates is a catalogue read, not a render, and carries no rate.
+    const privateToken = await getPlacidPrivateToken();
+    if (!privateToken) return res.status(500).json({ message: 'Placid private token is not configured' });
 
     const { page, per_page, collection_id } = req.query as {
       page?: string;

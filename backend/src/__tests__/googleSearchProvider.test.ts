@@ -4,8 +4,12 @@ jest.mock('googleapis', () => ({
   },
 }));
 
+const recordVendorUsage = jest.fn();
+jest.mock('../services/usageRecorderService', () => ({ recordVendorUsage }));
+
 import { google } from 'googleapis';
 import { extractPublishedDate, GoogleSearchProvider } from '../search/googleSearchProvider';
+import { getAllocatedRate } from '../utils/vendorRateCard';
 
 describe('GoogleSearchProvider', () => {
   afterEach(() => {
@@ -58,6 +62,23 @@ describe('GoogleSearchProvider', () => {
         }),
       ],
     }));
+  });
+
+  it('records an allocated query against the request owner', async () => {
+    const list = jest.fn().mockResolvedValue({ data: { items: [] } });
+    (google.customsearch as jest.Mock).mockReturnValue({ cse: { list } });
+    const provider = new GoogleSearchProvider({
+      credentialsProvider: async () => ({ apiKey: 'google-api-key', searchEngineId: 'google-cse-id' }),
+    });
+
+    await provider.search({ query: 'meter me', count: 1, userId: 'user-1', purpose: 'crm_enrichment' });
+
+    expect(recordVendorUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1', provider: 'google_cse', operation: 'query', unit: 'query',
+      quantity: 1, rateKey: 'query', feature: 'crm_enrichment',
+    }));
+    // ENG-1929: priced by the recorder from the card, $0.0125 per query.
+    expect(getAllocatedRate('google_cse', 'query')).toBe(0.0125);
   });
 
   it('extracts published dates from supported Google metadata fields', () => {

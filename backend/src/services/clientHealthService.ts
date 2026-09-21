@@ -11,14 +11,52 @@
 
 import { userDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
+import { getThresholdsForAccount } from './adsThresholdsDb';
+import { resolveThresholds } from './adsThresholds';
+import { captureFatigueRecommendations } from './adsRecommendationCapture';
+import { isEvaluationUser } from './evaluationPolicy';
 
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
+
+/** Both Meta reads share this boundary. A malformed element makes the read incomplete,
+ * rather than letting a partial array manufacture a fatigue recommendation. */
+function healthRows(result: any): any[] {
+  const object = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!object(result)) throw new Error('Invalid Meta health response');
+  if (result.error) return [];
+  if (!Array.isArray(result.data)) throw new Error('Invalid Meta health data');
+  for (const row of result.data) {
+    if (!object(row) || typeof row.id !== 'string' || !row.id.trim() ||
+        (row.status !== undefined && typeof row.status !== 'string') ||
+        (row.campaign_id !== undefined && typeof row.campaign_id !== 'string') ||
+        (row.creative !== undefined && !object(row.creative))) throw new Error('Invalid Meta health row');
+    if (row.insights !== undefined) {
+      if (!object(row.insights) || !Array.isArray(row.insights.data)) throw new Error('Invalid Meta insights');
+      for (const insight of row.insights.data) {
+        if (!object(insight)) throw new Error('Invalid Meta insight row');
+        for (const key of ['date_start', 'date_stop']) {
+          if (insight[key] !== undefined && typeof insight[key] !== 'string') throw new Error('Invalid Meta insight date');
+        }
+        for (const key of ['spend', 'frequency', 'ctr', 'cpm']) {
+          const value = insight[key];
+          if (value !== undefined &&
+              !((typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) &&
+                Number.isFinite(Number(value)) && Number(value) >= 0)) throw new Error('Invalid Meta insight metric');
+        }
+      }
+    }
+  }
+  return result.data;
+}
 
 interface AdsLayerHealth {
   connected: boolean;
   ad_account_id?: string;
   active_campaigns: number;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+  // ENG-1584 sibling: fetchWithRetryAndPaging is bounded and reports pagingTruncated when a
+  // read stops short. false here means active_campaigns undercounts the real total.
+  campaigns_complete?: boolean;
 }
 
 interface LanderLayerHealth {
@@ -36,6 +74,16 @@ interface CreativeVariety {
   cannibalization_warning: boolean;
   fatigue_warning: boolean;
   top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
+  fatigued_creatives?: Array<{
+    id: string;
+    name: string;
+    reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
+  }>;
+  // Sibling of ads_layer.campaigns_complete: false when the ad-level insights read (the
+  // creative-fatigue/cannibalization source data) failed or was truncated despite active
+  // campaigns existing. Without this, a failed read reports zero warnings with full confidence
+  // — a client's health can look BETTER than it is, not just incomplete.
+  creative_data_complete?: boolean;
 }
 
 interface PaymentInfo {
@@ -210,6 +258,8 @@ export async function assessClientHealth(
 
     // Look up client by email first, then by name
     let client = await userDb.getUserByEmail(clientNameOrEmail);
+    // ENG-1907: sandbox principals are not clients — same rule as the name match below.
+    if (client && isEvaluationUser(client.userId)) client = undefined;
 
     if (!client) {
       // Try name match
@@ -217,8 +267,10 @@ export async function assessClientHealth(
       const searchLower = clientNameOrEmail.toLowerCase();
       client = allUsers.find(
         (u: any) =>
-          (u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
-          (u.email && u.email.toLowerCase().includes(searchLower))
+          // ENG-1907: sandbox principals are not clients.
+          !isEvaluationUser(u.userId) &&
+          ((u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
+            (u.email && u.email.toLowerCase().includes(searchLower)))
       );
     }
 
@@ -239,33 +291,183 @@ export async function assessClientHealth(
     );
     const hasAds = metaAdAccounts.length > 0 || (client.adAccount && client.adAccount.trim() !== '');
 
+    // ENG-1767: resolve the account id AND token together as a genuine matched pair — preferring
+    // the client's own connected Meta account (their own OAuth grant, their own token) over the
+    // legacy `adAccount` field, same precedence `getMetaCredentials` already uses and already has
+    // tests for ("connected_accounts over adAccount fallback when both exist"). Both must come
+    // from the SAME source: using the connected account's id with the shared/global token (or
+    // vice versa) silently reintroduces the exact bug this fix exists to close — the shared token
+    // queried against an account id it may not be granted access to, returning zero campaigns
+    // with no error. Only falls back to the legacy id + shared token TOGETHER, and only when the
+    // connected account has no usable (non-empty) access_token of its own.
+    const connectedMetaAccount = metaAdAccounts[0];
+    const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
+    const connectedAccessToken = connectedMetaAccount?.config?.access_token;
+    const useConnectedAccount = !!connectedAdAccountId && !!connectedAccessToken;
+
+    // Reused below for the campaigns/insights fetches, the reported ad_account_id, and the
+    // thresholds lookup, replacing three independent re-derivations that previously disagreed on
+    // which field won and could silently drift out of sync with each other.
+    const resolvedAdAccountId: string | undefined = useConnectedAccount
+      ? connectedAdAccountId
+      : (client.adAccount || undefined);
+
     let activeCampaigns: any[] = [];
     let adLevelData: any[] = [];
+    // Defaults true: trivially complete when the ad-level fetch is never attempted (no active
+    // campaigns to look up, or the campaigns fetch itself already failed — that failure is
+    // already signalled via campaigns_complete below, and creative_variety derives from
+    // active_campaigns, so a reader who already distrusts one already knows to distrust both).
+    // Only flips false when the ad-level fetch is attempted AND it independently fails/truncates.
+    let adLevelDataComplete = true;
+    /*
+     * Defaults to "complete" only when there is nothing to check (`!hasAds`) — `active_campaigns:
+     * 0` is genuinely the true count there. When `hasAds`, this starts false and only flips true
+     * after a campaigns read actually succeeds cleanly, below. Before this fix it defaulted to
+     * true unconditionally and only flipped FALSE on a truncated success — a fetch that THREW
+     * (network error, expired token) fell through to the catch block below, which only logs,
+     * leaving activeCampaigns empty and campaignsComplete still true: a fetch that read NOTHING
+     * reported as "confirmed zero campaigns, complete."
+     *
+     * ENG-1767 follow-up: `fetchWithRetryAndPaging` does not throw on a Graph API error (bad
+     * token, permission revoked, etc.) — by its own documented contract it RETURNS the parsed
+     * `{ error: {...} }` body instead, with no `data` array and no `pagingTruncated` flag.
+     * Checking only `pagingTruncated` missed exactly this case: a real permission error came back
+     * as `activeCampaigns: [], campaignsComplete: true` — confirmed live against a real account
+     * whose stored token had lost Graph access — the same "silent wrong zero" failure shape this
+     * ticket exists to eliminate, just via a first-page API error instead of a wrong token source.
+     */
+    let campaignsComplete = !hasAds;
 
     if (hasAds) {
       try {
         const { getMetaAccessToken } = await import('../utils/secretsManager');
         const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-        const accessToken = await getMetaAccessToken();
+        // ENG-1767: use the client's OWN connected token when `useConnectedAccount` selected it
+        // above — previously this always used the shared app-wide token regardless, which can
+        // silently see zero campaigns for an account the shared token isn't granted access to
+        // even though the client's own OAuth grant works fine (confirmed live: a real account
+        // with real spend read zero campaigns through the shared token, no error). Only falls
+        // back to the shared token for the legacy-only case (no usable connected account at all)
+        // — matching `resolvedAdAccountId`'s own fallback above, so id and token never diverge.
+        //
+        // Refresh BEFORE reading it: unlike the shared token (which never expires from this
+        // caller's perspective), a client's own connected token can go stale, and reading a stale
+        // token here would trade one silent-wrong-data failure mode for a different one — this
+        // client's OWN health check quietly degrading to "unverified" even though the shared token
+        // might have coincidentally still worked for them before this fix. `ensureFreshMetaAdAccountToken`
+        // never throws — it refreshes proactively when needed and mutates `connectedMetaAccount.config`
+        // in place on success (re-read below, not the closure-captured `connectedAccessToken`, since
+        // that was captured before this call), or silently leaves the existing token in place if
+        // refresh fails (it may still be valid).
+        let accessToken: string;
+        if (useConnectedAccount) {
+          const { ensureFreshMetaAdAccountToken } = await import('./metaTokenRefresh');
+          await ensureFreshMetaAdAccountToken(connectedMetaAccount, client.userId);
+          accessToken = connectedMetaAccount.config.access_token;
+        } else {
+          accessToken = await getMetaAccessToken();
+        }
         const apiVersion = process.env.META_API_VERSION || 'v25.0';
-        const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
+        const adAccountId = resolvedAdAccountId;
+
+        // Current 14-day window and the prior 14-day window immediately preceding it, used as
+        // the baseline for CTR-drop / CPM-rise fatigue checks. Fetched via the Graph API's
+        // `time_ranges` array param on a single `insights` edge — NOT via aliasing two separate
+        // `insights` sub-fields (e.g. `current:insights.date_preset(...)`), which the Graph API
+        // silently drops (confirmed live against a real ad account: the aliased field is simply
+        // absent from the response, no error). `time_ranges` returns one row per window in
+        // `insights.data`, distinguished by `date_start`/`date_stop`.
+        const currentWindowEndDate = new Date();
+        const currentWindowStartDate = new Date(currentWindowEndDate);
+        currentWindowStartDate.setUTCDate(currentWindowStartDate.getUTCDate() - 13);
+        const priorWindowEndDate = new Date(currentWindowStartDate);
+        priorWindowEndDate.setUTCDate(priorWindowEndDate.getUTCDate() - 1);
+        const priorWindowStartDate = new Date(priorWindowEndDate);
+        priorWindowStartDate.setUTCDate(priorWindowStartDate.getUTCDate() - 13);
+
+        const currentWindowStart = currentWindowStartDate.toISOString().slice(0, 10);
+        const currentWindowEnd = currentWindowEndDate.toISOString().slice(0, 10);
+        const priorWindowStart = priorWindowStartDate.toISOString().slice(0, 10);
+        const priorWindowEnd = priorWindowEndDate.toISOString().slice(0, 10);
 
         if (adAccountId) {
           // Fetch campaigns
           const campaignsData = await fetchWithRetryAndPaging(
             `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
           );
-          activeCampaigns = (campaignsData.data || []).filter(
+          activeCampaigns = healthRows(campaignsData).filter(
             (c: any) => c.status === 'ACTIVE'
           );
+          campaignsComplete = campaignsData.pagingTruncated !== true && !campaignsData.error;
 
-          // Fetch ad-level data for creative variety analysis
+          // Fetch ad-level data for creative variety + fatigue analysis, requesting both the
+          // current and prior 14-day windows via `time_ranges` in one `insights` edge call —
+          // returns two rows per ad in `insights.data`, distinguished by `date_start`.
           if (activeCampaigns.length > 0) {
+            const filtering = `[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]`;
+            const insightsFields = 'spend,frequency,ctr,cpm,date_start,date_stop';
+            const timeRanges = JSON.stringify([
+              { since: currentWindowStart, until: currentWindowEnd },
+              { since: priorWindowStart, until: priorWindowEnd },
+            ]);
+            /*
+             * ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+             * mangled by Graph, and the failure mode depends on the edge/syntax involved —
+             * confirmed live 2026-09-04 against a real ad account:
+             *   - `creative{id,name}` on this `ads` edge doesn't error, it silently drops the
+             *     whole `creative` field from every result (same as the sibling fix in
+             *     meta.ts/agentModeService.ts).
+             *   - `insights.time_ranges(...){...}` is worse: it hard-errors on EVERY call
+             *     ("Syntax error \"Expected end of string...\""), so this feature has never
+             *     returned ad-level insights at all, not just missing creative names.
+             * `encodeURIComponent` each selector independently — the field-call argument
+             * (`time_ranges(...)`) was already correctly encoded; only the two `{...}` sub-field
+             * blocks around it needed the same treatment.
+             */
+            const creativeSelector = encodeURIComponent('creative{id,name}');
+            const insightsSelector =
+              encodeURIComponent('insights.time_ranges(') +
+              encodeURIComponent(timeRanges) +
+              encodeURIComponent(`){${insightsFields}}`);
+            // Pessimistic the moment we decide to attempt this fetch — mirrors campaignsComplete's
+            // own pattern (starts false, only flips true after a full clean read). If the transform
+            // below throws on malformed data, this stays false rather than reverting to the outer
+            // "nothing to check" default, which would otherwise misreport a crashed read as complete.
+            adLevelDataComplete = false;
             const adData = await fetchWithRetryAndPaging(
-              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,insights.date_preset(last_14d){spend}&filtering=[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]&access_token=${accessToken}`
+              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,campaign_id,${creativeSelector},status,` +
+                `${insightsSelector}` +
+                `&filtering=${filtering}&access_token=${accessToken}`
             );
-            adLevelData = adData.data || [];
+            adLevelData = healthRows(adData).map((ad: any) => {
+              // Matched by RELATIVE ORDER (newest date_start = current, oldest = prior), not by
+              // exact string equality against our own UTC-computed date strings. Meta buckets
+              // insights `date_start` in the AD ACCOUNT's own timezone, not UTC — this codebase
+              // has been burned by that exact mismatch before (see ENG-926's "Windows and
+              // timing" notes). An exact-match `.find()` would silently return undefined for
+              // every ad on any non-UTC account, degrading fatigue detection with no error. We
+              // requested exactly two non-overlapping 13-day windows with a 1-day gap between
+              // them, so even a several-hour timezone shift cannot reorder them — "later window"
+              // is a safe, timezone-agnostic way to identify "current" that exact-string matching
+              // is not.
+              const rows: any[] = (ad.insights?.data || [])
+                .filter((r: any) => typeof r.date_start === 'string')
+                .sort((a: any, b: any) => (a.date_start < b.date_start ? 1 : -1)); // newest first
+              const [current, prior] = rows;
+              return {
+                ...ad,
+                current_insights: current ? { data: [current] } : undefined,
+                prior_insights: prior ? { data: [prior] } : undefined,
+              };
+            });
+            // Only reached once the fetch AND the transform above both completed without
+            // throwing — same shape as campaigns_complete: fetchWithRetryAndPaging resolves with
+            // {error:{...}} rather than throwing on a Graph API error, so this must be checked
+            // explicitly rather than relying on the catch block below, which never runs for that
+            // case.
+            adLevelDataComplete = adData.pagingTruncated !== true && !adData.error;
           }
         }
       } catch (err) {
@@ -276,7 +478,7 @@ export async function assessClientHealth(
 
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
-      ad_account_id: client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id,
+      ad_account_id: resolvedAdAccountId,
       active_campaigns: activeCampaigns.length,
       campaigns: activeCampaigns.map((c: any) => ({
         id: c.id,
@@ -284,6 +486,7 @@ export async function assessClientHealth(
         status: c.status,
         objective: c.objective,
       })),
+      campaigns_complete: campaignsComplete,
     };
 
     // --- Lander Layer ---
@@ -328,7 +531,7 @@ export async function assessClientHealth(
       platforms: crmPlatforms,
     };
 
-    // --- Creative Variety Heuristic ---
+    // --- Creative Variety + Fatigue Detection ---
     const activeAds = adLevelData.filter((ad: any) => ad.status === 'ACTIVE');
     const distinctCreatives = new Set(
       activeAds.map((ad: any) => ad.creative?.id).filter(Boolean)
@@ -336,15 +539,36 @@ export async function assessClientHealth(
 
     // Compute spend distribution
     let cannibalizationWarning = false;
-    let fatigueWarning = false;
     const topCreatives: Array<{ id: string; name: string; spend_pct: number }> = [];
+    const fatiguedCreatives: Array<{
+      id: string;
+      name: string;
+      reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'>;
+    }> = [];
 
     if (activeAds.length > 0) {
+      // Resolved once per assessment (not per-creative) — same thresholds apply to every
+      // creative in this ad account.
+      const adAccountIdForThresholds = resolvedAdAccountId;
+      let resolvedThresholds: Record<string, { value: number; source: string }> = {};
+      if (adAccountIdForThresholds) {
+        try {
+          const storedThresholds = await getThresholdsForAccount('meta', adAccountIdForThresholds);
+          resolvedThresholds = resolveThresholds(storedThresholds);
+        } catch (err) {
+          // Non-fatal: fall back to no fatigue checks rather than failing the whole assessment.
+          console.error('Client health: Error resolving ads thresholds:', err);
+        }
+      }
+      const frequencyCritical = resolvedThresholds['creativeFatigue.frequencyCritical']?.value;
+      const ctrDropCriticalPct = resolvedThresholds['creativeFatigue.ctrDropCriticalPct']?.value;
+      const cpmRiseCriticalPct = resolvedThresholds['creativeFatigue.cpmRiseCriticalPct']?.value;
+
       const adSpends = activeAds.map((ad: any) => ({
         id: ad.id,
         name: ad.name,
         creativeId: ad.creative?.id,
-        spend: parseFloat(ad.insights?.data?.[0]?.spend || '0'),
+        spend: parseFloat(ad.current_insights?.data?.[0]?.spend || '0'),
       }));
 
       const totalSpend = adSpends.reduce((sum: number, a: any) => sum + a.spend, 0);
@@ -366,17 +590,69 @@ export async function assessClientHealth(
         }
       }
 
-      if (distinctCreatives <= 1) {
-        fatigueWarning = true;
+      // Per-creative fatigue checks against the resolved thresholds. `frequency` is an absolute
+      // ceiling; `ctr`/`cpm` need the prior-period baseline to express a drop/rise — creatives
+      // with no prior-period data (e.g. newly launched) skip those two checks, since there's no
+      // baseline to compare against.
+      for (const ad of activeAds) {
+        const reasons: Array<'frequency' | 'ctr_drop' | 'cpm_rise'> = [];
+        const cur = ad.current_insights?.data?.[0];
+        const prior = ad.prior_insights?.data?.[0];
+
+        const curFrequency = parseFloat(cur?.frequency || '0');
+        if (frequencyCritical !== undefined && curFrequency > frequencyCritical) {
+          reasons.push('frequency');
+        }
+
+        if (prior) {
+          const curCtr = parseFloat(cur?.ctr || '0');
+          const priorCtr = parseFloat(prior.ctr || '0');
+          if (ctrDropCriticalPct !== undefined && priorCtr > 0) {
+            const ctrDropPct = ((priorCtr - curCtr) / priorCtr) * 100;
+            if (ctrDropPct > ctrDropCriticalPct) {
+              reasons.push('ctr_drop');
+            }
+          }
+
+          const curCpm = parseFloat(cur?.cpm || '0');
+          const priorCpm = parseFloat(prior.cpm || '0');
+          if (cpmRiseCriticalPct !== undefined && priorCpm > 0) {
+            const cpmRisePct = ((curCpm - priorCpm) / priorCpm) * 100;
+            if (cpmRisePct > cpmRiseCriticalPct) {
+              reasons.push('cpm_rise');
+            }
+          }
+        }
+
+        if (reasons.length > 0) {
+          fatiguedCreatives.push({ id: ad.id, name: ad.name, reasons });
+        }
       }
     }
+
+    const fatigueWarning = fatiguedCreatives.length > 0;
 
     const creativeVariety: CreativeVariety = {
       distinct_creatives: distinctCreatives,
       cannibalization_warning: cannibalizationWarning,
       fatigue_warning: fatigueWarning,
       top_creatives: topCreatives,
+      fatigued_creatives: fatiguedCreatives,
+      // ANDed with campaignsComplete: the ad-level fetch can succeed cleanly on its own while
+      // still being built from a truncated/errored campaigns list (fetchWithRetryAndPaging keeps
+      // whatever partial data it already has rather than discarding it on truncation) — that
+      // input incompleteness has to propagate here too, not just report the ad-level fetch's own
+      // isolated success.
+      creative_data_complete: adLevelDataComplete && campaignsComplete,
     };
+
+    if (creativeVariety.creative_data_complete && resolvedAdAccountId) {
+      await captureFatigueRecommendations({
+        clientUserId: client.userId, accountId: resolvedAdAccountId,
+        campaignIds: activeCampaigns.map((c: any) => c.id), ads: activeAds,
+        fatigued: fatiguedCreatives, now: new Date().toISOString(),
+      });
+    }
 
     // --- Overall Status ---
     const { status, reasons } = determineStatus(adsLayer, landerLayer, leadQualityLayer, creativeVariety);
@@ -430,7 +706,9 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
       };
     }
 
-    const allUsers = await userDb.getAllUsers();
+    // ENG-1907: a sandbox take-home account looks like a Pro customer with a Meta
+    // connection; it is not a client and must not appear in the roster or its health sweep.
+    const allUsers = (await userDb.getAllUsers()).filter((u: any) => !isEvaluationUser(u.userId));
     const landingPageSignalCache: LandingPageSignalCache = new Map();
 
     const clients: ClientSummary[] = await Promise.all(

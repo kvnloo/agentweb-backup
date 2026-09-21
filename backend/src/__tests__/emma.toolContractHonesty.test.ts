@@ -103,6 +103,47 @@ describe('Emma tool contracts match dispatch behavior', () => {
     expect(result.status).toBe('invalid');
   });
 
+  // ENG-1486: org memory has always enforced this ceiling at persistence time,
+  // but until these tests it only described it in prose. That let a schema-valid
+  // call reach the handler and fail after the model had spent a full tool turn.
+  it('declares the enforced 2,000-character org-memory limit in JSON Schema', () => {
+    const contentSchema = emmaToolRegistry.getTool('save_org_memory')!
+      .definition.inputSchema.properties.content;
+
+    expect(contentSchema.maxLength).toBe(2000);
+  });
+
+  it('rejects over-length org memory before execution with an exact recovery count', () => {
+    const tool = emmaToolRegistry.getTool('save_org_memory')!;
+    const result = validateAndRepairToolArgs({
+      toolName: 'save_org_memory',
+      args: { content: 'x'.repeat(2001), category: 'insight' },
+      inputSchema: tool.definition.inputSchema,
+      effect: 'internal_write',
+    });
+
+    expect(result).toMatchObject({
+      status: 'invalid',
+      modelMessage: expect.stringContaining('received 2001; remove at least 1'),
+    });
+  });
+
+  it('uses Unicode code points for the org-memory boundary too', () => {
+    const tool = emmaToolRegistry.getTool('save_org_memory')!;
+    const emoji = '😀'.repeat(2001);
+    const result = validateAndRepairToolArgs({
+      toolName: 'save_org_memory',
+      args: { content: emoji, category: 'insight' },
+      inputSchema: tool.definition.inputSchema,
+      effect: 'internal_write',
+    });
+
+    expect(result).toMatchObject({
+      status: 'invalid',
+      modelMessage: expect.stringContaining('received 2001; remove at least 1'),
+    });
+  });
+
 
   it('normalizes a JSON-encoded campaign_ids array before dispatch', async () => {
     await emmaToolRegistry.getTool('get_meta_ads_metrics')!.execute(

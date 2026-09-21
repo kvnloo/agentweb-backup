@@ -25,6 +25,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionPublishAdmission: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -46,7 +47,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
-  generateMarketingResponseWorkerService: { runInWorker: jest.fn() },
+  generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
 
 jest.mock('../services/db', () => ({
@@ -200,6 +201,50 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(secondMsg).toMatch(/exhausted its processing-step budget|cut short/i);
     expect(secondMsg).not.toMatch(/indicated some entities\/steps were not finished/i);
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
+  it('ENG-1640: resumes unfinished workflow steps before asking for the final report', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Inbox triage complete; sourcing did not run.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete. Final report below.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/resume.*first unfinished|complete all unfinished/i);
+    expect(continuation.indexOf('unfinished')).toBeLessThan(continuation.indexOf('final consolidated report'));
+  });
+
+  it('ENG-1640: permits tools in the budget continuation instead of restricting it to already-gathered data', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Housekeeping complete; the sourcing step was starved.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete with tool evidence.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/using tools as needed/i);
+    expect(continuation).not.toMatch(/using the data already gathered, produce the final/i);
+  });
+
+  it('ENG-1640: tells the continuation not to replay completed writes or actions', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => Promise.resolve(
+      ++call === 1
+        ? { ...workerResult('Three DMs sent; sourcing did not run.'), truncatedByStepBudget: true }
+        : workerResult('Sourcing complete without duplicate sends.')
+    ));
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    const continuation = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(continuation).toMatch(/do not repeat completed (?:writes|steps|actions)/i);
   });
 
   it('does NOT issue a continuation when the first turn is already complete', async () => {
@@ -422,5 +467,60 @@ describe('runScheduledChat — deterministic completion gate', () => {
     const calls = mockWorker.runInWorker.mock.calls.length;
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(calls).toBeLessThanOrEqual(3);
+  });
+
+  // ENG-827 (Greptile P1, security): the completion-gate CONTINUATION turn builds its
+  // own message and calls the model on a separate code path from the main turn. It did
+  // not carry the mid-run publish-withdrawal notice, so a run that was admitted
+  // authorized and then had consent revoked reached the model with the persisted
+  // "you are authorized to publish" system prompt intact — the gate stopped nudging,
+  // but nothing told the model to stop publishing.
+  describe('mid-run publish revocation reaches the CONTINUATION turn too (ENG-827)', () => {
+    const publishSchedule = {
+      ...leadEngSchedule,
+      scheduleId: 'sched-publish',
+      requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    };
+
+    beforeEach(async () => {
+      // This schedule requires a non-foundation tool, so the subscription pre-check
+      // would abort the run before it ever starts.
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      (getAllowedFunctionCalls as jest.Mock).mockResolvedValue(['*']);
+      // The owner revoked after admission: every mid-run re-read comes back withheld.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+      } as any);
+    });
+
+    it('prepends the withdrawal notice to EVERY turn, including the gate continuation', async () => {
+      // Every turn admits unfinished work, so the gate keeps issuing continuation
+      // turns — the exact path that bypassed the notice.
+      mockWorker.runInWorker.mockResolvedValue(
+        workerResult('Draft is ready. I did not complete Step 3 for the remaining items.')
+      );
+
+      await runScheduledChat(publishSchedule as any, 'test-user-123', true);
+
+      const messages = mockWorker.runInWorker.mock.calls.map(
+        (c: any[]) => c[0].messageContent as string
+      );
+      // The gate fired, so at least one of these is a continuation turn.
+      expect(messages.length).toBeGreaterThanOrEqual(2);
+      const continuationTurns = messages.filter((m) =>
+        /remaining|not finished|complete all/i.test(m)
+      );
+      expect(continuationTurns.length).toBeGreaterThan(0);
+      // Assert the OUTCOME — what the model was actually told — on every turn sent
+      // after the revocation, not merely that the checker stopped asking.
+      for (const message of messages) {
+        expect(message).toContain('[PUBLISH AUTHORIZATION WITHDRAWN]');
+        expect(message).toContain('no longer authorized to publish with any tool');
+      }
+    });
   });
 });

@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { clearDisconnectFlag } from '../services/linkedInConnectionHealth';
 
 const router = express.Router();
 
@@ -34,6 +35,7 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
       api_url: await linkedInOutreachService.getApiUrl(),
     });
 
+    console.log(`[LinkedIn Outreach] Hosted auth link generated (type=create) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
 
   } catch (error: any) {
@@ -114,7 +116,14 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
 
     // Invalidate the cached connectivity status so the next GET /connected-accounts
     // re-checks Unipile rather than returning the stale "disconnected" result.
+    //
+    // That cache is per-process, and production runs more than one instance, so this
+    // alone only convinces whichever instance happened to serve the reconnect. Clear
+    // the persisted flag too (ENG-1197) — that is the copy the other instance and the
+    // scheduled runner read, and leaving it set is how an account stays "disconnected"
+    // in-app after the customer has genuinely reconnected it.
     linkedInOutreachService.clearStatusCache(unipileAccountId);
+    await clearDisconnectFlag(userId, unipileAccountId);
 
     console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} (name: "${accountName}") for user ${userId}`);
     res.json({ success: true, account });
@@ -151,11 +160,44 @@ router.post('/reconnect', authenticateToken, async (req: any, res: any) => {
       api_url: await linkedInOutreachService.getApiUrl(),
     } as any);
 
+    console.log(`[LinkedIn Outreach] Hosted auth link generated (type=reconnect, account=${unipileAccountId}) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating reconnect link:', error);
     res.status(500).json({ error: 'Failed to generate reconnect link', details: error.message });
   }
+});
+
+/**
+ * POST /callback-event
+ * ENG-1272: fired by the hosted-auth popup (UnipileLinkedInCallback) the moment it
+ * lands, before it postMessages the opener and closes — regardless of whether the
+ * connection succeeded or failed. Best-effort and silent by design: a customer
+ * dispute about whether they reconnected currently has no trace to check either way,
+ * and this is the only point where Unipile's own success/failure verdict ever
+ * reaches our backend at all (the popup gets it via redirect query params; nothing
+ * about that redirect is otherwise visible to us).
+ */
+router.post('/callback-event', authenticateToken, async (req: any, res: any) => {
+  const { status, unipileAccountId, error } = req.body;
+  const userId = req.user.userId;
+
+  if (status !== 'success' && status !== 'failure') {
+    return res.status(400).json({ error: 'Missing or invalid status' });
+  }
+
+  // This log is meant to be a trustworthy evidence trail for exactly the kind
+  // of "did the customer actually reconnect" dispute ENG-1272 raised, so the
+  // caller-supplied fields are JSON-encoded rather than interpolated raw —
+  // stringifying a string still just prints the string, but it also fixes
+  // width, escapes newlines, and defuses a non-string payload, so an
+  // authenticated caller can't forge what looks like a second, separate log
+  // line or corrupt the format others may grep against.
+  console.log(
+    `[LinkedIn Outreach] Callback observed: status=${status} user=${userId} `
+    + `account=${JSON.stringify(unipileAccountId ?? 'n/a')} error=${JSON.stringify(error ?? 'n/a')}`,
+  );
+  res.json({ success: true });
 });
 
 export default router;

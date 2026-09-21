@@ -3,7 +3,8 @@ import { sendAgentModeOncallAlert, __resetAgentModeAlertDedupeForTests } from '.
 // Mock the dependencies
 jest.mock('../../services/chatbotService', () => ({
   chatbotDb: {
-    createOrReuseInteractiveShare: jest.fn()
+    createOrReuseInteractiveShare: jest.fn(),
+    getChatSessionRecord: jest.fn(),
   }
 }));
 
@@ -256,6 +257,59 @@ describe('agentModeAlerts utils', () => {
       expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
     });
 
+    // ENG-932 CodeRabbit finding: the dedupe window was reserved before the
+    // send was attempted, so a failed delivery still permanently suppressed
+    // every later alert on that key for the rest of the window — nothing was
+    // actually delivered, but the system believed it had already alerted.
+    it('clears the dedupe reservation when delivery fails, so the next call retries', async () => {
+      const ts = 1_700_000_000_000;
+      mockedEmailService.sendOncallAlert.mockRejectedValueOnce(new Error('SMTP down'));
+
+      await expect(sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'first attempt',
+        dedupeKey: 'retry-after-failure',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      })).rejects.toThrow('SMTP down');
+
+      mockedEmailService.sendOncallAlert.mockResolvedValueOnce(undefined);
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'retry, still inside the same window',
+        dedupeKey: 'retry-after-failure',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000, // still well inside the 60s window
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it('still throws on a failed send (does not swallow the error)', async () => {
+      mockedEmailService.sendOncallAlert.mockRejectedValueOnce(new Error('SMTP down'));
+      await expect(sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'no dedupe key',
+      })).rejects.toThrow('SMTP down');
+    });
+
+    it('a successful send still dedupes normally (failure-clear does not leak into the happy path)', async () => {
+      const ts = 1_700_000_000_000;
+      mockedEmailService.sendOncallAlert.mockResolvedValue(undefined);
+
+      const first = await sendAgentModeOncallAlert({
+        subject: 'Test', message: 'first', dedupeKey: 'happy-path', dedupeWindowMs: 60_000, now: ts,
+      });
+      const second = await sendAgentModeOncallAlert({
+        subject: 'Test', message: 'second, same window', dedupeKey: 'happy-path', dedupeWindowMs: 60_000, now: ts + 1_000,
+      });
+
+      expect(first).toBe(true);
+      expect(second).toBe(false);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
     it('preserves existing behavior: no dedupeKey => every call fires (backwards compatible)', async () => {
       for (let i = 0; i < 3; i++) {
         await sendAgentModeOncallAlert({
@@ -265,5 +319,119 @@ describe('agentModeAlerts utils', () => {
       }
       expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
     });
+
+    // ENG-932: a caller reporting "did I actually send a digest" needs to
+    // distinguish delivered from suppressed — a caller that only checked
+    // "did this reject" previously reported every deduped call as sent.
+    it('returns true when the alert is delivered and false when suppressed by dedupe', async () => {
+      const ts = 1_700_000_000_000;
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'first',
+        dedupeKey: 'return-value-test',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      });
+      const suppressed = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'suppressed',
+        dedupeKey: 'return-value-test',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000,
+      });
+
+      expect(delivered).toBe(true);
+      expect(suppressed).toBe(false);
+    });
   });
+
+  // ENG-1907: a take-home candidate deliberately breaking Emma in a sandbox
+  // account must never page the on-call. Suppression is keyed on the principal
+  // (explicit userId, or the owner of the session the alert is about), not on a
+  // caller-supplied flag — the 30 call sites stay untouched.
+  describe('sandbox principals never page oncall (ENG-1907)', () => {
+    const EVAL_USER = 'eval_9f8e7d6c-0000-4000-8000-000000000000';
+
+    beforeEach(() => {
+      mockedEmailService.sendOncallAlert.mockResolvedValue(undefined);
+      mockedChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('https://share.example.com/x');
+    });
+
+    it('suppresses when the alert names a sandbox userId, without creating a share link', async () => {
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        userId: EVAL_USER,
+        sessionId: 'session-sbx-1',
+      });
+
+      expect(delivered).toBe(false);
+      expect(mockedEmailService.sendOncallAlert).not.toHaveBeenCalled();
+      expect(mockedChatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    });
+
+    it('suppresses when only a sessionId is given and that session is owned by a sandbox principal', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-sbx-2', userId: EVAL_USER });
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'boom',
+        sessionId: 'session-sbx-2',
+      });
+
+      expect(delivered).toBe(false);
+      expect(mockedChatbotDb.getChatSessionRecord).toHaveBeenCalledWith('session-sbx-2');
+      expect(mockedEmailService.sendOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('still delivers for a session owned by a normal customer', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockResolvedValue({ sessionId: 'session-real', userId: 'customer-1' });
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        sessionId: 'session-real',
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails open — an owner lookup error must not silence a real alert', async () => {
+      (mockedChatbotDb.getChatSessionRecord as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: worker crashed',
+        message: 'boom',
+        sessionId: 'session-unknown',
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not consume the dedupe window for a suppressed sandbox alert', async () => {
+      const ts = 1_700_000_000_000;
+      const suppressed = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'sandbox',
+        userId: EVAL_USER,
+        dedupeKey: 'context_limit:shared-key',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      });
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Agent Mode: Context limit exceeded',
+        message: 'real customer, same key, same window',
+        userId: 'customer-1',
+        dedupeKey: 'context_limit:shared-key',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000,
+      });
+
+      expect(suppressed).toBe(false);
+      expect(delivered).toBe(true);
+    });
+  });
+
 });

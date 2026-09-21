@@ -295,12 +295,11 @@ export async function listFolders(accessToken: string, spaceId: string): Promise
 export async function createDoc(
   accessToken: string,
   workspaceId: string,
-  name: string,
-  content: string
+  name: string
 ): Promise<{ id: string; name: string }> {
   const response = await axios.post<{ id: string; name: string }>(
     `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs`,
-    { name, content },
+    { name, create_page: false },
     { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
   );
   return { id: response.data.id, name: response.data.name };

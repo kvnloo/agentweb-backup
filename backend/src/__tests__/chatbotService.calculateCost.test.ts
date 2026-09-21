@@ -1,8 +1,10 @@
 /**
  * Emma chatbot cost accounting (calculateCost).
  *
- * calculateCost feeds `estimated_cost` on each message's usage, which flows into
- * incrementUserTokenUsage() — i.e. the user's real per-month cost accounting.
+ * calculateCost feeds `estimated_cost` on each message's usage, which drives the
+ * session-level cost display. It no longer charges the per-user quota: ENG-1134
+ * moved that to the LLM call site, because charging at message-persist time
+ * double-billed every agent-mode turn and wrote no ledger row.
  * It previously carried a hardcoded per-1K table whose gpt-4o prompt rate was
  * 10x the published list price ($25/1M vs the real $2.50/1M), silently
  * overcharging chatbot cost. It must instead price from the single source of
@@ -77,5 +79,30 @@ describe('chatbotService.calculateCost', () => {
 
   it('returns 0 for an unknown model (unchanged behavior)', () => {
     expect(calculateCost(1000, 1000, 'some-unknown-model')).toBe(0);
+  });
+});
+
+describe('calculateCost — cache-write TTL (ENG-893 / ENG-1134)', () => {
+  // Greptile catch. ENG-893 prices cache writes by the TTL Bedrock applied:
+  // 1.25x input at 5 minutes, 2x at one hour. Dropping the breakdown priced every
+  // write at the 5-minute rate, so an Emma-on-Claude session carrying 1h writes
+  // displayed a cost materially below the ledger figure for the very same call.
+  const MODEL = 'anthropic.claude-sonnet-4-6'; // $3/M in
+  const WRITES = 1_000_000;
+
+  it('prices a one-hour cache write at 2x input, not the 5-minute default', () => {
+    const oneHour = calculateCost(0, 0, MODEL, 0, WRITES, { '1h': WRITES });
+
+    expect(oneHour).toBeCloseTo(6, 5); // 1M x $3/M x 2
+  });
+
+  it('prices a five-minute cache write at 1.25x input', () => {
+    const fiveMin = calculateCost(0, 0, MODEL, 0, WRITES, { '5m': WRITES });
+
+    expect(fiveMin).toBeCloseTo(3.75, 5); // 1M x $3/M x 1.25
+  });
+
+  it('falls back to the 5-minute rate when no breakdown is reported', () => {
+    expect(calculateCost(0, 0, MODEL, 0, WRITES)).toBeCloseTo(3.75, 5);
   });
 });

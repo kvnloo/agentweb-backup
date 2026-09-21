@@ -1,13 +1,16 @@
 import dotenv from 'dotenv';
+import { isSuppressedSendResult } from '../utils/nonProdEmailGuard';
 
 import { resendService } from './resendService';
 import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients, recordReportDeliveryState, deliveryEnforcementEnabled, logShadowDecision } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
+import { resetDateFromMonth, formatResetDateLong } from '../utils/usageCycle';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -50,6 +53,16 @@ dotenv.config();
 const SYSTEM_FROM = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
 const SUPPORT_REPLY_TO = 'support@agentweb.pro';
 
+/**
+ * ENG-1552: one Alert Class for every "scheduled report withheld" occurrence, so intake
+ * clusters them onto a single canonical Linear defect instead of one issue per schedule/day.
+ */
+export const WITHHELD_REPORT_ALERT_CLASS = 'scheduled-report-withheld-no-recipients';
+
+export type EmailSendOutcome = 'sent' | 'suppressed' | 'failed';
+
+const EMPTY_RUN_DIGEST_PLACEHOLDER = '(This run produced no report content.)';
+
 // Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
 async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
   if (settingKey === 'oncall_emails' && process.env.ONCALL_EMAIL_LIST) {
@@ -71,9 +84,14 @@ export const emailService = {
       .replace(/'/g, '&#39;');
   },
 
-  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]) {
+  /**
+   * Best-effort send — never throws. Resolves to what actually happened so a caller
+   * that records delivery (ENG-1552) can tell a real send from a swallowed failure or
+   * a non-prod suppression. `void` only ever comes from a test stub; treat it as unknown.
+   */
+  async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]): Promise<EmailSendOutcome | void> {
     try {
-      await resendService.sendEmail({
+      const result = await resendService.sendEmail({
         from: SYSTEM_FROM,
         to,
         cc,
@@ -84,11 +102,19 @@ export const emailService = {
       });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
+      // Never claim delivery for a send the non-prod guard blocked — the log is
+      // the only record this best-effort path leaves behind.
+      if (isSuppressedSendResult(result)) {
+        console.log('Email suppressed by the non-prod guard, not sent to:', toList, cc ? `CC: ${ccList}` : '');
+        return 'suppressed';
+      }
       console.log('Email sent successfully to:', toList, cc ? `CC: ${ccList}` : '');
+      return 'sent';
     } catch (error) {
       console.error('Error sending email:', error);
       // Don't throw - best-effort by design. Callers that need delivery
       // guarantees use sendEmailStrict.
+      return 'failed';
     }
   },
 
@@ -123,6 +149,18 @@ export const emailService = {
       replyTo: SUPPORT_REPLY_TO
     });
 
+    // A suppressed send did not leave the box, so it cannot satisfy this
+    // method's contract — its whole purpose is that the caller's audit row
+    // reflects ground truth. Checked BEFORE the messageId check, because the
+    // guard deliberately supplies a string id (so it is not misread as a
+    // provider failure) and that id would otherwise be recorded as a delivery.
+    if (isSuppressedSendResult(result)) {
+      throw new Error(
+        'sendEmailStrict: send suppressed by the non-prod email guard — ' +
+          'no message left the box. Add the recipient to NONPROD_EMAIL_ALLOWLIST, ' +
+          'or set NONPROD_EMAIL_ALLOW_ALL=true for a deliberate delivery test.',
+      );
+    }
     const messageId = (result && typeof (result as any).id === 'string')
       ? (result as any).id
       : null;
@@ -1049,6 +1087,263 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     }
   },
 
+  /**
+   * Tell an owner their LinkedIn (Unipile) session died and only they can revive it
+   * (ENG-1197).
+   *
+   * Deliberately names what is blocked rather than just "reconnect": the failure is
+   * invisible from the product's surface, because discovery keeps working off a
+   * shared account (ENG-1198) while every send, withdraw and even the read of the
+   * pending queue is dead. An owner told only "reconnect your account" has no way to
+   * tell whether that mattered.
+   */
+  async sendLinkedInAccountDisconnectedEmail(
+    toEmails: string | string[],
+    opts: {
+      accountName: string;
+      /**
+       * When we DETECTED the dead session — not when LinkedIn ended it, which we have
+       * no way to know. On a first-ever detection this is stamped "now", so for an
+       * account that has been dead for weeks it is the moment we noticed and nothing
+       * more. The copy says exactly that. Omit it entirely when even that is unknown;
+       * the sentence drops rather than inventing a time.
+       */
+      disconnectedAt?: string;
+      isReminder: boolean;
+      daysDisconnected: number;
+      /**
+       * Set when a schedule was paused after repeated skips. Changes the remedy:
+       * reconnecting is no longer sufficient on its own, because a paused schedule
+       * does not resume by itself — which is the opposite of what the ordinary skip
+       * copy promises, and the reason this cannot reuse the generic run-failed email.
+       */
+      pausedScheduleName?: string;
+      /**
+       * How many scheduled RUNS were skipped before the pause — a different unit from
+       * `daysDisconnected`, and the one the pause copy actually means. Conflating them
+       * mis-stated the elapsed time by whatever the schedule's cadence happened to be.
+       */
+      skippedRunCount?: number;
+    }
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(opts.accountName);
+      // Rendered in UTC and labelled as such. Without an explicit `timeZone` this took
+      // the SERVER's zone — meaningless to a customer base spread across the world, and
+      // actively misleading once labelled, since the label would name our zone as
+      // though it were theirs. UTC is the one zone that is unambiguous to everyone.
+      const whenParsed = opts.disconnectedAt ? new Date(opts.disconnectedAt) : null;
+      const when = whenParsed && !Number.isNaN(whenParsed.getTime())
+        ? whenParsed.toLocaleString('en-US', {
+            year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            timeZone: 'UTC', timeZoneName: 'short',
+          })
+        : null;
+      const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
+      const headline = opts.pausedScheduleName
+        ? 'A schedule was paused — LinkedIn Outreach still disconnected'
+        : opts.isReminder
+          ? `Still disconnected ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'} after we detected it`
+          : 'Your LinkedIn Outreach account disconnected';
+      // /settings/:tab — the tab slug is `accounts` (labelled "Connected Accounts"
+      // in the sidebar). `/settings/connected-accounts` is not a real tab, so it
+      // would have sent every recipient of this alert to a dead page. Canonical
+      // source: customer-portal src/config/portalRoutes.ts.
+      const settingsUrl = `${customerFrontendUrl}/settings/accounts`;
+      // A paused schedule needs BOTH actions, and saying only "reconnect" would
+      // leave it stopped indefinitely.
+      // NOT `?? opts.daysDisconnected`: that fallback re-created the units bug it was
+      // added to remove, silently, for any caller that sets `pausedScheduleName`
+      // without a run count.
+      const skippedRuns = opts.skippedRunCount;
+      const pausedAfter = typeof skippedRuns === 'number'
+        ? ` after ${skippedRuns} skipped run${skippedRuns === 1 ? '' : 's'}`
+        : '';
+      const resumeHtml = opts.pausedScheduleName
+        ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong>
+             has been paused${pausedAfter}.
+             Reconnecting is not enough on its own — once the account is back, switch the schedule
+             back on from your schedules page.</p>`
+        : `<p style="line-height: 1.6;">
+             Any scheduled outreach that needs this account is being skipped rather than run, so nothing is
+             being sent from a broken session. It resumes on its own once you reconnect &mdash; there is
+             nothing to switch back on.</p>`;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>🔌 ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="error-section">
+                <h3>LinkedIn Outreach is paused until you reconnect</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  LinkedIn has ended the session for <strong>${safeName}</strong>${when ? ` &mdash; we detected this on <strong>${when}</strong>` : ''}.
+                  Reconnecting takes about a minute and only you can do it &mdash; it needs your LinkedIn login.
+                </p>
+              </div>
+              <p style="line-height: 1.6;"><strong>What has stopped:</strong></p>
+              <ul style="line-height: 1.6;">
+                <li>Sending connection invitations and messages</li>
+                <li>Withdrawing old pending invitations</li>
+                <li>Reading how many invitations are still pending</li>
+              </ul>
+              ${resumeHtml}
+            </div>
+            <div class="footer">
+              <a class="button" href="${settingsUrl}">Reconnect LinkedIn Outreach</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                If reconnecting does not work, remove the connection and add it again as a new connection.
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${opts.accountName}
+
+LinkedIn has ended the session for "${opts.accountName}"${when ? ` - we detected this on ${when}` : ''}. Reconnecting takes about a minute and only you can do it - it needs your LinkedIn login.
+
+What has stopped:
+- Sending connection invitations and messages
+- Withdrawing old pending invitations
+- Reading how many invitations are still pending
+
+${opts.pausedScheduleName
+  ? `"${opts.pausedScheduleName}" has been paused${pausedAfter}. Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
+  : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
+
+---
+Reconnect LinkedIn Outreach: ${settingsUrl}
+If reconnecting does not work, remove the connection and add it again as a new connection.`;
+
+      const subject = opts.pausedScheduleName
+        ? `⏸️ Schedule paused: "${opts.pausedScheduleName}" needs ${opts.accountName} reconnected`
+        : opts.isReminder
+          ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn Outreach paused)`
+          : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn Outreach paused)`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`LinkedIn disconnect email sent to: ${emailList.join(', ')} (reminder=${opts.isReminder})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending LinkedIn disconnect email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the sync cron.
+    }
+  },
+
+  /**
+   * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+   * schedule's LinkedIn sourcing capability changes state, rather than only
+   * reporting it passively via the schedule-card badge / per-run emails the
+   * next time they happen to check. Called on the EDGE (see
+   * didSourcingBlockStateChange in agentModeController.ts) — once when a run
+   * first comes back blocked, once when a later run recovers — never on every
+   * run of a multi-day outage.
+   */
+  async sendScheduleSourcingBlockTransitionEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    isNowBlocked: boolean,
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(scheduleName);
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+
+      const headline = isNowBlocked
+        ? 'LinkedIn search is currently unavailable for this schedule'
+        : 'LinkedIn search is working again for this schedule';
+      const bodyHtml = isNowBlocked
+        ? `Your scheduled prospecting chat <strong>"${safeName}"</strong> could not source any prospects on its most recent ` +
+          `run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. ` +
+          `This is <strong>not</strong> "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is ` +
+          `account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; ` +
+          `we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to <strong>"${safeName}"</strong>, ` +
+          `and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+      const bodyText = isNowBlocked
+        ? `Your scheduled prospecting chat "${scheduleName}" could not source any prospects on its most recent run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. This is NOT "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to "${scheduleName}", and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+
+      const headerColor = isNowBlocked ? '#ffc107' : '#28a745';
+      const icon = isNowBlocked ? '⚠️' : '✅';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: ${headerColor}; color: ${isNowBlocked ? '#664d03' : 'white'}; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .info-section { background-color: ${isNowBlocked ? '#fff3cd' : '#e8f5e8'}; border-left: 4px solid ${headerColor}; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>${icon} ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="info-section">
+                <p style="margin: 0; line-height: 1.6;">${bodyHtml}</p>
+              </div>
+            </div>
+            <div class="footer">
+              <a class="button" href="${customerFrontendUrl}/agent-mode?tab=scheduled">Review your schedules</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">This is an automated email from your scheduled chat.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${scheduleName}
+
+${bodyText}
+
+---
+Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
+
+      const subject = isNowBlocked
+        ? `⚠️ LinkedIn search unavailable: ${scheduleName}`
+        : `✅ LinkedIn search is back: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Sourcing-block transition email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId}, isNowBlocked=${isNowBlocked})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending sourcing-block transition email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the scheduled chat flow.
+    }
+  },
+
   async sendScheduledChatTokenLimitEmail(
     toEmails: string | string[],
     scheduleName: string,
@@ -1061,6 +1356,14 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       costUsed?: number;
       costAllowance?: number | null;
       costPercentUsed?: number;
+      // ENG-1116: which dimension actually gated. Without it a cost block over an
+      // also-exceeded token counter would be worded in tokens, contradicting the
+      // in-app message the same block produces.
+      costEnforced?: boolean;
+      // ENG-1344: the billing month (`YYYY-MM`), used to name the reset DATE.
+      // Optional only because this type under-declared the `TokenUsageStatus` the
+      // sole caller has always passed whole — every runtime call already carries it.
+      month?: string;
     }
   ) {
     try {
@@ -1075,20 +1378,28 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       });
 
       // A block can be caused by either the token-count cap or the dollar cost cap
-      // (ENG-200). When the cost cap is the trigger — the only reason a user with an
-      // unlimited token allowance can be blocked — render a cost-based message so it
-      // doesn't misleadingly read "N/A tokens".
+      // (ENG-200). Which dimension gated only picks which percentage to read — never
+      // the wording: the raw figures and the "cost" vs "token" dimension name are
+      // never surfaced to the customer, matching the in-app UsageMeter policy of a
+      // percentage of "monthly usage" only (ENG-1566).
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
+      const limitPercent = Math.round(
+        blockedByCost ? (usageStatus.costPercentUsed ?? 100) : (usageStatus.percentUsed ?? 100)
+      );
 
-      const limitLabel = blockedByCost ? 'Monthly Cost Limit Reached' : 'Monthly Token Limit Reached';
-      const limitReasonText = blockedByCost ? 'monthly cost limit' : 'monthly token limit';
-      const usageLine = blockedByCost
-        ? `<strong>Spend:</strong> $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
-        : `<strong>Usage:</strong> ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
-      const usageLineText = blockedByCost
-        ? `Spend: $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
-        : `Usage: ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
-      const allowanceResetNoun = blockedByCost ? 'cost allowance' : 'token allowance';
+      const limitLabel = 'Monthly Usage Limit Reached';
+      const limitReasonText = 'monthly usage limit';
+      const usageLine = `<strong>Usage:</strong> ${limitPercent}% of your monthly allowance used.`;
+      const usageLineText = `Usage: ${limitPercent}% of your monthly allowance used.`;
+      const allowanceResetNoun = 'usage allowance';
+      // ENG-1344: "resets at the start of each billing period" is the exact
+      // vagueness the escalating customer could not decode. Name the day when we
+      // can derive it; keep the old sentence when we cannot, rather than guess.
+      const resetIso = resetDateFromMonth(usageStatus.month);
+      const resetLabel = formatResetDateLong(resetIso);
+      const allowanceResetClause = resetLabel
+        ? `Your ${allowanceResetNoun} resets on ${resetLabel}.`
+        : `Your ${allowanceResetNoun} resets at the start of each billing period.`;
 
       const html = `
         <html>
@@ -1122,7 +1433,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                   ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  ${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
                 </p>
               </div>
             </div>
@@ -1144,7 +1455,7 @@ Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, bu
 
 ${usageLineText}
 
-Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+${allowanceResetClause} To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
 
 ---
 This is an automated email from your scheduled chat.
@@ -1359,13 +1670,41 @@ Schedule ID: ${scheduleId}
       sessionId: string;
       attempt: number;
       createdAt: string;
+      // ENG-1131: set when the run "succeeded" (produced a report) but its only
+      // sourcing path was blocked — e.g. the LinkedIn people-search outage. Left
+      // separate from `passed` on purpose (see agentModeController.ts), so this
+      // email must read it explicitly instead of trusting `passed` alone.
+      blockedBy?: string;
+      // ENG-1552: the run this email reports on, so its delivery state is recorded
+      // against the right run. Callers that only have a session fall back to it.
+      runId?: string;
     },
     scheduleId: string,
-    summary?: string
+    summary?: string,
+    // ENG-1552: false for a manual resend to an address the owner typed — that is not
+    // the scheduled delivery, so it must not overwrite the run's recorded state.
+    options?: { recordDelivery?: boolean }
   ) {
+    const deliveryScheduleId = options?.recordDelivery === false ? undefined : scheduleId;
+    // ENG-1552 (the xCures / ENG-1504 class): a run can finish with a real session and
+    // no output at all. Sending that is an empty report that reads as delivered, so
+    // withhold it and record why — before a share link is minted or anything is composed.
+    if (!String(result.actualResponse ?? '').trim()) {
+      if (deliveryEnforcementEnabled()) {
+        await this.withholdEmptyScheduledReport(toEmails, result, deliveryScheduleId);
+        return;
+      }
+      // Shadow mode: send exactly as before; the send is still recorded below.
+      logShadowDecision('withheld an empty report', { scheduleId, runId: result.runId || result.sessionId });
+    }
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      // CodeRabbit (PR #2383): escape before interpolating into the HTML body —
+      // a schedule name containing markup otherwise renders unescaped in the
+      // recipient's email client. sendScheduleSourcingBlockTransitionEmail
+      // already does this; this brings the sibling function in line with it.
+      const safeScheduleName = this.escapeHtml(scheduleName);
 
       // ENG-351: resolve {{cite:N}} markers to inline sources so recipients can trace each figure.
       // 'markdown' → the HTML body (marked()) renders clickable source links; the plain-text body
@@ -1384,8 +1723,49 @@ Schedule ID: ${scheduleId}
         // Fall back to regular agent-mode URL if share creation fails
       }
 
-      const statusColor = result.passed ? '#28a745' : '#dc3545';
-      const statusIcon = result.passed ? '✅' : '❌';
+      // ENG-1131: a blocked-sourcing run reads neither as a plain success nor a
+      // failure — `passed` stays `true` (the run itself completed; see
+      // agentModeController.ts for why), but the card/email must not say
+      // "successfully executed" when the reason it produced nothing was an
+      // upstream outage, not a real empty result.
+      //
+      // ENG-1131 follow-up: a run can be BOTH blocked AND have failed to meet
+      // its OTHER requirements — a schedule whose only sourcing path is search
+      // can't satisfy requiredFunctionCalls when that path is down
+      // (allRequirementsMet in agentModeController.ts depends on
+      // allFunctionCallsMet). Failure must take icon/color precedence over the
+      // blocked state: an owner must never read a run that failed as a
+      // reassuring "outage, self-heals, nothing to worry about" notice with no
+      // mention it also failed. The outage explanation is instead ALWAYS
+      // appended as its own note when isBlockedRun, independent of pass/fail —
+      // additive context, never a replacement for the failure signal.
+      const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+      const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+      const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+      const statusBg = !result.passed ? '#ffeaea' : (isBlockedRun ? '#fff3cd' : '#e8f5e8');
+      // Each of the 4 (passed x blocked) combinations gets its own headline —
+      // NOT derived from `passed` alone, or the original "don't say
+      // 'successfully executed' for a blocked run" fix (the whole point of
+      // this email surfacing at all) regresses right back for the passed +
+      // blocked case.
+      const primaryMessage = !result.passed && isBlockedRun
+        ? 'did not meet all criteria on this run. LinkedIn people search was also unavailable for the connected account during the run — see the note below.'
+        : !result.passed
+        ? 'executed but did not meet all criteria and results are ready.'
+        : isBlockedRun
+        ? 'ran, but LinkedIn people search was unavailable for the connected account, so no prospects could be sourced — see the note below.'
+        : 'has been successfully executed and results are ready.';
+      const outageNoteHtml = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is ' +
+          'account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically ' +
+          'once search returns for the account.'
+        : '';
+      const outageNoteText = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: ' +
+          'your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.'
+        : '';
 
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric',
@@ -1428,18 +1808,24 @@ Schedule ID: ${scheduleId}
           <div class="container">
             <div class="header">
               <h1>${statusIcon} Scheduled Chat Results</h1>
-              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeScheduleName}</p>
             </div>
-            
+
             <div class="content">
-              <div class="section" style="background-color: ${result.passed ? '#e8f5e8' : '#ffeaea'}; border-left: 4px solid ${result.passed ? '#28a745' : '#dc3545'}; margin: 20px 0;">
+              <div class="section" style="background-color: ${statusBg}; border-left: 4px solid ${statusColor}; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; line-height: 1.5;">
-                  Your scheduled chat <strong>"${scheduleName}"</strong> has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready. 
-                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong> 
+                  Your scheduled chat <strong>"${safeScheduleName}"</strong> ${primaryMessage}
+                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong>
                   and completed at <strong>${currentDate}</strong>.
                 </p>
               </div>
-              
+
+              ${isBlockedRun ? `
+              <div class="section" style="background-color: #fff3cd; border-left: 4px solid #ffc107; margin: 20px 0;">
+                <p style="margin: 0; font-size: 14px; line-height: 1.5;">${outageNoteHtml}</p>
+              </div>
+              ` : ''}
+
               ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
               <div class="section">
                 <h3>🔧 Function Call Details</h3>
@@ -1488,8 +1874,11 @@ Schedule ID: ${scheduleId}
       const text = `
 Scheduled Chat Results: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.
+Your scheduled chat "${scheduleName}" ${primaryMessage}
 It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
+${isBlockedRun ? `
+${outageNoteText}
+` : ''}
 
 ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
@@ -1516,68 +1905,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // user data via an admin-only tool, the report can contain other accounts'
       // identities/records — so restrict distribution to authorized (admin)
       // recipients + the owner, rather than auto-sending to every configured
-      // address. No-op for ordinary reports. Fail-closed: if we cannot classify
-      // the run (session lookup error), treat it as sensitive.
-      let recipients = emailList;
-      let finalHtml = html;
-      let finalText = text;
-      let guardOwnerEmail: string | undefined;
-      try {
-        let guardSession: any;
-        // FAIL-CLOSED DEFAULT: treat the report as sensitive UNLESS we can
-        // positively verify it is ordinary. Verification requires a present
-        // session AND a clean strongly-consistent tool-call record. A missing
-        // session, an unreadable/stale record, or any error therefore restricts
-        // distribution rather than broadcasting — closing the whole class of
-        // "couldn't classify → sent to everyone" fail-opens.
-        let isSensitive = true;
-        try {
-          guardSession = await chatbotDb.getChatSession(result.sessionId);
-          if (guardSession) {
-            if (reportContainsCrossAccountData(guardSession.calledFunctions)) {
-              isSensitive = true;
-            } else {
-              // calledFunctions is a best-effort counter (its write errors are
-              // swallowed at the call site), so a successful cross-account tool
-              // call can be missing from it. Confirm against the authoritative
-              // tool-call message records. Use a STRONGLY CONSISTENT read: this
-              // send fires immediately after the run wrote these messages, so an
-              // eventually-consistent read could miss a just-written call.
-              const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId, true);
-              isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
-            }
-          }
-          // guardSession falsy → cannot verify → isSensitive stays true (closed).
-        } catch (classifyError) {
-          console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
-          isSensitive = true;
-        }
-        // Resolve the owner email up front — used both to authorize the owner and
-        // to notify them if delivery ends up blocked.
-        try {
-          const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
-          guardOwnerEmail = (owner as any)?.email;
-        } catch { /* owner unknown → resolver still restricts to verified admins */ }
-        if (isSensitive) {
-          const authz = await resolveAuthorizedReportRecipients({ recipients: emailList, ownerEmail: guardOwnerEmail, isSensitive: true });
-          recipients = authz.authorized;
-          if (authz.withheld.length > 0) {
-            const noticeText = `⚠️ ${authz.withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${authz.withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
-            // Escape the notice before HTML interpolation: withheld addresses are
-            // attacker-influenceable (a configured recipient can contain HTML
-            // metacharacters), so raw insertion would inject markup into the notice.
-            finalHtml = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${this.escapeHtml(noticeText)}</div>${html}`;
-            finalText = `${noticeText}\n\n${text}`;
-            console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session ${result.sessionId}: ${authz.withheld.join(', ')}`);
-          }
-        }
-      } catch (guardError) {
-        // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
-        // than risk distributing possibly-sensitive data to unverified addresses.
-        // The empty-recipients branch below notifies the owner so it is not silent.
-        console.error(`Scheduled report guard errored for session ${result.sessionId}; failing closed:`, guardError);
-        recipients = [];
-      }
+      // address. No-op for ordinary reports. Fail-closed throughout; see
+      // classifyAndResolveScheduledReportRecipients.
+      const guard = await this.classifyAndResolveScheduledReportRecipients([result.sessionId], emailList);
+      const recipients = guard.authorized;
+      const notice = this.withheldRecipientsNotice(guard.withheld);
+      const finalHtml = notice ? `${notice.html}${html}` : html;
+      const finalText = notice ? `${notice.text}\n\n${text}` : text;
+      const runKey = result.runId || result.sessionId;
 
       if (recipients.length === 0) {
         // Fail-closed left no authorized recipient. Do NOT silently drop the
@@ -1585,31 +1920,26 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // (a status message ONLY — never the report data) so the report is not
         // lost without a signal and the owner can add an authorized recipient.
         console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
-        // Durable escalation so a fully-withheld report is never lost silently —
-        // this fires regardless of whether the owner email is known or its notice
-        // succeeds (owner-notice failure would otherwise be swallowed by sendEmail).
-        try {
-          await this.sendOncallAlert(
-            `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
-            `Session ${result.sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered. Owner: ${guardOwnerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`
-          );
-        } catch (alertError) {
-          console.error(`Failed to send oncall alert for withheld report ${result.sessionId}:`, alertError);
-        }
-        if (guardOwnerEmail) {
-          try {
-            const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
-            const blockedText = `Your scheduled report "${scheduleName}" was not delivered because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and re-run.`;
-            const blockedHtml = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(blockedText)}</div>`;
-            await this.sendEmail([guardOwnerEmail], blockedSubject, blockedText, blockedHtml);
-            console.log(`Scheduled report delivery-blocked notice sent to owner ${guardOwnerEmail} for session ${result.sessionId}`);
-          } catch (notifyError) {
-            console.error(`Failed to send delivery-blocked notice for session ${result.sessionId}:`, notifyError);
-          }
-        }
+        await recordReportDeliveryState(deliveryScheduleId, {
+          runId: runKey,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: emailList,
+          missingPermission: 'isAdmin',
+        });
+        await this.notifyScheduledReportWithheld({
+          scheduleId,
+          scheduleName,
+          sessionId: result.sessionId,
+          ownerEmail: guard.ownerEmail,
+          ownerUserId: guard.ownerUserId,
+          stage: 'after_generation',
+          emailOwner: true,
+        });
       } else {
         // Send ONE email to all authorized recipients
-        await this.sendEmail(recipients, subject, finalText, finalHtml);
+        await this.deliverScheduledReport(deliveryScheduleId, runKey, recipients, guard.withheld, subject, finalText, finalHtml);
         console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
       }
 
@@ -1620,12 +1950,244 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     }
   },
 
+  /**
+   * The ENG-500 recipient guard for one report or a batch of runs (a daily digest).
+   *
+   * FAIL-CLOSED DEFAULT: each session is treated as sensitive UNLESS it can be
+   * positively verified ordinary — a present session AND a clean strongly-consistent
+   * tool-call record. A missing session, an unreadable record, or any error restricts
+   * distribution rather than broadcasting. A batch is sensitive if ANY of its runs is:
+   * a combined digest cannot redact one run's content, so it takes the safer policy.
+   * Callers pass only the sessions whose content is actually in the email. Never
+   * throws: if the guard itself fails, nobody is authorized.
+   */
+  async classifyAndResolveScheduledReportRecipients(
+    sessionIds: string[],
+    recipients: string[],
+  ): Promise<{ authorized: string[]; withheld: string[]; ownerEmail?: string; ownerUserId?: string }> {
+    let ownerEmail: string | undefined;
+    let ownerUserId: string | undefined;
+    try {
+      let isSensitive = false;
+      for (const sessionId of sessionIds) {
+        let sessionSensitive = true;
+        try {
+          const session: any = await chatbotDb.getChatSession(sessionId);
+          if (session) {
+            ownerUserId = ownerUserId || session.userId;
+            if (!reportContainsCrossAccountData(session.calledFunctions)) {
+              // calledFunctions is a best-effort counter (its write errors are
+              // swallowed at the call site), so a successful cross-account tool
+              // call can be missing from it. Confirm against the authoritative
+              // tool-call message records. Use a STRONGLY CONSISTENT read: this
+              // send fires immediately after the run wrote these messages, so an
+              // eventually-consistent read could miss a just-written call.
+              const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId, true);
+              sessionSensitive = messagesReferenceCrossAccountTool(messages as any);
+            }
+          }
+          // session falsy → cannot verify → sessionSensitive stays true (closed).
+        } catch (classifyError) {
+          console.error(`Scheduled report guard: could not classify session ${sessionId}; failing closed (treating as sensitive):`, classifyError);
+          sessionSensitive = true;
+        }
+        isSensitive = isSensitive || sessionSensitive;
+      }
+      // Resolve the owner up front — used both to authorize the owner and to
+      // notify them if delivery ends up blocked.
+      try {
+        const owner = ownerUserId ? await userDb.getUserById(ownerUserId) : undefined;
+        ownerEmail = (owner as any)?.email;
+      } catch { /* owner unknown → resolver still restricts to verified admins */ }
+      const authz = await resolveAuthorizedReportRecipients({ recipients, ownerEmail, isSensitive });
+      if (authz.withheld.length > 0) {
+        console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session(s) ${sessionIds.join(', ')}: ${authz.withheld.join(', ')}`);
+      }
+      return { authorized: authz.authorized, withheld: authz.withheld, ownerEmail, ownerUserId };
+    } catch (guardError) {
+      // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
+      // than risk distributing possibly-sensitive data to unverified addresses.
+      // The caller's empty-recipients branch notifies the owner so it is not silent.
+      console.error(`Scheduled report guard errored for session(s) ${sessionIds.join(', ')}; failing closed:`, guardError);
+      return { authorized: [], withheld: [...recipients], ownerEmail, ownerUserId };
+    }
+  },
+
+  /** The banner prepended to a report some configured recipients were withheld from. */
+  withheldRecipientsNotice(withheld: string[]): { html: string; text: string } | null {
+    if (withheld.length === 0) return null;
+    const text = `⚠️ ${withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
+    // Escape the notice before HTML interpolation: withheld addresses are
+    // attacker-influenceable (a configured recipient can contain HTML
+    // metacharacters), so raw insertion would inject markup into the notice.
+    const html = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${this.escapeHtml(text)}</div>`;
+    return { html, text };
+  },
+
+  /**
+   * ENG-1552: send a scheduled report and record what actually happened — ONE write,
+   * after the send (each append rewrites the whole schedule row, so it is kept to the
+   * minimum). `delivered` only for a send the provider accepted; a swallowed failure or
+   * a non-prod suppression is `delivery_attempted` with the reason.
+   */
+  async deliverScheduledReport(
+    scheduleId: string | undefined,
+    runId: string,
+    recipients: string[],
+    withheld: string[],
+    subject: string,
+    text: string,
+    html: string,
+  ): Promise<void> {
+    const base = {
+      runId,
+      authorizedRecipients: recipients,
+      ...(withheld.length > 0 ? { withheldRecipients: withheld } : {}),
+    };
+    const outcome = await this.sendEmail(recipients, subject, text, html);
+    await recordReportDeliveryState(scheduleId, outcome === 'sent'
+      ? { ...base, state: 'delivered' }
+      : {
+          ...base,
+          state: 'delivery_attempted',
+          ...(outcome === 'failed' ? { reason: 'provider_error' as const } : {}),
+          ...(outcome === 'suppressed' ? { reason: 'suppressed_nonprod' as const } : {}),
+        });
+  },
+
+  /**
+   * ENG-1552: the empty-content half of sendScheduledChatResultEmail. Records the
+   * withhold and sends nothing — the recipients used to get an empty report, and the
+   * customer is deliberately sent nothing new during the review period. Never throws.
+   */
+  async withholdEmptyScheduledReport(
+    toEmails: string | string[],
+    result: { sessionId: string; runId?: string },
+    scheduleId: string | undefined,
+  ): Promise<void> {
+    const emailList = (Array.isArray(toEmails) ? toEmails : [toEmails]).filter(Boolean);
+    console.error(`Scheduled report for schedule ${scheduleId} (session ${result.sessionId || 'none'}) has no content; NOT sent to ${emailList.length} recipient(s).`);
+    await recordReportDeliveryState(scheduleId, {
+      runId: result.runId || result.sessionId,
+      state: 'withheld',
+      reason: 'empty_content',
+      withheldRecipients: emailList,
+    });
+  },
+
+  /**
+   * A sensitive scheduled report has no authorized recipient, so nothing was
+   * delivered. Oncall is always told (durably, deduped onto one canonical defect).
+   * The schedule owner is emailed a status notice (never report data) only when
+   * `emailOwner` is set — the pre-ENG-1552 single-report path, which already did so.
+   * The paths ENG-1552 added (preflight, digest) deliberately send the customer
+   * nothing new: reports are in an internal review period (2026-09-18), and the
+   * outcome is recorded in the schedule's deliveryLog instead. Never throws.
+   *
+   * ENG-1552 / ENG-1825: the oncall alert used to carry no context, so intake could
+   * only fuzzy-match on a per-schedule title and re-filed a fresh Linear issue per
+   * schedule per day. The Alert Class folds every occurrence, across all schedules,
+   * onto one canonical defect (each occurrence comment still names its Schedule ID);
+   * the dedupeKey keeps a daily schedule from re-emailing oncall inside 24h.
+   * `sessionId` goes only into context, never the helper's own sessionId param: that
+   * would mint a no-login share link to a report withheld because it holds
+   * cross-account data.
+   */
+  async notifyScheduledReportWithheld(params: {
+    scheduleId: string;
+    scheduleName: string;
+    sessionId?: string;
+    ownerEmail?: string;
+    ownerUserId?: string;
+    stage: 'before_generation' | 'after_generation';
+    emailOwner?: boolean;
+  }): Promise<void> {
+    const { scheduleId, scheduleName, sessionId, ownerEmail, ownerUserId, stage, emailOwner } = params;
+    const what = stage === 'before_generation'
+      ? `Schedule ${scheduleId} was not run: it produces a report containing cross-account account data, and none of its configured recipients (or the schedule owner) are currently authorized (admin) to receive it, so generation was skipped.`
+      : `Session ${sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered.`;
+    try {
+      const { sendAgentModeOncallAlert } = await import('../utils/agentModeAlerts');
+      await sendAgentModeOncallAlert({
+        subject: `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
+        message: `${what} Owner: ${ownerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`,
+        userId: ownerUserId,
+        context: {
+          'Session ID': sessionId || 'N/A',
+          'Schedule ID': scheduleId,
+          'Alert Class': WITHHELD_REPORT_ALERT_CLASS,
+        },
+        dedupeKey: `withheld-recipients:${scheduleId}`,
+        dedupeWindowMs: 24 * 60 * 60 * 1000,
+      });
+    } catch (alertError) {
+      console.error(`Failed to send oncall alert for withheld report on schedule ${scheduleId}:`, alertError);
+    }
+    if (!emailOwner || !ownerEmail) return;
+    try {
+      const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
+      const blockedText = `Your scheduled report "${scheduleName}" was not delivered because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and re-run.`;
+      const blockedHtml = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(blockedText)}</div>`;
+      await this.sendEmail([ownerEmail], blockedSubject, blockedText, blockedHtml);
+      console.log(`Scheduled report delivery-blocked notice sent to owner ${ownerEmail} for schedule ${scheduleId}`);
+    } catch (notifyError) {
+      console.error(`Failed to send delivery-blocked notice for schedule ${scheduleId}:`, notifyError);
+    }
+  },
+
   async sendSessionNotificationEmail(
     toEmails: string | string[],
     sessionId: string,
     content: string,
     subject?: string
   ) {
+    const emailListForClaim = Array.isArray(toEmails) ? toEmails : [toEmails];
+    // ENG-1297: a scheduled run's automated completion nudge can re-invoke this after
+    // the notification for THIS session + recipient set has already gone out (the
+    // nudge fires because an unrelated requirement is still unmet, not because the
+    // notification failed) — the observed production outcome was a duplicate report
+    // email. Claim atomically BEFORE sending so a repeat call for the same session
+    // and recipients is a no-op instead of a second send.
+    //
+    // Deliberately NOT content-aware (a prior version of this guard hashed
+    // subject+content into the claim member so a genuinely different notification
+    // to the same recipients wouldn't be permanently suppressed). Re-derived
+    // against the actual production incident this ticket reports (session
+    // 0050a0b4-…): the scheduler's nudge caused the SAME run to re-run its
+    // research, regenerate an "updated" report, and re-notify the same recipient
+    // — different content both times (9588 vs 11359 chars, a restructured report).
+    // A content hash produces a different signature for each call and does NOT
+    // suppress that duplicate, so it does not fix the bug it was added for.
+    // Recipient+session is coarser — a genuinely distinct second notification to
+    // the same recipients later in the same session is also suppressed — but that
+    // trade is the one that actually stops the proven regression.
+    //
+    // NOT superseded by the read-only press circuit breaker
+    // (readOnlyPressCircuitBreaker.ts): that breaker still allows exactly ONE
+    // nudge per the ticket's own recommendation ("cap nudges, suggest 1"), and in
+    // the real incident the duplicate send happened on the response to that
+    // FIRST, still-permitted nudge — the model complied immediately, so the
+    // breaker's budget was never exhausted before the second notify_session call
+    // went out. The breaker only caps the COST of a run that keeps refusing (the
+    // sibling session in this ticket, d1f7942d-…); this guard is what actually
+    // stops the duplicate SEND when a run complies instead.
+    // JSON.stringify (not a bare comma-join) keeps the recipient signature
+    // collision-safe against an embedded comma in a single recipient entry.
+    // De-duplicated via Set before sorting (CodeRabbit): sort() alone does not
+    // collapse repeats, so a call listing the same address twice would claim a
+    // different signature than a later, legitimate call listing it once —
+    // letting that second call slip past the guard as if it were a distinct
+    // recipient set.
+    const claimMember = JSON.stringify(
+      [...new Set(emailListForClaim.map(e => e.trim().toLowerCase()))].sort()
+    );
+    const notifyClaimKey = `notify-session:${sessionId}`;
+    const claimed = await settingsService.claimSetMember(notifyClaimKey, claimMember);
+    if (!claimed) {
+      console.log(`Session notification to ${emailListForClaim.join(', ')} for session ${sessionId} was already sent — skipping duplicate.`);
+      return { sent: false, duplicate: true };
+    }
+
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -1715,9 +2277,18 @@ Sent via AgentWeb: ${customerFrontendUrl}
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmailStrict(emailList, emailSubject, text, html);
       console.log(`Session notification email sent to: ${emailList.join(', ')}`);
+      return { sent: true, duplicate: false };
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending session notification email to ${emailList.join(', ')}:`, error);
+      // The primary action failed, so release the claim — a retry (nudge-driven or
+      // otherwise) must be allowed to actually send, not get silently swallowed as
+      // "already sent" for a notification that never went out.
+      try {
+        await settingsService.releaseSetMember(notifyClaimKey, claimMember);
+      } catch (releaseError) {
+        console.error(`Failed to release notify-session claim for session ${sessionId}:`, releaseError);
+      }
       throw error; // Let the tool surface the error to the agent
     }
   },
@@ -1727,8 +2298,11 @@ Sent via AgentWeb: ${customerFrontendUrl}
     scheduleName: string,
     todaysResults: any[],
     scheduleId: string,
-    customDate?: Date
+    customDate?: Date,
+    // ENG-1552: false for a manual resend — see sendScheduledChatResultEmail.
+    options?: { recordDelivery?: boolean }
   ) {
+    const deliveryScheduleId = options?.recordDelivery === false ? undefined : scheduleId;
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
@@ -1741,8 +2315,53 @@ Sent via AgentWeb: ${customerFrontendUrl}
             : r
         )
       );
+      // ENG-1552: a run with no content is shown as such, not as a blank preview
+      // (a missing actualResponse also used to throw on `.length` below). Customer-
+      // visible, so enforcement-only like everything else ENG-1552 changes.
+      if (deliveryEnforcementEnabled()) {
+        todaysResults = todaysResults.map((r) =>
+          r && !(typeof r.actualResponse === 'string' && r.actualResponse.trim())
+            ? { ...r, actualResponse: EMPTY_RUN_DIGEST_PLACEHOLDER }
+            : r
+        );
+      }
 
       const displayDate = customDate || new Date();
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      const digestRunKey = `digest-${displayDate.toISOString().slice(0, 10)}`;
+
+      // ENG-1552: the same ENG-500 recipient guard as a single report. This path
+      // used to send every run's content to every configured address unchecked.
+      // Runs without a session carry only system text, so only sessions count.
+      const digestSessionIds = [...new Set(todaysResults.map((r) => r?.sessionId).filter(Boolean))] as string[];
+      const enforced = deliveryEnforcementEnabled();
+      const classified = await this.classifyAndResolveScheduledReportRecipients(digestSessionIds, emailList);
+      if (!enforced && classified.withheld.length > 0) {
+        logShadowDecision('restricted a digest', { scheduleId, withheldRecipients: classified.withheld });
+      }
+      // Shadow mode: every configured recipient gets the digest, exactly as before.
+      const guard = enforced ? classified : { ...classified, authorized: emailList, withheld: [] as string[] };
+      if (guard.authorized.length === 0) {
+        console.error(`Daily digest for schedule ${scheduleId} had no authorized recipients after the guard; digest NOT delivered.`);
+        await recordReportDeliveryState(deliveryScheduleId, {
+          runId: digestRunKey,
+          state: 'withheld',
+          reason: 'no_authorized_recipients',
+          authorizedRecipients: [],
+          withheldRecipients: emailList,
+          missingPermission: 'isAdmin',
+        });
+        await this.notifyScheduledReportWithheld({
+          scheduleId,
+          scheduleName,
+          sessionId: digestSessionIds[0],
+          ownerEmail: guard.ownerEmail,
+          ownerUserId: guard.ownerUserId,
+          stage: 'after_generation',
+        });
+        return;
+      }
+      const digestNotice = this.withheldRecipientsNotice(guard.withheld);
       const currentDate = displayDate.toLocaleDateString('en-US', {
         year: 'numeric',
         month: 'long',
@@ -1778,8 +2397,22 @@ Sent via AgentWeb: ${customerFrontendUrl}
 
       // Generate results HTML
       const resultsHtml = todaysResults.map((result, index) => {
-        const statusIcon = result.passed ? '✅' : '❌';
-        const statusColor = result.passed ? '#28a745' : '#dc3545';
+        // ENG-1131: a blocked-sourcing run (LinkedIn search outage) still has
+        // `passed: true` — see agentModeController.ts — so it must be read off
+        // `blockedBy` explicitly rather than rendered as a plain PASSED run.
+        //
+        // ENG-1131 follow-up: a run can be BOTH blocked AND failed to meet its
+        // other requirements (a schedule whose only sourcing path is search
+        // can't satisfy requiredFunctionCalls when that path is down). FAILED
+        // must take badge precedence over BLOCKED — the outage note below is
+        // always shown when isBlockedRun regardless of pass/fail, so no
+        // information is lost either way.
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
+        const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+        const statusTextColor = !result.passed ? 'white' : (isBlockedRun ? '#664d03' : 'white');
+        const itemBg = !result.passed ? '#fff8f8' : (isBlockedRun ? '#fffbea' : '#f8fff8');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
@@ -1787,11 +2420,11 @@ Sent via AgentWeb: ${customerFrontendUrl}
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : '#';
 
         return `
-          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${result.passed ? '#f8fff8' : '#fff8f8'};">
+          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${itemBg};">
             <div class="result-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
               <div class="result-info">
-                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: white;">
-                  ${statusIcon} ${result.passed ? 'PASSED' : 'FAILED'}
+                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: ${statusTextColor};">
+                  ${statusIcon} ${statusLabel}
                 </span>
                 <span style="margin-left: 15px; color: #6c757d; font-size: 14px;">Run ${index + 1} at ${runTime}</span>
               </div>
@@ -1801,6 +2434,14 @@ Sent via AgentWeb: ${customerFrontendUrl}
               </div>
             </div>
             <div class="result-content">
+              ${isBlockedRun ? `
+                <div style="background-color: #fff3cd; border: 1px solid #ffe69c; color: #664d03; padding: 10px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; line-height: 1.4;">
+                  LinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced —
+                  this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is
+                  account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically
+                  once search returns for the account.
+                </div>
+              ` : ''}
               <div class="response-preview" style="background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; line-height: 1.4; max-height: 100px; overflow: hidden; position: relative;">
                 ${this.escapeHtml(result.actualResponse.length > 200 ? result.actualResponse.substring(0, 200) + '...' : result.actualResponse)}
               </div>
@@ -1903,13 +2544,16 @@ ${dateLabel}:
 
 Individual Run Results:
 ${todaysResults.map((result, index) => {
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        // FAILED takes precedence over BLOCKED — see the HTML branch above for why.
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
         });
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
         return `
-Run ${index + 1} at ${runTime} - ${result.passed ? 'PASSED' : 'FAILED'}
+Run ${index + 1} at ${runTime} - ${statusLabel}${isBlockedRun ? '\nLinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced — this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.' : ''}
 Response: ${result.actualResponse.substring(0, 100)}${result.actualResponse.length > 100 ? '...' : ''}
 View Conversation: ${sessionUrl}
 `;
@@ -1922,13 +2566,18 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
       const subject = `📊 Daily Digest: ${scheduleName} - ${currentDate} - ${totalRuns} runs (${Math.round((successfulRuns / totalRuns) * 100)}% success)`;
 
-      // Normalize to array for consistent handling
-      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      // Send ONE email to all authorized recipients
+      await this.deliverScheduledReport(
+        deliveryScheduleId,
+        digestRunKey,
+        guard.authorized,
+        guard.withheld,
+        subject,
+        digestNotice ? `${digestNotice.text}\n\n${text}` : text,
+        digestNotice ? html.replace(/<body([^>]*)>/i, (m) => `${m}${digestNotice.html}`) : html,
+      );
 
-      // Send ONE email to all recipients
-      await this.sendEmail(emailList, subject, text, html);
-
-      console.log(`Daily digest email sent to recipients: ${emailList.join(', ')}`);
+      console.log(`Daily digest email sent to recipients: ${guard.authorized.join(', ')}`);
 
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];

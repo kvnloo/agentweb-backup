@@ -105,9 +105,11 @@ describe("emailService.sendEmailStrict", () => {
   it("regular sendEmail still swallows failures (best-effort contract preserved)", async () => {
     mockResendSendEmail.mockRejectedValueOnce(new Error("Resend API error: down"));
 
+    // Still never throws. ENG-1552: it now resolves to the outcome instead of
+    // undefined, so a caller recording delivery can tell this from a real send.
     await expect(
       emailService.sendEmail("bob@example.com", "Hi", "text", "<p>html</p>"),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe("failed");
     expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
   });
 });

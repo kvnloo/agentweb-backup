@@ -20,6 +20,7 @@ import yaml
 import random
 from typing import Dict, Any, List, Optional
 from task_utils import get_downloads_path, upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
+from web_agent_cli_result import parse_web_agent_cli_result
 import subprocess
 import tempfile
 import shutil
@@ -30,8 +31,8 @@ import resource
 from email_utils import get_task_subscribers
 import requests
 from google.cloud import storage
-from openai import AzureOpenAI
-from task_utils import get_azure_openai_llm3, create_jwt_token
+from openrouter_gateway import get_openrouter_llm
+from task_utils import create_jwt_token
 from knowledge_base_utils import get_knowledge_base_manager
 
 # Increase file descriptor limit
@@ -889,46 +890,12 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
                     f.write("\n")
                 f.write("=" * 80 + "\n")
             
-            if process.returncode == 0:
-                try:
-                    # Try to find the JSON output in stdout
-                    output = stdout.decode()
-                    # Split into lines and reverse to find the last JSON object
-                    lines = output.split('\n')
-                    for line in reversed(lines):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            result = json.loads(line)
-                            if isinstance(result, dict) and 'success' in result:
-                                logger.info(f"Successfully parsed result from web_agent.py")
-                                return result
-                        except json.JSONDecodeError:
-                            continue
-                    
-                    # If we get here, no valid JSON was found
-                    logger.error(f"No valid JSON found in output. Full output written to {log_file}")
-                    return {
-                        "success": False,
-                        "error": f"No valid JSON output found. Check {log_file} for details.",
-                        "llmName": llm_name
-                    }
-                except Exception as e:
-                    logger.error(f"Error parsing output: {e}")
-                    return {
-                        "success": False,
-                        "error": f"Failed to parse output: {str(e)}. Check {log_file} for details.",
-                        "llmName": llm_name
-                    }
-            else:
-                error_msg = stderr.decode() if stderr else "Unknown error"
-                logger.error(f"Process failed with error: {error_msg}")
-                return {
-                    "success": False,
-                    "error": f"Process error: {error_msg}. Check {log_file} for details.",
-                    "llmName": llm_name
-                }
+            # ENG-1823: look for the result dict in stdout regardless of
+            # returncode -- see web_agent_cli_result.py for why (a correctly
+            # reported task failure now exits non-zero but still prints a
+            # complete result dict first, which must not be thrown away in
+            # favor of a generic stderr-based error).
+            return parse_web_agent_cli_result(stdout, stderr, process.returncode, log_file, llm_name)
                 
         except asyncio.TimeoutError:
             # Task execution timed out
@@ -1344,7 +1311,7 @@ Context - Original Task: {base_prompt}"""
                                 logger.info(f"Starting knowledge base update for task {task_id}")
                                 # Initialize clients
                                 storage_client = storage.Client()
-                                openai_client = get_azure_openai_llm3('gpt-5-chat')
+                                openai_client = get_openrouter_llm('azure->openai->gpt-5-chat')
 
                                 # Determine which bucket to use based on knowledgeBaseType
                                 bucket_type = task.get('knowledgeBaseType', 'private')

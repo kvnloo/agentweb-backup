@@ -26,6 +26,7 @@ import {
   parsePageSize,
   Orientation,
 } from "../utils/pdfPrintLayout";
+import { assertPublicHostname } from "../utils/ssrfGuard";
 
 const CHROME_PATH = "/usr/bin/google-chrome";
 const CHROME_ARGS = [
@@ -99,6 +100,31 @@ export async function renderHtmlToPdf(
     const page = await browser.newPage();
 
     if (opts.url) {
+      // SSRF guard: a url-sourced render fetches whatever server-side content
+      // the caller points it at (e.g. the convert_to_pdf agent tool, reachable
+      // by every session as a foundation tool). Validate the requested URL up
+      // front, then re-validate on EVERY subsequent HTTP(S) request Chrome
+      // makes for this page — redirect hops, but ALSO subresource fetch/XHR
+      // and iframe navigations. A rendered page can embed
+      // <iframe src="http://169.254.169.254/..."> or run
+      // fetch("http://169.254.169.254/...") itself; scoping revalidation to
+      // just main-frame navigations (as an earlier version of this guard did)
+      // lets either one through unchecked and paint the response straight
+      // into the exported PDF. Non-HTTP(S) requests (data:, blob:, about:)
+      // never leave the browser process, so there's nothing to validate.
+      await assertPublicHostname(opts.url);
+      await page.setRequestInterception(true);
+      page.on("request", (req: any) => {
+        const url = req.url();
+        if (!/^https?:\/\//i.test(url)) {
+          req.continue();
+          return;
+        }
+        assertPublicHostname(url).then(
+          () => req.continue(),
+          () => req.abort("blockedbyclient")
+        );
+      });
       await page.goto(opts.url, { waitUntil: "networkidle0", timeout });
     } else {
       await page.setContent(opts.html as string, {

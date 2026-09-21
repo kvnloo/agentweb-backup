@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { buildWorkPlanInputRequest, type WorkPlanInputField } from './agentMode/core/workPlanInputRequest';
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -10,13 +11,39 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts
+  // (same fix as db.ts's guard — this file was never updated to match).
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 export type WorkPlanVisibility = 'system' | 'private' | 'public' | 'pending_review';
+export type WorkPlanDisplayCategory = 'strategy' | 'paid-ads' | 'founder-led-sales' | 'event-led-sales' | 'content';
+export type WorkPlanDisplayChannel = 'meta' | 'google' | 'linkedin' | 'email' | 'event' | 'content' | 'cross-channel';
+
+/** Customer-facing metadata only. It never changes how a plan executes. */
+export interface WorkPlanDisplayMetadataV1 {
+  version: 1;
+  title?: string;
+  summary?: string;
+  categories?: WorkPlanDisplayCategory[];
+  channel?: WorkPlanDisplayChannel;
+  suite?: { id: string; name: string; position: number };
+  stepLabels?: string[];
+  /** Author-approved optional continuations; users may still start any plan. */
+  nextPlanIds?: string[];
+}
 
 /**
  * Maximum length of a step's userInstructions field. Capped so the
@@ -42,6 +69,22 @@ export interface WorkPlanStep {
    *  setWorkPlanStatus. Set this on multi-image steps (e.g. "Generate 18 images") so
    *  the step cannot be closed with only a fraction generated. */
   expectedAssetCount?: number;
+  /**
+   * ENG-1331: which tool name(s) count toward expectedAssetCount, when a step's
+   * deliverable isn't unambiguous from ASSET_PRODUCING_TOOL_NAMES alone. A step
+   * whose requiredFunctionCalls span multiple asset-producing tools with different
+   * roles (e.g. "Render the Full Size Matrix": a FEW reusable create_html_file
+   * templates plus ONE playwright_browser_take_screenshot per requested size) needs
+   * to say which one is actually "the N things" — otherwise the count either sums
+   * across unrelated tools (padding: 5 templates + 7 screenshots satisfies N=12
+   * while only 7 of 12 sizes exist) or takes the max across all of them (safe
+   * against padding, but would undercount a step that legitimately needs several
+   * DIFFERENT tools to jointly reach N). When set, only these tool(s)' successes
+   * are summed. When unset, the count falls back to the max across every producing
+   * tool in ASSET_PRODUCING_TOOL_NAMES — unambiguous templates need nothing here.
+   */
+  expectedAssetCountTools?: string[];
+  inputRequest?: { title: string; prompt: string; fields: WorkPlanInputField[] };
 }
 
 export interface WorkPlan {
@@ -55,6 +98,7 @@ export interface WorkPlan {
   showInAgentMode?: boolean;
   defaultModel?: string;
   category?: string;
+  display?: WorkPlanDisplayMetadataV1;
   steps: WorkPlanStep[];
   ownerId?: string;
   orgId?: string;
@@ -90,6 +134,7 @@ const THUMBNAIL_FIELDS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_te
 const OPTIONAL_PLAN_FIELDS = [
   'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
   'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+  'display',
 ] as const;
 
 /** Always written. */
@@ -114,14 +159,16 @@ export class WorkPlanService {
   private validateSteps(steps: WorkPlanStep[] | undefined): void {
     if (!steps) return;
     steps.forEach((step, idx) => {
-      if (step.userInstructions === undefined || step.userInstructions === null) return;
-      if (typeof step.userInstructions !== 'string') {
+      if (step.userInstructions !== undefined && step.userInstructions !== null && typeof step.userInstructions !== 'string') {
         throw new Error(`step ${idx + 1}: userInstructions must be a string`);
       }
-      if (step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
+      if (typeof step.userInstructions === 'string' && step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
         throw new Error(
           `step ${idx + 1}: userInstructions exceeds ${USER_INSTRUCTIONS_MAX_LENGTH} characters (got ${step.userInstructions.length})`,
         );
+      }
+      if (step.inputRequest !== undefined) {
+        buildWorkPlanInputRequest({ requestId: `validation-step-${idx + 1}`, stepCount: idx + 1, ...step.inputRequest, createdAt: '1970-01-01T00:00:00.000Z' });
       }
     });
   }

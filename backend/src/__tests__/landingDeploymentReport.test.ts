@@ -80,6 +80,47 @@ describe('landingDeploymentReport', () => {
         { name: 'generate_image', result: { imageUrl: 'https://img.example.com/a.png' } },
       ])).toEqual([]);
     });
+
+    // ENG-1868 review: first-occurrence-wins dedup silently dropped a LATER, accurate
+    // failure in favor of an EARLIER optimistic default — reproducing the exact bug this
+    // module exists to fix. smokeTestResult is fire-and-forget after deploy, so
+    // generate_landing_page's own ledger entry genuinely cannot know it yet (ready:true by
+    // default); a later get_deployment_status call for the SAME url sees the real result.
+    describe('launchReadiness merge across duplicate URLs (ENG-1868 review)', () => {
+      it('surfaces a LATER failure even though the FIRST entry for the url was ready:true', () => {
+        const urls = collectSuccessfulLandingUrls([
+          { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: true, reasons: [] } } },
+          { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] } } },
+        ]);
+        expect(urls).toEqual([{ url: DEPLOYED_URL, name: undefined, launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] } }]);
+      });
+
+      it('surfaces an EARLIER failure even if a later entry for the url looks ready (never silently upgrade)', () => {
+        const urls = collectSuccessfulLandingUrls([
+          { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: false, reasons: ['No conversion tracking (GTM) installed'] } } },
+          { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: true, reasons: [] } } },
+        ]);
+        expect(urls[0].launchReadiness).toEqual({ ready: false, reasons: ['No conversion tracking (GTM) installed'] });
+      });
+
+      it('unions distinct reasons from both entries without duplicating', () => {
+        const urls = collectSuccessfulLandingUrls([
+          { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: false, reasons: ['No conversion tracking (GTM) installed'] } } },
+          { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] } } },
+        ]);
+        expect(urls[0].launchReadiness?.reasons.sort()).toEqual(
+          ['No conversion tracking (GTM) installed', 'Post-deploy smoke test failed'].sort()
+        );
+      });
+
+      it('stays ready when every entry for the url is ready, preferring the later name', () => {
+        const urls = collectSuccessfulLandingUrls([
+          { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: true, reasons: [] } } },
+          { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL, name: 'Cold Outreach', launchReadiness: { ready: true, reasons: [] } } },
+        ]);
+        expect(urls).toEqual([{ url: DEPLOYED_URL, name: 'Cold Outreach', launchReadiness: { ready: true, reasons: [] } }]);
+      });
+    });
   });
 
   describe('reconcileLandingDeploymentReport', () => {
@@ -138,6 +179,80 @@ describe('landingDeploymentReport', () => {
     it('handles a missing/non-array ledger without throwing', () => {
       expect(reconcileLandingDeploymentReport(failureText, undefined as any)).toBe(failureText);
       expect(reconcileLandingDeploymentReport(failureText, [] as any)).toBe(failureText);
+    });
+  });
+
+  // ENG-1868: "deployed successfully" is a true BUILD claim — the smoke-test/tracking
+  // caveat is a SEPARATE, additional truth appended after it, never a rewrite.
+  describe('reconcileLandingDeploymentReport — launch-readiness caveat (ENG-1868)', () => {
+    const failureText =
+      'I have successfully drafted the content for your landing page, but the final deployment step timed out. You can review your saved draft in the dashboard.';
+
+    it('appends a caveat when the smoke test failed', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] },
+          },
+        },
+      ]);
+      expect(out).toContain('was deployed successfully');
+      expect(out).toContain(DEPLOYED_URL);
+      expect(out).toContain('Not launch-ready yet');
+      expect(out).toContain('Post-deploy smoke test failed');
+    });
+
+    it('appends no caveat when ready', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: true, reasons: [] },
+          },
+        },
+      ]);
+      expect(out).not.toContain('Not launch-ready yet');
+    });
+
+    it('appends no caveat when launchReadiness is absent (older/unrelated tool results)', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL } },
+      ]);
+      expect(out).not.toContain('Not launch-ready yet');
+    });
+
+    it('never removes or rewrites the "deployed successfully" line — append-only', () => {
+      const out = reconcileLandingDeploymentReport(failureText, [
+        {
+          name: 'get_deployment_status',
+          result: {
+            status: 'deployed',
+            buildStatus: 'success',
+            deployedUrl: DEPLOYED_URL,
+            launchReadiness: { ready: false, reasons: ['No conversion tracking (GTM) installed'] },
+          },
+        },
+      ]);
+      expect(out).toContain(failureText);
+      expect(out).toMatch(/deployed successfully.*Not launch-ready yet/s);
+    });
+
+    it('end-to-end: generate then a later get_deployment_status catching a real smoke-test failure', () => {
+      // The actual flow the ENG-1868 tool descriptions train Emma to use: generate, then
+      // check get_deployment_status. smokeTestResult hasn't run yet at generate time.
+      const out = reconcileLandingDeploymentReport(failureText, [
+        { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: true, reasons: [] } } },
+        { name: 'get_deployment_status', result: { status: 'deployed', buildStatus: 'success', deployedUrl: DEPLOYED_URL, launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed'] } } },
+      ]);
+      expect(out).toContain('Not launch-ready yet');
+      expect(out).toContain('Post-deploy smoke test failed');
     });
   });
 });

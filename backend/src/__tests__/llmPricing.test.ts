@@ -2,39 +2,65 @@
  * Tests for the shadow-metering price book.
  *
  * The "registry coverage" suite is the CI guard: every model id in
- * agentModeService's llmModels registry MUST have a price entry. It parses the
- * registry out of the source file (rather than importing the 470KB module with
- * its construction side effects) so the guard stays cheap and side-effect free.
+ * the LLM model registry MUST have a price entry. It imports the registry from
+ * agentMode/llmModelRegistry.ts (ENG-1831), which has no runtime dependencies,
+ * so the guard stays cheap and side-effect free.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   MODEL_PRICING,
+  LLM_PRICE_BOOK_VERSION,
+  LLM_PRICE_BOOK_PROVENANCE,
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
   getModelPrice,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
+  costScoreFromPrice,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
 import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
 
 function parseLlmModelsRegistryKeys(): string[] {
-  const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
-  const src = fs.readFileSync(srcPath, 'utf8');
-  const blockMatch = src.match(
-    /private llmModels: Record<string, LLMModelConfig> = \{([\s\S]*?)\n {2}\};/
-  );
-  if (!blockMatch) {
-    throw new Error('Could not locate the llmModels registry in agentModeService.ts');
-  }
-  const keys = [...blockMatch[1].matchAll(/^\s*'([^']+)':\s*\{/gm)].map((m) => m[1]);
-  if (keys.length === 0) {
-    throw new Error('Parsed zero model ids from the llmModels registry');
-  }
-  return keys;
+  return Object.keys(LLM_MODEL_REGISTRY);
 }
+
+/**
+ * ENG-1934: every LLM spend event carries LLM_PRICE_BOOK_VERSION, so a price
+ * edit that forgets to bump it would leave two different prices under one
+ * version and make historical events impossible to re-derive. A fingerprint of
+ * the tables is pinned to the version; changing a price fails this test until
+ * BOTH are updated in the same commit.
+ */
+describe('price book version (ENG-1250 §5, ENG-1934)', () => {
+  const canonical = (value: unknown): string =>
+    value && typeof value === 'object'
+      ? `{${Object.keys(value as object)
+          .sort()
+          .map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`)
+          .join(',')}}`
+      : JSON.stringify(value);
+
+  const fingerprint = () =>
+    require('crypto')
+      .createHash('sha256')
+      .update(canonical({ MODEL_PRICING, IMAGE_GENERATION_PRICING_USD, VIDEO_GENERATION_PRICING_USD_PER_CLIP }))
+      .digest('hex')
+      .slice(0, 16);
+
+  it('is a dated version string', () => {
+    expect(LLM_PRICE_BOOK_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(LLM_PRICE_BOOK_PROVENANCE).toBe(`llm-price-book:${LLM_PRICE_BOOK_VERSION}`);
+  });
+
+  it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
+    expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
+      version: '2026-09-10',
+      fingerprint: 'a271b4b8838a9308',
+    });
+  });
+});
 
 describe('llmPricing', () => {
   beforeEach(() => {
@@ -100,7 +126,6 @@ describe('llmPricing', () => {
     });
 
     it('has corrected GPT rates', () => {
-      expectRate('gpt-5.2-chat', 1.75, 14);
       expectRate('gpt-5.4', 2.5, 15);
     });
 
@@ -158,6 +183,19 @@ describe('llmPricing', () => {
       expect(MODEL_PRICING['gpt-5.5'].cacheReadPerM ?? MODEL_PRICING['gpt-5.5'].inPerM * 0.1).toBeCloseTo(0.5, 6);
     });
 
+    it('prices GPT-6 Astra at the Azure GlobalStandard $10/$50 BYOK rate, not a marketplace promo (ENG-1769)', () => {
+      // BYOK traffic bills at Azure's list rate; the backend only takes
+      // OpenRouter's usage.cost override when is_byok !== true, so this row
+      // is what customers are actually charged. Live-confirmed 2026-09-05:
+      // 13 prompt + 5 completion tokens -> $0.00013 + $0.00025 upstream.
+      const price = getModelPrice('openrouter/openai/gpt-6-astra');
+      expect(price).not.toBeNull();
+      expect(price!.inPerM).toBe(10);
+      expect(price!.outPerM).toBe(50);
+      expect(price!.cacheReadPerM).toBeCloseTo(1.0, 10);
+      expect(price!.cacheWritePerM).toBeCloseTo(12.5, 10);
+    });
+
     it('prices gemini-3.1-flash-live-preview at the confirmed $0.75/$4.50 text rate', () => {
       expectRate('gemini-3.1-flash-live-preview', 0.75, 4.5);
     });
@@ -203,7 +241,7 @@ describe('llmPricing', () => {
       // Models whose provider publishes an explicit cache rate that differs from the
       // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
       // cached-input rate is $1.25 (50% of input), not the derived 10%.
-      const explicitCacheOverrides = new Set(['gpt-4o']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;
@@ -261,13 +299,11 @@ describe('llmPricing', () => {
       expect(dated!.outPerM).toBe(base!.outPerM);
     });
 
-    it('resolves the gpt-chat-latest rolling alias to gpt-5-chat-2 pricing', () => {
-      const alias = getModelPrice('gpt-chat-latest');
-      const canonical = getModelPrice('gpt-5-chat-2');
-      expect(alias).not.toBeNull();
-      expect(canonical).not.toBeNull();
-      expect(alias!.inPerM).toBe(canonical!.inPerM);
-      expect(alias!.outPerM).toBe(canonical!.outPerM);
+    // The gpt-chat-latest rolling alias (for the since-removed gpt-5-chat-2
+    // deployment) was removed 2026-08-19 along with that deployment — MODEL_ID_ALIASES
+    // is empty for now; this asserts it stays a well-behaved miss, not a crash.
+    it('an unmapped rolling-alias-shaped id falls through to unknown-model handling, not a crash', () => {
+      expect(() => getModelPrice('gpt-chat-latest')).not.toThrow();
     });
 
     it('handles a missing/empty model id without throwing (recordUsage passes undefined)', () => {
@@ -345,6 +381,39 @@ describe('llmPricing', () => {
 
     it('falls back to $3.20/clip for an unknown video model', () => {
       expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
+    });
+  });
+
+  // 2026-08-19: the picker's cost meter used to store costScore as a separate
+  // hand-typed number per model. 11 of 29 had already drifted from what this
+  // exact formula produces against real MODEL_PRICING by the time that was
+  // caught. costScoreFromPrice replaces the hand-typed number so the two can
+  // never disagree again — these tests pin the formula itself.
+  describe('costScoreFromPrice', () => {
+    it('computes the 75/25 blended-rate log score for a known real price', () => {
+      // Claude Opus 5: $5/$25 -> blended $10.00/1M
+      expect(costScoreFromPrice({ inPerM: 5, outPerM: 25 })).toBe(70);
+      // GPT-4o Mini (OpenRouter): $0.15/$0.6 -> blended $0.2625/1M
+      expect(costScoreFromPrice({ inPerM: 0.15, outPerM: 0.6 })).toBe(22);
+    });
+
+    it('clamps to 0 for a blended rate at or below the $0.05/1M floor', () => {
+      expect(costScoreFromPrice({ inPerM: 0.01, outPerM: 0.01 })).toBe(0);
+      expect(costScoreFromPrice({ inPerM: 0, outPerM: 0 })).toBe(0);
+    });
+
+    it('clamps to 100 for a blended rate at or above the $100/1M ceiling', () => {
+      expect(costScoreFromPrice({ inPerM: 100, outPerM: 100 })).toBe(100);
+      expect(costScoreFromPrice({ inPerM: 500, outPerM: 500 })).toBe(100);
+    });
+
+    it('always returns an integer 0-100', () => {
+      for (const price of Object.values(MODEL_PRICING)) {
+        const score = costScoreFromPrice(price);
+        expect(Number.isInteger(score)).toBe(true);
+        expect(score).toBeGreaterThanOrEqual(0);
+        expect(score).toBeLessThanOrEqual(100);
+      }
     });
   });
 });

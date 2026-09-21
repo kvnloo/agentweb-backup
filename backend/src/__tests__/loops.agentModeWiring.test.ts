@@ -14,7 +14,6 @@ import {
   getRegisteredLoopIds,
   getRuleSet,
 } from '../loops';
-import { CooldownRuleSet } from '../loops/core/policy/cooldownRuleSet';
 import { DynamoLearningStore } from '../loops/core/learning/dynamoLearningStore';
 import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
 import {
@@ -52,7 +51,9 @@ describe('agent-mode loop wiring', () => {
 
     expect(getRegisteredLoopIds()).toContain(AGENT_MODE_LOOP_ID);
     expect(getLearningStore('agentModeLearning')).toBeInstanceOf(DynamoLearningStore);
-    expect(getRuleSet('agentModeFailurePolicy')).toBeInstanceOf(CooldownRuleSet);
+    expect(getRuleSet('agentModeFailurePolicy')).toEqual(
+      expect.objectContaining({ evaluate: expect.any(Function) }),
+    );
   });
 
   it('registration is idempotent (safe to call from app boot + cron)', () => {

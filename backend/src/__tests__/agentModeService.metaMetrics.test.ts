@@ -259,6 +259,49 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(deviceUrl).not.toContain('level=ad');
     });
 
+    it('requests the ads creative sub-selector URL-encoded, not raw braces (ENG-1742 follow-up)', async () => {
+      // Confirmed live 2026-09-04 against a real ad account: an unencoded `creative{...}`
+      // selector doesn't error on this `ads` edge — Graph silently drops the whole `creative`
+      // field from every result instead, with no error anywhere to reveal it. getMetaAdsMetrics
+      // would report success with every ad's thumbnail/title/body/image silently missing.
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      let capturedUrls: string[] = [];
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        capturedUrls.push(url);
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ data: [] })
+        });
+      }) as jest.Mock;
+
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      const adsUrl = capturedUrls.find(url => url.includes('/ads?'));
+      expect(adsUrl).toBeDefined();
+      expect(adsUrl).toContain('creative%7Bthumbnail_url');
+      expect(adsUrl).not.toContain('creative{thumbnail_url');
+    });
+
     it('should not include adset_id and ad_id in breakdown API calls', async () => {
       const mockUser = {
         id: 'user123',
@@ -549,6 +592,20 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       // There are 9 parallel API calls in Promise.all
       expect(attemptCount).toBe(9);
       expect(result.success).toBe(false);
+
+      // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+      // non-enumerable __httpStatus field; the per-section classification loop
+      // in getMetaAdsMetrics now threads it onto the thrown error's `.status`,
+      // which the outer catch surfaces as `code` — proving a genuine 404 (no
+      // Meta business `error.code` present on this mock at all) classifies
+      // correctly end-to-end.
+      expect(result.code).toBe(404);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('not_found');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should give up after 3 retry attempts', async () => {
@@ -594,6 +651,54 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(attemptCount).toBe(27); // 9 × 3
       expect(result.success).toBe(false);
     }, 15000); // Longer timeout for multiple retries
+  });
+
+  describe('ENG-1300: real HTTP status vs Meta business code', () => {
+    it('errorType still derives from the Meta business code (190) while `code` derives from the real HTTP status — the two can legitimately differ and must not be confused', async () => {
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      global.fetch = jest.fn().mockImplementation(() => {
+        return Promise.resolve({
+          ok: false,
+          // Deliberately a different value than the business code below, so a test
+          // that passed only because the two numbers happened to match would be
+          // worthless — this proves they're read from genuinely separate sources.
+          status: 400,
+          json: () => Promise.resolve({
+            error: { message: 'Error validating access token', code: 190 } // Meta's OAuth-error business code
+          })
+        });
+      }) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('connection'); // derived from the business code 190, by design
+      expect(result.code).toBe(400); // derived from the real HTTP status, not 190
+
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('invalid_args'); // classFromStatus(400), not auth from the 190
+    });
   });
 
   describe('Partial breakdown failure (ENG-104)', () => {
@@ -653,6 +758,52 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       expect(result.sections).toEqual({ demographics: 'ok', placement: 'ok', device: 'ok' });
       expect(result.unavailableSections).toEqual([]);
       expect(result.message).toBe('Meta ads metrics loaded for 7d timeframe');
+    });
+
+    /*
+     * ENG-1584 sibling: fetchWithRetryAndPaging is bounded (META_PAGING_MAX_PAGES) and none of
+     * these 9 parallel reads set a `limit`, so a dashboard for an account past the default
+     * page-size bound was silently short with no signal in the tool result at all. This drives
+     * a real multi-page campaigns fetch through the actual helper (a paging.next page that comes
+     * back unreadable) rather than asserting on a hand-built pagingTruncated literal, so it
+     * proves the flag survives all the way out of getMetaAdsMetrics, not just that the helper
+     * itself can set it.
+     */
+    it('flags truncatedSections when a paged read stops before the end of the account', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      let campaignsCallCount = 0;
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/campaigns?')) {
+          campaignsCallCount++;
+          if (campaignsCallCount === 1) {
+            return Promise.resolve({
+              ok: true,
+              json: () => Promise.resolve({
+                data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }],
+                paging: { next: 'https://graph.facebook.com/v25.0/act_123456789/campaigns?after=X' },
+              }),
+            });
+          }
+          // The second page comes back unreadable — no `data`, no `paging` — the shape
+          // fetchWithRetryAndPaging cannot merge, so it must report the read as truncated
+          // rather than silently returning only page 1's row as the whole account.
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ error: { message: 'Please reduce the amount of data' } }),
+          });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) });
+      }) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.truncatedSections).toContain('Campaigns');
+      expect(result.message).toMatch(/INCOMPLETE/);
     });
   });
 
