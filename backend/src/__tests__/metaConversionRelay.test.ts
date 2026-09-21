@@ -579,6 +579,31 @@ describe('relayLeadStatusEvent — skips (expected, never errors)', () => {
     expect(deps.sendEvent).not.toHaveBeenCalled();
   });
 
+  it('skips a smoke-test lead recognised by its PHONE, when the address cannot carry the marker', async () => {
+    // A lander with no email field substitutes its own placeholder address (observed live:
+    // noemail+<ts>@waterheater.app), so the email marker cannot match. Without the phone
+    // marker a real CAPI conversion fires on a synthetic lead, and deleting the row
+    // afterwards does not un-fire it.
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ email: 'noemail+1789767265236@waterheater.app', phone: '(415) 555-0142' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('still relays a REAL lead whose phone is merely similar', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ email: 'buyer@acme.com', phone: '4155551234' }) }),
+      deps,
+    );
+
+    expect(deps.sendEvent).toHaveBeenCalled();
+  });
+
   it('skips when the per-list send budget is exhausted', async () => {
     const deps = makeDeps({ shouldAttemptSend: jest.fn().mockReturnValue(false) });
     const result = await relayLeadStatusEvent(ctx(), deps);
