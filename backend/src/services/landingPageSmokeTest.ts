@@ -21,7 +21,7 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail, isSmokeTestEmail } from "../utils/smokeTestLead";
+import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead } from "../utils/smokeTestLead";
 import { crmDb } from "./db";
 import { sendLandingPageSmokeTestAlert } from "./slackService";
 import { updateLandingPageSmokeTestResult, GeneratedLandingPage } from "./v0Service";
@@ -73,7 +73,7 @@ function releaseSmokeTestSlot(): void {
  *
  * Such a page cannot carry our synthetic address, so the lander invents a placeholder —
  * `noemail+<timestamp>@<its own domain>` was observed live on campaign.waterheater.app —
- * and posts that. isSmokeTestEmail() never matches it, so pollForLead misses it and the
+ * and posts that. The smoke-test ADDRESS never matches it, so pollForLead misses it and the
  * synthetic row stays in the customer's CRM permanently. This matters MORE after the fill
  * fixes in this branch, not less: those pages used to fail validation and never submit at
  * all, so they created nothing. Now they submit, so every deploy would leave a row behind.
@@ -85,9 +85,6 @@ function releaseSmokeTestSlot(): void {
 // Bounds on the start-of-run sweep: it runs on every deploy, so it must stay cheap.
 const SWEEP_MAX_PAGES = 3;
 const SWEEP_MAX_DELETES = 20;
-/** The reserved fictional range this test fills — 415-555-0100..0199. A real visitor cannot have one. */
-const SYNTHETIC_PHONE_RE = /^41555501\d{2}$/;
-
 /**
  * Delete synthetic leads that a PREVIOUS run stranded in this list.
  *
@@ -101,8 +98,9 @@ const SYNTHETIC_PHONE_RE = /^41555501\d{2}$/;
  * 8-second window. Sweeping at the START of each run makes the failure self-correcting —
  * whatever the last deploy stranded, this one removes.
  *
- * Only rows provably ours are touched: the smoke-test address, or the reserved fictional
- * phone. `beforeIso` is this run's start, so the row we are about to create is never in scope.
+ * Only rows provably ours are touched — isSmokeTestLead matches the smoke-test address OR
+ * the reserved fictional phone. `beforeIso` is this run's start, so the row we are about to
+ * create is never in scope.
  */
 async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promise<number> {
   let deleted = 0;
@@ -115,8 +113,7 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
         // Only rows that predate this run — never the one we are about to create.
         const createdAt = String(lead?.createdAt || "");
         if (!createdAt || createdAt >= beforeIso) continue;
-        const phone = String(lead?.phone || "").replace(/\D/g, "");
-        if (!isSmokeTestEmail(lead?.email) && !SYNTHETIC_PHONE_RE.test(phone)) continue;
+        if (!isSmokeTestLead(lead)) continue;
         if (!lead?.leadId) continue;
         await crmDb.deleteLead(listId, lead.leadId);
         deleted++;
@@ -184,6 +181,7 @@ export type SmokeField = {
   /** The field's own constraints, so a synthetic value cannot violate them. */
   min?: string | null;
   max?: string | null;
+  step?: string | null;
   maxLength?: number | null;
 };
 
@@ -198,9 +196,10 @@ export type SmokeFields = {
     name: string | null;
     required: boolean;
     /**
-     * True when `selector` targets the control's LABEL rather than the input itself. The
-     * shadcn/Radix pattern renders a visually-hidden input with a visible label as its only
-     * clickable surface, so the input is permanently 0x0.
+     * True when `selector` targets the control's LABEL rather than the input itself (the
+     * shadcn/Radix pattern renders a visually-hidden input whose label is its only clickable
+     * surface). Diagnostic only — the caller drives every checkable through check() first
+     * and falls back to click(), so it does not branch on this.
      */
     viaLabel: boolean;
     /** Already-checked controls must not be toggled back off. */
@@ -459,6 +458,11 @@ export function discoverSmokeFields(): SmokeFields {
     return `${scope}:is(input, textarea) >> nth=${index}`;
   };
 
+  // Elements discovery actually emitted a selector for. skippedRequired is derived from
+  // this rather than re-deriving usable(), so it also catches required controls of types
+  // outside FILLABLE (datetime-local, color, file...) and ones dropped for having no
+  // addressable id, name or index.
+  const emitted = new Set<Element>();
   const fields: SmokeField[] = [];
   for (const el of controls) {
     if (!matches(el, FILLABLE) || !usable(el)) continue;
@@ -467,12 +471,14 @@ export function discoverSmokeFields(): SmokeFields {
     const isTextarea = el.tagName.toUpperCase() === "TEXTAREA";
     const input = el as HTMLInputElement;
     const maxLengthAttr = el.getAttribute("maxlength");
+    emitted.add(el);
     fields.push({
       selector,
       hint: hintFor(el),
       kind: isTextarea ? "textarea" : input.type || "text",
       min: el.getAttribute("min"),
       max: el.getAttribute("max"),
+      step: el.getAttribute("step"),
       maxLength: maxLengthAttr ? Number(maxLengthAttr) : null,
     });
   }
@@ -481,6 +487,7 @@ export function discoverSmokeFields(): SmokeFields {
   const allSelects = (form ? all(form, "select") : all(document, "select")) as HTMLSelectElement[];
   allSelects.forEach((sel, index) => {
     if (!usable(sel)) return;
+    emitted.add(sel);
     selects.push({
       selector: sel.id
         ? `${scope}[id="${esc(sel.id)}"]`
@@ -496,17 +503,28 @@ export function discoverSmokeFields(): SmokeFields {
 
   let clickTargets = 0;
   const checkables: SmokeFields["checkables"] = [];
+  // Native inputs plus ARIA widgets. shadcn/Radix renders a checkbox as
+  // <button role="checkbox" aria-checked> with a visually-hidden proxy input carrying
+  // aria-hidden — which usable() rejects — so keying only on input[type=checkbox] made the
+  // control invisible everywhere: never filled, and never even counted as unreachable.
+  const ARIA_CHECKABLE = '[role="checkbox"], [role="radio"], [role="switch"]';
   const checkableEls = controls.filter((el) =>
-    matches(el, 'input[type="checkbox"], input[type="radio"]')
+    matches(el, `input[type="checkbox"], input[type="radio"], ${ARIA_CHECKABLE}`)
   );
   checkableEls.forEach((el) => {
     if (!usable(el, true)) return;
     const input = el as HTMLInputElement;
+    const ariaRole = el.getAttribute("role");
+    const isAria = !!ariaRole && matches(el, ARIA_CHECKABLE);
     const label = hasBox(el) ? null : clickableLabel(el);
     const viaLabel = label !== null;
     let selector: string;
     if (!viaLabel) {
       selector = selFor(el);
+      if (!selector && isAria) {
+        el.setAttribute(CLICK_MARK, String(clickTargets++));
+        selector = `[${CLICK_MARK}="${clickTargets - 1}"]`;
+      }
     } else {
       // Stamp the exact label we mean. A `label:has([id="x"])` selector only matches a label
       // that CONTAINS the input, while shadcn/ui ships the two as siblings
@@ -516,14 +534,18 @@ export function discoverSmokeFields(): SmokeFields {
       selector = `[${CLICK_MARK}="${clickTargets - 1}"]`;
     }
     if (!selector) return;
+    emitted.add(el);
     checkables.push({
       selector,
-      type: input.type,
-      name: input.name || null,
-      required: input.required,
+      // An ARIA widget reports its role; check() cannot operate on one, and the caller's
+      // existing click() fallback (gated on Playwright's "Not a checkbox or radio button")
+      // is exactly the right path for it.
+      type: isAria ? (ariaRole === "radio" ? "radio" : "checkbox") : input.type,
+      name: input.name || el.getAttribute("name") || null,
+      required: isAria ? el.getAttribute("aria-required") === "true" : input.required,
       viaLabel,
       // Reported so an already-satisfied control is never toggled back off.
-      checked: !!input.checked,
+      checked: isAria ? el.getAttribute("aria-checked") === "true" : !!input.checked,
     });
   });
 
@@ -548,7 +570,10 @@ export function discoverSmokeFields(): SmokeFields {
       // would submit the form before a single field has been filled, and before the response
       // listener even exists.
       const tag = t.tagName.toUpperCase();
-      if (tag === "BUTTON" && ((t as HTMLButtonElement).type || "submit") !== "button") return;
+      // HTMLButtonElement.type always resolves ("submit" when the attribute is absent), so
+      // a typeless <button> inside a form is a submit control — clicking one here would
+      // submit before a single field is filled.
+      if (tag === "BUTTON" && (t as HTMLButtonElement).type !== "button") return;
       // An <input> is never a disclosure, and an <a href> click navigates away and destroys
       // the page. An anchor with no real href is a common hand-written disclosure — keep it.
       if (tag === "INPUT") return;
@@ -616,9 +641,9 @@ export function discoverSmokeFields(): SmokeFields {
   // validation blocks submit, and saying so beats reporting "no lead in the CRM".
   const skippedRequired = controls.filter((el) => {
     const input = el as HTMLInputElement;
-    if (!input.required) return false;
-    const checkable = matches(el, 'input[type="checkbox"], input[type="radio"]');
-    return !usable(el, checkable);
+    const required = input.required || el.getAttribute("aria-required") === "true";
+    if (!required) return false;
+    return !emitted.has(el);
   }).length;
   const noFormOnPage =
     (forms.length === 0 || authFormOnly) && fields.length === 0 && checkables.length === 0;
@@ -657,12 +682,25 @@ export function syntheticValueFor(field: SmokeField, email: string, phone: strin
   // lander's validation and blocks submit, which is the false negative this path exists to
   // remove. Length is trimmed last so a clamped number is never re-truncated.
   if (field.kind === "number") {
-    const numeric = Number(value);
-    const min = field.min != null && field.min !== "" ? Number(field.min) : null;
-    const max = field.max != null && field.max !== "" ? Number(field.max) : null;
-    let clamped = Number.isFinite(numeric) ? numeric : 1;
-    if (min !== null && Number.isFinite(min) && clamped < min) clamped = min;
-    if (max !== null && Number.isFinite(max) && clamped > max) clamped = max;
+    const num = (v: string | null | undefined): number | null => {
+      if (v == null || v === "") return null;
+      const parsed = Number(v);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const min = num(field.min);
+    const max = num(field.max);
+    const step = num(field.step);
+    let clamped = Number.isFinite(Number(value)) ? Number(value) : 1;
+    if (max !== null && clamped > max) clamped = max;
+    // min is applied AFTER max: when the two contradict each other (min > max) the field is
+    // unsatisfiable either way, and landing below min is the more common validation failure.
+    if (min !== null && clamped < min) clamped = min;
+    // A `step` field rejects anything off its ladder, so "5" fails step="10" outright.
+    if (step !== null && step > 0) {
+      const base = min !== null ? min : 0;
+      const snapped = base + Math.ceil((clamped - base) / step) * step;
+      clamped = max !== null && snapped > max ? base : snapped;
+    }
     return String(clamped);
   }
   if (field.kind === "date") {
@@ -906,6 +944,9 @@ async function fillAllRequiredFields(
  * launch, navigation, form submission, CRM lookup, even the result-persist/alert calls
  * themselves) is caught and reported as a failed result rather than propagated, since this
  * always runs fire-and-forget (`void runGenerationSmokeTest(...)`) with nobody awaiting it.
+ * (The result-persist and alert calls at the very end sit OUTSIDE that try/finally — both
+ * call sites in v0Service attach their own .catch, which is what actually holds the
+ * never-throws guarantee there.)
  */
 export async function runGenerationSmokeTest(page: GeneratedLandingPage): Promise<void> {
   if (!page.leadListId || !page.deployedUrl) {
@@ -1012,14 +1053,14 @@ async function runGenerationSmokeTestNow(
     // data; the old fill-email-only path failed on both while the forms worked for
     // real visitors.
     //
-    // 415-555-0100..0199 is the NANP's officially reserved fictional range, inside a real
-    // area code — libphonenumber-style validators accept it and it is provably unroutable.
-    // Two things it is deliberately NOT: a bare "555" AREA code (the previous value —
-    // unassignable, and real validators reject it outright, which blocked submit on exactly
-    // the landers this fill path was added for), and an arbitrary 555-XXXX line (555-1212
-    // is live directory assistance). Only the low 2 digits vary, which is fine: the CRM
-    // lookup key is the email, never the phone.
-    const testPhone = `41555501${String(Date.now()).slice(-2)}`;
+    // Built by the shared helper, so the number we FILL and the number webhooks.ts
+    // SUPPRESSES on can never drift apart. 415-555-0100..0199 is the NANP's reserved
+    // fictional range inside a real area code — accepted by libphonenumber-style validators
+    // (unlike a bare "555" area code, which is unassignable and blocked submit on exactly
+    // the landers this path was added for), provably unroutable (unlike an arbitrary
+    // 555-XXXX line: 555-1212 is live directory assistance), and impossible for a real
+    // visitor to hold, which is what makes it safe to key suppression off.
+    const testPhone = buildSmokeTestPhone();
     const email = buildSmokeTestEmail();
     const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
     const {
@@ -1061,8 +1102,9 @@ async function runGenerationSmokeTestNow(
     // %2B and %40 — so body.includes(email) is false for exactly the plain HTML forms most
     // likely to be on a lander. The email's timestamp and the phone's digits survive every
     // encoding, and both are unique to this run.
-    const emailFingerprint = email.replace(/\D/g, "");
-    const fingerprints = [emailFingerprint, testPhone].filter((f) => f.length >= 8);
+    // Both are always long, digit-only and unique to this run — buildSmokeTestEmail embeds a
+    // 13-digit timestamp and the phone is 10 digits.
+    const fingerprints = [email.replace(/\D/g, ""), testPhone];
     const carriesOurData = (body: string | null): boolean => {
       if (!body) return false;
       let decoded = body;
@@ -1146,7 +1188,10 @@ async function runGenerationSmokeTestNow(
       // No navigation — form likely posts to a capture API and shows inline success.
     }
     const urlAfterSubmit = browserPage.url();
-    // Final 2xx only, and it must have carried our synthetic data.
+    // Final 2xx carrying our synthetic data. Note this inspects the STATUS LINE only — a
+    // handler that catches its own CRM failure and still returns 200 {"ok":false} would pass
+    // this check. That is a narrower hole than the URL-only evidence it replaced, not a
+    // closed one; reading the body would close it.
     const submitAccepted = submitEvidence.some(
       (evidence) => evidence.status >= 200 && evidence.status < 300 && evidence.carriedOurData
     );
@@ -1186,8 +1231,9 @@ async function runGenerationSmokeTestNow(
     // synthetic lead in the customer's list forever. That matters most in exactly the case
     // that tempts you to skip it, because a lander whose only contact field is an untyped
     // `name="contact"` receives "Smoke Test" rather than the smoke-test address —
-    // webhooks.ts validates presence but not format, so a real lead row is created that
-    // isSmokeTestEmail() will never match and no suppression will ever cover.
+    // webhooks.ts validates presence but not format, so a real lead row is created that the
+    // ADDRESS marker will never match. The synthetic phone is what covers that case, both
+    // here and at the suppression sites (isSmokeTestLead).
     // Only the PASS CONDITION branches on the redirect.
     // When no email field existed, fall back to the phone so the row we just created is
     // still found and deleted rather than stranded in the customer's CRM.

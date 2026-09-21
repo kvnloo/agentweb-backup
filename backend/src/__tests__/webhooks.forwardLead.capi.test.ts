@@ -126,6 +126,71 @@ describe('forward-lead CAPI send', () => {
     );
   });
 
+  // --- ENG-449 gap #3: the post-deploy smoke test submits a REAL lead through a real form.
+  // Deleting the row afterwards does not un-fire a CAPI conversion, so the guard has to
+  // recognise the lead at creation time — by EITHER marker. ---
+
+  it('never fires CAPI for a smoke-test lead recognised by its email', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 't' });
+
+    const response = await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({
+        listId: 'list_123',
+        email: 'smoke-test+1789767265236@agentweb.pro',
+        pixelId: '1430870751246428',
+        metaAccountId: 'acc1',
+        eventId: 'evt_client_abc',
+      });
+
+    await flushAsyncWork();
+
+    expect(response.status).toBe(201);
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('never fires CAPI for a smoke-test lead recognised by its PHONE', async () => {
+    // A lander with no email field substitutes its own placeholder address (observed live:
+    // noemail+<ts>@waterheater.app), so the email marker cannot match and a real conversion
+    // would land in the customer's ad account on every deploy.
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 't' });
+
+    const response = await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({
+        listId: 'list_123',
+        email: 'noemail+1789767265236@waterheater.app',
+        phone: '(415) 555-0142',
+        pixelId: '1430870751246428',
+        metaAccountId: 'acc1',
+        eventId: 'evt_client_abc',
+      });
+
+    await flushAsyncWork();
+
+    expect(response.status).toBe(201);
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('still fires CAPI for a real lead whose phone merely looks similar', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 't' });
+
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({
+        listId: 'list_123',
+        email: 'buyer@acme.com',
+        phone: '4155551234',
+        pixelId: '1430870751246428',
+        metaAccountId: 'acc1',
+        eventId: 'evt_client_abc',
+      });
+
+    await flushAsyncWork();
+
+    expect(sendSpy).toHaveBeenCalled();
+  });
+
   // --- ENG-449: real client-submission time (capturedAtMs) threaded into event_time ---
 
   it('a valid, recent capturedAtMs is threaded through as eventTimeSeconds', async () => {

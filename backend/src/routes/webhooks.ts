@@ -26,7 +26,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -832,7 +832,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+    if (pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -902,7 +902,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew && isSmokeTestEmail(lead.email)) {
+    if (isNew && isSmokeTestLead(lead)) {
       // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
       // customer's real form to verify the pipeline works, then deletes the row. But deleting
       // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence

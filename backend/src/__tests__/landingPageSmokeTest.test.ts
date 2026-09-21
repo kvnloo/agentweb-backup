@@ -1061,6 +1061,12 @@ describe("runGenerationSmokeTest", () => {
     // required date that previously filled fine.
     expect(v({ selector: "#d3", hint: "preferred date", kind: "date", max: "12/31/2026" })).toBe("2030-01-01");
     expect(v({ selector: "#n", hint: "full name", kind: "text", maxLength: 5 })).toBe("Smoke");
+    // step: "5" is off a step=10 ladder and the field rejects it outright
+    expect(v({ selector: "#s", hint: "headcount", kind: "number", min: "0", step: "10" })).toBe("10");
+    expect(v({ selector: "#s2", hint: "budget", kind: "number", min: "1000", step: "500" })).toBe("1000");
+    // contradictory bounds (min > max) are unsatisfiable either way; land on min, since
+    // falling below it is the more common validation failure
+    expect(v({ selector: "#c", hint: "qty", kind: "number", min: "10", max: "4" })).toBe("10");
   });
 
   it("FAIL: navigation without handoff_id still polls the CRM (no false pass on anchor scrolls)", async () => {

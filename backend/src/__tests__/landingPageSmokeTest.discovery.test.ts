@@ -19,7 +19,7 @@ const SCOPE = 'form[data-agentweb-smoke-form="1"] ';
 // config excludes __tests__, so nothing else catches drift here.
 type Discovered = {
   scope: string;
-  fields: { selector: string; hint: string; kind: string }[];
+  fields: { selector: string; hint: string; kind: string; min?: string | null; max?: string | null; step?: string | null; maxLength?: number | null }[];
   selects: { selector: string; options: string[] }[];
   checkables: {
     selector: string;
@@ -206,6 +206,25 @@ const CASES: Record<string, string> = {
   duplicateSubmitIds: `
     <form id="mobile"><input type="email" name="email" required data-rect="0,0,0,0"><button type="submit" id="go" data-rect="0,0,0,0">Go</button></form>
     <form id="desktop"><input type="email" name="email" required><button type="submit" id="go">Go</button></form>`,
+  radixCheckbox: `
+    <form>
+      <input type="email" name="email" required>
+      <button type="button" role="checkbox" id="terms-rx" aria-checked="false" aria-required="true">Accept</button>
+      <input type="checkbox" aria-hidden="true" tabindex="-1" data-rect="0,0,0,0">
+      <button type="button" role="checkbox" id="news-rx" aria-checked="true">Newsletter</button>
+    </form>`,
+  unreachableRequired: `
+    <form>
+      <input type="email" name="email" required>
+      <input type="datetime-local" name="slot" required>
+      <input type="color" name="brand" required>
+      <input type="file" name="cv" required>
+    </form>`,
+  numberConstraints: `
+    <form>
+      <input type="number" name="budget" min="1000" step="500" required>
+      <input type="number" name="qty" min="10" max="4" required>
+    </form>`,
   preMarked: `
     <form id="already" data-agentweb-smoke-form="1"><input type="text" name="q"></form>
     <form id="lead"><input type="email" name="email" required><input type="tel" name="phone" required></form>`,
@@ -564,6 +583,32 @@ describe("discoverSmokeFields", () => {
     expect(out.duplicateSubmitIds.markedFormIds).toEqual(["desktop"]);
     expect(r.submitSelector).toBe(`${SCOPE}[id="go"]`);
     expect(out.duplicateSubmitIds.selectorMatches![r.submitSelector!]).toBe(1);
+  });
+
+  it("sees a Radix/shadcn <button role=checkbox>, which has no checkable input at all", () => {
+    // Radix renders the control as a button plus an aria-hidden proxy input that usable()
+    // rejects. Keying only on input[type=checkbox] made the control invisible everywhere —
+    // never filled, and not even counted as unreachable.
+    const boxes = got("radixCheckbox").checkables;
+    expect(boxes).toHaveLength(2);
+    expect(boxes[0]).toMatchObject({ type: "checkbox", required: true, checked: false });
+    // aria-checked=true must be reported so it is never toggled back off
+    expect(boxes[1]).toMatchObject({ required: false, checked: true });
+    for (const b of boxes) expect(out.radixCheckbox.selectorMatches![b.selector]).toBe(1);
+  });
+
+  it("counts required controls it cannot address, including types outside FILLABLE", () => {
+    // datetime-local / color / file are required and unfillable; the old count re-derived
+    // usable() and so reported 0 for exactly the pages the diagnostic was added for.
+    expect(got("unreachableRequired").skippedRequired).toBe(3);
+  });
+
+  it("carries min/max/step so a synthetic value cannot violate them", () => {
+    const byName = Object.fromEntries(
+      got("numberConstraints").fields.map((f: any) => [f.hint.split(" ")[0], f])
+    );
+    expect(byName.budget).toMatchObject({ min: "1000", step: "500" });
+    expect(byName.qty).toMatchObject({ min: "10", max: "4" });
   });
 
   it("clears a stale marker so only one form is ever marked", () => {
