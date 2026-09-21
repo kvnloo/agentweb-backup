@@ -20,6 +20,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../services/deepResearchService', () => ({
+  deepResearchService: {
+    isAvailable: jest.fn(),
+    performDeepResearch: jest.fn()
+  }
+}));
+
 describe('AgentModeService - create_blog_article function', () => {
   let agentModeService: AgentModeService;
   let mockGenerateBlogContent: jest.Mock;
@@ -27,22 +34,25 @@ describe('AgentModeService - create_blog_article function', () => {
   let mockGenerateBlogHtml: jest.Mock;
   let mockRestyleContent: jest.Mock;
   let mockUploadFileToS3: jest.Mock;
+  let mockDeepResearchService: { isAvailable: jest.Mock; performDeepResearch: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     // Create AgentModeService instance
     agentModeService = new AgentModeService();
 
     // Get mocked functions
     const blogModule = require('../controllers/blog');
     const s3UtilsModule = require('../utils/s3Utils');
-    
+    const deepResearchModule = require('../services/deepResearchService');
+
     mockGenerateBlogContent = blogModule.generateBlogContent;
     mockGenerateBlogImage = blogModule.generateBlogImage;
     mockGenerateBlogHtml = blogModule.generateBlogHtml;
     mockRestyleContent = blogModule.restyleContent;
     mockUploadFileToS3 = s3UtilsModule.uploadFileToS3;
+    mockDeepResearchService = deepResearchModule.deepResearchService;
   });
 
   describe('Default Style', () => {
@@ -678,6 +688,120 @@ describe('AgentModeService - create_blog_article function', () => {
 
       expect(result.success).toBe(true);
       expect(result.data.deepResearchUsed).toBe(false);
+    });
+
+    // ENG-738: a timed-out deep research call that still gathered real
+    // partial findings must not sink the whole article request — continue
+    // building from what was actually gathered instead of failing a request
+    // that would otherwise get nothing at all.
+    it('continues building the article from partial content when deep research times out with partial findings', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({
+        success: false,
+        error: 'Deep research timed out. Please try again with a more specific topic.',
+        partial: true,
+        partialContent: '# Partial Research\n\nSome findings gathered before the cutoff.',
+      });
+      mockRestyleContent.mockResolvedValue({
+        title: 'Partial Article',
+        description: 'Description',
+        content: 'Restyled partial content',
+        imagePrompt: 'prompt'
+      });
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Partial</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/blog.html'
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        true // deep_research = true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.deepResearchPartial).toBe(true);
+      expect(result.message).toContain('partial findings');
+      expect(mockRestyleContent).toHaveBeenCalledWith(
+        '# Partial Research\n\nSome findings gathered before the cutoff.',
+        'Test Title Draft',
+        'professional',
+        'default',
+        true
+      );
+    });
+
+    it('still fails when deep research fails with no usable partial content', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({
+        success: false,
+        error: 'Deep research timed out. Please try again with a more specific topic.',
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        true
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('timed out');
+      expect(mockRestyleContent).not.toHaveBeenCalled();
+    });
+
+    it('reports deepResearchPartial as false and omits the partial note on a normal deep-research success', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({
+        success: true,
+        markdownContent: '# Full Research\n\nComplete findings.',
+        title: 'Full Research',
+        researchSummary: 'Summary',
+      });
+      mockRestyleContent.mockResolvedValue({
+        title: 'Full Article',
+        description: 'Description',
+        content: 'Restyled full content',
+        imagePrompt: 'prompt'
+      });
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Full</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/blog.html'
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.deepResearchPartial).toBe(false);
+      expect(result.message).not.toContain('partial findings');
     });
   });
 });

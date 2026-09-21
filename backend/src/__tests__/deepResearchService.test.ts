@@ -3,8 +3,10 @@
 import {
   DeepResearchService,
   extractReportText,
-  DEFAULT_POLL_BUDGET_MS,
-  DEFAULT_RETRY_POLL_BUDGET_MS,
+  RESEARCH_TIME_BUFFER_MS,
+  RETRY_SHARE_MS,
+  getPollBudgetMs,
+  getRetryPollBudgetMs,
 } from '../services/deepResearchService';
 import * as secretsManager from '../utils/secretsManager';
 import { DEEP_RESEARCH_AGENT, DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
@@ -356,19 +358,68 @@ describe('DeepResearchService', () => {
   });
 
   describe('Polling Configuration', () => {
+    const ENV_KEYS = [
+      'AGENT_MODE_GENERATION_TIMEOUT_MS',
+      'DEEP_RESEARCH_POLL_BUDGET_MS',
+      'DEEP_RESEARCH_RETRY_POLL_BUDGET_MS',
+    ];
+
+    afterEach(() => {
+      ENV_KEYS.forEach((key) => delete process.env[key]);
+    });
+
     // ENG-738: the OLD fixed 20-minute poll budget outlived
     // agentModeController's GENERATION_TIMEOUT_MS (10 minutes by default) — the
     // outer wall-clock timeout always killed the whole turn first, so this
-    // service's own graceful-degradation logic never got a chance to run. The
-    // primary attempt plus one depth-degraded retry must together stay safely
-    // under that outer cap, with headroom for API latency and the S3 upload
-    // that follows a successful result.
-    it('keeps the combined primary + retry poll budgets safely under the outer generation timeout', () => {
-      const OUTER_GENERATION_TIMEOUT_MS = 600000; // agentModeController default
-      const HEADROOM_MS = 60000;
+    // service's own graceful-degradation logic never got a chance to run.
+    it('keeps the primary + retry poll budgets safely under the DEFAULT outer generation timeout', () => {
+      const OUTER_GENERATION_TIMEOUT_MS = 600000; // agentModeController's own default
 
-      expect(DEFAULT_POLL_BUDGET_MS + DEFAULT_RETRY_POLL_BUDGET_MS)
-        .toBeLessThanOrEqual(OUTER_GENERATION_TIMEOUT_MS - HEADROOM_MS);
+      expect(getPollBudgetMs(true) + getRetryPollBudgetMs())
+        .toBeLessThanOrEqual(OUTER_GENERATION_TIMEOUT_MS - RESEARCH_TIME_BUFFER_MS);
+      // A non-degradable request (e.g. 'overview', or no depth at all — the
+      // createBlogArticle caller) never retries, so it alone must also fit.
+      expect(getPollBudgetMs(false)).toBeLessThanOrEqual(OUTER_GENERATION_TIMEOUT_MS - RESEARCH_TIME_BUFFER_MS);
+    });
+
+    // ENG-738 follow-up: a fixed constant here would silently become unsafe
+    // again (too long relative to the outer cap) if ops ever reconfigures
+    // AGENT_MODE_GENERATION_TIMEOUT_MS without knowing this file depends on
+    // it. The budgets must be DERIVED from that same env var, not hardcoded.
+    it('shrinks the poll budgets when AGENT_MODE_GENERATION_TIMEOUT_MS is lowered', () => {
+      process.env.AGENT_MODE_GENERATION_TIMEOUT_MS = '300000'; // 5 minutes
+
+      const primaryWithRetry = getPollBudgetMs(true);
+      const retry = getRetryPollBudgetMs();
+      const solo = getPollBudgetMs(false);
+
+      expect(primaryWithRetry + retry).toBeLessThanOrEqual(300000 - RESEARCH_TIME_BUFFER_MS);
+      expect(solo).toBeLessThanOrEqual(300000 - RESEARCH_TIME_BUFFER_MS);
+      // And it must actually be smaller than the default-outer-timeout budgets,
+      // not just coincidentally still safe.
+      delete process.env.AGENT_MODE_GENERATION_TIMEOUT_MS;
+      expect(primaryWithRetry).toBeLessThan(getPollBudgetMs(true));
+      expect(solo).toBeLessThan(getPollBudgetMs(false));
+    });
+
+    it('never lets a degradable primary budget drop below the one-minute floor even under a very small outer timeout', () => {
+      process.env.AGENT_MODE_GENERATION_TIMEOUT_MS = '60000'; // 1 minute — smaller than the buffer alone
+      expect(getPollBudgetMs(true)).toBeGreaterThanOrEqual(60000);
+      expect(getPollBudgetMs(false)).toBeGreaterThanOrEqual(60000);
+    });
+
+    it('lets a non-degradable request use the full usable budget instead of reserving retry headroom nothing will use', () => {
+      // No explicit override — compare the two paths directly against the default outer timeout.
+      const solo = getPollBudgetMs(false);
+      const primaryWithRetry = getPollBudgetMs(true);
+      expect(solo).toBeGreaterThan(primaryWithRetry);
+      expect(solo - primaryWithRetry).toBe(RETRY_SHARE_MS);
+    });
+
+    it('honors an explicit DEEP_RESEARCH_POLL_BUDGET_MS override regardless of canDegrade', () => {
+      process.env.DEEP_RESEARCH_POLL_BUDGET_MS = '42000';
+      expect(getPollBudgetMs(true)).toBe(42000);
+      expect(getPollBudgetMs(false)).toBe(42000);
     });
   });
 
@@ -424,6 +475,7 @@ describe('DeepResearchService', () => {
     const mockGoogleGenAI = require('@google/genai').GoogleGenAI;
     let createMock: jest.Mock;
     let getMock: jest.Mock;
+    let cancelMock: jest.Mock;
 
     beforeEach(() => {
       mockGetSecret.mockResolvedValue('test-api-key');
@@ -444,8 +496,9 @@ describe('DeepResearchService', () => {
       createSequence.forEach((value) => createMock.mockResolvedValueOnce(value));
       getMock = jest.fn();
       getSequence.forEach((value) => getMock.mockResolvedValueOnce(value));
+      cancelMock = jest.fn().mockResolvedValue({});
       mockGoogleGenAI.mockImplementation(() => ({
-        interactions: { create: createMock, get: getMock },
+        interactions: { create: createMock, get: getMock, cancel: cancelMock },
       }));
     }
 
@@ -475,6 +528,12 @@ describe('DeepResearchService', () => {
       expect(createMock.mock.calls[1][0]).toEqual(
         expect.objectContaining({ agent: DEEP_RESEARCH_AGENT_SPEED })
       );
+      // ENG-738: the abandoned primary interaction (still running server-side
+      // in the background) must be cancelled — not left to burn compute/cost
+      // for a result nothing will ever read. The winning retry, which is now
+      // 'completed' (terminal), must NOT be cancelled.
+      expect(cancelMock).toHaveBeenCalledTimes(1);
+      expect(cancelMock).toHaveBeenCalledWith('primary-1');
     });
 
     it('returns honest partial content when the depth-degraded retry also times out', async () => {
@@ -499,6 +558,12 @@ describe('DeepResearchService', () => {
       expect(result.partialContent).toContain('Primary partial findings');
       expect(result.partialDepth).toBe('comprehensive');
       expect(result.error).toBeTruthy();
+      // ENG-738: neither interaction ever reached a terminal status — both are
+      // still running server-side and must both be cancelled exactly once
+      // (not zero, not duplicated) once we're done reading from them.
+      expect(cancelMock).toHaveBeenCalledTimes(2);
+      expect(cancelMock).toHaveBeenCalledWith('primary-2');
+      expect(cancelMock).toHaveBeenCalledWith('retry-2');
     });
 
     it('does not attempt a further retry when depth is already overview', async () => {
@@ -521,6 +586,10 @@ describe('DeepResearchService', () => {
       expect(result.partial).toBe(true);
       expect(result.partialContent).toContain('Overview partial text');
       expect(result.partialDepth).toBe('overview');
+      // ENG-738: no retry ran, but the single timed-out interaction is still
+      // abandoned in the give-up path.
+      expect(cancelMock).toHaveBeenCalledTimes(1);
+      expect(cancelMock).toHaveBeenCalledWith('primary-3');
     });
 
     it('does not mark the result partial when the timed-out attempt produced no content', async () => {
@@ -539,6 +608,38 @@ describe('DeepResearchService', () => {
       expect(result.success).toBe(false);
       expect(result.partial).toBeFalsy();
       expect(result.partialContent).toBeUndefined();
+      expect(result.error).toBeTruthy();
+    });
+
+    it('does not attempt to cancel an interaction that already reached a terminal failed/cancelled status', async () => {
+      // 'failed'/'cancelled' is already terminal — nothing left to cancel, and
+      // the Gemini API itself only supports cancelling still-running interactions.
+      const failedInteraction = { id: 'primary-5', status: 'failed', steps: [] };
+      mockInteractions([failedInteraction], []);
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Topic F',
+        depth: 'overview',
+      });
+      const result = await resultPromise;
+
+      expect(result.success).toBe(false);
+      expect(cancelMock).not.toHaveBeenCalled();
+    });
+
+    it('does not let a cancel failure break the returned research result', async () => {
+      const emptyRunning = { id: 'primary-6', status: 'running', steps: [] };
+      mockInteractions([emptyRunning], [emptyRunning]);
+      cancelMock.mockRejectedValue(new Error('cancel API unavailable'));
+
+      const resultPromise = deepResearchService.performDeepResearch({
+        topic: 'Topic G',
+        depth: 'overview',
+      });
+      await jest.advanceTimersByTimeAsync(10000);
+      const result = await resultPromise;
+
+      expect(result.success).toBe(false);
       expect(result.error).toBeTruthy();
     });
 
