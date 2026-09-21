@@ -34,6 +34,15 @@ process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '
 process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
 process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 
+// Same placeholder-leak class as above: routes/slack.ts's verifySlackRequest
+// deliberately treats an ABSENT SLACK_SIGNING_SECRET as "tests intentionally
+// omit Slack credentials" and skips verification when NODE_ENV==='test'. A
+// local .env still carrying the unfilled '.env.example' placeholder text
+// (e.g. 'your_slack_signing_secret', a truthy string) defeats that check and
+// makes every unsigned test request 401 in that dev's own runs, though not
+// in CI (a clean checkout's local .env may not define this key at all).
+process.env.SLACK_SIGNING_SECRET = '';
+
 // Set Azure OpenAI embeddings environment variables for tests
 process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
 process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';
