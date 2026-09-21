@@ -28,7 +28,13 @@ Read this before touching anything WhatsApp.
    the way `routes/slack.ts` does; a test asserts it never imports one.
 4. **Template variables bind positionally.** Meta fills `{{1}}`, `{{2}}` by index.
    Reordering `TEMPLATES.*.variables` does not error — it renders the wrong words into
-   the wrong slots. A count mismatch is refused before the request.
+   the wrong slots. A count mismatch is refused before the request. Pass `''` for an
+   absent optional value so the count stays right; `toTemplateParam` (applied inside
+   `sendTemplate`) then makes each value acceptable to Meta: empty becomes `-`,
+   newlines/tabs and space runs collapse to one space, invisible characters are
+   stripped, and the value is capped at 1024 characters. Meta rejects each of those
+   with a 400 that does not name the cause. These rules are from Meta's docs and have
+   not yet been exercised against the live API.
 
 ## Deployment Model
 
