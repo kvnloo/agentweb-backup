@@ -189,8 +189,13 @@ export interface UserMessagingChannelConfig {
   /** Channel id (Slack) or E.164 phone (WhatsApp). */
   destination: string;
   enabled: boolean;
-  /** Required before the first outbound message on channels where `requiresOptIn`. */
-  optIn?: { at: string; source: string };
+  /**
+   * Required before the first outbound message on channels where `requiresOptIn`.
+   * `at` is when the person acknowledged consent; `verifiedAt` is when they proved
+   * they control the number (WhatsApp: by messaging us a one-time code). A channel in
+   * `VERIFIED_OPT_IN_CHANNELS` is not messaged without `verifiedAt`.
+   */
+  optIn?: { at: string; source: string; verifiedAt?: string };
 }
 
 /** The slice of the user record this module reads. */
@@ -236,6 +241,30 @@ export function normalizeUserChannels(
 }
 
 /**
+ * The channels a user has EXPLICITLY configured, with nothing inferred.
+ *
+ * Every WRITE path must start from this, never from `normalizeUserChannels`, which
+ * folds the legacy slackChannel / slackChannels fields in. Persisting that would copy
+ * the user's current Slack destination into an explicit entry, and an explicit entry
+ * outranks the legacy field — freezing their Slack routing at whatever it happened to
+ * be the day they configured a second channel.
+ */
+export function explicitChannels(user: ChannelUser | null | undefined): UserMessagingChannelConfig[] {
+  return (Array.isArray(user?.messagingChannels) ? user!.messagingChannels! : []).filter(
+    (c) => !!c && typeof c.channel === 'string' && typeof c.destination === 'string' && !!c.destination,
+  );
+}
+
+/**
+ * Channels where a stored destination is not enough: the person must also have proven
+ * they control it. WhatsApp is messaged from one shared business number, so a number
+ * someone merely typed in — a typo, or a stranger's — would put that number's quality
+ * rating at risk. Mirrors `requiresOptIn` on the channel's capability record, kept here
+ * because destination resolution must not depend on the adapter registry being bootstrapped.
+ */
+const VERIFIED_OPT_IN_CHANNELS: ReadonlySet<MessagingChannel> = new Set(['whatsapp']);
+
+/**
  * The one platform-wide answer to "where does this user receive messages on channel X".
  *
  * Channel-neutral successor to `slackService.getEffectiveAllowedChannels`, preserving
@@ -250,7 +279,14 @@ export async function resolveDestination(
   channel: MessagingChannel,
 ): Promise<string | null> {
   try {
-    const personal = normalizeUserChannels(user).find((c) => c.channel === channel && c.enabled);
+    const personal = normalizeUserChannels(user).find(
+      (c) =>
+        c.channel === channel &&
+        c.enabled &&
+        // An unverified entry resolves to nothing rather than to a number we are not
+        // yet sure belongs to this person.
+        (!VERIFIED_OPT_IN_CHANNELS.has(channel) || !!c.optIn?.verifiedAt),
+    );
     if (personal) return personal.destination;
 
     // Org fallback is Slack-only: an org-wide Slack channel is a shared room, whereas a

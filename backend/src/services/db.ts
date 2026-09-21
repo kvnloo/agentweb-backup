@@ -212,7 +212,7 @@ export interface User {
     channel: 'slack' | 'whatsapp';
     destination: string; // Slack channel id, or E.164 phone for WhatsApp
     enabled: boolean;
-    optIn?: { at: string; source: string }; // Required before first send where the channel demands it
+    optIn?: { at: string; source: string; verifiedAt?: string }; // Required before first send where the channel demands it; verifiedAt = proved control of the number
   }>;
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
