@@ -2,9 +2,11 @@
  * Per-user messaging channel configuration routes (ENG-273).
  *
  * The consent behavior is the point of this suite. Meta requires recorded opt-in
- * before the first outbound WhatsApp message, so a phone number saved without it
- * would be a destination we are not permitted to message — the route must refuse
- * rather than store it and find out later.
+ * before the first outbound WhatsApp message, and AgentWeb messages from ONE shared
+ * business number, so a number someone merely typed in — a typo, or a stranger's — must
+ * never become a destination. There is therefore no endpoint that saves a phone number:
+ * the user starts a verification, messages a code to the business number, and only the
+ * webhook connects the sender (see whatsappVerificationService).
  */
 
 import express from 'express';
@@ -21,12 +23,17 @@ jest.mock('../services/db', () => ({
   orgDb: { getOrgById: jest.fn() },
 }));
 jest.mock('../services/whatsappService', () => ({
-  toE164: jest.requireActual('../services/whatsappService').toE164,
   isOptedOut: jest.fn(),
+  getDisplayPhoneNumber: jest.fn(),
+}));
+jest.mock('../services/whatsappVerificationService', () => ({
+  startVerification: jest.fn(),
+  getVerificationStatus: jest.fn(),
 }));
 
 const { userDb } = require('../services/db');
-const { isOptedOut } = require('../services/whatsappService');
+const { isOptedOut, getDisplayPhoneNumber } = require('../services/whatsappService');
+const { startVerification, getVerificationStatus } = require('../services/whatsappVerificationService');
 
 import messagingChannelsRouter from '../routes/messagingChannels';
 
@@ -60,125 +67,144 @@ describe('GET /', () => {
     expect(res.body.channels[0].optedOut).toBe(true);
   });
 
+  it('tells the UI whether a WhatsApp destination has been verified', async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [
+        {
+          channel: 'whatsapp',
+          destination: '+14155550123',
+          enabled: true,
+          optIn: { at: 'a', source: 'inbound_verification', verifiedAt: 'b' },
+        },
+      ],
+    });
+    expect((await request(app).get('/api/messaging-channels')).body.channels[0].verified).toBe(true);
+
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    expect((await request(app).get('/api/messaging-channels')).body.channels[0].verified).toBe(false);
+  });
+
   it('404s for an unknown user', async () => {
     userDb.getUserById.mockResolvedValue(null);
     expect((await request(app).get('/api/messaging-channels')).status).toBe(404);
   });
 });
 
-describe('PUT /whatsapp', () => {
+describe('there is no way to save a typed-in number', () => {
+  // Removed with the PUT route: its tests asserted that a number the user typed was
+  // stored on the strength of a self-declared opt-in. That is exactly what verification
+  // replaces — the same invariants (legacy Slack not frozen, other channels kept, one
+  // WhatsApp entry) now live in whatsappVerificationService.test.ts, where the write is.
+  it('has no PUT /whatsapp, and a request to it writes nothing', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
+    const res = await request(app)
+      .put('/api/messaging-channels/whatsapp')
+      .send({ phone: '+14155550123', optIn: true });
+    expect(res.status).toBe(404);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('never writes a user record when a verification is merely started', async () => {
+    getDisplayPhoneNumber.mockResolvedValue('14155550100');
+    startVerification.mockResolvedValue({ code: 'K7Q2M9XA', expiresAt: '2026-09-21T12:10:00.000Z' });
+    await request(app).post('/api/messaging-channels/whatsapp/verification').send({ optIn: true });
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /whatsapp/verification', () => {
   beforeEach(() => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    getDisplayPhoneNumber.mockResolvedValue('14155550100');
+    startVerification.mockResolvedValue({ code: 'K7Q2M9XA', expiresAt: '2026-09-21T12:10:00.000Z' });
   });
 
-  it('saves a valid number with a recorded opt-in', async () => {
+  it('starts a verification and returns the code with a ready-to-tap WhatsApp link', async () => {
     const res = await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+1 415 555 0123', optIn: true });
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
     expect(res.status).toBe(200);
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    const wa = saved.find((c: any) => c.channel === 'whatsapp');
-    expect(wa.destination).toBe('+14155550123');
-    expect(wa.optIn.source).toBe('settings_ui');
-    expect(typeof wa.optIn.at).toBe('string');
+    expect(res.body).toMatchObject({
+      success: true,
+      code: 'K7Q2M9XA',
+      expiresAt: '2026-09-21T12:10:00.000Z',
+      message: 'Verify K7Q2M9XA',
+      displayNumber: '+14155550100',
+      link: 'https://wa.me/14155550100?text=Verify%20K7Q2M9XA',
+    });
   });
 
-  it('refuses to store a number without an explicit opt-in', async () => {
+  it('starts it for the signed-in user, stamping when consent was acknowledged', async () => {
+    const before = Date.now();
+    await request(app).post('/api/messaging-channels/whatsapp/verification').send({ optIn: true });
+    const [userId, acknowledgedAt] = startVerification.mock.calls[0];
+    expect(userId).toBe('u1');
+    expect(Date.parse(acknowledgedAt)).toBeGreaterThanOrEqual(before);
+  });
+
+  it('must not be cached, since the response carries a live credential', async () => {
     const res = await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123' });
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('refuses without an explicit opt-in, and issues no code', async () => {
+    const res = await request(app).post('/api/messaging-channels/whatsapp/verification').send({});
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/opt-in/i);
-    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(startVerification).not.toHaveBeenCalled();
   });
 
   it('treats a truthy-but-not-true optIn as missing consent', async () => {
     const res = await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: 'yes' });
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: 'yes' });
     expect(res.status).toBe(400);
-    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(startVerification).not.toHaveBeenCalled();
   });
 
-  it('rejects an unparseable number with a message naming the country code', async () => {
+  it('is unavailable — and issues no code — when the business number cannot be read', async () => {
+    // A code the user has no link to send it to would just be a dead credential.
+    getDisplayPhoneNumber.mockRejectedValue(new Error('Graph is down'));
     const res = await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '555-CALL-NOW', optIn: true });
-    expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/country code/i);
-    expect(userDb.updateUser).not.toHaveBeenCalled();
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+    expect(res.status).toBe(503);
+    expect(startVerification).not.toHaveBeenCalled();
   });
 
-  it('rejects a national number with no country code rather than guessing US', async () => {
+  it('500s when the verification cannot be stored', async () => {
+    startVerification.mockRejectedValue(new Error('dynamo down'));
     const res = await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '4155550123', optIn: true });
-    expect(res.status).toBe(400);
+      .post('/api/messaging-channels/whatsapp/verification')
+      .send({ optIn: true });
+    expect(res.status).toBe(500);
+  });
+});
+
+describe('GET /whatsapp/verification', () => {
+  it("returns where the caller's verification stands, uncached", async () => {
+    getVerificationStatus.mockResolvedValue({ state: 'pending', expiresAt: '2026-09-21T12:10:00.000Z' });
+    const res = await request(app).get('/api/messaging-channels/whatsapp/verification');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, state: 'pending', expiresAt: '2026-09-21T12:10:00.000Z' });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(getVerificationStatus).toHaveBeenCalledWith('u1');
   });
 
-  it('does NOT copy a legacy Slack channel into messagingChannels', async () => {
-    // Greptile P1. Persisting the normalized list would write the user's CURRENT
-    // Slack destination in as an explicit entry, and an explicit entry outranks the
-    // legacy field — so a later admin re-mapping of their Slack channel would be
-    // silently ignored and notifications would keep going to the old channel.
-    // Configuring WhatsApp must not freeze Slack routing.
-    await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    expect(saved.some((c: any) => c.channel === 'slack')).toBe(false);
-    expect(saved).toHaveLength(1);
+  it('reports a STOPped number so the UI can explain why nothing happened', async () => {
+    getVerificationStatus.mockResolvedValue({ state: 'opted_out', expiresAt: 'x' });
+    const res = await request(app).get('/api/messaging-channels/whatsapp/verification');
+    expect(res.body.state).toBe('opted_out');
   });
 
-  it('leaves a legacy Slack user still resolvable on Slack after adding WhatsApp', async () => {
-    // The other half of the same guarantee: not persisting Slack must not mean
-    // losing it. It still resolves through the legacy field at read time.
-    await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    userDb.getUserById.mockResolvedValue({
-      userId: 'u1',
-      slackChannels: ['C-remapped-by-admin'],
-      messagingChannels: saved,
-    });
-    const res = await request(app).get('/api/messaging-channels');
-    const slack = res.body.channels.find((c: any) => c.channel === 'slack');
-    // The admin's NEW channel, not the one present when WhatsApp was configured.
-    expect(slack.destination).toBe('C-remapped-by-admin');
-  });
-
-  it('preserves an explicitly-configured non-WhatsApp entry', async () => {
-    userDb.getUserById.mockResolvedValue({
-      userId: 'u1',
-      messagingChannels: [{ channel: 'slack', destination: 'C-explicit', enabled: true }],
-    });
-    await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    expect(saved.find((c: any) => c.channel === 'slack')?.destination).toBe('C-explicit');
-  });
-
-  it('replaces an existing WhatsApp entry rather than adding a second', async () => {
-    userDb.getUserById.mockResolvedValue({
-      userId: 'u1',
-      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550000', enabled: true }],
-    });
-    await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    expect(saved.filter((c: any) => c.channel === 'whatsapp')).toHaveLength(1);
-    expect(saved[0].destination).toBe('+14155550123');
-  });
-
-  it('records a caller-supplied opt-in source', async () => {
-    await request(app)
-      .put('/api/messaging-channels/whatsapp')
-      .send({ phone: '+14155550123', optIn: true, source: 'onboarding_call' });
-    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    expect(saved.find((c: any) => c.channel === 'whatsapp').optIn.source).toBe('onboarding_call');
+  it('500s when the status cannot be read', async () => {
+    getVerificationStatus.mockRejectedValue(new Error('dynamo down'));
+    expect((await request(app).get('/api/messaging-channels/whatsapp/verification')).status).toBe(500);
   });
 });
 
@@ -199,7 +225,7 @@ describe('DELETE /whatsapp', () => {
   });
 
   it('does not pin a legacy Slack destination as a side effect of removing WhatsApp', async () => {
-    // Same Greptile P1 as the PUT path: removing WhatsApp must not write the
+    // Same Greptile P1 as the verification write: removing WhatsApp must not write the
     // current Slack destination in as an explicit entry.
     userDb.getUserById.mockResolvedValue({
       userId: 'u1',

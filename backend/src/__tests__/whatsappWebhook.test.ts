@@ -24,11 +24,15 @@ jest.mock('../services/whatsappService', () => ({
   recordOptOut: jest.fn(),
   recordOptIn: jest.fn(),
 }));
+jest.mock('../services/whatsappVerificationService', () => ({
+  handleVerificationMessage: jest.fn(),
+}));
 jest.mock('../utils/secretsManager', () => ({
   getWhatsAppCredentials: jest.fn(),
 }));
 
 const { recordInboundMessage, recordOptOut, recordOptIn } = require('../services/whatsappService');
+const { handleVerificationMessage } = require('../services/whatsappVerificationService');
 const { getWhatsAppCredentials } = require('../utils/secretsManager');
 
 import whatsappWebhookRouter from '../routes/whatsappWebhook';
@@ -295,5 +299,65 @@ describe('POST — inbound messages', () => {
       .send(body);
     expect(recordInboundMessage).toHaveBeenCalledWith('+14155550123');
     expect(recordInboundMessage).toHaveBeenCalledWith('+447700900123');
+  });
+});
+
+// ── Number verification ────────────────────────────────────────────────────
+
+describe('POST — number verification', () => {
+  const post = (body: string) =>
+    request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', sign(body))
+      .set('Content-Type', 'application/json')
+      .send(body);
+
+  it("hands a text message to the verification handler with the sender in E.164 form", async () => {
+    await post(inboundPayload('Verify K7Q2M9XA'));
+    // The handler owns deciding whether it is a verification attempt; the webhook only
+    // supplies the text and the normalized number the code will be bound to.
+    expect(handleVerificationMessage).toHaveBeenCalledWith('Verify K7Q2M9XA', '+14155550123');
+  });
+
+  it('opens the service window first, so the confirmation reply is deliverable', async () => {
+    await post(inboundPayload('Verify K7Q2M9XA'));
+    expect(recordInboundMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      handleVerificationMessage.mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each(['STOP', 'unsubscribe', 'START', 'unstop'])(
+    'does not route the keyword %j to verification',
+    async (keyword) => {
+      await post(inboundPayload(keyword));
+      expect(handleVerificationMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not run verification for a delivery status callback', async () => {
+    await post(statusPayload('delivered'));
+    expect(handleVerificationMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not run verification for a badly signed delivery', async () => {
+    const body = inboundPayload('Verify K7Q2M9XA');
+    const res = await request(app)
+      .post('/api/webhooks/whatsapp')
+      .set('X-Hub-Signature-256', 'sha256=' + '0'.repeat(64))
+      .set('Content-Type', 'application/json')
+      .send(body);
+    expect(res.status).toBe(401);
+    expect(handleVerificationMessage).not.toHaveBeenCalled();
+  });
+
+  it('500s when verification storage fails, so Meta retries and the claim is resumed', async () => {
+    handleVerificationMessage.mockRejectedValue(new Error('dynamo down'));
+    const res = await post(inboundPayload('Verify K7Q2M9XA'));
+    expect(res.status).toBe(500);
+  });
+
+  it('200s when verification completes, whatever the outcome it chose to reply with', async () => {
+    handleVerificationMessage.mockResolvedValue(true);
+    expect((await post(inboundPayload('Verify K7Q2M9XA'))).status).toBe(200);
   });
 });

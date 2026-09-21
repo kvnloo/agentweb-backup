@@ -20,6 +20,8 @@ import {
   sendMessage,
   sendTemplate,
   toTemplateParam,
+  getDisplayPhoneNumber,
+  __resetDisplayPhoneNumberCache,
   toE164,
   recordInboundMessage,
   isServiceWindowOpen,
@@ -344,6 +346,84 @@ describe('template parameter hygiene', () => {
       template: { name: TEMPLATES.LEAD_ALERT.name, variables: ['Ada\nLovelace', 'replied on  Q3 list'] },
     });
     expect(bodyTexts()).toEqual(['Ada Lovelace', 'replied on Q3 list']);
+  });
+});
+
+// ── Display number ─────────────────────────────────────────────────────────
+
+describe('getDisplayPhoneNumber', () => {
+  // The number people are sent to message. Asked of Meta rather than configured: the
+  // credentials carry the phone number ID, which is not the number, and a hand-copied
+  // value that drifted would send verification messages to somebody else's WhatsApp.
+  const displayResponse = (n = '+1 415-555-0100') => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ display_phone_number: n, id: '111' }),
+  });
+
+  beforeEach(() => {
+    __resetDisplayPhoneNumberCache();
+    fetchMock.mockResolvedValue(displayResponse());
+  });
+
+  it('returns the number as bare digits, ready for a wa.me link', async () => {
+    await expect(getDisplayPhoneNumber()).resolves.toBe('14155550100');
+  });
+
+  it('asks Meta for display_phone_number of the configured phone number ID, with the token', async () => {
+    await getDisplayPhoneNumber();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain('/111?fields=display_phone_number');
+    expect(init.headers.Authorization).toBe('Bearer tok');
+  });
+
+  it('bounds the request with a timeout so a hung Graph call cannot hang the route', async () => {
+    await getDisplayPhoneNumber();
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('caches per phone number ID, so it is one lookup rather than one per request', async () => {
+    await getDisplayPhoneNumber();
+    await getDisplayPhoneNumber();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('looks again when the credentials point at a different phone number ID', async () => {
+    await getDisplayPhoneNumber();
+    getWhatsAppCredentials.mockResolvedValue({
+      phoneNumberId: '999',
+      wabaId: '222',
+      accessToken: 'tok',
+      appSecret: 'sec',
+      webhookVerifyToken: 'verify',
+    });
+    fetchMock.mockResolvedValue(displayResponse('+44 20 7946 0000'));
+    await expect(getDisplayPhoneNumber()).resolves.toBe('442079460000');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails without leaking the access token when Meta answers with an error', async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 401, json: async () => ({}) });
+    const err: any = await getDisplayPhoneNumber().catch((e) => e);
+    expect(err).toBeInstanceOf(WhatsAppError);
+    expect(err.message).toContain('401');
+    expect(err.message).not.toContain('tok');
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['empty', ''],
+    ['too short to be a number', '+123'],
+  ])('refuses a response where the number is %s', async (_label, value) => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ display_phone_number: value }) });
+    await expect(getDisplayPhoneNumber()).rejects.toBeInstanceOf(WhatsAppError);
+  });
+
+  it('does not cache a failure, so the next call can recover', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) });
+    await expect(getDisplayPhoneNumber()).rejects.toBeInstanceOf(WhatsAppError);
+    fetchMock.mockResolvedValue(displayResponse());
+    await expect(getDisplayPhoneNumber()).resolves.toBe('14155550100');
   });
 });
 

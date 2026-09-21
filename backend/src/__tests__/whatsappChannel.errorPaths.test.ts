@@ -37,6 +37,7 @@ import {
   toE164,
   sendTemplate,
   sendMessage,
+  __resetDisplayPhoneNumberCache,
   TEMPLATES,
   WhatsAppError,
   WhatsAppRateLimitError,
@@ -63,6 +64,9 @@ configApp.use('/cfg', messagingChannelsRouter);
 
 beforeEach(() => {
   jest.resetAllMocks();
+  // The display number is cached for the process lifetime; without this a test that
+  // succeeded in fetching it would silently serve every later one from the cache.
+  __resetDisplayPhoneNumberCache();
   getWhatsAppCredentials.mockResolvedValue(CREDS);
   settingsService.getSetting.mockResolvedValue(null);
   settingsService.setSetting.mockResolvedValue(undefined);
@@ -232,13 +236,27 @@ describe('config route failure handling', () => {
     expect((await request(configApp).get('/cfg')).status).toBe(500);
   });
 
-  it('500s the save when the write throws', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
-    userDb.updateUser.mockRejectedValue(new Error('dynamo down'));
-    const res = await request(configApp)
-      .put('/cfg/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
+  // The old "500s the save when the write throws", "404s the save for an unknown user"
+  // and "rejects a non-string phone" tests covered the PUT route, which is gone: no
+  // endpoint takes a typed-in number any more, so there is no phone to reject and no
+  // user record touched at start. Their failure-handling counterparts are below.
+  it('500s starting a verification when the store throws', async () => {
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ display_phone_number: '+1 415-555-0100' }),
+    });
+    settingsService.setSetting.mockRejectedValue(new Error('dynamo down'));
+    const res = await request(configApp).post('/cfg/whatsapp/verification').send({ optIn: true });
     expect(res.status).toBe(500);
+  });
+
+  it('503s starting a verification when Meta will not give us the business number', async () => {
+    (global as any).fetch = jest.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({}) });
+    const res = await request(configApp).post('/cfg/whatsapp/verification').send({ optIn: true });
+    expect(res.status).toBe(503);
+    // No live code is left behind for a user who has nowhere to send it.
+    expect(settingsService.setSetting).not.toHaveBeenCalled();
   });
 
   it('500s the delete when the write throws', async () => {
@@ -247,23 +265,9 @@ describe('config route failure handling', () => {
     expect((await request(configApp).delete('/cfg/whatsapp')).status).toBe(500);
   });
 
-  it('404s the save for an unknown user', async () => {
-    userDb.getUserById.mockResolvedValue(null);
-    const res = await request(configApp)
-      .put('/cfg/whatsapp')
-      .send({ phone: '+14155550123', optIn: true });
-    expect(res.status).toBe(404);
-  });
-
   it('404s the delete for an unknown user', async () => {
     userDb.getUserById.mockResolvedValue(null);
     expect((await request(configApp).delete('/cfg/whatsapp')).status).toBe(404);
-  });
-
-  it('rejects a non-string phone without attempting to parse it', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1' });
-    const res = await request(configApp).put('/cfg/whatsapp').send({ phone: 12345, optIn: true });
-    expect(res.status).toBe(400);
   });
 
   it('drops a malformed stored entry from the listing', async () => {
