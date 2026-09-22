@@ -199,7 +199,9 @@ describe('Slack Events API', () => {
             },
           });
 
-        const loggedText = logSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+        const loggedText = logSpy.mock.calls
+          .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+          .join('\n');
         expect(loggedText).not.toContain('super-secret-session-cookie-should-not-be-logged');
         expect(loggedText).not.toContain('confidential-customer-message-content');
       } finally {
