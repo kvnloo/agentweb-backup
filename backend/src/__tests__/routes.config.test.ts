@@ -105,11 +105,30 @@ describe('Config Routes', () => {
 
     it('should handle errors gracefully', async () => {
       mockDynamoDb.promise.mockRejectedValue(new Error('DynamoDB Error'));
-      
+
       const res = await request(app).get('/api/config');
-      
+
       expect(res.status).toBe(500);
       expect(res.body).toHaveProperty('error');
+    });
+
+    it('should omit a shared-with user whose account no longer exists, not 500', async () => {
+      const mockConfigs = [
+        { configId: '2', userId: 'test-user-id', website: 'test.com', password: 'p2', encryptedPassword: 'enc2', sharedConfigIds: ['shared-1'] }
+      ];
+      const mockSharedConfig = { configId: 'shared-1', userId: 'deleted-user', website: 'shared.com' };
+
+      mockDynamoDb.promise.mockResolvedValueOnce({ Items: mockConfigs });
+      mockDynamoDb.promise.mockResolvedValueOnce({ Items: [mockSharedConfig] });
+
+      // getUserById returns undefined (not null) for a deleted/not-found user.
+      (dbUtils.userDb.getUserById as jest.Mock).mockResolvedValue(undefined);
+
+      const res = await request(app).get('/api/config');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(res.body[0].sharedWith).toEqual([]);
     });
   });
 

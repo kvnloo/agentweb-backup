@@ -64,7 +64,7 @@ router.get('/', authenticateToken, async (req, res) => {
         return {
           ...configWithoutPassword,
           sharedWith: sharedWithUsers
-            .filter((user): user is NonNullable<typeof user> => user !== null)
+            .filter((user): user is NonNullable<typeof user> => user != null)
             .map(user => user.email)
         };
       }
