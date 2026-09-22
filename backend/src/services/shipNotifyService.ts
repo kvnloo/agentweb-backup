@@ -34,7 +34,7 @@ import {
   resolveDestination,
   type MessagingChannel,
 } from './messagingChannelService';
-import { TEMPLATES } from './whatsappService';
+import { redactPhone, TEMPLATES } from './whatsappService';
 
 export type ShipNotifyOutcome = 'sent' | 'no_user' | 'opted_out' | 'no_channel' | 'already_sent' | 'failed';
 
@@ -71,7 +71,6 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
   try {
     const user = await userDb.getUserByEmail(p.email);
     if (!user) return 'no_user';
-    if (user.slackShipNotifyDisabled) return 'opted_out';
 
     await bootstrapMessagingChannels();
 
@@ -80,15 +79,31 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
     // config can still have an inherited channel. Dropping Slack from the candidate
     // list when the user record carries no slack* field would silently stop
     // notifying every org member who relies on that inheritance.
+    //
+    // slackShipNotifyDisabled is a SLACK-ONLY flag (see its doc comment on the User
+    // model) — it must not gate WhatsApp or any future channel. It only removes
+    // 'slack' from the candidate set, rather than returning before channel
+    // resolution runs at all, which previously silenced WhatsApp too for a user who
+    // had only ever turned off the Slack ping.
+    const slackDisabled = !!user.slackShipNotifyDisabled;
     const configured = normalizeUserChannels(user)
       .filter((c) => c.enabled)
       .map((c) => c.channel);
+    const candidates = new Set<MessagingChannel>(['slack', ...configured]);
+    if (slackDisabled) candidates.delete('slack');
+
     const targets: Array<{ channel: MessagingChannel; destination: string }> = [];
-    for (const channel of new Set<MessagingChannel>(['slack', ...configured])) {
+    for (const channel of candidates) {
       const destination = await resolveDestination(user, channel);
       if (destination) targets.push({ channel, destination });
     }
-    if (targets.length === 0) return 'no_channel';
+    if (targets.length === 0) {
+      // Slack being turned off is the REASON nothing went out only if Slack would
+      // otherwise have been reachable. Otherwise this is "nothing configured", which
+      // reads differently to a caller inspecting the outcome.
+      if (slackDisabled && (await resolveDestination(user, 'slack'))) return 'opted_out';
+      return 'no_channel';
+    }
 
     const url = safeUrl(p.url);
     // Greet by first name so the message is addressed to the requester, not the room —
@@ -146,8 +161,14 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
         } as any);
         anySent = true;
       } catch (e) {
+        // Neither a raw phone number nor the reporter's email belongs in application
+        // logs (CWE-532) — the item id is enough to correlate this with the delivery
+        // it belongs to, and a WhatsApp destination is redacted rather than dropped so
+        // a support ticket can still be matched to a customer.
         console.warn(
-          `[ship-notify] ${target.channel} send to ${target.destination} for ${p.email} failed:`,
+          `[ship-notify] ${target.channel} send for item ${p.itemId} failed (destination ${
+            target.channel === 'whatsapp' ? redactPhone(target.destination) : target.destination
+          }):`,
           e instanceof Error ? e.message : e,
         );
         // Release only THIS channel's claim so a retry re-attempts it alone. A sibling
