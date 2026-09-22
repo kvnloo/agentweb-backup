@@ -186,6 +186,17 @@ describe('opt-out (STOP)', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('does not put the raw phone number in the opted-out error message', async () => {
+    // This error's .message ends up in application logs at every catch site up the
+    // call chain (ship-notify, lead alerts) — it must not carry cleartext PII either.
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:optout:') ? { settingValue: 'x' } : null,
+    );
+    const err: any = await sendMessage({ destination: '+14155550123', text: 'hi' }).catch((e) => e);
+    expect(err.message).not.toContain('4155550123');
+    expect(err.message).toContain('0123');
+  });
+
   it('records an opt-out even for a number that maps to no known user', async () => {
     // STOP is a platform obligation, not a CRM operation. A blocklist keyed on the
     // phone is the only thing that works when the sender is not a known contact.
@@ -214,6 +225,12 @@ describe('sendMessage — window-aware routing', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('does not put the raw phone number in the window-closed error message', async () => {
+    const err: any = await sendMessage({ destination: '+14155550123', text: 'hello' }).catch((e) => e);
+    expect(err.message).not.toContain('4155550123');
+    expect(err.message).toContain('0123');
+  });
+
   it('sends the supplied template when the window is closed', async () => {
     await sendMessage({
       destination: '+14155550123',
@@ -230,6 +247,12 @@ describe('sendMessage — window-aware routing', () => {
       WhatsAppError,
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('redacts even the raw, not-yet-validated destination in the invalid-phone error', async () => {
+    // Not yet confirmed as E.164, but very likely a real attempted phone number.
+    const err: any = await sendMessage({ destination: '+14155550123x', text: 'x' }).catch((e) => e);
+    expect(err.message).not.toContain('4155550123');
   });
 
   it('returns the provider message handle', async () => {
