@@ -389,7 +389,12 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
         );
         console.log(`[CODING AGENT] Draft was ${divergence.behindBy} behind main; merged main into it`);
         return;
-      } catch (mergeErr) {
+      } catch (mergeErr: any) {
+        // Only a confirmed merge conflict (409) justifies backup + reset. Timeouts,
+        // rate limits, or auth failures leave the merge result unknown, so keep the draft.
+        if (mergeErr?.response?.status !== 409) {
+          throw new Error(`Cannot prepare preview branch: ${_describeGithubError(mergeErr, 'sync main into the draft')}`);
+        }
         const draftRef = await axios.get<any>(`${repoBase}/git/ref/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, { headers, timeout: GITHUB_API_TIMEOUT_MS });
         const draftSha = draftRef.data?.object?.sha;
         const backup = `refs/heads/backup/agentweb-preview-${Date.now()}`;

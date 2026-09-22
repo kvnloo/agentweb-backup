@@ -2033,16 +2033,17 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         });
       }
 
-      console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
+      console.warn(`[LP GENERATION] Standard merge returned 409; fast-forwarding main to draft branch tip`);
 
       // The post-Tests ref read above proved that this exact SHA is still the
       // draft tip. Use that immutable SHA here, never a newer untested branch tip.
       if (await refuseIfConsentWithdrawn()) return;
 
-      // Force-update main to the tested draft SHA.
+      // Fast-forward main to the tested draft SHA. force:false makes GitHub reject
+      // the update if main advanced between the compare above and this PATCH.
       await axios.patch<any>(
         `${repoBase}/git/refs/heads/main`,
-        { sha: draftSha, force: true },
+        { sha: draftSha, force: false },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
       mergeCommitSha = draftSha;
