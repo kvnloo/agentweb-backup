@@ -34,6 +34,13 @@ process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '
 process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
 process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 
+// Same dotenv-refill hazard as above: a real SLACK_SIGNING_SECRET in a dev's local
+// .env would make verifySlackRequest (routes/slack.ts) demand a valid HMAC signature
+// on every /api/slack/events test request, causing 401s instead of exercising the
+// no-secret/test-env pass-through path most Slack event tests rely on. Set to ''
+// (not delete) for the same hasOwnProperty reason documented above.
+process.env.SLACK_SIGNING_SECRET = '';
+
 // Set Azure OpenAI embeddings environment variables for tests
 process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
 process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';

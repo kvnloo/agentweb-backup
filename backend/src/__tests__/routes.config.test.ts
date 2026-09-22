@@ -38,7 +38,7 @@ jest.mock('../services/db', () => ({
 // Import the router and encryption functions
 // We need to use require to ensure mocks are applied first, or just standard import is fine since jest hoists mocks.
 // However, since we're testing the router attached to an express app, we'll set that up.
-import configRouter, { encryptPassword, decryptPassword } from '../routes/config';
+import configRouter, { encryptPassword, decryptPassword, omitSensitiveConfigFields } from '../routes/config';
 
 const app = express();
 app.use(express.json());
@@ -54,34 +54,56 @@ describe('Config Routes', () => {
     it('should encrypt and decrypt a password correctly', () => {
       const originalPassword = 'my-secret-password';
       const userId = 'user-123';
-      
+
       const encrypted = encryptPassword(originalPassword, userId);
       expect(encrypted).toBeDefined();
       expect(typeof encrypted).toBe('string');
-      
+
       const decrypted = decryptPassword(encrypted);
       expect(decrypted.password).toBe(originalPassword);
       expect(decrypted.userId).toBe(userId);
     });
   });
 
+  describe('omitSensitiveConfigFields', () => {
+    it('strips both password and encryptedPassword and keeps everything else', () => {
+      const result = omitSensitiveConfigFields({
+        configId: '1',
+        website: 'example.com',
+        password: 'plain',
+        encryptedPassword: 'enc'
+      });
+
+      expect(result).toEqual({ configId: '1', website: 'example.com' });
+      expect(result).not.toHaveProperty('password');
+      expect(result).not.toHaveProperty('encryptedPassword');
+    });
+
+    it('is a no-op when neither sensitive field is present', () => {
+      const config = { configId: '2', appName: 'GitHub' };
+      expect(omitSensitiveConfigFields(config)).toEqual(config);
+    });
+  });
+
   describe('GET /api/config', () => {
     it('should return user configurations', async () => {
       const mockConfigs = [
-        { configId: '1', userId: 'test-user-id', website: 'example.com', password: 'p1' },
-        { configId: '2', userId: 'test-user-id', website: 'test.com', password: 'p2', sharedConfigIds: ['shared-1'] }
+        { configId: '1', userId: 'test-user-id', website: 'example.com', password: 'p1', encryptedPassword: 'enc1' },
+        { configId: '2', userId: 'test-user-id', website: 'test.com', password: 'p2', encryptedPassword: 'enc2', sharedConfigIds: ['shared-1'] }
       ];
 
-      const mockSharedConfig = { 
-        configId: 'shared-1', 
-        userId: 'other-user', 
-        website: 'shared.com', 
-        password: 'p3' 
+      // No password/encryptedPassword here: the shared-config branch only ever
+      // reads .userId off this object (for the getUserById lookup below) and
+      // never serializes it into the response, so there's nothing to assert.
+      const mockSharedConfig = {
+        configId: 'shared-1',
+        userId: 'other-user',
+        website: 'shared.com'
       };
 
       // Mock query response for user configs
       mockDynamoDb.promise.mockResolvedValueOnce({ Items: mockConfigs });
-      
+
       // Mock query response for shared config lookup
       mockDynamoDb.promise.mockResolvedValueOnce({ Items: [mockSharedConfig] });
 
@@ -94,7 +116,8 @@ describe('Config Routes', () => {
       expect(res.body).toHaveLength(2);
       expect(res.body[0].website).toBe('example.com');
       expect(res.body[0]).not.toHaveProperty('password'); // Password should be stripped
-      
+      expect(res.body[0]).not.toHaveProperty('encryptedPassword'); // Encrypted password should be stripped
+
       // Check shared config processing
       expect(res.body[1].sharedWith).toBeDefined();
       expect(res.body[1].sharedWith).toContain('shared@example.com');
@@ -102,11 +125,30 @@ describe('Config Routes', () => {
 
     it('should handle errors gracefully', async () => {
       mockDynamoDb.promise.mockRejectedValue(new Error('DynamoDB Error'));
-      
+
       const res = await request(app).get('/api/config');
-      
+
       expect(res.status).toBe(500);
       expect(res.body).toHaveProperty('error');
+    });
+
+    it('should omit a shared-with user whose account no longer exists, not 500', async () => {
+      const mockConfigs = [
+        { configId: '2', userId: 'test-user-id', website: 'test.com', password: 'p2', encryptedPassword: 'enc2', sharedConfigIds: ['shared-1'] }
+      ];
+      const mockSharedConfig = { configId: 'shared-1', userId: 'deleted-user', website: 'shared.com' };
+
+      mockDynamoDb.promise.mockResolvedValueOnce({ Items: mockConfigs });
+      mockDynamoDb.promise.mockResolvedValueOnce({ Items: [mockSharedConfig] });
+
+      // getUserById returns undefined (not null) for a deleted/not-found user.
+      (dbUtils.userDb.getUserById as jest.Mock).mockResolvedValue(undefined);
+
+      const res = await request(app).get('/api/config');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(res.body[0].sharedWith).toEqual([]);
     });
   });
 
@@ -317,23 +359,27 @@ describe('Config Routes', () => {
   describe('GET /api/config/shared', () => {
     it('should return configs shared with me', async () => {
       // Mock directly shared configs
-      mockDynamoDb.promise.mockResolvedValueOnce({ 
-        Items: [{ 
-          configId: 'shared-1', 
-          website: 'direct.com', 
-          sharedBy: 'friend-id', 
-          userId: 'test-user-id' 
-        }] 
+      mockDynamoDb.promise.mockResolvedValueOnce({
+        Items: [{
+          configId: 'shared-1',
+          website: 'direct.com',
+          sharedBy: 'friend-id',
+          userId: 'test-user-id',
+          password: 'p1',
+          encryptedPassword: 'enc1'
+        }]
       });
-      
+
       // Mock publicly shared configs
-      mockDynamoDb.promise.mockResolvedValueOnce({ 
-        Items: [{ 
-          configId: 'public-1', 
-          appName: 'PublicAPI', 
-          shareWithEveryone: 1, 
-          userId: 'public-user' 
-        }] 
+      mockDynamoDb.promise.mockResolvedValueOnce({
+        Items: [{
+          configId: 'public-1',
+          appName: 'PublicAPI',
+          shareWithEveryone: 1,
+          userId: 'public-user',
+          password: 'p2',
+          encryptedPassword: 'enc2'
+        }]
       });
 
       // Mock user lookup for sharers
@@ -347,13 +393,17 @@ describe('Config Routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toHaveLength(2);
-      
+
       const direct = res.body.find((c: any) => c.configId === 'shared-1');
       expect(direct.sharedBy).toBe('friend@example.com');
-      
+      expect(direct).not.toHaveProperty('password');
+      expect(direct).not.toHaveProperty('encryptedPassword');
+
       const publicConf = res.body.find((c: any) => c.configId === 'public-1');
       expect(publicConf.isPublic).toBe(true);
       expect(publicConf.appName).toBe('PublicAPI');
+      expect(publicConf).not.toHaveProperty('password');
+      expect(publicConf).not.toHaveProperty('encryptedPassword');
     });
   });
 
@@ -361,12 +411,14 @@ describe('Config Routes', () => {
     it('should return user\'s own API config if exists', async () => {
       // Mock user config found
       mockDynamoDb.promise.mockResolvedValueOnce({
-        Items: [{ 
-          configId: 'own-api', 
-          appName: 'TargetApp', 
-          isApiConfig: true, 
-          username: 'me', 
-          userId: 'test-user-id' 
+        Items: [{
+          configId: 'own-api',
+          appName: 'TargetApp',
+          isApiConfig: true,
+          username: 'me',
+          userId: 'test-user-id',
+          password: 'p1',
+          encryptedPassword: 'enc1'
         }]
       });
 
@@ -374,20 +426,24 @@ describe('Config Routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.configId).toBe('own-api');
+      expect(res.body).not.toHaveProperty('password');
+      expect(res.body).not.toHaveProperty('encryptedPassword');
     });
 
     it('should return public API config if user config not found', async () => {
       // Mock user config NOT found
       mockDynamoDb.promise.mockResolvedValueOnce({ Items: [] });
-      
+
       // Mock public config found
       mockDynamoDb.promise.mockResolvedValueOnce({
-        Items: [{ 
-          configId: 'public-api', 
-          appName: 'TargetApp', 
-          isApiConfig: true, 
+        Items: [{
+          configId: 'public-api',
+          appName: 'TargetApp',
+          isApiConfig: true,
           shareWithEveryone: 1,
-          userId: 'other' 
+          userId: 'other',
+          password: 'p2',
+          encryptedPassword: 'enc2'
         }]
       });
 
@@ -395,6 +451,8 @@ describe('Config Routes', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.configId).toBe('public-api');
+      expect(res.body).not.toHaveProperty('password');
+      expect(res.body).not.toHaveProperty('encryptedPassword');
     });
 
     it('should return 404 if no config found', async () => {
